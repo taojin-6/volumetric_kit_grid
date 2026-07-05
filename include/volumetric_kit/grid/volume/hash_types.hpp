@@ -6,11 +6,20 @@
 /// @file volume/hash_types.hpp
 /// @brief POD storage layouts for the sparse voxel hash map.
 ///
-/// These are the on-device storage layouts shared by the CPU, Metal, and CUDA
-/// views of the volume. They are deliberately plain structs with
-/// `static_assert`'d sizes/offsets so every view agrees byte-for-byte -- a
-/// layout drift between the host allocator and a device kernel is a silent
-/// corruption bug, so it is made a compile error instead.
+/// These are the on-device storage layouts shared by the CPU, the Vulkan/GLSL
+/// compute shaders, and the optional CUDA accelerator. They are deliberately
+/// plain structs with `static_assert`'d sizes/offsets so the host and device
+/// views agree byte-for-byte -- a layout drift between the host allocator and a
+/// device kernel is a silent corruption bug, so it is made a compile error.
+///
+/// The layout here is the C/CUDA layout (a bare `Vec3i` packs to 12 B, so
+/// `HashEntry` is 20 B with `pos` at offset 4). The GLSL side reads these via
+/// **scalar block layout** (`GL_EXT_scalar_block_layout`; Vulkan 1.2 core,
+/// MoltenVK-supported), under which the shader struct is byte-identical to this
+/// one. A naive `std430` block does *not* match -- `std430` 16-byte-aligns a
+/// three-component vector, placing `pos` at offset 16 and spanning 32 B. The
+/// `static_assert`s below guard only the host side; the shader keeps its
+/// `layout(scalar)` definition in lockstep (see the gotchas in CLAUDE.md).
 ///
 /// The sparse-hashing scheme (a hash table of block coordinates into a heap of
 /// fixed-size voxel blocks) keeps memory proportional to the observed surface
@@ -72,7 +81,7 @@ static_assert(offsetof(Voxel, weight) == 4, "Voxel layout drift");
 /// rather than reaching into @ref HashTable internals, so new per-voxel
 /// channels can be added without touching every consumer.
 struct VoxelData {
-  Voxel* sdf_blocks = nullptr;     ///< SDF + weight (always present, non-null).
+  Voxel* sdf_blocks = nullptr;     ///< SDF + weight (non-null once allocated).
   Vec3u8* color_blocks = nullptr;  ///< Optional per-voxel RGB (nullptr = off).
 };
 
