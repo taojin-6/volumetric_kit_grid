@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 #include "volumetric_kit/recon/core/result.hpp"
@@ -117,6 +118,17 @@ inline Status VoxelGridParams::validate() const {
   if (num_blocks != bucket_size * num_buckets) {
     return Status::invalid_argument(
         "VoxelGridParams: num_blocks must equal bucket_size * num_buckets");
+  }
+  // A block pointer is block_idx * voxels_per_block held as a signed 32-bit int
+  // (BlockIndex::ptr); reject a pool whose largest pointer would overflow it,
+  // so a pointer stays a valid non-negative offset into the SoA attribute
+  // arrays. (resize validates the grown grid, so a grow that would overflow is
+  // rejected before it mutates the live map.)
+  if (static_cast<std::int64_t>(num_blocks) * voxels_per_block >
+      std::numeric_limits<std::int32_t>::max()) {
+    return Status::invalid_argument(
+        "VoxelGridParams: num_blocks * voxels_per_block must fit a signed "
+        "32-bit block pointer");
   }
   if (max_chain <= 0) {
     return Status::invalid_argument("VoxelGridParams: max_chain must be > 0");

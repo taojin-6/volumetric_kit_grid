@@ -44,8 +44,10 @@ struct AttributeSpec {
 ///
 /// @ref buffer is the device buffer to bind to a compute kernel (or read/write
 /// through @ref Buffer::mapped for this host-visible slice); it holds
-/// @ref element_count voxels of @ref element_size bytes each. Do not hold a
-/// view across a move of the owning grid.
+/// @ref element_count voxels of @ref element_size bytes each. Re-fetch the view
+/// (do not cache @ref buffer or its handle) across a move **or a
+/// @ref VoxelBlockGrid::resize** of the owning grid -- resize replaces every
+/// attribute buffer, so a held view or handle dangles.
 struct AttributeView {
   const Buffer* buffer = nullptr;   ///< The attribute's device buffer.
   std::uint32_t element_size = 0;   ///< Bytes per voxel.

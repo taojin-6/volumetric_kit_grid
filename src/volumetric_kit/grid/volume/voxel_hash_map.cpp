@@ -30,9 +30,11 @@ namespace {
 // Local group size, matching `layout(local_size_x = 256)` in every kernel.
 constexpr std::uint32_t kLocalSize = 256;
 
-// Bounded passes for the resize re-insert. allocate() is idempotent, so re-
-// driving the whole snapshot absorbs transient bucket-lock contention; the cap
-// keeps a genuine (near-impossible post-growth) overflow from looping forever.
+// Bounded passes for the resize rehash. insert_block is idempotent (an
+// already-present coord is a no-op), so re-driving the whole snapshot absorbs
+// transient bucket-lock contention; the cap keeps a genuine chain overflow --
+// a bucket the changed modulus concentrates past max_chain, still possible even
+// though the set fit the old table -- from looping forever.
 constexpr int kReinsertPasses = 3;
 
 // The push-constant block every kernel shares: the grid shape plus one
@@ -465,62 +467,85 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   VR_ASSIGN(std::vector<BlockIndex> active, compact_active_blocks());
 
   // The grown grid: num_blocks == bucket_size * num_buckets (one block per
-  // slot), the invariant create() validates.
+  // slot). validate() re-checks that invariant AND that num_blocks *
+  // voxels_per_block still fits a signed 32-bit block pointer -- before any
+  // mutation, so an over-large grow fails here with the live map untouched.
   VoxelGridParams new_grid = grid_;
   new_grid.num_buckets = new_num_buckets;
   new_grid.num_blocks =
       static_cast<std::int32_t>(static_cast<std::uint32_t>(new_num_buckets) *
                                 static_cast<std::uint32_t>(grid_.bucket_size));
+  VR_TRY(new_grid.validate());
 
-  // Build the larger buffers off to the side and commit only once all of them
-  // exist, so a mid-grow allocation failure leaves the live map untouched (a
-  // partial in-place swap would strand descriptors on a freed buffer while
-  // valid() still reported true). compacted_ tracks num_blocks, so it grows
-  // too.
+  // Build the larger buffers off to the side; a failure here leaves the live
+  // map untouched (nothing swapped yet). compacted_ tracks num_blocks, so it
+  // grows too.
   VR_ASSIGN(PersistentBuffers bufs,
             make_persistent_buffers(*allocator_, new_grid));
-  entries_ = std::move(bufs.entries);
-  heap_ = std::move(bufs.heap);
-  heap_counter_ = std::move(bufs.heap_counter);
-  bucket_mutex_ = std::move(bufs.bucket_mutex);
-  fail_counts_ = std::move(bufs.fail_counts);
-  compacted_ = std::move(bufs.compacted);
-  active_count_ = std::move(bufs.active_count);
-  grid_ = new_grid;
 
-  // Point the sets at the new buffers and init the larger table (entries free,
-  // heap holding every index, mutexes unlocked).
-  write_persistent_bindings();
-  VR_TRY(init_table());
-  if (active.empty()) {
-    return {};  // nothing to rehash; the fresh table + full heap is complete
-  }
+  // Swap the new buffers in, holding the old ones (and old grid) aside so ANY
+  // failure past this point rolls the live map back to exactly its prior state.
+  // resize is all-or-nothing across init_table / rehash too, not only the
+  // allocation above: a half-swapped map (a grown grid_ over a partial or
+  // uninitialised table, or a heap still listing the preserved live indices)
+  // would corrupt later allocations while valid() reported true.
+  PersistentBuffers old{std::move(entries_),      std::move(heap_),
+                        std::move(heap_counter_), std::move(bucket_mutex_),
+                        std::move(fail_counts_),  std::move(compacted_),
+                        std::move(active_count_)};
+  const VoxelGridParams old_grid = grid_;
+  auto commit = [this](PersistentBuffers& b, const VoxelGridParams& g) {
+    entries_ = std::move(b.entries);
+    heap_ = std::move(b.heap);
+    heap_counter_ = std::move(b.heap_counter);
+    bucket_mutex_ = std::move(b.bucket_mutex);
+    fail_counts_ = std::move(b.fail_counts);
+    compacted_ = std::move(b.compacted);
+    active_count_ = std::move(b.active_count);
+    grid_ = g;
+    write_persistent_bindings();  // point the sets at the committed buffers
+  };
+  commit(bufs, new_grid);
 
-  // Rehash: re-insert each block with its ORIGINAL pointer (the rehash_
-  // kernel's preset path, not a fresh heap draw), so per-voxel data keyed by
-  // that pointer survives the grow. insert_block is idempotent, and the grown
-  // table has strictly less hash pressure than the one the set already fit, so
-  // re-driving the whole snapshot converges past transient bucket-lock
-  // contention; a residual failure is a genuine overflow.
-  std::uint32_t failed = 0;
-  for (int pass = 0; pass < kReinsertPasses; ++pass) {
-    VR_ASSIGN(failed,
-              run_input_kernel(
-                  "VoxelHashMap::resize", active.data(), sizeof(BlockIndex),
-                  static_cast<std::uint32_t>(active.size()), rehash_));
-    if (failed == 0) {
-      break;
+  // Init the larger table, then rehash the snapshot into it; on any failure,
+  // roll back to the old buffers so a failed grow is a no-op.
+  auto grow = [&]() -> Status {
+    VR_TRY(
+        init_table());  // entries free, heap holds every index, mutexes clear
+    if (active.empty()) {
+      return {};  // fresh table + full heap is complete; nothing to rehash
     }
+    // Rehash: re-insert each block with its ORIGINAL pointer (rehash_'s preset
+    // path, not a fresh heap draw), so per-voxel data keyed by that pointer
+    // survives the grow. The snapshot is loop-invariant, so upload it once;
+    // insert_block is idempotent, so re-driving the dispatch absorbs transient
+    // bucket-lock contention. A residual failure is a genuine chain overflow.
+    const auto count = static_cast<std::uint32_t>(active.size());
+    VR_ASSIGN(Buffer snapshot,
+              upload_to_binding(rehash_.set, 4, active.data(),
+                                VkDeviceSize(count) * sizeof(BlockIndex)));
+    std::uint32_t failed = 0;
+    for (int pass = 0; pass < kReinsertPasses; ++pass) {
+      VR_ASSIGN(failed,
+                dispatch_with_retry(rehash_, count, group_count(count)));
+      if (failed == 0) {
+        break;
+      }
+    }
+    if (failed != 0) {
+      return Status::out_of_memory(
+          "VoxelHashMap::resize: rehash failed after growing");
+    }
+    // The rehash drew nothing from the heap, so init_table's "all free" heap
+    // still lists the preserved indices; rebuild it to hold only the genuinely
+    // free ones so a future allocation never hands out a live block.
+    rebuild_heap_excluding(active);
+    return {};
+  };
+  if (Status st = grow(); !st.ok()) {
+    commit(old, old_grid);  // roll back to the untouched live map
+    return st;
   }
-  if (failed != 0) {
-    return Status::out_of_memory(
-        "VoxelHashMap::resize: rehash failed after growing");
-  }
-
-  // The rehash drew nothing from the heap, so init_table's "all free" heap
-  // still lists the preserved indices; rebuild it to hold only the genuinely
-  // free ones so a future allocation never hands out a live block.
-  rebuild_heap_excluding(active);
   return {};
 }
 

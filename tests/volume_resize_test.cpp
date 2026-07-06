@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <set>
 #include <tuple>
@@ -226,6 +227,22 @@ int main() {
   // resize refuses a non-growing count.
   CHECK(map.resize(1024).domain() == vr::Status::Code::InvalidArgument);
   CHECK(map.resize(512).domain() == vr::Status::Code::InvalidArgument);
+
+  // resize refuses a grow whose num_blocks * voxels_per_block would overflow a
+  // signed 32-bit block pointer: rejected up front (InvalidArgument), before
+  // any buffer is allocated, so the live map is left untouched. buckets past
+  // INT32_MAX / (bucket_size * voxels_per_block) overflow.
+  const std::int64_t elems_per_bucket =
+      static_cast<std::int64_t>(map.grid().bucket_size) *
+      map.grid().voxels_per_block;
+  const std::int64_t overflow_buckets =
+      std::numeric_limits<std::int32_t>::max() / elems_per_bucket + 2;
+  CHECK(overflow_buckets > map.grid().num_buckets &&
+        overflow_buckets <= std::numeric_limits<std::int32_t>::max());
+  CHECK(map.resize(static_cast<std::int32_t>(overflow_buckets)).domain() ==
+        vr::Status::Code::InvalidArgument);
+  CHECK(map.grid().num_buckets ==
+        1024);  // rejected grow left the map untouched
 
   std::printf(
       "recon volume resize test passed: grew 256 -> 1024 buckets, %zu blocks "

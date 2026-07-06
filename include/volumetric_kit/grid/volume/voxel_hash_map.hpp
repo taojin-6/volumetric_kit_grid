@@ -79,9 +79,9 @@ static_assert(std::is_standard_layout_v<DepthCameraParams>,
 /// @ref ComputePipeline, @ref Device::submit_single_time). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
-/// byte-for-byte. Covers init, allocate-from-coords, remove, compact, and
-/// resize; diagnostics, the index-preserving GPU rehash, and depth/point
-/// allocation follow.
+/// byte-for-byte. Covers init, allocate-from-coords / -depth / -points, remove,
+/// compact / compact-in-frustum, diagnostics, and an **index-preserving**
+/// @ref resize (the GPU rehash that keeps each block's `ptr`).
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.

@@ -21,18 +21,25 @@ std::uint64_t voxel_count(const VoxelGridParams& grid) {
          static_cast<std::uint64_t>(grid.voxels_per_block);
 }
 
-// A host-visible, host-mapped storage buffer of the given byte size, zeroed so
-// a freshly-created attribute reads as all-zero.
+// A host-visible, host-mapped storage buffer of the given byte size,
+// uninitialised (the caller fills or zeroes it). resize() copies old attribute
+// contents into the head and zeroes only the grown tail through this, avoiding
+// a redundant full-buffer zero-then-overwrite.
 // TODO(volume): host-visible for this slice; a device-local + staging path is a
 // follow-up perf pass, matching the hash-map buffers.
-Result<Buffer> attribute_buffer(Allocator& allocator, VkDeviceSize bytes) {
+Result<Buffer> raw_attribute_buffer(Allocator& allocator, VkDeviceSize bytes) {
   BufferDesc desc;
   desc.size = bytes;
   desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
   desc.memory = MemoryUsage::HostVisible;
   desc.mapped = true;
   desc.host_access = HostAccess::Random;
-  VR_ASSIGN(Buffer buffer, allocator.create_buffer(desc));
+  return allocator.create_buffer(desc);
+}
+
+// The same, fully zeroed so a freshly-created attribute reads as all-zero.
+Result<Buffer> attribute_buffer(Allocator& allocator, VkDeviceSize bytes) {
+  VR_ASSIGN(Buffer buffer, raw_attribute_buffer(allocator, bytes));
   std::memset(buffer.mapped(), 0, static_cast<std::size_t>(bytes));
   return buffer;
 }
@@ -116,38 +123,42 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
   if (!valid()) {
     return Status::invalid_argument("VoxelBlockGrid::resize: moved-from grid");
   }
-  const VoxelGridParams& grid = map_.grid();
+  // A value copy, not a reference: map_.resize() below mutates map_'s grid in
+  // place, so a reference would start reporting the grown dimensions mid-way.
+  const VoxelGridParams grid = map_.grid();
   if (new_num_buckets <= grid.num_buckets) {
     return Status::invalid_argument(
         "VoxelBlockGrid::resize: new_num_buckets must exceed the current "
         "count");
   }
 
-  // The old voxel count (what each attribute buffer currently holds) and the
-  // new one. new num_blocks = bucket_size * new_num_buckets, the invariant
-  // VoxelHashMap::create validates; one attribute element per voxel of the
-  // pool.
-  const auto vpb = static_cast<std::uint64_t>(grid.voxels_per_block);
-  const std::uint64_t old_elements =
-      static_cast<std::uint64_t>(grid.num_blocks) * vpb;
+  // The grown per-voxel count: new num_blocks = bucket_size * new_num_buckets
+  // (the invariant VoxelHashMap::create validates), one attribute element per
+  // voxel of the pool.
   const std::uint64_t new_elements =
       static_cast<std::uint64_t>(grid.bucket_size) *
-      static_cast<std::uint64_t>(new_num_buckets) * vpb;
+      static_cast<std::uint64_t>(new_num_buckets) *
+      static_cast<std::uint64_t>(grid.voxels_per_block);
 
-  // Build each grown attribute buffer off to the side: allocate the new size
-  // (zero-filled by attribute_buffer), then copy the old contents forward. The
-  // map resize below preserves every block's index (BlockIndex::ptr <
-  // old_elements), so the copied data stays correctly addressed and the grown
-  // tail stays zero for future blocks. Commit only once the map resize
-  // succeeds, so an allocation failure leaves the grid untouched.
+  // Build each grown attribute buffer off to the side: copy the old contents
+  // into the head (bounded by the source buffer's own size, so it can never
+  // over-read even if map_ and the attributes were ever out of lockstep) and
+  // zero only the grown tail. map_.resize below preserves every block's index
+  // (BlockIndex::ptr < the old count), so the copied data stays correctly
+  // addressed and the tail stays zero for future blocks. Commit only once the
+  // map resize succeeds -- and map_.resize is itself all-or-nothing -- so a
+  // failure leaves the grid untouched.
   std::vector<Buffer> grown;
   grown.reserve(attributes_.size());
   for (const Attribute& attr : attributes_) {
     const auto new_bytes = static_cast<VkDeviceSize>(new_elements) *
                            static_cast<VkDeviceSize>(attr.element_size);
-    VR_ASSIGN(Buffer buffer, attribute_buffer(*allocator_, new_bytes));
-    std::memcpy(buffer.mapped(), attr.buffer.mapped(),
-                static_cast<std::size_t>(old_elements) * attr.element_size);
+    VR_ASSIGN(Buffer buffer, raw_attribute_buffer(*allocator_, new_bytes));
+    const auto old_bytes = static_cast<std::size_t>(attr.buffer.size());
+    auto* dst = static_cast<std::uint8_t*>(buffer.mapped());
+    std::memcpy(dst, attr.buffer.mapped(), old_bytes);
+    std::memset(dst + old_bytes, 0,
+                static_cast<std::size_t>(new_bytes) - old_bytes);
     grown.push_back(std::move(buffer));
   }
 
