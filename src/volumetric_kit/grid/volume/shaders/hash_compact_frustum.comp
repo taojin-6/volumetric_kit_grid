@@ -1,0 +1,73 @@
+#version 450
+
+// Compact the active blocks that intersect the camera frustum: scan every hash
+// entry, and for each occupied one whose world-space block AABB is not fully
+// outside any of the six frustum planes, append its (coord, ptr) to a
+// contiguous output array via an atomic bump counter. `pc.arg` is the output
+// capacity -- writes past it are dropped but still counted, so the host learns
+// the true visible count. The plane test is a conservative p-vertex AABB test,
+// mirroring compactActiveBlocksInFrustum in hash_ops.metal. One atomic per
+// surviving entry (the same simple form as hash_compact.comp).
+// TODO(volume): subgroup-dedup the bump (one atomic per subgroup), as noted in
+// hash_compact.comp.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer Entries {
+  HashEntry entries[];
+};
+layout(set = 0, binding = 1, scalar) writeonly buffer Output {
+  BlockIndex active_blocks[];
+};
+layout(set = 0, binding = 2) buffer Count { uint active_count; };
+// Six inward-normal, unit-length frustum planes (Hessian form): a point p is
+// inside plane i when dot(planes[i].xyz, p) + planes[i].w >= 0.
+layout(set = 0, binding = 3, scalar) readonly buffer Planes { vec4 planes[6]; };
+
+// Conservative AABB/frustum test: keep the box unless it lies fully outside some
+// plane. For each plane, test the box corner farthest along the inward normal
+// (the "p-vertex"); if even that corner is outside, the whole box is.
+bool aabb_in_frustum(vec3 bmin, vec3 bmax) {
+  for (int i = 0; i < 6; ++i) {
+    vec3 n = planes[i].xyz;
+    vec3 p = vec3(n.x >= 0.0 ? bmax.x : bmin.x, n.y >= 0.0 ? bmax.y : bmin.y,
+                  n.z >= 0.0 ? bmax.z : bmin.z);
+    if (dot(n, p) + planes[i].w < 0.0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint total = uint(pc.grid.num_buckets * pc.grid.bucket_size);
+  if (gid >= total) {
+    return;
+  }
+
+  int ptr = entries[gid].ptr;
+  if (ptr == kFreeEntry || ptr == kLockEntry) {
+    return;
+  }
+
+  // Block world AABB: the min-corner voxel origin (coord * block_size *
+  // voxel_size) spanning one block edge. This sits a half-voxel below the
+  // block's voxel centres -- immaterial for a conservative, ~10%-widened cull.
+  ivec3 coord = entries[gid].pos;
+  float edge = float(pc.grid.block_size) * pc.grid.voxel_size;
+  vec3 bmin = vec3(coord) * edge;
+  vec3 bmax = bmin + vec3(edge);
+  if (!aabb_in_frustum(bmin, bmax)) {
+    return;
+  }
+
+  uint index = atomicAdd(active_count, 1u);
+  if (index < pc.arg) {
+    active_blocks[index].coord = coord;
+    active_blocks[index].ptr = ptr;
+  }
+}

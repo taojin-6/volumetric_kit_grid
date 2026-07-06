@@ -20,6 +20,7 @@
 #include "hash_allocate_depth_comp.spv.hpp"
 #include "hash_allocate_points_comp.spv.hpp"
 #include "hash_compact_comp.spv.hpp"
+#include "hash_compact_frustum_comp.spv.hpp"
 #include "hash_delete_coords_comp.spv.hpp"
 #include "hash_init_comp.spv.hpp"
 
@@ -213,6 +214,11 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VR_ASSIGN(map.camera_params_,
             storage_buffer(allocator, sizeof(DepthCameraParams),
                            HostAccess::SequentialWrite));
+  // Frustum planes for compact_active_blocks_in_frustum: likewise a small
+  // (96 B), fixed-size buffer, persisted at binding 3 of compact_frustum_set_.
+  VR_ASSIGN(map.frustum_planes_,
+            storage_buffer(allocator, sizeof(FrustumPlanes),
+                           HostAccess::SequentialWrite));
 
   // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
   // 65535 guaranteed); cache it so every dispatch can reject an over-large
@@ -248,6 +254,12 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VR_ASSIGN(map.depth_layout_, DescriptorSetLayout::create(
                                    dev, depth_b.data(),
                                    static_cast<std::uint32_t>(depth_b.size())));
+  // Frustum compaction adds the planes buffer (binding 3) to compact's shape.
+  const auto compact_frustum_b = storage_bindings(4);
+  VR_ASSIGN(map.compact_frustum_layout_,
+            DescriptorSetLayout::create(
+                dev, compact_frustum_b.data(),
+                static_cast<std::uint32_t>(compact_frustum_b.size())));
 
   VR_ASSIGN(map.init_pipeline_, make_pipeline(dev, vr_hash_init_comp_spv,
                                               vr_hash_init_comp_spv_size,
@@ -271,6 +283,10 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
             make_pipeline(dev, vr_hash_allocate_points_comp_spv,
                           vr_hash_allocate_points_comp_spv_size,
                           map.allocate_layout_.handle()));
+  VR_ASSIGN(map.compact_frustum_pipeline_,
+            make_pipeline(dev, vr_hash_compact_frustum_comp_spv,
+                          vr_hash_compact_frustum_comp_spv_size,
+                          map.compact_frustum_layout_.handle()));
 
   // Pool: one set per kernel, sized to the exact descriptor total. points_set_
   // is allocated from allocate_layout_, so it costs another alloc_b worth.
@@ -278,8 +294,8 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   pool_size.descriptorCount = static_cast<std::uint32_t>(
       init_b.size() + alloc_b.size() + compact_b.size() + delete_b.size() +
-      depth_b.size() + alloc_b.size());
-  VR_ASSIGN(map.pool_, DescriptorPool::create(dev, &pool_size, 1, 6));
+      depth_b.size() + alloc_b.size() + compact_frustum_b.size());
+  VR_ASSIGN(map.pool_, DescriptorPool::create(dev, &pool_size, 1, 7));
   VR_ASSIGN(map.init_set_, map.pool_.allocate(map.init_layout_.handle()));
   VR_ASSIGN(map.allocate_set_,
             map.pool_.allocate(map.allocate_layout_.handle()));
@@ -287,6 +303,8 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VR_ASSIGN(map.delete_set_, map.pool_.allocate(map.delete_layout_.handle()));
   VR_ASSIGN(map.depth_set_, map.pool_.allocate(map.depth_layout_.handle()));
   VR_ASSIGN(map.points_set_, map.pool_.allocate(map.allocate_layout_.handle()));
+  VR_ASSIGN(map.compact_frustum_set_,
+            map.pool_.allocate(map.compact_frustum_layout_.handle()));
 
   // Point every set at the persistent buffers (the per-call coords buffer is
   // written before each allocate/delete dispatch). Shared with resize().
@@ -327,6 +345,15 @@ void VoxelHashMap::write_persistent_bindings() {
   compact_set_.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
   compact_set_.write_storage_buffer(2, active_count_.handle(), 0,
                                     VK_WHOLE_SIZE);
+  // Frustum compaction shares the compaction output + counter with plain
+  // compact; its planes buffer (binding 3) is persistent, rewritten per call.
+  compact_frustum_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
+  compact_frustum_set_.write_storage_buffer(1, compacted_.handle(), 0,
+                                            VK_WHOLE_SIZE);
+  compact_frustum_set_.write_storage_buffer(2, active_count_.handle(), 0,
+                                            VK_WHOLE_SIZE);
+  compact_frustum_set_.write_storage_buffer(3, frustum_planes_.handle(), 0,
+                                            VK_WHOLE_SIZE);
 }
 
 std::uint32_t VoxelHashMap::total_entries() const noexcept {
@@ -470,18 +497,15 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
                           count, delete_set_, delete_pipeline_);
 }
 
-Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
-  if (!valid()) {
-    return Status::invalid_argument(
-        "VoxelHashMap::compact_active_blocks: moved-from map");
-  }
+Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
+    const ComputePipeline& pipeline, DescriptorSet& set) {
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   std::memset(active_count_.mapped(), 0, sizeof(std::uint32_t));
 
   const PushConstants push{grid_, capacity};
-  VR_TRY(dispatch(*device_, compact_pipeline_, compact_set_.handle(), push,
+  VR_TRY(dispatch(*device_, pipeline, set.handle(), push,
                   group_count(total_entries()), max_workgroup_count_x_));
 
   std::uint32_t count = 0;
@@ -493,6 +517,33 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
                 static_cast<std::size_t>(count) * sizeof(BlockIndex));
   }
   return active;
+}
+
+Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
+  if (!valid()) {
+    return Status::invalid_argument(
+        "VoxelHashMap::compact_active_blocks: moved-from map");
+  }
+  return collect_compacted(compact_pipeline_, compact_set_);
+}
+
+Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
+    const FrustumPlanes& planes) {
+  if (!valid()) {
+    return Status::invalid_argument(
+        "VoxelHashMap::compact_active_blocks_in_frustum: moved-from map");
+  }
+  // The six planes are per-call; rewrite them into the persistent buffer bound
+  // once at binding 3 of the frustum set (like camera_params_).
+  std::memcpy(frustum_planes_.mapped(), planes.data(), sizeof(FrustumPlanes));
+  return collect_compacted(compact_frustum_pipeline_, compact_frustum_set_);
+}
+
+Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
+    const DepthCameraParams& camera) {
+  return compact_active_blocks_in_frustum(make_frustum_planes(
+      camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height,
+      camera.min_depth, camera.max_depth, camera.cam_to_world));
 }
 
 Status VoxelHashMap::clear() {
