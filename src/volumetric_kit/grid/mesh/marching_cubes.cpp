@@ -187,26 +187,26 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                      HostAccess::SequentialWrite));
   std::memcpy(samples_buf.mapped(), samples, count * sizeof(volume::Voxel));
 
-  // Colors (optional, parallel to samples): each RGB packed into a uint
-  // (unpackUnorm4x8 in the kernel). Always bound so the descriptor is valid;
-  // the has_color push flag tells the kernel whether to read it. Absent -> a
-  // 1-element dummy buffer + opaque-white vertices.
+  // Colors (optional, parallel to samples): each sample's RGB packed into the
+  // low three bytes of a uint (the kernel reads it back with unpackUnorm4x8 and
+  // takes .rgb, so the high byte is unused and left zero). Always bound so the
+  // descriptor is valid; the has_color push flag tells the kernel whether to
+  // read it. Absent -> a 1-element dummy buffer + opaque-white vertices.
   const std::uint32_t has_color = colors != nullptr ? 1u : 0u;
   Buffer colors_buf;
   if (colors != nullptr) {
-    std::vector<std::uint32_t> packed(count);
-    for (std::size_t i = 0; i < count; ++i) {
-      packed[i] = static_cast<std::uint32_t>(colors[i].x) |
-                  (static_cast<std::uint32_t>(colors[i].y) << 8) |
-                  (static_cast<std::uint32_t>(colors[i].z) << 16) |
-                  (std::uint32_t{0xFF} << 24);
-    }
     VR_ASSIGN(colors_buf, storage_buffer(*allocator_,
                                          static_cast<VkDeviceSize>(count) *
                                              sizeof(std::uint32_t),
                                          HostAccess::SequentialWrite));
-    std::memcpy(colors_buf.mapped(), packed.data(),
-                count * sizeof(std::uint32_t));
+    // Pack straight into the mapped buffer -- SequentialWrite is exactly this
+    // forward, write-once pattern, so no staging vector or second copy.
+    auto* packed = static_cast<std::uint32_t*>(colors_buf.mapped());
+    for (std::size_t i = 0; i < count; ++i) {
+      packed[i] = static_cast<std::uint32_t>(colors[i].x) |
+                  (static_cast<std::uint32_t>(colors[i].y) << 8) |
+                  (static_cast<std::uint32_t>(colors[i].z) << 16);
+    }
   } else {
     VR_ASSIGN(colors_buf, storage_buffer(*allocator_, sizeof(std::uint32_t),
                                          HostAccess::SequentialWrite));
