@@ -1,0 +1,72 @@
+#version 450
+
+// Allocate voxel blocks from a posed depth frame: one thread per pixel
+// unprojects its depth sample to a world point, finds the block containing it,
+// and dilates that into the (2*tb+1)^3 truncation-band cube
+// (allocate_truncation_band). Mirrors allocateBlocksFromDepth in hash_ops.metal.
+//
+// Depth is float metres -- the host applies any raw sensor depth-scale before
+// upload, so the shader stays format-agnostic. Non-finite / out-of-range
+// samples are dropped.
+//
+// TODO(volume): port the intra-warp leader election from hash_ops.metal (dedup
+// adjacent pixels that hit the same block before expanding the cube). Omitted
+// here: allocate_block is idempotent, so overlapping per-pixel bands merge at
+// the table -- the election is a throughput optimization, not a correctness one.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+#include "hash_allocate_common.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 4: the depth image, row-major float metres (width*height samples).
+layout(set = 0, binding = 4, scalar) readonly buffer Depth {
+  float depth_data[];
+};
+
+// binding 6: pinhole intrinsics + pose. Mirrors the host DepthCameraParams;
+// under scalar block layout the struct is byte-identical (floats/uints pack at
+// 4-byte, the mat4 lands at offset 32).
+struct CameraParams {
+  float fx;
+  float fy;
+  float cx;
+  float cy;
+  float min_depth;
+  float max_depth;
+  uint width;
+  uint height;
+  mat4 cam_to_world;  // column-major camera -> world rigid transform
+};
+layout(set = 0, binding = 6, scalar) readonly buffer Camera {
+  CameraParams cam;
+};
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint pixel_count = cam.width * cam.height;
+  if (gid >= pixel_count) {
+    return;
+  }
+
+  // Reject out-of-range and non-finite samples (the range test also drops NaN,
+  // whose comparisons are all false).
+  float depth = depth_data[gid];
+  if (!(depth >= cam.min_depth && depth <= cam.max_depth)) {
+    return;
+  }
+
+  uint u = gid % cam.width;
+  uint v = gid / cam.width;
+
+  // Unproject to camera space, then to world via the rigid pose.
+  float x = (float(u) - cam.cx) * depth / cam.fx;
+  float y = (float(v) - cam.cy) * depth / cam.fy;
+  vec3 world = (cam.cam_to_world * vec4(x, y, depth, 1.0)).xyz;
+  if (any(isinf(world)) || any(isnan(world))) {
+    return;
+  }
+
+  allocate_truncation_band(worldToBlock(world, pc.grid));
+}
