@@ -14,7 +14,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/buffer.hpp"
-#include "volumetric_kit/recon/core/compute_pipeline.hpp"
+#include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -251,39 +251,37 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
 
-  /// Shared body of the compaction kernels: zero the counter, run @p pipeline
-  /// (bound through @p set) over every hash slot, then read back the appended
-  /// @ref BlockIndex list. Used by @ref compact_active_blocks (plain) and
-  /// @ref compact_active_blocks_in_frustum (with the frustum set + planes).
+  /// Shared body of the compaction kernels: zero the counter, run @p kernel
+  /// over every hash slot, then read back the appended @ref BlockIndex list.
+  /// Used by @ref compact_active_blocks (plain) and
+  /// @ref compact_active_blocks_in_frustum (whose set also carries the planes).
   Result<std::vector<BlockIndex>> collect_compacted(
-      const ComputePipeline& pipeline, DescriptorSet& set);
+      const ComputeKernel& kernel);
 
-  /// Dispatch @p pipeline (bound through @p set, push arg = @p arg) over
-  /// @p groups groups, re-dispatching while the shared `fail_counts_[0]` tally
-  /// keeps dropping to converge past transient same-bucket lock contention.
-  /// Re-zeroes the tally each round. The shared tail of every allocate/remove
-  /// kernel.
-  Result<std::uint32_t> dispatch_with_retry(const ComputePipeline& pipeline,
-                                            DescriptorSet& set,
+  /// Dispatch @p kernel (push arg = @p arg) over @p groups groups,
+  /// re-dispatching while the shared `fail_counts_[0]` tally keeps dropping to
+  /// converge past transient same-bucket lock contention. Re-zeroes the tally
+  /// each round. The shared tail of every allocate/remove kernel.
+  Result<std::uint32_t> dispatch_with_retry(const ComputeKernel& kernel,
                                             std::uint32_t arg,
                                             std::uint32_t groups);
 
   /// Create a transient host-visible buffer holding @p bytes of @p data and
   /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
   /// alive across the (synchronous) dispatch that reads it.
-  Result<Buffer> upload_to_binding(DescriptorSet& set, std::uint32_t binding,
-                                   const void* data, VkDeviceSize bytes);
+  Result<Buffer> upload_to_binding(const DescriptorSet& set,
+                                   std::uint32_t binding, const void* data,
+                                   VkDeviceSize bytes);
 
   /// Shared body of the per-element allocate kernels (@ref allocate,
   /// @ref remove, @ref allocate_from_points): upload @p count elements of
-  /// @p elem_size bytes to the input binding (4) of @p set, then run @p
-  /// pipeline over them (one thread per element) via @ref dispatch_with_retry.
+  /// @p elem_size bytes to the input binding (4) of @p kernel's set, then run
+  /// @p kernel over them (one thread per element) via @ref dispatch_with_retry.
   /// @p op names the caller for diagnostics.
   Result<std::uint32_t> run_input_kernel(const char* op, const void* data,
                                          std::size_t elem_size,
                                          std::uint32_t count,
-                                         DescriptorSet& set,
-                                         const ComputePipeline& pipeline);
+                                         const ComputeKernel& kernel);
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and
@@ -312,39 +310,29 @@ class VR_VOLUME_API VoxelHashMap {
   Buffer compacted_;
   Buffer active_count_;
   // Persistent camera params for allocate_from_depth (bound at binding 6 of
-  // depth_set_, rewritten per call); grid-independent, so not in the bundle.
+  // depth_.set, rewritten per call); grid-independent, so not in the bundle.
   Buffer camera_params_;
   // Persistent frustum planes for compact_active_blocks_in_frustum (bound at
-  // binding 3 of compact_frustum_set_, rewritten per call); grid-independent.
+  // binding 3 of compact_frustum_.set, rewritten per call); grid-independent.
   Buffer frustum_planes_;
 
-  // One descriptor-set layout + pipeline per kernel; every persistent-buffer
-  // binding is written once at create(), and only the genuinely per-call input
-  // buffer(s) (coords / points / depth+camera) are (re)written before each
-  // dispatch. allocate-from-coords and allocate-from-points share one 6-binding
-  // layout (identical shape); depth needs its own 7-binding layout (it adds the
-  // camera-params buffer at binding 6).
-  DescriptorSetLayout init_layout_;
-  DescriptorSetLayout allocate_layout_;
-  DescriptorSetLayout compact_layout_;
-  DescriptorSetLayout delete_layout_;
-  DescriptorSetLayout depth_layout_;
-  DescriptorSetLayout compact_frustum_layout_;
-  ComputePipeline init_pipeline_;
-  ComputePipeline allocate_pipeline_;
-  ComputePipeline compact_pipeline_;
-  ComputePipeline delete_pipeline_;
-  ComputePipeline depth_pipeline_;
-  ComputePipeline points_pipeline_;  // bound through allocate_layout_
-  ComputePipeline compact_frustum_pipeline_;
+  // One ComputeKernel per shader -- its descriptor-set layout, pipeline, and
+  // the set allocated from the shared pool_ (see @ref ComputeKernel). The
+  // KernelSetBuilder in create() builds all seven and sizes pool_ to them.
+  // Every persistent-buffer binding is written once by
+  // write_persistent_bindings(); only the genuinely per-call input (coords /
+  // points / depth+camera) is (re)written before a dispatch.
+  // allocate-from-coords and -from-points have the same 6-binding shape but
+  // each owns its kernel; depth adds the camera-params buffer at binding 6 (7
+  // bindings).
+  ComputeKernel init_;
+  ComputeKernel allocate_;
+  ComputeKernel compact_;
+  ComputeKernel delete_;
+  ComputeKernel depth_;
+  ComputeKernel points_;
+  ComputeKernel compact_frustum_;
   DescriptorPool pool_;
-  DescriptorSet init_set_;
-  DescriptorSet allocate_set_;
-  DescriptorSet compact_set_;
-  DescriptorSet delete_set_;
-  DescriptorSet depth_set_;
-  DescriptorSet points_set_;  // allocated from allocate_layout_
-  DescriptorSet compact_frustum_set_;
 };
 
 }  // namespace volumetric_kit::recon::volume
