@@ -316,6 +316,13 @@ class VR_VOLUME_API VoxelHashMap {
   // binding 3 of compact_frustum_.set, rewritten per call); grid-independent.
   Buffer frustum_planes_;
 
+  // The shared descriptor pool the kernels' sets are allocated from. Declared
+  // BEFORE the ComputeKernel members so it is destroyed AFTER them (members
+  // tear down in reverse declaration order): a pool must outlive the sets it
+  // owns. DescriptorSet is a non-owning view today (freed with the pool, so the
+  // order is not yet load-bearing), but this keeps the safe ordering if that
+  // ever changes.
+  DescriptorPool pool_;
   // One ComputeKernel per shader -- its descriptor-set layout, pipeline, and
   // the set allocated from the shared pool_ (see @ref ComputeKernel). The
   // KernelSetBuilder in create() builds all seven and sizes pool_ to them.
@@ -332,7 +339,6 @@ class VR_VOLUME_API VoxelHashMap {
   ComputeKernel depth_;
   ComputeKernel points_;
   ComputeKernel compact_frustum_;
-  DescriptorPool pool_;
 };
 
 }  // namespace volumetric_kit::recon::volume
