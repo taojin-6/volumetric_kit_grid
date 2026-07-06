@@ -21,8 +21,9 @@ std::uint64_t voxel_count(const VoxelGridParams& grid) {
 }
 
 // A host-visible, host-mapped storage buffer of the given byte size, zeroed so
-// a freshly-created attribute reads as all-zero (device-local + staging is a
-// follow-up perf pass, matching the rest of the volume slice).
+// a freshly-created attribute reads as all-zero.
+// TODO(volume): host-visible for this slice; a device-local + staging path is a
+// follow-up perf pass, matching the hash-map buffers.
 Result<Buffer> attribute_buffer(Allocator& allocator, VkDeviceSize bytes) {
   BufferDesc desc;
   desc.size = bytes;
@@ -46,11 +47,9 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
     return Status::invalid_argument("VoxelBlockGrid::create: attrs is null");
   }
 
-  VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
-  VoxelBlockGrid vbg(std::move(map));
-
-  const std::uint64_t elements = voxel_count(grid);
-  vbg.attributes_.reserve(attr_count);
+  // Validate every spec up front, before building the map or allocating any
+  // buffer, so a malformed spec (empty name, zero size, duplicate) is rejected
+  // without the (potentially multi-GB) allocations the rest of create() does.
   for (std::size_t i = 0; i < attr_count; ++i) {
     const AttributeSpec& spec = attrs[i];
     if (spec.name.empty()) {
@@ -61,10 +60,21 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
       return Status::invalid_argument(
           "VoxelBlockGrid::create: attribute element_size must be positive");
     }
-    if (vbg.has_attribute(spec.name)) {
-      return Status::invalid_argument(
-          "VoxelBlockGrid::create: duplicate attribute name");
+    for (std::size_t j = 0; j < i; ++j) {
+      if (attrs[j].name == spec.name) {
+        return Status::invalid_argument(
+            "VoxelBlockGrid::create: duplicate attribute name");
+      }
     }
+  }
+
+  VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
+  VoxelBlockGrid vbg(std::move(map));
+
+  const std::uint64_t elements = voxel_count(grid);
+  vbg.attributes_.reserve(attr_count);
+  for (std::size_t i = 0; i < attr_count; ++i) {
+    const AttributeSpec& spec = attrs[i];
     const auto bytes = static_cast<VkDeviceSize>(elements) *
                        static_cast<VkDeviceSize>(spec.element_size);
     VR_ASSIGN(Buffer buffer, attribute_buffer(allocator, bytes));
@@ -81,8 +91,11 @@ Result<AttributeView> VoxelBlockGrid::attribute(std::string_view name) const {
   }
   for (const Attribute& attr : attributes_) {
     if (attr.name == name) {
+      // element_count is derived from the buffer this view carries, not the
+      // live grid, so it always matches attr.buffer and never inflates past it
+      // if the map is later resized (see VoxelBlockGrid::map()).
       return AttributeView{&attr.buffer, attr.element_size,
-                           voxel_count(map_.grid())};
+                           attr.buffer.size() / attr.element_size};
     }
   }
   return Status::invalid_argument(

@@ -147,12 +147,44 @@ int main() {
       vbg.map().compact_active_blocks();
   CHECK(active.ok() && active.value().size() == cube.size());
 
-  // A block's ptr keys into the attribute arrays (ptr + local voxel index).
-  const std::int32_t ptr = active.value().front().ptr;
-  CHECK(ptr >= 0 &&
-        static_cast<std::uint64_t>(ptr) + grid.voxels_per_block <= voxels);
-  tsdf_data[ptr] = -0.02f;
-  CHECK(tsdf_data[ptr] == -0.02f && weight_data[ptr] == 0.0f);
+  // A block's ptr keys into the attribute arrays at [ptr, ptr +
+  // voxels_per_block): ptr is voxel-granular (block_idx * voxels_per_block), so
+  // two distinct blocks address disjoint ranges. Probing two blocks (not one
+  // same-index round-trip) proves the scaling -- a bare-block-index ptr would
+  // fail the modulo check and alias its neighbours.
+  CHECK(active.value().size() >= 2);
+  const std::int32_t vpb = grid.voxels_per_block;
+  const std::int32_t ptr_a = active.value()[0].ptr;
+  const std::int32_t ptr_b = active.value()[1].ptr;
+  CHECK(ptr_a != ptr_b);
+  CHECK(ptr_a % vpb == 0 && ptr_b % vpb == 0);  // voxel-granular block base
+  CHECK(ptr_a >= 0 && static_cast<std::uint64_t>(ptr_a) + vpb <= voxels);
+  CHECK(ptr_b >= 0 && static_cast<std::uint64_t>(ptr_b) + vpb <= voxels);
+  // Fill block A's whole tsdf range, then set only block B's base: disjoint
+  // ranges mean B never reaches A's last voxel and A's fill never reaches B.
+  for (std::int32_t i = 0; i < vpb; ++i) {
+    tsdf_data[ptr_a + i] = -0.02f;
+  }
+  tsdf_data[ptr_b] = 0.75f;
+  CHECK(tsdf_data[ptr_a + vpb - 1] == -0.02f);  // B did not overwrite A
+  CHECK(tsdf_data[ptr_b] == 0.75f);             // A did not overwrite B
+  // SoA independence at a live block: writing block A's weight leaves its tsdf
+  // untouched (independent buffers, not interleaved AoS).
+  weight_data[ptr_a] = 30.0f;
+  CHECK(weight_data[ptr_a] == 30.0f && tsdf_data[ptr_a] == -0.02f);
+
+  // Resize regression: growing the underlying map must NOT inflate the reported
+  // attribute element_count past the frozen buffer. element_count is
+  // buffer-derived, so it stays == the original pool even as num_blocks grows,
+  // keeping a downstream bounds check sound. (Attribute buffers are sized once
+  // at create; growing them with the map awaits the index-preserving rehash.)
+  CHECK(vbg.map().resize(grid.num_buckets * 4).ok());
+  CHECK(vbg.map().grid().num_blocks > grid.num_blocks);  // the map grew
+  vr::Result<vol::AttributeView> tsdf_after = vbg.attribute("tsdf");
+  CHECK(tsdf_after.ok());
+  CHECK(tsdf_after.value().element_count ==
+        voxels);  // frozen, not the grown grid
+  CHECK(tsdf_after.value().buffer->size() == voxels * sizeof(float));
 
   // Error paths: null list with a count, empty name, zero element size, and a
   // duplicate name are each rejected before any buffer is allocated.
@@ -186,11 +218,18 @@ int main() {
   vol::VoxelBlockGrid moved = std::move(vbg);
   CHECK(moved.valid() && moved.has_attribute("tsdf"));
   CHECK(!vbg.valid());  // NOLINT(bugprone-use-after-move) -- asserting empty
-  moved = std::move(bare).value();  // move-assign over a live grid
-  CHECK(moved.valid() && !moved.has_attribute("tsdf"));
+
+  // Self-move must preserve a grid that STILL owns its attribute buffers: a
+  // defaulted memberwise move-assign would free them (std::vector self-move),
+  // so operator= guards it. Launder through a pointer to dodge -Wself-move.
   vol::VoxelBlockGrid* alias = &moved;
-  moved = std::move(*alias);  // self-move must leave it usable
-  CHECK(moved.valid());
+  moved = std::move(*alias);
+  CHECK(moved.valid() && moved.has_attribute("tsdf") &&
+        moved.has_attribute("weight"));
+
+  // Move-assign over a live grid frees the destination's attributes first.
+  moved = std::move(bare).value();
+  CHECK(moved.valid() && !moved.has_attribute("tsdf"));
 
   std::printf(
       "recon volume block grid test passed: 2 SoA attributes (%llu voxels "

@@ -88,16 +88,39 @@ class VR_VOLUME_API VoxelBlockGrid {
                                        const AttributeSpec* attrs,
                                        std::size_t attr_count);
 
-  // Rule of zero: the owned VoxelHashMap and the attribute Buffers are each
-  // move-only and self-reset on move, so the defaulted moves leave a moved-from
-  // grid empty (valid() == false) and move-only follows from the members.
+  // The owned VoxelHashMap and each attribute Buffer self-reset on move, so the
+  // destructor and move-construct are defaulted and a moved-from grid is left
+  // empty (valid() == false). Move-assignment is hand-written for the self-move
+  // guard: a defaulted memberwise version would run
+  // `attributes_ = std::move(attributes_)`, and std::vector
+  // self-move-assignment frees its storage -- destroying every attribute Buffer
+  // while map_ (whose members self-guard) survives, leaving valid() == true
+  // with the attributes gone. The guard below keeps a self-assigned grid
+  // intact.
   ~VoxelBlockGrid() = default;
   VoxelBlockGrid(VoxelBlockGrid&&) noexcept = default;
-  VoxelBlockGrid& operator=(VoxelBlockGrid&&) noexcept = default;
+  VoxelBlockGrid& operator=(VoxelBlockGrid&& other) noexcept {
+    if (this != &other) {
+      map_ = std::move(other.map_);
+      attributes_ = std::move(other.attributes_);
+    }
+    return *this;
+  }
   VoxelBlockGrid(const VoxelBlockGrid&) = delete;
   VoxelBlockGrid& operator=(const VoxelBlockGrid&) = delete;
 
-  /// @return The block index, for allocation / compaction / resize.
+  /// @brief The composed block index, for allocation / compaction.
+  ///
+  /// @warning The attribute arrays are sized once at @ref create for the grid's
+  ///          `num_blocks * voxels_per_block` voxels and are **not** grown by
+  ///          @ref VoxelHashMap::resize: a resize through this handle reassigns
+  ///          block indices past the frozen attribute storage, so a grid that
+  ///          carries attributes must be rebuilt rather than resized.
+  ///          @ref attribute reports the frozen, buffer-derived capacity (not
+  ///          the grown grid), so a downstream bounds check stays sound.
+  ///          TODO(volume): an attribute-aware resize once the block-index-
+  ///          preserving GPU rehash lands (the tsdf-tier rehash).
+  /// @return The block index.
   VoxelHashMap& map() noexcept { return map_; }
   /// @overload
   const VoxelHashMap& map() const noexcept { return map_; }
