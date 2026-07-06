@@ -9,8 +9,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
-#include "volumetric_kit/recon/core/device_macros.hpp"
+#include "volumetric_kit/recon/core/result.hpp"
 
 namespace volumetric_kit::recon::volume {
 
@@ -39,7 +40,20 @@ struct VoxelGridParams {
   /// @brief The ported production defaults: 5 mm voxels, 8-voxel blocks, a 40
   /// mm
   ///        truncation band, and a 50 x 30000 hash table.
+  /// @return A fully-populated parameter set (passes @ref validate).
   static constexpr VoxelGridParams defaults();
+
+  /// @brief Check that every field is a usable value the helpers can trust.
+  ///
+  /// The coordinate and hash helpers treat these parameters as preconditions --
+  /// e.g. @ref hash_bucket divides by `num_buckets`, so a zero bucket count is
+  /// undefined. Validate a user-built set once here at configuration time
+  /// rather than per-call on the device hot path; @ref defaults always passes.
+  /// The two precomputed fields (`voxels_per_block`, `num_blocks`) are checked
+  /// against their defining products so a stale value cannot slip through.
+  /// @return An OK @ref Status when every field is valid, otherwise
+  ///         @ref Status::invalid_argument naming the offending field.
+  Status validate() const;
 };
 
 // All-scalar, tightly packed: pin the size + offsets so the struct stays the
@@ -56,6 +70,14 @@ static_assert(offsetof(VoxelGridParams, num_buckets) == 20, "layout drift");
 static_assert(offsetof(VoxelGridParams, num_blocks) == 24, "layout drift");
 static_assert(offsetof(VoxelGridParams, max_chain) == 28, "layout drift");
 
+// Uploaded to the GPU by value and inspected with offsetof, so it must stay a
+// trivially-copyable, standard-layout POD even as fields (or methods) are
+// added.
+static_assert(std::is_trivially_copyable_v<VoxelGridParams>,
+              "VoxelGridParams must be trivially copyable");
+static_assert(std::is_standard_layout_v<VoxelGridParams>,
+              "VoxelGridParams must be standard-layout");
+
 constexpr VoxelGridParams VoxelGridParams::defaults() {
   constexpr std::int32_t kBlockSize = 8;
   constexpr std::int32_t kBucketSize = 50;
@@ -70,6 +92,36 @@ constexpr VoxelGridParams VoxelGridParams::defaults() {
       /*num_blocks=*/kBucketSize * kNumBuckets,
       /*max_chain=*/128,
   };
+}
+
+inline Status VoxelGridParams::validate() const {
+  if (voxel_size <= 0.0f) {
+    return Status::invalid_argument("VoxelGridParams: voxel_size must be > 0");
+  }
+  if (block_size <= 0) {
+    return Status::invalid_argument("VoxelGridParams: block_size must be > 0");
+  }
+  if (voxels_per_block != block_size * block_size * block_size) {
+    return Status::invalid_argument(
+        "VoxelGridParams: voxels_per_block must equal block_size^3");
+  }
+  if (trunc_dist <= 0.0f) {
+    return Status::invalid_argument("VoxelGridParams: trunc_dist must be > 0");
+  }
+  if (bucket_size <= 0) {
+    return Status::invalid_argument("VoxelGridParams: bucket_size must be > 0");
+  }
+  if (num_buckets <= 0) {
+    return Status::invalid_argument("VoxelGridParams: num_buckets must be > 0");
+  }
+  if (num_blocks != bucket_size * num_buckets) {
+    return Status::invalid_argument(
+        "VoxelGridParams: num_blocks must equal bucket_size * num_buckets");
+  }
+  if (max_chain <= 0) {
+    return Status::invalid_argument("VoxelGridParams: max_chain must be > 0");
+  }
+  return {};
 }
 
 }  // namespace volumetric_kit::recon::volume

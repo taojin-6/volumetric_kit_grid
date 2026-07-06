@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Spatial-hash tests: determinism, bucket range, two locked known values, and a
-// weak distribution sanity check. Pure host math -- no device -- so it always
-// runs.
+// Spatial-hash tests: determinism, bucket range, three locked known values (one
+// per prime), and a weak distribution sanity check. Pure host math -- no device
+// -- so it always runs.
 
 #include <cstdint>
 #include <cstdio>
@@ -38,12 +38,17 @@ int main() {
     }
   }
 
-  // --- Known values (lock the function against accidental change).
-  // The origin: 0 ^ 0 ^ 0 = 0, and 0 % N = 0.
+  // --- Known values: hard literals that pin each prime independently
+  // (N = 30000). A self-referential `== kHashPrimeX % N` moves with an edited
+  // constant and catches nothing; these fail on a typo in any prime -- or a
+  // Y<->Z swap. With two axes zero, each case isolates one prime:
+  //   hash(1,0,0) = kHashPrimeX % N = 73856093 % 30000 = 26093
+  //   hash(0,1,0) = kHashPrimeY % N = 19349669 % 30000 = 29669
+  //   hash(0,0,1) = kHashPrimeZ % N = 83492791 % 30000 =  2791
   CHECK(vol::hash_bucket(vr::Vec3i(0, 0, 0), kBuckets) == 0u);
-  // (1,0,0): (1 * kHashPrimeX) ^ 0 ^ 0 = kHashPrimeX.
-  CHECK(vol::hash_bucket(vr::Vec3i(1, 0, 0), kBuckets) ==
-        vol::kHashPrimeX % static_cast<std::uint32_t>(kBuckets));
+  CHECK(vol::hash_bucket(vr::Vec3i(1, 0, 0), kBuckets) == 26093u);
+  CHECK(vol::hash_bucket(vr::Vec3i(0, 1, 0), kBuckets) == 29669u);
+  CHECK(vol::hash_bucket(vr::Vec3i(0, 0, 1), kBuckets) == 2791u);
 
   // --- Weak distribution sanity: a diagonal line of coordinates must not all
   // collide into one bucket.
