@@ -25,6 +25,18 @@ class Device;
 
 namespace volumetric_kit::recon::volume {
 
+/// @brief On-demand occupancy + health statistics for a @ref VoxelHashMap,
+///        computed by @ref VoxelHashMap::diagnostics.
+struct HashDiagnostics {
+  std::int32_t active_count = 0;      ///< Occupied hash slots.
+  std::int32_t overflow_count = 0;    ///< Active slots in collision chains.
+  std::int32_t max_chain_length = 0;  ///< Longest collision chain, in hops.
+  std::int32_t heap_free_count = 0;   ///< Free blocks left on the heap.
+  std::int32_t total_blocks = 0;      ///< Block capacity (grid `num_blocks`).
+  float load_factor = 0.0f;           ///< `active_count / total slots`.
+  float heap_utilization = 0.0f;      ///< `1 - heap_free / total_blocks`.
+};
+
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
 ///        pipelines that operate on them, and drives block allocation and
@@ -72,9 +84,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param coords  The block coordinates to insert.
   /// @param count   How many.
   /// @return The number of allocations that failed (0 = all succeeded), or a
-  ///         non-OK @ref Status if a buffer or the dispatch fails. A non-zero
-  ///         count means bucket/heap pressure -- resize + retry lands in a
-  ///         later slice.
+  ///         non-OK @ref Status if a buffer or the dispatch fails. Allocation
+  ///         re-dispatches to converge under contention; a non-zero count means
+  ///         a genuine capacity limit (chain full / heap empty) -- grow with
+  ///         @ref resize.
   Result<std::uint32_t> allocate(const BlockIndex* coords, std::uint32_t count);
 
   /// @brief Remove voxel blocks at the given block coordinates (only `coord` is
@@ -123,6 +136,15 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return All hash-entry slots (length `num_buckets * bucket_size`), or a
   ///         non-OK @ref Status if the map is moved-from.
   Result<std::vector<HashEntry>> read_entries();
+
+  /// @brief Compute occupancy + health statistics (active / overflow / chain
+  ///        length + heap utilization).
+  ///
+  /// A host-side scan of the entries plus the heap counter -- O(total slots),
+  /// so call it for inspection/logging, not per frame. A GPU-side scan is a
+  /// perf follow-up for very large tables.
+  /// @return The statistics, or a non-OK @ref Status (e.g. moved-from map).
+  Result<HashDiagnostics> diagnostics();
 
   /// @return The grid + hash-table parameters this map was built with.
   const VoxelGridParams& grid() const noexcept { return grid_; }
