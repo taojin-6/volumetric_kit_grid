@@ -36,6 +36,14 @@ const int kFailHeap = 3;
 
 const uint kHeapEmpty = 0xFFFFFFFFu;
 
+// Sentinel for insert_block's preset pointer: draw a fresh block off the heap
+// (normal allocation). A real block pointer is block_idx * voxels_per_block, so
+// it is always >= 0 and never collides with this. A non-sentinel preset reuses
+// that exact pointer instead of consuming the heap -- the rehash path preserves
+// each block's index so its per-voxel attribute data (keyed by the pointer)
+// survives a resize.
+const int kNoPresetPtr = -1;
+
 // Pop a free block index off the heap, or kHeapEmpty when exhausted.
 uint consume_heap() {
   uint old = atomicAdd(heap_counter, 0u);  // atomic load
@@ -108,12 +116,15 @@ bool block_exists(ivec3 coord) {
   return false;
 }
 
-bool allocate_in_primary(uint first_empty, ivec3 coord) {
-  uint block_idx = consume_heap();
-  if (block_idx == kHeapEmpty) {
-    return false;
+bool allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
+  int voxel_block_ptr = preset_ptr;
+  if (preset_ptr == kNoPresetPtr) {
+    uint block_idx = consume_heap();
+    if (block_idx == kHeapEmpty) {
+      return false;
+    }
+    voxel_block_ptr = int(block_idx * uint(pc.grid.voxels_per_block));
   }
-  int voxel_block_ptr = int(block_idx * uint(pc.grid.voxels_per_block));
 
   entries[first_empty].pos = coord;
   entries[first_empty].offset = kNoOffset;
@@ -122,7 +133,8 @@ bool allocate_in_primary(uint first_empty, ivec3 coord) {
   return true;
 }
 
-bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord) {
+bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
+                          int preset_ptr) {
   uint bucket_size = uint(pc.grid.bucket_size);
   uint total_entries = uint(pc.grid.num_buckets) * bucket_size;
   uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
@@ -149,14 +161,17 @@ bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord) {
     }
 
     if (entries[target_idx].ptr == kFreeEntry) {
-      uint block_idx = consume_heap();
-      if (block_idx == kHeapEmpty) {
-        if (target_bucket != hash_bucket) {
-          unlock_bucket(target_bucket);
+      int voxel_block_ptr = preset_ptr;
+      if (preset_ptr == kNoPresetPtr) {
+        uint block_idx = consume_heap();
+        if (block_idx == kHeapEmpty) {
+          if (target_bucket != hash_bucket) {
+            unlock_bucket(target_bucket);
+          }
+          return false;
         }
-        return false;
+        voxel_block_ptr = int(block_idx * uint(pc.grid.voxels_per_block));
       }
-      int voxel_block_ptr = int(block_idx * uint(pc.grid.voxels_per_block));
       entries[target_idx].pos = coord;
       // Head-insert into the anchor's chain: adopt the old head, then repoint.
       entries[target_idx].offset = entries[idx_last].offset;
@@ -178,9 +193,11 @@ bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord) {
   return false;
 }
 
-// Insert `coord` if absent. Returns -1 on success (or already present), else the
-// fail reason (kFailLock / kFailChain / kFailHeap).
-int allocate_block(ivec3 coord) {
+// Insert `coord` if absent, giving its block `preset_ptr` (or kNoPresetPtr to
+// draw a fresh block off the heap). Returns -1 on success (or already present),
+// else the fail reason (kFailLock / kFailChain / kFailHeap). Shared by normal
+// allocation (fresh heap pointer) and rehash (each block's pointer preserved).
+int insert_block(ivec3 coord, int preset_ptr) {
   int last_fail = kFailLock;
   for (int attempt = 0; attempt < 5; ++attempt) {
     if (block_exists(coord)) {
@@ -240,12 +257,13 @@ int allocate_block(ivec3 coord) {
     bool chain_at_limit = (chain_hops >= pc.grid.max_chain - 1);
     bool success = false;
     if (first_empty != -1) {
-      success = allocate_in_primary(uint(first_empty), coord);
+      success = allocate_in_primary(uint(first_empty), coord, preset_ptr);
       if (!success) {
         last_fail = kFailHeap;
       }
     } else if (!chain_at_limit) {
-      success = allocate_in_overflow(hash_bucket, bucket_start, coord);
+      success =
+          allocate_in_overflow(hash_bucket, bucket_start, coord, preset_ptr);
       if (!success) {
         last_fail = kFailHeap;
       }
@@ -259,6 +277,14 @@ int allocate_block(ivec3 coord) {
     }
   }
   return last_fail;
+}
+
+// Allocate `coord` if absent, drawing a fresh block off the heap -- the name the
+// allocate-from-coords / -depth / -points kernels call. A thin wrapper over
+// insert_block's heap path (kNoPresetPtr); rehash calls insert_block directly
+// with each block's preserved pointer.
+int allocate_block(ivec3 coord) {
+  return insert_block(coord, kNoPresetPtr);
 }
 
 // Record a per-block allocation outcome by reason: a no-op on success

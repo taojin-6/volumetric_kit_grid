@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "volumetric_kit/recon/core/vulkan.hpp"
 
@@ -69,7 +70,7 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
   }
 
   VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
-  VoxelBlockGrid vbg(std::move(map));
+  VoxelBlockGrid vbg(std::move(map), &allocator);
 
   const std::uint64_t elements = voxel_count(grid);
   vbg.attributes_.reserve(attr_count);
@@ -109,6 +110,52 @@ bool VoxelBlockGrid::has_attribute(std::string_view name) const noexcept {
     }
   }
   return false;
+}
+
+Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
+  if (!valid()) {
+    return Status::invalid_argument("VoxelBlockGrid::resize: moved-from grid");
+  }
+  const VoxelGridParams& grid = map_.grid();
+  if (new_num_buckets <= grid.num_buckets) {
+    return Status::invalid_argument(
+        "VoxelBlockGrid::resize: new_num_buckets must exceed the current "
+        "count");
+  }
+
+  // The old voxel count (what each attribute buffer currently holds) and the
+  // new one. new num_blocks = bucket_size * new_num_buckets, the invariant
+  // VoxelHashMap::create validates; one attribute element per voxel of the
+  // pool.
+  const auto vpb = static_cast<std::uint64_t>(grid.voxels_per_block);
+  const std::uint64_t old_elements =
+      static_cast<std::uint64_t>(grid.num_blocks) * vpb;
+  const std::uint64_t new_elements =
+      static_cast<std::uint64_t>(grid.bucket_size) *
+      static_cast<std::uint64_t>(new_num_buckets) * vpb;
+
+  // Build each grown attribute buffer off to the side: allocate the new size
+  // (zero-filled by attribute_buffer), then copy the old contents forward. The
+  // map resize below preserves every block's index (BlockIndex::ptr <
+  // old_elements), so the copied data stays correctly addressed and the grown
+  // tail stays zero for future blocks. Commit only once the map resize
+  // succeeds, so an allocation failure leaves the grid untouched.
+  std::vector<Buffer> grown;
+  grown.reserve(attributes_.size());
+  for (const Attribute& attr : attributes_) {
+    const auto new_bytes = static_cast<VkDeviceSize>(new_elements) *
+                           static_cast<VkDeviceSize>(attr.element_size);
+    VR_ASSIGN(Buffer buffer, attribute_buffer(*allocator_, new_bytes));
+    std::memcpy(buffer.mapped(), attr.buffer.mapped(),
+                static_cast<std::size_t>(old_elements) * attr.element_size);
+    grown.push_back(std::move(buffer));
+  }
+
+  VR_TRY(map_.resize(new_num_buckets));
+  for (std::size_t i = 0; i < attributes_.size(); ++i) {
+    attributes_[i].buffer = std::move(grown[i]);
+  }
+  return {};
 }
 
 }  // namespace volumetric_kit::recon::volume

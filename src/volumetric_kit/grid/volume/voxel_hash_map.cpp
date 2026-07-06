@@ -22,6 +22,7 @@
 #include "hash_compact_frustum_comp.spv.hpp"
 #include "hash_delete_coords_comp.spv.hpp"
 #include "hash_init_comp.spv.hpp"
+#include "hash_rehash_comp.spv.hpp"
 
 namespace volumetric_kit::recon::volume {
 namespace {
@@ -178,6 +179,8 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
                 vr_hash_allocate_points_comp_spv_size, 6, &push));
   VR_TRY(kb.add(map.compact_frustum_, vr_hash_compact_frustum_comp_spv,
                 vr_hash_compact_frustum_comp_spv_size, 4, &push));
+  VR_TRY(kb.add(map.rehash_, vr_hash_rehash_comp_spv,
+                vr_hash_rehash_comp_spv_size, 6, &push));
   VR_ASSIGN(map.pool_, kb.build());
 
   // Point every set at the persistent buffers (the per-call coords buffer is
@@ -200,16 +203,16 @@ void VoxelHashMap::write_persistent_bindings() {
   const VkBuffer heap = heap_.handle();
   const VkBuffer counter = heap_counter_.handle();
   const VkBuffer mutex = bucket_mutex_.handle();
-  for (const DescriptorSet* set :
-       {&init_.set, &allocate_.set, &delete_.set, &depth_.set, &points_.set}) {
+  for (const DescriptorSet* set : {&init_.set, &allocate_.set, &delete_.set,
+                                   &depth_.set, &points_.set, &rehash_.set}) {
     set->write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(1, heap, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(3, mutex, 0, VK_WHOLE_SIZE);
   }
   const VkBuffer fail = fail_counts_.handle();
-  for (const DescriptorSet* set :
-       {&allocate_.set, &delete_.set, &depth_.set, &points_.set}) {
+  for (const DescriptorSet* set : {&allocate_.set, &delete_.set, &depth_.set,
+                                   &points_.set, &rehash_.set}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
   // depth_.set alone has binding 6: the persistent camera params (its contents
@@ -242,6 +245,29 @@ Status VoxelHashMap::init_table() {
   const PushConstants push{grid_, 0};
   return dispatch(*device_, init_, &push, sizeof(push), group_count(widest),
                   max_workgroup_count_x_);
+}
+
+void VoxelHashMap::rebuild_heap_excluding(
+    const std::vector<BlockIndex>& active) {
+  const auto num_blocks = static_cast<std::uint32_t>(grid_.num_blocks);
+  const auto vpb = static_cast<std::uint32_t>(grid_.voxels_per_block);
+
+  // Mark the block indices the snapshot preserves (ptr = block_idx * vpb, so
+  // block_idx = ptr / vpb; the old capacity <= the new, so every index is in
+  // range). init_table left the heap holding all indices; overwrite it to hold
+  // only the free ones so a future allocation never hands out a live block.
+  std::vector<std::uint8_t> used(num_blocks, 0);
+  for (const BlockIndex& b : active) {
+    used[static_cast<std::uint32_t>(b.ptr) / vpb] = 1;
+  }
+  auto* heap = static_cast<std::uint32_t*>(heap_.mapped());
+  std::uint32_t free_count = 0;
+  for (std::uint32_t i = 0; i < num_blocks; ++i) {
+    if (used[i] == 0) {
+      heap[free_count++] = i;
+    }
+  }
+  std::memcpy(heap_counter_.mapped(), &free_count, sizeof(std::uint32_t));
 }
 
 // Dispatch `kernel` (push arg = `arg`) over `groups` groups, re-dispatching
@@ -462,26 +488,39 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   active_count_ = std::move(bufs.active_count);
   grid_ = new_grid;
 
-  // Point the sets at the new buffers, init the larger table, and re-insert.
+  // Point the sets at the new buffers and init the larger table (entries free,
+  // heap holding every index, mutexes unlocked).
   write_persistent_bindings();
   VR_TRY(init_table());
+  if (active.empty()) {
+    return {};  // nothing to rehash; the fresh table + full heap is complete
+  }
 
-  // Re-drive the whole snapshot up to kReinsertPasses times: allocate() skips
-  // already-present coords, and the grown table has strictly less hash pressure
-  // than the one the set already fit, so this converges past any transient
-  // bucket-lock contention. A residual failure is a genuine overflow.
+  // Rehash: re-insert each block with its ORIGINAL pointer (the rehash_
+  // kernel's preset path, not a fresh heap draw), so per-voxel data keyed by
+  // that pointer survives the grow. insert_block is idempotent, and the grown
+  // table has strictly less hash pressure than the one the set already fit, so
+  // re-driving the whole snapshot converges past transient bucket-lock
+  // contention; a residual failure is a genuine overflow.
   std::uint32_t failed = 0;
-  for (int pass = 0; pass < kReinsertPasses && !active.empty(); ++pass) {
-    VR_ASSIGN(failed, allocate(active.data(),
-                               static_cast<std::uint32_t>(active.size())));
+  for (int pass = 0; pass < kReinsertPasses; ++pass) {
+    VR_ASSIGN(failed,
+              run_input_kernel(
+                  "VoxelHashMap::resize", active.data(), sizeof(BlockIndex),
+                  static_cast<std::uint32_t>(active.size()), rehash_));
     if (failed == 0) {
       break;
     }
   }
   if (failed != 0) {
     return Status::out_of_memory(
-        "VoxelHashMap::resize: re-insert failed after growing");
+        "VoxelHashMap::resize: rehash failed after growing");
   }
+
+  // The rehash drew nothing from the heap, so init_table's "all free" heap
+  // still lists the preserved indices; rebuild it to hold only the genuinely
+  // free ones so a future allocation never hands out a live block.
+  rebuild_heap_excluding(active);
   return {};
 }
 

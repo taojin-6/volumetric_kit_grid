@@ -103,6 +103,7 @@ class VR_VOLUME_API VoxelBlockGrid {
     if (this != &other) {
       map_ = std::move(other.map_);
       attributes_ = std::move(other.attributes_);
+      allocator_ = other.allocator_;
     }
     return *this;
   }
@@ -111,15 +112,15 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   /// @brief The composed block index, for allocation / compaction.
   ///
-  /// @warning The attribute arrays are sized once at @ref create for the grid's
-  ///          `num_blocks * voxels_per_block` voxels and are **not** grown by
-  ///          @ref VoxelHashMap::resize: a resize through this handle reassigns
-  ///          block indices past the frozen attribute storage, so a grid that
-  ///          carries attributes must be rebuilt rather than resized.
-  ///          @ref attribute reports the frozen, buffer-derived capacity (not
-  ///          the grown grid), so a downstream bounds check stays sound.
-  ///          TODO(volume): an attribute-aware resize once the block-index-
-  ///          preserving GPU rehash lands (the tsdf-tier rehash).
+  /// @warning To grow a grid that carries attributes, call @ref resize, which
+  ///          grows the attribute arrays *and* rehashes the map preserving
+  ///          block indices. Calling @ref VoxelHashMap::resize through this
+  ///          handle grows the table (preserving indices) but leaves the
+  ///          attribute arrays at their old `num_blocks * voxels_per_block`
+  ///          size, so a block allocated into the grown capacity would address
+  ///          past them.
+  ///          @ref attribute reports the buffer-derived capacity (not the live
+  ///          grid), so a downstream bounds check stays sound.
   /// @return The block index.
   VoxelHashMap& map() noexcept { return map_; }
   /// @overload
@@ -138,14 +139,35 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return `true` if an attribute of @p name was declared.
   bool has_attribute(std::string_view name) const noexcept;
 
+  /// @brief Grow the grid to @p new_num_buckets buckets, preserving every
+  ///        block's per-voxel attribute data.
+  ///
+  /// Grows each attribute array to the new `num_blocks * voxels_per_block` (new
+  /// capacity zero-filled, existing contents copied), then rehashes the map
+  /// with
+  /// @ref VoxelHashMap::resize, which **preserves each block's index** -- so
+  /// the data a block held (addressed by @ref BlockIndex::ptr) stays valid at
+  /// the same offset. All-or-nothing: the enlarged buffers are built and filled
+  /// before the map resize and committed only once it succeeds, so an
+  /// allocation failure leaves the grid untouched.
+  /// @param new_num_buckets  The new bucket count (> the current @ref grid).
+  /// @return OK on success, or a non-OK @ref Status: @ref
+  ///         Status::Code::InvalidArgument for a moved-from grid or a
+  ///         non-growing count; an allocation failure; or whatever @ref
+  ///         VoxelHashMap::resize returns (e.g. @ref Status::Code::OutOfMemory
+  ///         on a rehash overflow).
+  Status resize(std::int32_t new_num_buckets);
+
   /// @return `true` if this owns a live grid (`false` when moved-from).
   bool valid() const noexcept { return map_.valid(); }
 
  private:
-  /// Construct from an already-built block index; attributes are added by
-  /// @ref create. (VoxelHashMap has no public default ctor, so the grid is
+  /// Construct from an already-built block index + the allocator its attribute
+  /// buffers come from (borrowed; must outlive the grid). Attributes are added
+  /// by @ref create. (VoxelHashMap has no public default ctor, so the grid is
   /// built map-first rather than default-then-assign.)
-  explicit VoxelBlockGrid(VoxelHashMap map) : map_(std::move(map)) {}
+  VoxelBlockGrid(VoxelHashMap map, Allocator* allocator)
+      : map_(std::move(map)), allocator_(allocator) {}
 
   /// One named attribute array: its declared name + element size + the buffer.
   struct Attribute {
@@ -156,6 +178,10 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
+  // Borrowed (must outlive this): backs every attribute buffer, including those
+  // grown by resize(). A moved-from grid keeps the pointer but reports
+  // valid() == false through map_, so it is never dereferenced.
+  Allocator* allocator_ = nullptr;
 };
 
 }  // namespace volumetric_kit::recon::volume
