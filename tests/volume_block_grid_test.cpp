@@ -3,9 +3,10 @@
 
 // GPU test for VoxelBlockGrid: declare independent per-voxel attributes (SoA),
 // verify they are distinct, correctly-sized device buffers keyed by the block
-// pool, that the composed VoxelHashMap still allocates, and the error / move
-// paths. Runs on the real driver (MoltenVK / NVIDIA); exits 0 (skip) where no
-// device is present.
+// pool, that the composed VoxelHashMap still allocates, that resize grows the
+// attribute arrays while preserving per-voxel data at the same block pointer,
+// and the error / move paths. Runs on the real driver (MoltenVK / NVIDIA);
+// exits 0 (skip) where no device is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -173,18 +174,62 @@ int main() {
   weight_data[ptr_a] = 30.0f;
   CHECK(weight_data[ptr_a] == 30.0f && tsdf_data[ptr_a] == -0.02f);
 
-  // Resize regression: growing the underlying map must NOT inflate the reported
-  // attribute element_count past the frozen buffer. element_count is
-  // buffer-derived, so it stays == the original pool even as num_blocks grows,
-  // keeping a downstream bounds check sound. (Attribute buffers are sized once
-  // at create; growing them with the map awaits the index-preserving rehash.)
-  CHECK(vbg.map().resize(grid.num_buckets * 4).ok());
-  CHECK(vbg.map().grid().num_blocks > grid.num_blocks);  // the map grew
-  vr::Result<vol::AttributeView> tsdf_after = vbg.attribute("tsdf");
-  CHECK(tsdf_after.ok());
-  CHECK(tsdf_after.value().element_count ==
-        voxels);  // frozen, not the grown grid
-  CHECK(tsdf_after.value().buffer->size() == voxels * sizeof(float));
+  // Resize with attribute preservation: VoxelBlockGrid::resize grows every
+  // attribute array AND rehashes the map preserving block indices, so the
+  // per-voxel data written above survives at the SAME ptr. Snapshot the live
+  // block count first.
+  vr::Result<std::vector<vol::BlockIndex>> before =
+      vbg.map().compact_active_blocks();
+  CHECK(before.ok());
+  const std::size_t before_count = before.value().size();
+
+  const std::int32_t new_buckets = grid.num_buckets * 4;
+  CHECK(vbg.resize(new_buckets).ok());
+  CHECK(vbg.map().grid().num_buckets == new_buckets);  // the map grew
+  const std::uint64_t new_voxels =
+      static_cast<std::uint64_t>(grid.bucket_size) *
+      static_cast<std::uint64_t>(new_buckets) * grid.voxels_per_block;
+
+  // The attribute buffers grew to the new pool (a resize swaps them), so
+  // re-fetch the views: element_count now tracks the grown grid, buffer-derived
+  // as ever.
+  vr::Result<vol::AttributeView> tsdf_grown = vbg.attribute("tsdf");
+  vr::Result<vol::AttributeView> weight_grown = vbg.attribute("weight");
+  CHECK(tsdf_grown.ok() && weight_grown.ok());
+  CHECK(tsdf_grown.value().element_count == new_voxels);  // grew, not frozen
+  CHECK(weight_grown.value().element_count == new_voxels);
+  CHECK(tsdf_grown.value().buffer->size() == new_voxels * sizeof(float));
+
+  // The data written before the grow survives at the same pointers (indices
+  // preserved): block A's filled tsdf range, block B's base, block A's weight.
+  auto* tsdf_grown_data =
+      static_cast<float*>(tsdf_grown.value().buffer->mapped());
+  auto* weight_grown_data =
+      static_cast<float*>(weight_grown.value().buffer->mapped());
+  CHECK(tsdf_grown_data[ptr_a] == -0.02f);
+  CHECK(tsdf_grown_data[ptr_a + vpb - 1] == -0.02f);  // whole range survived
+  CHECK(tsdf_grown_data[ptr_b] == 0.75f);
+  CHECK(weight_grown_data[ptr_a] == 30.0f);
+
+  // The active set is intact, and the grown table still allocates a fresh block
+  // whose attribute range lands in the new pool and reads back zero.
+  const vr::Vec3i fresh_coord(40, 40, 40);
+  vol::BlockIndex fresh{};
+  fresh.coord = fresh_coord;
+  vr::Result<std::uint32_t> fresh_alloc = vbg.map().allocate(&fresh, 1);
+  CHECK(fresh_alloc.ok() && fresh_alloc.value() == 0);
+  vr::Result<std::vector<vol::BlockIndex>> with_fresh =
+      vbg.map().compact_active_blocks();
+  CHECK(with_fresh.ok() && with_fresh.value().size() == before_count + 1);
+  std::int32_t fresh_ptr = -1;
+  for (const vol::BlockIndex& blk : with_fresh.value()) {
+    if (blk.coord == fresh_coord) {
+      fresh_ptr = blk.ptr;
+    }
+  }
+  CHECK(fresh_ptr >= 0);
+  CHECK(static_cast<std::uint64_t>(fresh_ptr) + vpb <= new_voxels);  // in pool
+  CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);  // fresh block: zeroed attribute
 
   // Error paths: null list with a count, empty name, zero element size, and a
   // duplicate name are each rejected before any buffer is allocated.
@@ -233,7 +278,9 @@ int main() {
 
   std::printf(
       "recon volume block grid test passed: 2 SoA attributes (%llu voxels "
-      "each), independent storage, composed map allocates\n",
-      static_cast<unsigned long long>(voxels));
+      "each), independent storage, composed map allocates, resize grew them to "
+      "%llu voxels preserving per-voxel data\n",
+      static_cast<unsigned long long>(voxels),
+      static_cast<unsigned long long>(new_voxels));
   return 0;
 }
