@@ -34,9 +34,8 @@ namespace volumetric_kit::recon::volume {
 /// @ref ComputePipeline, @ref Device::submit_single_time). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
-/// byte-for-byte. This first slice covers init + allocate-from-coords +
-/// compact; delete, resize/rehash, diagnostics, and depth/point allocation
-/// follow.
+/// byte-for-byte. This slice covers init + allocate-from-coords + remove +
+/// compact; resize/rehash, diagnostics, and depth/point allocation follow.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -123,6 +122,16 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
+
+  /// Shared body of @ref allocate and @ref remove: upload @p coords, run
+  /// @p pipeline (bound through @p set) over them, and read back the
+  /// `fail_counts_[0]` tally the coord kernels share (allocate and delete never
+  /// run in the same dispatch). @p op names the caller for diagnostics.
+  Result<std::uint32_t> run_coord_kernel(const char* op,
+                                         const BlockIndex* coords,
+                                         std::uint32_t count,
+                                         DescriptorSet& set,
+                                         const ComputePipeline& pipeline);
 
   // Borrowed (must outlive this). Pointers, not references, so a moved-from map
   // is left in a defined (empty) state.

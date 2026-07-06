@@ -51,6 +51,20 @@ vr::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
   return out;
 }
 
+// Collect the active block pointers into a set (to prove heap reuse: reused
+// blocks draw the same pointers, a leaked free-list hands out fresh ones).
+vr::Result<std::set<std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
+  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+  if (!active) {
+    return active.status();
+  }
+  std::set<std::int32_t> out;
+  for (const vol::BlockIndex& block : active.value()) {
+    out.insert(block.ptr);
+  }
+  return out;
+}
+
 }  // namespace
 
 int main() {
@@ -86,9 +100,17 @@ int main() {
   grid.block_size = 8;
   grid.voxels_per_block = 512;
   grid.trunc_dist = 0.04f;
-  grid.bucket_size = 8;
+  // Force the delete paths on-device: bucket_size = 2 makes the corner buckets
+  // (the 8 corners hash into just two buckets, 4 apiece) overflow into
+  // collision chains, so removing the corners drives the chain splice +
+  // successor pull-up rather than only the trivial primary-slot clear.
+  // num_blocks must equal bucket_size * num_buckets
+  // (VoxelGridParams::validate), so heap reuse can't be forced by starving
+  // capacity -- it is proven instead by the block-pointer set (a reused block
+  // draws its old pointer back; a leaked one hands out a fresh).
+  grid.bucket_size = 2;
   grid.num_buckets = 1024;
-  grid.num_blocks = 8192;
+  grid.num_blocks = 2048;  // == bucket_size * num_buckets (grid invariant)
   grid.max_chain = 128;
 
   vr::Result<vol::VoxelHashMap> map_result =
@@ -127,6 +149,11 @@ int main() {
       map.allocate(all.data(), static_cast<std::uint32_t>(all.size()));
   CHECK(alloc_fail.ok() && alloc_fail.value() == 0);
 
+  // Snapshot the block pointers in use, to prove heap reuse after the
+  // remove/re-allocate round-trip below.
+  vr::Result<std::set<std::int32_t>> ptrs_before = active_ptrs(map);
+  CHECK(ptrs_before.ok() && ptrs_before.value().size() == want_all.size());
+
   // Remove the 8 corners.
   vr::Result<std::uint32_t> remove_fail =
       map.remove(corners.data(), static_cast<std::uint32_t>(corners.size()));
@@ -152,14 +179,28 @@ int main() {
   vr::Result<std::set<Coord>> unchanged = active_set(map);
   CHECK(unchanged.ok() && unchanged.value() == after_remove.value());
 
-  // Heap reuse: re-allocating the removed corners succeeds (their blocks were
-  // returned to the heap) and restores the full cube.
+  // Removing already-removed coords is also a no-op: their freed slots read as
+  // absent under the lock, so no block is double-freed back onto the heap (a
+  // double-free would later surface as a duplicate in the pointer set).
+  vr::Result<std::uint32_t> double_remove =
+      map.remove(corners.data(), static_cast<std::uint32_t>(corners.size()));
+  CHECK(double_remove.ok() && double_remove.value() == 0);
+  vr::Result<std::set<Coord>> still_gone = active_set(map);
+  CHECK(still_gone.ok() && still_gone.value() == after_remove.value());
+
+  // Heap reuse: re-allocating the removed corners restores the full cube AND
+  // draws back exactly the block pointers that were freed. If the freed blocks
+  // had leaked, the re-allocate would hand out fresh pointers and the set would
+  // differ (or fail outright once the heap ran dry).
   vr::Result<std::uint32_t> realloc_fail =
       map.allocate(corners.data(), static_cast<std::uint32_t>(corners.size()));
   CHECK(realloc_fail.ok() && realloc_fail.value() == 0);
   vr::Result<std::set<Coord>> restored = active_set(map);
   CHECK(restored.ok());
   CHECK(restored.value() == want_all);
+  vr::Result<std::set<std::int32_t>> ptrs_after = active_ptrs(map);
+  CHECK(ptrs_after.ok());
+  CHECK(ptrs_after.value() == ptrs_before.value());
 
   std::printf(
       "recon volume delete test passed: removed %zu of %zu blocks, survivors "

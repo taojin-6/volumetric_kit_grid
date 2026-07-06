@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "volumetric_kit/recon/core/device.hpp"
@@ -174,8 +175,8 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   const auto delete_b = storage_bindings(6);
   VR_ASSIGN(
       map.delete_layout_,
-      DescriptorSetLayout::create(
-          dev, delete_b.data(), static_cast<std::uint32_t>(delete_b.size())));
+      DescriptorSetLayout::create(dev, delete_b.data(),
+                                  static_cast<std::uint32_t>(delete_b.size())));
 
   VR_ASSIGN(map.init_pipeline_, make_pipeline(dev, vr_hash_init_comp_spv,
                                               vr_hash_init_comp_spv_size,
@@ -248,16 +249,17 @@ Status VoxelHashMap::init_table() {
                   group_count(widest));
 }
 
-Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
-                                             std::uint32_t count) {
+Result<std::uint32_t> VoxelHashMap::run_coord_kernel(
+    const char* op, const BlockIndex* coords, std::uint32_t count,
+    DescriptorSet& set, const ComputePipeline& pipeline) {
   if (!valid()) {
-    return Status::invalid_argument("VoxelHashMap::allocate: moved-from map");
+    return Status::invalid_argument(std::string(op) + ": moved-from map");
   }
   if (count == 0) {
     return std::uint32_t{0};
   }
   if (coords == nullptr) {
-    return Status::invalid_argument("VoxelHashMap::allocate: coords is null");
+    return Status::invalid_argument(std::string(op) + ": coords is null");
   }
 
   // Coords are genuinely per-call (variable count), so this buffer is
@@ -269,53 +271,32 @@ Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
   std::memcpy(coords_buf.mapped(), coords,
               static_cast<std::size_t>(count) * sizeof(BlockIndex));
 
-  // fail_counts_[4]: [0]=total, [1]=lock, [2]=chain, [3]=heap. Zeroed each
-  // call.
+  // fail_counts_[0] is the total-failures tally both kernels report (allocate
+  // also splits reasons into [1]=lock/[2]=chain/[3]=heap); shared because
+  // allocate and delete never run in the same dispatch. Re-zeroed each call.
   std::memset(fail_counts_.mapped(), 0, 4 * sizeof(std::uint32_t));
-  allocate_set_.write_storage_buffer(4, coords_buf.handle(), 0, VK_WHOLE_SIZE);
+  set.write_storage_buffer(4, coords_buf.handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid_, count};
-  VR_TRY(dispatch(*device_, allocate_pipeline_, allocate_set_.handle(), push,
-                  group_count(count)));
+  VR_TRY(dispatch(*device_, pipeline, set.handle(), push, group_count(count)));
 
   std::uint32_t failures = 0;
   std::memcpy(&failures, fail_counts_.mapped(), sizeof(std::uint32_t));
+  return failures;
+}
+
+Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
+                                             std::uint32_t count) {
   // TODO(volume): on non-zero failures, grow the table (resize/rehash) and
   // retry the failed coords -- lands with the resize slice.
-  return failures;
+  return run_coord_kernel("VoxelHashMap::allocate", coords, count,
+                          allocate_set_, allocate_pipeline_);
 }
 
 Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
                                            std::uint32_t count) {
-  if (!valid()) {
-    return Status::invalid_argument("VoxelHashMap::remove: moved-from map");
-  }
-  if (count == 0) {
-    return std::uint32_t{0};
-  }
-  if (coords == nullptr) {
-    return Status::invalid_argument("VoxelHashMap::remove: coords is null");
-  }
-
-  VR_ASSIGN(
-      Buffer coords_buf,
-      storage_buffer(*allocator_, VkDeviceSize(count) * sizeof(BlockIndex),
-                     HostAccess::SequentialWrite));
-  std::memcpy(coords_buf.mapped(), coords,
-              static_cast<std::size_t>(count) * sizeof(BlockIndex));
-
-  // Shares the persistent fail_counts_ buffer with allocate (never concurrent);
-  // the delete kernel writes only [0]. Re-zeroed each call.
-  std::memset(fail_counts_.mapped(), 0, 4 * sizeof(std::uint32_t));
-  delete_set_.write_storage_buffer(4, coords_buf.handle(), 0, VK_WHOLE_SIZE);
-
-  const PushConstants push{grid_, count};
-  VR_TRY(dispatch(*device_, delete_pipeline_, delete_set_.handle(), push,
-                  group_count(count)));
-
-  std::uint32_t failures = 0;
-  std::memcpy(&failures, fail_counts_.mapped(), sizeof(std::uint32_t));
-  return failures;
+  return run_coord_kernel("VoxelHashMap::remove", coords, count, delete_set_,
+                          delete_pipeline_);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {

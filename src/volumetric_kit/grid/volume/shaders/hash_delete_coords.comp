@@ -8,10 +8,20 @@
 //
 // Concurrency mirrors the allocate kernel: per-bucket spin locks + a
 // memoryBarrierBuffer() release/acquire, and alloc and delete run in SEPARATE
-// dispatches (never concurrently), which the heap requires. Voxel-data clearing
-// (the Metal path zeroed SDF/color on free) is deferred until the tsdf tier
-// lands the SDF block buffer -- there is no voxel data to clear yet.
-// TODO(tsdf): clear the freed block's SDF/color once the SDF buffer exists.
+// dispatches (never concurrently), which the heap requires. One deliberate
+// divergence from the Metal source and the allocate kernel: there is NO
+// lock-free existence pre-check. Allocate may trust a lock-free "already
+// present" read because presence is monotonic within an alloc-only dispatch;
+// delete acts on presence, and a concurrent delete of a neighbouring chain node
+// can transiently make a still-present coord read absent, so trusting a
+// lock-free "absent" read would silently drop the delete. Every search here is
+// therefore authoritative under the bucket lock.
+//
+// Voxel-data clearing (the Metal path zeroed SDF/color on free) is deferred
+// until the tsdf tier lands the SDF block buffer -- there is no voxel data to
+// clear yet.
+// TODO: clear the freed block's SDF/color once the tsdf tier lands the SDF
+// buffer.
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
@@ -47,12 +57,16 @@ void unlock_bucket(uint bucket) {
   atomicExchange(bucket_mutex[bucket], kFreeEntry);
 }
 
-// Return a freed block index to the heap.
+// Return a freed block index to the heap. A block that cannot be returned is a
+// capacity leak, so both exits without an append bump fail_count[0] rather than
+// dropping the block silently: the entry is already gone from the table, but the
+// non-zero failure tells the host the dispatch was not clean.
 void append_heap(uint block_idx) {
   uint old = atomicAdd(heap_counter, 0u);  // atomic load
   for (int a = 0; a < kMaxHeapRetries; ++a) {
     if (old >= uint(pc.grid.num_blocks)) {
-      return;  // heap full (should not happen: we only free what we allocated)
+      atomicAdd(fail_count[0], 1u);  // heap full: we only free what we allocated
+      return;
     }
     uint prev = atomicCompSwap(heap_counter, old, old + 1u);
     if (prev == old) {
@@ -61,34 +75,7 @@ void append_heap(uint block_idx) {
     }
     old = prev;
   }
-}
-
-// Lock-free existence check: the block's ptr, or kFreeEntry if absent.
-int find_block(ivec3 coord) {
-  uint bucket_size = uint(pc.grid.bucket_size);
-  uint total = uint(pc.grid.num_buckets) * bucket_size;
-  uint bucket = computeHashPos(coord, pc.grid.num_buckets);
-  uint bucket_start = bucket * bucket_size;
-
-  for (uint i = 0u; i < bucket_size; ++i) {
-    uint slot = bucket_start + i;
-    if (entries[slot].ptr != kFreeEntry && entries[slot].pos == coord) {
-      return entries[slot].ptr;
-    }
-  }
-  uint idx_last = (bucket + 1u) * bucket_size - 1u;
-  uint idx = idx_last;
-  for (int it = 0; it < pc.grid.max_chain; ++it) {
-    if (entries[idx].ptr != kFreeEntry && entries[idx].pos == coord) {
-      return entries[idx].ptr;
-    }
-    int off = entries[idx].offset;
-    if (off == kNoOffset) {
-      break;
-    }
-    idx = (idx_last + uint(off)) % total;
-  }
-  return kFreeEntry;
+  atomicAdd(fail_count[0], 1u);  // counter CAS starved under contention
 }
 
 uint block_of(int ptr) { return uint(ptr) / uint(pc.grid.voxels_per_block); }
@@ -167,11 +154,8 @@ void main() {
   uint bucket_start = hash_bucket * bucket_size;
 
   for (int attempt = 0; attempt < 5; ++attempt) {
-    if (find_block(coord) == kFreeEntry) {
-      return;  // not present
-    }
     if (!try_lock_bucket(hash_bucket, kMaxSpinRetries)) {
-      continue;
+      continue;  // bucket busy -- retry
     }
 
     // Search the primary bucket under lock.
@@ -186,6 +170,10 @@ void main() {
       }
     }
 
+    // `found` is true once the coord is located in the primary bucket OR the
+    // chain -- both delete paths can fail on a lost successor-bucket lock race,
+    // and either must retry, not be mistaken for "absent".
+    bool found = found_in_primary;
     bool success = false;
     if (found_in_primary) {
       success = delete_primary(target_slot, hash_bucket);
@@ -194,7 +182,6 @@ void main() {
       uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
       uint prev = idx_last;
       uint curr = 0u;
-      bool found = false;
       if (entries[prev].offset != kNoOffset) {
         curr = (idx_last + uint(entries[prev].offset)) % total;
         for (int it = 0; it < pc.grid.max_chain; ++it) {
@@ -215,9 +202,11 @@ void main() {
     }
 
     unlock_bucket(hash_bucket);
-    // Retry only a primary delete that lost the successor-lock race; a chain
-    // miss/handled case is done (mirrors hash_ops.metal).
-    if (success || !found_in_primary) {
+    // Done when the delete landed, or the coord is genuinely absent under the
+    // lock. A found-but-not-deleted coord (lost the successor-bucket lock race,
+    // primary or chain) retries; if every attempt loses it is counted below, so
+    // the host learns rather than the block silently staying resident.
+    if (success || !found) {
       return;
     }
   }
