@@ -17,7 +17,7 @@ set(_vr_volume_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(recon_volume)
 add_library(volumetric_kit::recon_volume ALIAS recon_volume)
 
-target_sources(recon_volume PRIVATE voxel_hash_map.cpp)
+target_sources(recon_volume PRIVATE voxel_hash_map.cpp voxel_block_grid.cpp)
 
 # Per-tier export header (VR_VOLUME_API / VR_VOLUME_STATIC_DEFINE), isolated
 # from recon_core's so the macros never collide on one include path.
