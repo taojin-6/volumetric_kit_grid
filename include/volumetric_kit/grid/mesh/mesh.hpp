@@ -33,7 +33,8 @@ namespace volumetric_kit::recon::mesh {
 /// job in a later slice, not a field on this struct.
 struct Vertex {
   Vec3f position;  ///< World-space position (metres).
-  Vec3f normal;    ///< Unit surface normal (zero for degenerate geometry).
+  Vec3f normal;    ///< Unit surface normal (an arbitrary unit axis where the
+                   ///< SDF gradient vanishes; never the zero vector).
 };
 static_assert(sizeof(Vertex) == 24, "Vertex must be 24 bytes");
 static_assert(offsetof(Vertex, position) == 0, "Vertex layout drift");

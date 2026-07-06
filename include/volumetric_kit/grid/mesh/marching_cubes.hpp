@@ -57,8 +57,9 @@ struct DenseGrid {
 /// builds the cube index from the eight corner signs, interpolates a vertex on
 /// each crossed edge, and appends independent triangles through an atomic bump
 /// counter -- the simple, correct form; shared-edge dedup and an incremental
-/// block-mesh pool are later slices. Per-vertex normals come from the SDF
-/// gradient (central differences), so they point outward (increasing distance).
+/// block-mesh pool are later slices. Normals come from the SDF gradient -- one
+/// central difference over the cell's eight corners, shared by that cell's
+/// vertices -- so they point outward (increasing distance).
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -74,7 +75,7 @@ class VR_MESH_API MarchingCubes {
 
   // Rule of zero: every owned member (Buffer / pipeline / layout / pool /
   // descriptor set) self-frees and self-resets on move, so the defaulted moves
-  // are correct and move-only follows. device_ / allocator_ are borrowed
+  // are correct. device_ / allocator_ are borrowed
   // pointers, so a defaulted move leaving the moved-from extractor pointing at
   // them is harmless -- it reports valid() == false and is only destroyed.
   ~MarchingCubes() = default;
@@ -107,6 +108,11 @@ class VR_MESH_API MarchingCubes {
   // extractor is left in a defined (empty) state.
   Device* device_ = nullptr;
   Allocator* allocator_ = nullptr;
+
+  // Cached maxComputeWorkGroupCount[0]: the ceiling on a 1-D dispatch's
+  // groupCountX (Vulkan guarantees only >= 65535), so extract() can reject an
+  // over-large grid cleanly instead of risking a device-lost.
+  std::uint32_t max_workgroup_count_x_ = 0;
 
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0
   // for every extract (the counterpart to the volume tier's persistent

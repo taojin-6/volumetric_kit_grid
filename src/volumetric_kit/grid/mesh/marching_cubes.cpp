@@ -69,7 +69,10 @@ static_assert(offsetof(PushConstants, weight_threshold) == 36,
               "PushConstants layout drift");
 
 std::uint32_t group_count(std::uint32_t items) {
-  return (items + kLocalSize - 1) / kLocalSize;
+  // Ceil-divide without the `items + kLocalSize - 1` term, which overflows
+  // uint32 near the top of the range and wraps to ~0 groups (a silent no-op
+  // dispatch); mirrors the volume tier's group_count.
+  return items / kLocalSize + (items % kLocalSize != 0u ? 1u : 0u);
 }
 
 // `count` storage-buffer bindings at 0..count-1, all compute-stage.
@@ -124,7 +127,16 @@ Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
 // tier's dispatch helper).
 Status dispatch(Device& device, const ComputePipeline& pipeline,
                 VkDescriptorSet set, const PushConstants& push,
-                std::uint32_t groups) {
+                std::uint32_t groups, std::uint32_t max_groups) {
+  // A 1-D dispatch flattens every cell onto groupCountX, but Vulkan guarantees
+  // maxComputeWorkGroupCount[0] only >= 65535 -- a large grid would be invalid
+  // usage on a min-spec (mobile) driver. Reject it as a clean error rather than
+  // risk a device-lost (mirrors the volume tier's dispatch guard).
+  if (groups > max_groups) {
+    return Status::invalid_argument(
+        "MarchingCubes::extract: workgroup count exceeds the device's "
+        "maxComputeWorkGroupCount[0] -- grid too large for a 1-D dispatch");
+  }
   return device.submit_single_time([&](VkCommandBuffer cmd) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -151,6 +163,12 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   MarchingCubes mc;
   mc.device_ = &device;
   mc.allocator_ = &allocator;
+
+  // Cache the 1-D dispatch's groupCountX ceiling so extract() can reject an
+  // over-large grid cleanly (see dispatch()).
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(device.physical_device(), &props);
+  mc.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
 
   // The kernel binds four storage buffers: tables (persistent) + the
   // per-extract samples / vertices / counter.
@@ -196,7 +214,9 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     return Status::invalid_argument(
         "MarchingCubes::extract: grid must be at least 2x2x2 samples");
   }
-  if (grid.voxel_size <= 0.0f) {
+  // `!(x > 0)` rather than `x <= 0` so a NaN voxel_size is rejected too (every
+  // comparison with NaN is false, so `<= 0` would let it through).
+  if (!(grid.voxel_size > 0.0f)) {
     return Status::invalid_argument(
         "MarchingCubes::extract: voxel_size must be > 0");
   }
@@ -224,10 +244,6 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   }
   const auto capacity = static_cast<std::uint32_t>(capacity64);
 
-  if (capacity == 0) {
-    return Mesh{};  // no cells (degenerate grid) -> empty mesh
-  }
-
   // Per-extract buffers (sized to this grid): the samples in, the vertex arena
   // out (3 vertices per triangle at worst-case capacity), and the atomic
   // triangle counter.
@@ -252,7 +268,8 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   const PushConstants push{grid.dims, grid.voxel_size, grid.origin,
                            iso,       capacity,        kWeightThreshold};
   VR_TRY(dispatch(*device_, pipeline_, set_.handle(), push,
-                  group_count(static_cast<std::uint32_t>(cells))));
+                  group_count(static_cast<std::uint32_t>(cells)),
+                  max_workgroup_count_x_));
 
   std::uint32_t emitted = 0;
   std::memcpy(&emitted, counter_buf.mapped(), sizeof(std::uint32_t));
