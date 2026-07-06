@@ -12,7 +12,7 @@
 #include <cstdint>
 
 #include "volumetric_kit/recon/core/buffer.hpp"
-#include "volumetric_kit/recon/core/compute_pipeline.hpp"
+#include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -52,7 +52,7 @@ struct DenseGrid {
 ///        from a @ref DenseGrid into a host @ref Mesh.
 ///
 /// Built on the `core` compute foundation (@ref Allocator, @ref Buffer,
-/// @ref ComputePipeline, @ref Device::submit_single_time), mirroring the volume
+/// @ref ComputeKernel, @ref Device::submit_single_time), mirroring the volume
 /// tier's @ref volume::VoxelHashMap. The kernel runs one invocation per cell,
 /// builds the cube index from the eight corner signs, interpolates a vertex on
 /// each crossed edge, and appends independent triangles through an atomic bump
@@ -73,11 +73,11 @@ class VR_MESH_API MarchingCubes {
   ///         descriptor allocation fails.
   static Result<MarchingCubes> create(Device& device, Allocator& allocator);
 
-  // Rule of zero: every owned member (Buffer / pipeline / layout / pool /
-  // descriptor set) self-frees and self-resets on move, so the defaulted moves
-  // are correct. device_ / allocator_ are borrowed
-  // pointers, so a defaulted move leaving the moved-from extractor pointing at
-  // them is harmless -- it reports valid() == false and is only destroyed.
+  // Rule of zero: every owned member (Buffer / ComputeKernel / pool) self-frees
+  // and self-resets on move, so the defaulted moves are correct. device_ /
+  // allocator_ are borrowed pointers, so a defaulted move leaving the
+  // moved-from extractor pointing at them is harmless -- it reports valid() ==
+  // false and is only destroyed.
   ~MarchingCubes() = default;
   MarchingCubes(MarchingCubes&&) noexcept = default;
   MarchingCubes& operator=(MarchingCubes&&) noexcept = default;
@@ -98,8 +98,8 @@ class VR_MESH_API MarchingCubes {
   Result<Mesh> extract(const volume::Voxel* samples, std::size_t count,
                        const DenseGrid& grid, float iso = 0.0f);
 
-  /// @return `true` if this owns a live pipeline (`false` when moved-from).
-  bool valid() const noexcept { return pipeline_.valid(); }
+  /// @return `true` if this owns a live kernel (`false` when moved-from).
+  bool valid() const noexcept { return kernel_.valid(); }
 
  private:
   MarchingCubes() = default;
@@ -120,11 +120,10 @@ class VR_MESH_API MarchingCubes {
   // and are (re)written into bindings 1-3 before each dispatch.
   Buffer tables_;
 
-  // One descriptor-set layout + pipeline for the single kernel.
-  DescriptorSetLayout layout_;
-  ComputePipeline pipeline_;
+  // The single marching-cubes kernel -- its descriptor-set layout, pipeline,
+  // and the set allocated from the shared pool_ (see @ref ComputeKernel).
+  ComputeKernel kernel_;
   DescriptorPool pool_;
-  DescriptorSet set_;
 };
 
 }  // namespace volumetric_kit::recon::mesh

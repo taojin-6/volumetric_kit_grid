@@ -12,8 +12,8 @@
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/shader.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes_tables.hpp"
 
@@ -75,41 +75,6 @@ std::uint32_t group_count(std::uint32_t items) {
   return items / kLocalSize + (items % kLocalSize != 0u ? 1u : 0u);
 }
 
-// `count` storage-buffer bindings at 0..count-1, all compute-stage.
-std::vector<VkDescriptorSetLayoutBinding> storage_bindings(
-    std::uint32_t count) {
-  std::vector<VkDescriptorSetLayoutBinding> bindings(count);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    bindings[i].binding = i;
-    bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[i].descriptorCount = 1;
-    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  }
-  return bindings;
-}
-
-// Build the compute pipeline from embedded SPIR-V + a descriptor-set layout,
-// with a single PushConstants range. The shader module is transient.
-Result<ComputePipeline> make_pipeline(VkDevice device, const unsigned char* spv,
-                                      std::size_t spv_size,
-                                      VkDescriptorSetLayout layout) {
-  VR_ASSIGN(ShaderModule module,
-            ShaderModule::create(
-                device, reinterpret_cast<const std::uint32_t*>(spv), spv_size));
-  VkPushConstantRange push{};
-  push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  push.offset = 0;
-  push.size = sizeof(PushConstants);
-
-  ComputePipelineDesc desc;
-  desc.shader = &module;
-  desc.set_layouts = &layout;
-  desc.set_layout_count = 1;
-  desc.push_ranges = &push;
-  desc.push_range_count = 1;
-  return ComputePipeline::create(device, desc);
-}
-
 // A host-visible, host-mapped storage buffer of the given byte size.
 Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
                               HostAccess access = HostAccess::Random) {
@@ -120,38 +85,6 @@ Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
   desc.mapped = true;
   desc.host_access = access;
   return allocator.create_buffer(desc);
-}
-
-// Record + submit one 1-D dispatch with a trailing barrier that makes the
-// kernel's SSBO writes visible to the host readback (same shape as the volume
-// tier's dispatch helper).
-Status dispatch(Device& device, const ComputePipeline& pipeline,
-                VkDescriptorSet set, const PushConstants& push,
-                std::uint32_t groups, std::uint32_t max_groups) {
-  // A 1-D dispatch flattens every cell onto groupCountX, but Vulkan guarantees
-  // maxComputeWorkGroupCount[0] only >= 65535 -- a large grid would be invalid
-  // usage on a min-spec (mobile) driver. Reject it as a clean error rather than
-  // risk a device-lost (mirrors the volume tier's dispatch guard).
-  if (groups > max_groups) {
-    return Status::invalid_argument(
-        "MarchingCubes::extract: workgroup count exceeds the device's "
-        "maxComputeWorkGroupCount[0] -- grid too large for a 1-D dispatch");
-  }
-  return device.submit_single_time([&](VkCommandBuffer cmd) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline.layout(), 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(cmd, pipeline.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       sizeof(PushConstants), &push);
-    vkCmdDispatch(cmd, groups, 1, 1);
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr,
-                         0, nullptr);
-  });
 }
 
 }  // namespace
@@ -171,20 +104,17 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   mc.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
 
   // The kernel binds four storage buffers: tables (persistent) + the
-  // per-extract samples / vertices / counter.
-  const auto bindings = storage_bindings(4);
-  VR_ASSIGN(mc.layout_, DescriptorSetLayout::create(
-                            dev, bindings.data(),
-                            static_cast<std::uint32_t>(bindings.size())));
-  VR_ASSIGN(mc.pipeline_, make_pipeline(dev, vr_marching_cubes_comp_spv,
-                                        vr_marching_cubes_comp_spv_size,
-                                        mc.layout_.handle()));
-
-  VkDescriptorPoolSize pool_size{};
-  pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = static_cast<std::uint32_t>(bindings.size());
-  VR_ASSIGN(mc.pool_, DescriptorPool::create(dev, &pool_size, 1, 1));
-  VR_ASSIGN(mc.set_, mc.pool_.allocate(mc.layout_.handle()));
+  // per-extract samples / vertices / counter. KernelSetBuilder
+  // (core/compute_kernel.hpp) builds its layout + pipeline and allocates its
+  // set from a shared pool sized to the exact descriptor total.
+  VkPushConstantRange push{};
+  push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push.offset = 0;
+  push.size = sizeof(PushConstants);
+  KernelSetBuilder kb(dev);
+  VR_TRY(kb.add(mc.kernel_, vr_marching_cubes_comp_spv,
+                vr_marching_cubes_comp_spv_size, 4, &push));
+  VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 for good. The
   // constexpr header arrays are the single source; flatten them into the shader
@@ -196,7 +126,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   std::memcpy(host_tables.corner_offset, kCornerOffset, sizeof(kCornerOffset));
   std::memcpy(host_tables.edge_to_vert, kEdgeToVert, sizeof(kEdgeToVert));
   std::memcpy(mc.tables_.mapped(), &host_tables, sizeof(McTables));
-  mc.set_.write_storage_buffer(0, mc.tables_.handle(), 0, VK_WHOLE_SIZE);
+  mc.kernel_.set.write_storage_buffer(0, mc.tables_.handle(), 0, VK_WHOLE_SIZE);
 
   return mc;
 }
@@ -261,13 +191,13 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
             storage_buffer(*allocator_, sizeof(std::uint32_t)));
   std::memset(counter_buf.mapped(), 0, sizeof(std::uint32_t));
 
-  set_.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
-  set_.write_storage_buffer(2, vertices_buf.handle(), 0, VK_WHOLE_SIZE);
-  set_.write_storage_buffer(3, counter_buf.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(2, vertices_buf.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(3, counter_buf.handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid.dims, grid.voxel_size, grid.origin,
                            iso,       capacity,        kWeightThreshold};
-  VR_TRY(dispatch(*device_, pipeline_, set_.handle(), push,
+  VR_TRY(dispatch(*device_, kernel_, &push, sizeof(push),
                   group_count(static_cast<std::uint32_t>(cells)),
                   max_workgroup_count_x_));
 
