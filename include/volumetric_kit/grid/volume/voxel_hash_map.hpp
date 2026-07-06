@@ -19,6 +19,7 @@
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
+#include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
@@ -172,6 +173,30 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The active blocks (order unspecified), or a non-OK @ref Status.
   Result<std::vector<BlockIndex>> compact_active_blocks();
 
+  /// @brief Compact only the active blocks intersecting @p planes -- the
+  ///        per-frame streamed working set for a camera view.
+  ///
+  /// Like @ref compact_active_blocks, but each block's world AABB is tested
+  /// against the six frustum planes and dropped if fully outside any of them
+  /// (a conservative p-vertex test; the planes are ~10% widened, see
+  /// @ref make_frustum_planes). This is what TSDF integration and meshing
+  /// consume so only camera-visible blocks are processed.
+  /// @param planes  Six inward-normal frustum planes (@ref
+  /// make_frustum_planes).
+  /// @return The visible active blocks (order unspecified), or a non-OK
+  ///         @ref Status if a buffer or the dispatch fails / the map is
+  ///         moved-from.
+  Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
+      const FrustumPlanes& planes);
+
+  /// @brief @ref compact_active_blocks_in_frustum for a depth camera: derives
+  ///        the frustum from @p camera's intrinsics, `[min_depth, max_depth]`
+  ///        range, and pose, then culls.
+  /// @param camera  The same camera passed to @ref allocate_from_depth.
+  /// @return The visible active blocks, or a non-OK @ref Status.
+  Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
+      const DepthCameraParams& camera);
+
   /// @brief Reset the table to empty (re-runs the init kernel).
   /// @return An OK @ref Status, or a non-OK one if the init dispatch fails or
   ///         the map is moved-from.
@@ -225,6 +250,13 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
+
+  /// Shared body of the compaction kernels: zero the counter, run @p pipeline
+  /// (bound through @p set) over every hash slot, then read back the appended
+  /// @ref BlockIndex list. Used by @ref compact_active_blocks (plain) and
+  /// @ref compact_active_blocks_in_frustum (with the frustum set + planes).
+  Result<std::vector<BlockIndex>> collect_compacted(
+      const ComputePipeline& pipeline, DescriptorSet& set);
 
   /// Dispatch @p pipeline (bound through @p set, push arg = @p arg) over
   /// @p groups groups, re-dispatching while the shared `fail_counts_[0]` tally
@@ -294,12 +326,14 @@ class VR_VOLUME_API VoxelHashMap {
   DescriptorSetLayout compact_layout_;
   DescriptorSetLayout delete_layout_;
   DescriptorSetLayout depth_layout_;
+  DescriptorSetLayout compact_frustum_layout_;
   ComputePipeline init_pipeline_;
   ComputePipeline allocate_pipeline_;
   ComputePipeline compact_pipeline_;
   ComputePipeline delete_pipeline_;
   ComputePipeline depth_pipeline_;
   ComputePipeline points_pipeline_;  // bound through allocate_layout_
+  ComputePipeline compact_frustum_pipeline_;
   DescriptorPool pool_;
   DescriptorSet init_set_;
   DescriptorSet allocate_set_;
@@ -307,6 +341,7 @@ class VR_VOLUME_API VoxelHashMap {
   DescriptorSet delete_set_;
   DescriptorSet depth_set_;
   DescriptorSet points_set_;  // allocated from allocate_layout_
+  DescriptorSet compact_frustum_set_;
 };
 
 }  // namespace volumetric_kit::recon::volume
