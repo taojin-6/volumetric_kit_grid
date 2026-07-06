@@ -79,9 +79,9 @@ static_assert(std::is_standard_layout_v<DepthCameraParams>,
 /// @ref ComputePipeline, @ref Device::submit_single_time). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
-/// byte-for-byte. Covers init, allocate-from-coords, remove, compact, and
-/// resize; diagnostics, the index-preserving GPU rehash, and depth/point
-/// allocation follow.
+/// byte-for-byte. Covers init, allocate-from-coords / -depth / -points, remove,
+/// compact / compact-in-frustum, diagnostics, and an **index-preserving**
+/// @ref resize (the GPU rehash that keeps each block's `ptr`).
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -203,14 +203,18 @@ class VR_VOLUME_API VoxelHashMap {
   Status clear();
 
   /// @brief Grow the hash table to @p new_num_buckets buckets (must exceed the
-  ///        current count), preserving the active block set.
+  ///        current count), **preserving each block's index** so per-voxel data
+  ///        keyed by @ref BlockIndex::ptr survives.
   ///
-  /// Reuses the proven init / allocate / compact kernels: snapshot the active
-  /// coordinates, grow the buffers, re-init the larger table, and re-insert.
-  /// This reassigns block indices -- transparent for the coordinate set, but it
-  /// does not preserve per-block voxel data.
-  /// TODO(tsdf): a block-index-preserving GPU rehash once blocks carry SDF
-  /// data.
+  /// Snapshot the active blocks (coordinate + pointer), grow the buffers,
+  /// re-init the larger table, then rehash: the @ref rehash_ kernel re-inserts
+  /// each block with its *original* pointer (not a fresh heap draw), and the
+  /// heap is rebuilt to hold exactly the block indices the snapshot does not
+  /// occupy. A block thus keeps its `ptr`, so a @ref VoxelBlockGrid's attribute
+  /// arrays (addressed by `ptr`) stay valid across the grow -- but those arrays
+  /// are sized for the old `num_blocks` and are **not** grown here; resize a
+  /// grid that carries attributes through @ref VoxelBlockGrid::resize, which
+  /// grows them first.
   /// @param new_num_buckets  The new bucket count (> the current @ref grid).
   /// @return OK on success, or a non-OK @ref Status:
   ///         @ref Status::Code::InvalidArgument for a non-growing count;
@@ -247,6 +251,14 @@ class VR_VOLUME_API VoxelHashMap {
   /// Run the init kernel, resetting every slot to empty (used by create +
   /// clear).
   Status init_table();
+
+  /// Rebuild the free-block heap so it holds exactly the block indices @p
+  /// active does *not* occupy, in ascending order, with @ref heap_counter_ set
+  /// to that free count. Called by @ref resize after @ref init_table (which
+  /// fills the heap with every index) and the rehash (which re-inserts @p
+  /// active with their preserved pointers): a plain host write of @ref heap_ +
+  /// @ref heap_counter_, since resize runs single-threaded between dispatches.
+  void rebuild_heap_excluding(const std::vector<BlockIndex>& active);
 
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
@@ -339,6 +351,11 @@ class VR_VOLUME_API VoxelHashMap {
   ComputeKernel depth_;
   ComputeKernel points_;
   ComputeKernel compact_frustum_;
+  // Re-inserts a snapshot of active blocks into the grown table preserving each
+  // block's index (insert_block with the block's own pointer, not a fresh heap
+  // draw), so per-voxel data survives a resize. Same 6-binding shape as
+  // allocate_ (its input at binding 4 is BlockIndex{coord, ptr}, ptr read).
+  ComputeKernel rehash_;
 };
 
 }  // namespace volumetric_kit::recon::volume

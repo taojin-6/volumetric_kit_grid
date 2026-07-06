@@ -1,0 +1,33 @@
+#version 450
+
+// Re-insert a snapshot of active blocks into a freshly-initialised (larger)
+// table during resize, preserving each block's index. Each thread takes one
+// BlockIndex{coord, ptr} from the snapshot and inserts it through the same
+// machinery as allocation (hash_allocate_common.glsl) -- a bucket-locked insert
+// into the primary bucket or the overflow chain -- but with the block's ORIGINAL
+// pointer (insert_block's preset_ptr) instead of drawing a fresh one off the
+// heap. Preserving the pointer keeps each block's per-voxel attribute data
+// (VoxelBlockGrid arrays are keyed by BlockIndex::ptr) valid across the grow;
+// the host separately rebuilds the heap to hold exactly the block indices this
+// snapshot does not occupy. insert_block is idempotent (an already-inserted
+// coord is a no-op), so the host can re-drive the snapshot to absorb transient
+// bucket-lock contention, exactly as it re-drives allocation.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+#include "hash_allocate_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 4, scalar) readonly buffer Snapshot {
+  BlockIndex snapshot[];
+};
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.arg) {  // pc.arg = snapshot block count
+    return;
+  }
+  // preset_ptr = the block's preserved pointer, so its per-voxel data survives.
+  report_alloc_fail(insert_block(snapshot[gid].coord, snapshot[gid].ptr));
+}

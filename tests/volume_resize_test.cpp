@@ -2,12 +2,16 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for VoxelHashMap::resize: allocate a set of blocks, grow the table
-// to more buckets, and verify the active set survives the resize and that
-// further allocation into the grown table works. Runs on the real driver
+// to more buckets, and verify the active set survives the resize with each
+// block's index PRESERVED (the ptr-preserving rehash, so per-voxel data keyed
+// by the pointer survives), the heap rebuilt to exclude the live blocks, and
+// that further allocation into the grown table works. Runs on the real driver
 // (MoltenVK / NVIDIA); exits 0 (skip) where no device is present.
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <map>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -81,6 +85,19 @@ vr::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
   return out;
 }
 
+// Each active block's coordinate -> its voxel-array pointer (BlockIndex::ptr).
+vr::Result<std::map<Coord, std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
+  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+  if (!active) {
+    return active.status();
+  }
+  std::map<Coord, std::int32_t> out;
+  for (const vol::BlockIndex& block : active.value()) {
+    out[{block.coord.x, block.coord.y, block.coord.z}] = block.ptr;
+  }
+  return out;
+}
+
 }  // namespace
 
 int main() {
@@ -141,6 +158,11 @@ int main() {
       map.allocate(a.data(), static_cast<std::uint32_t>(a.size()));
   CHECK(alloc_a.ok() && alloc_a.value() == 0);
 
+  // Snapshot each block's index before growing; the rehash must preserve it
+  // (not reassign it) so per-voxel data keyed by the pointer survives.
+  vr::Result<std::map<Coord, std::int32_t>> ptrs_before = active_ptrs(map);
+  CHECK(ptrs_before.ok() && ptrs_before.value().size() == a.size());
+
   CHECK(map.resize(1024).ok());
   CHECK(map.grid().num_buckets == 1024);
   CHECK(map.grid().num_blocks == 1024 * 8);
@@ -149,6 +171,21 @@ int main() {
   vr::Result<std::set<Coord>> after = active_set(map);
   CHECK(after.ok());
   CHECK(after.value() == want);
+
+  // Block indices are PRESERVED, not reassigned: every coord keeps the exact
+  // ptr it held before -- the rehash's core guarantee, and what keeps a
+  // VoxelBlockGrid's attribute data (addressed by ptr) valid across the grow.
+  vr::Result<std::map<Coord, std::int32_t>> ptrs_after = active_ptrs(map);
+  CHECK(ptrs_after.ok());
+  CHECK(ptrs_after.value() == ptrs_before.value());
+
+  // The heap was rebuilt to exclude the preserved indices: free blocks = the
+  // new capacity minus the live set (so a later allocation never reuses a live
+  // one).
+  vr::Result<vol::HashDiagnostics> diag = map.diagnostics();
+  CHECK(diag.ok());
+  CHECK(diag.value().heap_free_count ==
+        static_cast<std::int32_t>(1024 * 8 - a.size()));
 
   // The grown table still allocates: cube B, disjoint from A.
   std::vector<vol::BlockIndex> b = cube(20, 20, 20);
@@ -190,6 +227,22 @@ int main() {
   // resize refuses a non-growing count.
   CHECK(map.resize(1024).domain() == vr::Status::Code::InvalidArgument);
   CHECK(map.resize(512).domain() == vr::Status::Code::InvalidArgument);
+
+  // resize refuses a grow whose num_blocks * voxels_per_block would overflow a
+  // signed 32-bit block pointer: rejected up front (InvalidArgument), before
+  // any buffer is allocated, so the live map is left untouched. buckets past
+  // INT32_MAX / (bucket_size * voxels_per_block) overflow.
+  const std::int64_t elems_per_bucket =
+      static_cast<std::int64_t>(map.grid().bucket_size) *
+      map.grid().voxels_per_block;
+  const std::int64_t overflow_buckets =
+      std::numeric_limits<std::int32_t>::max() / elems_per_bucket + 2;
+  CHECK(overflow_buckets > map.grid().num_buckets &&
+        overflow_buckets <= std::numeric_limits<std::int32_t>::max());
+  CHECK(map.resize(static_cast<std::int32_t>(overflow_buckets)).domain() ==
+        vr::Status::Code::InvalidArgument);
+  CHECK(map.grid().num_buckets ==
+        1024);  // rejected grow left the map untouched
 
   std::printf(
       "recon volume resize test passed: grew 256 -> 1024 buckets, %zu blocks "
