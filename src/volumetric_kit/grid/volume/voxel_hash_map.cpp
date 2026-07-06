@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/shader.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash.hpp"
 
@@ -46,82 +45,6 @@ struct PushConstants {
 // for items near UINT32_MAX (yielding ~0 groups -> a silent no-op dispatch).
 std::uint32_t group_count(std::uint32_t items) {
   return items / kLocalSize + (items % kLocalSize != 0u ? 1u : 0u);
-}
-
-// `count` storage-buffer bindings at 0..count-1, all compute-stage.
-std::vector<VkDescriptorSetLayoutBinding> storage_bindings(
-    std::uint32_t count) {
-  std::vector<VkDescriptorSetLayoutBinding> bindings(count);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    bindings[i].binding = i;
-    bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[i].descriptorCount = 1;
-    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  }
-  return bindings;
-}
-
-// Build a compute pipeline from embedded SPIR-V + a descriptor-set layout, with
-// a single PushConstants range. The shader module is transient (the pipeline
-// does not retain it).
-Result<ComputePipeline> make_pipeline(VkDevice device, const unsigned char* spv,
-                                      std::size_t spv_size,
-                                      VkDescriptorSetLayout layout) {
-  VR_ASSIGN(ShaderModule module,
-            ShaderModule::create(
-                device, reinterpret_cast<const std::uint32_t*>(spv), spv_size));
-  VkPushConstantRange push{};
-  push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  push.offset = 0;
-  push.size = sizeof(PushConstants);
-
-  ComputePipelineDesc desc;
-  desc.shader = &module;
-  desc.set_layouts = &layout;
-  desc.set_layout_count = 1;
-  desc.push_ranges = &push;
-  desc.push_range_count = 1;
-  return ComputePipeline::create(device, desc);
-}
-
-// Record + submit one 1-D dispatch: bind, push, dispatch, then a memory barrier
-// that makes this kernel's SSBO writes available and visible to (a) the next
-// dispatch's shader reads/writes of the same persistent buffers and (b) a host
-// read of the mapped results. Each kernel runs as its own one-shot submission
-// (submit_single_time fully fence-waits it), and a fence orders execution but
-// is NOT a memory dependency -- so this barrier, not the fence, is what carries
-// cross-dispatch visibility (init -> allocate, allocate -> compact). Cheap: one
-// global barrier per already-serialized dispatch.
-Status dispatch(Device& device, const ComputePipeline& pipeline,
-                VkDescriptorSet set, const PushConstants& push,
-                std::uint32_t groups, std::uint32_t max_groups) {
-  // A 1-D dispatch flattens the whole input onto groupCountX, but Vulkan only
-  // guarantees maxComputeWorkGroupCount[0] >= 65535 -- an oversized depth frame
-  // / point cloud (or huge grid) would be invalid usage on a min-spec (mobile)
-  // driver. Reject it as a clean error rather than risk a device-lost.
-  if (groups > max_groups) {
-    return Status::invalid_argument(
-        "VoxelHashMap dispatch: workgroup count exceeds the device's "
-        "maxComputeWorkGroupCount[0] -- input too large for a 1-D dispatch");
-  }
-  return device.submit_single_time([&](VkCommandBuffer cmd) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline.layout(), 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(cmd, pipeline.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       sizeof(PushConstants), &push);
-    vkCmdDispatch(cmd, groups, 1, 1);
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
-                            VK_ACCESS_SHADER_WRITE_BIT |
-                            VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(
-        cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-        &barrier, 0, nullptr, 0, nullptr);
-  });
 }
 
 // A host-visible, host-mapped storage buffer of the given byte size.
@@ -208,14 +131,14 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   map.active_count_ = std::move(bufs.active_count);
 
   // Camera params for allocate_from_depth: a small (96 B), fixed-size buffer,
-  // so persist it (bound once at binding 6 of depth_set_) and rewrite the
+  // so persist it (bound once at binding 6 of depth_.set) and rewrite the
   // contents each call -- like fail_counts_, not a per-call allocation.
   // Grid-independent, so it is not part of the resized bundle.
   VR_ASSIGN(map.camera_params_,
             storage_buffer(allocator, sizeof(DepthCameraParams),
                            HostAccess::SequentialWrite));
   // Frustum planes for compact_active_blocks_in_frustum: likewise a small
-  // (96 B), fixed-size buffer, persisted at binding 3 of compact_frustum_set_.
+  // (96 B), fixed-size buffer, persisted at binding 3 of compact_frustum_.set.
   VR_ASSIGN(map.frustum_planes_,
             storage_buffer(allocator, sizeof(FrustumPlanes),
                            HostAccess::SequentialWrite));
@@ -228,83 +151,34 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   map.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
 
-  // One layout + pipeline per kernel (bindings match each shader's set 0).
-  const auto init_b = storage_bindings(4);
-  VR_ASSIGN(map.init_layout_,
-            DescriptorSetLayout::create(
-                dev, init_b.data(), static_cast<std::uint32_t>(init_b.size())));
-  const auto alloc_b = storage_bindings(6);
-  VR_ASSIGN(
-      map.allocate_layout_,
-      DescriptorSetLayout::create(dev, alloc_b.data(),
-                                  static_cast<std::uint32_t>(alloc_b.size())));
-  const auto compact_b = storage_bindings(3);
-  VR_ASSIGN(
-      map.compact_layout_,
-      DescriptorSetLayout::create(
-          dev, compact_b.data(), static_cast<std::uint32_t>(compact_b.size())));
-  const auto delete_b = storage_bindings(6);
-  VR_ASSIGN(
-      map.delete_layout_,
-      DescriptorSetLayout::create(dev, delete_b.data(),
-                                  static_cast<std::uint32_t>(delete_b.size())));
-  // Depth adds the camera-params buffer at binding 6 (7 bindings); allocate-
-  // from-points reuses allocate_layout_ (same 6-binding shape as coords).
-  const auto depth_b = storage_bindings(7);
-  VR_ASSIGN(map.depth_layout_, DescriptorSetLayout::create(
-                                   dev, depth_b.data(),
-                                   static_cast<std::uint32_t>(depth_b.size())));
-  // Frustum compaction adds the planes buffer (binding 3) to compact's shape.
-  const auto compact_frustum_b = storage_bindings(4);
-  VR_ASSIGN(map.compact_frustum_layout_,
-            DescriptorSetLayout::create(
-                dev, compact_frustum_b.data(),
-                static_cast<std::uint32_t>(compact_frustum_b.size())));
+  // Build every kernel's layout + pipeline and size the shared pool_ to them
+  // via KernelSetBuilder (core/compute_kernel.hpp) -- one add() per shader, its
+  // storage-buffer binding count matching that shader's set 0. Every kernel
+  // pushes the shared PushConstants block. allocate-from-coords and
+  // -from-points have the same 6-binding shape but each owns its kernel; depth
+  // adds the camera-params buffer at binding 6 (7 bindings); frustum compaction
+  // adds the planes buffer at binding 3 (4 bindings).
+  VkPushConstantRange push{};
+  push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push.offset = 0;
+  push.size = sizeof(PushConstants);
 
-  VR_ASSIGN(map.init_pipeline_, make_pipeline(dev, vr_hash_init_comp_spv,
-                                              vr_hash_init_comp_spv_size,
-                                              map.init_layout_.handle()));
-  VR_ASSIGN(map.allocate_pipeline_,
-            make_pipeline(dev, vr_hash_allocate_coords_comp_spv,
-                          vr_hash_allocate_coords_comp_spv_size,
-                          map.allocate_layout_.handle()));
-  VR_ASSIGN(map.compact_pipeline_, make_pipeline(dev, vr_hash_compact_comp_spv,
-                                                 vr_hash_compact_comp_spv_size,
-                                                 map.compact_layout_.handle()));
-  VR_ASSIGN(map.delete_pipeline_,
-            make_pipeline(dev, vr_hash_delete_coords_comp_spv,
-                          vr_hash_delete_coords_comp_spv_size,
-                          map.delete_layout_.handle()));
-  VR_ASSIGN(map.depth_pipeline_,
-            make_pipeline(dev, vr_hash_allocate_depth_comp_spv,
-                          vr_hash_allocate_depth_comp_spv_size,
-                          map.depth_layout_.handle()));
-  VR_ASSIGN(map.points_pipeline_,
-            make_pipeline(dev, vr_hash_allocate_points_comp_spv,
-                          vr_hash_allocate_points_comp_spv_size,
-                          map.allocate_layout_.handle()));
-  VR_ASSIGN(map.compact_frustum_pipeline_,
-            make_pipeline(dev, vr_hash_compact_frustum_comp_spv,
-                          vr_hash_compact_frustum_comp_spv_size,
-                          map.compact_frustum_layout_.handle()));
-
-  // Pool: one set per kernel, sized to the exact descriptor total. points_set_
-  // is allocated from allocate_layout_, so it costs another alloc_b worth.
-  VkDescriptorPoolSize pool_size{};
-  pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = static_cast<std::uint32_t>(
-      init_b.size() + alloc_b.size() + compact_b.size() + delete_b.size() +
-      depth_b.size() + alloc_b.size() + compact_frustum_b.size());
-  VR_ASSIGN(map.pool_, DescriptorPool::create(dev, &pool_size, 1, 7));
-  VR_ASSIGN(map.init_set_, map.pool_.allocate(map.init_layout_.handle()));
-  VR_ASSIGN(map.allocate_set_,
-            map.pool_.allocate(map.allocate_layout_.handle()));
-  VR_ASSIGN(map.compact_set_, map.pool_.allocate(map.compact_layout_.handle()));
-  VR_ASSIGN(map.delete_set_, map.pool_.allocate(map.delete_layout_.handle()));
-  VR_ASSIGN(map.depth_set_, map.pool_.allocate(map.depth_layout_.handle()));
-  VR_ASSIGN(map.points_set_, map.pool_.allocate(map.allocate_layout_.handle()));
-  VR_ASSIGN(map.compact_frustum_set_,
-            map.pool_.allocate(map.compact_frustum_layout_.handle()));
+  KernelSetBuilder kb(dev);
+  VR_TRY(kb.add(map.init_, vr_hash_init_comp_spv, vr_hash_init_comp_spv_size, 4,
+                &push));
+  VR_TRY(kb.add(map.allocate_, vr_hash_allocate_coords_comp_spv,
+                vr_hash_allocate_coords_comp_spv_size, 6, &push));
+  VR_TRY(kb.add(map.compact_, vr_hash_compact_comp_spv,
+                vr_hash_compact_comp_spv_size, 3, &push));
+  VR_TRY(kb.add(map.delete_, vr_hash_delete_coords_comp_spv,
+                vr_hash_delete_coords_comp_spv_size, 6, &push));
+  VR_TRY(kb.add(map.depth_, vr_hash_allocate_depth_comp_spv,
+                vr_hash_allocate_depth_comp_spv_size, 7, &push));
+  VR_TRY(kb.add(map.points_, vr_hash_allocate_points_comp_spv,
+                vr_hash_allocate_points_comp_spv_size, 6, &push));
+  VR_TRY(kb.add(map.compact_frustum_, vr_hash_compact_frustum_comp_spv,
+                vr_hash_compact_frustum_comp_spv_size, 4, &push));
+  VR_ASSIGN(map.pool_, kb.build());
 
   // Point every set at the persistent buffers (the per-call coords buffer is
   // written before each allocate/delete dispatch). Shared with resize().
@@ -327,7 +201,7 @@ void VoxelHashMap::write_persistent_bindings() {
   const VkBuffer counter = heap_counter_.handle();
   const VkBuffer mutex = bucket_mutex_.handle();
   for (const DescriptorSet* set :
-       {&init_set_, &allocate_set_, &delete_set_, &depth_set_, &points_set_}) {
+       {&init_.set, &allocate_.set, &delete_.set, &depth_.set, &points_.set}) {
     set->write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(1, heap, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
@@ -335,24 +209,24 @@ void VoxelHashMap::write_persistent_bindings() {
   }
   const VkBuffer fail = fail_counts_.handle();
   for (const DescriptorSet* set :
-       {&allocate_set_, &delete_set_, &depth_set_, &points_set_}) {
+       {&allocate_.set, &delete_.set, &depth_.set, &points_.set}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
-  // depth_set_ alone has binding 6: the persistent camera params (its contents
+  // depth_.set alone has binding 6: the persistent camera params (its contents
   // are rewritten per call; only the depth buffer at binding 4 is transient).
-  depth_set_.write_storage_buffer(6, camera_params_.handle(), 0, VK_WHOLE_SIZE);
-  compact_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
-  compact_set_.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
-  compact_set_.write_storage_buffer(2, active_count_.handle(), 0,
+  depth_.set.write_storage_buffer(6, camera_params_.handle(), 0, VK_WHOLE_SIZE);
+  compact_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
+  compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
+  compact_.set.write_storage_buffer(2, active_count_.handle(), 0,
                                     VK_WHOLE_SIZE);
   // Frustum compaction shares the compaction output + counter with plain
   // compact; its planes buffer (binding 3) is persistent, rewritten per call.
-  compact_frustum_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
-  compact_frustum_set_.write_storage_buffer(1, compacted_.handle(), 0,
+  compact_frustum_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
+  compact_frustum_.set.write_storage_buffer(1, compacted_.handle(), 0,
                                             VK_WHOLE_SIZE);
-  compact_frustum_set_.write_storage_buffer(2, active_count_.handle(), 0,
+  compact_frustum_.set.write_storage_buffer(2, active_count_.handle(), 0,
                                             VK_WHOLE_SIZE);
-  compact_frustum_set_.write_storage_buffer(3, frustum_planes_.handle(), 0,
+  compact_frustum_.set.write_storage_buffer(3, frustum_planes_.handle(), 0,
                                             VK_WHOLE_SIZE);
 }
 
@@ -366,12 +240,12 @@ Status VoxelHashMap::init_table() {
       std::max({total_entries(), static_cast<std::uint32_t>(grid_.num_blocks),
                 static_cast<std::uint32_t>(grid_.num_buckets)});
   const PushConstants push{grid_, 0};
-  return dispatch(*device_, init_pipeline_, init_set_.handle(), push,
-                  group_count(widest), max_workgroup_count_x_);
+  return dispatch(*device_, init_, &push, sizeof(push), group_count(widest),
+                  max_workgroup_count_x_);
 }
 
-// Dispatch `pipeline` (bound through `set`, push arg = `arg`) over `groups`
-// groups, re-dispatching while the reported failure count keeps dropping.
+// Dispatch `kernel` (push arg = `arg`) over `groups` groups, re-dispatching
+// while the reported failure count keeps dropping.
 // Allocations spuriously fail under heavy same-bucket contention (a GPU
 // spin-lock livelock within a SIMD group) -- worst for depth, whose adjacent
 // pixels hammer the same block. Already-processed elements take the lock-free
@@ -384,8 +258,7 @@ Status VoxelHashMap::init_table() {
 // fail_counts_[0] is the shared total-failures tally (allocate / depth / points
 // also split reasons into [1]=lock/[2]=chain/[3]=heap); re-zeroed each round.
 Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
-    const ComputePipeline& pipeline, DescriptorSet& set, std::uint32_t arg,
-    std::uint32_t groups) {
+    const ComputeKernel& kernel, std::uint32_t arg, std::uint32_t groups) {
   const PushConstants push{grid_, arg};
   constexpr int kMaxRounds = 10;
   constexpr int kStallLimit = 2;  // consecutive no-progress rounds -> give up
@@ -394,7 +267,7 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
   int stall = 0;
   for (int round = 0; round < kMaxRounds; ++round) {
     std::memset(fail_counts_.mapped(), 0, 4 * sizeof(std::uint32_t));
-    VR_TRY(dispatch(*device_, pipeline, set.handle(), push, groups,
+    VR_TRY(dispatch(*device_, kernel, &push, sizeof(push), groups,
                     max_workgroup_count_x_));
     std::memcpy(&failures, fail_counts_.mapped(), sizeof(std::uint32_t));
     if (failures == 0) {
@@ -410,7 +283,7 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
   return failures;
 }
 
-Result<Buffer> VoxelHashMap::upload_to_binding(DescriptorSet& set,
+Result<Buffer> VoxelHashMap::upload_to_binding(const DescriptorSet& set,
                                                std::uint32_t binding,
                                                const void* data,
                                                VkDeviceSize bytes) {
@@ -423,7 +296,7 @@ Result<Buffer> VoxelHashMap::upload_to_binding(DescriptorSet& set,
 
 Result<std::uint32_t> VoxelHashMap::run_input_kernel(
     const char* op, const void* data, std::size_t elem_size,
-    std::uint32_t count, DescriptorSet& set, const ComputePipeline& pipeline) {
+    std::uint32_t count, const ComputeKernel& kernel) {
   if (!valid()) {
     return Status::invalid_argument(std::string(op) + ": moved-from map");
   }
@@ -437,15 +310,16 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   // The input is genuinely per-call (variable count), so this buffer is
   // transient; fail_counts_ is persistent and re-zeroed per round inside
   // dispatch_with_retry.
-  VR_ASSIGN(Buffer input_buf,
-            upload_to_binding(set, 4, data, VkDeviceSize(count) * elem_size));
-  return dispatch_with_retry(pipeline, set, count, group_count(count));
+  VR_ASSIGN(
+      Buffer input_buf,
+      upload_to_binding(kernel.set, 4, data, VkDeviceSize(count) * elem_size));
+  return dispatch_with_retry(kernel, count, group_count(count));
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
                                              std::uint32_t count) {
   return run_input_kernel("VoxelHashMap::allocate", coords, sizeof(BlockIndex),
-                          count, allocate_set_, allocate_pipeline_);
+                          count, allocate_);
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
@@ -477,35 +351,34 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
   // params ride the persistent camera_params_ buffer (binding 6, bound once at
   // create), rewritten in place here.
   VR_ASSIGN(Buffer depth_buf,
-            upload_to_binding(depth_set_, 4, depth,
+            upload_to_binding(depth_.set, 4, depth,
                               VkDeviceSize(pixels) * sizeof(float)));
   std::memcpy(camera_params_.mapped(), &camera, sizeof(DepthCameraParams));
 
-  return dispatch_with_retry(depth_pipeline_, depth_set_, pixels,
-                             group_count(pixels));
+  return dispatch_with_retry(depth_, pixels, group_count(pixels));
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_points(const Vec3f* points,
                                                          std::uint32_t count) {
   return run_input_kernel("VoxelHashMap::allocate_from_points", points,
-                          sizeof(Vec3f), count, points_set_, points_pipeline_);
+                          sizeof(Vec3f), count, points_);
 }
 
 Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
                                            std::uint32_t count) {
   return run_input_kernel("VoxelHashMap::remove", coords, sizeof(BlockIndex),
-                          count, delete_set_, delete_pipeline_);
+                          count, delete_);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
-    const ComputePipeline& pipeline, DescriptorSet& set) {
+    const ComputeKernel& kernel) {
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   std::memset(active_count_.mapped(), 0, sizeof(std::uint32_t));
 
   const PushConstants push{grid_, capacity};
-  VR_TRY(dispatch(*device_, pipeline, set.handle(), push,
+  VR_TRY(dispatch(*device_, kernel, &push, sizeof(push),
                   group_count(total_entries()), max_workgroup_count_x_));
 
   std::uint32_t count = 0;
@@ -524,7 +397,7 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
-  return collect_compacted(compact_pipeline_, compact_set_);
+  return collect_compacted(compact_);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
@@ -536,7 +409,7 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
   // The six planes are per-call; rewrite them into the persistent buffer bound
   // once at binding 3 of the frustum set (like camera_params_).
   std::memcpy(frustum_planes_.mapped(), planes.data(), sizeof(FrustumPlanes));
-  return collect_compacted(compact_frustum_pipeline_, compact_frustum_set_);
+  return collect_compacted(compact_frustum_);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
