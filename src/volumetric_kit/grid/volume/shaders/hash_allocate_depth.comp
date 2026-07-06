@@ -27,7 +27,10 @@ layout(set = 0, binding = 4, scalar) readonly buffer Depth {
 
 // binding 6: pinhole intrinsics + pose. Mirrors the host DepthCameraParams;
 // under scalar block layout the struct is byte-identical (floats/uints pack at
-// 4-byte, the mat4 lands at offset 32).
+// 4-byte, the mat4 lands at offset 32). It rides a storage buffer, NOT the push
+// block: grid (36 B) + camera (96 B) = 132 B exceeds the 128 B guaranteed
+// maxPushConstantsSize, so folding it into the push constants would fail on
+// min-spec (mobile) drivers.
 struct CameraParams {
   float fx;
   float fy;

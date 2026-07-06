@@ -236,6 +236,12 @@ class VR_VOLUME_API VoxelHashMap {
                                             std::uint32_t arg,
                                             std::uint32_t groups);
 
+  /// Create a transient host-visible buffer holding @p bytes of @p data and
+  /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
+  /// alive across the (synchronous) dispatch that reads it.
+  Result<Buffer> upload_to_binding(DescriptorSet& set, std::uint32_t binding,
+                                   const void* data, VkDeviceSize bytes);
+
   /// Shared body of the per-element allocate kernels (@ref allocate,
   /// @ref remove, @ref allocate_from_points): upload @p count elements of
   /// @p elem_size bytes to the input binding (4) of @p set, then run @p
@@ -257,6 +263,9 @@ class VR_VOLUME_API VoxelHashMap {
   Device* device_ = nullptr;
   Allocator* allocator_ = nullptr;
   VoxelGridParams grid_{};
+  // Cached maxComputeWorkGroupCount[0] -- the device cap on a 1-D dispatch's
+  // groupCountX; every dispatch rejects an input that would exceed it.
+  std::uint32_t max_workgroup_count_x_ = 0;
 
   // Persistent device buffers. TODO(volume): these are host-visible for this
   // slice; a device-local + staging path is a follow-up perf pass.
@@ -270,6 +279,9 @@ class VR_VOLUME_API VoxelHashMap {
   Buffer fail_counts_;
   Buffer compacted_;
   Buffer active_count_;
+  // Persistent camera params for allocate_from_depth (bound at binding 6 of
+  // depth_set_, rewritten per call); grid-independent, so not in the bundle.
+  Buffer camera_params_;
 
   // One descriptor-set layout + pipeline per kernel; every persistent-buffer
   // binding is written once at create(), and only the genuinely per-call input

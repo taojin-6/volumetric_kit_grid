@@ -41,8 +41,10 @@ struct PushConstants {
   std::uint32_t arg;
 };
 
+// Ceil-divide without the `items + kLocalSize - 1` term, which overflows uint32
+// for items near UINT32_MAX (yielding ~0 groups -> a silent no-op dispatch).
 std::uint32_t group_count(std::uint32_t items) {
-  return (items + kLocalSize - 1) / kLocalSize;
+  return items / kLocalSize + (items % kLocalSize != 0u ? 1u : 0u);
 }
 
 // `count` storage-buffer bindings at 0..count-1, all compute-stage.
@@ -91,7 +93,16 @@ Result<ComputePipeline> make_pipeline(VkDevice device, const unsigned char* spv,
 // global barrier per already-serialized dispatch.
 Status dispatch(Device& device, const ComputePipeline& pipeline,
                 VkDescriptorSet set, const PushConstants& push,
-                std::uint32_t groups) {
+                std::uint32_t groups, std::uint32_t max_groups) {
+  // A 1-D dispatch flattens the whole input onto groupCountX, but Vulkan only
+  // guarantees maxComputeWorkGroupCount[0] >= 65535 -- an oversized depth frame
+  // / point cloud (or huge grid) would be invalid usage on a min-spec (mobile)
+  // driver. Reject it as a clean error rather than risk a device-lost.
+  if (groups > max_groups) {
+    return Status::invalid_argument(
+        "VoxelHashMap dispatch: workgroup count exceeds the device's "
+        "maxComputeWorkGroupCount[0] -- input too large for a 1-D dispatch");
+  }
   return device.submit_single_time([&](VkCommandBuffer cmd) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -195,6 +206,22 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   map.compacted_ = std::move(bufs.compacted);
   map.active_count_ = std::move(bufs.active_count);
 
+  // Camera params for allocate_from_depth: a small (96 B), fixed-size buffer,
+  // so persist it (bound once at binding 6 of depth_set_) and rewrite the
+  // contents each call -- like fail_counts_, not a per-call allocation.
+  // Grid-independent, so it is not part of the resized bundle.
+  VR_ASSIGN(map.camera_params_,
+            storage_buffer(allocator, sizeof(DepthCameraParams),
+                           HostAccess::SequentialWrite));
+
+  // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
+  // 65535 guaranteed); cache it so every dispatch can reject an over-large
+  // input (an 8K+ depth frame / dense point cloud on a min-spec GPU) as a clean
+  // error.
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(device.physical_device(), &props);
+  map.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
+
   // One layout + pipeline per kernel (bindings match each shader's set 0).
   const auto init_b = storage_bindings(4);
   VR_ASSIGN(map.init_layout_,
@@ -293,6 +320,9 @@ void VoxelHashMap::write_persistent_bindings() {
        {&allocate_set_, &delete_set_, &depth_set_, &points_set_}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
+  // depth_set_ alone has binding 6: the persistent camera params (its contents
+  // are rewritten per call; only the depth buffer at binding 4 is transient).
+  depth_set_.write_storage_buffer(6, camera_params_.handle(), 0, VK_WHOLE_SIZE);
   compact_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_set_.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
   compact_set_.write_storage_buffer(2, active_count_.handle(), 0,
@@ -310,7 +340,7 @@ Status VoxelHashMap::init_table() {
                 static_cast<std::uint32_t>(grid_.num_buckets)});
   const PushConstants push{grid_, 0};
   return dispatch(*device_, init_pipeline_, init_set_.handle(), push,
-                  group_count(widest));
+                  group_count(widest), max_workgroup_count_x_);
 }
 
 // Dispatch `pipeline` (bound through `set`, push arg = `arg`) over `groups`
@@ -337,7 +367,8 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
   int stall = 0;
   for (int round = 0; round < kMaxRounds; ++round) {
     std::memset(fail_counts_.mapped(), 0, 4 * sizeof(std::uint32_t));
-    VR_TRY(dispatch(*device_, pipeline, set.handle(), push, groups));
+    VR_TRY(dispatch(*device_, pipeline, set.handle(), push, groups,
+                    max_workgroup_count_x_));
     std::memcpy(&failures, fail_counts_.mapped(), sizeof(std::uint32_t));
     if (failures == 0) {
       break;
@@ -350,6 +381,17 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     }
   }
   return failures;
+}
+
+Result<Buffer> VoxelHashMap::upload_to_binding(DescriptorSet& set,
+                                               std::uint32_t binding,
+                                               const void* data,
+                                               VkDeviceSize bytes) {
+  VR_ASSIGN(Buffer buf,
+            storage_buffer(*allocator_, bytes, HostAccess::SequentialWrite));
+  std::memcpy(buf.mapped(), data, static_cast<std::size_t>(bytes));
+  set.write_storage_buffer(binding, buf.handle(), 0, VK_WHOLE_SIZE);
+  return buf;  // caller keeps it alive across the (synchronous) dispatch
 }
 
 Result<std::uint32_t> VoxelHashMap::run_input_kernel(
@@ -369,12 +411,7 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   // transient; fail_counts_ is persistent and re-zeroed per round inside
   // dispatch_with_retry.
   VR_ASSIGN(Buffer input_buf,
-            storage_buffer(*allocator_, VkDeviceSize(count) * elem_size,
-                           HostAccess::SequentialWrite));
-  std::memcpy(input_buf.mapped(), data,
-              static_cast<std::size_t>(count) * elem_size);
-  set.write_storage_buffer(4, input_buf.handle(), 0, VK_WHOLE_SIZE);
-
+            upload_to_binding(set, 4, data, VkDeviceSize(count) * elem_size));
   return dispatch_with_retry(pipeline, set, count, group_count(count));
 }
 
@@ -399,27 +436,23 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
   if (pixel_count == 0) {
     return std::uint32_t{0};
   }
-  // One dispatch thread per pixel; the count feeds a 32-bit push arg + group
-  // count, so a pathological image dimension is rejected rather than truncated.
+  // One dispatch thread per pixel. width*height feeds the 32-bit group count
+  // (the depth shader derives its own bound from cam.width*cam.height); reject
+  // a pathological image dimension here rather than let the uint64 product
+  // truncate. dispatch() separately caps groupCountX at the device limit.
   if (pixel_count > std::numeric_limits<std::uint32_t>::max()) {
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: width*height exceeds 2^32");
   }
   const auto pixels = static_cast<std::uint32_t>(pixel_count);
 
-  // Depth samples + camera params are genuinely per-call (transient); the depth
-  // buffer feeds binding 4, the camera params binding 6.
+  // Depth samples are per-call/variable (transient, binding 4); the camera
+  // params ride the persistent camera_params_ buffer (binding 6, bound once at
+  // create), rewritten in place here.
   VR_ASSIGN(Buffer depth_buf,
-            storage_buffer(*allocator_, VkDeviceSize(pixels) * sizeof(float),
-                           HostAccess::SequentialWrite));
-  std::memcpy(depth_buf.mapped(), depth,
-              static_cast<std::size_t>(pixels) * sizeof(float));
-  VR_ASSIGN(Buffer camera_buf,
-            storage_buffer(*allocator_, sizeof(DepthCameraParams),
-                           HostAccess::SequentialWrite));
-  std::memcpy(camera_buf.mapped(), &camera, sizeof(DepthCameraParams));
-  depth_set_.write_storage_buffer(4, depth_buf.handle(), 0, VK_WHOLE_SIZE);
-  depth_set_.write_storage_buffer(6, camera_buf.handle(), 0, VK_WHOLE_SIZE);
+            upload_to_binding(depth_set_, 4, depth,
+                              VkDeviceSize(pixels) * sizeof(float)));
+  std::memcpy(camera_params_.mapped(), &camera, sizeof(DepthCameraParams));
 
   return dispatch_with_retry(depth_pipeline_, depth_set_, pixels,
                              group_count(pixels));
@@ -449,7 +482,7 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
 
   const PushConstants push{grid_, capacity};
   VR_TRY(dispatch(*device_, compact_pipeline_, compact_set_.handle(), push,
-                  group_count(total_entries())));
+                  group_count(total_entries()), max_workgroup_count_x_));
 
   std::uint32_t count = 0;
   std::memcpy(&count, active_count_.mapped(), sizeof(std::uint32_t));

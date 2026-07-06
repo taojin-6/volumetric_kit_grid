@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// GPU test for depth / point-cloud block allocation: unproject a synthetic
-// one-pixel depth frame (identity pose, principal point on the valid pixel) and
-// a small world-space point set, then verify that exactly the expected
-// (2*tb+1)^3 truncation-band block cube around each surface hit is allocated --
-// the camera unprojection, the band dilation, and the DepthCameraParams
-// scalar-layout upload, all on the real driver (MoltenVK on Apple, the NVIDIA
-// ICD on the Linux CI box). The expected cubes are derived with the same host
-// coordinate math the shader mirrors (world_to_block + truncation_blocks), so
-// the check stays correct whatever truncation_blocks rounds to. Exits 0 (skip)
-// where no device is present.
+// GPU test for depth / point-cloud block allocation: unproject a posed depth
+// frame (off-centre principal point, a non-identity pose, every pixel valid)
+// and a small world-space point set, then verify that exactly the expected
+// (2*tb+1)^3 truncation-band block cubes are allocated on the real driver
+// (MoltenVK on Apple, the NVIDIA ICD on the Linux CI box). The expected blocks
+// are derived by unprojecting each pixel on the HOST (unproject_to_block, the
+// glm/C++ mirror of the shader) and dilating with the host coord math, so the
+// shader's unprojection + band dilation are genuinely under test -- a wrong
+// intrinsic or a transposed pose would diverge. Also covers many overlapping
+// pixels (lock contention + retry), negative-bias blocks, idempotent re-run,
+// clear(), and null/zero-count guards. Exits 0 (skip) where no device is
+// present.
 
 #include <cstdint>
 #include <cstdio>
@@ -75,6 +77,20 @@ int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
   return 0;
 }
 
+// Host mirror of the depth kernel's unprojection (pinhole intrinsics + pose),
+// so the expected block for a pixel is derived INDEPENDENTLY of the shader --
+// a wrong fx/fy/cx/cy or a transposed cam_to_world changes this result and the
+// on-device set no longer matches. (The device path is GLSL; this is glm/C++.)
+vr::Vec3i unproject_to_block(const vol::DepthCameraParams& cam,
+                             const vol::VoxelGridParams& grid, std::uint32_t u,
+                             std::uint32_t v, float d) {
+  const float x = (static_cast<float>(u) - cam.cx) * d / cam.fx;
+  const float y = (static_cast<float>(v) - cam.cy) * d / cam.fy;
+  const vr::Vec3f world =
+      vr::Vec3f(cam.cam_to_world * vr::Vec4f(x, y, d, 1.0f));
+  return vol::world_to_block(world, grid);
+}
+
 }  // namespace
 
 int main() {
@@ -127,24 +143,36 @@ int main() {
   vol::VoxelHashMap map = std::move(map_result).value();
 
   // --- allocate-from-depth --------------------------------------------------
-  // A 3x3 depth image with one valid sample at the principal point (u,v)=(1,1);
-  // with an identity pose it unprojects to world (0,0,depth), independent of
-  // the focal length (the (u-cx) term is zero). Every other pixel is 0 -- below
-  // min_depth, so dropped.
+  // A 4x4 frame, every pixel valid at depth 1 m, viewed through a NON-identity
+  // pose and an off-centre principal point -- so the unprojection is
+  // non-degenerate (a wrong fx/fy/cx/cy or a transposed cam_to_world changes
+  // the world point, unlike a principal-point pixel under identity where it
+  // cancels to (0,0,depth)). The 16 adjacent pixels also land in overlapping
+  // bands that hammer the same buckets -- the multi-thread lock contention the
+  // depth kernel
+  // + retry exist for -- and the pose lands the blocks at a negative Y,
+  // exercising the negative-bias voxel->block floor.
   vol::DepthCameraParams cam{};
   cam.fx = 100.0f;
-  cam.fy = 100.0f;
-  cam.cx = 1.0f;
-  cam.cy = 1.0f;
+  cam.fy = 120.0f;  // fx != fy, so a swapped focal length is caught
+  cam.cx = 1.5f;
+  cam.cy = 1.5f;
   cam.min_depth = 0.1f;
   cam.max_depth = 10.0f;
-  cam.width = 3;
-  cam.height = 3;
-  cam.cam_to_world = vr::Mat4f(1.0f);  // identity (glm default-init is garbage)
+  cam.width = 4;
+  cam.height = 4;
+  // 90 deg about Z (exact 0/+-1 entries -> no rounding to race the shader) + a
+  // translation. Column-major (glm): col0=(0,1,0,0), col1=(-1,0,0,0),
+  // col2=(0,0,1,0), col3=translate. (glm default-init is garbage.)
+  cam.cam_to_world =
+      vr::Mat4f(0.0f, 1.0f, 0.0f, 0.0f,    // column 0
+                -1.0f, 0.0f, 0.0f, 0.0f,   // column 1
+                0.0f, 0.0f, 1.0f, 0.0f,    // column 2
+                0.2f, -0.1f, 0.3f, 1.0f);  // column 3 (translate)
 
   const float kDepth = 1.0f;
-  std::vector<float> depth(9, 0.0f);
-  depth[1 * 3 + 1] = kDepth;  // pixel (u=1, v=1)
+  std::vector<float> depth(static_cast<std::size_t>(cam.width) * cam.height,
+                           kDepth);
 
   // Null input is rejected without touching the device.
   CHECK(!map.allocate_from_depth(nullptr, cam).ok());
@@ -154,10 +182,16 @@ int main() {
   CHECK(depth_fail.ok());
   CHECK(depth_fail.value() == 0);
 
-  // The one valid pixel -> world (0,0,kDepth) -> its block -> the band cube.
+  // want = the union of every valid pixel's band, unprojected on the HOST (so
+  // the shader's unprojection is what's under test, not just the band
+  // dilation).
   std::set<Coord> depth_want;
-  insert_cube(grid, vol::world_to_block(vr::Vec3f(0.0f, 0.0f, kDepth), grid),
-              depth_want);
+  for (std::uint32_t v = 0; v < cam.height; ++v) {
+    for (std::uint32_t u = 0; u < cam.width; ++u) {
+      insert_cube(grid, unproject_to_block(cam, grid, u, v, kDepth),
+                  depth_want);
+    }
+  }
 
   std::set<Coord> depth_got;
   if (collect_active(map, depth_got) != 0) return 1;
@@ -172,14 +206,23 @@ int main() {
   CHECK(depth_got2 == depth_want);
 
   // --- allocate-from-points -------------------------------------------------
-  // Fresh table; two world points far enough apart that their bands are
-  // disjoint, so the active set is the union of two full cubes.
+  // Fresh table. clear() must actually empty it -- assert that directly, since
+  // reusing the map below could otherwise let a no-op clear() slip through.
   CHECK(map.clear().ok());
+  vr::Result<std::vector<vol::BlockIndex>> after_clear =
+      map.compact_active_blocks();
+  CHECK(after_clear.ok() && after_clear.value().empty());
 
+  // World points, including a negative one so the points path also exercises
+  // the negative-bias voxel->block floor. Bands may overlap; the set union
+  // folds it.
   std::vector<vr::Vec3f> points = {vr::Vec3f(0.0f, 0.0f, 1.0f),
-                                   vr::Vec3f(0.0f, 1.0f, 0.0f)};
+                                   vr::Vec3f(0.0f, 1.0f, 0.0f),
+                                   vr::Vec3f(-0.03f, -0.02f, 0.5f)};
 
-  // Zero count is a no-op success.
+  // Null input rejected, zero count a no-op success -- both without touching
+  // the set (the depth path checks null too; cover points symmetrically).
+  CHECK(!map.allocate_from_points(nullptr, 1).ok());
   vr::Result<std::uint32_t> points_zero =
       map.allocate_from_points(points.data(), 0);
   CHECK(points_zero.ok() && points_zero.value() == 0);
