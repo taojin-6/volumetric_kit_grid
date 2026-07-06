@@ -34,8 +34,9 @@ namespace volumetric_kit::recon::volume {
 /// @ref ComputePipeline, @ref Device::submit_single_time). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
-/// byte-for-byte. This slice covers init + allocate-from-coords + remove +
-/// compact; resize/rehash, diagnostics, and depth/point allocation follow.
+/// byte-for-byte. Covers init, allocate-from-coords, remove, compact, and
+/// resize; diagnostics, the index-preserving GPU rehash, and depth/point
+/// allocation follow.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -50,7 +51,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The hash map, or a non-OK @ref Status if a buffer, pipeline, or
   /// the
   ///         init dispatch fails; @ref Status::Code::InvalidArgument for a grid
-  ///         with a non-positive dimension.
+  ///         that fails @ref VoxelGridParams::validate.
   static Result<VoxelHashMap> create(Device& device, Allocator& allocator,
                                      const VoxelGridParams& grid);
 
@@ -98,6 +99,21 @@ class VR_VOLUME_API VoxelHashMap {
   ///         the map is moved-from.
   Status clear();
 
+  /// @brief Grow the hash table to @p new_num_buckets buckets (must exceed the
+  ///        current count), preserving the active block set.
+  ///
+  /// Reuses the proven init / allocate / compact kernels: snapshot the active
+  /// coordinates, grow the buffers, re-init the larger table, and re-insert.
+  /// This reassigns block indices -- transparent for the coordinate set, but it
+  /// does not preserve per-block voxel data.
+  /// TODO(tsdf): a block-index-preserving GPU rehash once blocks carry SDF
+  /// data.
+  /// @param new_num_buckets  The new bucket count (> the current @ref grid).
+  /// @return OK on success, or a non-OK @ref Status:
+  ///         @ref Status::Code::InvalidArgument for a non-growing count;
+  ///         @ref Status::Code::OutOfMemory if the re-insert overflows.
+  Status resize(std::int32_t new_num_buckets);
+
   /// @brief Read the raw hash-entry slots back to the host.
   ///
   /// Low-level / diagnostic: exposes the on-device @ref HashEntry array (all
@@ -133,6 +149,11 @@ class VR_VOLUME_API VoxelHashMap {
                                          DescriptorSet& set,
                                          const ComputePipeline& pipeline);
 
+  /// Point every set at the persistent buffers (entries / heap / heap_counter /
+  /// bucket_mutex / fail_counts / compacted / active_count); run at create and
+  /// after a resize swaps them.
+  void write_persistent_bindings();
+
   // Borrowed (must outlive this). Pointers, not references, so a moved-from map
   // is left in a defined (empty) state.
   Device* device_ = nullptr;
@@ -145,8 +166,9 @@ class VR_VOLUME_API VoxelHashMap {
   Buffer heap_;
   Buffer heap_counter_;
   Buffer bucket_mutex_;
-  // Persistent scratch (fixed size for the map's lifetime, re-zeroed per call
-  // rather than re-allocated): allocate fail-counts, compaction output + count.
+  // Persistent scratch, re-zeroed per call rather than re-allocated: allocate
+  // fail-counts and the compaction counter are fixed; the compaction output
+  // tracks num_blocks, so resize() grows it with the rest.
   Buffer fail_counts_;
   Buffer compacted_;
   Buffer active_count_;
