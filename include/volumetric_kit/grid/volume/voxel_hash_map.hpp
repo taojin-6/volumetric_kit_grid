@@ -34,9 +34,8 @@ namespace volumetric_kit::recon::volume {
 /// @ref ComputePipeline, @ref Device::submit_single_time). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
-/// byte-for-byte. This first slice covers init + allocate-from-coords +
-/// compact; delete, resize/rehash, diagnostics, and depth/point allocation
-/// follow.
+/// byte-for-byte. This slice covers init + allocate-from-coords + remove +
+/// compact; resize/rehash, diagnostics, and depth/point allocation follow.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -77,6 +76,19 @@ class VR_VOLUME_API VoxelHashMap {
   ///         later slice.
   Result<std::uint32_t> allocate(const BlockIndex* coords, std::uint32_t count);
 
+  /// @brief Remove voxel blocks at the given block coordinates (only `coord` is
+  ///        read); absent coordinates are ignored. Returns each freed block to
+  ///        the heap.
+  ///
+  /// Must not run concurrently with @ref allocate — the heap requires alloc and
+  /// free in separate dispatches, which the fence between calls guarantees for
+  /// single-threaded use.
+  /// @param coords  The block coordinates to remove.
+  /// @param count   How many.
+  /// @return The number of removals that failed (0 = all done), or a non-OK
+  ///         @ref Status if a buffer or the dispatch fails.
+  Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count);
+
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
   /// @return The active blocks (order unspecified), or a non-OK @ref Status.
   Result<std::vector<BlockIndex>> compact_active_blocks();
@@ -111,6 +123,16 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
 
+  /// Shared body of @ref allocate and @ref remove: upload @p coords, run
+  /// @p pipeline (bound through @p set) over them, and read back the
+  /// `fail_counts_[0]` tally the coord kernels share (allocate and delete never
+  /// run in the same dispatch). @p op names the caller for diagnostics.
+  Result<std::uint32_t> run_coord_kernel(const char* op,
+                                         const BlockIndex* coords,
+                                         std::uint32_t count,
+                                         DescriptorSet& set,
+                                         const ComputePipeline& pipeline);
+
   // Borrowed (must outlive this). Pointers, not references, so a moved-from map
   // is left in a defined (empty) state.
   Device* device_ = nullptr;
@@ -135,13 +157,16 @@ class VR_VOLUME_API VoxelHashMap {
   DescriptorSetLayout init_layout_;
   DescriptorSetLayout allocate_layout_;
   DescriptorSetLayout compact_layout_;
+  DescriptorSetLayout delete_layout_;
   ComputePipeline init_pipeline_;
   ComputePipeline allocate_pipeline_;
   ComputePipeline compact_pipeline_;
+  ComputePipeline delete_pipeline_;
   DescriptorPool pool_;
   DescriptorSet init_set_;
   DescriptorSet allocate_set_;
   DescriptorSet compact_set_;
+  DescriptorSet delete_set_;
 };
 
 }  // namespace volumetric_kit::recon::volume

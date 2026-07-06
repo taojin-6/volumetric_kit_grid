@@ -60,9 +60,12 @@ target_include_directories(
 # files.
 include(vr_embed)
 vr_embed_shaders(
-  recon_volume SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_init.comp"
+  recon_volume
+  SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_init.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_coords.comp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact.comp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_delete_coords.comp")
 
 vr_target_warnings(recon_volume)
 

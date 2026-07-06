@@ -5,7 +5,7 @@
 // layouts (scalar block layout, byte-identical to the host POD structs in
 // volume/hash_types.hpp and volume/voxel_grid.hpp), the hash-table constants,
 // the push-constant block, and the spatial hash. #included by hash_init.comp,
-// hash_allocate_coords.comp, and hash_compact.comp.
+// hash_allocate_coords.comp, hash_compact.comp, and hash_delete_coords.comp.
 //
 // Buffer bindings and the SSBO-touching helpers are NOT here: GLSL buffer blocks
 // are global and cannot be passed to functions, so each kernel declares only the

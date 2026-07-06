@@ -1,0 +1,214 @@
+#version 450
+
+// Delete voxel blocks at the given block coordinates. Each thread takes one
+// coord and, if present, removes it from the hash table -- pulling a collision
+// successor up into a vacated primary slot, or splicing a slot out of the
+// overflow chain -- and returns its block to the free heap. Ported from
+// deleteBlocksByCoord (+ helpers) in hash_ops.metal.
+//
+// Concurrency mirrors the allocate kernel: per-bucket spin locks + a
+// memoryBarrierBuffer() release/acquire, and alloc and delete run in SEPARATE
+// dispatches (never concurrently), which the heap requires. One deliberate
+// divergence from the Metal source and the allocate kernel: there is NO
+// lock-free existence pre-check. Allocate may trust a lock-free "already
+// present" read because presence is monotonic within an alloc-only dispatch;
+// delete acts on presence, and a concurrent delete of a neighbouring chain node
+// can transiently make a still-present coord read absent, so trusting a
+// lock-free "absent" read would silently drop the delete. Every search here is
+// therefore authoritative under the bucket lock.
+//
+// Voxel-data clearing (the Metal path zeroed SDF/color on free) is deferred
+// until the tsdf tier lands the SDF block buffer -- there is no voxel data to
+// clear yet.
+// TODO: clear the freed block's SDF/color once the tsdf tier lands the SDF
+// buffer.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) coherent buffer Entries {
+  HashEntry entries[];
+};
+layout(set = 0, binding = 1) coherent buffer Heap { uint heap[]; };
+layout(set = 0, binding = 2) coherent buffer HeapCounter { uint heap_counter; };
+layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
+layout(set = 0, binding = 4, scalar) readonly buffer Coords {
+  BlockIndex coords[];
+};
+layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
+
+// --- helpers (self-contained; the allocate kernel has its own copies) ---
+
+bool try_lock_bucket(uint bucket, int max_retries) {
+  for (int a = 0; a < max_retries; ++a) {
+    if (atomicCompSwap(bucket_mutex[bucket], kFreeEntry, kLockEntry) ==
+        kFreeEntry) {
+      memoryBarrierBuffer();  // acquire
+      return true;
+    }
+  }
+  return false;
+}
+
+void unlock_bucket(uint bucket) {
+  memoryBarrierBuffer();  // release
+  atomicExchange(bucket_mutex[bucket], kFreeEntry);
+}
+
+// Return a freed block index to the heap. A block that cannot be returned is a
+// capacity leak, so both exits without an append bump fail_count[0] rather than
+// dropping the block silently: the entry is already gone from the table, but the
+// non-zero failure tells the host the dispatch was not clean.
+void append_heap(uint block_idx) {
+  uint old = atomicAdd(heap_counter, 0u);  // atomic load
+  for (int a = 0; a < kMaxHeapRetries; ++a) {
+    if (old >= uint(pc.grid.num_blocks)) {
+      atomicAdd(fail_count[0], 1u);  // heap full: we only free what we allocated
+      return;
+    }
+    uint prev = atomicCompSwap(heap_counter, old, old + 1u);
+    if (prev == old) {
+      heap[old] = block_idx;
+      return;
+    }
+    old = prev;
+  }
+  atomicAdd(fail_count[0], 1u);  // counter CAS starved under contention
+}
+
+uint block_of(int ptr) { return uint(ptr) / uint(pc.grid.voxels_per_block); }
+
+// Delete a primary-bucket entry. With a chain successor, pull it up into this
+// slot and free the successor's slot; otherwise clear the slot. The old block
+// goes back to the heap.
+bool delete_primary(uint target_slot, uint hash_bucket) {
+  uint bucket_size = uint(pc.grid.bucket_size);
+  uint total = uint(pc.grid.num_buckets) * bucket_size;
+
+  if (entries[target_slot].offset != kNoOffset) {
+    // Only the anchor slot carries a chain offset, so target_slot == idx_last
+    // here and (target_slot + offset) lands on the chain head.
+    uint next_idx = (target_slot + uint(entries[target_slot].offset)) % total;
+    uint next_bucket = next_idx / bucket_size;
+    bool different = next_bucket != hash_bucket;
+    if (different && !try_lock_bucket(next_bucket, kMaxSpinRetries)) {
+      return false;
+    }
+    int old_ptr = entries[target_slot].ptr;
+    entries[target_slot].ptr = entries[next_idx].ptr;
+    entries[target_slot].pos = entries[next_idx].pos;
+    entries[target_slot].offset = entries[next_idx].offset;
+    entries[next_idx].pos = ivec3(0);
+    entries[next_idx].offset = kNoOffset;
+    memoryBarrierBuffer();
+    atomicExchange(entries[next_idx].ptr, kFreeEntry);
+    append_heap(block_of(old_ptr));
+    if (different) {
+      unlock_bucket(next_bucket);
+    }
+  } else {
+    int saved_ptr = entries[target_slot].ptr;
+    entries[target_slot].pos = ivec3(0);
+    entries[target_slot].offset = kNoOffset;
+    memoryBarrierBuffer();
+    atomicExchange(entries[target_slot].ptr, kFreeEntry);
+    append_heap(block_of(saved_ptr));
+  }
+  return true;
+}
+
+// Delete an overflow-chain entry: clear it, free its block, and splice it out by
+// pointing its predecessor at its successor.
+bool delete_linked_list(uint target_idx, uint prev_idx, uint hash_bucket) {
+  uint bucket_size = uint(pc.grid.bucket_size);
+  uint target_bucket = target_idx / bucket_size;
+  bool different = target_bucket != hash_bucket;
+  if (different && !try_lock_bucket(target_bucket, kMaxSpinRetries)) {
+    return false;
+  }
+  int saved_ptr = entries[target_idx].ptr;
+  int curr_offset = entries[target_idx].offset;
+  entries[target_idx].pos = ivec3(0);
+  entries[target_idx].offset = kNoOffset;
+  memoryBarrierBuffer();
+  atomicExchange(entries[target_idx].ptr, kFreeEntry);
+  append_heap(block_of(saved_ptr));
+  entries[prev_idx].offset = curr_offset;  // splice out
+  if (different) {
+    unlock_bucket(target_bucket);
+  }
+  return true;
+}
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.arg) {
+    return;
+  }
+  ivec3 coord = coords[gid].coord;
+  uint bucket_size = uint(pc.grid.bucket_size);
+  uint total = uint(pc.grid.num_buckets) * bucket_size;
+  uint hash_bucket = computeHashPos(coord, pc.grid.num_buckets);
+  uint bucket_start = hash_bucket * bucket_size;
+
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    if (!try_lock_bucket(hash_bucket, kMaxSpinRetries)) {
+      continue;  // bucket busy -- retry
+    }
+
+    // Search the primary bucket under lock.
+    bool found_in_primary = false;
+    uint target_slot = 0u;
+    for (uint i = 0u; i < bucket_size; ++i) {
+      uint slot = bucket_start + i;
+      if (entries[slot].ptr != kFreeEntry && entries[slot].pos == coord) {
+        found_in_primary = true;
+        target_slot = slot;
+        break;
+      }
+    }
+
+    // `found` is true once the coord is located in the primary bucket OR the
+    // chain -- both delete paths can fail on a lost successor-bucket lock race,
+    // and either must retry, not be mistaken for "absent".
+    bool found = found_in_primary;
+    bool success = false;
+    if (found_in_primary) {
+      success = delete_primary(target_slot, hash_bucket);
+    } else {
+      // Search the collision chain under lock.
+      uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
+      uint prev = idx_last;
+      uint curr = 0u;
+      if (entries[prev].offset != kNoOffset) {
+        curr = (idx_last + uint(entries[prev].offset)) % total;
+        for (int it = 0; it < pc.grid.max_chain; ++it) {
+          if (entries[curr].ptr != kFreeEntry && entries[curr].pos == coord) {
+            found = true;
+            break;
+          }
+          if (entries[curr].offset == kNoOffset) {
+            break;
+          }
+          prev = curr;
+          curr = (idx_last + uint(entries[curr].offset)) % total;
+        }
+      }
+      if (found) {
+        success = delete_linked_list(curr, prev, hash_bucket);
+      }
+    }
+
+    unlock_bucket(hash_bucket);
+    // Done when the delete landed, or the coord is genuinely absent under the
+    // lock. A found-but-not-deleted coord (lost the successor-bucket lock race,
+    // primary or chain) retries; if every attempt loses it is counted below, so
+    // the host learns rather than the block silently staying resident.
+    if (success || !found) {
+      return;
+    }
+  }
+  atomicAdd(fail_count[0], 1u);
+}
