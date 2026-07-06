@@ -162,6 +162,11 @@ class VR_MESH_API MarchingCubes {
   // over-large grid cleanly instead of risking a device-lost.
   std::uint32_t max_workgroup_count_x_ = 0;
 
+  // Cached maxStorageBufferRange: the ceiling on a storage-buffer binding, so
+  // extract() can reject a worst-case vertex arena that would exceed it with a
+  // clean Status instead of an opaque allocation failure.
+  std::uint32_t max_storage_buffer_range_ = 0;
+
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0
   // of both kernels for every extract (the counterpart to the volume tier's
   // persistent bindings). The per-extract input / vertex / counter buffers

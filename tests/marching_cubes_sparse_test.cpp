@@ -74,9 +74,14 @@ vr::Vec3f grad_color(vr::Vec3f p) {
 }
 
 std::uint32_t pack_rgb(vr::Vec3f c) {
+  // RGB in the low three bytes, alpha 0xFF in the high byte -- matching the
+  // tsdf integrator's packUnorm4x8(vec4(rgb, 1.0)). An observed colour is then
+  // always non-zero, so 0 uniquely means "colour unobserved", the sentinel the
+  // sparse kernel falls back to white on.
   return static_cast<std::uint32_t>(c.x * 255.0f + 0.5f) |
          (static_cast<std::uint32_t>(c.y * 255.0f + 0.5f) << 8) |
-         (static_cast<std::uint32_t>(c.z * 255.0f + 0.5f) << 16);
+         (static_cast<std::uint32_t>(c.z * 255.0f + 0.5f) << 16) |
+         (0xFFu << 24);
 }
 
 // The dense reference field over the same kN^3 samples (x-fastest).
@@ -111,11 +116,14 @@ vol::VoxelGridParams sphere_grid_params() {
   return grid;
 }
 
-// Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (and,
-// when requested, the gradient colour) into every voxel of every allocated
-// block, addressed by the compacted BlockIndex::ptr + local. Returns false on
-// any device error.
-bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color) {
+// Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (at the
+// given @p weight) and, when requested, the gradient colour into every voxel of
+// every allocated block, addressed by the compacted BlockIndex::ptr + local. A
+// colour attribute left unwritten (with_color = false on a grid that carries
+// one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
+// false on any device error.
+bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
+                      float weight_value = 1.0f) {
   std::vector<vol::BlockIndex> blocks;
   for (int cz = 0; cz < kBlocks; ++cz) {
     for (int cy = 0; cy < kBlocks; ++cy) {
@@ -162,7 +170,7 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color) {
           const vr::Vec3f world = vr::Vec3f(voxel) * kH;
           const auto idx = static_cast<std::size_t>(b.ptr) + local;
           tptr[idx] = sphere_sdf(world);
-          wptr[idx] = 1.0f;
+          wptr[idx] = weight_value;
           if (cptr != nullptr) {
             cptr[idx] = pack_rgb(grad_color(world));
           }
@@ -321,6 +329,46 @@ int main() {
     CHECK(std::fabs(v.color.z - expected.z) < 0.005f);
     CHECK(v.color.w == 1.0f);
     CHECK(v.uv0.x < 0.0f && v.uv0.y < 0.0f);  // still the sentinel
+  }
+
+  // --- Weight gate: sub-threshold weight drops every cell --------------------
+  // The kernel skips any cell touching a voxel whose weight is at/below the
+  // unintegrated threshold. Fill the same sphere SDF but with weight 0 (the
+  // never-integrated state -- e.g. an allocated-but-unfused truncation-band
+  // block): the field still crosses the iso, yet every cell is gated out, so
+  // the mesh is empty. Proves the gate fires on-device (a dropped or mis-signed
+  // gate would mesh the sphere here); the sphere fill above only ever exercises
+  // the pass side.
+  vr::Result<vol::VoxelBlockGrid> zw_result = vol::VoxelBlockGrid::create(
+      device.value(), allocator.value(), gp, attrs, 2);
+  CHECK(zw_result.ok());
+  vol::VoxelBlockGrid zw_grid = std::move(zw_result).value();
+  CHECK(fill_sphere_grid(zw_grid, /*with_color=*/false, /*weight=*/0.0f));
+  vr::Result<mesh::Mesh> zw_mesh = extractor.extract(zw_grid, 0.0f);
+  CHECK(zw_mesh.ok());
+  CHECK(std::move(zw_mesh).value().empty());
+
+  // --- Colour sentinel: unobserved colour is white, not black ----------------
+  // A grid that carries a colour attribute whose colour was never written (all
+  // zero -- the integrator's "colour unobserved" sentinel, e.g. a separate
+  // colour camera that never saw these voxels) meshes with has_color enabled,
+  // yet every corner reads the 0 sentinel. Each vertex must fall back to opaque
+  // white rather than be dragged toward black (which is what an unguarded
+  // unpack of the 0 sentinel would produce). Geometry is unaffected, so the
+  // triangle count still matches the dense path.
+  vr::Result<vol::VoxelBlockGrid> sgrid_result = vol::VoxelBlockGrid::create(
+      device.value(), allocator.value(), gp, cattrs, 3);
+  CHECK(sgrid_result.ok());
+  vol::VoxelBlockGrid sgrid = std::move(sgrid_result).value();
+  CHECK(fill_sphere_grid(sgrid, /*with_color=*/false));  // colour left at 0
+  vr::Result<mesh::Mesh> sentinel_result = extractor.extract(sgrid, 0.0f);
+  CHECK(sentinel_result.ok());
+  const mesh::Mesh sentinel = std::move(sentinel_result).value();
+  CHECK(!sentinel.empty());
+  CHECK(sentinel.triangle_count() == dense_mesh.triangle_count());
+  for (const mesh::Vertex& v : sentinel.vertices) {
+    CHECK(v.color.x == 1.0f && v.color.y == 1.0f && v.color.z == 1.0f &&
+          v.color.w == 1.0f);
   }
 
   // --- Empty map -> empty mesh -----------------------------------------------

@@ -9,12 +9,10 @@
 // a neighbour is unallocated) rather than a device-side hash probe -- the
 // meshing dispatch is quiescent (no concurrent allocation), so the host resolves
 // the neighbourhood from the already-compacted active set and the kernel just
-// indexes it. The per-cell body (cube index, gradient normal, independent
-// triangles via an atomic bump counter, reversed winding, hybrid vertex colour)
-// mirrors marching_cubes.comp; only the corner sampling differs. Shared-vertex
-// dedup and the incremental block-mesh pool remain later slices, at which point
-// the per-cell body common to both kernels is worth factoring into a shared
-// include.
+// indexes it. Only the corner sampling below differs from the dense kernel; the
+// per-cell body (cube index, gradient normal, reversed-winding triangle
+// emission, hybrid vertex colour) is the shared marching_cubes_common.glsl both
+// kernels include.
 //
 // Voxels are node-centred (world = voxel * voxel_size), matching
 // tsdf_integrate.comp and volume/voxel_coords.hpp, so the extracted surface
@@ -24,6 +22,7 @@
 // uv0@40, 48 B).
 
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
 
@@ -81,28 +80,15 @@ layout(push_constant, scalar) uniform PushConstants {
   uint has_color;          // 0 = no color input; vertices get opaque white
 } pc;
 
-// Corner c's step (0/1 per axis) from the cell base.
-ivec3 cornerShift(int corner) {
-  return ivec3(corner_offset[corner * 3 + 0], corner_offset[corner * 3 + 1],
-               corner_offset[corner * 3 + 2]);
-}
-
 // Local voxel index within a block (x-fastest), matching the attribute layout
 // BlockIndex::ptr + local the tsdf integrator writes.
 int localIndex(ivec3 lc, int bs) {
   return lc.x + bs * (lc.y + bs * lc.z);
 }
 
-// Clamped iso-crossing ratio along the edge sa -> sb. Guards the near-tangent
-// case so the ratio stays finite (mirrors the prior engine's copysign(kEpsilon)
-// guard); clamp keeps the interpolant on the segment.
-float edgeRatio(float sa, float sb) {
-  float denom = sb - sa;
-  if (abs(denom) < 1e-6) {
-    denom = denom < 0.0 ? -1e-6 : 1e-6;
-  }
-  return clamp((pc.iso - sa) / denom, 0.0, 1.0);
-}
+// mcCornerShift / mcCellNormal / mcEmitCell + the near-tangent edge guard, over
+// the Tables / Vertices / Counter bindings declared above.
+#include "marching_cubes_common.glsl"
 
 void main() {
   int bs = pc.block_size;
@@ -128,9 +114,9 @@ void main() {
   vec3 corner_color[8];
   int cube_index = 0;
   for (int i = 0; i < 8; ++i) {
-    ivec3 c = base + cornerShift(i);  // 0..bs per axis
-    ivec3 octant = c / bs;            // 0 or 1 per axis (c <= bs)
-    ivec3 lc = c - octant * bs;       // residual within the neighbour block
+    ivec3 c = base + mcCornerShift(i);  // 0..bs per axis
+    ivec3 octant = c / bs;              // 0 or 1 per axis (c <= bs)
+    ivec3 lc = c - octant * bs;         // residual within the neighbour block
     int oi = octant.x + 2 * octant.y + 4 * octant.z;
     int nptr = neighbour_ptr[block_i * 8u + uint(oi)];
     if (nptr < 0) {
@@ -142,7 +128,15 @@ void main() {
     }
     sdf[i] = tsdf[si];
     if (pc.has_color != 0u) {
-      corner_color[i] = unpackUnorm4x8(color_attr[si]).rgb;
+      // color_attr == 0 is the tsdf integrator's "colour never observed"
+      // sentinel: a fused colour is packed with alpha 0xFF (packUnorm4x8 of
+      // vec4(rgb, 1.0)), so any observed colour is non-zero. A depth-integrated
+      // but colour-unobserved corner (weight > 0, colour 0 -- a separate colour
+      // camera, or a depth-only warmup) falls back to opaque white rather than
+      // dragging the interpolated vertex toward black, mirroring the
+      // integrator's first-observation-assigns anti-darkening rule.
+      uint packed = color_attr[si];
+      corner_color[i] = packed != 0u ? unpackUnorm4x8(packed).rgb : vec3(1.0);
     }
     if (sdf[i] < pc.iso) {
       cube_index |= (1 << i);
@@ -152,59 +146,12 @@ void main() {
     return;  // no sign change -> no surface in this cell
   }
 
-  // World positions of the cell corners: node convention (voxel * voxel_size),
-  // the whole cell anchored on the base block's coordinate so a boundary cell's
-  // far corners land at the neighbour's voxels without a second coord lookup.
+  // World positions anchor on the base block's global voxel with a zero origin
+  // (node convention), so a boundary cell's far corners land at the neighbour's
+  // voxels without a second coord lookup. The shared body computes the gradient
+  // normal, reverses winding, and interpolates colour.
   ivec3 base_voxel = block.coord * bs + base;
-
-  // One normal per cell from the 8-corner central-difference gradient (points
-  // toward increasing distance, i.e. outward); shared by the cell's vertices.
-  // The 1/(4*voxel_size) scale is dropped -- it cancels under normalization.
-  vec3 grad =
-      vec3((sdf[1] + sdf[2] + sdf[5] + sdf[6]) - (sdf[0] + sdf[3] + sdf[4] + sdf[7]),
-           (sdf[2] + sdf[3] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[4] + sdf[5]),
-           (sdf[4] + sdf[5] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[2] + sdf[3]));
-  float glen = length(grad);
-  vec3 normal = glen > 1e-6 ? grad / glen : vec3(0.0, 0.0, 1.0);
-
-  for (int t = 0; tri_table[cube_index * 16 + t] != -1; t += 3) {
-    vec3 p[3];
-    vec3 col[3];
-    for (int k = 0; k < 3; ++k) {
-      int edge = tri_table[cube_index * 16 + t + k];
-      int a = edge_to_vert[edge * 2 + 0];
-      int b = edge_to_vert[edge * 2 + 1];
-      float ratio = edgeRatio(sdf[a], sdf[b]);
-      vec3 pa = vec3(base_voxel + cornerShift(a)) * pc.voxel_size;
-      vec3 pb = vec3(base_voxel + cornerShift(b)) * pc.voxel_size;
-      p[k] = mix(pa, pb, ratio);
-      // Interpolate color at the same ratio; opaque white where no color input.
-      col[k] = pc.has_color != 0u
-                   ? mix(corner_color[a], corner_color[b], ratio)
-                   : vec3(1.0);
-    }
-    uint tri = atomicAdd(tri_count, 1u);
-    if (tri >= pc.capacity) {
-      // Past capacity: drop. tri_count ends above capacity so the host detects
-      // the overflow. Unreachable while capacity is 5 triangles per voxel.
-      return;
-    }
-    // Emit with reversed winding (0, 2, 1) so the front face (CCW) points along
-    // the outward gradient normal -- the orientation gfx expects. Color follows
-    // the same reversal so each vertex keeps its own edge's color; uv0 is the
-    // "use vertex color" sentinel until projective texturing runs.
-    uint vbase = tri * 3u;
-    vertices[vbase + 0u].position = p[0];
-    vertices[vbase + 1u].position = p[2];
-    vertices[vbase + 2u].position = p[1];
-    vertices[vbase + 0u].normal = normal;
-    vertices[vbase + 1u].normal = normal;
-    vertices[vbase + 2u].normal = normal;
-    vertices[vbase + 0u].color = vec4(col[0], 1.0);
-    vertices[vbase + 1u].color = vec4(col[2], 1.0);
-    vertices[vbase + 2u].color = vec4(col[1], 1.0);
-    vertices[vbase + 0u].uv0 = vec2(-1.0);
-    vertices[vbase + 1u].uv0 = vec2(-1.0);
-    vertices[vbase + 2u].uv0 = vec2(-1.0);
-  }
+  vec3 normal = mcCellNormal(sdf);
+  mcEmitCell(cube_index, sdf, corner_color, vec3(0.0), base_voxel, pc.voxel_size,
+             normal, pc.iso, pc.has_color, pc.capacity);
 }
