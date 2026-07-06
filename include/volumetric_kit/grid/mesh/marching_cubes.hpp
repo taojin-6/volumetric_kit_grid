@@ -19,6 +19,7 @@
 #include "volumetric_kit/recon/mesh/export.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::recon {
 class Device;
@@ -38,18 +39,20 @@ namespace volumetric_kit::recon::mesh {
 /// payload the `tsdf` tier will fill on the sparse hash map -- the weight gates
 /// out cells that touch an unintegrated voxel.
 ///
-/// @note This dense entry point is the path-proving building block. Extraction
-///       straight off the sparse @ref volume::VoxelHashMap (with cross-block
-///       neighbour sampling at block boundaries) is the next slice; the
-///       per-cell kernel is identical -- only the corner-sampling differs.
+/// @note This dense entry point is the path-proving building block; the
+///       @ref MarchingCubes::extract overload taking a @ref
+///       volume::VoxelBlockGrid meshes the real sparse volume (with cross-block
+///       neighbour sampling at block boundaries). The per-cell kernel is
+///       identical -- only the corner-sampling differs.
 struct DenseGrid {
   Vec3i dims{};             ///< Sample count per axis (cells = `dims - 1`).
   float voxel_size = 0.0f;  ///< Metres between adjacent samples.
   Vec3f origin{};           ///< World position of sample index `(0, 0, 0)`.
 };
 
-/// @brief Owns the marching-cubes compute pipeline and extracts an iso-surface
-///        from a @ref DenseGrid into a host @ref Mesh.
+/// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
+///        into a host @ref Mesh -- from a dense @ref DenseGrid or straight off
+///        a sparse @ref volume::VoxelBlockGrid.
 ///
 /// Built on the `core` compute foundation (@ref Allocator, @ref Buffer,
 /// @ref ComputeKernel, @ref Device::submit_single_time), mirroring the volume
@@ -111,6 +114,38 @@ class VR_MESH_API MarchingCubes {
                        const DenseGrid& grid, float iso = 0.0f,
                        const Vec3u8* colors = nullptr);
 
+  /// @brief Extract the @p iso iso-surface straight off a sparse
+  ///        @ref volume::VoxelBlockGrid, meshing every active block.
+  ///
+  /// Runs one invocation per voxel of each active block (the block iteration
+  /// the `tsdf` integrator uses), each voxel the base corner of one
+  /// marching-cubes cell. A cell on a block's `+face` reaches its far corners
+  /// into neighbouring blocks; those samples are resolved through a host-built
+  /// 2x2x2 neighbour table (this block plus its seven `+x/+y/+z` neighbours,
+  /// built from the compacted active set), so the kernel needs no device-side
+  /// hash probe. The per-cell body is identical to the dense @ref extract --
+  /// independent triangles, one gradient normal per cell, reversed winding, and
+  /// the same hybrid @ref Vertex::color / @ref Vertex::uv0 appearance.
+  ///
+  /// @param grid  A grid carrying `float` `tsdf` + `weight` attributes (see
+  /// @ref
+  ///              volume::VoxelBlockGrid::create); a voxel whose weight is at
+  ///              or below the unintegrated threshold drops any cell that
+  ///              touches it. When the grid also carries a `uint32` packed-RGB
+  ///              `color` attribute, each vertex's @ref Vertex::color is
+  ///              interpolated from it; otherwise vertices are opaque white.
+  ///              @ref Vertex::uv0 is always the `(-1, -1)` sentinel
+  ///              (projective texturing fills it in a later slice).
+  /// @param iso   The iso-value to extract (0 for a raw signed-distance field).
+  /// @return The extracted mesh (empty when no active block holds a surface),
+  /// or
+  ///         a non-OK @ref Status: @ref Status::Code::InvalidArgument for a
+  ///         moved-from extractor, a moved-from @p grid, or a grid missing a
+  ///         `float` `tsdf`/`weight` attribute, or if the active set is too
+  ///         large for a single 1-D dispatch; a backend error if a buffer or
+  ///         the dispatch fails.
+  Result<Mesh> extract(volume::VoxelBlockGrid& grid, float iso = 0.0f);
+
   /// @return `true` if this owns a live kernel (`false` when moved-from).
   bool valid() const noexcept { return kernel_.valid(); }
 
@@ -127,15 +162,28 @@ class VR_MESH_API MarchingCubes {
   // over-large grid cleanly instead of risking a device-lost.
   std::uint32_t max_workgroup_count_x_ = 0;
 
-  // The marching-cubes lookup tables, uploaded once and bound at set binding 0
-  // for every extract (the counterpart to the volume tier's persistent
-  // bindings). The per-extract sample / color / vertex / counter buffers track
-  // the grid and are (re)written into bindings 1-4 before each dispatch.
-  Buffer tables_;
+  // Cached maxStorageBufferRange: the ceiling on a storage-buffer binding, so
+  // extract() can reject a worst-case vertex arena that would exceed it with a
+  // clean Status instead of an opaque allocation failure.
+  std::uint32_t max_storage_buffer_range_ = 0;
 
-  // The single marching-cubes kernel -- its descriptor-set layout, pipeline,
-  // and the set allocated from the shared pool_ (see @ref ComputeKernel).
+  // The marching-cubes lookup tables, uploaded once and bound at set binding 0
+  // of both kernels for every extract (the counterpart to the volume tier's
+  // persistent bindings). The per-extract input / vertex / counter buffers
+  // track the grid and are (re)written into the remaining bindings before a
+  // dispatch.
+  Buffer tables_;
+  // A 1-element dummy bound to the sparse kernel's color slot when a grid
+  // carries no `color` attribute, so that descriptor stays valid (the has_color
+  // push flag tells the kernel to ignore it). Mirrors the tsdf integrator's
+  // color dummy.
+  Buffer color_dummy_;
+
+  // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
+  // and a set allocated from the shared pool_ (see @ref ComputeKernel): the
+  // dense analytic-grid path and the sparse VoxelBlockGrid path.
   ComputeKernel kernel_;
+  ComputeKernel kernel_sparse_;
   DescriptorPool pool_;
 };
 

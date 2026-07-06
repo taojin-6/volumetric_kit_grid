@@ -61,8 +61,9 @@ target_include_directories(
 # *.spv.hpp on a PRIVATE path), so recon_mesh ships the technique with no
 # runtime shader files.
 include(vr_embed)
-vr_embed_shaders(recon_mesh SHADERS
-                 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes.comp")
+vr_embed_shaders(
+  recon_mesh SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes_sparse.comp")
 
 vr_target_warnings(recon_mesh)
 
