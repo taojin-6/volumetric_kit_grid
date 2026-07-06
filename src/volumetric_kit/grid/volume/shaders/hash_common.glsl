@@ -66,3 +66,38 @@ uint computeHashPos(ivec3 block, int num_buckets) {
            (uint(block.z) * kHashPrimeZ);
   return h % uint(num_buckets);
 }
+
+// --- World <-> voxel <-> block transforms (mirror volume/voxel_coords.hpp).
+// Byte-identical arithmetic to the host so the block a sample owns agrees across
+// CPU / GLSL / CUDA: roundEven is the host's round-half-to-even, and the
+// negative bias reproduces its block indexing that floors toward -infinity. ---
+
+// World position (metres) -> nearest integer voxel coordinate (ties to even).
+ivec3 worldToVoxel(vec3 world, VoxelGridParams grid) {
+  return ivec3(roundEven(world / grid.voxel_size));
+}
+
+// Voxel coordinate -> the block that contains it. Integer division truncates
+// toward zero, so a negative axis is biased by block_size-1 first to floor
+// toward -infinity (voxel -1 belongs to block -1, spanning voxels -8..-1).
+ivec3 voxelToBlock(ivec3 voxel, VoxelGridParams grid) {
+  int bs = grid.block_size;
+  if (voxel.x < 0) voxel.x -= bs - 1;
+  if (voxel.y < 0) voxel.y -= bs - 1;
+  if (voxel.z < 0) voxel.z -= bs - 1;
+  return voxel / bs;
+}
+
+// World position (metres) -> the block that contains it.
+ivec3 worldToBlock(vec3 world, VoxelGridParams grid) {
+  return voxelToBlock(worldToVoxel(world, grid), grid);
+}
+
+// Truncation band half-width in blocks (>= 1): trunc_dist as a whole number of
+// blocks, so depth/point allocation can dilate a surface block into the band
+// the TSDF integrates. Matches host truncation_blocks (same float op order).
+int truncationBlocks(VoxelGridParams grid) {
+  float block_extent = float(grid.block_size) * grid.voxel_size;
+  int blocks = int(ceil(grid.trunc_dist / block_extent));
+  return blocks > 1 ? blocks : 1;
+}

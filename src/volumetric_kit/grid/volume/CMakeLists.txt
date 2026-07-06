@@ -64,6 +64,8 @@ vr_embed_shaders(
   SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_init.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_coords.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_depth.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_points.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_delete_coords.comp")
 
