@@ -314,6 +314,9 @@ class VR_VOLUME_API VoxelHashMap {
   // Persistent camera params for allocate_from_depth (bound at binding 6 of
   // depth_set_, rewritten per call); grid-independent, so not in the bundle.
   Buffer camera_params_;
+  // Persistent frustum planes for compact_active_blocks_in_frustum (bound at
+  // binding 3 of compact_frustum_set_, rewritten per call); grid-independent.
+  Buffer frustum_planes_;
 
   // One descriptor-set layout + pipeline per kernel; every persistent-buffer
   // binding is written once at create(), and only the genuinely per-call input

@@ -214,6 +214,11 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VR_ASSIGN(map.camera_params_,
             storage_buffer(allocator, sizeof(DepthCameraParams),
                            HostAccess::SequentialWrite));
+  // Frustum planes for compact_active_blocks_in_frustum: likewise a small
+  // (96 B), fixed-size buffer, persisted at binding 3 of compact_frustum_set_.
+  VR_ASSIGN(map.frustum_planes_,
+            storage_buffer(allocator, sizeof(FrustumPlanes),
+                           HostAccess::SequentialWrite));
 
   // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
   // 65535 guaranteed); cache it so every dispatch can reject an over-large
@@ -341,11 +346,13 @@ void VoxelHashMap::write_persistent_bindings() {
   compact_set_.write_storage_buffer(2, active_count_.handle(), 0,
                                     VK_WHOLE_SIZE);
   // Frustum compaction shares the compaction output + counter with plain
-  // compact; its planes buffer (binding 3) is written per call.
+  // compact; its planes buffer (binding 3) is persistent, rewritten per call.
   compact_frustum_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_frustum_set_.write_storage_buffer(1, compacted_.handle(), 0,
                                             VK_WHOLE_SIZE);
   compact_frustum_set_.write_storage_buffer(2, active_count_.handle(), 0,
+                                            VK_WHOLE_SIZE);
+  compact_frustum_set_.write_storage_buffer(3, frustum_planes_.handle(), 0,
                                             VK_WHOLE_SIZE);
 }
 
@@ -526,13 +533,9 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks_in_frustum: moved-from map");
   }
-  // The six planes are per-call; upload them to binding 3 of the frustum set.
-  VR_ASSIGN(Buffer planes_buf,
-            storage_buffer(*allocator_, sizeof(FrustumPlanes),
-                           HostAccess::SequentialWrite));
-  std::memcpy(planes_buf.mapped(), planes.data(), sizeof(FrustumPlanes));
-  compact_frustum_set_.write_storage_buffer(3, planes_buf.handle(), 0,
-                                            VK_WHOLE_SIZE);
+  // The six planes are per-call; rewrite them into the persistent buffer bound
+  // once at binding 3 of the frustum set (like camera_params_).
+  std::memcpy(frustum_planes_.mapped(), planes.data(), sizeof(FrustumPlanes));
   return collect_compacted(compact_frustum_pipeline_, compact_frustum_set_);
 }
 

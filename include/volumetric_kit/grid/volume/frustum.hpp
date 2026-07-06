@@ -24,6 +24,12 @@ namespace volumetric_kit::recon::volume {
 /// far. This is exactly what the `hash_compact_frustum` kernel reads (a
 /// `vec4[6]` under scalar block layout), so the array uploads verbatim.
 using FrustumPlanes = std::array<Vec4f, 6>;
+// Pin the upload size the way every other shader-fed POD does (2026-07-05 ABI):
+// the `vr::` backing type is swappable, so a Vec4f layout change is a compile
+// error here, not a silent frustum misprojection.
+static_assert(sizeof(FrustumPlanes) == 96,
+              "FrustumPlanes must be 96 bytes (6 x vec4) to match the shader's "
+              "scalar-layout vec4[6]");
 
 /// @brief Build the world-space frustum planes for a pinhole camera.
 ///
