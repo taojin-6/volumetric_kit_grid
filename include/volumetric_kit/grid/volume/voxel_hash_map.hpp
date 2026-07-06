@@ -82,6 +82,8 @@ class VR_VOLUME_API VoxelHashMap {
   Result<std::vector<BlockIndex>> compact_active_blocks();
 
   /// @brief Reset the table to empty (re-runs the init kernel).
+  /// @return An OK @ref Status, or a non-OK one if the init dispatch fails or
+  ///         the map is moved-from.
   Status clear();
 
   /// @brief Read the raw hash-entry slots back to the host.
@@ -90,6 +92,8 @@ class VR_VOLUME_API VoxelHashMap {
   /// slots, including free ones) so callers can inspect the table or verify the
   /// host<->shader layout. @ref compact_active_blocks is the normal way to get
   /// the active set.
+  /// @return All hash-entry slots (length `num_buckets * bucket_size`), or a
+  ///         non-OK @ref Status if the map is moved-from.
   Result<std::vector<HashEntry>> read_entries();
 
   /// @return The grid + hash-table parameters this map was built with.
@@ -104,22 +108,30 @@ class VR_VOLUME_API VoxelHashMap {
   /// clear).
   Status init_table();
 
+  /// @return The hash-table slot count, `num_buckets * bucket_size`.
+  std::uint32_t total_entries() const noexcept;
+
   // Borrowed (must outlive this). Pointers, not references, so a moved-from map
   // is left in a defined (empty) state.
   Device* device_ = nullptr;
   Allocator* allocator_ = nullptr;
   VoxelGridParams grid_{};
 
-  // Persistent device buffers (host-visible for this slice; device-local +
-  // staging is a follow-up perf pass).
+  // Persistent device buffers. TODO(volume): these are host-visible for this
+  // slice; a device-local + staging path is a follow-up perf pass.
   Buffer entries_;
   Buffer heap_;
   Buffer heap_counter_;
   Buffer bucket_mutex_;
+  // Persistent scratch (fixed size for the map's lifetime, re-zeroed per call
+  // rather than re-allocated): allocate fail-counts, compaction output + count.
+  Buffer fail_counts_;
+  Buffer compacted_;
+  Buffer active_count_;
 
-  // One descriptor-set layout + pipeline per kernel; the persistent-buffer
-  // bindings of each set are written once at create(), the per-call buffers
-  // (coords / compacted / counters) before each dispatch.
+  // One descriptor-set layout + pipeline per kernel; every persistent-buffer
+  // binding is written once at create(), and only the genuinely per-call coords
+  // buffer is (re)written before each allocate dispatch.
   DescriptorSetLayout init_layout_;
   DescriptorSetLayout allocate_layout_;
   DescriptorSetLayout compact_layout_;

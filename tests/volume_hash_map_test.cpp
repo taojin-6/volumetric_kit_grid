@@ -4,9 +4,11 @@
 // GPU test for the sparse voxel hash map: build a VoxelHashMap, allocate a
 // known set of block coordinates, compact the active set, and verify it
 // round-trips -- including reading the raw HashEntry slots back to prove the
-// host<->shader scalar-layout ABI matches on-device. This exercises the real
-// driver (MoltenVK on Apple, the NVIDIA ICD on the Linux CI box); it exits 0
-// (skip) where no device is present.
+// host<->shader scalar-layout ABI matches on-device (both `pos` @4 and, via a
+// second collision-forcing table, the overflow-chain `offset` @16). Also checks
+// distinct heap slots, idempotent re-alloc, clear, and move semantics. This
+// exercises the real driver (MoltenVK on Apple, the NVIDIA ICD on the Linux CI
+// box); it exits 0 (skip) where no device is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -117,16 +119,21 @@ int main() {
       map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
   CHECK(failures2.ok() && failures2.value() == 0);
 
-  // Compact: exactly the input set comes back.
+  // Compact: exactly the input set comes back, each block drawing a DISTINCT
+  // heap slot (a double-pop would hand two coords the same block -- both would
+  // still look valid/aligned, so the distinctness check is what catches it).
   vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
   CHECK(active.ok());
   CHECK(active.value().size() == want.size());
   std::set<Coord> got;
+  std::set<int> ptrs;
   for (const vol::BlockIndex& block : active.value()) {
     got.insert({block.coord.x, block.coord.y, block.coord.z});
     CHECK(block.ptr >= 0);
+    ptrs.insert(block.ptr);
   }
   CHECK(got == want);
+  CHECK(ptrs.size() == want.size());
 
   // Scalar-ABI round-trip: read the raw HashEntry slots. Exactly 27 are
   // occupied, each pos is one of the inputs (proving `pos` lands at the host
@@ -151,14 +158,118 @@ int main() {
   CHECK(after_clear.ok());
   CHECK(after_clear.value().empty());
 
-  // Move-only: the source is emptied, the destination lives.
+  // --- Overflow / collision-chain coverage ----------------------------------
+  // The 3x3x3 cube above scatters across 1024 buckets and never fills one, so
+  // it exercises neither the overflow chain nor the HashEntry.offset field (all
+  // offsets stay kNoOffset). Build a second map on a tiny table and force many
+  // coords into ONE bucket so the allocator spills into the collision chain,
+  // then prove the chain round-trips -- i.e. `offset` lands at its
+  // scalar-layout byte (@16) and is traversable on-device.
+  {
+    vol::VoxelGridParams cg{};
+    cg.voxel_size = 0.005f;
+    cg.block_size = 8;
+    cg.voxels_per_block = 512;
+    cg.trunc_dist = 0.04f;
+    cg.bucket_size = 4;
+    cg.num_buckets = 8;
+    cg.num_blocks = 32;  // bucket_size * num_buckets
+    cg.max_chain = 16;
+
+    vr::Result<vol::VoxelHashMap> cmap_result =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), cg);
+    CHECK(cmap_result.ok());
+    vol::VoxelHashMap cmap = std::move(cmap_result).value();
+
+    // Seven coords that all hash to bucket 0 -- more than bucket_size (4), so
+    // the surplus must spill into the overflow chain.
+    const std::size_t kColliding = 7;
+    std::vector<vol::BlockIndex> cc;
+    std::set<Coord> cwant;
+    for (int x = 1; cc.size() < kColliding; ++x) {
+      vr::Vec3i coord(x, 0, 0);
+      if (vol::hash_bucket(coord, cg.num_buckets) == 0u) {
+        vol::BlockIndex block{};
+        block.coord = coord;
+        cc.push_back(block);
+        cwant.insert({x, 0, 0});
+      }
+    }
+
+    // Insert one per dispatch: a single dispatch of same-bucket coords has all
+    // threads hammer bucket 0's spin lock (the known SIMD-contention failure
+    // mode, which legitimately returns failures for the host to retry), so
+    // build the chain deterministically one coord at a time -- exactly the
+    // cross-dispatch retry the host is expected to do.
+    for (const vol::BlockIndex& block : cc) {
+      vr::Result<std::uint32_t> f = cmap.allocate(&block, 1);
+      CHECK(f.ok() && f.value() == 0);
+    }
+
+    // All seven come back, each with a distinct heap block.
+    vr::Result<std::vector<vol::BlockIndex>> cactive =
+        cmap.compact_active_blocks();
+    CHECK(cactive.ok());
+    CHECK(cactive.value().size() == cwant.size());
+    std::set<Coord> cgot;
+    std::set<int> cptrs;
+    for (const vol::BlockIndex& block : cactive.value()) {
+      cgot.insert({block.coord.x, block.coord.y, block.coord.z});
+      cptrs.insert(block.ptr);
+    }
+    CHECK(cgot == cwant);
+    CHECK(cptrs.size() == cwant.size());
+
+    // The chain is real: bucket 0's anchor (the last slot of its bucket) must
+    // carry a non-zero offset -- i.e. the surplus coords were linked through
+    // HashEntry.offset, proving that field round-trips at its scalar-layout
+    // byte (the 3x3x3 test, all offsets kNoOffset, never checks it).
+    vr::Result<std::vector<vol::HashEntry>> centries = cmap.read_entries();
+    CHECK(centries.ok());
+    const std::size_t anchor =
+        static_cast<std::size_t>((0 + 1) * cg.bucket_size - 1);
+    CHECK(centries.value()[anchor].offset != vol::kNoOffset);
+
+    // Idempotent under collisions: re-inserting the same coords must find the
+    // chained ones by TRAVERSING `offset` and allocate nothing new -- if offset
+    // were mis-read the chained coords would be re-inserted and the count grow.
+    vr::Result<std::uint32_t> cfail2 =
+        cmap.allocate(cc.data(), static_cast<std::uint32_t>(cc.size()));
+    CHECK(cfail2.ok() && cfail2.value() == 0);
+    vr::Result<std::vector<vol::BlockIndex>> cactive2 =
+        cmap.compact_active_blocks();
+    CHECK(cactive2.ok());
+    CHECK(cactive2.value().size() == cwant.size());
+  }
+
+  // --- Move-only ------------------------------------------------------------
+  // Move-construct: the source empties, the destination lives.
   vol::VoxelHashMap moved = std::move(map);
   CHECK(!map.valid());
   CHECK(moved.valid());
 
+  // Move-assign over a live object: build a second map and move it over
+  // `moved`; the source empties and the destination stays live (its prior
+  // buffers / pipelines are released by the move-assign -- ASan turns a
+  // leak/double-free here into a failure).
+  vr::Result<vol::VoxelHashMap> other_result =
+      vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+  CHECK(other_result.ok());
+  vol::VoxelHashMap other = std::move(other_result).value();
+  moved = std::move(other);
+  CHECK(!other.valid());
+  CHECK(moved.valid());
+
+  // Self-move (laundered through a pointer to dodge -Wself-move under -Werror):
+  // the guarded move leaves the object intact.
+  vol::VoxelHashMap* alias = &moved;
+  moved = std::move(*alias);
+  CHECK(moved.valid());
+
   std::printf(
       "recon volume hash-map test passed: allocated + compacted %zu blocks; "
-      "HashEntry scalar-layout round-trip matched on-device\n",
+      "HashEntry scalar-layout round-trip (incl. overflow-chain offset) "
+      "matched on-device\n",
       want.size());
   return 0;
 }

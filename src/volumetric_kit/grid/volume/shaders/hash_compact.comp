@@ -4,8 +4,9 @@
 // append its (coord, ptr) to a contiguous output array via an atomic bump
 // counter. `pc.arg` is the output capacity -- writes past it are dropped but
 // still counted, so the host sees the true active count and can grow + retry.
-// One atomic per active entry (the subgroup-dedup optimization in
-// hash_ops.metal is deferred; this is the simple, correct form).
+// One atomic per active entry; this is the simple, correct form.
+// TODO(volume): port the subgroup-dedup compaction from hash_ops.metal (one
+// atomic bump per subgroup instead of per active entry).
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"

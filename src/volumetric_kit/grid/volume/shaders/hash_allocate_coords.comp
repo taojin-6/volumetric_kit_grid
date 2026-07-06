@@ -70,8 +70,13 @@ void unlock_bucket(uint bucket) {
   atomicExchange(bucket_mutex[bucket], kFreeEntry);
 }
 
-// Lock-free fast path. A stale read only costs a redundant lock + recheck below
-// (the under-lock path is authoritative), so plain reads are fine here.
+// Lock-free fast path. A stale read that MISSES only costs a redundant lock +
+// recheck below (the under-lock path is authoritative). A stale read that
+// false-MATCHES, though, returns "present" here WITHOUT that recheck and would
+// silently drop the coord -- so before comparing pos we issue an acquire
+// (memoryBarrierBuffer) that pairs with the insert's release barrier, so a
+// just-published ptr is never observed alongside a stale pos (which, being the
+// init sentinel, would false-match coord (0,0,0)).
 bool block_exists(ivec3 coord) {
   uint bucket_size = uint(pc.grid.bucket_size);
   uint total_entries = uint(pc.grid.num_buckets) * bucket_size;
@@ -80,15 +85,21 @@ bool block_exists(ivec3 coord) {
 
   for (uint i = 0u; i < bucket_size; ++i) {
     uint slot = bucket_start + i;
-    if (entries[slot].ptr != kFreeEntry && entries[slot].pos == coord) {
-      return true;
+    if (entries[slot].ptr != kFreeEntry) {
+      memoryBarrierBuffer();  // acquire: pos is current w.r.t. the ptr we saw
+      if (entries[slot].pos == coord) {
+        return true;
+      }
     }
   }
   uint idx_last = (bucket + 1u) * bucket_size - 1u;
   uint idx = idx_last;
   for (int it = 0; it < pc.grid.max_chain; ++it) {
-    if (entries[idx].ptr != kFreeEntry && entries[idx].pos == coord) {
-      return true;
+    if (entries[idx].ptr != kFreeEntry) {
+      memoryBarrierBuffer();  // acquire (see above)
+      if (entries[idx].pos == coord) {
+        return true;
+      }
     }
     int off = entries[idx].offset;
     if (off == kNoOffset) {

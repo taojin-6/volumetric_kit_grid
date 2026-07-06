@@ -69,11 +69,17 @@ Result<ComputePipeline> make_pipeline(VkDevice device, const unsigned char* spv,
   return ComputePipeline::create(device, desc);
 }
 
-// Record + submit one 1-D dispatch: bind, push, dispatch, and (when the host
-// will read the results) a barrier making the shader writes host-visible.
+// Record + submit one 1-D dispatch: bind, push, dispatch, then a memory barrier
+// that makes this kernel's SSBO writes available and visible to (a) the next
+// dispatch's shader reads/writes of the same persistent buffers and (b) a host
+// read of the mapped results. Each kernel runs as its own one-shot submission
+// (submit_single_time fully fence-waits it), and a fence orders execution but
+// is NOT a memory dependency -- so this barrier, not the fence, is what carries
+// cross-dispatch visibility (init -> allocate, allocate -> compact). Cheap: one
+// global barrier per already-serialized dispatch.
 Status dispatch(Device& device, const ComputePipeline& pipeline,
                 VkDescriptorSet set, const PushConstants& push,
-                std::uint32_t groups, bool host_read) {
+                std::uint32_t groups) {
   return device.submit_single_time([&](VkCommandBuffer cmd) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle());
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -81,15 +87,16 @@ Status dispatch(Device& device, const ComputePipeline& pipeline,
     vkCmdPushConstants(cmd, pipeline.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(PushConstants), &push);
     vkCmdDispatch(cmd, groups, 1, 1);
-    if (host_read) {
-      VkMemoryBarrier barrier{};
-      barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-      barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0,
-                           nullptr, 0, nullptr);
-    }
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(
+        cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+        &barrier, 0, nullptr, 0, nullptr);
   });
 }
 
@@ -109,24 +116,25 @@ Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
 
 Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
                                           const VoxelGridParams& grid) {
-  if (grid.block_size <= 0 || grid.voxels_per_block <= 0 ||
-      grid.bucket_size <= 0 || grid.num_buckets <= 0 || grid.num_blocks <= 0) {
-    return Status::invalid_argument(
-        "VoxelHashMap::create: every grid dimension must be positive");
-  }
+  // Validate the full grid contract -- positivity AND the product invariants
+  // (num_blocks == bucket_size*num_buckets, voxels_per_block == block_size^3)
+  // that the buffer sizing and the block-pointer math below rely on.
+  // VoxelGridParams::validate is the single source of truth for a usable grid.
+  VR_TRY(grid.validate());
+
   const VkDevice dev = device.handle();
-  const auto total_entries = static_cast<std::uint32_t>(grid.num_buckets) *
-                             static_cast<std::uint32_t>(grid.bucket_size);
-  const auto num_blocks = static_cast<std::uint32_t>(grid.num_blocks);
-  const auto num_buckets = static_cast<std::uint32_t>(grid.num_buckets);
 
   VoxelHashMap map;
   map.device_ = &device;
   map.allocator_ = &allocator;
   map.grid_ = grid;
 
+  const std::uint32_t total_entries = map.total_entries();
+  const auto num_blocks = static_cast<std::uint32_t>(grid.num_blocks);
+  const auto num_buckets = static_cast<std::uint32_t>(grid.num_buckets);
+
   // Persistent buffers (host-visible for this slice; device-local + staging is
-  // a follow-up perf pass).
+  // a follow-up perf pass -- see the header TODO).
   VR_ASSIGN(map.entries_,
             storage_buffer(allocator,
                            VkDeviceSize(total_entries) * sizeof(HashEntry)));
@@ -137,17 +145,31 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VR_ASSIGN(map.bucket_mutex_,
             storage_buffer(allocator,
                            VkDeviceSize(num_buckets) * sizeof(std::int32_t)));
+  // Persistent scratch: allocate fail-counts (4 uints) and the compaction
+  // output (num_blocks blocks) + its counter. Fixed size, re-zeroed per call
+  // rather than re-allocated.
+  VR_ASSIGN(map.fail_counts_,
+            storage_buffer(allocator, 4 * sizeof(std::uint32_t)));
+  VR_ASSIGN(map.compacted_, storage_buffer(allocator, VkDeviceSize(num_blocks) *
+                                                          sizeof(BlockIndex)));
+  VR_ASSIGN(map.active_count_,
+            storage_buffer(allocator, sizeof(std::uint32_t)));
 
   // One layout + pipeline per kernel (bindings match each shader's set 0).
   const auto init_b = storage_bindings(4);
   VR_ASSIGN(map.init_layout_,
-            DescriptorSetLayout::create(dev, init_b.data(), 4));
+            DescriptorSetLayout::create(
+                dev, init_b.data(), static_cast<std::uint32_t>(init_b.size())));
   const auto alloc_b = storage_bindings(6);
-  VR_ASSIGN(map.allocate_layout_,
-            DescriptorSetLayout::create(dev, alloc_b.data(), 6));
+  VR_ASSIGN(
+      map.allocate_layout_,
+      DescriptorSetLayout::create(dev, alloc_b.data(),
+                                  static_cast<std::uint32_t>(alloc_b.size())));
   const auto compact_b = storage_bindings(3);
-  VR_ASSIGN(map.compact_layout_,
-            DescriptorSetLayout::create(dev, compact_b.data(), 3));
+  VR_ASSIGN(
+      map.compact_layout_,
+      DescriptorSetLayout::create(
+          dev, compact_b.data(), static_cast<std::uint32_t>(compact_b.size())));
 
   VR_ASSIGN(map.init_pipeline_, make_pipeline(dev, vr_hash_init_comp_spv,
                                               vr_hash_init_comp_spv_size,
@@ -160,18 +182,20 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
                                                  vr_hash_compact_comp_spv_size,
                                                  map.compact_layout_.handle()));
 
-  // Pool: 3 sets, 4 + 6 + 3 = 13 storage-buffer descriptors.
+  // Pool: one set per kernel, sized to the exact descriptor total.
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = 13;
+  pool_size.descriptorCount = static_cast<std::uint32_t>(
+      init_b.size() + alloc_b.size() + compact_b.size());
   VR_ASSIGN(map.pool_, DescriptorPool::create(dev, &pool_size, 1, 3));
   VR_ASSIGN(map.init_set_, map.pool_.allocate(map.init_layout_.handle()));
   VR_ASSIGN(map.allocate_set_,
             map.pool_.allocate(map.allocate_layout_.handle()));
   VR_ASSIGN(map.compact_set_, map.pool_.allocate(map.compact_layout_.handle()));
 
-  // Persistent-buffer bindings, written once; the per-call buffers (coords,
-  // fail-count, compacted, count) are written before each dispatch.
+  // Bind every persistent buffer once. Bindings 0-3 are identical across the
+  // init and allocate sets; allocate additionally uses binding 5 (fail-counts)
+  // and, per call, binding 4 (coords). Compact uses entries + output + count.
   const VkBuffer entries = map.entries_.handle();
   const VkBuffer heap = map.heap_.handle();
   const VkBuffer counter = map.heap_counter_.handle();
@@ -182,21 +206,30 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(3, mutex, 0, VK_WHOLE_SIZE);
   }
+  map.allocate_set_.write_storage_buffer(5, map.fail_counts_.handle(), 0,
+                                         VK_WHOLE_SIZE);
   map.compact_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
+  map.compact_set_.write_storage_buffer(1, map.compacted_.handle(), 0,
+                                        VK_WHOLE_SIZE);
+  map.compact_set_.write_storage_buffer(2, map.active_count_.handle(), 0,
+                                        VK_WHOLE_SIZE);
 
   VR_TRY(map.init_table());
   return map;
 }
 
+std::uint32_t VoxelHashMap::total_entries() const noexcept {
+  return static_cast<std::uint32_t>(grid_.num_buckets) *
+         static_cast<std::uint32_t>(grid_.bucket_size);
+}
+
 Status VoxelHashMap::init_table() {
-  const auto total_entries = static_cast<std::uint32_t>(grid_.num_buckets) *
-                             static_cast<std::uint32_t>(grid_.bucket_size);
   const std::uint32_t widest =
-      std::max({total_entries, static_cast<std::uint32_t>(grid_.num_blocks),
+      std::max({total_entries(), static_cast<std::uint32_t>(grid_.num_blocks),
                 static_cast<std::uint32_t>(grid_.num_buckets)});
   const PushConstants push{grid_, 0};
   return dispatch(*device_, init_pipeline_, init_set_.handle(), push,
-                  group_count(widest), /*host_read=*/false);
+                  group_count(widest));
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
@@ -211,6 +244,8 @@ Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
     return Status::invalid_argument("VoxelHashMap::allocate: coords is null");
   }
 
+  // Coords are genuinely per-call (variable count), so this buffer is
+  // transient; fail_counts_ is persistent and just re-zeroed here.
   VR_ASSIGN(
       Buffer coords_buf,
       storage_buffer(*allocator_, VkDeviceSize(count) * sizeof(BlockIndex),
@@ -218,20 +253,19 @@ Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
   std::memcpy(coords_buf.mapped(), coords,
               static_cast<std::size_t>(count) * sizeof(BlockIndex));
 
-  // fail_count[4]: [0]=total, [1]=lock, [2]=chain, [3]=heap. Zeroed each call.
-  VR_ASSIGN(Buffer fail_buf,
-            storage_buffer(*allocator_, 4 * sizeof(std::uint32_t)));
-  std::memset(fail_buf.mapped(), 0, 4 * sizeof(std::uint32_t));
-
+  // fail_counts_[4]: [0]=total, [1]=lock, [2]=chain, [3]=heap. Zeroed each
+  // call.
+  std::memset(fail_counts_.mapped(), 0, 4 * sizeof(std::uint32_t));
   allocate_set_.write_storage_buffer(4, coords_buf.handle(), 0, VK_WHOLE_SIZE);
-  allocate_set_.write_storage_buffer(5, fail_buf.handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid_, count};
   VR_TRY(dispatch(*device_, allocate_pipeline_, allocate_set_.handle(), push,
-                  group_count(count), /*host_read=*/true));
+                  group_count(count)));
 
   std::uint32_t failures = 0;
-  std::memcpy(&failures, fail_buf.mapped(), sizeof(std::uint32_t));
+  std::memcpy(&failures, fail_counts_.mapped(), sizeof(std::uint32_t));
+  // TODO(volume): on non-zero failures, grow the table (resize/rehash) and
+  // retry the failed coords -- lands with the resize slice.
   return failures;
 }
 
@@ -240,31 +274,21 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
-  // The active set can be at most num_blocks entries; size the output to that
-  // upper bound so no grow/retry is needed for this slice.
+  // The active set is at most num_blocks entries; the persistent output buffer
+  // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
-  VR_ASSIGN(
-      Buffer out_buf,
-      storage_buffer(*allocator_, VkDeviceSize(capacity) * sizeof(BlockIndex)));
-  VR_ASSIGN(Buffer count_buf,
-            storage_buffer(*allocator_, sizeof(std::uint32_t)));
-  std::memset(count_buf.mapped(), 0, sizeof(std::uint32_t));
+  std::memset(active_count_.mapped(), 0, sizeof(std::uint32_t));
 
-  compact_set_.write_storage_buffer(1, out_buf.handle(), 0, VK_WHOLE_SIZE);
-  compact_set_.write_storage_buffer(2, count_buf.handle(), 0, VK_WHOLE_SIZE);
-
-  const auto total_entries = static_cast<std::uint32_t>(grid_.num_buckets) *
-                             static_cast<std::uint32_t>(grid_.bucket_size);
   const PushConstants push{grid_, capacity};
   VR_TRY(dispatch(*device_, compact_pipeline_, compact_set_.handle(), push,
-                  group_count(total_entries), /*host_read=*/true));
+                  group_count(total_entries())));
 
   std::uint32_t count = 0;
-  std::memcpy(&count, count_buf.mapped(), sizeof(std::uint32_t));
+  std::memcpy(&count, active_count_.mapped(), sizeof(std::uint32_t));
   count = std::min(count, capacity);
   std::vector<BlockIndex> active(count);
   if (count > 0) {
-    std::memcpy(active.data(), out_buf.mapped(),
+    std::memcpy(active.data(), compacted_.mapped(),
                 static_cast<std::size_t>(count) * sizeof(BlockIndex));
   }
   return active;
@@ -282,11 +306,10 @@ Result<std::vector<HashEntry>> VoxelHashMap::read_entries() {
     return Status::invalid_argument(
         "VoxelHashMap::read_entries: moved-from map");
   }
-  const auto total_entries = static_cast<std::uint32_t>(grid_.num_buckets) *
-                             static_cast<std::uint32_t>(grid_.bucket_size);
-  std::vector<HashEntry> entries(total_entries);
+  const std::uint32_t total = total_entries();
+  std::vector<HashEntry> entries(total);
   std::memcpy(entries.data(), entries_.mapped(),
-              static_cast<std::size_t>(total_entries) * sizeof(HashEntry));
+              static_cast<std::size_t>(total) * sizeof(HashEntry));
   return entries;
 }
 
