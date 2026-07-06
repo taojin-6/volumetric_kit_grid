@@ -1,0 +1,210 @@
+#version 450
+
+// Marching-cubes extraction straight off the sparse VoxelBlockGrid: one
+// invocation per voxel of each active block (the same block iteration the tsdf
+// integrator uses), where each voxel is the base corner of one marching-cubes
+// cell. A cell whose base sits at a block's +face reaches its far corners into
+// neighbouring blocks, so corner samples are fetched through a host-built 2x2x2
+// neighbour lookup table (this block plus its seven +x/+y/+z neighbours, -1 when
+// a neighbour is unallocated) rather than a device-side hash probe -- the
+// meshing dispatch is quiescent (no concurrent allocation), so the host resolves
+// the neighbourhood from the already-compacted active set and the kernel just
+// indexes it. The per-cell body (cube index, gradient normal, independent
+// triangles via an atomic bump counter, reversed winding, hybrid vertex colour)
+// mirrors marching_cubes.comp; only the corner sampling differs. Shared-vertex
+// dedup and the incremental block-mesh pool remain later slices, at which point
+// the per-cell body common to both kernels is worth factoring into a shared
+// include.
+//
+// Voxels are node-centred (world = voxel * voxel_size), matching
+// tsdf_integrate.comp and volume/voxel_coords.hpp, so the extracted surface
+// aligns with the fused field. BlockIndex / Vertex are read/written through
+// scalar block layout to match the host structs byte-for-byte (BlockIndex:
+// ivec3 coord@0, ptr@12, 16 B; mesh Vertex: position@0, normal@12, color@24,
+// uv0@40, 48 B).
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+// One active block: its block coordinate + the base index of its voxel run in
+// the attribute arrays (mirrors volume::BlockIndex).
+struct BlockIndex {
+  ivec3 coord;
+  int ptr;
+};
+
+// One mesh vertex (mirrors mesh::Vertex).
+struct Vertex {
+  vec3 position;
+  vec3 normal;
+  vec4 color;
+  vec2 uv0;
+};
+
+// The marching-cubes tables (mirrors mesh::McTables): the flattened 256x16
+// triangle table, the 8 corner offsets, and the 12 edge-endpoint pairs.
+layout(set = 0, binding = 0, scalar) readonly buffer Tables {
+  int tri_table[4096];    // [256][16]
+  int corner_offset[24];  // [8][3]
+  int edge_to_vert[24];   // [12][2]
+};
+// The compacted active blocks (one invocation group per block) and, parallel to
+// it, each block's 2x2x2 neighbour pointers: neighbour_ptr[block * 8 + octant],
+// octant = ox + 2*oy + 4*oz for ox/oy/oz in {0, 1}. A -1 pointer marks an
+// unallocated neighbour (the cell is skipped).
+layout(set = 0, binding = 1, scalar) readonly buffer Active {
+  BlockIndex active_blocks[];
+};
+layout(set = 0, binding = 2, scalar) readonly buffer Neighbours {
+  int neighbour_ptr[];
+};
+// Per-voxel SDF + integration weight (the tsdf tier's attributes), addressed by
+// BlockIndex::ptr + local. Color is the packed-RGB attribute (low three bytes,
+// unpackUnorm4x8 -> .rgb) read only when pc.has_color != 0 (else a dummy binds).
+layout(set = 0, binding = 3, scalar) readonly buffer Tsdf { float tsdf[]; };
+layout(set = 0, binding = 4, scalar) readonly buffer Weight { float weight[]; };
+layout(set = 0, binding = 5, scalar) readonly buffer Color { uint color_attr[]; };
+layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
+  Vertex vertices[];
+};
+layout(set = 0, binding = 7) buffer Counter { uint tri_count; };
+
+layout(push_constant, scalar) uniform PushConstants {
+  int block_size;          // voxels per block edge
+  int voxels_per_block;    // block_size^3
+  float voxel_size;        // metres between adjacent voxels
+  float iso;               // iso-value to extract
+  uint num_active_blocks;  // active_blocks length
+  uint capacity;           // max triangles the vertex buffer holds
+  float weight_threshold;  // corners below this weight invalidate the cell
+  uint has_color;          // 0 = no color input; vertices get opaque white
+} pc;
+
+// Corner c's step (0/1 per axis) from the cell base.
+ivec3 cornerShift(int corner) {
+  return ivec3(corner_offset[corner * 3 + 0], corner_offset[corner * 3 + 1],
+               corner_offset[corner * 3 + 2]);
+}
+
+// Local voxel index within a block (x-fastest), matching the attribute layout
+// BlockIndex::ptr + local the tsdf integrator writes.
+int localIndex(ivec3 lc, int bs) {
+  return lc.x + bs * (lc.y + bs * lc.z);
+}
+
+// Clamped iso-crossing ratio along the edge sa -> sb. Guards the near-tangent
+// case so the ratio stays finite (mirrors the prior engine's copysign(kEpsilon)
+// guard); clamp keeps the interpolant on the segment.
+float edgeRatio(float sa, float sb) {
+  float denom = sb - sa;
+  if (abs(denom) < 1e-6) {
+    denom = denom < 0.0 ? -1e-6 : 1e-6;
+  }
+  return clamp((pc.iso - sa) / denom, 0.0, 1.0);
+}
+
+void main() {
+  int bs = pc.block_size;
+  uint vpb = uint(pc.voxels_per_block);
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.num_active_blocks * vpb) {
+    return;
+  }
+  uint block_i = gid / vpb;
+  uint local = gid % vpb;
+  BlockIndex block = active_blocks[block_i];
+
+  // The cell base voxel, in this block's local frame (x-fastest, as tsdf wrote).
+  ivec3 base = ivec3(int(local % uint(bs)), int((local / uint(bs)) % uint(bs)),
+                     int(local / uint(bs * bs)));
+
+  // Gather the eight corners. A corner at local coordinate bs on an axis spills
+  // into the +neighbour block on that axis: octant selects which of the 2x2x2
+  // neighbourhood holds it, and the residual (coord % bs) indexes within it. A
+  // corner in an unallocated neighbour (ptr < 0) or an unintegrated voxel
+  // (weight below threshold) drops the whole cell -- no extrapolation.
+  float sdf[8];
+  vec3 corner_color[8];
+  int cube_index = 0;
+  for (int i = 0; i < 8; ++i) {
+    ivec3 c = base + cornerShift(i);  // 0..bs per axis
+    ivec3 octant = c / bs;            // 0 or 1 per axis (c <= bs)
+    ivec3 lc = c - octant * bs;       // residual within the neighbour block
+    int oi = octant.x + 2 * octant.y + 4 * octant.z;
+    int nptr = neighbour_ptr[block_i * 8u + uint(oi)];
+    if (nptr < 0) {
+      return;  // neighbour block not allocated: no surface to close here
+    }
+    uint si = uint(nptr) + uint(localIndex(lc, bs));
+    if (weight[si] < pc.weight_threshold) {
+      return;  // unintegrated voxel
+    }
+    sdf[i] = tsdf[si];
+    if (pc.has_color != 0u) {
+      corner_color[i] = unpackUnorm4x8(color_attr[si]).rgb;
+    }
+    if (sdf[i] < pc.iso) {
+      cube_index |= (1 << i);
+    }
+  }
+  if (cube_index == 0 || cube_index == 255) {
+    return;  // no sign change -> no surface in this cell
+  }
+
+  // World positions of the cell corners: node convention (voxel * voxel_size),
+  // the whole cell anchored on the base block's coordinate so a boundary cell's
+  // far corners land at the neighbour's voxels without a second coord lookup.
+  ivec3 base_voxel = block.coord * bs + base;
+
+  // One normal per cell from the 8-corner central-difference gradient (points
+  // toward increasing distance, i.e. outward); shared by the cell's vertices.
+  // The 1/(4*voxel_size) scale is dropped -- it cancels under normalization.
+  vec3 grad =
+      vec3((sdf[1] + sdf[2] + sdf[5] + sdf[6]) - (sdf[0] + sdf[3] + sdf[4] + sdf[7]),
+           (sdf[2] + sdf[3] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[4] + sdf[5]),
+           (sdf[4] + sdf[5] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[2] + sdf[3]));
+  float glen = length(grad);
+  vec3 normal = glen > 1e-6 ? grad / glen : vec3(0.0, 0.0, 1.0);
+
+  for (int t = 0; tri_table[cube_index * 16 + t] != -1; t += 3) {
+    vec3 p[3];
+    vec3 col[3];
+    for (int k = 0; k < 3; ++k) {
+      int edge = tri_table[cube_index * 16 + t + k];
+      int a = edge_to_vert[edge * 2 + 0];
+      int b = edge_to_vert[edge * 2 + 1];
+      float ratio = edgeRatio(sdf[a], sdf[b]);
+      vec3 pa = vec3(base_voxel + cornerShift(a)) * pc.voxel_size;
+      vec3 pb = vec3(base_voxel + cornerShift(b)) * pc.voxel_size;
+      p[k] = mix(pa, pb, ratio);
+      // Interpolate color at the same ratio; opaque white where no color input.
+      col[k] = pc.has_color != 0u
+                   ? mix(corner_color[a], corner_color[b], ratio)
+                   : vec3(1.0);
+    }
+    uint tri = atomicAdd(tri_count, 1u);
+    if (tri >= pc.capacity) {
+      // Past capacity: drop. tri_count ends above capacity so the host detects
+      // the overflow. Unreachable while capacity is 5 triangles per voxel.
+      return;
+    }
+    // Emit with reversed winding (0, 2, 1) so the front face (CCW) points along
+    // the outward gradient normal -- the orientation gfx expects. Color follows
+    // the same reversal so each vertex keeps its own edge's color; uv0 is the
+    // "use vertex color" sentinel until projective texturing runs.
+    uint vbase = tri * 3u;
+    vertices[vbase + 0u].position = p[0];
+    vertices[vbase + 1u].position = p[2];
+    vertices[vbase + 2u].position = p[1];
+    vertices[vbase + 0u].normal = normal;
+    vertices[vbase + 1u].normal = normal;
+    vertices[vbase + 2u].normal = normal;
+    vertices[vbase + 0u].color = vec4(col[0], 1.0);
+    vertices[vbase + 1u].color = vec4(col[2], 1.0);
+    vertices[vbase + 2u].color = vec4(col[1], 1.0);
+    vertices[vbase + 0u].uv0 = vec2(-1.0);
+    vertices[vbase + 1u].uv0 = vec2(-1.0);
+    vertices[vbase + 2u].uv0 = vec2(-1.0);
+  }
+}
