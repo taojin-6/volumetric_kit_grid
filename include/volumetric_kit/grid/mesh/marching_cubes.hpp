@@ -59,7 +59,11 @@ struct DenseGrid {
 /// counter -- the simple, correct form; shared-edge dedup and an incremental
 /// block-mesh pool are later slices. Normals come from the SDF gradient -- one
 /// central difference over the cell's eight corners, shared by that cell's
-/// vertices -- so they point outward (increasing distance).
+/// vertices -- so they point outward (increasing distance). Each vertex also
+/// carries the hybrid appearance the renderer consumes: a @ref Vertex::color
+/// interpolated from the optional per-sample color input (opaque white when
+/// absent), and a @ref Vertex::uv0 left at the `(-1, -1)` sentinel -- the
+/// projective-texturing pass (a later slice) fills real atlas coordinates.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -90,13 +94,22 @@ class VR_MESH_API MarchingCubes {
   /// @param grid     The grid dimensions, spacing, and world origin.
   /// @param iso      The iso-value to extract (0 for a raw signed-distance
   ///                 field).
+  /// @param colors   Optional per-sample RGB, parallel to @p samples (same
+  /// count
+  ///                 and x-fastest layout) -- the color the `tsdf` tier fuses
+  ///                 into the volume. When non-null, each vertex's
+  ///                 @ref Vertex::color is interpolated from it at the edge
+  ///                 crossing; when null, vertices are opaque white.
+  ///                 @ref Vertex::uv0 is always the `(-1, -1)` sentinel
+  ///                 (projective texturing fills it in a later slice).
   /// @return The extracted mesh (empty when the surface misses the grid), or a
   ///         non-OK @ref Status: @ref Status::Code::InvalidArgument for a
   ///         moved-from extractor, a null/mis-sized sample array, or a grid
   ///         that is not at least `2x2x2` samples; a backend error if a buffer
   ///         or the dispatch fails.
   Result<Mesh> extract(const volume::Voxel* samples, std::size_t count,
-                       const DenseGrid& grid, float iso = 0.0f);
+                       const DenseGrid& grid, float iso = 0.0f,
+                       const Vec3u8* colors = nullptr);
 
   /// @return `true` if this owns a live kernel (`false` when moved-from).
   bool valid() const noexcept { return kernel_.valid(); }
@@ -116,8 +129,8 @@ class VR_MESH_API MarchingCubes {
 
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0
   // for every extract (the counterpart to the volume tier's persistent
-  // bindings). The per-extract sample / vertex / counter buffers track the grid
-  // and are (re)written into bindings 1-3 before each dispatch.
+  // bindings). The per-extract sample / color / vertex / counter buffers track
+  // the grid and are (re)written into bindings 1-4 before each dispatch.
   Buffer tables_;
 
   // The single marching-cubes kernel -- its descriptor-set layout, pipeline,
