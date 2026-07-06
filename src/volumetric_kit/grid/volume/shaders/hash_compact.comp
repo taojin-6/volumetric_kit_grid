@@ -1,0 +1,38 @@
+#version 450
+
+// Compact the active blocks: scan every hash entry, and for each occupied one
+// append its (coord, ptr) to a contiguous output array via an atomic bump
+// counter. `pc.arg` is the output capacity -- writes past it are dropped but
+// still counted, so the host sees the true active count and can grow + retry.
+// One atomic per active entry (the subgroup-dedup optimization in
+// hash_ops.metal is deferred; this is the simple, correct form).
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer Entries {
+  HashEntry entries[];
+};
+layout(set = 0, binding = 1, scalar) writeonly buffer Output {
+  BlockIndex active_blocks[];
+};
+layout(set = 0, binding = 2) buffer Count { uint active_count; };
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint total = uint(pc.grid.num_buckets * pc.grid.bucket_size);
+  if (gid >= total) {
+    return;
+  }
+
+  int ptr = entries[gid].ptr;
+  if (ptr != kFreeEntry && ptr != kLockEntry) {
+    uint index = atomicAdd(active_count, 1u);
+    if (index < pc.arg) {
+      active_blocks[index].coord = entries[gid].pos;
+      active_blocks[index].ptr = ptr;
+    }
+  }
+}

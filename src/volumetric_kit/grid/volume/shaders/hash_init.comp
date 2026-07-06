@@ -1,0 +1,40 @@
+#version 450
+
+// Initialize the hash table on the device: every entry free, the heap filled
+// with all block indices, the heap counter at capacity, and every bucket mutex
+// unlocked. One dispatch covers all three arrays (each thread does the slice its
+// index falls in). Mirrors initHashTable in hash_ops.metal.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) writeonly buffer Entries {
+  HashEntry entries[];
+};
+layout(set = 0, binding = 1) writeonly buffer Heap { uint heap[]; };
+layout(set = 0, binding = 2) buffer HeapCounter { uint heap_counter; };
+layout(set = 0, binding = 3) writeonly buffer BucketMutex { int bucket_mutex[]; };
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint total_entries = uint(pc.grid.num_buckets * pc.grid.bucket_size);
+  uint num_blocks = uint(pc.grid.num_blocks);
+  uint num_buckets = uint(pc.grid.num_buckets);
+
+  if (gid < total_entries) {
+    entries[gid].ptr = kFreeEntry;
+    entries[gid].pos = ivec3(0);
+    entries[gid].offset = kNoOffset;
+  }
+  if (gid < num_blocks) {
+    heap[gid] = gid;
+  }
+  if (gid == 0u) {
+    heap_counter = num_blocks;
+  }
+  if (gid < num_buckets) {
+    bucket_mutex[gid] = kFreeEntry;
+  }
+}
