@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "volumetric_kit/recon/core/device.hpp"
@@ -23,6 +24,11 @@ namespace {
 
 // Local group size, matching `layout(local_size_x = 256)` in every kernel.
 constexpr std::uint32_t kLocalSize = 256;
+
+// Bounded passes for the resize re-insert. allocate() is idempotent, so re-
+// driving the whole snapshot absorbs transient bucket-lock contention; the cap
+// keeps a genuine (near-impossible post-growth) overflow from looping forever.
+constexpr int kReinsertPasses = 3;
 
 // The push-constant block every kernel shares: the grid shape plus one
 // kernel-specific argument (mirrors `PushConstants` in hash_common.glsl).
@@ -114,6 +120,47 @@ Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
   return allocator.create_buffer(desc);
 }
 
+// All the persistent device buffers, sized for one grid. Returned as a bundle
+// so a caller commits them only once every allocation has succeeded: create()
+// into a fresh map, resize() as an all-or-nothing swap over the live one (a
+// partial in-place swap would strand descriptors on a freed buffer). Keeps the
+// buffer sizing in one place -- the counterpart to write_persistent_bindings().
+struct PersistentBuffers {
+  Buffer entries;
+  Buffer heap;
+  Buffer heap_counter;
+  Buffer bucket_mutex;
+  Buffer fail_counts;
+  Buffer compacted;
+  Buffer active_count;
+};
+
+Result<PersistentBuffers> make_persistent_buffers(Allocator& allocator,
+                                                  const VoxelGridParams& grid) {
+  const auto total_entries = static_cast<std::uint32_t>(grid.num_buckets) *
+                             static_cast<std::uint32_t>(grid.bucket_size);
+  const auto num_blocks = static_cast<std::uint32_t>(grid.num_blocks);
+  const auto num_buckets = static_cast<std::uint32_t>(grid.num_buckets);
+  PersistentBuffers bufs;
+  VR_ASSIGN(bufs.entries,
+            storage_buffer(allocator,
+                           VkDeviceSize(total_entries) * sizeof(HashEntry)));
+  VR_ASSIGN(bufs.heap, storage_buffer(allocator, VkDeviceSize(num_blocks) *
+                                                     sizeof(std::uint32_t)));
+  VR_ASSIGN(bufs.heap_counter,
+            storage_buffer(allocator, sizeof(std::uint32_t)));
+  VR_ASSIGN(bufs.bucket_mutex,
+            storage_buffer(allocator,
+                           VkDeviceSize(num_buckets) * sizeof(std::int32_t)));
+  VR_ASSIGN(bufs.fail_counts,
+            storage_buffer(allocator, 4 * sizeof(std::uint32_t)));
+  VR_ASSIGN(bufs.compacted, storage_buffer(allocator, VkDeviceSize(num_blocks) *
+                                                          sizeof(BlockIndex)));
+  VR_ASSIGN(bufs.active_count,
+            storage_buffer(allocator, sizeof(std::uint32_t)));
+  return bufs;
+}
+
 }  // namespace
 
 Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
@@ -131,31 +178,18 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   map.allocator_ = &allocator;
   map.grid_ = grid;
 
-  const std::uint32_t total_entries = map.total_entries();
-  const auto num_blocks = static_cast<std::uint32_t>(grid.num_blocks);
-  const auto num_buckets = static_cast<std::uint32_t>(grid.num_buckets);
-
-  // Persistent buffers (host-visible for this slice; device-local + staging is
-  // a follow-up perf pass -- see the header TODO).
-  VR_ASSIGN(map.entries_,
-            storage_buffer(allocator,
-                           VkDeviceSize(total_entries) * sizeof(HashEntry)));
-  VR_ASSIGN(map.heap_, storage_buffer(allocator, VkDeviceSize(num_blocks) *
-                                                     sizeof(std::uint32_t)));
-  VR_ASSIGN(map.heap_counter_,
-            storage_buffer(allocator, sizeof(std::uint32_t)));
-  VR_ASSIGN(map.bucket_mutex_,
-            storage_buffer(allocator,
-                           VkDeviceSize(num_buckets) * sizeof(std::int32_t)));
-  // Persistent scratch: allocate fail-counts (4 uints) and the compaction
-  // output (num_blocks blocks) + its counter. Fixed size, re-zeroed per call
-  // rather than re-allocated.
-  VR_ASSIGN(map.fail_counts_,
-            storage_buffer(allocator, 4 * sizeof(std::uint32_t)));
-  VR_ASSIGN(map.compacted_, storage_buffer(allocator, VkDeviceSize(num_blocks) *
-                                                          sizeof(BlockIndex)));
-  VR_ASSIGN(map.active_count_,
-            storage_buffer(allocator, sizeof(std::uint32_t)));
+  // Persistent buffers + scratch (host-visible for this slice; device-local +
+  // staging is a follow-up perf pass -- see the header TODO). Built as a bundle
+  // and moved in together so the sizing lives in one place (make_persistent_-
+  // buffers), shared with resize().
+  VR_ASSIGN(PersistentBuffers bufs, make_persistent_buffers(allocator, grid));
+  map.entries_ = std::move(bufs.entries);
+  map.heap_ = std::move(bufs.heap);
+  map.heap_counter_ = std::move(bufs.heap_counter);
+  map.bucket_mutex_ = std::move(bufs.bucket_mutex);
+  map.fail_counts_ = std::move(bufs.fail_counts);
+  map.compacted_ = std::move(bufs.compacted);
+  map.active_count_ = std::move(bufs.active_count);
 
   // One layout + pipeline per kernel (bindings match each shader's set 0).
   const auto init_b = storage_bindings(4);
@@ -205,34 +239,36 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VR_ASSIGN(map.compact_set_, map.pool_.allocate(map.compact_layout_.handle()));
   VR_ASSIGN(map.delete_set_, map.pool_.allocate(map.delete_layout_.handle()));
 
-  // Bind every persistent buffer once. Bindings 0-3 are identical across the
-  // init and allocate sets; allocate additionally uses binding 5 (fail-counts)
-  // and, per call, binding 4 (coords). Compact uses entries + output + count.
-  const VkBuffer entries = map.entries_.handle();
-  const VkBuffer heap = map.heap_.handle();
-  const VkBuffer counter = map.heap_counter_.handle();
-  const VkBuffer mutex = map.bucket_mutex_.handle();
-  for (const DescriptorSet* set :
-       {&map.init_set_, &map.allocate_set_, &map.delete_set_}) {
+  // Point every set at the persistent buffers (the per-call coords buffer is
+  // written before each allocate/delete dispatch). Shared with resize().
+  map.write_persistent_bindings();
+
+  VR_TRY(map.init_table());
+  return map;
+}
+
+void VoxelHashMap::write_persistent_bindings() {
+  // Bindings 0-3 are identical across the init, allocate, and delete sets;
+  // allocate + delete additionally share the fail-counts buffer at binding 5
+  // (they never run in the same dispatch, and each re-zeroes it before use).
+  // Compact uses entries + the compaction output + its counter.
+  const VkBuffer entries = entries_.handle();
+  const VkBuffer heap = heap_.handle();
+  const VkBuffer counter = heap_counter_.handle();
+  const VkBuffer mutex = bucket_mutex_.handle();
+  for (const DescriptorSet* set : {&init_set_, &allocate_set_, &delete_set_}) {
     set->write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(1, heap, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(3, mutex, 0, VK_WHOLE_SIZE);
   }
-  // allocate + delete share the persistent fail-counts buffer at binding 5 --
-  // they never run in the same dispatch, and each re-zeroes it before use.
-  map.allocate_set_.write_storage_buffer(5, map.fail_counts_.handle(), 0,
-                                         VK_WHOLE_SIZE);
-  map.delete_set_.write_storage_buffer(5, map.fail_counts_.handle(), 0,
-                                       VK_WHOLE_SIZE);
-  map.compact_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
-  map.compact_set_.write_storage_buffer(1, map.compacted_.handle(), 0,
-                                        VK_WHOLE_SIZE);
-  map.compact_set_.write_storage_buffer(2, map.active_count_.handle(), 0,
-                                        VK_WHOLE_SIZE);
-
-  VR_TRY(map.init_table());
-  return map;
+  allocate_set_.write_storage_buffer(5, fail_counts_.handle(), 0,
+                                     VK_WHOLE_SIZE);
+  delete_set_.write_storage_buffer(5, fail_counts_.handle(), 0, VK_WHOLE_SIZE);
+  compact_set_.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
+  compact_set_.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
+  compact_set_.write_storage_buffer(2, active_count_.handle(), 0,
+                                    VK_WHOLE_SIZE);
 }
 
 std::uint32_t VoxelHashMap::total_entries() const noexcept {
@@ -329,6 +365,65 @@ Status VoxelHashMap::clear() {
     return Status::invalid_argument("VoxelHashMap::clear: moved-from map");
   }
   return init_table();
+}
+
+Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
+  if (!valid()) {
+    return Status::invalid_argument("VoxelHashMap::resize: moved-from map");
+  }
+  if (new_num_buckets <= grid_.num_buckets) {
+    return Status::invalid_argument(
+        "VoxelHashMap::resize: new_num_buckets must exceed the current count");
+  }
+
+  // Snapshot the active blocks before growing (compact reads the old table).
+  VR_ASSIGN(std::vector<BlockIndex> active, compact_active_blocks());
+
+  // The grown grid: num_blocks == bucket_size * num_buckets (one block per
+  // slot), the invariant create() validates.
+  VoxelGridParams new_grid = grid_;
+  new_grid.num_buckets = new_num_buckets;
+  new_grid.num_blocks =
+      static_cast<std::int32_t>(static_cast<std::uint32_t>(new_num_buckets) *
+                                static_cast<std::uint32_t>(grid_.bucket_size));
+
+  // Build the larger buffers off to the side and commit only once all of them
+  // exist, so a mid-grow allocation failure leaves the live map untouched (a
+  // partial in-place swap would strand descriptors on a freed buffer while
+  // valid() still reported true). compacted_ tracks num_blocks, so it grows
+  // too.
+  VR_ASSIGN(PersistentBuffers bufs,
+            make_persistent_buffers(*allocator_, new_grid));
+  entries_ = std::move(bufs.entries);
+  heap_ = std::move(bufs.heap);
+  heap_counter_ = std::move(bufs.heap_counter);
+  bucket_mutex_ = std::move(bufs.bucket_mutex);
+  fail_counts_ = std::move(bufs.fail_counts);
+  compacted_ = std::move(bufs.compacted);
+  active_count_ = std::move(bufs.active_count);
+  grid_ = new_grid;
+
+  // Point the sets at the new buffers, init the larger table, and re-insert.
+  write_persistent_bindings();
+  VR_TRY(init_table());
+
+  // Re-drive the whole snapshot up to kReinsertPasses times: allocate() skips
+  // already-present coords, and the grown table has strictly less hash pressure
+  // than the one the set already fit, so this converges past any transient
+  // bucket-lock contention. A residual failure is a genuine overflow.
+  std::uint32_t failed = 0;
+  for (int pass = 0; pass < kReinsertPasses && !active.empty(); ++pass) {
+    VR_ASSIGN(failed, allocate(active.data(),
+                               static_cast<std::uint32_t>(active.size())));
+    if (failed == 0) {
+      break;
+    }
+  }
+  if (failed != 0) {
+    return Status::out_of_memory(
+        "VoxelHashMap::resize: re-insert failed after growing");
+  }
+  return {};
 }
 
 Result<std::vector<HashEntry>> VoxelHashMap::read_entries() {
