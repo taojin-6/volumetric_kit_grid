@@ -58,14 +58,17 @@ struct PushConstants {
   float iso;
   std::uint32_t capacity;
   float weight_threshold;
+  std::uint32_t has_color;  // 0 = no color input; vertices get opaque white
 };
-static_assert(sizeof(PushConstants) == 40, "PushConstants must be 40 bytes");
+static_assert(sizeof(PushConstants) == 44, "PushConstants must be 44 bytes");
 static_assert(offsetof(PushConstants, dims) == 0, "PushConstants layout drift");
 static_assert(offsetof(PushConstants, voxel_size) == 12, "PushConstants drift");
 static_assert(offsetof(PushConstants, origin) == 16, "PushConstants drift");
 static_assert(offsetof(PushConstants, iso) == 28, "PushConstants drift");
 static_assert(offsetof(PushConstants, capacity) == 32, "PushConstants drift");
 static_assert(offsetof(PushConstants, weight_threshold) == 36,
+              "PushConstants layout drift");
+static_assert(offsetof(PushConstants, has_color) == 40,
               "PushConstants layout drift");
 
 std::uint32_t group_count(std::uint32_t items) {
@@ -103,8 +106,8 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   mc.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
 
-  // The kernel binds four storage buffers: tables (persistent) + the
-  // per-extract samples / vertices / counter. KernelSetBuilder
+  // The kernel binds five storage buffers: tables (persistent) + the
+  // per-extract samples / colors / vertices / counter. KernelSetBuilder
   // (core/compute_kernel.hpp) builds its layout + pipeline and allocates its
   // set from a shared pool sized to the exact descriptor total.
   VkPushConstantRange push{};
@@ -113,7 +116,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   push.size = sizeof(PushConstants);
   KernelSetBuilder kb(dev);
   VR_TRY(kb.add(mc.kernel_, vr_marching_cubes_comp_spv,
-                vr_marching_cubes_comp_spv_size, 4, &push));
+                vr_marching_cubes_comp_spv_size, 5, &push));
   VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 for good. The
@@ -133,7 +136,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
 
 Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                                     std::size_t count, const DenseGrid& grid,
-                                    float iso) {
+                                    float iso, const Vec3u8* colors) {
   if (!valid()) {
     return Status::invalid_argument("MarchingCubes::extract: moved-from");
   }
@@ -184,6 +187,32 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                      HostAccess::SequentialWrite));
   std::memcpy(samples_buf.mapped(), samples, count * sizeof(volume::Voxel));
 
+  // Colors (optional, parallel to samples): each sample's RGB packed into the
+  // low three bytes of a uint (the kernel reads it back with unpackUnorm4x8 and
+  // takes .rgb, so the high byte is unused and left zero). Always bound so the
+  // descriptor is valid; the has_color push flag tells the kernel whether to
+  // read it. Absent -> a 1-element dummy buffer + opaque-white vertices.
+  const std::uint32_t has_color = colors != nullptr ? 1u : 0u;
+  Buffer colors_buf;
+  if (colors != nullptr) {
+    VR_ASSIGN(colors_buf, storage_buffer(*allocator_,
+                                         static_cast<VkDeviceSize>(count) *
+                                             sizeof(std::uint32_t),
+                                         HostAccess::SequentialWrite));
+    // Pack straight into the mapped buffer -- SequentialWrite is exactly this
+    // forward, write-once pattern, so no staging vector or second copy.
+    auto* packed = static_cast<std::uint32_t*>(colors_buf.mapped());
+    for (std::size_t i = 0; i < count; ++i) {
+      packed[i] = static_cast<std::uint32_t>(colors[i].x) |
+                  (static_cast<std::uint32_t>(colors[i].y) << 8) |
+                  (static_cast<std::uint32_t>(colors[i].z) << 16);
+    }
+  } else {
+    VR_ASSIGN(colors_buf, storage_buffer(*allocator_, sizeof(std::uint32_t),
+                                         HostAccess::SequentialWrite));
+    std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
+  }
+
   VR_ASSIGN(Buffer vertices_buf,
             storage_buffer(*allocator_, static_cast<VkDeviceSize>(capacity) *
                                             3 * sizeof(Vertex)));
@@ -192,11 +221,12 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   std::memset(counter_buf.mapped(), 0, sizeof(std::uint32_t));
 
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(2, vertices_buf.handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(3, counter_buf.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(2, colors_buf.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(3, vertices_buf.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(4, counter_buf.handle(), 0, VK_WHOLE_SIZE);
 
-  const PushConstants push{grid.dims, grid.voxel_size, grid.origin,
-                           iso,       capacity,        kWeightThreshold};
+  const PushConstants push{grid.dims, grid.voxel_size,  grid.origin, iso,
+                           capacity,  kWeightThreshold, has_color};
   VR_TRY(dispatch(*device_, kernel_, &push, sizeof(push),
                   group_count(static_cast<std::uint32_t>(cells)),
                   max_workgroup_count_x_));
