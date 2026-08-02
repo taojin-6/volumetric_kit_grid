@@ -59,8 +59,10 @@ vec3 mcCellNormal(float sdf[8]) {
 // points along the outward gradient `normal` -- the orientation gfx expects;
 // color follows the same reversal so each vertex keeps its own edge's color,
 // and uv0 stays the "use vertex color" sentinel until projective texturing
-// runs. Past `capacity` the triangle is dropped and tri_count still counts up,
-// so the host detects the overflow (unreachable at the 5-tri/cell worst case).
+// runs. Past `capacity` a triangle is dropped but still counted, so tri_count
+// always ends as the field's true total -- that is the contract the host sizes
+// its arena from when it fits the arena to the surface rather than to the
+// 5-tri/cell worst case, and re-runs after an undersized guess.
 void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
                 ivec3 base_voxel, float voxel_size, vec3 normal, float iso,
                 uint has_color, uint capacity) {
@@ -81,7 +83,12 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
     }
     uint tri = atomicAdd(tri_count, 1u);
     if (tri >= capacity) {
-      return;
+      // Drop this triangle but keep going: `tri_count` must end up the field's
+      // TRUE total, because the host sizes the arena from it and re-runs. A
+      // `return` here would abandon this cell's remaining triangles uncounted,
+      // making the reported total a lower bound -- so the host's refit would
+      // still be too small and the retry would overflow again.
+      continue;
     }
     uint vbase = tri * 3u;
     vertices[vbase + 0u].position = p[0];

@@ -333,6 +333,17 @@ class VR_MESH_API MarchingCubes {
                                       (3 * sizeof(Vertex)));
   }
 
+  // Capacity to *try* for a dispatch whose theoretical ceiling is
+  // @p worst_case triangles: whatever the arena already holds (the previous
+  // surface plus headroom), a small seed on the first call, and never more
+  // than the ceiling.
+  std::uint32_t plan_capacity(std::uint64_t worst_case) const;
+
+  // Grow the arena to hold @p triangles plus headroom, after a dispatch
+  // reported that many. Headroom keeps a steadily-growing scan from re-running
+  // every frame.
+  Status refit_arena(std::uint32_t triangles);
+
   // Size @ref vertex_arena_ / @ref counter_ for a dispatch emitting at most
   // @p capacity triangles, reallocating only when the current arena is too
   // small, and zero the counter. Returns a non-OK Status when @p capacity's
