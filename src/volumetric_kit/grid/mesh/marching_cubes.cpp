@@ -33,6 +33,15 @@ constexpr std::uint32_t kLocalSize = 256;
 // Worst-case triangles a single marching-cubes cell can emit (5 per the table).
 constexpr std::uint64_t kMaxTrisPerCell = 5;
 
+// Triangles per active block the first extract plans for, before any
+// measurement is available. A real scan measures 54-68 (Replica room0) against
+// the 5*block_size^3 worst case -- 2560 for the default 8-voxel block, ~40x
+// higher -- and the estimate self-corrects from the first completed extract, so
+// this only has to be the right order of magnitude. Guessing low costs one
+// extra dispatch on the first call; guessing high costs resident memory for the
+// extractor's whole lifetime, since the arena never shrinks.
+constexpr std::uint64_t kSeedTrisPerBlock = 64;
+
 // A corner with weight at or below this is treated as unintegrated, and any
 // cell touching it is skipped. Small and positive so a never-integrated voxel
 // (weight 0) is excluded while any genuine integration counts. The `tsdf` tier
@@ -150,14 +159,16 @@ std::uint64_t arena_bytes_for(std::uint32_t capacity) {
 // Read the atomic triangle count back and copy the emitted vertices into a
 // Mesh with the trivial 0,1,2,... index run (independent triangles; a later
 // shared-vertex dedup can shrink `vertices` without changing the Mesh
-// contract). Shared by both extract overloads.
+// contract). The dense extract's readback; the sparse path leaves its result on
+// the device and downloads it separately.
 Mesh collect_mesh(const Buffer& vertices, const Buffer& counter,
                   std::uint32_t capacity,
                   std::uint32_t* emitted_out = nullptr) {
   std::uint32_t emitted = 0;
   std::memcpy(&emitted, counter.mapped(), sizeof(std::uint32_t));
-  // Worst-case capacity means the kernel never drops, but clamp defensively so
-  // a future smaller-capacity mode cannot over-read the vertex arena.
+  // The dense path is worst-case sized, so the kernel never drops -- but the
+  // count is a device write, and this clamp is what keeps the copy below inside
+  // the arena regardless.
   emitted = std::min(emitted, capacity);
   if (emitted_out != nullptr) *emitted_out = emitted;
 
@@ -201,20 +212,44 @@ class PhaseClock {
 
 }  // namespace
 
+std::uint32_t MarchingCubes::plan_capacity(std::uint32_t num_active,
+                                           std::uint64_t worst_case) const {
+  // Predict from density rather than react to an overflow: the last extract
+  // measured how many triangles an active block carries, and scaling that by
+  // THIS call's active set moves the plan ahead of a growing surface. A purely
+  // reactive plan (whatever the arena happens to hold) discovers every size
+  // increase by overflowing, which throws a whole dispatch away each time.
+  const std::uint64_t per_block =
+      tris_per_block_ != 0 ? tris_per_block_ : kSeedTrisPerBlock;
+  const std::uint64_t estimate =
+      static_cast<std::uint64_t>(num_active) * per_block;
+  // Never below what the arena already holds: the dispatch is told this
+  // number, so planning under the arena would drop triangles there was room
+  // for and force a pointless refit. Never above the worst case -- more than
+  // that cannot be emitted, so asking for it would waste memory outright.
+  const std::uint64_t held = arena_capacity();
+  return static_cast<std::uint32_t>(
+      std::min(std::max(estimate, held), worst_case));
+}
+
 Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // Guard the REQUESTED capacity against the device's binding limit before any
-  // growth headroom is added, so a grid that legitimately fits is never
+  // growth headroom is added, so a surface that legitimately fits is never
   // rejected because the growth policy overshot.
   if (arena_bytes_for(capacity) > max_storage_buffer_range_) {
     return Status::invalid_argument(
-        "MarchingCubes::extract: vertex arena exceeds the device "
-        "maxStorageBufferRange; grid too large for this slice");
+        "MarchingCubes::extract: a vertex arena for " +
+        std::to_string(capacity) +
+        " triangles exceeds the device maxStorageBufferRange");
   }
   if (!counter_.valid()) {
     VR_ASSIGN(counter_, storage_buffer(*allocator_, sizeof(std::uint32_t)));
   }
   // The counter is the only per-call reset: 4 bytes, against an arena whose
-  // stale tail is never read (the counter bounds the readback).
+  // stale tail is never read (the counter bounds the readback). It happens
+  // ABOVE the reuse early-return below, and must stay there: a refit that
+  // reallocated nothing still has to hand the retry a zeroed counter, or the
+  // second dispatch accumulates onto the first's count.
   std::memset(counter_.mapped(), 0, sizeof(std::uint32_t));
 
   if (vertex_arena_.valid() && capacity <= arena_capacity()) {
@@ -222,14 +257,17 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   }
   // Grow geometrically rather than to the exact request: the active set climbs
   // steadily through a scan, so exact sizing would reallocate (and re-fault)
-  // this large buffer on most frames. Fall back to the exact request whenever
-  // the headroom would not fit -- the request itself already passed the guard
-  // above, so a grid that legitimately fits is never rejected by an overshoot.
-  // Both tests run in 64-bit *before* narrowing: 1.5x a near-uint32 capacity
-  // does not fit a uint32, and truncating first could turn an over-large
-  // request into a small one that passes the byte check.
-  const std::uint64_t grown = std::max<std::uint64_t>(
-      capacity, static_cast<std::uint64_t>(arena_capacity()) * 3 / 2);
+  // this large buffer on most frames. The headroom multiplies the LARGER of
+  // the request and what is held, so a refit to a measured count gets headroom
+  // too (it is the request that a growing scan will outgrow next). Fall back to
+  // the exact request whenever the headroom would not fit -- the request itself
+  // already passed the guard above, so a surface that legitimately fits is
+  // never rejected by an overshoot. Both tests run in 64-bit *before*
+  // narrowing: 1.5x a near-uint32 capacity does not fit a uint32, and
+  // truncating first could turn an over-large request into a small one that
+  // passes the byte check.
+  const std::uint64_t grown =
+      std::max<std::uint64_t>(capacity, arena_capacity()) * 3 / 2;
   const bool headroom_fits =
       grown <= 0xFFFFFFFFull &&
       arena_bytes_for(static_cast<std::uint32_t>(grown)) <=
@@ -374,12 +412,14 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   const std::uint64_t capacity64 = cells * kMaxTrisPerCell;
   // capacity + the per-cell dispatch index both flow through 32-bit shader
   // values, so keep the worst case inside uint32.
-  // TODO(mesh): a two-pass count->fill would size the vertex buffer exactly
-  // instead of at the 5-per-cell worst case. It is the live follow-up now that
-  // the arena is reused: reuse removed the per-call allocation, exact sizing
-  // removes the retained peak. (It is NOT superseded by the incremental
-  // block-mesh pool -- profiling showed the pool would optimise the dispatch,
-  // which is already the cheap phase. See CLAUDE.md's overlay finding.)
+  // The dense path keeps the worst-case sizing: it takes a caller-supplied
+  // sample grid (the analytic/test entry point), so its cell count is small and
+  // bounded by the caller, and one dispatch with no measurement step is the
+  // simpler thing to keep correct.
+  // TODO(mesh): fit this path to the surface too, as the sparse extract does.
+  // The two share one retained arena, so a large dense call grows it to the
+  // dense worst case and every later sparse extract plans from there -- which
+  // forfeits the fitted arena for a process that uses both entry points.
   if (capacity64 > 0xFFFFFFFFull || cells > 0xFFFFFFFFull) {
     return Status::invalid_argument(
         "MarchingCubes::extract: grid too large for this slice");
@@ -422,6 +462,10 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
   }
 
+  // This call is about to overwrite -- and, on a grow, reallocate -- the shared
+  // arena, so every outstanding DeviceMesh is stale from here on, whether or
+  // not the call succeeds. Bump before the first thing that touches it.
+  ++generation_;
   VR_TRY(ensure_output_buffers(capacity));
 
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
@@ -487,6 +531,10 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
+  // Fully overwrite the caller's struct up front, so the accumulating spans
+  // below start from zero and one instance can be reused across frames. A
+  // failed call then reports zeros rather than a previous call's numbers.
+  if (timings != nullptr) *timings = ExtractTimings{};
   if (!valid()) {
     return Status::invalid_argument("MarchingCubes::extract: moved-from");
   }
@@ -536,19 +584,35 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
 
   // One invocation per voxel of each active block; worst-case 5 triangles each.
   // Both the thread index and the triangle capacity flow through 32-bit shader
-  // values, so keep the worst case inside uint32.
-  // TODO(mesh): a two-pass count->fill would size the vertex arena to the real
-  // triangle count instead of this 5-per-voxel worst case -- the follow-up that
-  // shrinks the arena the extractor now retains (see the same TODO on the dense
-  // path for why the block-mesh pool does not supersede it).
+  // values, so keep the thread count inside uint32.
   const std::uint64_t threads =
       static_cast<std::uint64_t>(num_active) * static_cast<std::uint64_t>(vpb);
-  const std::uint64_t capacity64 = threads * kMaxTrisPerCell;
-  if (threads > 0xFFFFFFFFull || capacity64 > 0xFFFFFFFFull) {
+  const std::uint64_t worst_case = threads * kMaxTrisPerCell;
+  // Both the thread index and the triangle counter are 32-bit shader values.
+  // The counter bound matters even though the arena is no longer sized for the
+  // worst case: the kernel bumps `tri_count` for every triangle the field
+  // produces, dropped ones included, so a field whose worst case exceeds uint32
+  // could wrap it -- and the host, which now trusts that count, would publish a
+  // handful of triangles as the whole surface. Rejected here, before the
+  // neighbour table, the uploads and a dispatch.
+  if (threads > 0xFFFFFFFFull || worst_case > 0xFFFFFFFFull) {
     return Status::invalid_argument(
         "MarchingCubes::extract: active set too large for this slice");
   }
-  const auto capacity = static_cast<std::uint32_t>(capacity64);
+  // The arena is sized to what the surface actually emits, not to the
+  // 5-triangles-per-cell worst case. Real fields are nowhere near that bound --
+  // a room scan fills ~2% of it -- and since the arena is now *retained*, the
+  // worst case was resident memory rather than a transient over-allocation
+  // (~1.8 GB against ~38 MB of triangles on Replica room0).
+  //
+  // Correctness does not depend on the guess: the kernel bumps `tri_count`
+  // for every triangle and drops those past `capacity`, so an undersized arena
+  // is *detected*, never silently truncated. The count is a property of the
+  // field, not of the atomic ordering, so refitting to it and re-running is
+  // guaranteed to fit. That makes this a one-dispatch steady state that pays a
+  // second dispatch only when the plan undershoots the surface, rather than
+  // the unconditional two-dispatch count-then-fill this replaces.
+  const std::uint32_t capacity = plan_capacity(num_active, worst_case);
 
   // Neighbour lookup: map each active block coordinate to its voxel-array base,
   // then, per block, gather the eight pointers of its 2x2x2 +neighbourhood
@@ -594,6 +658,13 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
               neighbour_lut.size() * sizeof(std::int32_t));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
+  // This call is about to overwrite -- and, on a grow, reallocate -- the arena,
+  // so every outstanding DeviceMesh is stale from here on, whether or not the
+  // call succeeds. Bump before the first thing that touches it, not on the
+  // success path: a failure between here and the return would otherwise leave
+  // a superseded DeviceMesh passing download()'s currency check and reading
+  // this call's geometry under its own stale counts.
+  ++generation_;
   VR_TRY(ensure_output_buffers(capacity));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
@@ -608,47 +679,97 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   kernel_sparse_.set.write_storage_buffer(
       5, has_color ? color_view.buffer->handle() : color_dummy_.handle(), 0,
       VK_WHOLE_SIZE);
+
+  // Both output bindings are written once: the counter's handle never changes
+  // (ensure_output_buffers creates it only when it holds none), and the arena's
+  // changes only when a refit reallocates it -- which rebinds it there.
   kernel_sparse_.set.write_storage_buffer(6, vertex_arena_.handle(), 0,
                                           VK_WHOLE_SIZE);
   kernel_sparse_.set.write_storage_buffer(7, counter_.handle(), 0,
                                           VK_WHOLE_SIZE);
-
   if (timings != nullptr) timings->descriptor_ms = phase_clock.lap();
-  const SparsePushConstants push{bs,
-                                 static_cast<std::int32_t>(vpb),
-                                 gp.voxel_size,
-                                 iso,
-                                 num_active,
-                                 capacity,
-                                 kWeightThreshold,
-                                 has_color ? 1u : 0u};
-  VR_TRY(dispatch(*device_, kernel_sparse_, &push, sizeof(push),
-                  group_count(static_cast<std::uint32_t>(threads)),
-                  max_workgroup_count_x_));
 
-  if (timings != nullptr) timings->dispatch_ms = phase_clock.lap();
+  // Run the surface, read the count, and re-run once if the arena was too
+  // small. `tri_count` counts every triangle the field produces -- the kernel
+  // drops those past `capacity` but still bumps -- so an undersized arena
+  // reports the exact size it needed, and the count is a property of the field
+  // rather than of the atomic ordering, so the refitted retry cannot overflow
+  // again. Bounded at two iterations for that reason.
+  //
+  // The dispatch is told the arena's *full* capacity rather than the planned
+  // number, so it never drops a triangle the arena had room for -- and that
+  // keeps `requested <= arena_capacity()` true by construction, which is what
+  // bounds the vertex count published below.
+  std::uint32_t requested = arena_capacity();
+  std::uint32_t produced = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const SparsePushConstants push{bs,
+                                   static_cast<std::int32_t>(vpb),
+                                   gp.voxel_size,
+                                   iso,
+                                   num_active,
+                                   requested,
+                                   kWeightThreshold,
+                                   has_color ? 1u : 0u};
+    VR_TRY(dispatch(*device_, kernel_sparse_, &push, sizeof(push),
+                    group_count(static_cast<std::uint32_t>(threads)),
+                    max_workgroup_count_x_));
+    if (timings != nullptr) {
+      timings->dispatch_ms += phase_clock.lap();
+      ++timings->dispatches;
+    }
 
-  // Only the 4-byte counter comes back; the geometry stays where the kernel
-  // wrote it. Clamp defensively so a future smaller-capacity mode cannot
-  // publish a count that over-reads the arena.
-  std::uint32_t emitted = 0;
-  std::memcpy(&emitted, counter_.mapped(), sizeof(std::uint32_t));
-  emitted = std::min(emitted, capacity);
+    // Only the 4-byte counter comes back; the geometry stays where the kernel
+    // wrote it.
+    std::memcpy(&produced, counter_.mapped(), sizeof(std::uint32_t));
+    if (timings != nullptr) timings->readback_ms += phase_clock.lap();
+    if (produced <= requested) {
+      break;  // everything the field emitted is in the arena
+    }
+    if (attempt == 1) {
+      // Cannot happen -- the same field emits the same count, so the refitted
+      // arena fits it -- but report rather than hand back a truncated mesh if
+      // that assumption is ever broken.
+      return Status::out_of_memory(
+          "MarchingCubes::extract: the vertex arena still overflowed after "
+          "refitting it to the measured triangle count");
+    }
+    // Refit to the measured count (ensure_output_buffers adds the growth
+    // headroom, and re-zeroes the counter the retry is about to bump), then
+    // rebind the arena in case it was reallocated.
+    VR_TRY(ensure_output_buffers(produced));
+    kernel_sparse_.set.write_storage_buffer(6, vertex_arena_.handle(), 0,
+                                            VK_WHOLE_SIZE);
+    requested = arena_capacity();
+    if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
+  }
+  // Clamped against the arena itself, not against `requested`: this count is
+  // what download()'s memcpy and the texturer's `num_vertices` bound run on, so
+  // bound it by the buffer that has to hold it rather than by a variable that
+  // tracks that buffer.
+  const std::uint32_t emitted = std::min(produced, arena_capacity());
+
+  // Record the density this surface actually had, so the next call's plan
+  // scales it by that call's active set instead of discovering the size by
+  // overflowing. Rounded up, so any non-empty surface records at least one
+  // triangle per block; a surface that emitted nothing records 0, and the next
+  // plan falls back to the seed.
+  tris_per_block_ = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
 
   DeviceMesh device_mesh;
   device_mesh.vertices = vertex_arena_.handle();
   device_mesh.indices = index_run_.handle();
   device_mesh.triangle_count = emitted;
   device_mesh.vertex_count = emitted * 3;
-  device_mesh.generation = ++generation_;
+  device_mesh.generation = generation_;
   if (timings != nullptr) {
-    timings->readback_ms = phase_clock.lap();
     timings->active_blocks = num_active;
-    timings->triangle_capacity = capacity;
+    timings->triangle_capacity = requested;
     timings->emitted_triangles = emitted;
     // What the extractor is holding, not what this call asked for: the arena is
-    // retained and grown, so a steady-state call allocates nothing and a grown
-    // arena exceeds `capacity`'s own footprint.
+    // retained and grown, so a steady-state call allocates nothing and still
+    // reports it.
     timings->arena_bytes = vertex_arena_.size();
   }
   return device_mesh;

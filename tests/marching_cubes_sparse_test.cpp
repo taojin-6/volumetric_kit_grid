@@ -10,9 +10,12 @@
 // triangle counts must match exactly -- a wrong neighbour octant or lookup
 // index would corrupt every boundary cell and diverge. Also verifies the sphere
 // shape (radius, outward normals, winding), cross-block colour interpolation,
-// and the empty / argument-validation / moved-from paths. Exits 0 (skip) where
-// no device is present.
+// the vertex-arena growth policy, the refit-and-re-run path an undersized
+// arena takes, and the empty / argument-validation / moved-from paths. Exits 0
+// (skip) where no device is present.
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -179,6 +182,65 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
     }
   }
   return true;
+}
+
+// Allocate ONE block and fill it with a sign-alternating field, so every cell
+// has mixed corner signs and emits several triangles: ~1400 triangles from one
+// block, against the ~64 per block a first extract plans for. That gap is what
+// makes the refit-and-re-run path fire deterministically rather than by
+// numeric accident. Returns false on any device error.
+bool fill_dense_block(vol::VoxelBlockGrid& g) {
+  vol::BlockIndex b{};
+  b.coord = vr::Vec3i(0, 0, 0);
+  vr::Result<std::uint32_t> failed = g.map().allocate(&b, 1);
+  if (!failed || failed.value() != 0) {
+    return false;
+  }
+  vr::Result<std::vector<vol::BlockIndex>> active =
+      g.map().compact_active_blocks();
+  if (!active || active.value().size() != 1) {
+    return false;
+  }
+  vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
+  vr::Result<vol::AttributeView> weight = g.attribute("weight");
+  if (!tsdf || !weight) {
+    return false;
+  }
+  auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
+  auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
+  const vol::BlockIndex& blk = active.value().front();
+  for (int lz = 0; lz < kBlock; ++lz) {
+    for (int ly = 0; ly < kBlock; ++ly) {
+      for (int lx = 0; lx < kBlock; ++lx) {
+        const int local = lx + kBlock * (ly + kBlock * lz);
+        const auto idx = static_cast<std::size_t>(blk.ptr) + local;
+        tptr[idx] = ((lx + ly + lz) % 2 == 0) ? -0.5f * kH : 0.5f * kH;
+        wptr[idx] = 1.0f;
+      }
+    }
+  }
+  return true;
+}
+
+// A mesh's triangles as a sorted, directly comparable list of their nine
+// position floats. Marching cubes appends through an atomic, so two runs over
+// the same field emit the same triangles in a different ORDER; each triangle's
+// arithmetic is independent of that order, so the floats themselves are
+// bit-identical and the sorted lists must match exactly.
+std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
+  std::vector<std::array<float, 9>> tris;
+  tris.reserve(m.vertices.size() / 3);
+  for (std::size_t i = 0; i + 2 < m.vertices.size(); i += 3) {
+    std::array<float, 9> t{};
+    for (std::size_t k = 0; k < 3; ++k) {
+      t[k * 3 + 0] = m.vertices[i + k].position.x;
+      t[k * 3 + 1] = m.vertices[i + k].position.y;
+      t[k * 3 + 2] = m.vertices[i + k].position.z;
+    }
+    tris.push_back(t);
+  }
+  std::sort(tris.begin(), tris.end());
+  return tris;
 }
 
 }  // namespace
@@ -432,11 +494,72 @@ int main() {
   CHECK(big_timings.arena_bytes > small_timings.arena_bytes);
 
   // Back to the one-block grid: the oversized arena is reused as-is, neither
-  // reallocated nor shrunk.
+  // reallocated nor shrunk, and the dispatch runs at its full capacity (so it
+  // never drops a triangle the arena had room for).
   mesh::ExtractTimings reuse_timings;
   CHECK(arena_mc.extract(one_grid, 0.0f, &reuse_timings).ok());
-  CHECK(reuse_timings.triangle_capacity == small_timings.triangle_capacity);
+  CHECK(reuse_timings.triangle_capacity == big_timings.triangle_capacity);
   CHECK(reuse_timings.arena_bytes == big_timings.arena_bytes);
+  CHECK(reuse_timings.dispatches == 1);  // it already fits: no refit
+
+  // --- Refit and re-run when the planned capacity undershoots ----------------
+  // The arena is fitted to the surface, so a call CAN plan too small -- and the
+  // recovery is the load-bearing part of that trade. It rests on the kernel
+  // counting every triangle the field produces, dropped ones included, so an
+  // undersized arena reports the exact size it needed; a kernel that stopped at
+  // the first drop would report a lower bound, the refit would still be too
+  // small, and the retry would overflow again (an out_of_memory below).
+  //
+  // Forced by density, not by a tuned number: one block of a sign-alternating
+  // field emits ~1400 triangles where a first extract plans ~64 per block, so
+  // the first call MUST refit and re-run. The second call over the same grid
+  // then plans from the density the first one measured, so it must not.
+  vr::Result<mesh::MarchingCubes> refit_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value());
+  CHECK(refit_result.ok());
+  mesh::MarchingCubes refit_mc = std::move(refit_result).value();
+
+  vr::Result<vol::VoxelBlockGrid> dense_block_result =
+      vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp, attrs,
+                                  2);
+  CHECK(dense_block_result.ok());
+  vol::VoxelBlockGrid dense_block = std::move(dense_block_result).value();
+  CHECK(fill_dense_block(dense_block));
+
+  mesh::ExtractTimings refit_timings;
+  vr::Result<mesh::Mesh> refit_mesh_result =
+      refit_mc.extract(dense_block, 0.0f, &refit_timings);
+  CHECK(refit_mesh_result.ok());
+  const mesh::Mesh refit_mesh = std::move(refit_mesh_result).value();
+  CHECK(refit_timings.dispatches == 2);  // planned short, measured, re-ran
+  CHECK(refit_timings.emitted_triangles > refit_timings.active_blocks * 64);
+  CHECK(refit_mesh.triangle_count() == refit_timings.emitted_triangles);
+  // The refitted arena holds the whole surface, with the growth headroom on
+  // top of the measured count.
+  CHECK(refit_timings.triangle_capacity >= refit_timings.emitted_triangles);
+  CHECK(refit_timings.arena_bytes >= needed_bytes(refit_timings));
+
+  // Same grid again: the measured density now plans it in ONE dispatch, and
+  // the geometry is identical triangle-for-triangle -- so the retried mesh lost
+  // nothing and duplicated nothing, which a truncated or double-counted first
+  // pass would both break.
+  mesh::ExtractTimings settled_timings;
+  vr::Result<mesh::Mesh> settled_result =
+      refit_mc.extract(dense_block, 0.0f, &settled_timings);
+  CHECK(settled_result.ok());
+  const mesh::Mesh settled_mesh = std::move(settled_result).value();
+  CHECK(settled_timings.dispatches == 1);
+  CHECK(settled_timings.emitted_triangles == refit_timings.emitted_triangles);
+  CHECK(canonical_triangles(refit_mesh) == canonical_triangles(settled_mesh));
+
+  // Reusing one ExtractTimings across calls must not accumulate: every field is
+  // overwritten, so the second call's spans are its own. (dispatch_ms and
+  // readback_ms sum over a call's attempts internally, which is exactly why
+  // they have to start from zero.)
+  mesh::ExtractTimings reused_stats = refit_timings;
+  CHECK(refit_mc.extract(dense_block, 0.0f, &reused_stats).ok());
+  CHECK(reused_stats.dispatches == 1);
+  CHECK(reused_stats.emitted_triangles == refit_timings.emitted_triangles);
 
   // --- Argument validation ---------------------------------------------------
   // A grid missing the tsdf/weight attributes is rejected (a bare grid here).
