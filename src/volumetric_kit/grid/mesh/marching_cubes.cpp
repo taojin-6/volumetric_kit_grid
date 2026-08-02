@@ -217,7 +217,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // stale tail is never read (the counter bounds the readback).
   std::memset(counter_.mapped(), 0, sizeof(std::uint32_t));
 
-  if (vertex_arena_.valid() && capacity <= arena_capacity_) {
+  if (vertex_arena_.valid() && capacity <= arena_capacity()) {
     return {};  // the steady state -- no allocation at all
   }
   // Grow geometrically rather than to the exact request: the active set climbs
@@ -229,7 +229,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // does not fit a uint32, and truncating first could turn an over-large
   // request into a small one that passes the byte check.
   const std::uint64_t grown = std::max<std::uint64_t>(
-      capacity, static_cast<std::uint64_t>(arena_capacity_) * 3 / 2);
+      capacity, static_cast<std::uint64_t>(arena_capacity()) * 3 / 2);
   const bool headroom_fits =
       grown <= 0xFFFFFFFFull &&
       arena_bytes_for(static_cast<std::uint32_t>(grown)) <=
@@ -237,14 +237,17 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   const std::uint32_t grown_capacity =
       headroom_fits ? static_cast<std::uint32_t>(grown) : capacity;
 
-  // Drop the old arena BEFORE allocating the new one, so a grow needs peak
-  // memory for one arena rather than two.
+  // Drop the old arena BEFORE allocating the new one, so the grow asks the
+  // driver for one arena rather than two. VMA pools an emptied block instead of
+  // returning it (see tests/core_memory_stats_test.cpp), so this holds against
+  // the *driver* for an arena large enough to get a dedicated allocation; a
+  // small one lives in a pooled block that VMA keeps, and process RSS can still
+  // show both across the grow. Failing here leaves the extractor with no arena
+  // rather than a capacity claiming a buffer that was never allocated.
   vertex_arena_ = Buffer{};
-  arena_capacity_ = 0;
   VR_ASSIGN(vertex_arena_,
             storage_buffer(*allocator_, static_cast<VkDeviceSize>(
                                             arena_bytes_for(grown_capacity))));
-  arena_capacity_ = grown_capacity;
   return {};
 }
 
@@ -346,8 +349,11 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   // capacity + the per-cell dispatch index both flow through 32-bit shader
   // values, so keep the worst case inside uint32.
   // TODO(mesh): a two-pass count->fill would size the vertex buffer exactly
-  // instead of at the 5-per-cell worst case; the incremental block-mesh pool
-  // slice supersedes both.
+  // instead of at the 5-per-cell worst case. It is the live follow-up now that
+  // the arena is reused: reuse removed the per-call allocation, exact sizing
+  // removes the retained peak. (It is NOT superseded by the incremental
+  // block-mesh pool -- profiling showed the pool would optimise the dispatch,
+  // which is already the cheap phase. See CLAUDE.md's overlay finding.)
   if (capacity64 > 0xFFFFFFFFull || cells > 0xFFFFFFFFull) {
     return Status::invalid_argument(
         "MarchingCubes::extract: grid too large for this slice");
@@ -452,9 +458,10 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
   // One invocation per voxel of each active block; worst-case 5 triangles each.
   // Both the thread index and the triangle capacity flow through 32-bit shader
   // values, so keep the worst case inside uint32.
-  // TODO(mesh): a two-pass count->fill (or the incremental block-mesh pool
-  // slice) would size the vertex arena to the real triangle count instead of
-  // this 5-per-voxel worst case.
+  // TODO(mesh): a two-pass count->fill would size the vertex arena to the real
+  // triangle count instead of this 5-per-voxel worst case -- the follow-up that
+  // shrinks the arena the extractor now retains (see the same TODO on the dense
+  // path for why the block-mesh pool does not supersede it).
   const std::uint64_t threads =
       static_cast<std::uint64_t>(num_active) * static_cast<std::uint64_t>(vpb);
   const std::uint64_t capacity64 = threads * kMaxTrisPerCell;
@@ -549,8 +556,10 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
     timings->active_blocks = num_active;
     timings->triangle_capacity = capacity;
     timings->emitted_triangles = emitted;
-    timings->arena_bytes =
-        static_cast<std::uint64_t>(capacity) * 3 * sizeof(Vertex);
+    // What the extractor is holding, not what this call asked for: the arena is
+    // retained and grown, so a steady-state call allocates nothing and a grown
+    // arena exceeds `capacity`'s own footprint.
+    timings->arena_bytes = vertex_arena_.size();
   }
   return mesh;
 }

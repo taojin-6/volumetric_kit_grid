@@ -65,9 +65,10 @@ struct DenseGrid {
 /// either alone.
 ///
 /// Meshing is currently whole-volume and worst-case-sized, so the counters
-/// matter as much as the spans: @ref arena_bytes is the *capacity* allocated
-/// (5 triangles per cell), typically orders of magnitude above what @ref
-/// emitted_triangles fills.
+/// matter as much as the spans: @ref triangle_capacity is what this call sized
+/// for (5 triangles per cell), typically orders of magnitude above what @ref
+/// emitted_triangles fills, and @ref arena_bytes is what the extractor is
+/// holding to serve it.
 struct ExtractTimings {
   /// Compacting the hash map's active block list (a dispatch + readback).
   double compact_ms = 0.0;
@@ -75,7 +76,9 @@ struct ExtractTimings {
   double neighbour_lut_ms = 0.0;
   /// Allocating + filling the active-block and neighbour input buffers.
   double input_upload_ms = 0.0;
-  /// Allocating the worst-case vertex arena + zeroing the atomic counter.
+  /// Sizing the worst-case vertex arena + zeroing the atomic counter. Near
+  /// zero once the retained arena already fits the call -- the steady state,
+  /// since the arena is reused across extracts (see @ref MarchingCubes).
   double arena_alloc_ms = 0.0;
   /// Writing the kernel's descriptor bindings.
   double descriptor_ms = 0.0;
@@ -91,7 +94,10 @@ struct ExtractTimings {
   std::uint32_t triangle_capacity = 0;
   /// Triangles the kernel actually emitted.
   std::uint32_t emitted_triangles = 0;
-  /// Bytes allocated for the vertex arena this call.
+  /// Bytes the extractor's vertex arena currently holds. This is *resident*
+  /// size, not this call's allocation: the arena is retained across extracts,
+  /// so a steady-state call allocates nothing and still reports it, and a
+  /// grown arena can exceed what @ref triangle_capacity alone would need.
   std::uint64_t arena_bytes = 0;
 
   /// @return The sum of every phase, in milliseconds.
@@ -119,12 +125,22 @@ struct ExtractTimings {
 /// absent), and a @ref Vertex::uv0 left at the `(-1, -1)` sentinel -- the
 /// projective-texturing pass (a later slice) fills real atlas coordinates.
 ///
+/// @note An extractor **retains its vertex arena between calls**, growing it
+///       when a call needs more and never shrinking it. The arena is sized for
+///       the worst case of 5 triangles per cell, so it can reach hundreds of
+///       megabytes on a large volume and stays resident for this object's
+///       lifetime -- reuse is what makes a steady-state extract pay nothing for
+///       its output storage (it was ~90% of a sparse extract when allocated per
+///       call), at the cost of holding the peak. Destroy the extractor to
+///       release it; @ref ExtractTimings::arena_bytes reports what it holds.
+///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
 class VR_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and
-  ///        binding it to @p allocator for the per-extract scratch buffers.
+  ///        binding it to @p allocator for its input, vertex-arena, and
+  ///        counter buffers.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator its buffers come from (must outlive this).
   /// @return The extractor, or a non-OK @ref Status if a pipeline, layout, or
@@ -132,8 +148,11 @@ class VR_MESH_API MarchingCubes {
   static Result<MarchingCubes> create(Device& device, Allocator& allocator);
 
   // Rule of zero: every owned member (Buffer / ComputeKernel / pool) self-frees
-  // and self-resets on move, so the defaulted moves are correct. device_ /
-  // allocator_ are borrowed pointers, so a defaulted move leaving the
+  // and self-resets on move, so the defaulted moves are correct. Nothing here
+  // caches a *copy* of an owned member's state -- the arena's capacity is
+  // derived from vertex_arena_ (see arena_capacity) rather than tracked
+  // alongside it, so a defaulted move cannot leave the two disagreeing.
+  // device_ / allocator_ are borrowed pointers, so a defaulted move leaving the
   // moved-from extractor pointing at them is harmless -- it reports valid() ==
   // false and is only destroyed.
   ~MarchingCubes() = default;
@@ -224,9 +243,10 @@ class VR_MESH_API MarchingCubes {
 
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0
   // of both kernels for every extract (the counterpart to the volume tier's
-  // persistent bindings). The per-extract input / vertex / counter buffers
-  // track the grid and are (re)written into the remaining bindings before a
-  // dispatch.
+  // persistent bindings). The input buffers are per-extract; the vertex arena
+  // and counter are retained (below). All of them are (re)written into the
+  // remaining bindings before a dispatch, so a regrown arena's new handle is
+  // always the one bound.
   Buffer tables_;
   // A 1-element dummy bound to the sparse kernel's color slot when a grid
   // carries no `color` attribute, so that descriptor stays valid (the has_color
@@ -248,8 +268,6 @@ class VR_MESH_API MarchingCubes {
   // the readback.
   Buffer vertex_arena_;
   Buffer counter_;
-  // Triangle capacity @ref vertex_arena_ is currently sized for (0 = unsized).
-  std::uint32_t arena_capacity_ = 0;
 
   // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
   // and a set allocated from the shared pool_ (see @ref ComputeKernel): the
@@ -257,6 +275,16 @@ class VR_MESH_API MarchingCubes {
   ComputeKernel kernel_;
   ComputeKernel kernel_sparse_;
   DescriptorPool pool_;
+
+  // Triangle capacity @ref vertex_arena_ is currently sized for (0 when it
+  // holds no buffer, including after a move -- Buffer zeroes its size). Derived
+  // rather than stored so the capacity can never disagree with the buffer it
+  // describes; the division is exact because the arena is only ever allocated
+  // as a whole number of triangles.
+  std::uint32_t arena_capacity() const noexcept {
+    return static_cast<std::uint32_t>(vertex_arena_.size() /
+                                      (3 * sizeof(Vertex)));
+  }
 
   // Size @ref vertex_arena_ / @ref counter_ for a dispatch emitting at most
   // @p capacity triangles, reallocating only when the current arena is too

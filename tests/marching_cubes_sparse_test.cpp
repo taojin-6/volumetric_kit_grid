@@ -381,6 +381,63 @@ int main() {
   CHECK(empty_mesh.ok());
   CHECK(std::move(empty_mesh).value().empty());
 
+  // --- Vertex-arena growth policy --------------------------------------------
+  // The arena is retained between extracts and only ever grown, so its size is
+  // part of the extractor's contract, not an implementation detail: it must
+  // always cover the call's worst-case capacity, must grow when a call needs
+  // more than the last one, and must NOT shrink back when a later call needs
+  // less (that reuse is the whole point -- reallocating this buffer was ~90% of
+  // a sparse extract). ExtractTimings::arena_bytes reports what the extractor
+  // is holding, which is what makes the policy checkable from outside.
+  //
+  // Checked here rather than on the dense path because the sizes must be
+  // observed, not inferred: the worst-case capacity is ~5 triangles per cell
+  // while a sphere emits a small fraction of that, so an undersized arena still
+  // holds every emitted triangle and comparing meshes would NOT catch a broken
+  // growth policy.
+  vr::Result<mesh::MarchingCubes> arena_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value());
+  CHECK(arena_result.ok());
+  mesh::MarchingCubes arena_mc = std::move(arena_result).value();
+
+  // One allocated block: the smallest non-empty active set. (An empty one
+  // returns early without sizing anything, so it cannot anchor this.)
+  vr::Result<vol::VoxelBlockGrid> one_result = vol::VoxelBlockGrid::create(
+      device.value(), allocator.value(), gp, attrs, 2);
+  CHECK(one_result.ok());
+  vol::VoxelBlockGrid one_grid = std::move(one_result).value();
+  vol::BlockIndex single_block{};
+  single_block.coord = vr::Vec3i(0, 0, 0);
+  vr::Result<std::uint32_t> single_failed =
+      one_grid.map().allocate(&single_block, 1);
+  CHECK(single_failed.ok());
+  CHECK(single_failed.value() == 0);
+
+  // Bytes the call's own worst case needs, independent of what is held.
+  const auto needed_bytes = [](const mesh::ExtractTimings& t) {
+    return static_cast<std::uint64_t>(t.triangle_capacity) * 3 *
+           sizeof(mesh::Vertex);
+  };
+
+  mesh::ExtractTimings small_timings;
+  CHECK(arena_mc.extract(one_grid, 0.0f, &small_timings).ok());
+  CHECK(small_timings.triangle_capacity > 0);
+  CHECK(small_timings.arena_bytes >= needed_bytes(small_timings));
+
+  // The sphere grid needs a far larger capacity: the grow path.
+  mesh::ExtractTimings big_timings;
+  CHECK(arena_mc.extract(grid, 0.0f, &big_timings).ok());
+  CHECK(big_timings.triangle_capacity > small_timings.triangle_capacity);
+  CHECK(big_timings.arena_bytes >= needed_bytes(big_timings));
+  CHECK(big_timings.arena_bytes > small_timings.arena_bytes);
+
+  // Back to the one-block grid: the oversized arena is reused as-is, neither
+  // reallocated nor shrunk.
+  mesh::ExtractTimings reuse_timings;
+  CHECK(arena_mc.extract(one_grid, 0.0f, &reuse_timings).ok());
+  CHECK(reuse_timings.triangle_capacity == small_timings.triangle_capacity);
+  CHECK(reuse_timings.arena_bytes == big_timings.arena_bytes);
+
   // --- Argument validation ---------------------------------------------------
   // A grid missing the tsdf/weight attributes is rejected (a bare grid here).
   vr::Result<vol::VoxelBlockGrid> bare_result = vol::VoxelBlockGrid::create(
