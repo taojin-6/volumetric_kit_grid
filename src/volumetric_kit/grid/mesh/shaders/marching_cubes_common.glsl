@@ -67,6 +67,20 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
                 ivec3 base_voxel, float voxel_size, vec3 normal, float iso,
                 uint has_color, uint capacity) {
   for (int t = 0; tri_table[cube_index * 16 + t] != -1; t += 3) {
+    // Claim the slot BEFORE interpolating: the claim decides whether this
+    // triangle's three edge interpolations are worth doing at all, and on the
+    // dispatch that discovers an undersized arena most of them are not. The
+    // reservation depends on nothing the loop below computes, so hoisting it is
+    // semantically identical.
+    uint tri = atomicAdd(tri_count, 1u);
+    if (tri >= capacity) {
+      // Drop this triangle but keep counting: `tri_count` must end up the
+      // field's TRUE total, because the host sizes the arena from it and
+      // re-runs. A `return` here would abandon this cell's remaining triangles
+      // uncounted, making the reported total a lower bound -- so the host's
+      // refit would still be too small and the retry would overflow again.
+      continue;
+    }
     vec3 p[3];
     vec3 col[3];
     for (int k = 0; k < 3; ++k) {
@@ -80,15 +94,6 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
       // Interpolate color at the same ratio; opaque white where no color input.
       col[k] = has_color != 0u ? mix(corner_color[a], corner_color[b], ratio)
                                : vec3(1.0);
-    }
-    uint tri = atomicAdd(tri_count, 1u);
-    if (tri >= capacity) {
-      // Drop this triangle but keep going: `tri_count` must end up the field's
-      // TRUE total, because the host sizes the arena from it and re-runs. A
-      // `return` here would abandon this cell's remaining triangles uncounted,
-      // making the reported total a lower bound -- so the host's refit would
-      // still be too small and the retry would overflow again.
-      continue;
     }
     uint vbase = tri * 3u;
     vertices[vbase + 0u].position = p[0];
