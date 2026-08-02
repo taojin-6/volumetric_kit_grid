@@ -81,7 +81,7 @@ int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
 // so the expected block for a pixel is derived INDEPENDENTLY of the shader --
 // a wrong fx/fy/cx/cy or a transposed cam_to_world changes this result and the
 // on-device set no longer matches. (The device path is GLSL; this is glm/C++.)
-vr::Vec3i unproject_to_block(const vol::DepthCameraParams& cam,
+vr::Vec3i unproject_to_block(const vr::DepthCameraParams& cam,
                              const vol::VoxelGridParams& grid, std::uint32_t u,
                              std::uint32_t v, float d) {
   const float x = (static_cast<float>(u) - cam.cx) * d / cam.fx;
@@ -152,7 +152,7 @@ int main() {
   // depth kernel
   // + retry exist for -- and the pose lands the blocks at a negative Y,
   // exercising the negative-bias voxel->block floor.
-  vol::DepthCameraParams cam{};
+  vr::DepthCameraParams cam{};
   cam.fx = 100.0f;
   cam.fy = 120.0f;  // fx != fy, so a swapped focal length is caught
   cam.cx = 1.5f;
