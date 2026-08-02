@@ -50,6 +50,57 @@ struct DenseGrid {
   Vec3f origin{};           ///< World position of sample index `(0, 0, 0)`.
 };
 
+/// @brief Where one sparse @ref MarchingCubes::extract call spent its time, and
+///        the sizes that explain it.
+///
+/// Opt-in and explicit: the caller passes one of these to @ref
+/// MarchingCubes::extract to have it filled, and `nullptr` (the default)
+/// measures nothing. The tier keeps no profiler, no global sink, and no
+/// timing state between calls -- a caller that wants a running view (the
+/// viewer's overlay) aggregates these itself.
+///
+/// The spans are **wall-clock**, and the GPU ones are end-to-end: the dispatch
+/// goes through @ref Device::submit_single_time, which blocks on a fence, so
+/// @ref dispatch_ms covers host record *plus* device execution rather than
+/// either alone.
+///
+/// Meshing is currently whole-volume and worst-case-sized, so the counters
+/// matter as much as the spans: @ref arena_bytes is the *capacity* allocated
+/// (5 triangles per cell), typically orders of magnitude above what @ref
+/// emitted_triangles fills.
+struct ExtractTimings {
+  /// Compacting the hash map's active block list (a dispatch + readback).
+  double compact_ms = 0.0;
+  /// Building the host-side 2x2x2 neighbour lookup table.
+  double neighbour_lut_ms = 0.0;
+  /// Allocating + filling the active-block and neighbour input buffers.
+  double input_upload_ms = 0.0;
+  /// Allocating the worst-case vertex arena + zeroing the atomic counter.
+  double arena_alloc_ms = 0.0;
+  /// Writing the kernel's descriptor bindings.
+  double descriptor_ms = 0.0;
+  /// The marching-cubes dispatch, including the blocking fence wait.
+  double dispatch_ms = 0.0;
+  /// Reading the counter back and copying the vertices into the host mesh.
+  double readback_ms = 0.0;
+
+  /// Active blocks meshed -- the dispatch's real size (occupancy, not the
+  /// map's capacity).
+  std::uint32_t active_blocks = 0;
+  /// Worst-case triangle capacity the arena was sized for.
+  std::uint32_t triangle_capacity = 0;
+  /// Triangles the kernel actually emitted.
+  std::uint32_t emitted_triangles = 0;
+  /// Bytes allocated for the vertex arena this call.
+  std::uint64_t arena_bytes = 0;
+
+  /// @return The sum of every phase, in milliseconds.
+  double total_ms() const noexcept {
+    return compact_ms + neighbour_lut_ms + input_upload_ms + arena_alloc_ms +
+           descriptor_ms + dispatch_ms + readback_ms;
+  }
+};
+
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
 ///        into a host @ref Mesh -- from a dense @ref DenseGrid or straight off
 ///        a sparse @ref volume::VoxelBlockGrid.
@@ -137,6 +188,9 @@ class VR_MESH_API MarchingCubes {
   ///              @ref Vertex::uv0 is always the `(-1, -1)` sentinel
   ///              (projective texturing fills it in a later slice).
   /// @param iso   The iso-value to extract (0 for a raw signed-distance field).
+  /// @param timings  Optional; when non-null, receives this call's per-phase
+  ///                 wall-clock breakdown and size counters (see @ref
+  ///                 ExtractTimings). `nullptr` measures nothing.
   /// @return The extracted mesh (empty when no active block holds a surface),
   /// or
   ///         a non-OK @ref Status: @ref Status::Code::InvalidArgument for a
@@ -144,7 +198,8 @@ class VR_MESH_API MarchingCubes {
   ///         `float` `tsdf`/`weight` attribute, or if the active set is too
   ///         large for a single 1-D dispatch; a backend error if a buffer or
   ///         the dispatch fails.
-  Result<Mesh> extract(volume::VoxelBlockGrid& grid, float iso = 0.0f);
+  Result<Mesh> extract(volume::VoxelBlockGrid& grid, float iso = 0.0f,
+                       ExtractTimings* timings = nullptr);
 
   /// @return `true` if this owns a live kernel (`false` when moved-from).
   bool valid() const noexcept { return kernel_.valid(); }

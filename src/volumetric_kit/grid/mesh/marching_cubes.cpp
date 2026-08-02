@@ -4,6 +4,7 @@
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <numeric>
@@ -178,12 +179,14 @@ Result<OutputBuffers> make_output_buffers(Allocator& allocator,
 // shared-vertex dedup can shrink `vertices` without changing the Mesh
 // contract). Shared by both extract overloads.
 Mesh collect_mesh(const Buffer& vertices, const Buffer& counter,
-                  std::uint32_t capacity) {
+                  std::uint32_t capacity,
+                  std::uint32_t* emitted_out = nullptr) {
   std::uint32_t emitted = 0;
   std::memcpy(&emitted, counter.mapped(), sizeof(std::uint32_t));
   // Worst-case capacity means the kernel never drops, but clamp defensively so
   // a future smaller-capacity mode cannot over-read the vertex arena.
   emitted = std::min(emitted, capacity);
+  if (emitted_out != nullptr) *emitted_out = emitted;
 
   const auto vertex_count = static_cast<std::size_t>(emitted) * 3;
   Mesh mesh;
@@ -196,6 +199,32 @@ Mesh collect_mesh(const Buffer& vertices, const Buffer& counter,
   std::iota(mesh.indices.begin(), mesh.indices.end(), std::uint32_t{0});
   return mesh;
 }
+
+// Stopwatch for the opt-in ExtractTimings. Reading the clock is cheap, but it
+// is skipped entirely when the caller wants no measurement, so the untimed path
+// costs one branch per phase.
+class PhaseClock {
+ public:
+  explicit PhaseClock(bool enabled) : enabled_(enabled) { restart(); }
+
+  void restart() {
+    if (enabled_) start_ = std::chrono::steady_clock::now();
+  }
+
+  // Milliseconds since the last restart, then restart for the next phase.
+  double lap() {
+    if (!enabled_) return 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(now - start_).count();
+    start_ = now;
+    return ms;
+  }
+
+ private:
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_{};
+};
 
 }  // namespace
 
@@ -358,7 +387,8 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   return collect_mesh(out.vertices, out.counter, capacity);
 }
 
-Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
+Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
+                                    ExtractTimings* timings) {
   if (!valid()) {
     return Status::invalid_argument("MarchingCubes::extract: moved-from");
   }
@@ -387,8 +417,10 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
 
   // The active set drives the dispatch (one thread per voxel of each block) and
   // supplies the neighbour lookup. An empty map means nothing to mesh.
+  PhaseClock phase_clock(timings != nullptr);
   VR_ASSIGN(std::vector<volume::BlockIndex> active,
             grid.map().compact_active_blocks());
+  if (timings != nullptr) timings->compact_ms = phase_clock.lap();
   if (active.empty()) {
     return Mesh{};
   }
@@ -418,6 +450,7 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
   // (octant = ox + 2*oy + 4*oz). -1 marks an unallocated neighbour, which the
   // kernel treats as no-surface. Built host-side from the compacted set, so the
   // kernel does no device-side hash probe.
+  phase_clock.restart();
   std::unordered_map<Vec3i, std::int32_t, CoordHash> ptr_by_coord;
   ptr_by_coord.reserve(active.size() * 2);
   for (const volume::BlockIndex& b : active) {
@@ -439,6 +472,7 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
   // Per-extract inputs: the active blocks + neighbour LUT (write-once), and the
   // vertex arena + atomic counter out. Attribute buffers bind straight from the
   // grid (no copy).
+  if (timings != nullptr) timings->neighbour_lut_ms = phase_clock.lap();
   VR_ASSIGN(Buffer active_buf,
             storage_buffer(*allocator_,
                            static_cast<VkDeviceSize>(num_active) *
@@ -454,8 +488,10 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
   std::memcpy(neighbour_buf.mapped(), neighbour_lut.data(),
               neighbour_lut.size() * sizeof(std::int32_t));
 
+  if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
   VR_ASSIGN(OutputBuffers out, make_output_buffers(*allocator_, capacity,
                                                    max_storage_buffer_range_));
+  if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
                                           VK_WHOLE_SIZE);
@@ -473,6 +509,7 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
   kernel_sparse_.set.write_storage_buffer(7, out.counter.handle(), 0,
                                           VK_WHOLE_SIZE);
 
+  if (timings != nullptr) timings->descriptor_ms = phase_clock.lap();
   const SparsePushConstants push{bs,
                                  static_cast<std::int32_t>(vpb),
                                  gp.voxel_size,
@@ -485,7 +522,19 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso) {
                   group_count(static_cast<std::uint32_t>(threads)),
                   max_workgroup_count_x_));
 
-  return collect_mesh(out.vertices, out.counter, capacity);
+  if (timings != nullptr) timings->dispatch_ms = phase_clock.lap();
+
+  std::uint32_t emitted = 0;
+  Mesh mesh = collect_mesh(out.vertices, out.counter, capacity, &emitted);
+  if (timings != nullptr) {
+    timings->readback_ms = phase_clock.lap();
+    timings->active_blocks = num_active;
+    timings->triangle_capacity = capacity;
+    timings->emitted_triangles = emitted;
+    timings->arena_bytes =
+        static_cast<std::uint64_t>(capacity) * 3 * sizeof(Vertex);
+  }
+  return mesh;
 }
 
 }  // namespace volumetric_kit::recon::mesh
