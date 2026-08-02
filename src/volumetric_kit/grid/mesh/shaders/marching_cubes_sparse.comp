@@ -37,8 +37,9 @@ struct BlockIndex {
 struct Vertex {
   vec3 position;
   vec3 normal;
-  vec4 color;
+  vec4 tangent;  // renderer's slot; meshing has no parameterisation for one
   vec2 uv0;
+  vec4 color;
 };
 
 // The marching-cubes tables (mirrors mesh::McTables): the flattened 256x16
