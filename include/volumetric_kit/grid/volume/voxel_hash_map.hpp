@@ -9,7 +9,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
@@ -18,6 +17,10 @@
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+// DepthCameraParams lives in its own Vulkan-free header so a consumer that only
+// describes a camera (the sensor tier's out-of-tree drivers) need not compile
+// this one; re-exported here so existing users are unaffected.
+#include "volumetric_kit/recon/volume/camera_params.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
 #include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -40,35 +43,6 @@ struct HashDiagnostics {
   float load_factor = 0.0f;           ///< `active_count / total slots`.
   float heap_utilization = 0.0f;      ///< `1 - heap_free / total_blocks`.
 };
-
-/// @brief Pinhole depth-camera intrinsics + pose for
-///        @ref VoxelHashMap::allocate_from_depth.
-///
-/// Uploaded verbatim to the depth-allocation kernel, which reads it through
-/// scalar block layout -- so this packs byte-for-byte to the shader's
-/// `CameraParams`: the scalars at their natural 4-byte offsets, the `mat4` at
-/// offset 32. The `static_assert`s below pin that layout (a drift is a compile
-/// error, not silent misprojection).
-struct DepthCameraParams {
-  float fx;              ///< Focal length x (pixels).
-  float fy;              ///< Focal length y (pixels).
-  float cx;              ///< Principal point x (pixels).
-  float cy;              ///< Principal point y (pixels).
-  float min_depth;       ///< Reject samples nearer than this (metres).
-  float max_depth;       ///< Reject samples farther than this (metres).
-  std::uint32_t width;   ///< Depth image width (pixels).
-  std::uint32_t height;  ///< Depth image height (pixels).
-  Mat4f cam_to_world;    ///< Camera -> world rigid transform (column-major).
-};
-static_assert(sizeof(DepthCameraParams) == 96,
-              "DepthCameraParams must be 96 bytes");
-static_assert(offsetof(DepthCameraParams, min_depth) == 16, "layout drift");
-static_assert(offsetof(DepthCameraParams, width) == 24, "layout drift");
-static_assert(offsetof(DepthCameraParams, cam_to_world) == 32, "layout drift");
-static_assert(std::is_trivially_copyable_v<DepthCameraParams>,
-              "DepthCameraParams must be trivially copyable");
-static_assert(std::is_standard_layout_v<DepthCameraParams>,
-              "DepthCameraParams must be standard-layout");
 
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
