@@ -44,16 +44,27 @@ struct Vertex {
   Vec3f position;  ///< World-space position (metres).
   Vec3f normal;    ///< Unit surface normal (an arbitrary unit axis where the
                    ///< SDF gradient vanishes; never the zero vector).
-  Vec4f color;     ///< Per-vertex RGBA, opaque (alpha 1) -- the vertex-color
-                   ///< fallback used where @ref uv0 is the sentinel.
+  Vec4f tangent;   ///< xyz tangent, w handedness. Carried for the renderer's
+                   ///< vertex layout, not produced by meshing: marching cubes
+                   ///< has no surface parameterisation to derive one from, so
+                   ///< every vertex gets the same placeholder the host
+                   ///< converter used to synthesize. See the layout note above.
   Vec2f uv0;       ///< Atlas texture coordinate, or the `(-1, -1)` sentinel
                    ///< meaning "no atlas; use @ref color".
+  Vec4f color;     ///< Per-vertex RGBA, opaque (alpha 1) -- the vertex-color
+                   ///< fallback used where @ref uv0 is the sentinel.
 };
-static_assert(sizeof(Vertex) == 48, "Vertex must be 48 bytes");
+// Byte-for-byte `volumetric_kit::gfx::assets::Vertex`. These offsets are the
+// interop-seam contract, not an internal detail: the renderer's vertex-input
+// description reads position/normal/uv0/color at exactly these offsets with
+// this stride, so a mesh the kernel wrote can be bound and drawn with no
+// conversion. Changing one without the other silently misreads every vertex.
+static_assert(sizeof(Vertex) == 64, "Vertex must be 64 bytes");
 static_assert(offsetof(Vertex, position) == 0, "Vertex layout drift");
 static_assert(offsetof(Vertex, normal) == 12, "Vertex layout drift");
-static_assert(offsetof(Vertex, color) == 24, "Vertex layout drift");
+static_assert(offsetof(Vertex, tangent) == 24, "Vertex layout drift");
 static_assert(offsetof(Vertex, uv0) == 40, "Vertex layout drift");
+static_assert(offsetof(Vertex, color) == 48, "Vertex layout drift");
 // Uploaded/downloaded by value and mirrored by a GLSL scalar-layout block, so
 // it must stay a trivially-copyable, standard-layout POD.
 static_assert(std::is_trivially_copyable_v<Vertex>,

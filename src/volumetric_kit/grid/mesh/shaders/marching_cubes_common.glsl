@@ -108,6 +108,14 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
     vertices[vbase + 0u].uv0 = vec2(-1.0);
     vertices[vbase + 1u].uv0 = vec2(-1.0);
     vertices[vbase + 2u].uv0 = vec2(-1.0);
+    // The renderer's tangent slot. Marching cubes has no surface
+    // parameterisation to derive a real tangent from, so write the same
+    // placeholder the host converter used to synthesize -- the kernel fills it
+    // because the buffer is handed to the renderer as-is, and a slot left
+    // unwritten would carry whatever the previous, larger mesh put there.
+    vertices[vbase + 0u].tangent = vec4(1.0, 0.0, 0.0, 1.0);
+    vertices[vbase + 1u].tangent = vec4(1.0, 0.0, 0.0, 1.0);
+    vertices[vbase + 2u].tangent = vec4(1.0, 0.0, 0.0, 1.0);
   }
 }
 
