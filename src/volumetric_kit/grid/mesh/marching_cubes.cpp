@@ -174,6 +174,10 @@ Mesh collect_mesh(const Buffer& vertices, const Buffer& counter,
 
   const auto vertex_count = static_cast<std::size_t>(emitted) * 3;
   Mesh mesh;
+  // TODO(mesh): resize() zero-initializes the vector and the memcpy below
+  // immediately overwrites it -- two passes over the whole readback. There is
+  // no resize-without-init on std::vector; revisit if the download shows up in
+  // an ExtractTimings profile.
   mesh.vertices.resize(vertex_count);
   if (vertex_count > 0) {
     std::memcpy(mesh.vertices.data(), vertices.mapped(),

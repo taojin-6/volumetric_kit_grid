@@ -37,9 +37,9 @@ namespace volumetric_kit::recon::mesh {
 /// `(-1, -1)` sentinel and the shader falls back to @ref color (the color TSDF
 /// integration fused into the volume, interpolated here). Marching cubes fills
 /// @ref color and leaves @ref uv0 at the sentinel; the projective-texturing
-/// pass (a later slice) overwrites @ref uv0 for textured triangles. The gfx
-/// ingestion vertex additionally carries a `tangent`; synthesizing it is the
-/// interop-seam converter's job, not a field on this struct.
+/// pass (a later slice) overwrites @ref uv0 for textured triangles. @ref
+/// tangent is here only to hold the renderer's layout in place: meshing cannot
+/// derive one, so the kernel writes a fixed placeholder into it.
 struct Vertex {
   Vec3f position;  ///< World-space position (metres).
   Vec3f normal;    ///< Unit surface normal (an arbitrary unit axis where the
@@ -57,8 +57,14 @@ struct Vertex {
 // Byte-for-byte `volumetric_kit::gfx::assets::Vertex`. These offsets are the
 // interop-seam contract, not an internal detail: the renderer's vertex-input
 // description reads position/normal/uv0/color at exactly these offsets with
-// this stride, so a mesh the kernel wrote can be bound and drawn with no
-// conversion. Changing one without the other silently misreads every vertex.
+// this stride, so a mesh the kernel wrote crosses the seam unconverted.
+// Changing one without the other silently misreads every vertex.
+// TODO(mesh): the layout is necessary for interop seam B but not sufficient --
+// marching_cubes.cpp creates the vertex arena STORAGE_BUFFER-only and
+// host-visible, so it still needs VERTEX_BUFFER usage (and the index run
+// INDEX_BUFFER, plus probably a device-local home) before gfx can bind and draw
+// it in place. Add those with the shared-device bootstrap, which is what would
+// consume them.
 static_assert(sizeof(Vertex) == 64, "Vertex must be 64 bytes");
 static_assert(offsetof(Vertex, position) == 0, "Vertex layout drift");
 static_assert(offsetof(Vertex, normal) == 12, "Vertex layout drift");
