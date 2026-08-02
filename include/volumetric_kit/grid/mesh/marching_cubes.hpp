@@ -16,6 +16,7 @@
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/mesh/device_mesh.hpp"
 #include "volumetric_kit/recon/mesh/export.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -84,7 +85,10 @@ struct ExtractTimings {
   double descriptor_ms = 0.0;
   /// The marching-cubes dispatch, including the blocking fence wait.
   double dispatch_ms = 0.0;
-  /// Reading the counter back and copying the vertices into the host mesh.
+  /// Getting the result back to the caller: the 4-byte counter read, plus the
+  /// vertex copy into the host mesh when one is made. @ref
+  /// MarchingCubes::extract makes one, so this covers both; @ref
+  /// MarchingCubes::extract_device does not, so there it is the counter alone.
   double readback_ms = 0.0;
 
   /// Active blocks meshed -- the dispatch's real size (occupancy, not the
@@ -245,8 +249,11 @@ class VR_MESH_API MarchingCubes {
   /// @param device_mesh  A mesh from @ref extract_device on *this* extractor,
   ///                     not yet invalidated by a later extract.
   /// @return The host mesh, or @ref Status::Code::InvalidArgument if
-  ///         @p device_mesh does not name this extractor's current buffers
-  ///         (the stale-view case).
+  ///         @p device_mesh is not this extractor's newest extract -- it was
+  ///         superseded by a later one, or came from a different extractor.
+  ///         The check is by @ref DeviceMesh::generation, not by buffer handle:
+  ///         the arena is reused in place, so a superseded view names the same
+  ///         `VkBuffer` and a handle comparison would accept it.
   Result<Mesh> download(const DeviceMesh& device_mesh) const;
 
   /// @return `true` if this owns a live kernel (`false` when moved-from).
@@ -304,6 +311,10 @@ class VR_MESH_API MarchingCubes {
   // (projective texturing, and the renderer at the interop seam) address
   // vertices through an index buffer.
   Buffer index_run_;
+  // Numbers the extracts, so a DeviceMesh can say which one it came from.
+  // Pre-incremented, so the first extract is generation 1 and a default-
+  // constructed (or foreign) DeviceMesh at 0 never passes for a live one.
+  std::uint64_t generation_ = 0;
 
   // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
   // and a set allocated from the shared pool_ (see @ref ComputeKernel): the

@@ -249,20 +249,31 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // dropping the arena is what marks the pair unsized, and the index run must
   // not outlive the arena it indexes.
   index_run_ = Buffer{};
-  VR_ASSIGN(vertex_arena_,
+
+  // Build both into locals and commit them together, so a failure on the second
+  // allocation cannot leave a sized arena beside a null index run -- which
+  // arena_capacity() would then report as ready and the next extract would hand
+  // out as a DeviceMesh naming no index buffer.
+  VR_ASSIGN(Buffer arena,
             storage_buffer(*allocator_, static_cast<VkDeviceSize>(
                                             arena_bytes_for(grown_capacity))));
 
   // The index run covers the whole arena and never changes shape, so it is
   // written once here rather than rebuilt per extract. iota straight into the
-  // mapped buffer: no staging copy, and only on a grow.
+  // mapped buffer: no staging copy, and only on a grow. SequentialWrite because
+  // this fill is the only host access it ever gets -- download() regenerates
+  // the run on the host rather than reading back from write-combined memory.
   const std::size_t index_count = static_cast<std::size_t>(grown_capacity) * 3;
-  VR_ASSIGN(index_run_, storage_buffer(*allocator_,
-                                       static_cast<VkDeviceSize>(
-                                           index_count * sizeof(std::uint32_t)),
-                                       HostAccess::SequentialWrite));
-  auto* indices = static_cast<std::uint32_t*>(index_run_.mapped());
+  VR_ASSIGN(Buffer indices_buf,
+            storage_buffer(
+                *allocator_,
+                static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
+                HostAccess::SequentialWrite));
+  auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
   std::iota(indices, indices + index_count, std::uint32_t{0});
+
+  vertex_arena_ = std::move(arena);
+  index_run_ = std::move(indices_buf);
   return {};
 }
 
@@ -430,7 +441,14 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
 Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
                                     ExtractTimings* timings) {
   VR_ASSIGN(const DeviceMesh device_mesh, extract_device(grid, iso, timings));
-  return download(device_mesh);
+  // The host copy is part of this call's readback, so it belongs in the phase
+  // that names it -- extract_device stamped readback_ms with the 4-byte counter
+  // read alone, which is right for that entry point but would leave the host
+  // path's ~45 MB copy uncounted in ExtractTimings::total_ms.
+  PhaseClock download_clock(timings != nullptr);
+  VR_ASSIGN(Mesh mesh, download(device_mesh));
+  if (timings != nullptr) timings->readback_ms += download_clock.lap();
+  return mesh;
 }
 
 Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
@@ -439,14 +457,16 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   if (device_mesh.empty()) {
     return Mesh{};
   }
-  // A view whose handles are not this extractor's current buffers is stale --
-  // a later extract already reallocated or overwrote what it names, so copying
-  // from it would hand back someone else's geometry.
-  if (!device_mesh.valid() || device_mesh.vertices != vertex_arena_.handle() ||
-      device_mesh.indices != index_run_.handle()) {
+  // Only this extractor's newest extract may be downloaded. Checked by
+  // generation, NOT by buffer handle: the arena is grow-only and reused in
+  // place, so a superseded view names the very same VkBuffer as the live one
+  // and a handle comparison would accept it and hand back the newer extract's
+  // geometry under this view's stale counts.
+  if (device_mesh.generation != generation_ || !device_mesh.valid()) {
     return Status::invalid_argument(
-        "MarchingCubes::download: the DeviceMesh does not name this "
-        "extractor's current buffers (invalidated by a later extract?)");
+        "MarchingCubes::download: the DeviceMesh is not this extractor's "
+        "current extract (superseded by a later one, or from another "
+        "extractor)");
   }
   Mesh mesh;
   const auto vertex_count = static_cast<std::size_t>(device_mesh.vertex_count);
@@ -455,8 +475,11 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   if (vertex_count > 0) {
     std::memcpy(mesh.vertices.data(), vertex_arena_.mapped(),
                 vertex_count * sizeof(Vertex));
-    std::memcpy(mesh.indices.data(), index_run_.mapped(),
-                vertex_count * sizeof(std::uint32_t));
+    // Regenerated, not read back: the run is the identity 0,1,2,... and
+    // index_run_ is write-combined (SequentialWrite), where host reads are
+    // pathologically slow. Generating it costs nothing and touches no device
+    // memory.
+    std::iota(mesh.indices.begin(), mesh.indices.end(), std::uint32_t{0});
   }
   return mesh;
 }
@@ -502,6 +525,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     DeviceMesh device_mesh;
     device_mesh.vertices = vertex_arena_.handle();
     device_mesh.indices = index_run_.handle();
+    device_mesh.generation = ++generation_;
     return device_mesh;
   }
 
@@ -616,6 +640,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   device_mesh.indices = index_run_.handle();
   device_mesh.triangle_count = emitted;
   device_mesh.vertex_count = emitted * 3;
+  device_mesh.generation = ++generation_;
   if (timings != nullptr) {
     timings->readback_ms = phase_clock.lap();
     timings->active_blocks = num_active;
