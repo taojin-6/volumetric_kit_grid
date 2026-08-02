@@ -220,6 +220,35 @@ class VR_MESH_API MarchingCubes {
   Result<Mesh> extract(volume::VoxelBlockGrid& grid, float iso = 0.0f,
                        ExtractTimings* timings = nullptr);
 
+  /// @brief Extract as @ref extract does, but leave the result in this
+  ///        extractor's device buffers instead of copying it to the host.
+  ///
+  /// The pass that consumes the mesh next -- `texture::ProjectiveTexturer`, or
+  /// the renderer at the interop seam -- can bind these buffers directly, so
+  /// the readback and the matching re-upload both disappear. Call @ref download
+  /// when a host @ref Mesh is finally needed; @ref extract is exactly this
+  /// followed by that.
+  ///
+  /// @param grid  As @ref extract.
+  /// @param iso   As @ref extract.
+  /// @param timings  As @ref extract, except @ref ExtractTimings::readback_ms
+  ///                 covers only the 4-byte counter read, not a vertex copy.
+  /// @return A @ref DeviceMesh **borrowing** this extractor's buffers -- valid
+  ///         only until the next extract on this object, which overwrites them
+  ///         -- or the same failures @ref extract reports.
+  Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid,
+                                    float iso = 0.0f,
+                                    ExtractTimings* timings = nullptr);
+
+  /// @brief Copy a @ref DeviceMesh's live vertices + indices into a host
+  ///        @ref Mesh.
+  /// @param device_mesh  A mesh from @ref extract_device on *this* extractor,
+  ///                     not yet invalidated by a later extract.
+  /// @return The host mesh, or @ref Status::Code::InvalidArgument if
+  ///         @p device_mesh does not name this extractor's current buffers
+  ///         (the stale-view case).
+  Result<Mesh> download(const DeviceMesh& device_mesh) const;
+
   /// @return `true` if this owns a live kernel (`false` when moved-from).
   bool valid() const noexcept { return kernel_.valid(); }
 
@@ -268,6 +297,13 @@ class VR_MESH_API MarchingCubes {
   // the readback.
   Buffer vertex_arena_;
   Buffer counter_;
+  // The identity index run 0,1,2,... covering @ref vertex_arena_. The kernels
+  // emit independent triangles, so this never varies in content -- it is filled
+  // once per grow and then reused, which is why it can live beside the arena
+  // instead of being rebuilt per call. It exists because the consuming passes
+  // (projective texturing, and the renderer at the interop seam) address
+  // vertices through an index buffer.
+  Buffer index_run_;
 
   // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
   // and a set allocated from the shared pool_ (see @ref ComputeKernel): the
