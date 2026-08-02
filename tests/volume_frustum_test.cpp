@@ -160,7 +160,7 @@ int main() {
 
   // The DepthCameraParams convenience derives the same frustum (min/max_depth
   // as near/far) and culls identically.
-  vol::DepthCameraParams cam{};
+  vr::DepthCameraParams cam{};
   cam.fx = 100.0f;
   cam.fy = 100.0f;
   cam.cx = 50.0f;
@@ -205,7 +205,7 @@ int main() {
       map.allocate(pcoords.data(), static_cast<std::uint32_t>(pcoords.size()));
   CHECK(pfail.ok() && pfail.value() == 0);
 
-  vol::DepthCameraParams pcam = cam;
+  vr::DepthCameraParams pcam = cam;
   pcam.cam_to_world = pose;
   vr::Result<std::vector<vol::BlockIndex>> pvisible =
       map.compact_active_blocks_in_frustum(pcam);
