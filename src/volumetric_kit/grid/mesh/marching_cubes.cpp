@@ -142,36 +142,9 @@ Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
   return allocator.create_buffer(desc);
 }
 
-// The per-extract outputs both marching-cubes paths write: the vertex arena
-// (3 vertices per triangle at the worst-case capacity) and the atomic triangle
-// counter.
-struct OutputBuffers {
-  Buffer vertices;
-  Buffer counter;
-};
-
-// Allocate the output buffers for a dispatch that emits at most @p capacity
-// triangles. Rejects a vertex arena larger than the device's storage-buffer
-// binding limit with a clean Status -- the worst-case 5-triangles-per-cell
-// sizing can reach hundreds of GB on a large active set (see the capacity TODO
-// in each extract), and without this guard that surfaces as an opaque VMA
-// allocation failure rather than an actionable "grid too large" error.
-Result<OutputBuffers> make_output_buffers(Allocator& allocator,
-                                          std::uint32_t capacity,
-                                          std::uint32_t max_storage_range) {
-  const std::uint64_t vertex_bytes =
-      static_cast<std::uint64_t>(capacity) * 3 * sizeof(Vertex);
-  if (vertex_bytes > max_storage_range) {
-    return Status::invalid_argument(
-        "MarchingCubes::extract: vertex arena exceeds the device "
-        "maxStorageBufferRange; grid too large for this slice");
-  }
-  OutputBuffers out;
-  VR_ASSIGN(out.vertices,
-            storage_buffer(allocator, static_cast<VkDeviceSize>(vertex_bytes)));
-  VR_ASSIGN(out.counter, storage_buffer(allocator, sizeof(std::uint32_t)));
-  std::memset(out.counter.mapped(), 0, sizeof(std::uint32_t));
-  return out;
+// Bytes a vertex arena needs to hold @p capacity triangles (3 vertices each).
+std::uint64_t arena_bytes_for(std::uint32_t capacity) {
+  return static_cast<std::uint64_t>(capacity) * 3 * sizeof(Vertex);
 }
 
 // Read the atomic triangle count back and copy the emitted vertices into a
@@ -227,6 +200,53 @@ class PhaseClock {
 };
 
 }  // namespace
+
+Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
+  // Guard the REQUESTED capacity against the device's binding limit before any
+  // growth headroom is added, so a grid that legitimately fits is never
+  // rejected because the growth policy overshot.
+  if (arena_bytes_for(capacity) > max_storage_buffer_range_) {
+    return Status::invalid_argument(
+        "MarchingCubes::extract: vertex arena exceeds the device "
+        "maxStorageBufferRange; grid too large for this slice");
+  }
+  if (!counter_.valid()) {
+    VR_ASSIGN(counter_, storage_buffer(*allocator_, sizeof(std::uint32_t)));
+  }
+  // The counter is the only per-call reset: 4 bytes, against an arena whose
+  // stale tail is never read (the counter bounds the readback).
+  std::memset(counter_.mapped(), 0, sizeof(std::uint32_t));
+
+  if (vertex_arena_.valid() && capacity <= arena_capacity_) {
+    return {};  // the steady state -- no allocation at all
+  }
+  // Grow geometrically rather than to the exact request: the active set climbs
+  // steadily through a scan, so exact sizing would reallocate (and re-fault)
+  // this large buffer on most frames. Fall back to the exact request whenever
+  // the headroom would not fit -- the request itself already passed the guard
+  // above, so a grid that legitimately fits is never rejected by an overshoot.
+  // Both tests run in 64-bit *before* narrowing: 1.5x a near-uint32 capacity
+  // does not fit a uint32, and truncating first could turn an over-large
+  // request into a small one that passes the byte check.
+  const std::uint64_t grown = std::max<std::uint64_t>(
+      capacity, static_cast<std::uint64_t>(arena_capacity_) * 3 / 2);
+  const bool headroom_fits =
+      grown <= 0xFFFFFFFFull &&
+      arena_bytes_for(static_cast<std::uint32_t>(grown)) <=
+          max_storage_buffer_range_;
+  const std::uint32_t grown_capacity =
+      headroom_fits ? static_cast<std::uint32_t>(grown) : capacity;
+
+  // Drop the old arena BEFORE allocating the new one, so a grow needs peak
+  // memory for one arena rather than two.
+  vertex_arena_ = Buffer{};
+  arena_capacity_ = 0;
+  VR_ASSIGN(vertex_arena_,
+            storage_buffer(*allocator_, static_cast<VkDeviceSize>(
+                                            arena_bytes_for(grown_capacity))));
+  arena_capacity_ = grown_capacity;
+  return {};
+}
 
 Result<MarchingCubes> MarchingCubes::create(Device& device,
                                             Allocator& allocator) {
@@ -370,13 +390,12 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
   }
 
-  VR_ASSIGN(OutputBuffers out, make_output_buffers(*allocator_, capacity,
-                                                   max_storage_buffer_range_));
+  VR_TRY(ensure_output_buffers(capacity));
 
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(2, colors_buf.handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(3, out.vertices.handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(4, out.counter.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(3, vertex_arena_.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(4, counter_.handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid.dims, grid.voxel_size,  grid.origin, iso,
                            capacity,  kWeightThreshold, has_color};
@@ -384,7 +403,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                   group_count(static_cast<std::uint32_t>(cells)),
                   max_workgroup_count_x_));
 
-  return collect_mesh(out.vertices, out.counter, capacity);
+  return collect_mesh(vertex_arena_, counter_, capacity);
 }
 
 Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
@@ -489,8 +508,7 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
               neighbour_lut.size() * sizeof(std::int32_t));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
-  VR_ASSIGN(OutputBuffers out, make_output_buffers(*allocator_, capacity,
-                                                   max_storage_buffer_range_));
+  VR_TRY(ensure_output_buffers(capacity));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
@@ -504,9 +522,9 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
   kernel_sparse_.set.write_storage_buffer(
       5, has_color ? color_view.buffer->handle() : color_dummy_.handle(), 0,
       VK_WHOLE_SIZE);
-  kernel_sparse_.set.write_storage_buffer(6, out.vertices.handle(), 0,
+  kernel_sparse_.set.write_storage_buffer(6, vertex_arena_.handle(), 0,
                                           VK_WHOLE_SIZE);
-  kernel_sparse_.set.write_storage_buffer(7, out.counter.handle(), 0,
+  kernel_sparse_.set.write_storage_buffer(7, counter_.handle(), 0,
                                           VK_WHOLE_SIZE);
 
   if (timings != nullptr) timings->descriptor_ms = phase_clock.lap();
@@ -525,7 +543,7 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
   if (timings != nullptr) timings->dispatch_ms = phase_clock.lap();
 
   std::uint32_t emitted = 0;
-  Mesh mesh = collect_mesh(out.vertices, out.counter, capacity, &emitted);
+  Mesh mesh = collect_mesh(vertex_arena_, counter_, capacity, &emitted);
   if (timings != nullptr) {
     timings->readback_ms = phase_clock.lap();
     timings->active_blocks = num_active;

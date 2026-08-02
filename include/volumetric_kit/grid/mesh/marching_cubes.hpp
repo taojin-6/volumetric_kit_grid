@@ -234,12 +234,35 @@ class VR_MESH_API MarchingCubes {
   // color dummy.
   Buffer color_dummy_;
 
+  // The vertex arena + atomic triangle counter the kernels write, kept ACROSS
+  // extract calls and grown only when a call needs more than the last one.
+  //
+  // These were allocated per call, which measured as ~90% of a sparse extract
+  // (~50 ms of a 55 ms call on Replica room0): the arena is sized for the
+  // worst case of 5 triangles per cell, so it runs to hundreds of megabytes,
+  // and creating it every frame makes the driver fault in and zero that many
+  // fresh pages while the dispatch that fills it costs ~2 ms. Reusing one
+  // allocation makes a steady-state extract pay nothing for its output
+  // storage. Only the counter is reset per call (4 bytes); the arena's stale
+  // contents past the emitted range are never read, since the counter bounds
+  // the readback.
+  Buffer vertex_arena_;
+  Buffer counter_;
+  // Triangle capacity @ref vertex_arena_ is currently sized for (0 = unsized).
+  std::uint32_t arena_capacity_ = 0;
+
   // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
   // and a set allocated from the shared pool_ (see @ref ComputeKernel): the
   // dense analytic-grid path and the sparse VoxelBlockGrid path.
   ComputeKernel kernel_;
   ComputeKernel kernel_sparse_;
   DescriptorPool pool_;
+
+  // Size @ref vertex_arena_ / @ref counter_ for a dispatch emitting at most
+  // @p capacity triangles, reallocating only when the current arena is too
+  // small, and zero the counter. Returns a non-OK Status when @p capacity's
+  // arena would exceed the device's maxStorageBufferRange.
+  Status ensure_output_buffers(std::uint32_t capacity);
 };
 
 }  // namespace volumetric_kit::recon::mesh
