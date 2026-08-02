@@ -245,9 +245,24 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // show both across the grow. Failing here leaves the extractor with no arena
   // rather than a capacity claiming a buffer that was never allocated.
   vertex_arena_ = Buffer{};
+  // Released together: arena_capacity() is derived from the arena's size, so
+  // dropping the arena is what marks the pair unsized, and the index run must
+  // not outlive the arena it indexes.
+  index_run_ = Buffer{};
   VR_ASSIGN(vertex_arena_,
             storage_buffer(*allocator_, static_cast<VkDeviceSize>(
                                             arena_bytes_for(grown_capacity))));
+
+  // The index run covers the whole arena and never changes shape, so it is
+  // written once here rather than rebuilt per extract. iota straight into the
+  // mapped buffer: no staging copy, and only on a grow.
+  const std::size_t index_count = static_cast<std::size_t>(grown_capacity) * 3;
+  VR_ASSIGN(index_run_, storage_buffer(*allocator_,
+                                       static_cast<VkDeviceSize>(
+                                           index_count * sizeof(std::uint32_t)),
+                                       HostAccess::SequentialWrite));
+  auto* indices = static_cast<std::uint32_t*>(index_run_.mapped());
+  std::iota(indices, indices + index_count, std::uint32_t{0});
   return {};
 }
 
@@ -414,6 +429,41 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
 
 Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
                                     ExtractTimings* timings) {
+  VR_ASSIGN(const DeviceMesh device_mesh, extract_device(grid, iso, timings));
+  return download(device_mesh);
+}
+
+Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
+  // An empty mesh copies to an empty Mesh without touching the buffers, which
+  // a grid with no active blocks never even allocated.
+  if (device_mesh.empty()) {
+    return Mesh{};
+  }
+  // A view whose handles are not this extractor's current buffers is stale --
+  // a later extract already reallocated or overwrote what it names, so copying
+  // from it would hand back someone else's geometry.
+  if (!device_mesh.valid() || device_mesh.vertices != vertex_arena_.handle() ||
+      device_mesh.indices != index_run_.handle()) {
+    return Status::invalid_argument(
+        "MarchingCubes::download: the DeviceMesh does not name this "
+        "extractor's current buffers (invalidated by a later extract?)");
+  }
+  Mesh mesh;
+  const auto vertex_count = static_cast<std::size_t>(device_mesh.vertex_count);
+  mesh.vertices.resize(vertex_count);
+  mesh.indices.resize(vertex_count);
+  if (vertex_count > 0) {
+    std::memcpy(mesh.vertices.data(), vertex_arena_.mapped(),
+                vertex_count * sizeof(Vertex));
+    std::memcpy(mesh.indices.data(), index_run_.mapped(),
+                vertex_count * sizeof(std::uint32_t));
+  }
+  return mesh;
+}
+
+Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
+                                                 float iso,
+                                                 ExtractTimings* timings) {
   if (!valid()) {
     return Status::invalid_argument("MarchingCubes::extract: moved-from");
   }
@@ -447,7 +497,12 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
             grid.map().compact_active_blocks());
   if (timings != nullptr) timings->compact_ms = phase_clock.lap();
   if (active.empty()) {
-    return Mesh{};
+    // Nothing to mesh. Still name the (possibly unsized) buffers so a caller
+    // can treat the result uniformly; the zero counts make it empty().
+    DeviceMesh device_mesh;
+    device_mesh.vertices = vertex_arena_.handle();
+    device_mesh.indices = index_run_.handle();
+    return device_mesh;
   }
 
   const volume::VoxelGridParams& gp = grid.grid();
@@ -549,8 +604,18 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
 
   if (timings != nullptr) timings->dispatch_ms = phase_clock.lap();
 
+  // Only the 4-byte counter comes back; the geometry stays where the kernel
+  // wrote it. Clamp defensively so a future smaller-capacity mode cannot
+  // publish a count that over-reads the arena.
   std::uint32_t emitted = 0;
-  Mesh mesh = collect_mesh(vertex_arena_, counter_, capacity, &emitted);
+  std::memcpy(&emitted, counter_.mapped(), sizeof(std::uint32_t));
+  emitted = std::min(emitted, capacity);
+
+  DeviceMesh device_mesh;
+  device_mesh.vertices = vertex_arena_.handle();
+  device_mesh.indices = index_run_.handle();
+  device_mesh.triangle_count = emitted;
+  device_mesh.vertex_count = emitted * 3;
   if (timings != nullptr) {
     timings->readback_ms = phase_clock.lap();
     timings->active_blocks = num_active;
@@ -561,7 +626,7 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
     // arena exceeds `capacity`'s own footprint.
     timings->arena_bytes = vertex_arena_.size();
   }
-  return mesh;
+  return device_mesh;
 }
 
 }  // namespace volumetric_kit::recon::mesh
