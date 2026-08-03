@@ -59,12 +59,16 @@ struct Vertex {
 // description reads position/normal/uv0/color at exactly these offsets with
 // this stride, so a mesh the kernel wrote crosses the seam unconverted.
 // Changing one without the other silently misreads every vertex.
-// TODO(mesh): the layout is necessary for interop seam B but not sufficient --
-// marching_cubes.cpp creates the vertex arena STORAGE_BUFFER-only and
-// host-visible, so it still needs VERTEX_BUFFER usage (and the index run
-// INDEX_BUFFER, plus probably a device-local home) before gfx can bind and draw
-// it in place. Add those with the shared-device bootstrap, which is what would
-// consume them.
+// The buffers are bindable as well as byte-compatible: marching_cubes.cpp now
+// creates the vertex arena with VERTEX_BUFFER usage and the index run with
+// INDEX_BUFFER, so a renderer sharing the device can draw them in place rather
+// than being handed a host copy of bytes that never left it.
+// TODO(mesh): they remain *host-visible*, which is right on a unified-memory
+// GPU (Apple silicon reports a host-visible DEVICE_LOCAL heap, so there is
+// nothing to stage) but not on a discrete one, where drawing vertices across
+// PCIe every frame is the slow path. Give them a device-local home with a
+// staging copy when a discrete-GPU consumer of seam B exists to measure it --
+// doing it now would add a copy to the one platform that does not need one.
 static_assert(sizeof(Vertex) == 64, "Vertex must be 64 bytes");
 static_assert(offsetof(Vertex, position) == 0, "Vertex layout drift");
 static_assert(offsetof(Vertex, normal) == 12, "Vertex layout drift");

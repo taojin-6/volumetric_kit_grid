@@ -140,11 +140,19 @@ std::uint32_t group_count(std::uint32_t items) {
 }
 
 // A host-visible, host-mapped storage buffer of the given byte size.
+//
+// @p extra_usage adds usage bits beyond STORAGE_BUFFER. The kernel only ever
+// needs storage; the extras exist so the *renderer* can bind the same memory
+// (interop seam B) instead of receiving a host copy of bytes that never left
+// the device. Usage bits are declarative -- they permit a binding, they do not
+// cost anything to carry -- so this is the whole of what the buffers need to
+// become bindable.
 Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
-                              HostAccess access = HostAccess::Random) {
+                              HostAccess access = HostAccess::Random,
+                              VkBufferUsageFlags extra_usage = 0) {
   BufferDesc desc;
   desc.size = bytes;
-  desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extra_usage;
   desc.memory = MemoryUsage::HostVisible;
   desc.mapped = true;
   desc.host_access = access;
@@ -296,9 +304,16 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // allocation cannot leave a sized arena beside a null index run -- which
   // arena_capacity() would then report as ready and the next extract would hand
   // out as a DeviceMesh naming no index buffer.
-  VR_ASSIGN(Buffer arena,
-            storage_buffer(*allocator_, static_cast<VkDeviceSize>(
-                                            arena_bytes_for(grown_capacity))));
+  // VERTEX_BUFFER as well as STORAGE_BUFFER: the kernel writes these as an
+  // SSBO, and since the 2026-08-02 layout decision the bytes it writes are
+  // already in the shape gfx's vertex-input description reads. Carrying the
+  // usage bit is what lets the renderer bind this arena directly rather than
+  // being handed a host copy of it.
+  VR_ASSIGN(
+      Buffer arena,
+      storage_buffer(*allocator_,
+                     static_cast<VkDeviceSize>(arena_bytes_for(grown_capacity)),
+                     HostAccess::Random, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
 
   // The index run covers the whole arena and never changes shape, so it is
   // written once here rather than rebuilt per extract. iota straight into the
@@ -310,7 +325,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
             storage_buffer(
                 *allocator_,
                 static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
-                HostAccess::SequentialWrite));
+                HostAccess::SequentialWrite, VK_BUFFER_USAGE_INDEX_BUFFER_BIT));
   auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
   std::iota(indices, indices + index_count, std::uint32_t{0});
 
