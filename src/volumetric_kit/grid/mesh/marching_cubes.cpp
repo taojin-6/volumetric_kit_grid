@@ -218,6 +218,55 @@ std::uint32_t MarchingCubes::plan_capacity(std::uint32_t num_active,
       std::min(std::max(estimate, held), worst_case));
 }
 
+Status MarchingCubes::claim_output_slot() {
+  // Called once at the top of each extract, before anything is touched and --
+  // load-bearing -- before generation_ is bumped.
+  //
+  // Refusing here must cost the caller nothing: this is the path that protects
+  // slots a consumer is still reading, so a refused extract has written no
+  // buffer, freed no allocation, and must leave every outstanding DeviceMesh
+  // exactly as valid as it was. Bumping the generation first would break that
+  // last part on its own -- download()'s currency check would then refuse a
+  // mesh whose slot this call deliberately did not touch, so the refusal meant
+  // to protect the consumer's live mesh would instead retire it.
+  //
+  // Once per extract, not once per call, is structural now rather than
+  // conditional: ensure_output_buffers runs twice when a call refits against
+  // its measured triangle count, and advancing there would strand the first
+  // dispatch's output in the previous slot. It also makes the refit's grow safe
+  // for free -- the buffer it frees is one only this extract has written.
+  if (slot_count_ == 1) {
+    // One slot never moves, and the contract is what it always was: a
+    // DeviceMesh is superseded by the next extract, and `generation` enforces
+    // it.
+    return {};
+  }
+  // Round-robin, so the next slot is always the oldest; only it can be the one
+  // still outstanding. Everything downstream is free to overwrite it, and a
+  // grow will *free* it outright, so it must have been released first.
+  const std::size_t next = (slot_ + 1) % slot_count_;
+  if (slots_[next].generation > released_through_) {
+    return Status::invalid_argument(
+        "MarchingCubes::extract: every output slot is still outstanding "
+        "(oldest is generation " +
+        std::to_string(slots_[next].generation) + ", released through " +
+        std::to_string(released_through_) +
+        "); call release_through as meshes are finished with, or configure "
+        "more slots than the consumer keeps in flight");
+  }
+  slot_ = next;
+  return {};
+}
+
+void MarchingCubes::release_through(std::uint64_t generation) noexcept {
+  // Monotonic: an older report never un-releases a slot. A consumer finishing
+  // frames out of order, or reporting a stale value after a newer one, would
+  // otherwise make a freed slot look busy again -- and, worse, could not make a
+  // busy one look free, so the failure would be a stall rather than corruption.
+  // Cheap to make impossible either way.
+  released_through_ = std::max(released_through_, generation);
+}
+
 Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
@@ -228,6 +277,13 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
         std::to_string(capacity) +
         " triangles exceeds the device maxStorageBufferRange");
   }
+  // Stamp the slot claim_output_slot() picked with the generation now being
+  // written, so the *next* claim can tell "still being read" from "free to
+  // reuse". Idempotent: a call that guessed its capacity low comes back here to
+  // refit and re-stamps the same value, because the slot was claimed once at
+  // the top of the extract rather than here.
+  slots_[slot_].generation = generation_;
+
   if (!counter_.valid()) {
     VR_ASSIGN(counter_, storage_buffer(*allocator_, sizeof(std::uint32_t)));
   }
@@ -238,7 +294,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // second dispatch accumulates onto the first's count.
   std::memset(counter_.mapped(), 0, sizeof(std::uint32_t));
 
-  if (vertex_arena_.valid() && capacity <= arena_capacity()) {
+  if (arena().valid() && capacity <= arena_capacity()) {
     return {};  // the steady state -- no allocation at all
   }
   // Grow geometrically rather than to the exact request: the active set climbs
@@ -274,11 +330,11 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // fence-blocked inside submit_single_time, but NOT for an external consumer
   // holding a DeviceMesh: see the seam-B TODO on MarchingCubesConfig, which is
   // why a bindable arena is not yet a drawable one.
-  vertex_arena_ = Buffer{};
+  arena() = Buffer{};
   // Released together: arena_capacity() is derived from the arena's size, so
   // dropping the arena is what marks the pair unsized, and the index run must
   // not outlive the arena it indexes.
-  index_run_ = Buffer{};
+  index_run() = Buffer{};
 
   // Build both into locals and commit them together, so a failure on the second
   // allocation cannot leave a sized arena beside a null index run -- which
@@ -287,7 +343,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // config_ is applied on every grow, not just the first, so the consumer's
   // usage survives a reallocation (see MarchingCubesConfig).
   VR_ASSIGN(
-      Buffer arena,
+      Buffer grown_arena,
       storage_buffer(*allocator_,
                      static_cast<VkDeviceSize>(arena_bytes_for(grown_capacity)),
                      HostAccess::Random, config_.extra_vertex_usage));
@@ -306,8 +362,8 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
   std::iota(indices, indices + index_count, std::uint32_t{0});
 
-  vertex_arena_ = std::move(arena);
-  index_run_ = std::move(indices_buf);
+  arena() = std::move(grown_arena);
+  index_run() = std::move(indices_buf);
   return {};
 }
 
@@ -331,6 +387,15 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
         "not supported -- Device::create does not enable bufferDeviceAddress");
   }
 
+  if (config.slot_count == 0 || config.slot_count > kMaxSlots) {
+    return Status::invalid_argument(
+        "MarchingCubes::create: slot_count must be 1.." +
+        std::to_string(kMaxSlots) + " (got " +
+        std::to_string(config.slot_count) +
+        "); 1 is the default and the single-arena behaviour, and the ceiling "
+        "is what the slot array holds");
+  }
+
   const VkDevice dev = device.handle();
 
   MarchingCubes mc;
@@ -346,6 +411,10 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   mc.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   mc.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
   mc.config_ = config;
+  // Sized once and never resized: slot_ indexes it on every extract, and the
+  // buffers are filled lazily by the first extract that needs each one, so an
+  // unused slot costs a Buffer's worth of null handles rather than an arena.
+  mc.slot_count_ = config.slot_count;
 
   // Two kernels share one pool. The dense kernel binds five storage buffers:
   // tables (persistent) + the per-extract samples / colors / vertices /
@@ -477,6 +546,9 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
   }
 
+  // Claim first, bump second. A refused claim has touched nothing, so it must
+  // leave outstanding DeviceMeshes valid -- see claim_output_slot.
+  VR_TRY(claim_output_slot());
   // This call is about to overwrite -- and, on a grow, reallocate -- the shared
   // arena, so every outstanding DeviceMesh is stale from here on, whether or
   // not the call succeeds. Bump before the first thing that touches it.
@@ -485,7 +557,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
 
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(2, colors_buf.handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(3, vertex_arena_.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(3, arena().handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(4, counter_.handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid.dims, grid.voxel_size,  grid.origin, iso,
@@ -494,7 +566,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                   group_count(static_cast<std::uint32_t>(cells), kLocalSize),
                   max_workgroup_count_x_));
 
-  return collect_mesh(vertex_arena_, counter_, capacity);
+  return collect_mesh(arena(), counter_, capacity);
 }
 
 Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
@@ -516,11 +588,19 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   if (device_mesh.empty()) {
     return Mesh{};
   }
-  // Only this extractor's newest extract may be downloaded. Checked by
-  // generation, NOT by buffer handle: the arena is grow-only and reused in
-  // place, so a superseded view names the very same VkBuffer as the live one
-  // and a handle comparison would accept it and hand back the newer extract's
-  // geometry under this view's stale counts.
+  // Only this extractor's newest extract may be downloaded, and the check is by
+  // generation, NOT by buffer handle. With one slot the arena is grow-only and
+  // reused in place, so a superseded view names the very same VkBuffer as the
+  // live one and a handle comparison would accept it, handing back the newer
+  // extract's geometry under this view's stale counts. With a ring it is the
+  // other way round -- a superseded view names a *different* buffer -- and the
+  // generation check is what makes the unqualified arena() below correct:
+  // claim_output_slot stamps the claimed slot with generation_ and nothing
+  // moves slot_ afterwards, so "this mesh is the current generation" and "this
+  // mesh lives in the current slot" are the same statement. A DeviceMesh does
+  // not carry its slot, so that invariant is the only thing tying the copy
+  // below to the right buffer. Widening this to accept an older generation
+  // therefore means indexing slots_ by it, not just relaxing the comparison.
   if (device_mesh.generation != generation_ || !device_mesh.valid()) {
     return Status::invalid_argument(
         "MarchingCubes::download: the DeviceMesh is not this extractor's "
@@ -532,10 +612,10 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   mesh.vertices.resize(vertex_count);
   mesh.indices.resize(vertex_count);
   if (vertex_count > 0) {
-    std::memcpy(mesh.vertices.data(), vertex_arena_.mapped(),
+    std::memcpy(mesh.vertices.data(), arena().mapped(),
                 vertex_count * sizeof(Vertex));
     // Regenerated, not read back: the run is the identity 0,1,2,... and
-    // index_run_ is write-combined (SequentialWrite), where host reads are
+    // index_run() is write-combined (SequentialWrite), where host reads are
     // pathologically slow. Generating it costs nothing and touches no device
     // memory.
     std::iota(mesh.indices.begin(), mesh.indices.end(), std::uint32_t{0});
@@ -585,11 +665,18 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   if (active.empty()) {
     // Nothing to mesh. Still name the (possibly unsized) buffers so a caller
     // can treat the result uniformly; the zero counts make it empty().
+    //
+    // This is the one path that advances generation_ without claiming a slot,
+    // so "every generation lives in exactly one slot" does not hold for it.
+    // Deliberate, and safe: an empty mesh owns no bytes, so it needs no slot to
+    // protect -- download() returns on empty() before it reads a buffer, and a
+    // renderer draws nothing. The next real extract claims from slot_ as
+    // usual, and the unstamped generation simply never comes round.
     DeviceMesh device_mesh;
-    device_mesh.vertices = vertex_arena_.handle();
-    device_mesh.indices = index_run_.handle();
-    device_mesh.vertex_usage = vertex_arena_.usage();
-    device_mesh.index_usage = index_run_.usage();
+    device_mesh.vertices = arena().handle();
+    device_mesh.indices = index_run().handle();
+    device_mesh.vertex_usage = arena().usage();
+    device_mesh.index_usage = index_run().usage();
     device_mesh.generation = ++generation_;
     return device_mesh;
   }
@@ -675,6 +762,9 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
               neighbour_lut.size() * sizeof(std::int32_t));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
+  // Claim first, bump second. A refused claim has touched nothing, so it must
+  // leave outstanding DeviceMeshes valid -- see claim_output_slot.
+  VR_TRY(claim_output_slot());
   // This call is about to overwrite -- and, on a grow, reallocate -- the arena,
   // so every outstanding DeviceMesh is stale from here on, whether or not the
   // call succeeds. Bump before the first thing that touches it, not on the
@@ -700,7 +790,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // Both output bindings are written once: the counter's handle never changes
   // (ensure_output_buffers creates it only when it holds none), and the arena's
   // changes only when a refit reallocates it -- which rebinds it there.
-  kernel_sparse_.set.write_storage_buffer(6, vertex_arena_.handle(), 0,
+  kernel_sparse_.set.write_storage_buffer(6, arena().handle(), 0,
                                           VK_WHOLE_SIZE);
   kernel_sparse_.set.write_storage_buffer(7, counter_.handle(), 0,
                                           VK_WHOLE_SIZE);
@@ -756,7 +846,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // headroom, and re-zeroes the counter the retry is about to bump), then
     // rebind the arena in case it was reallocated.
     VR_TRY(ensure_output_buffers(produced));
-    kernel_sparse_.set.write_storage_buffer(6, vertex_arena_.handle(), 0,
+    kernel_sparse_.set.write_storage_buffer(6, arena().handle(), 0,
                                             VK_WHOLE_SIZE);
     requested = arena_capacity();
     if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
@@ -776,10 +866,10 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
       (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
 
   DeviceMesh device_mesh;
-  device_mesh.vertices = vertex_arena_.handle();
-  device_mesh.indices = index_run_.handle();
-  device_mesh.vertex_usage = vertex_arena_.usage();
-  device_mesh.index_usage = index_run_.usage();
+  device_mesh.vertices = arena().handle();
+  device_mesh.indices = index_run().handle();
+  device_mesh.vertex_usage = arena().usage();
+  device_mesh.index_usage = index_run().usage();
   device_mesh.triangle_count = emitted;
   device_mesh.vertex_count = emitted * 3;
   device_mesh.generation = generation_;
@@ -790,7 +880,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // What the extractor is holding, not what this call asked for: the arena is
     // retained and grown, so a steady-state call allocates nothing and still
     // reports it.
-    timings->arena_bytes = vertex_arena_.size();
+    timings->arena_bytes = arena().size();
   }
   return device_mesh;
 }
