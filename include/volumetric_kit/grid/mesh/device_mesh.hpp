@@ -46,8 +46,18 @@ namespace volumetric_kit::recon::mesh {
 struct DeviceMesh {
   VkBuffer vertices = VK_NULL_HANDLE;  ///< Interleaved `Vertex` array.
   VkBuffer indices = VK_NULL_HANDLE;   ///< `uint32` indices, 3 per triangle.
-  std::uint32_t vertex_count = 0;      ///< Live vertices (`3 * triangles`).
-  std::uint32_t triangle_count = 0;    ///< Live triangles.
+  /// A single `VkDrawIndexedIndirectCommand` describing this mesh's draw, for
+  /// `vkCmdDrawIndexedIndirect`.
+  ///
+  /// The producer's kernel counts *indices* into `indexCount`, so the command
+  /// is written by the extraction itself rather than assembled afterwards from
+  /// a triangle count -- which is what lets a consumer draw without the count
+  /// ever passing through it. @ref triangle_count and @ref vertex_count say the
+  /// same thing for a consumer that wants to know; the command exists so one
+  /// does not have to.
+  VkBuffer indirect = VK_NULL_HANDLE;
+  std::uint32_t vertex_count = 0;    ///< Live vertices (`3 * triangles`).
+  std::uint32_t triangle_count = 0;  ///< Live triangles.
   /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
   /// plus whatever the producer's consumer asked for. Carried so a consumer can
   /// *check* that the binding it is about to make is permitted, rather than
@@ -58,15 +68,45 @@ struct DeviceMesh {
   VkBufferUsageFlags vertex_usage = 0;
   /// Usage flags @ref indices was created with; see @ref vertex_usage.
   VkBufferUsageFlags index_usage = 0;
+  /// Usage flags @ref indirect was created with; see @ref vertex_usage. Always
+  /// carries `INDIRECT_BUFFER` beside the `STORAGE_BUFFER` the kernel counts
+  /// through.
+  VkBufferUsageFlags indirect_usage = 0;
+  /// Sharing mode all three buffers were created with (one producer config
+  /// covers them, so they never differ).
+  ///
+  /// Published for the same reason as @ref vertex_usage, with more at stake:
+  /// reading a `VK_SHARING_MODE_EXCLUSIVE` buffer from a queue family that does
+  /// not own it is *undefined*, where a missing usage bit is at least a
+  /// validation diagnostic. A consumer on a second family must see
+  /// `VK_SHARING_MODE_CONCURRENT` here before it binds any of them -- and on
+  /// Apple, where Metal has no ownership concept, getting it wrong is undefined
+  /// in the way that appears to work.
+  ///
+  /// @note What is deliberately *not* published is the memory placement: this
+  ///       tier's buffers are host-visible, because it reads the command back
+  ///       and resets it on every extract. That is free on a unified-memory GPU
+  ///       and costs a PCIe fetch per indirect draw on a discrete one -- a
+  ///       recorded trade rather than a hidden one; see the `TODO(mesh)` on
+  ///       @ref MarchingCubesConfig.
+  VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.
   std::uint64_t generation = 0;
 
   /// @return `true` when the mesh has no triangles.
   bool empty() const noexcept { return triangle_count == 0; }
-  /// @return `true` when both buffers are present.
+  /// @return `true` when *every* buffer this view names is present.
+  ///
+  /// All three, not just the geometry: a consumer drawing indirectly reads
+  /// @ref indirect and never consults @ref triangle_count, so a predicate that
+  /// exempted it would wave through a null handle to
+  /// `vkCmdDrawIndexedIndirect`. An extract that meshed nothing still names its
+  /// command (zeroed), so `valid() && empty()` is the "draw nothing" case
+  /// rather than a malformed one.
   bool valid() const noexcept {
-    return vertices != VK_NULL_HANDLE && indices != VK_NULL_HANDLE;
+    return vertices != VK_NULL_HANDLE && indices != VK_NULL_HANDLE &&
+           indirect != VK_NULL_HANDLE;
   }
 };
 

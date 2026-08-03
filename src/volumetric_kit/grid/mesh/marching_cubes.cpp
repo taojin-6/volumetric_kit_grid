@@ -34,6 +34,21 @@ constexpr std::uint32_t kLocalSize = 256;
 // Worst-case triangles a single marching-cubes cell can emit (5 per the table).
 constexpr std::uint64_t kMaxTrisPerCell = 5;
 
+// The draw command is an ABI across three languages now -- the host resets it
+// and reads it back, the GLSL kernel aliases its first field as the append
+// atomic (`buffer DrawCommand { uint index_count; ... }`, offset 0 under scalar
+// block layout), and the renderer's vkCmdDrawIndexedIndirect consumes the whole
+// struct. Vulkan fixes this layout, but the raw 4-byte write in
+// clamp_indirect_to_arena() and the two 20-byte reads assume it here, and this
+// file already pins every other cross-language struct the same way.
+static_assert(sizeof(VkDrawIndexedIndirectCommand) == 20,
+              "VkDrawIndexedIndirectCommand must be 20 bytes -- the kernel's "
+              "DrawCommand mirror and the host reset/readback assume it");
+static_assert(offsetof(VkDrawIndexedIndirectCommand, indexCount) == 0,
+              "indexCount must be field 0 -- the kernel's append atomic bumps "
+              "it through a storage binding at offset 0, and the host clamps "
+              "it with a 4-byte write to the start of the buffer");
+
 // Triangles per active block the first extract plans for, before any
 // measurement is available. A real scan measures 54-68 (Replica room0) against
 // the 5*block_size^3 worst case -- 2560 for the default 8-voxel block, ~40x
@@ -135,7 +150,8 @@ struct CoordHash {
 
 // Bytes a vertex arena needs to hold @p capacity triangles (3 vertices each).
 std::uint64_t arena_bytes_for(std::uint32_t capacity) {
-  return static_cast<std::uint64_t>(capacity) * 3 * sizeof(Vertex);
+  return static_cast<std::uint64_t>(capacity) * kIndicesPerTriangle *
+         sizeof(Vertex);
 }
 
 // Read the atomic triangle count back and copy the emitted vertices into a
@@ -143,18 +159,22 @@ std::uint64_t arena_bytes_for(std::uint32_t capacity) {
 // shared-vertex dedup can shrink `vertices` without changing the Mesh
 // contract). The dense extract's readback; the sparse path leaves its result on
 // the device and downloads it separately.
-Mesh collect_mesh(const Buffer& vertices, const Buffer& counter,
+Mesh collect_mesh(const Buffer& vertices, const Buffer& indirect,
                   std::uint32_t capacity,
                   std::uint32_t* emitted_out = nullptr) {
-  std::uint32_t emitted = 0;
-  std::memcpy(&emitted, counter.mapped(), sizeof(std::uint32_t));
+  // The counter *is* the command's indexCount, so triangles are a third of it
+  // -- see mcEmitCell, which adds kIndicesPerTriangle per triangle.
+  VkDrawIndexedIndirectCommand command{};
+  std::memcpy(&command, indirect.mapped(), sizeof(command));
+  std::uint32_t emitted = command.indexCount / kIndicesPerTriangle;
   // The dense path is worst-case sized, so the kernel never drops -- but the
   // count is a device write, and this clamp is what keeps the copy below inside
   // the arena regardless.
   emitted = std::min(emitted, capacity);
   if (emitted_out != nullptr) *emitted_out = emitted;
 
-  const auto vertex_count = static_cast<std::size_t>(emitted) * 3;
+  const auto vertex_count =
+      static_cast<std::size_t>(emitted) * kIndicesPerTriangle;
   Mesh mesh;
   // TODO(mesh): resize() zero-initializes the vector and the memcpy below
   // immediately overwrites it -- two passes over the whole readback. There is
@@ -267,6 +287,51 @@ void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   released_through_ = std::max(released_through_, generation);
 }
 
+Status MarchingCubes::ensure_indirect_command() {
+  if (!indirect().valid()) {
+    // INDIRECT_BUFFER beside STORAGE_BUFFER: the kernel counts into field 0
+    // through the storage binding, and a renderer issues
+    // vkCmdDrawIndexedIndirect from the very same bytes. Both unconditional
+    // rather than config-gated -- 20 bytes, and a consumer that never draws
+    // indirectly pays a usage bit nobody reads. The queue families *are* the
+    // consumer's, though: a renderer on a second family reads this buffer as
+    // surely as it reads the arena, so it takes the same sharing treatment.
+    VR_ASSIGN(
+        indirect(),
+        storage_buffer(
+            *allocator_, sizeof(VkDrawIndexedIndirectCommand),
+            HostAccess::Random,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
+            config_.queue_family_count > 0 ? config_.queue_families : nullptr,
+            config_.queue_family_count));
+  }
+  // The whole command, not just the counter it starts as. indexCount is zeroed
+  // for the kernel to accumulate into; the other four fields are what make the
+  // result a *drawable* command rather than a number a host has to build one
+  // from -- one instance, no index or vertex offset, and the identity index run
+  // means firstIndex is always 0.
+  VkDrawIndexedIndirectCommand reset{};
+  reset.indexCount = 0;
+  reset.instanceCount = 1;
+  reset.firstIndex = 0;
+  reset.vertexOffset = 0;
+  reset.firstInstance = 0;
+  std::memcpy(indirect().mapped(), &reset, sizeof(reset));
+  return {};
+}
+
+void MarchingCubes::clamp_indirect_to_arena() noexcept {
+  if (!indirect().valid()) return;
+  // What the arena can hold, which is the only thing a draw may read. On a
+  // failure that freed the arena outright this is 0 -- the honest answer, since
+  // there is then no geometry to draw at all.
+  const auto indices = static_cast<std::uint32_t>(
+      static_cast<std::uint64_t>(arena_capacity()) * kIndicesPerTriangle);
+  // Field 0 only: the other four are still the drawable values the reset wrote,
+  // and rewriting the whole struct would need it rebuilt here for no reason.
+  std::memcpy(indirect().mapped(), &indices, sizeof(indices));
+}
+
 Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
@@ -284,15 +349,12 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // the top of the extract rather than here.
   slots_[slot_].generation = generation_;
 
-  if (!counter_.valid()) {
-    VR_ASSIGN(counter_, storage_buffer(*allocator_, sizeof(std::uint32_t)));
-  }
-  // The counter is the only per-call reset: 4 bytes, against an arena whose
-  // stale tail is never read (the counter bounds the readback). It happens
-  // ABOVE the reuse early-return below, and must stay there: a refit that
-  // reallocated nothing still has to hand the retry a zeroed counter, or the
-  // second dispatch accumulates onto the first's count.
-  std::memset(counter_.mapped(), 0, sizeof(std::uint32_t));
+  // The command is the only per-call reset: 20 bytes, against an arena whose
+  // stale tail is never read (indexCount bounds the readback). It happens ABOVE
+  // the reuse early-return below, and must stay there: a refit that reallocated
+  // nothing still has to hand the retry a zeroed count, or the second dispatch
+  // accumulates onto the first's.
+  VR_TRY(ensure_indirect_command());
 
   if (arena().valid() && capacity <= arena_capacity()) {
     return {};  // the steady state -- no allocation at all
@@ -344,21 +406,28 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // usage survives a reallocation (see MarchingCubesConfig).
   VR_ASSIGN(
       Buffer grown_arena,
-      storage_buffer(*allocator_,
-                     static_cast<VkDeviceSize>(arena_bytes_for(grown_capacity)),
-                     HostAccess::Random, config_.extra_vertex_usage));
+      storage_buffer(
+          *allocator_,
+          static_cast<VkDeviceSize>(arena_bytes_for(grown_capacity)),
+          HostAccess::Random, config_.extra_vertex_usage,
+          config_.queue_family_count > 0 ? config_.queue_families : nullptr,
+          config_.queue_family_count));
 
   // The index run covers the whole arena and never changes shape, so it is
   // written once here rather than rebuilt per extract. iota straight into the
   // mapped buffer: no staging copy, and only on a grow. SequentialWrite because
   // this fill is the only host access it ever gets -- download() regenerates
   // the run on the host rather than reading back from write-combined memory.
-  const std::size_t index_count = static_cast<std::size_t>(grown_capacity) * 3;
-  VR_ASSIGN(Buffer indices_buf,
-            storage_buffer(
-                *allocator_,
-                static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
-                HostAccess::SequentialWrite, config_.extra_index_usage));
+  const std::size_t index_count =
+      static_cast<std::size_t>(grown_capacity) * kIndicesPerTriangle;
+  VR_ASSIGN(
+      Buffer indices_buf,
+      storage_buffer(
+          *allocator_,
+          static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
+          HostAccess::SequentialWrite, config_.extra_index_usage,
+          config_.queue_family_count > 0 ? config_.queue_families : nullptr,
+          config_.queue_family_count));
   auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
   std::iota(indices, indices + index_count, std::uint32_t{0});
 
@@ -380,11 +449,27 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // legitimately have enabled, so they are the embedder's call, not ours.
   const VkBufferUsageFlags unsupported =
       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-  if (((config.extra_vertex_usage | config.extra_index_usage) & unsupported) !=
-      0) {
+  // All three output buffers, not two: the indirect command takes consumer
+  // usage the same way the arena and index run do, so leaving it out of the
+  // guard would let the bit through on the one buffer nothing else checks.
+  if (((config.extra_vertex_usage | config.extra_index_usage |
+        config.extra_indirect_usage) &
+       unsupported) != 0) {
     return Status::invalid_argument(
         "MarchingCubes::create: VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT is "
         "not supported -- Device::create does not enable bufferDeviceAddress");
+  }
+
+  // Caught here rather than at the first arena grow, where it would surface as
+  // a buffer-creation failure several frames into a scan. Allocator applies the
+  // same limit to *distinct* families; this bounds what the config can carry at
+  // all, since the array is fixed-size and a count past it would read past the
+  // end.
+  if (config.queue_family_count > BufferDesc::kMaxQueueFamilies) {
+    return Status::invalid_argument(
+        "MarchingCubes::create: queue_family_count must be 0.." +
+        std::to_string(BufferDesc::kMaxQueueFamilies) + " (got " +
+        std::to_string(config.queue_family_count) + ")");
   }
 
   if (config.slot_count == 0 || config.slot_count > kMaxSlots) {
@@ -558,7 +643,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(2, colors_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(3, arena().handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(4, counter_.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(4, indirect().handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid.dims, grid.voxel_size,  grid.origin, iso,
                            capacity,  kWeightThreshold, has_color};
@@ -566,19 +651,35 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                   group_count(static_cast<std::uint32_t>(cells), kLocalSize),
                   max_workgroup_count_x_));
 
-  return collect_mesh(arena(), counter_, capacity);
+  Mesh mesh = collect_mesh(arena(), indirect(), capacity);
+  // This overload's whole product is the host copy above, so the slot it
+  // claimed is finished with the moment the copy is taken. Releasing it here is
+  // what keeps a host-only caller off the ring contract entirely: it never sees
+  // a generation (the return type carries none), so it could not call
+  // release_through even if it knew to -- and without this the ring starves
+  // after slot_count calls and then refuses every extract, quoting generations
+  // the caller was never given.
+  release_through(generation_);
+  return mesh;
 }
 
 Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
                                     ExtractTimings* timings) {
   VR_ASSIGN(const DeviceMesh device_mesh, extract_device(grid, iso, timings));
   // The host copy is part of this call's readback, so it belongs in the phase
-  // that names it -- extract_device stamped readback_ms with the 4-byte counter
-  // read alone, which is right for that entry point but would leave the host
-  // path's ~45 MB copy uncounted in ExtractTimings::total_ms.
+  // that names it -- extract_device stamped readback_ms with the 20-byte
+  // command read alone, which is right for that entry point but would leave the
+  // host path's ~45 MB copy uncounted in ExtractTimings::total_ms.
   PhaseClock download_clock(timings != nullptr);
-  VR_ASSIGN(Mesh mesh, download(device_mesh));
+  Result<Mesh> mesh = download(device_mesh);
   if (timings != nullptr) timings->readback_ms += download_clock.lap();
+  // This overload's whole product is the host copy, so the slot extract_device
+  // claimed is finished with as soon as download() has run -- and released
+  // whether it succeeded or not, since a failure that stranded the slot would
+  // starve the ring just as surely. A host-only caller never sees a generation
+  // (the return type carries none), so it cannot honour the release contract
+  // itself; this is what keeps it off that contract entirely.
+  release_through(device_mesh.generation);
   return mesh;
 }
 
@@ -663,21 +764,42 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
             grid.map().compact_active_blocks());
   if (timings != nullptr) timings->compact_ms = phase_clock.lap();
   if (active.empty()) {
-    // Nothing to mesh. Still name the (possibly unsized) buffers so a caller
-    // can treat the result uniformly; the zero counts make it empty().
+    // Nothing to mesh -- but this path claims and stamps a slot exactly like a
+    // real extract, so "every generation lives in exactly one slot" is total.
     //
-    // This is the one path that advances generation_ without claiming a slot,
-    // so "every generation lives in exactly one slot" does not hold for it.
-    // Deliberate, and safe: an empty mesh owns no bytes, so it needs no slot to
-    // protect -- download() returns on empty() before it reads a buffer, and a
-    // renderer draws nothing. The next real extract claims from slot_ as
-    // usual, and the unstamped generation simply never comes round.
+    // It used to advance generation_ without claiming, on the reasoning that an
+    // empty mesh owns no bytes and so needs no slot to protect. That is true of
+    // the empty mesh and false of the *ring*: the consumer's contract is to
+    // release_through(g) as generation g retires, an empty mesh retires the
+    // instant it is handed over, and released_through_ is a high-water mark. So
+    // releasing the empty generation would mark every older slot released too
+    // -- including the one holding the mesh the consumer is still drawing,
+    // because an empty extract is precisely when it keeps showing the previous
+    // one. The next grow would then vmaDestroyBuffer an arena under a live
+    // draw.
+    VR_TRY(claim_output_slot());
+    ++generation_;
+    slots_[slot_].generation = generation_;
+    // The command must be reset even though no dispatch will touch it: a
+    // consumer drawing indirectly reads it and never consults triangle_count --
+    // that is the entire point of publishing one -- so inheriting the previous
+    // extract's live indexCount would silently redraw the previous mesh out of
+    // whichever arena this slot happens to hold. Zeroed, it draws nothing,
+    // which is what an empty mesh means.
+    VR_TRY(ensure_indirect_command());
+    // The arena and index run are named as they are found: this slot may never
+    // have been sized (nothing to size it for), in which case they are null
+    // handles and valid() is false beside empty() being true. A consumer gates
+    // on empty() and draws nothing either way.
     DeviceMesh device_mesh;
     device_mesh.vertices = arena().handle();
     device_mesh.indices = index_run().handle();
+    device_mesh.indirect = indirect().handle();
     device_mesh.vertex_usage = arena().usage();
     device_mesh.index_usage = index_run().usage();
-    device_mesh.generation = ++generation_;
+    device_mesh.indirect_usage = indirect().usage();
+    device_mesh.sharing_mode = indirect().sharing_mode();
+    device_mesh.generation = generation_;
     return device_mesh;
   }
 
@@ -694,12 +816,21 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   const std::uint64_t worst_case = threads * kMaxTrisPerCell;
   // Both the thread index and the triangle counter are 32-bit shader values.
   // The counter bound matters even though the arena is no longer sized for the
-  // worst case: the kernel bumps `tri_count` for every triangle the field
+  // worst case: the kernel bumps `index_count` for every triangle the field
   // produces, dropped ones included, so a field whose worst case exceeds uint32
   // could wrap it -- and the host, which now trusts that count, would publish a
   // handful of triangles as the whole surface. Rejected here, before the
   // neighbour table, the uploads and a dispatch.
-  if (threads > 0xFFFFFFFFull || worst_case > 0xFFFFFFFFull) {
+  //
+  // The bound is in INDICES, not triangles. The atomic counts
+  // kIndicesPerTriangle at a time (it is the draw command's indexCount), so
+  // bounding the triangle total instead leaves the real counter free to reach
+  // three times the limit -- exactly the wrap this exists to prevent. Worse
+  // than a plain overflow, too: 2^32 % 3 == 1, so a wrapped counter also
+  // desynchronises the `/ 3` that turns it into a slot index, and the dispatch
+  // would overwrite triangles it had already emitted.
+  if (threads > 0xFFFFFFFFull ||
+      worst_case > 0xFFFFFFFFull / kIndicesPerTriangle) {
     return Status::invalid_argument(
         "MarchingCubes::extract: active set too large for this slice");
   }
@@ -709,7 +840,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // worst case was resident memory rather than a transient over-allocation
   // (~1.8 GB against ~38 MB of triangles on Replica room0).
   //
-  // Correctness does not depend on the guess: the kernel bumps `tri_count`
+  // Correctness does not depend on the guess: the kernel bumps `index_count`
   // for every triangle and drops those past `capacity`, so an undersized arena
   // is *detected*, never silently truncated. The count is a property of the
   // field, not of the atomic ordering, so refitting to it and re-running is
@@ -787,17 +918,19 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
       5, has_color ? color_view.buffer->handle() : color_dummy_.handle(), 0,
       VK_WHOLE_SIZE);
 
-  // Both output bindings are written once: the counter's handle never changes
-  // (ensure_output_buffers creates it only when it holds none), and the arena's
-  // changes only when a refit reallocates it -- which rebinds it there.
+  // Both output bindings are written once per extract, which is what a ring
+  // requires: each names the *claimed slot's* buffer, so both move when slot_
+  // does. Within the call only the arena can change again -- a refit that
+  // reallocates it rebinds it there -- while the command buffer is created once
+  // per slot and reused.
   kernel_sparse_.set.write_storage_buffer(6, arena().handle(), 0,
                                           VK_WHOLE_SIZE);
-  kernel_sparse_.set.write_storage_buffer(7, counter_.handle(), 0,
+  kernel_sparse_.set.write_storage_buffer(7, indirect().handle(), 0,
                                           VK_WHOLE_SIZE);
   if (timings != nullptr) timings->descriptor_ms = phase_clock.lap();
 
   // Run the surface, read the count, and re-run once if the arena was too
-  // small. `tri_count` counts every triangle the field produces -- the kernel
+  // small. `index_count` counts every triangle the field produces -- the kernel
   // drops those past `capacity` but still bumps -- so an undersized arena
   // reports the exact size it needed, and the count is a property of the field
   // rather than of the atomic ordering, so the refitted retry cannot overflow
@@ -827,25 +960,43 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
       ++timings->dispatches;
     }
 
-    // Only the 4-byte counter comes back; the geometry stays where the kernel
+    // Only the 20-byte command comes back; the geometry stays where the kernel
     // wrote it.
-    std::memcpy(&produced, counter_.mapped(), sizeof(std::uint32_t));
+    VkDrawIndexedIndirectCommand produced_command{};
+    std::memcpy(&produced_command, indirect().mapped(),
+                sizeof(produced_command));
+    produced = produced_command.indexCount / kIndicesPerTriangle;
     if (timings != nullptr) timings->readback_ms += phase_clock.lap();
     if (produced <= requested) {
       break;  // everything the field emitted is in the arena
     }
+    // From here the command names more indices than the arena holds -- the
+    // over-count is how the refit below learns its size -- so every exit until
+    // the loop breaks has to bound it before returning. At slot_count == 1 an
+    // outstanding DeviceMesh names this very buffer, so a failure that left the
+    // over-count in place would hand a live consumer a draw that reads past the
+    // end of both the arena and the index run.
     if (attempt == 1) {
       // Cannot happen -- the same field emits the same count, so the refitted
       // arena fits it -- but report rather than hand back a truncated mesh if
       // that assumption is ever broken.
+      clamp_indirect_to_arena();
       return Status::out_of_memory(
           "MarchingCubes::extract: the vertex arena still overflowed after "
           "refitting it to the measured triangle count");
     }
     // Refit to the measured count (ensure_output_buffers adds the growth
-    // headroom, and re-zeroes the counter the retry is about to bump), then
+    // headroom, and re-zeroes the command the retry is about to bump), then
     // rebind the arena in case it was reallocated.
-    VR_TRY(ensure_output_buffers(produced));
+    //
+    // A failure here is the other path that returns mid-over-count: it can
+    // reject the refit against maxStorageBufferRange, or fail the allocation
+    // outright after having already freed the old arena -- in which case
+    // arena_capacity() is 0 and the clamp writes exactly that.
+    if (Status refit = ensure_output_buffers(produced); !refit.ok()) {
+      clamp_indirect_to_arena();
+      return refit;
+    }
     kernel_sparse_.set.write_storage_buffer(6, arena().handle(), 0,
                                             VK_WHOLE_SIZE);
     requested = arena_capacity();
@@ -865,13 +1016,26 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   tris_per_block_ = static_cast<std::uint32_t>(
       (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
 
+  // Nothing to clamp here, and that is a property worth stating rather than a
+  // line worth adding: the loop breaks only on `produced <= requested`, and
+  // `requested` is arena_capacity(), so `emitted == produced` and the command
+  // already reads exactly emitted * kIndicesPerTriangle. A memcpy at this point
+  // would rewrite the bytes that are already there and, by looking like the
+  // guarantee, hide the fact that the paths which actually need one are the two
+  // failure returns above -- which is where clamp_indirect_to_arena() is
+  // called.
+
   DeviceMesh device_mesh;
   device_mesh.vertices = arena().handle();
   device_mesh.indices = index_run().handle();
+  device_mesh.indirect = indirect().handle();
   device_mesh.vertex_usage = arena().usage();
   device_mesh.index_usage = index_run().usage();
+  device_mesh.indirect_usage = indirect().usage();
+  // One config creates all three, so any of them answers for the set.
+  device_mesh.sharing_mode = arena().sharing_mode();
   device_mesh.triangle_count = emitted;
-  device_mesh.vertex_count = emitted * 3;
+  device_mesh.vertex_count = emitted * kIndicesPerTriangle;
   device_mesh.generation = generation_;
   if (timings != nullptr) {
     timings->active_blocks = num_active;

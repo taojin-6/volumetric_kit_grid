@@ -21,12 +21,16 @@
 // Exits 0 (skip) where no device is present.
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/buffer.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -229,6 +233,18 @@ int main() {
   CHECK(plain_mesh.ok());
   CHECK(plain_mesh.value().vertex_usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
   CHECK(plain_mesh.value().index_usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+  // The command is unconditional, not config-gated: a recon-only consumer still
+  // gets one. Asserted on the *default* extractor specifically, because every
+  // other command assertion here runs through a configured one -- gating the
+  // buffer on config would otherwise leave the suite green while a default
+  // DeviceMesh carried a null handle.
+  CHECK(plain_mesh.value().indirect != VK_NULL_HANDLE);
+  CHECK(plain_mesh.value().indirect_usage ==
+        (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
+  // Default config names no families, so all three stay EXCLUSIVE -- bit for
+  // bit what this tier allocated before any of it existed.
+  CHECK(plain_mesh.value().sharing_mode == VK_SHARING_MODE_EXCLUSIVE);
 
   // --- An unsupported bit is rejected where the caller supplied it -----------
   // Device::create never enables bufferDeviceAddress, so this would otherwise
@@ -251,6 +267,130 @@ int main() {
   CHECK(!bad_index_result.ok());
   CHECK(bad_index_result.status().domain() ==
         vr::Status::Code::InvalidArgument);
+
+  // And the indirect field: it takes consumer usage the same way, so leaving it
+  // out of the guard would let the bit through on the one buffer nothing else
+  // checks.
+  mesh::MarchingCubesConfig bad_indirect;
+  bad_indirect.extra_indirect_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  vr::Result<mesh::MarchingCubes> bad_indirect_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                  bad_indirect);
+  CHECK(!bad_indirect_result.ok());
+  CHECK(bad_indirect_result.status().domain() ==
+        vr::Status::Code::InvalidArgument);
+
+  // A queue-family list longer than the fixed array is refused at create, not
+  // at the first arena grow several frames into a scan.
+  mesh::MarchingCubesConfig bad_families;
+  bad_families.queue_family_count = vr::BufferDesc::kMaxQueueFamilies + 1;
+  vr::Result<mesh::MarchingCubes> bad_families_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                  bad_families);
+  CHECK(!bad_families_result.ok());
+  CHECK(bad_families_result.status().domain() ==
+        vr::Status::Code::InvalidArgument);
+
+  // --- Queue families reach every output buffer ------------------------------
+  // Naming two distinct families must give CONCURRENT on all three, or a
+  // renderer on the second family reads a buffer its queue does not own. Only
+  // runs where the device actually exposes two families -- on a single-family
+  // driver (lavapipe, both Linux CI legs) two indices would collapse to one and
+  // EXCLUSIVE is the correct answer, which is asserted instead.
+  {
+    std::uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(device.value().physical_device(),
+                                             &family_count, nullptr);
+    mesh::MarchingCubesConfig shared_config;
+    shared_config.queue_families[0] = 0;
+    shared_config.queue_families[1] = family_count > 1 ? 1 : 0;
+    shared_config.queue_family_count = 2;
+    vr::Result<mesh::MarchingCubes> shared_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), shared_config);
+    CHECK(shared_result.ok());
+    mesh::MarchingCubes shared = std::move(shared_result).value();
+    vr::Result<mesh::DeviceMesh> shared_mesh =
+        shared.extract_device(small, 0.0f);
+    CHECK(shared_mesh.ok());
+    const VkSharingMode expected = family_count > 1 ? VK_SHARING_MODE_CONCURRENT
+                                                    : VK_SHARING_MODE_EXCLUSIVE;
+    CHECK(shared_mesh.value().sharing_mode == expected);
+  }
+
+  // --- The indirect draw command --------------------------------------------
+  // Present, and carrying the usage a vkCmdDrawIndexedIndirect needs beside the
+  // STORAGE_BUFFER the kernel counts through -- the same verify-don't-assume
+  // reason the vertex and index usage come back.
+  //
+  // Asserted on `big_mesh`, NOT `small_mesh`: the big extract ran on the same
+  // extractor at the default slot_count == 1 and grew the arena (checked
+  // above), so small_mesh's vertex and index handles have already been through
+  // vmaDestroyBuffer. Reading a superseded view is the very thing download()
+  // refuses, and a test that did it would start dereferencing freed buffers the
+  // moment the command joins the grow path.
+  CHECK(big_mesh.value().indirect != VK_NULL_HANDLE);
+  CHECK((big_mesh.value().indirect_usage &
+         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0);
+  CHECK((big_mesh.value().indirect_usage &
+         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0);
+  // valid() covers all three buffers, so a null command cannot pass for a
+  // drawable mesh.
+  CHECK(big_mesh.value().valid());
+
+  // The command's *contents*, which is the half nothing pinned before: a
+  // consumer drawing indirectly reads these five fields and never consults
+  // triangle_count, so an indexCount in the wrong units renders a third of the
+  // mesh with every other assertion in this suite still green (verified by
+  // mutation: `emitted * kIndicesPerTriangle` -> `emitted` passed everything).
+  //
+  // Read back through a copy rather than a map, because the test holds only a
+  // VkBuffer. That makes this a genuine consumer of extra_indirect_usage -- the
+  // TRANSFER_SRC bit below is the config knob under test, so the readback and
+  // the flag prove each other.
+  {
+    mesh::MarchingCubesConfig cmd_config;
+    cmd_config.extra_indirect_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    vr::Result<mesh::MarchingCubes> cmd_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), cmd_config);
+    CHECK(cmd_result.ok());
+    mesh::MarchingCubes cmd_extractor = std::move(cmd_result).value();
+
+    vr::Result<mesh::DeviceMesh> cmd_mesh =
+        cmd_extractor.extract_device(small, 0.0f);
+    CHECK(cmd_mesh.ok());
+    CHECK(!cmd_mesh.value().empty());
+    CHECK((cmd_mesh.value().indirect_usage &
+           VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0);
+
+    vr::Result<vr::Buffer> staging = vr::storage_buffer(
+        allocator.value(), sizeof(VkDrawIndexedIndirectCommand),
+        vr::HostAccess::Random, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CHECK(staging.ok());
+
+    const VkBuffer src = cmd_mesh.value().indirect;
+    const VkBuffer dst = staging.value().handle();
+    CHECK(device.value()
+              .submit_single_time([src, dst](VkCommandBuffer cb) {
+                VkBufferCopy region{};
+                region.size = sizeof(VkDrawIndexedIndirectCommand);
+                vkCmdCopyBuffer(cb, src, dst, 1, &region);
+              })
+              .ok());
+
+    VkDrawIndexedIndirectCommand cmd{};
+    std::memcpy(&cmd, staging.value().mapped(), sizeof(cmd));
+    // The units: three indices per triangle, which is what makes the kernel's
+    // append atomic the command itself.
+    CHECK(cmd.indexCount == cmd_mesh.value().triangle_count * 3);
+    CHECK(cmd.indexCount == cmd_mesh.value().vertex_count);
+    // The four fields that make it *drawable* rather than just a number. They
+    // have no effect until something issues a draw, and nothing in recon can --
+    // which is exactly why they need pinning here instead of downstream.
+    CHECK(cmd.instanceCount == 1);
+    CHECK(cmd.firstIndex == 0);
+    CHECK(cmd.vertexOffset == 0);
+    CHECK(cmd.firstInstance == 0);
+  }
 
   // --- slot_count: the output ring ------------------------------------------
   // A count outside 1..kMaxSlots is refused at create rather than indexing off
@@ -289,6 +429,10 @@ int main() {
   CHECK(gen2.value().generation != gen1.value().generation);
   CHECK(gen2.value().vertices != gen1.value().vertices);
   CHECK(gen2.value().indices != gen1.value().indices);
+  // The command rings with them. It is per-mesh, not per-extractor: a consumer
+  // drawing gen1 indirectly reads this buffer for the duration of its frame, so
+  // sharing one would hand gen2's count to gen1's draw.
+  CHECK(gen2.value().indirect != gen1.value().indirect);
 
   // Now both slots are outstanding. A third extract would have to overwrite the
   // one holding gen1, which the consumer has not finished with -- refused,
@@ -339,6 +483,110 @@ int main() {
       ring.extract_device(small, 0.0f);
   CHECK(after_self_move.ok());
   CHECK(after_self_move.value().valid());
+
+  // --- The host extract overloads do not starve the ring ---------------------
+  // They claim and stamp a slot like any extract, but return Result<Mesh> --
+  // no generation, so a host-only caller cannot release what it never saw, and
+  // download() does not release either. Left alone, slot_count calls exhaust
+  // the ring and every extract after that fails permanently, quoting
+  // generations the API never handed out. The overloads therefore release
+  // their own slot once the host copy is taken.
+  //
+  // Deterministic, not racy: with two slots this bricks on call three. Deleting
+  // either release_through() in the host overloads fails this loop.
+  {
+    mesh::MarchingCubesConfig host_ring;
+    host_ring.slot_count = 2;
+    vr::Result<mesh::MarchingCubes> host_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), host_ring);
+    CHECK(host_result.ok());
+    mesh::MarchingCubes host = std::move(host_result).value();
+
+    for (int i = 0; i < 5; ++i) {
+      vr::Result<mesh::Mesh> host_mesh = host.extract(small, 0.0f);
+      CHECK(host_mesh.ok());
+      CHECK(!host_mesh.value().vertices.empty());
+    }
+
+    // The dense overload shares the ring and mixes with the sparse one, so it
+    // has to release too.
+    const int dense_dim = 8;
+    std::vector<vol::Voxel> samples(
+        static_cast<std::size_t>(dense_dim * dense_dim * dense_dim));
+    for (int z = 0; z < dense_dim; ++z) {
+      for (int y = 0; y < dense_dim; ++y) {
+        for (int x = 0; x < dense_dim; ++x) {
+          const float dx = static_cast<float>(x) - 3.5f;
+          const float dy = static_cast<float>(y) - 3.5f;
+          const float dz = static_cast<float>(z) - 3.5f;
+          vol::Voxel& v = samples[static_cast<std::size_t>(
+              (z * dense_dim + y) * dense_dim + x)];
+          v.sdf = std::sqrt(dx * dx + dy * dy + dz * dz) - 2.0f;
+          v.weight = 1.0f;
+        }
+      }
+    }
+    mesh::DenseGrid dense_grid;
+    dense_grid.dims = vr::Vec3i{dense_dim, dense_dim, dense_dim};
+    dense_grid.voxel_size = 1.0f;
+    dense_grid.origin = vr::Vec3f{0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < 5; ++i) {
+      vr::Result<mesh::Mesh> dense_mesh =
+          host.extract(samples.data(), samples.size(), dense_grid, 0.0f);
+      CHECK(dense_mesh.ok());
+    }
+  }
+
+  // --- An empty extract is a first-class result ------------------------------
+  // A grid with no active blocks meshes nothing, and that path returns without
+  // ever reaching a dispatch. It still has to behave like every other extract:
+  // name its command, claim its own slot, and leave a consumer able to draw
+  // (nothing) without special-casing.
+  {
+    vr::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
+        device.value(), allocator.value(), gp, attrs, 2);
+    CHECK(empty_result.ok());
+    vol::VoxelBlockGrid empty_grid =
+        std::move(empty_result).value();  // unfilled
+
+    mesh::MarchingCubesConfig empty_config;
+    empty_config.slot_count = 2;
+    vr::Result<mesh::MarchingCubes> empty_ex = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), empty_config);
+    CHECK(empty_ex.ok());
+    mesh::MarchingCubes ex = std::move(empty_ex).value();
+
+    // A real mesh first, so the empty extract that follows has a live previous
+    // generation to *not* disturb.
+    vr::Result<mesh::DeviceMesh> real = ex.extract_device(small, 0.0f);
+    CHECK(real.ok());
+    CHECK(!real.value().empty());
+
+    vr::Result<mesh::DeviceMesh> none = ex.extract_device(empty_grid, 0.0f);
+    CHECK(none.ok());
+    CHECK(none.value().empty());
+    CHECK(none.value().triangle_count == 0);
+    // The command is named and zeroed, not left null and not left holding the
+    // previous extract's count -- a consumer drawing indirectly reads it and
+    // never looks at triangle_count, so either would silently redraw the
+    // previous mesh.
+    CHECK(none.value().indirect != VK_NULL_HANDLE);
+    CHECK(none.value().indirect != real.value().indirect);
+    // It took a slot of its own. That is what keeps release_through honest:
+    // released_through_ is a high-water mark, so an empty generation that
+    // shared -- or skipped -- a slot would mark the live mesh's slot released
+    // the moment the consumer retired the empty one, and the next grow would
+    // free an arena under a live draw.
+    CHECK(none.value().generation != real.value().generation);
+    ex.release_through(none.value().generation);
+    // Both slots are now spoken for (real is still outstanding by contract, but
+    // release_through is a high-water mark, so this releases it too) -- the
+    // point being simply that the empty extract consumed a slot rather than
+    // vanishing, which the generation inequality above already shows.
+    vr::Result<mesh::Mesh> none_host = ex.download(none.value());
+    CHECK(none_host.ok());
+    CHECK(none_host.value().vertices.empty());
+  }
 
   std::fprintf(stderr, "marching_cubes_config: OK\n");
   return 0;

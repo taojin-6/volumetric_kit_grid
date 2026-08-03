@@ -13,9 +13,16 @@
 //
 // The includer must, *before* the include, declare the binding-0 `Tables`
 // block (`int tri_table[4096]`, `corner_offset[24]`, `edge_to_vert[24]`), the
-// `Vertex` struct, the writeonly `vertices[]` buffer, and the `tri_count`
+// `Vertex` struct, the writeonly `vertices[]` buffer, and the `index_count`
 // counter -- all by those names. They are identical in both kernels; only the
 // binding indices differ, which is why the declarations stay in each shader.
+
+// Indices one triangle contributes. The append atomic bumps `index_count` by
+// exactly this, which is what makes the counter the draw command's indexCount
+// rather than a triangle total a host would have to convert. Mirrors
+// mesh::kIndicesPerTriangle on the host -- the two must not drift, since the
+// host divides by it to recover the triangle count.
+const uint kIndicesPerTriangle = 3u;
 
 // Corner c's step (0/1 per axis) from the cell base.
 ivec3 mcCornerShift(int corner) {
@@ -47,7 +54,7 @@ vec3 mcCellNormal(float sdf[8]) {
   return glen > 1e-6 ? grad / glen : vec3(0.0, 0.0, 1.0);
 }
 
-// Emit the cell's triangles into `vertices[]` / `tri_count`. Corner c's world
+// Emit the cell's triangles into `vertices[]` / `index_count`. Corner c's world
 // position is `origin + (base_voxel + cornerShift(c)) * voxel_size`, so the
 // caller passes the cell's integer base voxel and both kernels keep their exact
 // original arithmetic (the dense kernel supplies its grid `origin`; the sparse
@@ -61,10 +68,13 @@ vec3 mcCellNormal(float sdf[8]) {
 // points along the outward gradient `normal` -- the orientation gfx expects;
 // color follows the same reversal so each vertex keeps its own edge's color,
 // and uv0 stays the "use vertex color" sentinel until projective texturing
-// runs. Past `capacity` a triangle is dropped but still counted, so tri_count
-// always ends as the field's true total -- that is the contract the host sizes
-// its arena from when it fits the arena to the surface rather than to the
-// 5-tri/cell worst case, and re-runs after an undersized guess.
+// runs. Past `capacity` a triangle is dropped but still counted, so index_count
+// always ends as kIndicesPerTriangle times the field's true TRIANGLE total --
+// counted in indices, because it is the draw command's indexCount. That is the
+// contract the host sizes its arena from when it fits the arena to the surface
+// rather than to the 5-tri/cell worst case, and re-runs after an undersized
+// guess; the host divides by kIndicesPerTriangle to recover the triangle count,
+// and bounds the counter against uint32 in indices for the same reason.
 void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
                 ivec3 base_voxel, float voxel_size, vec3 normal, float iso,
                 uint has_color, uint capacity) {
@@ -74,13 +84,18 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
     // dispatch that discovers an undersized arena most of them are not. The
     // reservation depends on nothing the loop below computes, so hoisting it is
     // semantically identical.
-    uint tri = atomicAdd(tri_count, 1u);
+    // Three at a time, so the counter *is* the draw command's indexCount and
+    // the GPU never needs a host pass to turn a triangle count into one. The
+    // quotient is this triangle's slot, exactly as before -- the units changed,
+    // the meaning of `tri` did not.
+    uint tri = atomicAdd(index_count, kIndicesPerTriangle) / kIndicesPerTriangle;
     if (tri >= capacity) {
-      // Drop this triangle but keep counting: `tri_count` must end up the
-      // field's TRUE total, because the host sizes the arena from it and
-      // re-runs. A `return` here would abandon this cell's remaining triangles
-      // uncounted, making the reported total a lower bound -- so the host's
-      // refit would still be too small and the retry would overflow again.
+      // Drop this triangle but keep counting: `index_count` must end up
+      // kIndicesPerTriangle times the field's TRUE triangle total, because the
+      // host sizes the arena from it and re-runs. A `return` here would abandon
+      // this cell's remaining triangles uncounted, making the reported total a
+      // lower bound -- so the host's refit would still be too small and the
+      // retry would overflow again.
       continue;
     }
     vec3 p[3];

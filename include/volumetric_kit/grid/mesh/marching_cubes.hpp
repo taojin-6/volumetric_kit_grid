@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/buffer.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
@@ -29,6 +30,18 @@ class Allocator;
 }  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::mesh {
+
+/// @brief Indices one extracted triangle contributes: three, since marching
+///        cubes emits independent triangles and the index run is the identity.
+///
+/// Named because it is the conversion between the two units this tier trades
+/// in. The kernel's append atomic bumps the draw command's `indexCount` by
+/// exactly this per triangle, so the counter it maintains *is* the command --
+/// the host divides by it on every readback, multiplies by it to size the arena
+/// and to bound the 32-bit counter, and `marching_cubes_common.glsl` mirrors
+/// it. An open-coded `3` at any one of those sites is a unit error that
+/// compiles.
+inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 
 /// @brief A dense grid of SDF samples -- the input to the analytic extraction
 ///        path this first slice proves.
@@ -81,7 +94,7 @@ struct ExtractTimings {
   double neighbour_lut_ms = 0.0;
   /// Allocating + filling the active-block and neighbour input buffers.
   double input_upload_ms = 0.0;
-  /// Sizing the vertex arena + zeroing the atomic counter, including a refit
+  /// Sizing the vertex arena + resetting the draw command, including a refit
   /// after an undersized guess (see @ref dispatches). Near zero once the
   /// retained arena already fits the call -- the steady state, since the arena
   /// is reused across extracts (see @ref MarchingCubes).
@@ -91,10 +104,10 @@ struct ExtractTimings {
   /// The marching-cubes dispatch(es), including the blocking fence wait --
   /// summed over both when a refit forced a second one (@ref dispatches).
   double dispatch_ms = 0.0;
-  /// Getting the result back to the caller: the 4-byte counter read after each
-  /// dispatch, plus the vertex copy into the host mesh when one is made. @ref
-  /// MarchingCubes::extract makes one, so this covers both; @ref
-  /// MarchingCubes::extract_device does not, so there it is the counter alone.
+  /// Getting the result back to the caller: the 20-byte draw-command read after
+  /// each dispatch, plus the vertex copy into the host mesh when one is made.
+  /// @ref MarchingCubes::extract makes one, so this covers both; @ref
+  /// MarchingCubes::extract_device does not, so there it is the command alone.
   double readback_ms = 0.0;
 
   /// Active blocks meshed -- the dispatch's real size (occupancy, not the
@@ -157,26 +170,68 @@ struct ExtractTimings {
 //       GPU wait, because a command buffer waiting on a value the sibling has
 //       not signalled deadlocks against a swapchain rebuild, which drains the
 //       queue while holding the submit mutex.
-//   (2) Sharing. SETTLED 2026-08-03 in core, but not yet requested here:
-//       BufferDesc::queue_families now picks the mode from the families a
-//       caller names (Buffer::sharing_mode reads back what it got), so a
-//       cross-family read is expressible. MarchingCubesConfig does not carry
-//       them yet -- it waits for the consumer that has both indices, the same
-//       rule that put extra_vertex_usage on the app rather than this tier.
+//   (2) Sharing. SETTLED 2026-08-03: BufferDesc::queue_families picks the mode
+//       from the families a caller names (Buffer::sharing_mode reads back what
+//       it got), and MarchingCubesConfig::queue_families now carries them, so
+//       every buffer this tier hands out -- arena, index run and indirect
+//       command alike -- is CONCURRENT exactly where a sibling reads it.
 //   (3) Visibility. SETTLED 2026-08-03: core's shared dispatch() barrier now
 //       also reaches VERTEX_INPUT / VERTEX_ATTRIBUTE_READ / INDEX_READ and
 //       DRAW_INDIRECT / INDIRECT_COMMAND_READ -- the first two only where the
 //       queue family advertises graphics, since Vulkan forbids naming
 //       VERTEX_INPUT on a compute-only one. A cross-queue handoff still needs
 //       its semaphore, which carries visibility on its own.
-//   (4) Indirect draw. counter_ carries no INDIRECT_BUFFER usage and is not on
-//       DeviceMesh, so the vkCmdDrawIndexedIndirect path seam B is specified
-//       around cannot be expressed; the count still round-trips to the host.
+//   (4) Indirect draw. SETTLED 2026-08-03: the kernel's append atomic *is* the
+//       draw command's indexCount (it bumps by three per triangle), the command
+//       carries INDIRECT_BUFFER beside STORAGE_BUFFER, and DeviceMesh publishes
+//       it, so vkCmdDrawIndexedIndirect runs off the bytes the kernel wrote.
+//       The count still round-trips to the host, but only because *this tier*
+//       needs it to refit an undersized arena -- a consumer no longer does.
+//
+// TODO(mesh): the command lives in host-visible memory, because the refit
+// protocol reads it back on every extract and resets it before every dispatch.
+// On a unified-memory GPU that is free; on a discrete one the command processor
+// fetches those 20 bytes across PCIe on every indirect draw. Device-local would
+// invert the cost (two transfers per extract to buy a local fetch per draw), so
+// this waits for a discrete-GPU consumer to measure it rather than guessing --
+// the same wait-for-the-second-consumer rule the rest of this config follows.
+// Recorded on DeviceMesh::sharing_mode rather than left to be inferred, because
+// the hazard here is not the cost but that the cost is invisible on the only
+// hardware this repo's CI runs.
 struct MarchingCubesConfig {
   /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER`.
   VkBufferUsageFlags extra_vertex_usage = 0;
   /// Added to the index run's usage, beyond `STORAGE_BUFFER`.
   VkBufferUsageFlags extra_index_usage = 0;
+  /// Added to the indirect command's usage, beyond the `STORAGE_BUFFER` the
+  /// kernel counts through and the `INDIRECT_BUFFER` a draw reads it as (both
+  /// unconditional -- 20 bytes, and a consumer that never draws indirectly pays
+  /// a usage bit nobody reads).
+  VkBufferUsageFlags extra_indirect_usage = 0;
+
+  /// @brief Queue families that will access this extractor's output buffers.
+  ///
+  /// Applies to all three -- vertex arena, index run and indirect command --
+  /// since a renderer drawing the mesh reads every one of them. Left empty (the
+  /// default) they are `VK_SHARING_MODE_EXCLUSIVE`, which is right for a
+  /// recon-only consumer and byte-identical to what this tier always did.
+  ///
+  /// A consumer sharing the mesh with a sibling on another queue family must
+  /// name both here. Reading an EXCLUSIVE buffer from a family that does not
+  /// own it is undefined, and on Apple -- where the shared-device bootstrap
+  /// hands recon and gfx *different* families, and where Metal has no ownership
+  /// concept to violate -- it is undefined in the way that appears to work.
+  /// Pass both indices unconditionally: duplicates collapse, so a device whose
+  /// two consumers land on one family gets EXCLUSIVE for free.
+  ///
+  /// @see BufferDesc::queue_families, which this is copied into. Held by value
+  ///      rather than as a pointer because @ref MarchingCubes stores the config
+  ///      and re-reads it on every arena grow, long after @ref
+  ///      MarchingCubes::create returned.
+  std::uint32_t queue_families[BufferDesc::kMaxQueueFamilies] = {};
+  /// Entries in @ref queue_families; more than `kMaxQueueFamilies` distinct is
+  /// rejected by @ref MarchingCubes::create.
+  std::uint32_t queue_family_count = 0;
 
   /// @brief How many extracts may be outstanding at once.
   ///
@@ -250,12 +305,12 @@ class VR_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and
   ///        binding it to @p allocator for its input, vertex-arena, and
-  ///        counter buffers.
+  ///        draw-command buffers.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator its buffers come from (must outlive this).
-  /// @param config     Extra buffer usage a *consumer* of the mesh needs; see
-  ///                   @ref MarchingCubesConfig. Defaults to none, which is
-  ///                   what a recon-only consumer wants.
+  /// @param config     Extra buffer usage and queue families a *consumer* of
+  ///                   the mesh needs; see @ref MarchingCubesConfig. Defaults
+  ///                   to none, which is what a recon-only consumer wants.
   /// @return The extractor, or a non-OK @ref Status if @p config asks for an
   ///         unsupported usage bit, or a pipeline, layout, or descriptor
   ///         allocation fails.
@@ -391,7 +446,7 @@ class VR_MESH_API MarchingCubes {
   /// @param grid  As @ref extract.
   /// @param iso   As @ref extract.
   /// @param timings  As @ref extract, except @ref ExtractTimings::readback_ms
-  ///                 covers only the 4-byte counter read, not a vertex copy.
+  ///                 covers only the 20-byte command read, not a vertex copy.
   /// @return A @ref DeviceMesh **borrowing** this extractor's buffers -- valid
   ///         only until the next extract on this object, which overwrites them
   ///         -- or the same failures @ref extract reports (including its
@@ -450,7 +505,7 @@ class VR_MESH_API MarchingCubes {
   // color dummy.
   Buffer color_dummy_;
 
-  // The vertex arena + atomic triangle counter the kernels write, kept ACROSS
+  // The vertex arena + the draw command the kernels append through, kept ACROSS
   // extract calls and grown only when a call needs more than the last one.
   //
   // These were allocated per call, which measured as ~90% of a sparse extract
@@ -460,9 +515,9 @@ class VR_MESH_API MarchingCubes {
   // fresh pages while the dispatch that fills it costs ~2 ms. Reusing one
   // allocation makes a steady-state extract pay nothing for its output
   // storage, and fitting it to the surface (see plan_capacity) keeps what
-  // stays resident close to the mesh's real size. Only the counter is reset
-  // per call (4 bytes); the arena's stale contents past the emitted range are
-  // never read, since the counter bounds the readback.
+  // stays resident close to the mesh's real size. Only the draw command is
+  // reset per call (20 bytes); the arena's stale contents past the emitted
+  // range are never read, since the command's indexCount bounds the readback.
   //
   // One slot is the single reused arena described above. Several make a ring,
   // so a consumer can still be drawing generation N while N+1 is extracted --
@@ -476,6 +531,13 @@ class VR_MESH_API MarchingCubes {
     // passes (projective texturing, and the renderer at the interop seam)
     // address vertices through an index buffer.
     Buffer index_run;
+    // The `VkDrawIndexedIndirectCommand` this slot's draw is issued from, and
+    // the atomic the kernel counts into: `indexCount` is field 0, so the two
+    // are the same 20 bytes rather than a counter plus a command built from it.
+    // Per slot, not shared, because it *is* part of the mesh -- a renderer
+    // reading slot N's command while N+1 is extracted is the whole point of the
+    // ring.
+    Buffer indirect;
     // The extract that last wrote this slot; 0 until one has. Compared against
     // released_through_ to tell "still being read" from "free to reuse".
     std::uint64_t generation = 0;
@@ -514,8 +576,9 @@ class VR_MESH_API MarchingCubes {
   const Buffer& arena() const noexcept { return slots_[slot_].arena; }
   Buffer& index_run() noexcept { return slots_[slot_].index_run; }
   const Buffer& index_run() const noexcept { return slots_[slot_].index_run; }
+  Buffer& indirect() noexcept { return slots_[slot_].indirect; }
+  const Buffer& indirect() const noexcept { return slots_[slot_].indirect; }
 
-  Buffer counter_;
   // Numbers the extracts, so a DeviceMesh can say which one it came from.
   // Pre-incremented, so the first extract is generation 1 and a default-
   // constructed (or foreign) DeviceMesh at 0 never passes for a live one.
@@ -544,7 +607,8 @@ class VR_MESH_API MarchingCubes {
   // ever allocated as a whole number of triangles.
   //
   std::uint32_t arena_capacity() const noexcept {
-    return static_cast<std::uint32_t>(arena().size() / (3 * sizeof(Vertex)));
+    return static_cast<std::uint32_t>(arena().size() /
+                                      (kIndicesPerTriangle * sizeof(Vertex)));
   }
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
@@ -559,10 +623,10 @@ class VR_MESH_API MarchingCubes {
                               std::uint64_t worst_case) const;
 
   // Prepare the output buffers for a dispatch emitting at most @p capacity
-  // triangles: size @ref arena() (growing geometrically, never
-  // shrinking) and @ref index_run(), and reset @ref counter_ to zero.
+  // triangles: size arena() (growing geometrically, never shrinking) and
+  // index_run(), and reset the draw command via ensure_indirect_command().
   //
-  // The counter reset is part of the contract, not a side effect: it runs on
+  // The command reset is part of the contract, not a side effect: it runs on
   // every call, including one that reallocates nothing, because a retry after
   // a refit must start its dispatch from zero or it would accumulate onto the
   // first dispatch's count. Returns a non-OK Status when @p capacity's arena
@@ -577,6 +641,25 @@ class VR_MESH_API MarchingCubes {
   Status claim_output_slot();
 
   Status ensure_output_buffers(std::uint32_t capacity);
+
+  // Create this slot's draw command if it has none, and reset it to "draw
+  // nothing yet": indexCount 0 for the kernel to accumulate into, and the four
+  // fields that make the result a *drawable* command rather than a number a
+  // host has to build one from. Split out of ensure_output_buffers because the
+  // empty-active-set path needs the command without needing an arena.
+  Status ensure_indirect_command();
+
+  // Bound the command's indexCount by what the arena can actually hold.
+  //
+  // The kernel counts triangles it *dropped* as well as ones it wrote -- that
+  // over-count is deliberate, and is what the host refits from -- so between
+  // an undersized dispatch and its retry the command names more indices than
+  // exist. Every path that returns while that is still true must call this, or
+  // it hands back a command that reads past the end of both the arena and the
+  // index run. The success path is already in range by construction (the loop
+  // exits only when the count fits), so this is the *failure* paths' guarantee,
+  // not theirs.
+  void clamp_indirect_to_arena() noexcept;
 };
 
 }  // namespace volumetric_kit::recon::mesh

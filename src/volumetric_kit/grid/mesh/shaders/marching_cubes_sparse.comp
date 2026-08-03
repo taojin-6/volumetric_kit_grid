@@ -71,7 +71,10 @@ layout(set = 0, binding = 5, scalar) readonly buffer Color { uint color_attr[]; 
 layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
   Vertex vertices[];
 };
-layout(set = 0, binding = 7) buffer Counter { uint tri_count; };
+layout(set = 0, binding = 7) // The draw command's indexCount, which the kernel counts into directly --
+// see mcEmitCell. The rest of VkDrawIndexedIndirectCommand is host-written
+// once per extract and untouched here.
+buffer DrawCommand { uint index_count; };
 
 layout(push_constant, scalar) uniform PushConstants {
   int block_size;          // voxels per block edge
