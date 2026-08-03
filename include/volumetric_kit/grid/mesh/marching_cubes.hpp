@@ -124,10 +124,17 @@ struct ExtractTimings {
   std::uint32_t triangle_capacity = 0;
   /// Triangles the kernel actually emitted.
   std::uint32_t emitted_triangles = 0;
-  /// Bytes the extractor's vertex arena currently holds. This is *resident*
-  /// size, not this call's allocation: the arena is retained across extracts,
-  /// so a steady-state call allocates nothing and still reports it, and a
-  /// grown arena can exceed what @ref triangle_capacity alone would need.
+  /// Bytes the extractor's vertex arenas currently hold, summed over every
+  /// slot. This is *resident* size, not this call's allocation: an arena is
+  /// retained across extracts, so a steady-state call allocates nothing and
+  /// still reports it, and a grown arena can exceed what @ref
+  /// triangle_capacity alone would need.
+  ///
+  /// Summed rather than reporting the slot this call wrote, because each of
+  /// @ref MarchingCubesConfig::slot_count slots carries its own arena -- one of
+  /// them is what the *next* extract may grow, not what the extractor costs.
+  /// The index runs are not included (they are a sixteenth of an arena, four
+  /// bytes per index against a 64-byte vertex).
   std::uint64_t arena_bytes = 0;
 
   /// @return The sum of every phase, in milliseconds.
@@ -254,9 +261,15 @@ struct MarchingCubesConfig {
   /// the seam. A cross-library GPU wait is the one thing the shared-queue
   /// design forbids outright.
   ///
-  /// Size it to the consumer's frames in flight plus one. Extracting with
-  /// every slot outstanding is a contract violation, reported rather than
-  /// silently overwriting a live draw.
+  /// Size it to the consumer's frames in flight plus one -- and no higher than
+  /// that, because **each slot costs a full vertex arena**. They are sized
+  /// independently (a slot grows when the surface it is handed needs more) and
+  /// none of them ever shrinks, so resident output memory is roughly
+  /// `slot_count` times a single arena. @ref ExtractTimings::arena_bytes
+  /// reports the sum, not one slot's share.
+  ///
+  /// Extracting with every slot outstanding is a contract violation, reported
+  /// rather than silently overwriting a live draw.
   std::uint32_t slot_count = 1;
 };
 
@@ -287,9 +300,11 @@ struct MarchingCubesConfig {
 ///       arena to what the surface actually emits rather than to the
 ///       5-triangles-per-cell ceiling it can never reach, so what stays
 ///       resident is the mesh's real size plus headroom; the dense @ref extract
-///       still sizes for its (caller-bounded) worst case and grows the shared
-///       arena to it. Destroy the extractor to release it; @ref
-///       ExtractTimings::arena_bytes reports what it holds.
+///       still sizes for its (caller-bounded) worst case and grows whichever
+///       slot it lands on to that. At @ref MarchingCubesConfig::slot_count
+///       above one there is one such arena *per slot*, each sized
+///       independently. Destroy the extractor to release them; @ref
+///       ExtractTimings::arena_bytes reports their total.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -460,10 +475,11 @@ class VR_MESH_API MarchingCubes {
   ///        @ref Mesh.
   /// @param device_mesh  A mesh from @ref extract_device on *this* extractor,
   ///                     not yet invalidated by a later extract.
-  /// @return The host mesh, or @ref Status::Code::InvalidArgument if
-  ///         @p device_mesh is not this extractor's newest extract -- it was
-  ///         superseded by a later one, or came from a different extractor.
-  ///         The check is by @ref DeviceMesh::generation, not by buffer handle:
+  /// @return The host mesh, or @ref Status::Code::InvalidArgument for a
+  ///         moved-from extractor, or if @p device_mesh is not this extractor's
+  ///         newest extract -- it was superseded by a later one, or came from a
+  ///         different extractor. The currency check is by
+  ///         @ref DeviceMesh::generation, not by buffer handle: with one slot
   ///         the arena is reused in place, so a superseded view names the same
   ///         `VkBuffer` and a handle comparison would accept it.
   Result<Mesh> download(const DeviceMesh& device_mesh) const;
@@ -538,8 +554,11 @@ class VR_MESH_API MarchingCubes {
     // reading slot N's command while N+1 is extracted is the whole point of the
     // ring.
     Buffer indirect;
-    // The extract that last wrote this slot; 0 until one has. Compared against
-    // released_through_ to tell "still being read" from "free to reuse".
+    // The extract that last *published a DeviceMesh out of* this slot; 0 until
+    // one has. Compared against released_through_ to tell "still being read"
+    // from "free to reuse", so it is written where a mesh is handed out, not
+    // where the buffers are written: a slot marked with a generation nothing
+    // ever received is one nothing can release.
     std::uint64_t generation = 0;
   };
   // A fixed array, not a vector, and that is load-bearing rather than a
@@ -564,7 +583,7 @@ class VR_MESH_API MarchingCubes {
   std::size_t slot_count_ = 1;
   // Which slot the most recent extract wrote, and therefore which one a
   // DeviceMesh handed out now names. Advances before each extract touches
-  // anything; with one slot it never moves.
+  // anything, in the same breath as generation_; with one slot it never moves.
   std::size_t slot_ = 0;
   // The newest generation the consumer has finished reading, as reported by
   // release_through. Zero means "nothing released yet", which is correct at
@@ -582,10 +601,12 @@ class VR_MESH_API MarchingCubes {
   // Numbers the extracts, so a DeviceMesh can say which one it came from.
   // Pre-incremented, so the first extract is generation 1 and a default-
   // constructed (or foreign) DeviceMesh at 0 never passes for a live one.
-  // Bumped when a call is first about to touch the arena, NOT when it
-  // succeeds: a call that overwrites the arena and then fails must still
-  // invalidate every outstanding DeviceMesh, or download() would hand the
-  // caller this call's geometry under the previous call's counts.
+  // Bumped immediately after an extract claims its slot, NOT when it succeeds:
+  // a call that overwrites the arena and then fails must still invalidate every
+  // outstanding DeviceMesh, or download() would hand the caller this call's
+  // geometry under the previous call's counts. Immediately after, because
+  // download() reads slot_ on the strength of comparing this -- see
+  // claim_output_slot.
   std::uint64_t generation_ = 0;
 
   // Triangles per active block the last completed sparse extract measured, and
@@ -611,16 +632,49 @@ class VR_MESH_API MarchingCubes {
                                       (kIndicesPerTriangle * sizeof(Vertex)));
   }
 
+  // Vertex-arena bytes the whole ring is holding -- what ExtractTimings
+  // reports. Every slot carries its own arena, so the current one's size is
+  // this object's cost divided by slot_count_, not its cost.
+  std::uint64_t resident_arena_bytes() const noexcept {
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < slot_count_; ++i)
+      total += slots_[i].arena.size();
+    return total;
+  }
+
   // Capacity to *try* for a dispatch over @p num_active blocks whose
   // theoretical ceiling is @p worst_case triangles: the last extract's
-  // measured triangles-per-block scaled by *this* call's active set, never
-  // below what the arena already holds (planning under that would drop
-  // triangles there was room for), and never above the ceiling. Scaling by the
-  // current active set is what moves the plan ahead of a growing surface, so a
-  // scan does not discover each size increase by overflowing. Adds no headroom
-  // of its own -- ensure_output_buffers owns that, so the two do not compound.
+  // measured triangles-per-block scaled by *this* call's active set, clamped
+  // to the ceiling. Scaling by the current active set is what moves the plan
+  // ahead of a growing surface, so a scan does not discover each size increase
+  // by overflowing. Adds no headroom of its own -- ensure_output_buffers owns
+  // that, so the two do not compound.
+  //
+  // It reads no slot, which is a property to preserve rather than an accident:
+  // floored at the current slot's capacity it compounded 1.5x per extract
+  // across a ring (see plan_capacity's definition). Being slot-independent is
+  // also why it may be called before or after claim_output_slot.
   std::uint32_t plan_capacity(std::uint32_t num_active,
                               std::uint64_t worst_case) const;
+
+  // Pick the slot the extract about to run will write, or refuse because every
+  // slot is still outstanding. Called once at the top of each extract, with
+  // `++generation_` as the very next statement -- both halves load-bearing, and
+  // argued where it is defined. In short: before the bump, so a refusal leaves
+  // every outstanding DeviceMesh as valid as it was (this is the path that
+  // exists to protect a consumer's live mesh, so it must not retire it);
+  // immediately before it, so nothing fallible sits between slot_ moving and
+  // generation_ moving, which is the pair download() reads as one statement.
+  Status claim_output_slot();
+
+  // Give back the slot stamped with @p generation without moving
+  // released_through_. The host extract overloads' answer to "this call
+  // published no DeviceMesh, so nothing outside it can release the slot":
+  // release_through would do it with the *consumer's* high-water mark and so
+  // also retire every older slot, including one a DeviceMesh from the same
+  // extractor is still being drawn out of. A no-op on generation 0, which is
+  // every untouched slot's stamp.
+  void free_slot_of(std::uint64_t generation) noexcept;
 
   // Prepare the output buffers for a dispatch emitting at most @p capacity
   // triangles: size arena() (growing geometrically, never shrinking) and
@@ -633,13 +687,10 @@ class VR_MESH_API MarchingCubes {
   // would exceed the device's maxStorageBufferRange -- checked against the
   // request itself, before any growth headroom, so a surface that legitimately
   // fits is never rejected because the growth policy overshot.
-  // Pick the slot the extract about to run will write, or refuse because every
-  // slot is still outstanding. Called once at the top of each extract and --
-  // load-bearing -- *before* generation_ is bumped, so a refusal leaves every
-  // outstanding DeviceMesh exactly as valid as it was: this is the path that
-  // exists to protect a consumer's live mesh, so it must not retire it.
-  Status claim_output_slot();
-
+  //
+  // It does NOT stamp the claimed slot: that belongs beside the DeviceMesh a
+  // publishing return builds, so a call that fails here or after leaves the
+  // slot exactly as claimable as it found it.
   Status ensure_output_buffers(std::uint32_t capacity);
 
   // Create this slot's draw command if it has none, and reset it to "draw

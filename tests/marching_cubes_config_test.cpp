@@ -471,6 +471,85 @@ int main() {
   vr::Result<mesh::DeviceMesh> gen5 = ring.extract_device(small, 0.0f);
   CHECK(!gen5.ok());
 
+  // The arena must not ratchet as the ring turns.
+  //
+  // plan_capacity used to floor its estimate at what the arena already held.
+  // Read against the slot just written while a *different* slot was about to be
+  // grown, that floor compounds 1.5x per extract -- geometrically, with the
+  // measured triangle density never getting a say. On an iPad Pro it reached a
+  // 1.1 GB arena for 36904 triangles (0.59% full) before vkAllocateMemory
+  // refused and the device was lost.
+  //
+  // Same grid every time, so a correct extractor settles and stays there. Two
+  // assertions, because each is blind to something the other catches: flatness
+  // holds perfectly under a revert to worst-case sizing (which is flat, just
+  // ~19x too big), and the magnitude bound holds under any drift slow enough to
+  // stay inside it. The 1.5x compound this fixes trips both; the checks below
+  // were each confirmed to fail against a re-introduction of it.
+  {
+    constexpr std::uint32_t kRatchetSlots = 3;
+    // Four turns of the ring: two to let the seeded plan settle, two to hold it
+    // flat. Derived from the slot count, not hardcoded beside it, so changing
+    // one does not silently make the assertions below vacuous.
+    constexpr int kRatchetExtracts = 4 * static_cast<int>(kRatchetSlots);
+
+    mesh::MarchingCubesConfig ratchet_config;
+    ratchet_config.slot_count = kRatchetSlots;
+    vr::Result<mesh::MarchingCubes> ratchet_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                    ratchet_config);
+    CHECK(ratchet_result.ok());
+    mesh::MarchingCubes ratchet = std::move(ratchet_result).value();
+
+    std::uint64_t bytes[kRatchetExtracts] = {};
+    for (int i = 0; i < kRatchetExtracts; ++i) {
+      mesh::ExtractTimings t{};
+      vr::Result<mesh::DeviceMesh> m = ratchet.extract_device(small, 0.0f, &t);
+      CHECK(m.ok());
+      // Released immediately: this is testing the plan, not the ring's ability
+      // to refuse, and an exhausted ring would end the loop early.
+      ratchet.release_through(m.value().generation);
+      // The sum over every slot, not the one this extract wrote -- which is
+      // what makes it the extractor's real resident cost and what makes the
+      // flatness check below meaningful across the ring.
+      bytes[i] = t.arena_bytes;
+      CHECK(t.emitted_triangles > 0);
+
+      // (1) What the extractor holds tracks the *surface*, and it accounts for
+      // every slot. Measured here: 1052 triangles of surface, 911232 bytes of
+      // arena once all three slots are sized -- 4.5x, which is the 1.5x growth
+      // headroom times the three slots. Both bounds have a 1.5x margin or
+      // better, and each catches a different mutation.
+      //
+      // Above 9x: a revert to `return worst_case;`. This fixture's ceiling is 5
+      // triangles per cell over 8 blocks of 512 voxels, ~19x its actual surface
+      // *per slot* -- and perfectly flat, so (2) cannot see it.
+      //
+      // Below 3x: reporting one slot instead of the ring (`arena().size()`),
+      // which lands at ~1.5x and would make this whole loop blind to two thirds
+      // of the memory it exists to bound. Started once every slot has been
+      // sized, since before that the sum is genuinely smaller.
+      const std::uint64_t surface_bytes =
+          static_cast<std::uint64_t>(t.emitted_triangles) *
+          mesh::kIndicesPerTriangle * sizeof(mesh::Vertex);
+      CHECK(bytes[i] <= surface_bytes * 3 * kRatchetSlots);
+      if (i >= static_cast<int>(kRatchetSlots)) {
+        CHECK(bytes[i] >= surface_bytes * kRatchetSlots);
+      }
+
+      // (2) Flat. Every slot has been sized by the end of the first turn and
+      // the grid never changes, so from the second turn on no slot may grow
+      // again. Started at the second turn rather than the first so a settling
+      // plan is not mistaken for a drift. This is the assertion that survives a
+      // change of fixture: a compound gentle enough to stay inside (1) for
+      // twelve extracts still cannot be flat.
+      if (i >= 2 * static_cast<int>(kRatchetSlots)) {
+        CHECK(bytes[i] == bytes[i - 1]);
+      }
+    }
+    CHECK(bytes[kRatchetExtracts - 1] > 0);
+  }
+
   // Self-move leaves the ring intact, like every other member. This is not
   // hypothetical: the first cut held the slots in a std::vector, whose
   // self-move-assignment is valid-but-unspecified and empties under libc++, so
@@ -534,6 +613,57 @@ int main() {
       vr::Result<mesh::Mesh> dense_mesh =
           host.extract(samples.data(), samples.size(), dense_grid, 0.0f);
       CHECK(dense_mesh.ok());
+    }
+
+    // ...and they must give back *their own* slot, not everything below it.
+    //
+    // Handing the slot back is required (a Result<Mesh> carries no generation,
+    // so a host-only caller could not release it), but doing it with
+    // release_through -- the *consumer's* high-water mark -- also retires every
+    // older slot. Mixed with extract_device on the same extractor, that frees a
+    // slot the consumer is still drawing out of, and the next grow runs
+    // vmaDestroyBuffer under a live draw: undefined behaviour with validation
+    // off, which is the shipping configuration and the only one on iOS. The
+    // loops above cannot see it -- they use a dedicated extractor and hand out
+    // no DeviceMesh at all.
+    for (int overload = 0; overload < 2; ++overload) {
+      mesh::MarchingCubesConfig mixed_config;
+      mixed_config.slot_count = 2;
+      vr::Result<mesh::MarchingCubes> mixed_result =
+          mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                      mixed_config);
+      CHECK(mixed_result.ok());
+      mesh::MarchingCubes mixed = std::move(mixed_result).value();
+
+      // Outstanding for the rest of the block, and never released: this stands
+      // in for a renderer with the mesh bound in an in-flight draw.
+      vr::Result<mesh::DeviceMesh> live = mixed.extract_device(small, 0.0f);
+      CHECK(live.ok());
+
+      // A host extract takes the *other* slot and gives it straight back. Both
+      // overloads share the ring, so both are run through this.
+      if (overload == 0) {
+        vr::Result<mesh::Mesh> host_copy = mixed.extract(small, 0.0f);
+        CHECK(host_copy.ok());
+      } else {
+        vr::Result<mesh::Mesh> host_copy =
+            mixed.extract(samples.data(), samples.size(), dense_grid, 0.0f);
+        CHECK(host_copy.ok());
+      }
+
+      // So a slot is free for this one -- and it must be the freed one, never
+      // the one `live` names.
+      vr::Result<mesh::DeviceMesh> next = mixed.extract_device(small, 0.0f);
+      CHECK(next.ok());
+      CHECK(next.value().vertices != live.value().vertices);
+
+      // Both slots are outstanding again, so the ring refuses. This is the
+      // handle-independent half: with release_through in the host overload,
+      // `live`'s generation would have been marked released, `next` would have
+      // landed on `live`'s slot, and the other slot would still be free here --
+      // so this would succeed.
+      vr::Result<mesh::DeviceMesh> refused = mixed.extract_device(small, 0.0f);
+      CHECK(!refused.ok());
     }
   }
 
