@@ -72,15 +72,41 @@ struct DeviceMesh {
   /// carries `INDIRECT_BUFFER` beside the `STORAGE_BUFFER` the kernel counts
   /// through.
   VkBufferUsageFlags indirect_usage = 0;
+  /// Sharing mode all three buffers were created with (one producer config
+  /// covers them, so they never differ).
+  ///
+  /// Published for the same reason as @ref vertex_usage, with more at stake:
+  /// reading a `VK_SHARING_MODE_EXCLUSIVE` buffer from a queue family that does
+  /// not own it is *undefined*, where a missing usage bit is at least a
+  /// validation diagnostic. A consumer on a second family must see
+  /// `VK_SHARING_MODE_CONCURRENT` here before it binds any of them -- and on
+  /// Apple, where Metal has no ownership concept, getting it wrong is undefined
+  /// in the way that appears to work.
+  ///
+  /// @note What is deliberately *not* published is the memory placement: this
+  ///       tier's buffers are host-visible, because it reads the command back
+  ///       and resets it on every extract. That is free on a unified-memory GPU
+  ///       and costs a PCIe fetch per indirect draw on a discrete one -- a
+  ///       recorded trade rather than a hidden one; see the `TODO(mesh)` on
+  ///       @ref MarchingCubesConfig.
+  VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.
   std::uint64_t generation = 0;
 
   /// @return `true` when the mesh has no triangles.
   bool empty() const noexcept { return triangle_count == 0; }
-  /// @return `true` when both buffers are present.
+  /// @return `true` when *every* buffer this view names is present.
+  ///
+  /// All three, not just the geometry: a consumer drawing indirectly reads
+  /// @ref indirect and never consults @ref triangle_count, so a predicate that
+  /// exempted it would wave through a null handle to
+  /// `vkCmdDrawIndexedIndirect`. An extract that meshed nothing still names its
+  /// command (zeroed), so `valid() && empty()` is the "draw nothing" case
+  /// rather than a malformed one.
   bool valid() const noexcept {
-    return vertices != VK_NULL_HANDLE && indices != VK_NULL_HANDLE;
+    return vertices != VK_NULL_HANDLE && indices != VK_NULL_HANDLE &&
+           indirect != VK_NULL_HANDLE;
   }
 };
 

@@ -17,6 +17,13 @@
 // counter -- all by those names. They are identical in both kernels; only the
 // binding indices differ, which is why the declarations stay in each shader.
 
+// Indices one triangle contributes. The append atomic bumps `index_count` by
+// exactly this, which is what makes the counter the draw command's indexCount
+// rather than a triangle total a host would have to convert. Mirrors
+// mesh::kIndicesPerTriangle on the host -- the two must not drift, since the
+// host divides by it to recover the triangle count.
+const uint kIndicesPerTriangle = 3u;
+
 // Corner c's step (0/1 per axis) from the cell base.
 ivec3 mcCornerShift(int corner) {
   return ivec3(corner_offset[corner * 3 + 0], corner_offset[corner * 3 + 1],
@@ -62,9 +69,12 @@ vec3 mcCellNormal(float sdf[8]) {
 // color follows the same reversal so each vertex keeps its own edge's color,
 // and uv0 stays the "use vertex color" sentinel until projective texturing
 // runs. Past `capacity` a triangle is dropped but still counted, so index_count
-// always ends as the field's true total -- that is the contract the host sizes
-// its arena from when it fits the arena to the surface rather than to the
-// 5-tri/cell worst case, and re-runs after an undersized guess.
+// always ends as kIndicesPerTriangle times the field's true TRIANGLE total --
+// counted in indices, because it is the draw command's indexCount. That is the
+// contract the host sizes its arena from when it fits the arena to the surface
+// rather than to the 5-tri/cell worst case, and re-runs after an undersized
+// guess; the host divides by kIndicesPerTriangle to recover the triangle count,
+// and bounds the counter against uint32 in indices for the same reason.
 void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
                 ivec3 base_voxel, float voxel_size, vec3 normal, float iso,
                 uint has_color, uint capacity) {
@@ -78,13 +88,14 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
     // the GPU never needs a host pass to turn a triangle count into one. The
     // quotient is this triangle's slot, exactly as before -- the units changed,
     // the meaning of `tri` did not.
-    uint tri = atomicAdd(index_count, 3u) / 3u;
+    uint tri = atomicAdd(index_count, kIndicesPerTriangle) / kIndicesPerTriangle;
     if (tri >= capacity) {
-      // Drop this triangle but keep counting: `index_count` must end up the
-      // field's TRUE total, because the host sizes the arena from it and
-      // re-runs. A `return` here would abandon this cell's remaining triangles
-      // uncounted, making the reported total a lower bound -- so the host's
-      // refit would still be too small and the retry would overflow again.
+      // Drop this triangle but keep counting: `index_count` must end up
+      // kIndicesPerTriangle times the field's TRUE triangle total, because the
+      // host sizes the arena from it and re-runs. A `return` here would abandon
+      // this cell's remaining triangles uncounted, making the reported total a
+      // lower bound -- so the host's refit would still be too small and the
+      // retry would overflow again.
       continue;
     }
     vec3 p[3];

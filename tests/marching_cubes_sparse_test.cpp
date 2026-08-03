@@ -369,6 +369,35 @@ int main() {
   const mesh::Mesh dense_mesh = std::move(dense_result).value();
   CHECK(sphere.triangle_count() == dense_mesh.triangle_count());
 
+  // --- The counter's UNITS, pinned against the fixture's analytic area -------
+  // Everything above compares the kernel with itself: dense and sparse share
+  // mcEmitCell, so a mistake in what the append atomic counts moves both sides
+  // equally and every equality still holds. Measured, not assumed -- reverting
+  // `atomicAdd(index_count, kIndicesPerTriangle) / kIndicesPerTriangle` to a
+  // plain `atomicAdd(..., 1u)` left this whole suite green.
+  //
+  // The command's indexCount is now the draw's, so counting triangles instead
+  // of indices makes the host's `/ kIndicesPerTriangle` report a THIRD of the
+  // surface -- a mesh that still passes every per-vertex check, because the
+  // triangles it does report are correct. What it cannot do is still cover the
+  // sphere: total triangle area is an analytic property of the fixture
+  // (4*pi*r^2), independent of anything the counter says, so a 3x undercount
+  // fails by a mile. The tolerance is wide because marching cubes chords a
+  // curved surface and the field is sampled at kH -- it is sized to catch a
+  // factor of three, not to measure discretisation error.
+  double area = 0.0;
+  for (std::size_t i = 0; i + 2 < sphere.vertices.size(); i += 3) {
+    const vr::Vec3f& a = sphere.vertices[i + 0].position;
+    const vr::Vec3f& b = sphere.vertices[i + 1].position;
+    const vr::Vec3f& c = sphere.vertices[i + 2].position;
+    area += 0.5 * static_cast<double>(vr::length(vr::cross(b - a, c - a)));
+  }
+  const double analytic_area = 4.0 * 3.14159265358979323846 *
+                               static_cast<double>(kRadius) *
+                               static_cast<double>(kRadius);
+  CHECK(area > 0.80 * analytic_area);
+  CHECK(area < 1.20 * analytic_area);
+
   // --- Cross-block colour interpolation --------------------------------------
   // A grid carrying a packed-RGB colour attribute set to the linear gradient:
   // each vertex's colour must match grad_color at that vertex's own position
