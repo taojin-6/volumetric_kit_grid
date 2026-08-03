@@ -153,12 +153,18 @@ struct ExtractTimings {
 //       frees, memory an in-flight draw is reading. Needs the ring of slots +
 //       timeline semaphore DESIGN.md's seam B specifies; DeviceMesh::generation
 //       guards only the host download() path.
-//   (2) Sharing. Allocator::create_buffer hardcodes VK_SHARING_MODE_EXCLUSIVE
-//       and BufferDesc has no knob, while on Apple recon and gfx sit on
-//       different queue families (the 2026-08-02 bootstrap decision), so a
-//       cross-family read needs CONCURRENT or a release/acquire pair.
-//   (3) Visibility. core's shared dispatch() barrier reaches COMPUTE|HOST, not
-//       VERTEX_INPUT / VERTEX_ATTRIBUTE_READ / INDEX_READ.
+//   (2) Sharing. SETTLED 2026-08-03 in core, but not yet requested here:
+//       BufferDesc::queue_families now picks the mode from the families a
+//       caller names (Buffer::sharing_mode reads back what it got), so a
+//       cross-family read is expressible. MarchingCubesConfig does not carry
+//       them yet -- it waits for the consumer that has both indices, the same
+//       rule that put extra_vertex_usage on the app rather than this tier.
+//   (3) Visibility. SETTLED 2026-08-03: core's shared dispatch() barrier now
+//       also reaches VERTEX_INPUT / VERTEX_ATTRIBUTE_READ / INDEX_READ and
+//       DRAW_INDIRECT / INDIRECT_COMMAND_READ -- the first two only where the
+//       queue family advertises graphics, since Vulkan forbids naming
+//       VERTEX_INPUT on a compute-only one. A cross-queue handoff still needs
+//       its semaphore, which carries visibility on its own.
 //   (4) Indirect draw. counter_ carries no INDIRECT_BUFFER usage and is not on
 //       DeviceMesh, so the vkCmdDrawIndexedIndirect path seam B is specified
 //       around cannot be expressed; the count still round-trips to the host.
