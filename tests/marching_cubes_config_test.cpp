@@ -297,6 +297,15 @@ int main() {
   CHECK(!gen3.ok());
   CHECK(gen3.status().domain() == vr::Status::Code::InvalidArgument);
 
+  // ...and the refusal costs the consumer nothing. This is the whole point of
+  // refusing: gen2's slot was not touched, so gen2 must still be downloadable.
+  // It is not automatic -- the slot claim has to happen *before* the extract
+  // bumps generation_, or download()'s currency check retires the very mesh the
+  // refusal was protecting. Moving claim_output_slot() back after the bump
+  // fails here, and nothing else in the suite notices.
+  vr::Result<mesh::Mesh> gen2_after_refusal = ring.download(gen2.value());
+  CHECK(gen2_after_refusal.ok());
+
   // Releasing gen1 frees its slot and the next extract proceeds. What is
   // asserted is that it did not land on the slot still being read: gen2 is
   // outstanding, so gen4 must not share its buffer.

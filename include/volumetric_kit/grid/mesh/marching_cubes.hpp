@@ -148,11 +148,15 @@ struct ExtractTimings {
 // TODO(mesh): usage is *necessary* for interop seam B, not sufficient. What a
 // renderer binding this arena still needs, none of which a create-time flag can
 // supply:
-//   (1) Lifetime. One grow-only arena, reused in place, and freed synchronously
-//       on grow (ensure_output_buffers) -- so the next extract overwrites, or
-//       frees, memory an in-flight draw is reading. Needs the ring of slots +
-//       timeline semaphore DESIGN.md's seam B specifies; DeviceMesh::generation
-//       guards only the host download() path.
+//   (1) Lifetime. SETTLED 2026-08-03: MarchingCubesConfig::slot_count gives
+//       each outstanding extract its own arena and index run, and an extract
+//       only writes, grows or frees a slot the consumer has released through
+//       release_through. slot_count = 1 keeps the old single-arena behaviour.
+//       Note this takes the ring of slots DESIGN.md's seam B specifies but
+//       *not* its timeline semaphore: a host-side release report replaces the
+//       GPU wait, because a command buffer waiting on a value the sibling has
+//       not signalled deadlocks against a swapchain rebuild, which drains the
+//       queue while holding the submit mutex.
 //   (2) Sharing. SETTLED 2026-08-03 in core, but not yet requested here:
 //       BufferDesc::queue_families now picks the mode from the families a
 //       caller names (Buffer::sharing_mode reads back what it got), so a
@@ -244,6 +248,20 @@ struct MarchingCubesConfig {
 // finding).
 class VR_MESH_API MarchingCubes {
  public:
+  /// @brief Create the extractor on @p device, building its pipeline and
+  ///        binding it to @p allocator for its input, vertex-arena, and
+  ///        counter buffers.
+  /// @param device     The compute device (must outlive this object).
+  /// @param allocator  The allocator its buffers come from (must outlive this).
+  /// @param config     Extra buffer usage a *consumer* of the mesh needs; see
+  ///                   @ref MarchingCubesConfig. Defaults to none, which is
+  ///                   what a recon-only consumer wants.
+  /// @return The extractor, or a non-OK @ref Status if @p config asks for an
+  ///         unsupported usage bit, or a pipeline, layout, or descriptor
+  ///         allocation fails.
+  static Result<MarchingCubes> create(Device& device, Allocator& allocator,
+                                      const MarchingCubesConfig& config = {});
+
   /// @brief Report that every mesh up to and including @p generation has been
   ///        read, so its slot may be written again.
   ///
@@ -262,21 +280,23 @@ class VR_MESH_API MarchingCubes {
   /// value than the newest reported is ignored rather than un-releasing
   /// anything. With a single slot this records the value and changes no
   /// behaviour -- there, a @ref DeviceMesh still dies at the next extract.
+  ///
+  /// @warning **The caller must synchronize this against the extracting
+  ///          thread.** It is not atomic, and the natural consumer is on
+  ///          another thread -- a renderer retires the frame that drew a mesh
+  ///          on its own thread while fusion extracts on a background one
+  ///          (which is exactly how `examples/viewer/fuse_viewer` is built).
+  ///          Calling it concurrently with an @ref extract or @ref
+  ///          extract_device on the same object is a data race. Serialize it
+  ///          with whatever already guards the handoff of a @ref DeviceMesh
+  ///          from the extracting thread to the consuming one; that mutex is
+  ///          held for a `std::uint64_t` store, so the contention is nil.
+  ///          Made a documented contract rather than a `std::atomic` member
+  ///          deliberately: an atomic is not movable, and this class's
+  ///          rule-of-zero defaulted moves are load-bearing (see below), so
+  ///          one would cost hand-written move operations across every member
+  ///          to remove a lock the consumer is already holding.
   void release_through(std::uint64_t generation) noexcept;
-
-  /// @brief Create the extractor on @p device, building its pipeline and
-  ///        binding it to @p allocator for its input, vertex-arena, and
-  ///        counter buffers.
-  /// @param device     The compute device (must outlive this object).
-  /// @param allocator  The allocator its buffers come from (must outlive this).
-  /// @param config     Extra buffer usage a *consumer* of the mesh needs; see
-  ///                   @ref MarchingCubesConfig. Defaults to none, which is
-  ///                   what a recon-only consumer wants.
-  /// @return The extractor, or a non-OK @ref Status if @p config asks for an
-  ///         unsupported usage bit, or a pipeline, layout, or descriptor
-  ///         allocation fails.
-  static Result<MarchingCubes> create(Device& device, Allocator& allocator,
-                                      const MarchingCubesConfig& config = {});
 
   // Rule of zero: every owned member (Buffer / ComputeKernel / pool) self-frees
   // and self-resets on move, so the defaulted moves are correct. Nothing here
@@ -468,6 +488,12 @@ class VR_MESH_API MarchingCubes {
   // it valid but unspecified, and libc++ empties it, so the extractor would
   // pass valid() and then index nothing. An array of members that each survive
   // makes the aggregate survive too.
+  //
+  // All kMaxSlots are constructed regardless of slot_count_, which costs a
+  // little over a kilobyte of null Buffer handles on an extractor using one --
+  // against arenas measured in hundreds of megabytes. The buffers themselves
+  // are filled lazily by the first extract that reaches each slot, so an unused
+  // slot allocates no device memory at all.
   static constexpr std::size_t kMaxSlots = 8;
   Slot slots_[kMaxSlots];
   // Live entries in slots_. Never zero on a created extractor, and unchanged by
@@ -543,6 +569,13 @@ class VR_MESH_API MarchingCubes {
   // would exceed the device's maxStorageBufferRange -- checked against the
   // request itself, before any growth headroom, so a surface that legitimately
   // fits is never rejected because the growth policy overshot.
+  // Pick the slot the extract about to run will write, or refuse because every
+  // slot is still outstanding. Called once at the top of each extract and --
+  // load-bearing -- *before* generation_ is bumped, so a refusal leaves every
+  // outstanding DeviceMesh exactly as valid as it was: this is the path that
+  // exists to protect a consumer's live mesh, so it must not retire it.
+  Status claim_output_slot();
+
   Status ensure_output_buffers(std::uint32_t capacity);
 };
 
