@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <string>
@@ -230,26 +229,44 @@ std::uint32_t MarchingCubes::plan_capacity(std::uint32_t num_active,
       tris_per_block_ != 0 ? tris_per_block_ : kSeedTrisPerBlock;
   const std::uint64_t estimate =
       static_cast<std::uint64_t>(num_active) * per_block;
-  // Never below what the arena already holds: the dispatch is told this
-  // number, so planning under the arena would drop triangles there was room
-  // for and force a pointless refit. Never above the worst case -- more than
-  // that cannot be emitted, so asking for it would waste memory outright.
-  const std::uint64_t held = arena_capacity();
-  return static_cast<std::uint32_t>(
-      std::min(std::max(estimate, held), worst_case));
+  // Bounded above by the worst case and by nothing else. This is a *request*,
+  // and ensure_output_buffers is the only thing that reads it: it keeps
+  // whatever the slot already holds and grows only when the request is larger,
+  // so a floor at the held capacity would change no allocation it makes.
+  //
+  // That floor is gone rather than repositioned, and its absence is the fix.
+  // Floored at arena_capacity() this number depends on *which slot is
+  // current*, so with a ring it read the slot just written while a different
+  // one was about to be grown -- every extract then asked for 1.5x the last,
+  // geometrically, with the measured density never getting a say (an iPad Pro
+  // reached a 1.1 GB arena for 36904 triangles, 0.59% full, in a few hundred
+  // remeshes). A purely positional invariant inside a 340-line function is one
+  // reordering away from coming back; with the floor deleted the plan reads no
+  // slot at all and cannot compound in any call order.
+  return static_cast<std::uint32_t>(std::min(estimate, worst_case));
 }
 
 Status MarchingCubes::claim_output_slot() {
-  // Called once at the top of each extract, before anything is touched and --
-  // load-bearing -- before generation_ is bumped.
+  // Called once at the top of each extract, before anything is touched, with
+  // `++generation_` as the very next statement. Both halves of that are
+  // load-bearing and they pull in opposite directions, which is why they are
+  // adjacent rather than merely ordered.
   //
-  // Refusing here must cost the caller nothing: this is the path that protects
-  // slots a consumer is still reading, so a refused extract has written no
-  // buffer, freed no allocation, and must leave every outstanding DeviceMesh
-  // exactly as valid as it was. Bumping the generation first would break that
-  // last part on its own -- download()'s currency check would then refuse a
+  // Before the bump: refusing here must cost the caller nothing. This is the
+  // path that protects slots a consumer is still reading, so a refused extract
+  // has written no buffer, freed no allocation, and must leave every
+  // outstanding DeviceMesh exactly as valid as it was. Bumping first would
+  // break that on its own -- download()'s currency check would then refuse a
   // mesh whose slot this call deliberately did not touch, so the refusal meant
   // to protect the consumer's live mesh would instead retire it.
+  //
+  // Immediately before it: this advances slot_, and download() reads the
+  // current slot on the strength of a *generation* comparison. Anything
+  // fallible in between leaves a window where slot_ has moved and generation_
+  // has not, so an outstanding DeviceMesh passes the currency check and is
+  // copied out of a slot that may never have been sized -- a memcpy from
+  // Buffer::mapped() == nullptr, or from an older, smaller arena once the ring
+  // has turned.
   //
   // Once per extract, not once per call, is structural now rather than
   // conditional: ensure_output_buffers runs twice when a call refits against
@@ -262,21 +279,50 @@ Status MarchingCubes::claim_output_slot() {
     // it.
     return {};
   }
-  // Round-robin, so the next slot is always the oldest; only it can be the one
-  // still outstanding. Everything downstream is free to overwrite it, and a
-  // grow will *free* it outright, so it must have been released first.
-  const std::size_t next = (slot_ + 1) % slot_count_;
-  if (slots_[next].generation > released_through_) {
-    return Status::invalid_argument(
-        "MarchingCubes::extract: every output slot is still outstanding "
-        "(oldest is generation " +
-        std::to_string(slots_[next].generation) + ", released through " +
-        std::to_string(released_through_) +
-        "); call release_through as meshes are finished with, or configure "
-        "more slots than the consumer keeps in flight");
+  // Round-robin from the slot after the current one, so growth spreads evenly
+  // over the ring and the oldest slot is tried first. It *scans* rather than
+  // taking that one on faith: "the next slot is always the oldest" holds only
+  // while every claim goes on to publish a mesh, and two paths do not -- an
+  // extract that fails after claiming, and the host overloads, which give their
+  // slot straight back once the copy is taken (free_slot_of). Both leave a free
+  // slot behind the cursor, and assuming would refuse with one in hand.
+  //
+  // Everything downstream is free to overwrite the slot this picks, and a grow
+  // will *free* it outright, so it must have been released first.
+  std::uint64_t oldest = 0;
+  for (std::size_t i = 1; i <= slot_count_; ++i) {
+    const std::size_t candidate = (slot_ + i) % slot_count_;
+    if (slots_[candidate].generation <= released_through_) {
+      slot_ = candidate;
+      return {};
+    }
+    if (oldest == 0 || slots_[candidate].generation < oldest) {
+      oldest = slots_[candidate].generation;
+    }
   }
-  slot_ = next;
-  return {};
+  return Status::invalid_argument(
+      "MarchingCubes::extract: every output slot is still outstanding "
+      "(oldest is generation " +
+      std::to_string(oldest) + ", released through " +
+      std::to_string(released_through_) +
+      "); call release_through as meshes are finished with, or configure "
+      "more slots than the consumer keeps in flight");
+}
+
+void MarchingCubes::free_slot_of(std::uint64_t generation) noexcept {
+  // Give one slot back without moving released_through_. That distinction is
+  // the whole reason this exists beside release_through: the high-water mark is
+  // the *consumer's* statement about what it has finished reading, so using it
+  // to retire a slot this class allocated for itself would also mark every
+  // older slot released -- including one holding a DeviceMesh an extract_device
+  // caller is still drawing out of, on the same extractor.
+  //
+  // Generations are pre-incremented from 0, so 0 is "never written" and matches
+  // every untouched slot; refuse it rather than freeing the whole ring.
+  if (generation == 0) return;
+  for (Slot& slot : slots_) {
+    if (slot.generation == generation) slot.generation = 0;
+  }
 }
 
 void MarchingCubes::release_through(std::uint64_t generation) noexcept {
@@ -343,13 +389,15 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
         std::to_string(capacity) +
         " triangles exceeds the device maxStorageBufferRange");
   }
-  // Stamp the slot claim_output_slot() picked with the generation now being
-  // written, so the *next* claim can tell "still being read" from "free to
-  // reuse". Idempotent: a call that guessed its capacity low comes back here to
-  // refit and re-stamps the same value, because the slot was claimed once at
-  // the top of the extract rather than here.
-  slots_[slot_].generation = generation_;
-
+  // No slot stamp here, deliberately. Marking the slot outstanding is the
+  // publishing return's job (it sits beside `device_mesh.generation`), because
+  // the stamp says "a consumer holds a mesh in this slot" and only a path that
+  // hands one out can make that true. Stamping here instead made every failure
+  // exit below -- and the dispatch, the refit, and the out_of_memory return
+  // above the caller -- leave a slot marked with a generation no DeviceMesh
+  // ever carried, which nothing could then release: slot_count such failures
+  // and the extractor refuses forever, quoting generations it never handed out.
+  //
   // The command is the only per-call reset: 20 bytes, against an arena whose
   // stale tail is never read (indexCount bounds the readback). It happens ABOVE
   // the reuse early-return below, and must stay there: a refit that reallocated
@@ -587,14 +635,29 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   // bounded by the caller, and one dispatch with no measurement step is the
   // simpler thing to keep correct.
   // TODO(mesh): fit this path to the surface too, as the sparse extract does.
-  // The two share one retained arena, so a large dense call grows it to the
-  // dense worst case and every later sparse extract plans from there -- which
-  // forfeits the fitted arena for a process that uses both entry points.
+  // The two overloads share the same ring, so a large dense call grows whatever
+  // slot it lands on to the dense worst case, and that slot keeps it for the
+  // extractor's lifetime -- which forfeits the fitted arena, for one slot per
+  // dense call, in a process that uses both entry points.
   if (capacity64 > 0xFFFFFFFFull || cells > 0xFFFFFFFFull) {
     return Status::invalid_argument(
         "MarchingCubes::extract: grid too large for this slice");
   }
   const auto capacity = static_cast<std::uint32_t>(capacity64);
+
+  // Claim the slot and bump the generation before this call does anything else.
+  // Both placements are load-bearing and both are argued at claim_output_slot:
+  // a refusal has to cost the caller nothing, and the bump has to be the very
+  // next statement so no fallible work sits between slot_ moving and
+  // generation_ moving. Everything below is work a refused extract would only
+  // throw away.
+  //
+  // The bump is what invalidates every outstanding DeviceMesh, and it happens
+  // here rather than on success because this call is about to overwrite -- and,
+  // on a grow, reallocate -- the claimed slot's arena whether or not it
+  // succeeds.
+  VR_TRY(claim_output_slot());
+  ++generation_;
 
   // Per-extract buffers (sized to this grid): the samples in, the vertex arena
   // out (3 vertices per triangle at worst-case capacity), and the atomic
@@ -632,13 +695,6 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
   }
 
-  // This call is about to overwrite -- and, on a grow, reallocate -- the shared
-  // arena, so every outstanding DeviceMesh is stale from here on, whether or
-  // not the call succeeds. Bump before the first thing that touches it.
-  // Claim first, bump second. A refused claim has touched nothing, so it must
-  // leave outstanding DeviceMeshes valid -- see claim_output_slot.
-  VR_TRY(claim_output_slot());
-  ++generation_;
   VR_TRY(ensure_output_buffers(capacity));
 
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
@@ -653,14 +709,18 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                   max_workgroup_count_x_));
 
   Mesh mesh = collect_mesh(arena(), indirect(), capacity);
-  // This overload's whole product is the host copy above, so the slot it
-  // claimed is finished with the moment the copy is taken. Releasing it here is
-  // what keeps a host-only caller off the ring contract entirely: it never sees
-  // a generation (the return type carries none), so it could not call
-  // release_through even if it knew to -- and without this the ring starves
-  // after slot_count calls and then refuses every extract, quoting generations
-  // the caller was never given.
-  release_through(generation_);
+  // Nothing to give back, and that is a property rather than an omission: this
+  // overload's whole product is the host copy above, so it hands out no
+  // DeviceMesh and never stamps its slot -- which leaves the slot exactly as
+  // claimable as claim_output_slot found it, on this path and on every failure
+  // exit above.
+  //
+  // It used to call release_through(generation_) here, which kept a host-only
+  // caller off the ring contract but did it with the *consumer's* high-water
+  // mark: that also marked every older slot released, including one holding a
+  // DeviceMesh an extract_device caller on this same extractor was still
+  // drawing out of. See free_slot_of, which is the sparse overload's answer to
+  // the same problem.
   return mesh;
 }
 
@@ -675,16 +735,35 @@ Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
   Result<Mesh> mesh = download(device_mesh);
   if (timings != nullptr) timings->readback_ms += download_clock.lap();
   // This overload's whole product is the host copy, so the slot extract_device
-  // claimed is finished with as soon as download() has run -- and released
-  // whether it succeeded or not, since a failure that stranded the slot would
-  // starve the ring just as surely. A host-only caller never sees a generation
-  // (the return type carries none), so it cannot honour the release contract
-  // itself; this is what keeps it off that contract entirely.
-  release_through(device_mesh.generation);
+  // claimed and stamped is finished with as soon as download() has run -- and
+  // given back whether it succeeded or not, since a failure that stranded the
+  // slot would starve the ring just as surely. A host-only caller never sees a
+  // generation (the return type carries none), so it cannot honour the release
+  // contract itself; this is what keeps it off that contract entirely.
+  //
+  // free_slot_of, not release_through: this slot is the only one to give back.
+  // The high-water mark is the consumer's statement about what *it* has
+  // finished reading, so using it here would also retire every older slot --
+  // including one holding a DeviceMesh an extract_device caller on this same
+  // extractor is still drawing out of, whose arena the next grow would then
+  // vmaDestroyBuffer under a live draw.
+  free_slot_of(device_mesh.generation);
   return mesh;
 }
 
 Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
+  // Moved-from, like both extract entry points -- and this one needs it most.
+  // The defaulted moves reset every *owned* member (Buffer and the pipeline
+  // wrappers each self-empty), but generation_ and slot_ are plain scalars a
+  // defaulted move copies rather than zeroes, and a DeviceMesh holds raw
+  // VkBuffer values copied out at extract time, so valid() is still true on it.
+  // The currency check below would therefore pass on a moved-from extractor and
+  // the memcpy would run on a null Buffer::mapped(). Guarding here rather than
+  // hand-writing the moves keeps the rule-of-zero note above intact -- the
+  // scalars are unobservable once every entry point gates on valid().
+  if (!valid()) {
+    return Status::invalid_argument("MarchingCubes::download: moved-from");
+  }
   // An empty mesh copies to an empty Mesh without touching the buffers, which
   // a grid with no active blocks never even allocated.
   if (device_mesh.empty()) {
@@ -696,13 +775,16 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   // live one and a handle comparison would accept it, handing back the newer
   // extract's geometry under this view's stale counts. With a ring it is the
   // other way round -- a superseded view names a *different* buffer -- and the
-  // generation check is what makes the unqualified arena() below correct:
-  // claim_output_slot stamps the claimed slot with generation_ and nothing
-  // moves slot_ afterwards, so "this mesh is the current generation" and "this
-  // mesh lives in the current slot" are the same statement. A DeviceMesh does
-  // not carry its slot, so that invariant is the only thing tying the copy
-  // below to the right buffer. Widening this to accept an older generation
-  // therefore means indexing slots_ by it, not just relaxing the comparison.
+  // generation check is what makes the unqualified arena() below correct: an
+  // extract advances slot_ and generation_ in the same breath and nothing moves
+  // slot_ again until the next claim, so "this mesh is the current generation"
+  // and "this mesh lives in the current slot" are the same statement. That is
+  // why those two lines are adjacent: anything fallible between them opens a
+  // window where they disagree and this memcpy reads the wrong slot -- one that
+  // may never have been sized, so mapped() is null. A DeviceMesh does not carry
+  // its slot, so that invariant is the only thing tying the copy below to the
+  // right buffer. Widening this to accept an older generation therefore means
+  // indexing slots_ by it, not just relaxing the comparison.
   if (device_mesh.generation != generation_ || !device_mesh.valid()) {
     return Status::invalid_argument(
         "MarchingCubes::download: the DeviceMesh is not this extractor's "
@@ -758,6 +840,28 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     }
   }
 
+  // Claim the slot and bump the generation before this call does anything else
+  // -- which now means before the active-set compact below, not after it. Both
+  // placements are argued at claim_output_slot: a refusal must cost the caller
+  // nothing, and the bump must be the very next statement so no fallible work
+  // sits between slot_ moving and generation_ moving.
+  //
+  // "Costs nothing" is meant literally, and the compact is why it has to be
+  // here: it is a dispatch, a blocking fence wait and a full active-set
+  // readback -- hundreds of KB at room0 scale -- and a live consumer that is
+  // one frame behind refuses on *every* frame. Claiming above it makes the
+  // refusal a comparison of slot generations and nothing else, and skips the
+  // neighbour LUT and the two input uploads below for free.
+  //
+  // The bump is what invalidates every outstanding DeviceMesh, and it happens
+  // here rather than on success because this call is about to overwrite -- and,
+  // on a grow, reallocate -- the claimed slot's arena whether or not it
+  // succeeds. Moving it above the compact widens that to a compact failure,
+  // which is the conservative direction: it retires meshes a fraction earlier,
+  // never later.
+  VR_TRY(claim_output_slot());
+  ++generation_;
+
   // The active set drives the dispatch (one thread per voxel of each block) and
   // supplies the neighbour lookup. An empty map means nothing to mesh.
   PhaseClock phase_clock(timings != nullptr);
@@ -765,8 +869,9 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
             grid.map().compact_active_blocks());
   if (timings != nullptr) timings->compact_ms = phase_clock.lap();
   if (active.empty()) {
-    // Nothing to mesh -- but this path claims and stamps a slot exactly like a
-    // real extract, so "every generation lives in exactly one slot" is total.
+    // Nothing to mesh -- but this path stamps the slot it claimed above exactly
+    // like a real extract, so "every generation handed out lives in exactly one
+    // slot" is total.
     //
     // It used to advance generation_ without claiming, on the reasoning that an
     // empty mesh owns no bytes and so needs no slot to protect. That is true of
@@ -778,9 +883,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // because an empty extract is precisely when it keeps showing the previous
     // one. The next grow would then vmaDestroyBuffer an arena under a live
     // draw.
-    VR_TRY(claim_output_slot());
-    ++generation_;
-    slots_[slot_].generation = generation_;
+    //
     // The command must be reset even though no dispatch will touch it: a
     // consumer drawing indirectly reads it and never consults triangle_count --
     // that is the entire point of publishing one -- so inheriting the previous
@@ -788,6 +891,10 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // whichever arena this slot happens to hold. Zeroed, it draws nothing,
     // which is what an empty mesh means.
     VR_TRY(ensure_indirect_command());
+    // Stamped here and not a line earlier: this is the last fallible statement,
+    // so from here the DeviceMesh below is certain to be handed out. A stamp
+    // above a return that never publishes is a slot nothing can release.
+    slots_[slot_].generation = generation_;
     // The arena and index run are named as they are found: this slot may never
     // have been sized (nothing to size it for), in which case they are null
     // handles and valid() is false beside empty() being true. A consumer gates
@@ -848,24 +955,10 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // guaranteed to fit. That makes this a one-dispatch steady state that pays a
   // second dispatch only when the plan undershoots the surface, rather than
   // the unconditional two-dispatch count-then-fill this replaces.
-  // Claim the slot BEFORE planning, because the plan reads the arena it is
-  // about to grow.
   //
-  // plan_capacity floors its estimate at what the arena already holds, so it
-  // never asks for less room than has already been paid for. That is right for
-  // one reused arena and a ratchet across a ring: planning against the slot
-  // just written, then growing a *different* one to fit, makes every extract
-  // allocate 1.5x the last -- geometrically, forever, with the measured
-  // triangle density never getting a say. An iPad Pro reached a 1.1 GB arena
-  // for 36904 triangles (0.59% full) in a few hundred remeshes, and three ring
-  // slots of that is a device-lost.
-  //
-  // Claiming first costs nothing and fixes it at the root: arena_capacity()
-  // then describes the slot this call will actually write. A refused claim
-  // still touches nothing, and now also skips the neighbour LUT and the input
-  // upload below rather than doing them and throwing them away.
-  VR_TRY(claim_output_slot());
-
+  // The plan reads no slot -- only this call's active set and the density the
+  // last one measured -- so it is free to sit anywhere and cannot compound
+  // across the ring. That is deliberate; see plan_capacity.
   const std::uint32_t capacity = plan_capacity(num_active, worst_case);
 
   // Neighbour lookup: map each active block coordinate to its voxel-array base,
@@ -912,13 +1005,6 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
               neighbour_lut.size() * sizeof(std::int32_t));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
-  // This call is about to overwrite -- and, on a grow, reallocate -- the arena,
-  // so every outstanding DeviceMesh is stale from here on, whether or not the
-  // call succeeds. Bump before the first thing that touches it, not on the
-  // success path: a failure between here and the return would otherwise leave
-  // a superseded DeviceMesh passing download()'s currency check and reading
-  // this call's geometry under its own stale counts.
-  ++generation_;
   VR_TRY(ensure_output_buffers(capacity));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
@@ -1041,6 +1127,13 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // failure returns above -- which is where clamp_indirect_to_arena() is
   // called.
 
+  // Everything fallible is behind us, so the mesh below is certain to be handed
+  // out -- which is exactly when the slot may be marked outstanding. Stamping
+  // any earlier (it used to happen inside ensure_output_buffers) leaves a slot
+  // carrying a generation no DeviceMesh ever named whenever a call fails after
+  // it, and nothing can release a generation the caller was never given.
+  slots_[slot_].generation = generation_;
+
   DeviceMesh device_mesh;
   device_mesh.vertices = arena().handle();
   device_mesh.indices = index_run().handle();
@@ -1057,10 +1150,15 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     timings->active_blocks = num_active;
     timings->triangle_capacity = requested;
     timings->emitted_triangles = emitted;
-    // What the extractor is holding, not what this call asked for: the arena is
-    // retained and grown, so a steady-state call allocates nothing and still
-    // reports it.
-    timings->arena_bytes = arena().size();
+    // What the extractor is holding, not what this call asked for: the arenas
+    // are retained and grown, so a steady-state call allocates nothing and
+    // still reports them.
+    //
+    // Summed over the whole ring, not just the slot this call wrote. Every slot
+    // holds its own arena, grown geometrically and never shrunk, so reporting
+    // one of N would under-report resident memory N-fold -- and this field is
+    // the instrument the ring's own runaway growth was diagnosed with.
+    timings->arena_bytes = resident_arena_bytes();
   }
   return device_mesh;
 }
