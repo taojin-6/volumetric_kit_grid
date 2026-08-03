@@ -304,16 +304,18 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // allocation cannot leave a sized arena beside a null index run -- which
   // arena_capacity() would then report as ready and the next extract would hand
   // out as a DeviceMesh naming no index buffer.
-  // VERTEX_BUFFER as well as STORAGE_BUFFER: the kernel writes these as an
-  // SSBO, and since the 2026-08-02 layout decision the bytes it writes are
-  // already in the shape gfx's vertex-input description reads. Carrying the
-  // usage bit is what lets the renderer bind this arena directly rather than
-  // being handed a host copy of it.
+  // Whatever the consumer asked for, on top of STORAGE_BUFFER. A renderer
+  // sharing the device asks for VERTEX_BUFFER here: the kernel writes these as
+  // an SSBO, and since the 2026-08-02 layout decision the bytes it writes are
+  // already in the shape a vertex-input description reads -- so the usage bit
+  // is the whole of what stands between it and binding this arena in place
+  // rather than being handed a host copy of it. Applied on every grow, so a
+  // regrown arena stays bindable.
   VR_ASSIGN(
       Buffer arena,
       storage_buffer(*allocator_,
                      static_cast<VkDeviceSize>(arena_bytes_for(grown_capacity)),
-                     HostAccess::Random, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
+                     HostAccess::Random, config_.extra_vertex_usage));
 
   // The index run covers the whole arena and never changes shape, so it is
   // written once here rather than rebuilt per extract. iota straight into the
@@ -325,7 +327,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
             storage_buffer(
                 *allocator_,
                 static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
-                HostAccess::SequentialWrite, VK_BUFFER_USAGE_INDEX_BUFFER_BIT));
+                HostAccess::SequentialWrite, config_.extra_index_usage));
   auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
   std::iota(indices, indices + index_count, std::uint32_t{0});
 
@@ -335,7 +337,8 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
 }
 
 Result<MarchingCubes> MarchingCubes::create(Device& device,
-                                            Allocator& allocator) {
+                                            Allocator& allocator,
+                                            const MarchingCubesConfig& config) {
   const VkDevice dev = device.handle();
 
   MarchingCubes mc;
@@ -350,6 +353,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   mc.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   mc.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
+  mc.config_ = config;
 
   // Two kernels share one pool. The dense kernel binds five storage buffers:
   // tables (persistent) + the per-extract samples / colors / vertices /

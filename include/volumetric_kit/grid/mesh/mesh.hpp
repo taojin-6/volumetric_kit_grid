@@ -59,10 +59,12 @@ struct Vertex {
 // description reads position/normal/uv0/color at exactly these offsets with
 // this stride, so a mesh the kernel wrote crosses the seam unconverted.
 // Changing one without the other silently misreads every vertex.
-// The buffers are bindable as well as byte-compatible: marching_cubes.cpp now
-// creates the vertex arena with VERTEX_BUFFER usage and the index run with
-// INDEX_BUFFER, so a renderer sharing the device can draw them in place rather
-// than being handed a host copy of bytes that never left it.
+// The buffers can be made bindable as well as byte-compatible: a consumer
+// passes the usage it needs through MarchingCubesConfig, and the arena and
+// index run carry it, so a renderer sharing the device can draw them in place
+// rather than being handed a host copy of bytes that never left it. This tier
+// does not name the renderer's flags -- the consumer publishes them and the
+// application passes them in, as the create/adopt device seam works.
 // TODO(mesh): they remain *host-visible*, which is right on a unified-memory
 // GPU (Apple silicon reports a host-visible DEVICE_LOCAL heap, so there is
 // nothing to stage) but not on a discrete one, where drawing vertices across

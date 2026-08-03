@@ -123,6 +123,39 @@ struct ExtractTimings {
   }
 };
 
+/// @brief Extra buffer usage the mesh's *consumer* requires.
+///
+/// The kernel itself needs only `STORAGE_BUFFER`. A consumer that wants to read
+/// the arena in place rather than be handed a host copy — a renderer binding it
+/// as vertex + index buffers is the motivating case — needs its own usage bits
+/// on the same allocation, and only it knows which.
+///
+/// So this tier does not name them. The **consumer publishes** what it requires
+/// and the application passes it in, exactly as the create/adopt device seam
+/// works: each library states its needs, neither is compiled against the other,
+/// and the app satisfies the union. Hardcoding a sibling's flags here would be
+/// this tier guessing at an API it cannot see.
+///
+/// @code
+/// // The app, which knows both:
+/// const auto want = vg::pipelines::HybridMeshPipeline::mesh_requirements();
+/// mesh::MarchingCubesConfig config;
+/// config.extra_vertex_usage = want.vertex_usage;
+/// config.extra_index_usage = want.index_usage;
+/// @endcode
+///
+/// @note Usage bits are declarative — they permit a binding and cost nothing to
+///       carry — so asking for more than you use is harmless. Memory
+///       *residency* is a different question and not one of these: the buffers
+///       are host-visible, which is free on a unified-memory GPU and a PCIe
+///       round trip on a discrete one (see the `TODO(mesh)` in mesh.hpp).
+struct MarchingCubesConfig {
+  /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER`.
+  VkBufferUsageFlags extra_vertex_usage = 0;
+  /// Added to the index run's usage, beyond `STORAGE_BUFFER`.
+  VkBufferUsageFlags extra_index_usage = 0;
+};
+
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
 ///        into a host @ref Mesh -- from a dense @ref DenseGrid or straight off
 ///        a sparse @ref volume::VoxelBlockGrid.
@@ -173,7 +206,14 @@ class VR_MESH_API MarchingCubes {
   /// @param allocator  The allocator its buffers come from (must outlive this).
   /// @return The extractor, or a non-OK @ref Status if a pipeline, layout, or
   ///         descriptor allocation fails.
-  static Result<MarchingCubes> create(Device& device, Allocator& allocator);
+  /// @brief Create the extractor.
+  /// @param device     The compute device (must outlive this object).
+  /// @param allocator  The allocator its buffers come from (must outlive this).
+  /// @param config     Extra buffer usage a *consumer* of the mesh needs; see
+  ///                   @ref MarchingCubesConfig. Defaults to none, which is
+  ///                   what a recon-only consumer wants.
+  static Result<MarchingCubes> create(Device& device, Allocator& allocator,
+                                      const MarchingCubesConfig& config = {});
 
   // Rule of zero: every owned member (Buffer / ComputeKernel / pool) self-frees
   // and self-resets on move, so the defaulted moves are correct. Nothing here
@@ -310,6 +350,9 @@ class VR_MESH_API MarchingCubes {
   // a vertex arena that would exceed it is rejected with a clean Status
   // instead of an opaque allocation failure.
   std::uint32_t max_storage_buffer_range_ = 0;
+  // What a consumer asked for at create; applied on every arena grow, so a
+  // regrown buffer stays bindable by whoever is already holding views of it.
+  MarchingCubesConfig config_{};
 
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0
   // of both kernels for every extract (the counterpart to the volume tier's
