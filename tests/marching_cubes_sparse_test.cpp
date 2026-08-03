@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -389,10 +390,16 @@ int main() {
   CHECK(!colored.empty());
   CHECK(colored.triangle_count() == dense_mesh.triangle_count());
   for (const mesh::Vertex& v : colored.vertices) {
+    // Compared in ENCODED space: `Vertex::color` is linear working values while
+    // the gradient was written as canonical-encoded 8-bit, and inverting the
+    // vertex keeps the u8-floor tolerance meaningful (one code is a flat 1/255
+    // encoded, but ~0.0089 in linear near white). See the dense test for the
+    // full note.
     const vr::Vec3f expected = grad_color(v.position);
-    CHECK(std::fabs(v.color.x - expected.x) < 0.005f);  // ~2.5x the u8 floor
-    CHECK(std::fabs(v.color.y - expected.y) < 0.005f);
-    CHECK(std::fabs(v.color.z - expected.z) < 0.005f);
+    const vr::Vec3f encoded = vr::linear_to_srgb(vr::Vec3f(v.color));
+    CHECK(std::fabs(encoded.x - expected.x) < 0.005f);  // ~2.5x the u8 floor
+    CHECK(std::fabs(encoded.y - expected.y) < 0.005f);
+    CHECK(std::fabs(encoded.z - expected.z) < 0.005f);
     CHECK(v.color.w == 1.0f);
     CHECK(v.uv0.x < 0.0f && v.uv0.y < 0.0f);  // still the sentinel
   }

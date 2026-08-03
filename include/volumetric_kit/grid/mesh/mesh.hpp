@@ -51,8 +51,17 @@ struct Vertex {
                    ///< converter used to synthesize. See the layout note above.
   Vec2f uv0;       ///< Atlas texture coordinate, or the `(-1, -1)` sentinel
                    ///< meaning "no atlas; use @ref color".
-  Vec4f color;     ///< Per-vertex RGBA, opaque (alpha 1) -- the vertex-color
-                   ///< fallback used where @ref uv0 is the sentinel.
+  Vec4f color;     ///< Per-vertex RGBA in **linear** working values (linear
+                   ///< BT.709/D65), opaque (alpha 1) -- the vertex-color
+                   ///< fallback used where @ref uv0 is the sentinel. Linear
+                   ///< because a float color is linear (`core/color_space.hpp`)
+                   ///< and because that is what glTF specifies for `COLOR_0`
+                   ///< and what the renderer's shading multiply needs, so the
+                   ///< seam converts nothing. Marching cubes decodes the
+                   ///< canonical-encoded voxel attribute at the corner gather,
+                   ///< since interpolating along the cell edge is an average.
+                   ///< An 8-bit *export* must re-encode (PLY does; glTF does
+                   ///< not).
 };
 // Byte-for-byte `volumetric_kit::gfx::assets::Vertex`. These offsets are the
 // interop-seam contract, not an internal detail: the renderer's vertex-input

@@ -24,6 +24,9 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 
+// Cross-tier: the one transfer curve, from core.
+#include "volumetric_kit/recon/core/shaders/color_common.glsl"
+
 layout(local_size_x = 256) in;
 
 // One active block: its block coordinate + the base index of its voxel run in
@@ -136,8 +139,12 @@ void main() {
       // camera, or a depth-only warmup) falls back to opaque white rather than
       // dragging the interpolated vertex toward black, mirroring the
       // integrator's first-observation-assigns anti-darkening rule.
+      // Decoded to LINEAR working values here, because mcEmitCell interpolates
+      // them along the cell edge and an interpolation is an average (the
+      // 2026-08-02 decision). The white fallback is 1.0 in either space, so the
+      // sentinel branch is unchanged by that.
       uint packed = color_attr[si];
-      corner_color[i] = packed != 0u ? unpackUnorm4x8(packed).rgb : vec3(1.0);
+      corner_color[i] = packed != 0u ? vrUnpackSrgbToLinear(packed) : vec3(1.0);
     }
     if (sdf[i] < pc.iso) {
       cube_index |= (1 << i);
