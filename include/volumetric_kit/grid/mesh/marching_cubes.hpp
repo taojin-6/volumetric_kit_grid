@@ -173,6 +173,32 @@ struct MarchingCubesConfig {
   VkBufferUsageFlags extra_vertex_usage = 0;
   /// Added to the index run's usage, beyond `STORAGE_BUFFER`.
   VkBufferUsageFlags extra_index_usage = 0;
+
+  /// @brief How many extracts may be outstanding at once.
+  ///
+  /// One (the default) is the behaviour this always had: a single grow-only
+  /// arena reused in place, so a @ref DeviceMesh is valid only until the next
+  /// extract and @ref DeviceMesh::generation is what enforces it.
+  ///
+  /// That is unusable for a renderer drawing the arena directly. The next
+  /// extract overwrites the memory an in-flight draw is reading, and a grow
+  /// *frees* it -- `vmaDestroyBuffer` runs immediately, with no fence wait,
+  /// because this tier's own work is fence-blocked inside `submit_single_time`
+  /// and never needed one.
+  ///
+  /// More than one gives each extract its own arena and index run, and turns
+  /// on the release contract: the consumer calls
+  /// @ref MarchingCubes::release_through as its frames complete, and an
+  /// extract only ever writes -- or grows, or frees -- a slot that has been
+  /// released. That is what makes the immediate destroy safe again, and it is
+  /// why this needs no fence queue inside the library and no semaphore across
+  /// the seam. A cross-library GPU wait is the one thing the shared-queue
+  /// design forbids outright.
+  ///
+  /// Size it to the consumer's frames in flight plus one. Extracting with
+  /// every slot outstanding is a contract violation, reported rather than
+  /// silently overwriting a live draw.
+  std::uint32_t slot_count = 1;
 };
 
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
@@ -218,6 +244,26 @@ struct MarchingCubesConfig {
 // finding).
 class VR_MESH_API MarchingCubes {
  public:
+  /// @brief Report that every mesh up to and including @p generation has been
+  ///        read, so its slot may be written again.
+  ///
+  /// The consumer half of @ref MarchingCubesConfig::slot_count. Call it as the
+  /// work reading a @ref DeviceMesh completes -- for a renderer, when the frame
+  /// that drew it retires.
+  ///
+  /// Host-side by design. The alternative, a semaphore the extract waits on, is
+  /// the one thing the shared-queue arrangement forbids: a command buffer
+  /// waiting on a value the sibling library has not signalled deadlocks against
+  /// a swapchain rebuild, which drains the queue while holding the submit
+  /// mutex. Reporting completion after the fact costs nothing and cannot
+  /// deadlock.
+  ///
+  /// Monotonic: a generation already released stays released, and an older
+  /// value than the newest reported is ignored rather than un-releasing
+  /// anything. With a single slot this records the value and changes no
+  /// behaviour -- there, a @ref DeviceMesh still dies at the next extract.
+  void release_through(std::uint64_t generation) noexcept;
+
   /// @brief Create the extractor on @p device, building its pipeline and
   ///        binding it to @p allocator for its input, vertex-arena, and
   ///        counter buffers.
@@ -235,7 +281,7 @@ class VR_MESH_API MarchingCubes {
   // Rule of zero: every owned member (Buffer / ComputeKernel / pool) self-frees
   // and self-resets on move, so the defaulted moves are correct. Nothing here
   // caches a *copy* of an owned member's state -- the arena's capacity is
-  // derived from vertex_arena_ (see arena_capacity) rather than tracked
+  // derived from arena() (see arena_capacity) rather than tracked
   // alongside it, so a defaulted move cannot leave the two disagreeing.
   // device_ / allocator_ are borrowed pointers, so a defaulted move leaving the
   // moved-from extractor pointing at them is harmless -- it reports valid() ==
@@ -397,15 +443,53 @@ class VR_MESH_API MarchingCubes {
   // stays resident close to the mesh's real size. Only the counter is reset
   // per call (4 bytes); the arena's stale contents past the emitted range are
   // never read, since the counter bounds the readback.
-  Buffer vertex_arena_;
+  //
+  // One slot is the single reused arena described above. Several make a ring,
+  // so a consumer can still be drawing generation N while N+1 is extracted --
+  // see MarchingCubesConfig::slot_count.
+  struct Slot {
+    Buffer arena;
+    // The identity index run 0,1,2,... covering @ref arena. The kernels emit
+    // independent triangles, so this never varies in content -- it is filled
+    // once per grow and then reused, which is why it can live beside the arena
+    // instead of being rebuilt per call. It exists because the consuming
+    // passes (projective texturing, and the renderer at the interop seam)
+    // address vertices through an index buffer.
+    Buffer index_run;
+    // The extract that last wrote this slot; 0 until one has. Compared against
+    // released_through_ to tell "still being read" from "free to reuse".
+    std::uint64_t generation = 0;
+  };
+  // A fixed array, not a vector, and that is load-bearing rather than a
+  // micro-optimisation. This class promises that a *self*-move leaves it
+  // intact -- `mc = std::move(mc)` is exercised directly -- and every other
+  // member keeps that promise, because Buffer and the pipeline wrappers all
+  // survive self-assignment. std::vector does not: self-move-assignment leaves
+  // it valid but unspecified, and libc++ empties it, so the extractor would
+  // pass valid() and then index nothing. An array of members that each survive
+  // makes the aggregate survive too.
+  static constexpr std::size_t kMaxSlots = 8;
+  Slot slots_[kMaxSlots];
+  // Live entries in slots_. Never zero on a created extractor, and unchanged by
+  // a move -- which is what keeps arena_capacity() answering 0 after one rather
+  // than reading past the end.
+  std::size_t slot_count_ = 1;
+  // Which slot the most recent extract wrote, and therefore which one a
+  // DeviceMesh handed out now names. Advances before each extract touches
+  // anything; with one slot it never moves.
+  std::size_t slot_ = 0;
+  // The newest generation the consumer has finished reading, as reported by
+  // release_through. Zero means "nothing released yet", which is correct at
+  // rest: slot generations start at 0 too, and an extract has to be able to
+  // claim a slot that has never been written.
+  std::uint64_t released_through_ = 0;
+
+  Buffer& arena() noexcept { return slots_[slot_].arena; }
+  const Buffer& arena() const noexcept { return slots_[slot_].arena; }
+  Buffer& index_run() noexcept { return slots_[slot_].index_run; }
+  const Buffer& index_run() const noexcept { return slots_[slot_].index_run; }
+
   Buffer counter_;
-  // The identity index run 0,1,2,... covering @ref vertex_arena_. The kernels
-  // emit independent triangles, so this never varies in content -- it is filled
-  // once per grow and then reused, which is why it can live beside the arena
-  // instead of being rebuilt per call. It exists because the consuming passes
-  // (projective texturing, and the renderer at the interop seam) address
-  // vertices through an index buffer.
-  Buffer index_run_;
   // Numbers the extracts, so a DeviceMesh can say which one it came from.
   // Pre-incremented, so the first extract is generation 1 and a default-
   // constructed (or foreign) DeviceMesh at 0 never passes for a live one.
@@ -428,14 +512,13 @@ class VR_MESH_API MarchingCubes {
   ComputeKernel kernel_sparse_;
   DescriptorPool pool_;
 
-  // Triangle capacity @ref vertex_arena_ is currently sized for (0 when it
-  // holds no buffer, including after a move -- Buffer zeroes its size). Derived
-  // rather than stored so the capacity can never disagree with the buffer it
-  // describes; the division is exact because the arena is only ever allocated
-  // as a whole number of triangles.
+  // Triangle capacity the current slot's arena is sized for (0 when it holds no
+  // buffer). Derived rather than stored so the capacity can never disagree with
+  // the buffer it describes; the division is exact because the arena is only
+  // ever allocated as a whole number of triangles.
+  //
   std::uint32_t arena_capacity() const noexcept {
-    return static_cast<std::uint32_t>(vertex_arena_.size() /
-                                      (3 * sizeof(Vertex)));
+    return static_cast<std::uint32_t>(arena().size() / (3 * sizeof(Vertex)));
   }
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
@@ -450,8 +533,8 @@ class VR_MESH_API MarchingCubes {
                               std::uint64_t worst_case) const;
 
   // Prepare the output buffers for a dispatch emitting at most @p capacity
-  // triangles: size @ref vertex_arena_ (growing geometrically, never
-  // shrinking) and @ref index_run_, and reset @ref counter_ to zero.
+  // triangles: size @ref arena() (growing geometrically, never
+  // shrinking) and @ref index_run(), and reset @ref counter_ to zero.
   //
   // The counter reset is part of the contract, not a side effect: it runs on
   // every call, including one that reallocates nothing, because a retry after

@@ -252,6 +252,85 @@ int main() {
   CHECK(bad_index_result.status().domain() ==
         vr::Status::Code::InvalidArgument);
 
+  // --- slot_count: the output ring ------------------------------------------
+  // A count outside 1..kMaxSlots is refused at create rather than indexing off
+  // the end of the slot array on the first extract.
+  for (std::uint32_t bad_count : {0u, 9u}) {
+    mesh::MarchingCubesConfig bad_slots;
+    bad_slots.slot_count = bad_count;
+    vr::Result<mesh::MarchingCubes> bad_slots_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                    bad_slots);
+    CHECK(!bad_slots_result.ok());
+    CHECK(bad_slots_result.status().domain() ==
+          vr::Status::Code::InvalidArgument);
+  }
+
+  // Two slots, and the property the whole feature exists for: consecutive
+  // extracts land in *different* buffers, so a consumer still reading
+  // generation N is not overwritten by N+1. Comparing the VkBuffer handles is
+  // the assertion -- with one slot they are necessarily equal, which is exactly
+  // the hazard.
+  mesh::MarchingCubesConfig ringed;
+  ringed.slot_count = 2;
+  vr::Result<mesh::MarchingCubes> ring_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value(), ringed);
+  CHECK(ring_result.ok());
+  mesh::MarchingCubes ring = std::move(ring_result).value();
+
+  vr::Result<mesh::DeviceMesh> gen1 = ring.extract_device(small, 0.0f);
+  CHECK(gen1.ok());
+  CHECK(gen1.value().valid());
+
+  // Nothing released yet, so the only other slot is free and this succeeds.
+  vr::Result<mesh::DeviceMesh> gen2 = ring.extract_device(small, 0.0f);
+  CHECK(gen2.ok());
+  CHECK(gen2.value().valid());
+  CHECK(gen2.value().generation != gen1.value().generation);
+  CHECK(gen2.value().vertices != gen1.value().vertices);
+  CHECK(gen2.value().indices != gen1.value().indices);
+
+  // Now both slots are outstanding. A third extract would have to overwrite the
+  // one holding gen1, which the consumer has not finished with -- refused,
+  // rather than corrupting a live read.
+  vr::Result<mesh::DeviceMesh> gen3 = ring.extract_device(small, 0.0f);
+  CHECK(!gen3.ok());
+  CHECK(gen3.status().domain() == vr::Status::Code::InvalidArgument);
+
+  // Releasing gen1 frees its slot and the next extract proceeds. What is
+  // asserted is that it did not land on the slot still being read: gen2 is
+  // outstanding, so gen4 must not share its buffer.
+  //
+  // Deliberately not "gen4 reuses gen1's buffer". The ring comes round to the
+  // same *slot*, but a slot may grow when it gets there -- the capacity plan
+  // moves as the extractor measures triangles per block -- and a grown slot is
+  // a new allocation. Pinning the handle would have been testing the growth
+  // policy while claiming to test the ring.
+  ring.release_through(gen1.value().generation);
+  vr::Result<mesh::DeviceMesh> gen4 = ring.extract_device(small, 0.0f);
+  CHECK(gen4.ok());
+  CHECK(gen4.value().vertices != gen2.value().vertices);
+
+  // Releasing an older generation than the newest reported must not un-release
+  // anything: the slot holding gen2 is still outstanding, so this stays
+  // refused.
+  ring.release_through(0);
+  vr::Result<mesh::DeviceMesh> gen5 = ring.extract_device(small, 0.0f);
+  CHECK(!gen5.ok());
+
+  // Self-move leaves the ring intact, like every other member. This is not
+  // hypothetical: the first cut held the slots in a std::vector, whose
+  // self-move-assignment is valid-but-unspecified and empties under libc++, so
+  // the extractor passed valid() and then indexed nothing.
+  mesh::MarchingCubes* ring_alias = &ring;
+  ring = std::move(*ring_alias);
+  CHECK(ring.valid());
+  ring.release_through(gen4.value().generation);
+  vr::Result<mesh::DeviceMesh> after_self_move =
+      ring.extract_device(small, 0.0f);
+  CHECK(after_self_move.ok());
+  CHECK(after_self_move.value().valid());
+
   std::fprintf(stderr, "marching_cubes_config: OK\n");
   return 0;
 }
