@@ -252,6 +252,23 @@ int main() {
   CHECK(bad_index_result.status().domain() ==
         vr::Status::Code::InvalidArgument);
 
+  // --- The indirect draw command --------------------------------------------
+  // Present, and carrying the usage a vkCmdDrawIndexedIndirect needs beside the
+  // STORAGE_BUFFER the kernel counts through -- the same verify-don't-assume
+  // reason the vertex and index usage come back.
+  CHECK(small_mesh.value().indirect != VK_NULL_HANDLE);
+  CHECK((small_mesh.value().indirect_usage &
+         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0);
+  CHECK((small_mesh.value().indirect_usage &
+         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0);
+  //
+  // What is NOT asserted here: the command's field values. `indexCount` is
+  // pinned indirectly -- the kernel now counts in threes, so a mistake there
+  // moves every triangle count in this suite -- but `instanceCount == 1` and
+  // the three zero offsets have no observable effect until something issues a
+  // draw, and nothing in recon can. gfx's indirect-vs-direct pixel-equality
+  // test is what closes that, on the side that owns the draw.
+
   // --- slot_count: the output ring ------------------------------------------
   // A count outside 1..kMaxSlots is refused at create rather than indexing off
   // the end of the slot array on the first extract.
@@ -289,6 +306,10 @@ int main() {
   CHECK(gen2.value().generation != gen1.value().generation);
   CHECK(gen2.value().vertices != gen1.value().vertices);
   CHECK(gen2.value().indices != gen1.value().indices);
+  // The command rings with them. It is per-mesh, not per-extractor: a consumer
+  // drawing gen1 indirectly reads this buffer for the duration of its frame, so
+  // sharing one would hand gen2's count to gen1's draw.
+  CHECK(gen2.value().indirect != gen1.value().indirect);
 
   // Now both slots are outstanding. A third extract would have to overwrite the
   // one holding gen1, which the consumer has not finished with -- refused,

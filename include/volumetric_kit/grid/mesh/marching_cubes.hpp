@@ -476,6 +476,13 @@ class VR_MESH_API MarchingCubes {
     // passes (projective texturing, and the renderer at the interop seam)
     // address vertices through an index buffer.
     Buffer index_run;
+    // The `VkDrawIndexedIndirectCommand` this slot's draw is issued from, and
+    // the atomic the kernel counts into: `indexCount` is field 0, so the two
+    // are the same 20 bytes rather than a counter plus a command built from it.
+    // Per slot, not shared, because it *is* part of the mesh -- a renderer
+    // reading slot N's command while N+1 is extracted is the whole point of the
+    // ring.
+    Buffer indirect;
     // The extract that last wrote this slot; 0 until one has. Compared against
     // released_through_ to tell "still being read" from "free to reuse".
     std::uint64_t generation = 0;
@@ -514,8 +521,9 @@ class VR_MESH_API MarchingCubes {
   const Buffer& arena() const noexcept { return slots_[slot_].arena; }
   Buffer& index_run() noexcept { return slots_[slot_].index_run; }
   const Buffer& index_run() const noexcept { return slots_[slot_].index_run; }
+  Buffer& indirect() noexcept { return slots_[slot_].indirect; }
+  const Buffer& indirect() const noexcept { return slots_[slot_].indirect; }
 
-  Buffer counter_;
   // Numbers the extracts, so a DeviceMesh can say which one it came from.
   // Pre-incremented, so the first extract is generation 1 and a default-
   // constructed (or foreign) DeviceMesh at 0 never passes for a live one.

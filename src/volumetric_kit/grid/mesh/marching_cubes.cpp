@@ -146,8 +146,11 @@ std::uint64_t arena_bytes_for(std::uint32_t capacity) {
 Mesh collect_mesh(const Buffer& vertices, const Buffer& counter,
                   std::uint32_t capacity,
                   std::uint32_t* emitted_out = nullptr) {
-  std::uint32_t emitted = 0;
-  std::memcpy(&emitted, counter.mapped(), sizeof(std::uint32_t));
+  // The counter is the command's indexCount, so triangles are a third of it --
+  // see mcEmitCell, which adds three per triangle.
+  VkDrawIndexedIndirectCommand command{};
+  std::memcpy(&command, counter.mapped(), sizeof(command));
+  std::uint32_t emitted = command.indexCount / 3;
   // The dense path is worst-case sized, so the kernel never drops -- but the
   // count is a device write, and this clamp is what keeps the copy below inside
   // the arena regardless.
@@ -284,15 +287,34 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // the top of the extract rather than here.
   slots_[slot_].generation = generation_;
 
-  if (!counter_.valid()) {
-    VR_ASSIGN(counter_, storage_buffer(*allocator_, sizeof(std::uint32_t)));
+  if (!indirect().valid()) {
+    // INDIRECT_BUFFER beside STORAGE_BUFFER: the kernel counts into field 0
+    // through the storage binding, and a renderer issues
+    // vkCmdDrawIndexedIndirect from the very same bytes. Unconditional rather
+    // than config-gated -- 20 bytes, and a consumer that never draws indirectly
+    // pays a usage bit nobody reads.
+    VR_ASSIGN(indirect(),
+              storage_buffer(*allocator_, sizeof(VkDrawIndexedIndirectCommand),
+                             HostAccess::Random,
+                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
   }
   // The counter is the only per-call reset: 4 bytes, against an arena whose
   // stale tail is never read (the counter bounds the readback). It happens
   // ABOVE the reuse early-return below, and must stay there: a refit that
   // reallocated nothing still has to hand the retry a zeroed counter, or the
   // second dispatch accumulates onto the first's count.
-  std::memset(counter_.mapped(), 0, sizeof(std::uint32_t));
+  // The whole command, not just the counter it starts as. indexCount is zeroed
+  // for the kernel to accumulate into; the other four fields are what make the
+  // result a *drawable* command rather than a number a host has to build one
+  // from -- one instance, no index or vertex offset, and the identity index run
+  // means firstIndex is always 0.
+  VkDrawIndexedIndirectCommand reset{};
+  reset.indexCount = 0;
+  reset.instanceCount = 1;
+  reset.firstIndex = 0;
+  reset.vertexOffset = 0;
+  reset.firstInstance = 0;
+  std::memcpy(indirect().mapped(), &reset, sizeof(reset));
 
   if (arena().valid() && capacity <= arena_capacity()) {
     return {};  // the steady state -- no allocation at all
@@ -558,7 +580,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(2, colors_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(3, arena().handle(), 0, VK_WHOLE_SIZE);
-  kernel_.set.write_storage_buffer(4, counter_.handle(), 0, VK_WHOLE_SIZE);
+  kernel_.set.write_storage_buffer(4, indirect().handle(), 0, VK_WHOLE_SIZE);
 
   const PushConstants push{grid.dims, grid.voxel_size,  grid.origin, iso,
                            capacity,  kWeightThreshold, has_color};
@@ -566,7 +588,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
                   group_count(static_cast<std::uint32_t>(cells), kLocalSize),
                   max_workgroup_count_x_));
 
-  return collect_mesh(arena(), counter_, capacity);
+  return collect_mesh(arena(), indirect(), capacity);
 }
 
 Result<Mesh> MarchingCubes::extract(volume::VoxelBlockGrid& grid, float iso,
@@ -792,7 +814,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // changes only when a refit reallocates it -- which rebinds it there.
   kernel_sparse_.set.write_storage_buffer(6, arena().handle(), 0,
                                           VK_WHOLE_SIZE);
-  kernel_sparse_.set.write_storage_buffer(7, counter_.handle(), 0,
+  kernel_sparse_.set.write_storage_buffer(7, indirect().handle(), 0,
                                           VK_WHOLE_SIZE);
   if (timings != nullptr) timings->descriptor_ms = phase_clock.lap();
 
@@ -829,7 +851,10 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
 
     // Only the 4-byte counter comes back; the geometry stays where the kernel
     // wrote it.
-    std::memcpy(&produced, counter_.mapped(), sizeof(std::uint32_t));
+    VkDrawIndexedIndirectCommand produced_command{};
+    std::memcpy(&produced_command, indirect().mapped(),
+                sizeof(produced_command));
+    produced = produced_command.indexCount / 3;
     if (timings != nullptr) timings->readback_ms += phase_clock.lap();
     if (produced <= requested) {
       break;  // everything the field emitted is in the arena
@@ -865,11 +890,26 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   tris_per_block_ = static_cast<std::uint32_t>(
       (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
 
+  // Clamp the command to what the arena actually holds, before handing anyone a
+  // handle to it.
+  //
+  // The kernel counts triangles it *dropped* as well as ones it wrote -- that
+  // over-count is deliberate, and is what the host refits from -- so on an
+  // undersized guess indexCount ends larger than the arena. A draw issued from
+  // that reads past the end. The refit re-runs and the second pass fits, so the
+  // command a caller ends up with is in range either way; this makes that true
+  // by construction rather than by following the control flow, for four bytes
+  // on a buffer already mapped and already read.
+  const auto clamped_indices = static_cast<std::uint32_t>(emitted) * 3;
+  std::memcpy(indirect().mapped(), &clamped_indices, sizeof(clamped_indices));
+
   DeviceMesh device_mesh;
   device_mesh.vertices = arena().handle();
   device_mesh.indices = index_run().handle();
+  device_mesh.indirect = indirect().handle();
   device_mesh.vertex_usage = arena().usage();
   device_mesh.index_usage = index_run().usage();
+  device_mesh.indirect_usage = indirect().usage();
   device_mesh.triangle_count = emitted;
   device_mesh.vertex_count = emitted * 3;
   device_mesh.generation = generation_;

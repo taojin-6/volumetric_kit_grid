@@ -46,8 +46,18 @@ namespace volumetric_kit::recon::mesh {
 struct DeviceMesh {
   VkBuffer vertices = VK_NULL_HANDLE;  ///< Interleaved `Vertex` array.
   VkBuffer indices = VK_NULL_HANDLE;   ///< `uint32` indices, 3 per triangle.
-  std::uint32_t vertex_count = 0;      ///< Live vertices (`3 * triangles`).
-  std::uint32_t triangle_count = 0;    ///< Live triangles.
+  /// A single `VkDrawIndexedIndirectCommand` describing this mesh's draw, for
+  /// `vkCmdDrawIndexedIndirect`.
+  ///
+  /// The producer's kernel counts *indices* into `indexCount`, so the command
+  /// is written by the extraction itself rather than assembled afterwards from
+  /// a triangle count -- which is what lets a consumer draw without the count
+  /// ever passing through it. @ref triangle_count and @ref vertex_count say the
+  /// same thing for a consumer that wants to know; the command exists so one
+  /// does not have to.
+  VkBuffer indirect = VK_NULL_HANDLE;
+  std::uint32_t vertex_count = 0;    ///< Live vertices (`3 * triangles`).
+  std::uint32_t triangle_count = 0;  ///< Live triangles.
   /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
   /// plus whatever the producer's consumer asked for. Carried so a consumer can
   /// *check* that the binding it is about to make is permitted, rather than
@@ -58,6 +68,10 @@ struct DeviceMesh {
   VkBufferUsageFlags vertex_usage = 0;
   /// Usage flags @ref indices was created with; see @ref vertex_usage.
   VkBufferUsageFlags index_usage = 0;
+  /// Usage flags @ref indirect was created with; see @ref vertex_usage. Always
+  /// carries `INDIRECT_BUFFER` beside the `STORAGE_BUFFER` the kernel counts
+  /// through.
+  VkBufferUsageFlags indirect_usage = 0;
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.
   std::uint64_t generation = 0;
