@@ -55,7 +55,9 @@ vec3 mcCellNormal(float sdf[8]) {
 // boundary cell's far corners land on the neighbour's voxels without a second
 // coordinate lookup). `sdf` / `corner_color` are the eight gathered corner
 // values; `corner_color` is ignored when has_color == 0 (vertices get opaque
-// white). Triangles emit with reversed winding (0, 2, 1) so the CCW front face
+// white). `corner_color` is in LINEAR working values -- each kernel decodes the
+// canonical 8-bit attribute at the gather -- because the edge interpolation
+// below is an average. Triangles emit with reversed winding (0, 2, 1) so the CCW front face
 // points along the outward gradient `normal` -- the orientation gfx expects;
 // color follows the same reversal so each vertex keeps its own edge's color,
 // and uv0 stays the "use vertex color" sentinel until projective texturing
@@ -92,6 +94,10 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
       vec3 pb = origin + vec3(base_voxel + mcCornerShift(b)) * voxel_size;
       p[k] = mix(pa, pb, ratio);
       // Interpolate color at the same ratio; opaque white where no color input.
+      // `corner_color` arrives LINEAR (each kernel decodes at the gather), so
+      // this mix -- an average -- happens in linear working values and
+      // Vertex::color leaves linear, which is what glTF COLOR_0 means and what
+      // the renderer shades in. White is 1.0 in either space.
       col[k] = has_color != 0u ? mix(corner_color[a], corner_color[b], ratio)
                                : vec3(1.0);
     }
