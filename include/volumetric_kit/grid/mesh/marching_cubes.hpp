@@ -16,6 +16,7 @@
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/mesh/device_mesh.hpp"
 #include "volumetric_kit/recon/mesh/export.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
@@ -126,29 +127,41 @@ struct ExtractTimings {
 /// @brief Extra buffer usage the mesh's *consumer* requires.
 ///
 /// The kernel itself needs only `STORAGE_BUFFER`. A consumer that wants to read
-/// the arena in place rather than be handed a host copy — a renderer binding it
-/// as vertex + index buffers is the motivating case — needs its own usage bits
-/// on the same allocation, and only it knows which.
+/// the arena in place rather than be handed a host copy -- a renderer binding
+/// it as vertex + index buffers is the motivating case -- needs its own usage
+/// bits on the same allocation, and only it knows which. So this tier does not
+/// name them: the application, which knows both sides, passes them in, the way
+/// the create/adopt device seam has each library state its needs without either
+/// being compiled against the other.
 ///
-/// So this tier does not name them. The **consumer publishes** what it requires
-/// and the application passes it in, exactly as the create/adopt device seam
-/// works: each library states its needs, neither is compiled against the other,
-/// and the app satisfies the union. Hardcoding a sibling's flags here would be
-/// this tier guessing at an API it cannot see.
+/// The flags actually applied come back on @ref DeviceMesh::vertex_usage /
+/// @ref DeviceMesh::index_usage, so a consumer verifies rather than assumes --
+/// binding a buffer that lacks the bit is a validation-layer-only diagnostic.
 ///
-/// @code
-/// // The app, which knows both:
-/// const auto want = vg::pipelines::HybridMeshPipeline::mesh_requirements();
-/// mesh::MarchingCubesConfig config;
-/// config.extra_vertex_usage = want.vertex_usage;
-/// config.extra_index_usage = want.index_usage;
-/// @endcode
-///
-/// @note Usage bits are declarative — they permit a binding and cost nothing to
-///       carry — so asking for more than you use is harmless. Memory
-///       *residency* is a different question and not one of these: the buffers
-///       are host-visible, which is free on a unified-memory GPU and a PCIe
-///       round trip on a discrete one (see the `TODO(mesh)` in mesh.hpp).
+/// @warning Whatever is passed here reaches `vkCreateBuffer` directly, so ask
+///          only for bits the device supports. `SHADER_DEVICE_ADDRESS` is
+///          rejected by @ref MarchingCubes::create (this repo's @ref Device
+///          never enables `bufferDeviceAddress`); other feature- or
+///          extension-gated bits are the embedder's to get right, and asking
+///          for one the device lacks fails buffer creation.
+//
+// TODO(mesh): usage is *necessary* for interop seam B, not sufficient. What a
+// renderer binding this arena still needs, none of which a create-time flag can
+// supply:
+//   (1) Lifetime. One grow-only arena, reused in place, and freed synchronously
+//       on grow (ensure_output_buffers) -- so the next extract overwrites, or
+//       frees, memory an in-flight draw is reading. Needs the ring of slots +
+//       timeline semaphore DESIGN.md's seam B specifies; DeviceMesh::generation
+//       guards only the host download() path.
+//   (2) Sharing. Allocator::create_buffer hardcodes VK_SHARING_MODE_EXCLUSIVE
+//       and BufferDesc has no knob, while on Apple recon and gfx sit on
+//       different queue families (the 2026-08-02 bootstrap decision), so a
+//       cross-family read needs CONCURRENT or a release/acquire pair.
+//   (3) Visibility. core's shared dispatch() barrier reaches COMPUTE|HOST, not
+//       VERTEX_INPUT / VERTEX_ATTRIBUTE_READ / INDEX_READ.
+//   (4) Indirect draw. counter_ carries no INDIRECT_BUFFER usage and is not on
+//       DeviceMesh, so the vkCmdDrawIndexedIndirect path seam B is specified
+//       around cannot be expressed; the count still round-trips to the host.
 struct MarchingCubesConfig {
   /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER`.
   VkBufferUsageFlags extra_vertex_usage = 0;
@@ -204,14 +217,12 @@ class VR_MESH_API MarchingCubes {
   ///        counter buffers.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator its buffers come from (must outlive this).
-  /// @return The extractor, or a non-OK @ref Status if a pipeline, layout, or
-  ///         descriptor allocation fails.
-  /// @brief Create the extractor.
-  /// @param device     The compute device (must outlive this object).
-  /// @param allocator  The allocator its buffers come from (must outlive this).
   /// @param config     Extra buffer usage a *consumer* of the mesh needs; see
   ///                   @ref MarchingCubesConfig. Defaults to none, which is
   ///                   what a recon-only consumer wants.
+  /// @return The extractor, or a non-OK @ref Status if @p config asks for an
+  ///         unsupported usage bit, or a pipeline, layout, or descriptor
+  ///         allocation fails.
   static Result<MarchingCubes> create(Device& device, Allocator& allocator,
                                       const MarchingCubesConfig& config = {});
 
@@ -350,8 +361,8 @@ class VR_MESH_API MarchingCubes {
   // a vertex arena that would exceed it is rejected with a clean Status
   // instead of an opaque allocation failure.
   std::uint32_t max_storage_buffer_range_ = 0;
-  // What a consumer asked for at create; applied on every arena grow, so a
-  // regrown buffer stays bindable by whoever is already holding views of it.
+  // What a consumer asked for at create; applied on every arena grow, not just
+  // the first, so a regrown buffer carries the same usage.
   MarchingCubesConfig config_{};
 
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0

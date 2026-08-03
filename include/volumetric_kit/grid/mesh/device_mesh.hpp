@@ -48,6 +48,16 @@ struct DeviceMesh {
   VkBuffer indices = VK_NULL_HANDLE;   ///< `uint32` indices, 3 per triangle.
   std::uint32_t vertex_count = 0;      ///< Live vertices (`3 * triangles`).
   std::uint32_t triangle_count = 0;    ///< Live triangles.
+  /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
+  /// plus whatever the producer's consumer asked for. Carried so a consumer can
+  /// *check* that the binding it is about to make is permitted, rather than
+  /// assuming the flags it published reached the producer: Vulkan cannot be
+  /// asked what a `VkBuffer` was created with, and binding one that lacks the
+  /// bit is a validation-layer-only diagnostic -- undefined behaviour with
+  /// layers off, which is the shipping configuration.
+  VkBufferUsageFlags vertex_usage = 0;
+  /// Usage flags @ref indices was created with; see @ref vertex_usage.
+  VkBufferUsageFlags index_usage = 0;
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.
   std::uint64_t generation = 0;

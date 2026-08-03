@@ -22,13 +22,13 @@ namespace volumetric_kit::recon::mesh {
 ///
 /// This is also the on-device layout the marching-cubes kernel writes: under
 /// scalar block layout a GLSL
-/// `struct { vec3 position; vec3 normal; vec4 color; vec2 uv0; }` is
-/// byte-identical to this POD (position @0, normal @12, color @24, uv0 @40,
-/// 48 B), so the host reads the vertex buffer back with a plain `memcpy` -- the
-/// same one-struct-across-CPU/GLSL discipline the volume tier applies to @ref
-/// volume::HashEntry (the 2026-07-05 ABI). The `static_assert`s below pin the
-/// host packing; the GLSL mirror keeps its `layout(scalar)` definition in
-/// lockstep.
+/// `struct { vec3 position; vec3 normal; vec4 tangent; vec2 uv0; vec4 color; }`
+/// is byte-identical to this POD (position @0, normal @12, tangent @24,
+/// uv0 @40, color @48, 64 B), so the host reads the vertex buffer back with a
+/// plain `memcpy` -- the same one-struct-across-CPU/GLSL discipline the volume
+/// tier applies to @ref volume::HashEntry (the 2026-07-05 ABI). The
+/// `static_assert`s below pin the host packing; the GLSL mirror keeps its
+/// `layout(scalar)` definition in lockstep.
 ///
 /// @ref color and @ref uv0 encode the **hybrid** color path shared with the
 /// renderer's `HybridMeshPipeline`: where projective texturing won a triangle a
@@ -59,12 +59,10 @@ struct Vertex {
 // description reads position/normal/uv0/color at exactly these offsets with
 // this stride, so a mesh the kernel wrote crosses the seam unconverted.
 // Changing one without the other silently misreads every vertex.
-// The buffers can be made bindable as well as byte-compatible: a consumer
-// passes the usage it needs through MarchingCubesConfig, and the arena and
-// index run carry it, so a renderer sharing the device can draw them in place
-// rather than being handed a host copy of bytes that never left it. This tier
-// does not name the renderer's flags -- the consumer publishes them and the
-// application passes them in, as the create/adopt device seam works.
+// The buffers can also be made *bindable*: a consumer passes the usage it needs
+// through mesh/marching_cubes.hpp's MarchingCubesConfig, which is where the
+// remaining seam-B gaps are enumerated -- being byte-compatible and bindable is
+// still short of being drawable in place.
 // TODO(mesh): they remain *host-visible*, which is right on a unified-memory
 // GPU (Apple silicon reports a host-visible DEVICE_LOCAL heap, so there is
 // nothing to stage) but not on a discrete one, where drawing vertices across

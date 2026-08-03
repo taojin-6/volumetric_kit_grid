@@ -15,6 +15,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes_tables.hpp"
@@ -131,33 +132,6 @@ struct CoordHash {
            (static_cast<std::uint32_t>(c.z) * volume::kHashPrimeZ);
   }
 };
-
-std::uint32_t group_count(std::uint32_t items) {
-  // Ceil-divide without the `items + kLocalSize - 1` term, which overflows
-  // uint32 near the top of the range and wraps to ~0 groups (a silent no-op
-  // dispatch); mirrors the volume tier's group_count.
-  return items / kLocalSize + (items % kLocalSize != 0u ? 1u : 0u);
-}
-
-// A host-visible, host-mapped storage buffer of the given byte size.
-//
-// @p extra_usage adds usage bits beyond STORAGE_BUFFER. The kernel only ever
-// needs storage; the extras exist so the *renderer* can bind the same memory
-// (interop seam B) instead of receiving a host copy of bytes that never left
-// the device. Usage bits are declarative -- they permit a binding, they do not
-// cost anything to carry -- so this is the whole of what the buffers need to
-// become bindable.
-Result<Buffer> storage_buffer(Allocator& allocator, VkDeviceSize bytes,
-                              HostAccess access = HostAccess::Random,
-                              VkBufferUsageFlags extra_usage = 0) {
-  BufferDesc desc;
-  desc.size = bytes;
-  desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | extra_usage;
-  desc.memory = MemoryUsage::HostVisible;
-  desc.mapped = true;
-  desc.host_access = access;
-  return allocator.create_buffer(desc);
-}
 
 // Bytes a vertex arena needs to hold @p capacity triangles (3 vertices each).
 std::uint64_t arena_bytes_for(std::uint32_t capacity) {
@@ -294,6 +268,12 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // small one lives in a pooled block that VMA keeps, and process RSS can still
   // show both across the grow. Failing here leaves the extractor with no arena
   // rather than a capacity claiming a buffer that was never allocated.
+  //
+  // This assignment calls vmaDestroyBuffer *immediately* -- there is no fence
+  // wait and no deferred retire. Safe for this tier's own work, which is
+  // fence-blocked inside submit_single_time, but NOT for an external consumer
+  // holding a DeviceMesh: see the seam-B TODO on MarchingCubesConfig, which is
+  // why a bindable arena is not yet a drawable one.
   vertex_arena_ = Buffer{};
   // Released together: arena_capacity() is derived from the arena's size, so
   // dropping the arena is what marks the pair unsized, and the index run must
@@ -304,13 +284,8 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // allocation cannot leave a sized arena beside a null index run -- which
   // arena_capacity() would then report as ready and the next extract would hand
   // out as a DeviceMesh naming no index buffer.
-  // Whatever the consumer asked for, on top of STORAGE_BUFFER. A renderer
-  // sharing the device asks for VERTEX_BUFFER here: the kernel writes these as
-  // an SSBO, and since the 2026-08-02 layout decision the bytes it writes are
-  // already in the shape a vertex-input description reads -- so the usage bit
-  // is the whole of what stands between it and binding this arena in place
-  // rather than being handed a host copy of it. Applied on every grow, so a
-  // regrown arena stays bindable.
+  // config_ is applied on every grow, not just the first, so the consumer's
+  // usage survives a reallocation (see MarchingCubesConfig).
   VR_ASSIGN(
       Buffer arena,
       storage_buffer(*allocator_,
@@ -339,6 +314,23 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
 Result<MarchingCubes> MarchingCubes::create(Device& device,
                                             Allocator& allocator,
                                             const MarchingCubesConfig& config) {
+  // Reject the one usage bit this repo's Device provably cannot honour, here
+  // where the caller supplied it rather than inside the first extract's arena
+  // grow (CLAUDE.md's "validate before creating"). Device::create never enables
+  // bufferDeviceAddress, and the allocator is built without
+  // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT, so this bit trips a VMA
+  // assert in a debug build and drops VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT in
+  // NDEBUG. Other bits are gated by features/extensions an adopted device may
+  // legitimately have enabled, so they are the embedder's call, not ours.
+  const VkBufferUsageFlags unsupported =
+      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  if (((config.extra_vertex_usage | config.extra_index_usage) & unsupported) !=
+      0) {
+    return Status::invalid_argument(
+        "MarchingCubes::create: VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT is "
+        "not supported -- Device::create does not enable bufferDeviceAddress");
+  }
+
   const VkDevice dev = device.handle();
 
   MarchingCubes mc;
@@ -499,7 +491,7 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   const PushConstants push{grid.dims, grid.voxel_size,  grid.origin, iso,
                            capacity,  kWeightThreshold, has_color};
   VR_TRY(dispatch(*device_, kernel_, &push, sizeof(push),
-                  group_count(static_cast<std::uint32_t>(cells)),
+                  group_count(static_cast<std::uint32_t>(cells), kLocalSize),
                   max_workgroup_count_x_));
 
   return collect_mesh(vertex_arena_, counter_, capacity);
@@ -596,6 +588,8 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     DeviceMesh device_mesh;
     device_mesh.vertices = vertex_arena_.handle();
     device_mesh.indices = index_run_.handle();
+    device_mesh.vertex_usage = vertex_arena_.usage();
+    device_mesh.index_usage = index_run_.usage();
     device_mesh.generation = ++generation_;
     return device_mesh;
   }
@@ -734,9 +728,10 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                    requested,
                                    kWeightThreshold,
                                    has_color ? 1u : 0u};
-    VR_TRY(dispatch(*device_, kernel_sparse_, &push, sizeof(push),
-                    group_count(static_cast<std::uint32_t>(threads)),
-                    max_workgroup_count_x_));
+    VR_TRY(
+        dispatch(*device_, kernel_sparse_, &push, sizeof(push),
+                 group_count(static_cast<std::uint32_t>(threads), kLocalSize),
+                 max_workgroup_count_x_));
     if (timings != nullptr) {
       timings->dispatch_ms += phase_clock.lap();
       ++timings->dispatches;
@@ -783,6 +778,8 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   DeviceMesh device_mesh;
   device_mesh.vertices = vertex_arena_.handle();
   device_mesh.indices = index_run_.handle();
+  device_mesh.vertex_usage = vertex_arena_.usage();
+  device_mesh.index_usage = index_run_.usage();
   device_mesh.triangle_count = emitted;
   device_mesh.vertex_count = emitted * 3;
   device_mesh.generation = generation_;
