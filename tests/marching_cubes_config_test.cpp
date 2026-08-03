@@ -471,6 +471,47 @@ int main() {
   vr::Result<mesh::DeviceMesh> gen5 = ring.extract_device(small, 0.0f);
   CHECK(!gen5.ok());
 
+  // The arena must not ratchet as the ring turns.
+  //
+  // plan_capacity floors its estimate at what the arena already holds, so it
+  // never asks for less room than has been paid for. Read against the slot just
+  // written while a *different* slot is about to be grown, that floor compounds
+  // 1.5x per extract -- geometrically, with the measured triangle density never
+  // getting a say. On an iPad Pro it reached a 1.1 GB arena for 36904 triangles
+  // before vkAllocateMemory refused and the device was lost.
+  //
+  // Same grid every time, so a correct plan is flat. Ten extracts is well past
+  // where a 1.5x compound would show: even from the seed it would be ~57x.
+  {
+    mesh::MarchingCubesConfig ratchet_config;
+    ratchet_config.slot_count = 3;
+    vr::Result<mesh::MarchingCubes> ratchet_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                    ratchet_config);
+    CHECK(ratchet_result.ok());
+    mesh::MarchingCubes ratchet = std::move(ratchet_result).value();
+
+    // Compared slot against itself, three apart: with three slots, extract i
+    // and extract i-3 write the same one. Comparing adjacent extracts would
+    // fail honestly -- the slots differ in size while tris_per_block_ settles
+    // from its seed, and that is the plan working, not ratcheting.
+    std::uint64_t bytes[12] = {};
+    for (int i = 0; i < 12; ++i) {
+      mesh::ExtractTimings t{};
+      vr::Result<mesh::DeviceMesh> m = ratchet.extract_device(small, 0.0f, &t);
+      CHECK(m.ok());
+      // Released immediately: this is testing the plan, not the ring's ability
+      // to refuse, and an exhausted ring would end the loop early.
+      ratchet.release_through(m.value().generation);
+      bytes[i] = t.arena_bytes;
+      // From the second full turn, once every slot has been sized once.
+      if (i >= 6) {
+        CHECK(bytes[i] == bytes[i - 3]);
+      }
+    }
+    CHECK(bytes[11] > 0);
+  }
+
   // Self-move leaves the ring intact, like every other member. This is not
   // hypothetical: the first cut held the slots in a std::vector, whose
   // self-move-assignment is valid-but-unspecified and empties under libc++, so

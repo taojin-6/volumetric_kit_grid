@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <string>
@@ -631,12 +632,12 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
   }
 
-  // Claim first, bump second. A refused claim has touched nothing, so it must
-  // leave outstanding DeviceMeshes valid -- see claim_output_slot.
-  VR_TRY(claim_output_slot());
   // This call is about to overwrite -- and, on a grow, reallocate -- the shared
   // arena, so every outstanding DeviceMesh is stale from here on, whether or
   // not the call succeeds. Bump before the first thing that touches it.
+  // Claim first, bump second. A refused claim has touched nothing, so it must
+  // leave outstanding DeviceMeshes valid -- see claim_output_slot.
+  VR_TRY(claim_output_slot());
   ++generation_;
   VR_TRY(ensure_output_buffers(capacity));
 
@@ -847,6 +848,24 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // guaranteed to fit. That makes this a one-dispatch steady state that pays a
   // second dispatch only when the plan undershoots the surface, rather than
   // the unconditional two-dispatch count-then-fill this replaces.
+  // Claim the slot BEFORE planning, because the plan reads the arena it is
+  // about to grow.
+  //
+  // plan_capacity floors its estimate at what the arena already holds, so it
+  // never asks for less room than has already been paid for. That is right for
+  // one reused arena and a ratchet across a ring: planning against the slot
+  // just written, then growing a *different* one to fit, makes every extract
+  // allocate 1.5x the last -- geometrically, forever, with the measured
+  // triangle density never getting a say. An iPad Pro reached a 1.1 GB arena
+  // for 36904 triangles (0.59% full) in a few hundred remeshes, and three ring
+  // slots of that is a device-lost.
+  //
+  // Claiming first costs nothing and fixes it at the root: arena_capacity()
+  // then describes the slot this call will actually write. A refused claim
+  // still touches nothing, and now also skips the neighbour LUT and the input
+  // upload below rather than doing them and throwing them away.
+  VR_TRY(claim_output_slot());
+
   const std::uint32_t capacity = plan_capacity(num_active, worst_case);
 
   // Neighbour lookup: map each active block coordinate to its voxel-array base,
@@ -893,9 +912,6 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
               neighbour_lut.size() * sizeof(std::int32_t));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
-  // Claim first, bump second. A refused claim has touched nothing, so it must
-  // leave outstanding DeviceMeshes valid -- see claim_output_slot.
-  VR_TRY(claim_output_slot());
   // This call is about to overwrite -- and, on a grow, reallocate -- the arena,
   // so every outstanding DeviceMesh is stale from here on, whether or not the
   // call succeeds. Bump before the first thing that touches it, not on the
