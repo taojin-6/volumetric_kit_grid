@@ -231,6 +231,75 @@ int main() {
   CHECK(static_cast<std::uint64_t>(fresh_ptr) + vpb <= new_voxels);  // in pool
   CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);  // fresh block: zeroed attribute
 
+  // --- remove() clears the per-voxel data before the index goes back.
+  // The free heap is LIFO, so the next allocation re-draws the index just
+  // freed onto the identical attribute range. Left uncleared, the removed
+  // surface's tsdf/weight resurrect under the new geometry at full fused
+  // weight -- and the integrator's `color_attr == 0` first-observation gate,
+  // which exists to stop a wrong first colour, is bypassed by the stale
+  // non-zero value. Written through the grid, which owns both halves;
+  // map().remove() is the raw path that does not clear (documented there).
+  {
+    // Give the block being removed a distinctive, definitely-non-zero range.
+    tsdf_grown_data[fresh_ptr] = -0.5f;
+    tsdf_grown_data[fresh_ptr + vpb - 1] = -0.5f;
+    weight_grown_data[fresh_ptr] = 5.0f;
+
+    vr::Result<std::uint32_t> removed = vbg.remove(&fresh, 1);
+    CHECK(removed.ok() && removed.value() == 0);
+    // Cleared at the removed block's own range, both attributes, whole block.
+    CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);
+    CHECK(tsdf_grown_data[fresh_ptr + vpb - 1] == 0.0f);
+    CHECK(weight_grown_data[fresh_ptr] == 0.0f);
+    // ...and only there: a block that was not removed keeps its data.
+    CHECK(tsdf_grown_data[ptr_a] == -0.02f);
+    CHECK(weight_grown_data[ptr_a] == 30.0f);
+
+    // The reuse this protects against: re-allocating draws the same index back
+    // (LIFO) and it reads as a fresh block rather than the removed one.
+    vr::Result<std::uint32_t> realloc = vbg.map().allocate(&fresh, 1);
+    CHECK(realloc.ok() && realloc.value() == 0);
+    vr::Result<std::vector<vol::BlockIndex>> after_reuse =
+        vbg.map().compact_active_blocks();
+    CHECK(after_reuse.ok());
+    std::int32_t reused_ptr = -1;
+    for (const vol::BlockIndex& blk : after_reuse.value()) {
+      if (blk.coord == fresh_coord) {
+        reused_ptr = blk.ptr;
+      }
+    }
+    CHECK(reused_ptr == fresh_ptr);              // LIFO: the same index back
+    CHECK(tsdf_grown_data[reused_ptr] == 0.0f);  // and it is clean
+  }
+
+  // --- clear() zeroes every attribute, for the same reason: it returns every
+  // block to the heap, so every range is about to be re-drawn.
+  {
+    tsdf_grown_data[ptr_a] = -0.02f;
+    CHECK(vbg.clear().ok());
+    CHECK(tsdf_grown_data[ptr_a] == 0.0f);
+    CHECK(weight_grown_data[ptr_a] == 0.0f);
+    vr::Result<std::vector<vol::BlockIndex>> empty =
+        vbg.map().compact_active_blocks();
+    CHECK(empty.ok() && empty.value().empty());
+  }
+
+  // --- attribute() refuses an array that no longer covers the live grid.
+  // Resizing through the raw map() handle grows the table (preserving block
+  // indices) and leaves the attribute arrays at their old size, so a block
+  // allocated into the grown capacity addresses past them -- and both consumers
+  // bind these VK_WHOLE_SIZE with robustBufferAccess enabled nowhere, so the
+  // write is undefined rather than clamped. attribute() is the funnel every
+  // consumer passes through, so this is where the desync becomes a Status.
+  {
+    const std::int32_t bigger = vbg.map().grid().num_buckets * 2;
+    CHECK(vbg.map().resize(bigger).ok());  // the raw path, not vbg.resize
+    CHECK(vbg.map().grid().num_buckets == bigger);
+    vr::Result<vol::AttributeView> stale = vbg.attribute("tsdf");
+    CHECK(!stale.ok());
+    CHECK(stale.status().domain() == vr::Status::Code::InvalidArgument);
+  }
+
   // Error paths: null list with a count, empty name, zero element size, and a
   // duplicate name are each rejected before any buffer is allocated.
   CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,

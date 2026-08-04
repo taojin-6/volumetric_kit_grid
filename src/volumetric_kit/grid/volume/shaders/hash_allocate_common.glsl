@@ -27,12 +27,10 @@ layout(set = 0, binding = 2) coherent buffer HeapCounter { uint heap_counter; };
 layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
 
-// Fail-reason slots (mirror hash_ops.metal): [0]=total, [1]=lock contention,
-// [2]=chain full, [3]=heap empty.
-const int kFailTotal = 0;
-const int kFailLock = 1;
-const int kFailChain = 2;
-const int kFailHeap = 3;
+// The fail-reason slots (kFailTotal / kFailLock / kFailChain / kFailHeap) come
+// from hash_common.glsl -- the delete kernel reports through the same buffer,
+// so the slot layout is shared rather than owned by this header. Every failure
+// an allocate kernel reports is retryable, so none of them touch kFailTerminal.
 
 const uint kHeapEmpty = 0xFFFFFFFFu;
 

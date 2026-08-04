@@ -41,6 +41,37 @@ struct HashDiagnostics {
   float heap_utilization = 0.0f;      ///< `1 - heap_free / total_blocks`.
 };
 
+/// @brief Why a dispatch's failures failed -- the per-reason split behind the
+///        single count @ref VoxelHashMap::allocate and friends return.
+///
+/// Opt-in and caller-owned (pass `nullptr`, the default, and nothing is
+/// written) -- the shape @ref mesh::ExtractTimings established, for the same
+/// reason: the distinction is invisible from outside and choosing correctly
+/// needs it.
+///
+/// The choice it exists for is **grow or retry**. @ref lock is transient
+/// same-bucket contention (a GPU spin-lock livelock within a SIMD group, worst
+/// for depth, whose adjacent pixels hammer the same block) and says nothing
+/// about capacity: the table may be nearly empty. @ref chain and @ref heap are
+/// genuine capacity limits and are what @ref VoxelHashMap::resize answers.
+/// Reading the aggregate as capacity pressure grows the volume -- doubling
+/// every attribute array -- over a table that was never full.
+struct AllocFailures {
+  std::uint32_t total = 0;  ///< Retryable failures the final round reported.
+  std::uint32_t lock = 0;   ///< Lost bucket-lock races: contention, not size.
+  std::uint32_t chain = 0;  ///< Collision chain full: a capacity limit.
+  std::uint32_t heap = 0;   ///< Block heap empty: a capacity limit.
+  /// Non-retryable failures, summed over every round. Reported only by
+  /// @ref VoxelHashMap::remove, where a block index that could not be returned
+  /// to the free heap is unreachable capacity: neither in the table nor on the
+  /// heap. Not resolved by retrying and not fixed by @ref VoxelHashMap::resize.
+  std::uint32_t terminal = 0;
+
+  /// @return Whether growing the map could help: a genuine capacity limit was
+  ///         hit, rather than only transient lock contention.
+  bool capacity_limited() const noexcept { return chain > 0 || heap > 0; }
+};
+
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
 ///        pipelines that operate on them, and drives block allocation and
@@ -91,8 +122,12 @@ class VR_VOLUME_API VoxelHashMap {
   ///         non-OK @ref Status if a buffer or the dispatch fails. Allocation
   ///         re-dispatches to converge under contention; a non-zero count means
   ///         a genuine capacity limit (chain full / heap empty) -- grow with
-  ///         @ref resize.
-  Result<std::uint32_t> allocate(const BlockIndex* coords, std::uint32_t count);
+  ///         @ref resize -- but read @p out_failures rather than assuming that,
+  ///         since transient lock contention can also leave a residue.
+  /// @param out_failures  Optional: receives the per-reason split (see
+  ///                      @ref AllocFailures). Untouched when null.
+  Result<std::uint32_t> allocate(const BlockIndex* coords, std::uint32_t count,
+                                 AllocFailures* out_failures = nullptr);
 
   /// @brief Allocate voxel blocks from a posed depth frame.
   ///
@@ -108,10 +143,19 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param camera  Intrinsics, valid-depth range, dimensions, and pose.
   /// @return The number of block allocations that failed (0 = all succeeded),
   ///         or a non-OK @ref Status if a buffer or the dispatch fails, or the
-  ///         map is moved-from / @p depth is null. A non-zero count means
-  ///         bucket/heap pressure -- grow with @ref resize.
-  Result<std::uint32_t> allocate_from_depth(const float* depth,
-                                            const DepthCameraParams& camera);
+  ///         map is moved-from / @p depth is null.
+  /// @param out_failures  Optional: receives the per-reason split. **Consult it
+  ///                      before growing the map.** A non-zero count does *not*
+  ///                      by itself mean bucket/heap pressure -- this is the
+  ///                      most contended entry point (adjacent pixels dilate
+  ///                      into the same block), so a residue of pure
+  ///                      @ref AllocFailures::lock failures is expected on a
+  ///                      table with ample room. @ref
+  ///                      AllocFailures::capacity_limited is the test @ref
+  ///                      resize answers.
+  Result<std::uint32_t> allocate_from_depth(
+      const float* depth, const DepthCameraParams& camera,
+      AllocFailures* out_failures = nullptr);
 
   /// @brief Allocate voxel blocks from a world-space point cloud.
   ///
@@ -124,8 +168,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The number of block allocations that failed (0 = all succeeded),
   ///         or a non-OK @ref Status if a buffer or the dispatch fails, or the
   ///         map is moved-from / @p points is null.
-  Result<std::uint32_t> allocate_from_points(const Vec3f* points,
-                                             std::uint32_t count);
+  /// @param out_failures  Optional: receives the per-reason split (see
+  ///                      @ref AllocFailures). Untouched when null.
+  Result<std::uint32_t> allocate_from_points(
+      const Vec3f* points, std::uint32_t count,
+      AllocFailures* out_failures = nullptr);
 
   /// @brief Remove voxel blocks at the given block coordinates (only `coord` is
   ///        read); absent coordinates are ignored. Returns each freed block to
@@ -136,9 +183,24 @@ class VR_VOLUME_API VoxelHashMap {
   /// single-threaded use.
   /// @param coords  The block coordinates to remove.
   /// @param count   How many.
+  /// @warning This frees the block index but does **not** clear the per-voxel
+  ///          attribute data it addressed -- the block index does not know what
+  ///          attributes, if any, a consumer declared. The free heap is LIFO,
+  ///          so the next allocation re-draws this very index onto the same
+  ///          attribute range and the old surface's `tsdf`/`weight`/`color`
+  ///          resurrect under the new geometry. Use
+  ///          @ref VoxelBlockGrid::remove, which clears them first, on any grid
+  ///          that carries attributes.
   /// @return The number of removals that failed (0 = all done), or a non-OK
-  ///         @ref Status if a buffer or the dispatch fails.
-  Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count);
+  ///         @ref Status if a buffer or the dispatch fails. A non-zero count
+  ///         here is **not** capacity pressure: it counts blocks that were
+  ///         removed from the table but whose index could not be returned to
+  ///         the free heap, i.e. leaked capacity (@ref
+  ///         AllocFailures::terminal), plus any coord no attempt could delete.
+  /// @param out_failures  Optional: receives the per-reason split (see
+  ///                      @ref AllocFailures). Untouched when null.
+  Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
+                               AllocFailures* out_failures = nullptr);
 
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
   /// @return The active blocks (order unspecified), or a non-OK @ref Status.
@@ -242,12 +304,16 @@ class VR_VOLUME_API VoxelHashMap {
       const ComputeKernel& kernel);
 
   /// Dispatch @p kernel (push arg = @p arg) over @p groups groups,
-  /// re-dispatching while the shared `fail_counts_[0]` tally keeps dropping to
-  /// converge past transient same-bucket lock contention. Re-zeroes the tally
-  /// each round. The shared tail of every allocate/remove kernel.
+  /// re-dispatching while the shared `fail_counts_[kFailTotal]` tally keeps
+  /// dropping to converge past transient same-bucket lock contention. Re-zeroes
+  /// the tally each round. The shared tail of every allocate/remove kernel.
+  /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
+  /// added to the returned count; @p out_failures, when non-null, receives the
+  /// full per-reason split.
   Result<std::uint32_t> dispatch_with_retry(const ComputeKernel& kernel,
                                             std::uint32_t arg,
-                                            std::uint32_t groups);
+                                            std::uint32_t groups,
+                                            AllocFailures* out_failures);
 
   /// Create a transient host-visible buffer holding @p bytes of @p data and
   /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
@@ -264,7 +330,8 @@ class VR_VOLUME_API VoxelHashMap {
   Result<std::uint32_t> run_input_kernel(const char* op, const void* data,
                                          std::size_t elem_size,
                                          std::uint32_t count,
-                                         const ComputeKernel& kernel);
+                                         const ComputeKernel& kernel,
+                                         AllocFailures* out_failures);
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and
@@ -279,6 +346,10 @@ class VR_VOLUME_API VoxelHashMap {
   // Cached maxComputeWorkGroupCount[0] -- the device cap on a 1-D dispatch's
   // groupCountX; every dispatch rejects an input that would exceed it.
   std::uint32_t max_workgroup_count_x_ = 0;
+  // The ceiling on one storage-buffer binding's range, read once at create().
+  // The per-call input uploads (a depth frame, a coord or point list) are bound
+  // whole, so an over-large one is invalid usage rather than a slow path.
+  VkDeviceSize max_storage_buffer_range_ = 0;
 
   // Persistent device buffers. TODO(volume): these are host-visible for this
   // slice; a device-local + staging path is a follow-up perf pass.

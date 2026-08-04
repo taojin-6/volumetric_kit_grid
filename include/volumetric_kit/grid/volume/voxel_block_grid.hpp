@@ -18,6 +18,7 @@
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/buffer.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
@@ -105,6 +106,7 @@ class VR_VOLUME_API VoxelBlockGrid {
     if (this != &other) {
       map_ = std::move(other.map_);
       attributes_ = std::move(other.attributes_);
+      max_storage_buffer_range_ = other.max_storage_buffer_range_;
       allocator_ = other.allocator_;
     }
     return *this;
@@ -114,15 +116,22 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   /// @brief The composed block index, for allocation / compaction.
   ///
-  /// @warning To grow a grid that carries attributes, call @ref resize, which
-  ///          grows the attribute arrays *and* rehashes the map preserving
-  ///          block indices. Calling @ref VoxelHashMap::resize through this
-  ///          handle grows the table (preserving indices) but leaves the
-  ///          attribute arrays at their old `num_blocks * voxels_per_block`
-  ///          size, so a block allocated into the grown capacity would address
-  ///          past them.
-  ///          @ref attribute reports the buffer-derived capacity (not the live
-  ///          grid), so a downstream bounds check stays sound.
+  /// @warning Two of this handle's operations invalidate state only this class
+  ///          can keep consistent, so prefer the wrappers here:
+  ///          - @ref VoxelHashMap::resize grows the table (preserving block
+  ///            indices) but leaves the attribute arrays at their old
+  ///            `num_blocks * voxels_per_block`, so a block allocated into the
+  ///            grown capacity addresses past them. Use @ref resize, which
+  ///            grows both. Reaching it through this handle anyway is caught
+  ///            rather than silently tolerated: @ref attribute then **refuses**
+  ///            (see there), so the desync surfaces as a clean @ref Status at
+  ///            the next bind instead of an out-of-bounds device write.
+  ///          - @ref VoxelHashMap::remove frees a block index without clearing
+  ///            the per-voxel data it addressed, and the free heap is LIFO, so
+  ///            the next allocation resurrects it. Use @ref remove. This one
+  ///            cannot be detected after the fact -- the stale data is
+  ///            indistinguishable from fused data -- which is why it is
+  ///            wrapped rather than checked.
   /// @return The block index.
   VoxelHashMap& map() noexcept { return map_; }
   /// @overload
@@ -132,11 +141,50 @@ class VR_VOLUME_API VoxelBlockGrid {
   const VoxelGridParams& grid() const noexcept { return map_.grid(); }
 
   /// @brief Look up an attribute's backing store by name.
+  ///
+  /// Also the one place the attribute arrays are checked against the live grid,
+  /// because every consumer that binds one passes through here. An array that
+  /// no longer covers `num_blocks * voxels_per_block` -- which is what calling
+  /// @ref VoxelHashMap::resize through @ref map() leaves behind -- is refused,
+  /// so the mismatch becomes a clean @ref Status at the binding site rather
+  /// than a kernel indexing past the end of a buffer bound `VK_WHOLE_SIZE`.
   /// @param name  The attribute name (as declared at @ref create).
   /// @return A view of the attribute, or @ref Status::Code::InvalidArgument if
   ///         no attribute of that name was declared (or the grid is
-  ///         moved-from).
+  ///         moved-from), or if the array no longer covers the live grid.
   Result<AttributeView> attribute(std::string_view name) const;
+
+  /// @brief Remove voxel blocks at the given block coordinates, clearing the
+  ///        per-voxel attribute data they held.
+  ///
+  /// @ref VoxelHashMap::remove with the half it cannot do: the block index does
+  /// not know what attributes a consumer declared, so it returns a freed index
+  /// to the heap with its attribute range untouched. The heap is LIFO, so the
+  /// next allocation re-draws that index onto the same range and the removed
+  /// surface's `tsdf` / `weight` / `color` resurrect under the new geometry --
+  /// at full fused weight, which also bypasses the integrator's
+  /// first-observation-assigns colour gate. This zeroes each removed block's
+  /// range first, matching the state @ref create leaves a fresh array in.
+  ///
+  /// The ranges are resolved from a snapshot of the active set, so a coord that
+  /// is not currently allocated costs nothing and clears nothing.
+  /// @param coords  The block coordinates to remove (only `coord` is read).
+  /// @param count   How many.
+  /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
+  /// @return What @ref VoxelHashMap::remove returns, or a non-OK @ref Status if
+  ///         the grid is moved-from, @p coords is null, or the snapshot fails.
+  Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
+                               AllocFailures* out_failures = nullptr);
+
+  /// @brief Empty the grid: clear the block index and zero every attribute.
+  ///
+  /// @ref VoxelHashMap::clear returns every block to the heap, so every
+  /// attribute range is about to be re-drawn; zeroing them here is what keeps
+  /// "a freshly allocated block reads as zero" true after a clear, exactly as
+  /// it is after @ref create.
+  /// @return OK, or a non-OK @ref Status if the grid is moved-from or the
+  ///         underlying @ref VoxelHashMap::clear fails.
+  Status clear();
 
   /// @return `true` if an attribute of @p name was declared.
   bool has_attribute(std::string_view name) const noexcept;
@@ -168,8 +216,11 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// buffers come from (borrowed; must outlive the grid). Attributes are added
   /// by @ref create. (VoxelHashMap has no public default ctor, so the grid is
   /// built map-first rather than default-then-assign.)
-  VoxelBlockGrid(VoxelHashMap map, Allocator* allocator)
-      : map_(std::move(map)), allocator_(allocator) {}
+  VoxelBlockGrid(VoxelHashMap map, Allocator* allocator,
+                 VkDeviceSize max_storage_buffer_range)
+      : map_(std::move(map)),
+        max_storage_buffer_range_(max_storage_buffer_range),
+        allocator_(allocator) {}
 
   /// One named attribute array: its declared name + element size + the buffer.
   struct Attribute {
@@ -180,6 +231,11 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
+  // The device's maxStorageBufferRange, read once at create(). An attribute
+  // array is the largest buffer this repo allocates and is bound whole, so it
+  // is the one most likely to exceed what a single binding may cover -- at the
+  // examples' defaults it is already 2x Vulkan's guaranteed minimum.
+  VkDeviceSize max_storage_buffer_range_ = 0;
   // Borrowed (must outlive this): backs every attribute buffer, including those
   // grown by resize(). A moved-from grid keeps the pointer but reports
   // valid() == false through map_, so it is never dereferenced.

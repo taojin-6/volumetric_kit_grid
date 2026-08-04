@@ -54,6 +54,26 @@ const uint kHashPrimeZ = 83492791u;
 const int kMaxSpinRetries = 128;
 const int kMaxHeapRetries = 256;
 
+// --- Fail-count slots. A host/device ABI (VoxelHashMap::dispatch_with_retry
+// reads them), so they live here beside the other shared constants rather than
+// in one kernel's header.
+//
+// [0..3] mirror hash_ops.metal and are **retryable**: the host re-dispatches
+// while the total keeps dropping, because the element that failed is still
+// unprocessed and the next round can succeed. [4] is the one that is not, and
+// the distinction is load-bearing: a delete whose heap append fails has already
+// cleared the entry, so re-dispatching finds the coord absent and counts
+// nothing -- the convergence heuristic would erase the report instead of
+// resolving it, returning "0 failures" over a permanently leaked block index.
+// The host therefore accumulates [4] across rounds and adds it to the final
+// retryable count. Kernels that have no non-retryable failure never touch it.
+const int kFailTotal = 0;     // retryable total; drives the retry loop
+const int kFailLock = 1;      // lock contention
+const int kFailChain = 2;     // collision chain full
+const int kFailHeap = 3;      // block heap empty
+const int kFailTerminal = 4;  // non-retryable; host accumulates across rounds
+const int kFailSlots = 5;
+
 // --- Push constants: the grid shape + one kernel-specific argument. ---
 layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;

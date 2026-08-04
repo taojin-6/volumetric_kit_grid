@@ -102,6 +102,18 @@ inline Status VoxelGridParams::validate() const {
   if (block_size <= 0) {
     return Status::invalid_argument("VoxelGridParams: block_size must be > 0");
   }
+  // Bound the edge *before* cubing it. `voxels_per_block` is a signed 32-bit
+  // int, so the largest edge whose cube can be represented is 1290 (1291^3
+  // exceeds INT32_MAX) -- and past it the check below would be signed-overflow
+  // UB inside the very function whose job is rejecting bad input. It also lets
+  // provably-broken values through: 2048^3 wraps to exactly 0, so
+  // `voxels_per_block == 0` passes and every block then aliases pointer 0.
+  constexpr std::int32_t kMaxBlockSize = 1290;
+  if (block_size > kMaxBlockSize) {
+    return Status::invalid_argument(
+        "VoxelGridParams: block_size must be <= 1290 (block_size^3 must fit a "
+        "signed 32-bit voxels_per_block)");
+  }
   if (voxels_per_block != block_size * block_size * block_size) {
     return Status::invalid_argument(
         "VoxelGridParams: voxels_per_block must equal block_size^3");
@@ -109,13 +121,30 @@ inline Status VoxelGridParams::validate() const {
   if (trunc_dist <= 0.0f) {
     return Status::invalid_argument("VoxelGridParams: trunc_dist must be > 0");
   }
-  if (bucket_size <= 0) {
-    return Status::invalid_argument("VoxelGridParams: bucket_size must be > 0");
+  // Two, not one. The last entry of each bucket is that bucket's chain anchor,
+  // so at bucket_size == 1 *every* slot in the table is an anchor and there is
+  // nowhere for an overflow-chain node to live: `allocate_in_overflow` skips
+  // anchors, finds the whole table is anchors, and returns false for every
+  // insert past the first collision. That is a degenerate shape rather than a
+  // kernel bug, so it is rejected here -- otherwise the first two coords that
+  // hash together fail permanently, and a caller reads that as capacity
+  // pressure and grows the volume until it runs out of memory.
+  if (bucket_size < 2) {
+    return Status::invalid_argument(
+        "VoxelGridParams: bucket_size must be >= 2 (the last entry of each "
+        "bucket is its chain anchor, so a 1-entry bucket has no room for an "
+        "overflow chain)");
   }
   if (num_buckets <= 0) {
     return Status::invalid_argument("VoxelGridParams: num_buckets must be > 0");
   }
-  if (num_blocks != bucket_size * num_buckets) {
+  // Widened, because the narrow product wraps exactly as the uint32 multiply
+  // that produced `num_blocks` in VoxelHashMap::resize does -- so both sides
+  // agreed on the wrapped value and the guard could never fire, which also
+  // dodged the block-pointer check below it. (bucket_size and num_buckets are
+  // positive int32 by the checks above, so their int64 product cannot
+  // overflow.)
+  if (static_cast<std::int64_t>(bucket_size) * num_buckets != num_blocks) {
     return Status::invalid_argument(
         "VoxelGridParams: num_blocks must equal bucket_size * num_buckets");
   }
