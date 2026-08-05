@@ -61,6 +61,12 @@ struct AllocFailures {
   std::uint32_t lock = 0;   ///< Lost bucket-lock races: contention, not size.
   std::uint32_t chain = 0;  ///< Collision chain full: a capacity limit.
   std::uint32_t heap = 0;   ///< Block heap empty: a capacity limit.
+  /// No free entry anywhere in the table: a capacity limit, and a distinct one.
+  /// Kept apart from @ref heap because the two are not interchangeable -- the
+  /// rehash path presets each block's pointer and never touches the heap, so
+  /// @ref heap is *provably impossible* there and reporting it would name a
+  /// cause that cannot have occurred.
+  std::uint32_t table = 0;
   /// Non-retryable failures, summed over every round. Reported only by
   /// @ref VoxelHashMap::remove, where a block index that could not be returned
   /// to the free heap is unreachable capacity: neither in the table nor on the
@@ -69,7 +75,9 @@ struct AllocFailures {
 
   /// @return Whether growing the map could help: a genuine capacity limit was
   ///         hit, rather than only transient lock contention.
-  bool capacity_limited() const noexcept { return chain > 0 || heap > 0; }
+  bool capacity_limited() const noexcept {
+    return chain > 0 || heap > 0 || table > 0;
+  }
 };
 
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,

@@ -4,6 +4,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -164,6 +165,31 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
         "VoxelBlockGrid::resize: new_num_buckets must exceed the current "
         "count");
   }
+
+  // Validate the grown grid FIRST, against the same contract map_.resize will
+  // apply. It runs that check too -- but only after this function has already
+  // built every enlarged attribute buffer beside the live ones, which at the
+  // examples' defaults is gigabytes committed and then thrown away to report an
+  // invalid_argument the parameters could have been rejected on.
+  //
+  // This overlaps the maxStorageBufferRange guard below, and on real hardware
+  // that guard fires first -- an attribute array large enough to overflow the
+  // block-pointer bound is at least 8 GB, far past any device's binding limit.
+  // Kept anyway because it says something the other cannot: the grown grid is
+  // illegal *arithmetically*, on a machine of any size and a device of any
+  // limit, and it reports that rather than a limit the caller might read as
+  // "this hardware is too small".
+  VoxelGridParams grown_grid = grid;
+  grown_grid.num_buckets = new_num_buckets;
+  const std::int64_t grown_blocks =
+      static_cast<std::int64_t>(new_num_buckets) * grid.bucket_size;
+  if (grown_blocks > std::numeric_limits<std::int32_t>::max()) {
+    return Status::invalid_argument(
+        "VoxelBlockGrid::resize: new_num_buckets * bucket_size overflows a "
+        "signed 32-bit num_blocks");
+  }
+  grown_grid.num_blocks = static_cast<std::int32_t>(grown_blocks);
+  VR_TRY(grown_grid.validate());
 
   // The grown per-voxel count: new num_blocks = bucket_size * new_num_buckets
   // (the invariant VoxelHashMap::create validates), one attribute element per

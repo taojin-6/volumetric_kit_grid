@@ -309,6 +309,7 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
       out_failures->lock = slots[kFailLock];
       out_failures->chain = slots[kFailChain];
       out_failures->heap = slots[kFailHeap];
+      out_failures->table = slots[kFailTable];
       out_failures->terminal = terminal;
     }
     if (failures == 0) {

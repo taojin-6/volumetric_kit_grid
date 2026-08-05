@@ -284,6 +284,40 @@ int main() {
     CHECK(empty.ok() && empty.value().empty());
   }
 
+  // --- An impossible grow is rejected on the parameters, not after paying for
+  // it. resize() used to build every enlarged attribute buffer beside the live
+  // ones and only *then* call map_.resize, which validates -- so an
+  // arithmetically illegal grow committed the memory first and threw it away to
+  // report an invalid_argument. At this grid (bucket_size 8, 512 voxels/block)
+  // the request below is ~17 GB per attribute; the point is that it never
+  // reaches VMA.
+  //
+  // 2^20 buckets puts num_blocks * voxels_per_block past INT32_MAX, the bound
+  // BlockIndex::ptr must fit -- illegal regardless of how much memory the
+  // machine has, so this is deterministic rather than a resource test.
+  //
+  // Which of the two up-front guards rejects it is deliberately not asserted:
+  // the grid-contract check and the maxStorageBufferRange check both run before
+  // the allocation loop, and they cannot be separated on real hardware (an
+  // attribute array large enough to overflow the pointer bound is >= 8 GB, far
+  // past any device's binding limit). What is pinned is the property that
+  // matters -- rejected, before allocating, with the grid untouched.
+  {
+    const std::int32_t before_buckets = vbg.map().grid().num_buckets;
+    vr::Result<vol::AttributeView> before_tsdf = vbg.attribute("tsdf");
+    CHECK(before_tsdf.ok());
+    const std::uint64_t before_size = before_tsdf.value().buffer->size();
+
+    const vr::Status huge = vbg.resize(1 << 20);
+    CHECK(!huge.ok());
+    CHECK(huge.domain() == vr::Status::Code::InvalidArgument);
+    // All-or-nothing: the live grid is exactly as it was.
+    CHECK(vbg.map().grid().num_buckets == before_buckets);
+    vr::Result<vol::AttributeView> after_tsdf = vbg.attribute("tsdf");
+    CHECK(after_tsdf.ok());
+    CHECK(after_tsdf.value().buffer->size() == before_size);
+  }
+
   // --- attribute() refuses an array that no longer covers the live grid.
   // Resizing through the raw map() handle grows the table (preserving block
   // indices) and leaves the attribute arrays at their old size, so a block

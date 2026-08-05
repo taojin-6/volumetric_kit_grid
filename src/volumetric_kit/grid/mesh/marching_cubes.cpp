@@ -932,6 +932,16 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     device_mesh.sharing_mode = indirect().sharing_mode();
     device_mesh.generation = generation_;
     device_mesh.live_generation = &generation_;
+    if (timings != nullptr) {
+      // The arenas are retained across calls, so an extract that meshes
+      // nothing still costs whatever the ring is holding. Reporting 0 here read
+      // as "the extractor released its memory", which is the opposite of true
+      // -- and this is the instrument the ring's runaway growth was diagnosed
+      // with, so it is exactly the frame where a wrong figure misleads. The
+      // per-call counters below stay 0, which is honest: this call planned no
+      // capacity and emitted nothing.
+      timings->arena_bytes = resident_arena_bytes();
+    }
     return device_mesh;
   }
 

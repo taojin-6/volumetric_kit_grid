@@ -54,12 +54,26 @@ void main() {
     return;
   }
 
-  // Block world AABB: the min-corner voxel origin (coord * block_size *
-  // voxel_size) spanning one block edge. This sits a half-voxel below the
-  // block's voxel centres -- immaterial for a conservative, ~10%-widened cull.
+  // Block world AABB, over the volume the block's voxels actually occupy.
+  //
+  // Voxels are node-centred (voxel_to_world puts voxel v at v * voxel_size), so
+  // block b's voxels are centred over [b*bs*vs, b*bs*vs + (bs-1)*vs] and the
+  // volume they cover extends a half-voxel past each end. Taking the origin
+  // *centre* as bmin and adding one whole edge -- what this did -- is that box
+  // shifted +vs/2 on every axis.
+  //
+  // Not absorbed by the widening, which is the reason to fix it rather than
+  // note it: make_frustum_planes scales fx/fy by kSideMargin, so only the four
+  // *lateral* planes are loosened. Near and far are exact, and the shift is
+  // along +z, so it lands on them asymmetrically: the near test compares bmax
+  // and is merely loosened (over-inclusive, harmless), while the far test
+  // compares bmin and is *tightened* -- a block whose voxels lie within far_z
+  // but whose shifted bmin does not is culled while its surface is in view.
+  // A hole at the far edge of the working set, appearing only as geometry that
+  // never gets fused.
   ivec3 coord = entries[gid].pos;
   float edge = float(pc.grid.block_size) * pc.grid.voxel_size;
-  vec3 bmin = vec3(coord) * edge;
+  vec3 bmin = vec3(coord) * edge - vec3(0.5 * pc.grid.voxel_size);
   vec3 bmax = bmin + vec3(edge);
   if (!aabb_in_frustum(bmin, bmax)) {
     return;

@@ -72,7 +72,8 @@ const int kFailLock = 1;      // lock contention
 const int kFailChain = 2;     // collision chain full
 const int kFailHeap = 3;      // block heap empty
 const int kFailTerminal = 4;  // non-retryable; host accumulates across rounds
-const int kFailSlots = 5;
+const int kFailTable = 5;     // no free entry anywhere in the table
+const int kFailSlots = 6;
 
 // --- Push constants: the grid shape + one kernel-specific argument. ---
 layout(push_constant, scalar) uniform PushConstants {

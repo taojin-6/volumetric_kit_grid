@@ -465,11 +465,21 @@ int main() {
   CHECK(gen4.value().vertices != gen2.value().vertices);
 
   // Releasing an older generation than the newest reported must not un-release
-  // anything: the slot holding gen2 is still outstanding, so this stays
-  // refused.
-  ring.release_through(0);
+  // anything -- asserted where that is observable, which asserting a *refusal*
+  // was not: with gen2 still outstanding the ring had no free slot either way,
+  // so dropping the monotonic guard changed nothing and the check passed.
+  //
+  // Release the whole ring first, so the high-water mark alone is what makes
+  // the slots free (their stamps stay non-zero -- only the host `extract`
+  // overloads clear a stamp). Then report a stale older value. Monotonic, the
+  // mark stays put and the next extract succeeds; without std::max it drops to
+  // 0, every stamp is above it, and the entire already-released ring looks
+  // outstanding again -- a permanent stall.
+  ring.release_through(gen4.value().generation);
+  ring.release_through(gen2.value().generation);  // stale: older than the mark
+  ring.release_through(0);                        // and the oldest of all
   vr::Result<mesh::DeviceMesh> gen5 = ring.extract_device(small, 0.0f);
-  CHECK(!gen5.ok());
+  CHECK(gen5.ok());
 
   // The arena must not ratchet as the ring turns.
   //
