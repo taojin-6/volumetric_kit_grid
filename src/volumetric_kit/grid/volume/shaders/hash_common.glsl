@@ -11,6 +11,18 @@
 // are global and cannot be passed to functions, so each kernel declares only the
 // buffers it uses, and the lock/heap/allocate helpers live in the allocate
 // kernel that needs them.
+//
+// A kernel OUTSIDE the volume tier reaches this through hash_lookup.glsl, which
+// wants the struct layouts, the constants and computeHashPos but has push
+// constants of its own -- so the `pc` block below is opt-out via
+// VR_HASH_COMMON_NO_PUSH_CONSTANTS. Everything else is shared unconditionally,
+// which is the point: a second copy of these constants would compile clean, pass
+// spirv-val, and resolve neighbours from the wrong bucket the moment one of them
+// changed. The include guard is what lets a translation unit reach this both
+// directly and transitively.
+
+#ifndef VR_HASH_COMMON_GLSL
+#define VR_HASH_COMMON_GLSL
 
 #extension GL_EXT_scalar_block_layout : require
 
@@ -76,10 +88,18 @@ const int kFailTable = 5;     // no free entry anywhere in the table
 const int kFailSlots = 6;
 
 // --- Push constants: the grid shape + one kernel-specific argument. ---
+//
+// A GLSL translation unit may declare only ONE push-constant block, so a kernel
+// with push constants of its own defines VR_HASH_COMMON_NO_PUSH_CONSTANTS before
+// including this and passes the table shape as function arguments instead (see
+// hash_lookup.glsl). Nothing above this point reads `pc` -- the coord transforms
+// all take their VoxelGridParams as a parameter -- so opting out costs nothing.
+#ifndef VR_HASH_COMMON_NO_PUSH_CONSTANTS
 layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;
   uint arg;  // allocate: input coord count; compact: output capacity.
 } pc;
+#endif
 
 // Spatial hash: block coordinate -> bucket index (mirrors volume/hash.hpp).
 uint computeHashPos(ivec3 block, int num_buckets) {
@@ -122,3 +142,5 @@ int truncationBlocks(VoxelGridParams grid) {
   int blocks = int(ceil(grid.trunc_dist / block_extent));
   return blocks > 1 ? blocks : 1;
 }
+
+#endif  // VR_HASH_COMMON_GLSL

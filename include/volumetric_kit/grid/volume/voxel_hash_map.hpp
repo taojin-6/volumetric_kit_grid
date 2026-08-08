@@ -291,10 +291,27 @@ class VR_VOLUME_API VoxelHashMap {
   ///          accessor deliberately does not expose. A meshing pass qualifies
   ///          because it is quiescent by construction; a pass that also
   ///          allocates does not.
+  /// @warning **Do not cache the handle.** A completed @ref resize replaces the
+  ///          entry buffer outright -- the old allocation is destroyed, so a
+  ///          handle held in a persistent descriptor set then names freed
+  ///          memory, which is a validation-layer-only diagnostic and undefined
+  ///          with layers off. Both shipped examples resize mid-scan on
+  ///          block-heap overflow. Re-fetch on every use, exactly as @ref
+  ///          AttributeView requires across a @ref VoxelBlockGrid::resize; a
+  ///          move of the map has the same effect.
   /// @return The entry buffer, or `VK_NULL_HANDLE` on a moved-from map.
   VkBuffer entries_buffer() const noexcept;
 
-  /// @return Bytes in @ref entries_buffer, for a `VK_WHOLE_SIZE`-free binding.
+  /// @brief Bytes in @ref entries_buffer, for a `VK_WHOLE_SIZE`-free binding.
+  ///
+  /// Pair it with @ref entries_buffer: bind the range rather than
+  /// `VK_WHOLE_SIZE` so the consumer can check it against the device's
+  /// `maxStorageBufferRange` first. That limit matters here -- the table is
+  /// `num_buckets * bucket_size * sizeof(HashEntry)` and @ref resize doubles
+  /// `num_buckets`, while Vulkan guarantees only 2^27 (128 MiB), which is what
+  /// Android-class drivers report and no driver this repo tests on does.
+  /// @return The size in bytes, or 0 on a moved-from map (so the pair stays
+  ///         consistent: a null handle never carries a non-zero range).
   VkDeviceSize entries_buffer_size() const noexcept;
 
   /// @brief Compute occupancy + health statistics (active / overflow / chain

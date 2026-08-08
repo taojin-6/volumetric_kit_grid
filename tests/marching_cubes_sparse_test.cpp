@@ -398,6 +398,52 @@ int main() {
   CHECK(area > 0.80 * analytic_area);
   CHECK(area < 1.20 * analytic_area);
 
+  // --- The collision chain the on-device probe walks
+  // -------------------------- Everything above meshes through
+  // sphere_grid_params(), whose 8-entry buckets over 128 buckets never
+  // overflow: the 216 block coords reach a maximum bucket occupancy of 4, so
+  // allocate_in_overflow is never entered and NOT ONE entry is reachable only
+  // through a chain. That leaves the chain half of vrFindBlockPtr -- the
+  // subtlest code in the kernel, and the half that has no host-side counterpart
+  // to have been proven against -- executed by nothing. Measured, not assumed:
+  // replacing the chain walk with `return -1;` left this whole suite green, and
+  // every other suite too.
+  //
+  // Production is the overflow case (VoxelGridParams::defaults() is 50x30000
+  // with max_chain 128, and HashDiagnostics::overflow_count exists precisely
+  // because buckets fill), so mesh the SAME field through a table shaped to
+  // spill: 2-entry buckets make the last slot of each bucket its chain anchor,
+  // so a bucket holding two coords already pushes one into the chain. The block
+  // set, the field and therefore the surface are identical -- only the table
+  // geometry differs -- so the mesh must match the reference triangle for
+  // triangle. Under the mutation above it comes back short and returns
+  // Status::ok, which is the failure mode this exists to catch: surface
+  // silently missing at block seams.
+  vol::VoxelGridParams chained_gp = sphere_grid_params();
+  chained_gp.bucket_size = 2;
+  chained_gp.num_buckets = 512;  // num_blocks unchanged at 1024
+  vr::Result<vol::VoxelBlockGrid> chained_result = vol::VoxelBlockGrid::create(
+      device.value(), allocator.value(), chained_gp, attrs, 2);
+  CHECK(chained_result.ok());
+  vol::VoxelBlockGrid chained_grid = std::move(chained_result).value();
+  CHECK(fill_sphere_grid(chained_grid, /*with_color=*/false));
+
+  // The fixture only tests what it exercises, so assert that it spills before
+  // trusting what it proves -- otherwise a later change to the hash or to these
+  // numbers turns this case vacuous without failing.
+  vr::Result<vol::HashDiagnostics> chained_diag =
+      chained_grid.map().diagnostics();
+  CHECK(chained_diag.ok());
+  CHECK(chained_diag.value().overflow_count > 0);
+  CHECK(chained_diag.value().max_chain_length > 0);
+
+  vr::Result<mesh::Mesh> chained_mesh_result =
+      extractor.extract(chained_grid, 0.0f);
+  CHECK(chained_mesh_result.ok());
+  const mesh::Mesh chained_mesh = std::move(chained_mesh_result).value();
+  CHECK(chained_mesh.triangle_count() == sphere.triangle_count());
+  CHECK(canonical_triangles(chained_mesh) == canonical_triangles(sphere));
+
   // --- Cross-block colour interpolation --------------------------------------
   // A grid carrying a packed-RGB colour attribute set to the linear gradient:
   // each vertex's colour must match grad_color at that vertex's own position

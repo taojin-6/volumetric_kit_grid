@@ -34,14 +34,24 @@
 // Cross-tier: the one transfer curve, from core.
 #include "volumetric_kit/recon/core/shaders/color_common.glsl"
 
+// One workgroup per block. 256 is fixed rather than sized from
+// voxels_per_block, which is a push constant and so cannot set local_size
+// without a specialization constant. That is exact at the default block_size 8
+// (512 voxels = 2 cells per lane) and wasteful below it -- see the workgroup
+// note in main().
 layout(local_size_x = 256) in;
 
-// One active block: its block coordinate + the base index of its voxel run in
-// the attribute arrays (mirrors volume::BlockIndex).
-struct BlockIndex {
-  ivec3 coord;
-  int ptr;
-};
+// The hash entries + the read-only traversal that resolves a neighbouring
+// block's voxel-array base, which also supplies the shared BlockIndex /
+// HashEntry layouts and hash constants from the volume tier's hash_common.glsl
+// (one definition, not a mirror -- see hash_lookup.glsl). This binding used to
+// carry a host-built neighbour_ptr[block * 8 + octant] table, which cost an
+// O(active_blocks * 8) serial pass of unordered_map lookups on the CPU: 102 ms
+// of a 133 ms extract at 107k blocks on an M5 iPad Pro, against 26 ms for this
+// kernel's own dispatch. The table is built here instead, 8 probes per
+// workgroup.
+#define VR_HASH_ENTRIES_BINDING 2
+#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
 // One mesh vertex (mirrors mesh::Vertex).
 struct Vertex {
@@ -65,14 +75,7 @@ layout(set = 0, binding = 0, scalar) readonly buffer Tables {
 layout(set = 0, binding = 1, scalar) readonly buffer Active {
   BlockIndex active_blocks[];
 };
-// The hash entries, for resolving those neighbours on-device. This binding used
-// to carry a host-built neighbour_ptr[block * 8 + octant] table, which cost an
-// O(active_blocks * 8) serial pass of unordered_map lookups on the CPU: 102 ms of
-// a 133 ms extract at 107k blocks on an M5 iPad Pro, against 26 ms for this
-// kernel's own dispatch. The table is now built here instead, 8 probes per
-// workgroup.
-#define VR_HASH_ENTRIES_BINDING 2
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+// Binding 2 is the hash entries, declared by the hash_lookup.glsl include above.
 // Per-voxel SDF + integration weight (the tsdf tier's attributes), addressed by
 // BlockIndex::ptr + local. Color is the packed-RGB attribute (low three bytes,
 // unpackUnorm4x8 -> .rgb) read only when pc.has_color != 0 (else a dummy binds).
@@ -190,6 +193,19 @@ void mcCell(BlockIndex block, int bs, uint local) {
 void main() {
   int bs = pc.block_size;
   uint vpb = uint(pc.voxels_per_block);
+  // The workgroup's linear thread index, and its size. gl_LocalInvocationIndex
+  // rather than gl_LocalInvocationID.x, and the full dimension product rather
+  // than gl_WorkGroupSize.x, because the two agree only while local_size_y/z
+  // are 1. That is true today (the emitted SPIR-V is `LocalSize 256 1 1`) and
+  // nothing states it, so a later y/z dimension -- for the in-block vertex
+  // sharing that is this kernel's next step, or to cut the idle lanes noted
+  // below -- would silently race 8*Ny*Nz writers onto the 8 s_neighbour slots
+  // and re-mesh every voxel Ny*Nz times through the append atomic. Both forms
+  // compile; only this one stays correct.
+  uint tid = gl_LocalInvocationIndex;
+  uint group_threads =
+      gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+
   // One workgroup per block, NOT a flat voxel grid: shared memory is per
   // workgroup, so the neighbourhood can only be shared if every thread here
   // belongs to the same block.
@@ -200,8 +216,22 @@ void main() {
   BlockIndex block = active_blocks[block_i];
 
   // Threads 0..7 each resolve one octant. Octant 0 is this block, already known.
-  if (gl_LocalInvocationID.x < 8u) {
-    uint oi = gl_LocalInvocationID.x;
+  //
+  // TODO(mesh): this prologue, not an occupancy change, is what the on-device
+  // probe costs -- 8 of `group_threads` lanes each walking a bucket while the
+  // rest wait at the barrier, serialised ahead of every cell in the block. The
+  // dispatch measured +25% (25.9 -> 32.2 ms) on the M5 iPad Pro when the host
+  // table went away, and the flat grid it replaced was NOT more densely packed:
+  // at block_size 8, voxels_per_block is 512 = 2*256, so `gid / 512` was already
+  // constant across each 256-thread group and every workgroup belonged to one
+  // block. Only the group count changed (2 per block -> 1). So the levers are
+  // the probe -- spreading the 8 across subgroups, or one lane per bucket slot
+  // with a reduction -- not the cell or block count. Left unmeasured rather than
+  // guessed at; the repo's own lesson is to profile the phase before optimising
+  // it. Note that an early exit on the first free slot is NOT one of the levers:
+  // see the primary-scan note on vrFindBlockPtr.
+  if (tid < 8u) {
+    uint oi = tid;
     if (oi == 0u) {
       s_neighbour[0] = block.ptr;
     } else {
@@ -213,12 +243,23 @@ void main() {
   }
   barrier();
 
-  // Stride over the block's voxels rather than assuming one thread each: a
+  // Stride over the block's voxels rather than assuming one thread each: the
   // workgroup is a fixed 256 while voxels_per_block is block_size^3 from the
   // grid params, so this is correct for any block size instead of only 8 (512,
   // which would need a 512-thread workgroup and still break at 16).
-  for (uint local = gl_LocalInvocationID.x; local < vpb;
-       local += gl_WorkGroupSize.x) {
+  //
+  // Correct at any block size, but not equally efficient at one. Only
+  // voxels_per_block lanes ever enter this loop, so below block_size 8 most of
+  // the group idles -- 192 of 256 at block_size 4, 248 of 256 at block_size 2 --
+  // and the host's one-workgroup-per-block dispatch multiplies the group count
+  // by 256/voxels_per_block, which lowers the reachable active-block count
+  // against maxComputeWorkGroupCount[0] by the same factor (see the dispatch in
+  // marching_cubes.cpp). Both costs are booked rather than paid down: sizing the
+  // group from voxels_per_block needs a specialization constant plumbed through
+  // ComputePipeline::create, and every in-tree caller uses block_size 8, where
+  // this shape is a win. TODO(mesh): revisit if a consumer ships a smaller
+  // block.
+  for (uint local = tid; local < vpb; local += group_threads) {
     mcCell(block, bs, local);
   }
 }

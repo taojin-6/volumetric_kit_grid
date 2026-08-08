@@ -234,7 +234,16 @@ VkBuffer VoxelHashMap::entries_buffer() const noexcept {
 }
 
 VkDeviceSize VoxelHashMap::entries_buffer_size() const noexcept {
-  return static_cast<VkDeviceSize>(total_entries()) * sizeof(HashEntry);
+  // Gated on the same `valid()` as entries_buffer() one function above, not on
+  // grid_ alone: grid_ is a POD the defaulted move COPIES, so a moved-from map
+  // still knows its table shape while owning no buffer. Reporting the shape
+  // there would pair a VK_NULL_HANDLE with a non-zero range in exactly the
+  // descriptor write these two accessors exist to spell -- invalid usage this
+  // repo cannot detect (neither nullDescriptor nor robustBufferAccess is
+  // enabled), and one that looks well-formed in a debugger.
+  return entries_.valid()
+             ? static_cast<VkDeviceSize>(total_entries()) * sizeof(HashEntry)
+             : 0;
 }
 
 Status VoxelHashMap::init_table() {
