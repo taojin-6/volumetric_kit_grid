@@ -9,7 +9,6 @@
 #include <cstring>
 #include <numeric>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -113,12 +112,18 @@ struct SparsePushConstants {
   std::uint32_t capacity;
   float weight_threshold;
   std::uint32_t has_color;  // 0 = no color attribute; vertices get opaque white
+  // The hash-table shape, for the kernel's on-device neighbour probe. The
+  // sparse kernel resolves the 2x2x2 neighbourhood itself now, so it needs to
+  // traverse the table the same way the volume tier does.
+  std::int32_t num_buckets;
+  std::int32_t bucket_size;
+  std::int32_t max_chain;
 };
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
-// sizeof == 32 but silently drift the host<->GLSL push-constant ABI, so guard
+// sizeof == 44 but silently drift the host<->GLSL push-constant ABI, so guard
 // each one, matching the dense PushConstants above.
-static_assert(sizeof(SparsePushConstants) == 32,
-              "SparsePushConstants must be 32 bytes");
+static_assert(sizeof(SparsePushConstants) == 44,
+              "SparsePushConstants must be 44 bytes");
 static_assert(offsetof(SparsePushConstants, block_size) == 0,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, voxels_per_block) == 4,
@@ -135,18 +140,12 @@ static_assert(offsetof(SparsePushConstants, weight_threshold) == 24,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, has_color) == 28,
               "SparsePushConstants layout drift");
-
-// Hash a block coordinate for the host neighbour-lookup map. Reuses the volume
-// tier's spatial-hash prime constants (volume/hash.hpp) so the mixing matches
-// the device hash exactly; the map is a plain host container, not the device
-// table.
-struct CoordHash {
-  std::size_t operator()(const Vec3i& c) const noexcept {
-    return (static_cast<std::uint32_t>(c.x) * volume::kHashPrimeX) ^
-           (static_cast<std::uint32_t>(c.y) * volume::kHashPrimeY) ^
-           (static_cast<std::uint32_t>(c.z) * volume::kHashPrimeZ);
-  }
-};
+static_assert(offsetof(SparsePushConstants, num_buckets) == 32,
+              "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, bucket_size) == 36,
+              "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, max_chain) == 40,
+              "SparsePushConstants layout drift");
 
 // Bytes a vertex arena needs to hold @p capacity triangles (3 vertices each).
 std::uint64_t arena_bytes_for(std::uint32_t capacity) {
@@ -995,34 +994,20 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // across the ring. That is deliberate; see plan_capacity.
   const std::uint32_t capacity = plan_capacity(num_active, worst_case);
 
-  // Neighbour lookup: map each active block coordinate to its voxel-array base,
-  // then, per block, gather the eight pointers of its 2x2x2 +neighbourhood
-  // (octant = ox + 2*oy + 4*oz). -1 marks an unallocated neighbour, which the
-  // kernel treats as no-surface. Built host-side from the compacted set, so the
-  // kernel does no device-side hash probe.
+  // The neighbourhood is resolved in the kernel now, one workgroup per block,
+  // so there is no host pass here at all -- see marching_cubes_sparse.comp.
+  // This phase used to build an unordered_map of every active coord and do 8
+  // lookups per block, which measured 102 ms of a 133 ms extract at 107k
+  // blocks; the dispatch it fed was 26 ms. Kept as a zeroed timing rather than
+  // removed from ExtractTimings so a caller's read-out keeps its shape across
+  // this change and the phase's disappearance is visible as a 0 rather than a
+  // missing field.
   phase_clock.restart();
-  std::unordered_map<Vec3i, std::int32_t, CoordHash> ptr_by_coord;
-  ptr_by_coord.reserve(active.size() * 2);
-  for (const volume::BlockIndex& b : active) {
-    ptr_by_coord.emplace(b.coord, b.ptr);
-  }
-  std::vector<std::int32_t> neighbour_lut(static_cast<std::size_t>(num_active) *
-                                          8);
-  for (std::uint32_t i = 0; i < num_active; ++i) {
-    const Vec3i c = active[i].coord;
-    for (int oct = 0; oct < 8; ++oct) {
-      const Vec3i n = c + Vec3i(oct & 1, (oct >> 1) & 1, (oct >> 2) & 1);
-      const auto it = ptr_by_coord.find(n);
-      neighbour_lut[static_cast<std::size_t>(i) * 8 +
-                    static_cast<std::size_t>(oct)] =
-          it != ptr_by_coord.end() ? it->second : -1;
-    }
-  }
-
-  // Per-extract inputs: the active blocks + neighbour LUT (write-once), and the
-  // vertex arena + atomic counter out. Attribute buffers bind straight from the
-  // grid (no copy).
   if (timings != nullptr) timings->neighbour_lut_ms = phase_clock.lap();
+
+  // Per-extract inputs: the active blocks (write-once), and the vertex arena +
+  // atomic counter out. The hash entries and attribute buffers bind straight
+  // from the grid (no copy).
   VR_ASSIGN(Buffer active_buf,
             storage_buffer(*allocator_,
                            static_cast<VkDeviceSize>(num_active) *
@@ -1031,12 +1016,6 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   std::memcpy(
       active_buf.mapped(), active.data(),
       static_cast<std::size_t>(num_active) * sizeof(volume::BlockIndex));
-  VR_ASSIGN(
-      Buffer neighbour_buf,
-      storage_buffer(*allocator_, neighbour_lut.size() * sizeof(std::int32_t),
-                     HostAccess::SequentialWrite));
-  std::memcpy(neighbour_buf.mapped(), neighbour_lut.data(),
-              neighbour_lut.size() * sizeof(std::int32_t));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
   VR_TRY(ensure_output_buffers(capacity));
@@ -1044,7 +1023,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
 
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
                                           VK_WHOLE_SIZE);
-  kernel_sparse_.set.write_storage_buffer(2, neighbour_buf.handle(), 0,
+  kernel_sparse_.set.write_storage_buffer(2, grid.map().entries_buffer(), 0,
                                           VK_WHOLE_SIZE);
   kernel_sparse_.set.write_storage_buffer(3, tsdf_view.buffer->handle(), 0,
                                           VK_WHOLE_SIZE);
@@ -1086,11 +1065,16 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                    num_active,
                                    requested,
                                    kWeightThreshold,
-                                   has_color ? 1u : 0u};
-    VR_TRY(
-        dispatch(*device_, kernel_sparse_, &push, sizeof(push),
-                 group_count(static_cast<std::uint32_t>(threads), kLocalSize),
-                 max_workgroup_count_x_));
+                                   has_color ? 1u : 0u,
+                                   gp.num_buckets,
+                                   gp.bucket_size,
+                                   gp.max_chain};
+    // One workgroup per block, not one thread per voxel: the kernel resolves
+    // the block's 2x2x2 neighbourhood into shared memory, which only works when
+    // every thread in the group belongs to the same block. Each group then
+    // strides over the block's voxels, so this is independent of block_size.
+    VR_TRY(dispatch(*device_, kernel_sparse_, &push, sizeof(push), num_active,
+                    max_workgroup_count_x_));
     if (timings != nullptr) {
       timings->dispatch_ms += phase_clock.lap();
       ++timings->dispatches;

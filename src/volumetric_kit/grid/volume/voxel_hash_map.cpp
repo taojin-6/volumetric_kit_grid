@@ -229,6 +229,14 @@ std::uint32_t VoxelHashMap::total_entries() const noexcept {
          static_cast<std::uint32_t>(grid_.bucket_size);
 }
 
+VkBuffer VoxelHashMap::entries_buffer() const noexcept {
+  return entries_.valid() ? entries_.handle() : VK_NULL_HANDLE;
+}
+
+VkDeviceSize VoxelHashMap::entries_buffer_size() const noexcept {
+  return static_cast<VkDeviceSize>(total_entries()) * sizeof(HashEntry);
+}
+
 Status VoxelHashMap::init_table() {
   const std::uint32_t widest =
       std::max({total_entries(), static_cast<std::uint32_t>(grid_.num_blocks),
