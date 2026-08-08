@@ -61,11 +61,18 @@ struct AllocFailures {
   std::uint32_t lock = 0;   ///< Lost bucket-lock races: contention, not size.
   std::uint32_t chain = 0;  ///< Collision chain full: a capacity limit.
   std::uint32_t heap = 0;   ///< Block heap empty: a capacity limit.
-  /// No free entry anywhere in the table: a capacity limit, and a distinct one.
-  /// Kept apart from @ref heap because the two are not interchangeable -- the
-  /// rehash path presets each block's pointer and never touches the heap, so
-  /// @ref heap is *provably impossible* there and reporting it would name a
-  /// cause that cannot have occurred.
+  /// No free non-anchor slot within the overflow probe window: a capacity
+  /// limit, and a distinct one. Kept apart from @ref heap because the two are
+  /// not interchangeable -- the rehash path presets each block's pointer and
+  /// never touches the heap, so @ref heap is *provably impossible* there and
+  /// reporting it would name a cause that cannot have occurred.
+  ///
+  /// "Near this bucket", not "anywhere": the probe is bounded (see
+  /// `kMaxOverflowProbes`) because the exhaustive scan it replaced took a
+  /// contended atomic per slot and hung the GPU at high occupancy. So this is
+  /// evidence of pressure rather than proof of exhaustion, and a table that is
+  /// merely *clustered* can report it. The response is unchanged -- growing
+  /// both adds slots and disperses the clustering.
   std::uint32_t table = 0;
   /// Non-retryable failures, summed over every round. Reported only by
   /// @ref VoxelHashMap::remove, where a block index that could not be returned

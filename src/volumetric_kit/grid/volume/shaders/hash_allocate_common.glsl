@@ -137,7 +137,13 @@ int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
 }
 
 // Returns -1 on success, else kFailHeap (no block left on the heap) or
-// kFailTable (scanned every entry and found no free non-anchor slot).
+// kFailTable (found no free non-anchor slot within kMaxOverflowProbes).
+//
+// The probe is bounded, which makes kFailTable weaker than it reads: it means
+// "no free slot near this bucket", not "the table is full". That is deliberate
+// -- see kMaxOverflowProbes -- and it does not change what a caller should do,
+// since growing is the response to either. It does mean the count is a signal of
+// pressure rather than proof of exhaustion.
 int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
                          int preset_ptr) {
   uint bucket_size = uint(pc.grid.bucket_size);
@@ -145,7 +151,11 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
   uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
   uint target_idx = bucket_start + bucket_size;
 
-  for (uint attempts = 0u; attempts < total_entries; ++attempts) {
+  // min() so a table smaller than the probe window is still scanned exactly
+  // once rather than several times over: the wrap below would otherwise re-test
+  // the same slots, turning a cheap definitive "full" into needless work.
+  uint probes = min(total_entries, kMaxOverflowProbes);
+  for (uint attempts = 0u; attempts < probes; ++attempts) {
     if (target_idx >= total_entries) {
       target_idx = 0u;
     }
@@ -195,9 +205,9 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
     }
     ++target_idx;
   }
-  // Every entry scanned and none free: the table is full. NOT kFailHeap, which
-  // it used to report -- and which is provably impossible on the rehash path,
-  // where preset_ptr is set and the heap is never consulted at all.
+  // Probe window exhausted with nothing free near this bucket. NOT kFailHeap,
+  // which this used to report -- and which is provably impossible on the rehash
+  // path, where preset_ptr is set and the heap is never consulted at all.
   return kFailTable;
 }
 

@@ -252,6 +252,70 @@ int main() {
             static_cast<VkDeviceSize>(grid.bucket_size) *
             sizeof(vol::HashEntry));
 
+  // --- The overflow probe is bounded, but not so tight it refuses room
+  // -------- allocate_in_overflow probes at most kMaxOverflowProbes (256) slots
+  // instead of scanning the whole table, because the exhaustive scan took a
+  // contended atomic per slot and hung the GPU at high occupancy. The risk that
+  // introduces is the opposite failure: giving up while free slots exist. This
+  // pins that it does not.
+  //
+  // The table above cannot show it -- 32 entries is smaller than the probe
+  // window, so `min(total_entries, kMaxOverflowProbes)` makes it behave exactly
+  // as the unbounded version did. This one is deliberately *larger* than the
+  // window (2048 entries), and drives one bucket's overflow chain to nearly
+  // max_chain so ~120 inserts must each find a free slot by probing past a
+  // growing run of occupied ones. Occupancy stays ~6%, so every one of them is
+  // a slot the old scan would have found and the bounded probe must too.
+  {
+    vol::VoxelGridParams pg{};
+    pg.voxel_size = 0.005f;
+    pg.block_size = 8;
+    pg.voxels_per_block = 512;
+    pg.trunc_dist = 0.04f;
+    pg.bucket_size = 8;
+    pg.num_buckets = 256;
+    pg.num_blocks = 2048;  // bucket_size * num_buckets, > kMaxOverflowProbes
+    pg.max_chain = 128;
+
+    vr::Result<vol::VoxelHashMap> pmap_result =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), pg);
+    CHECK(pmap_result.ok());
+    vol::VoxelHashMap pmap = std::move(pmap_result).value();
+
+    // 120 coords on one bucket: under max_chain (128), so the chain itself is
+    // never the limit and any failure here is the probe giving up.
+    const std::size_t kDeepChain = 120;
+    std::vector<vol::BlockIndex> pc_coords;
+    for (int x = 1; pc_coords.size() < kDeepChain; ++x) {
+      vr::Vec3i coord(x, 7, 3);
+      if (vol::hash_bucket(coord, pg.num_buckets) == 0u) {
+        vol::BlockIndex block{};
+        block.coord = coord;
+        pc_coords.push_back(block);
+      }
+    }
+
+    // One per dispatch, as above: a single dispatch of same-bucket coords
+    // contends the spin lock and legitimately reports retryable failures, which
+    // would muddle what this is measuring.
+    for (const vol::BlockIndex& block : pc_coords) {
+      vol::AllocFailures pf{};
+      vr::Result<std::uint32_t> f = pmap.allocate(&block, 1, &pf);
+      CHECK(f.ok() && f.value() == 0);
+      // The point of the test: no slot was refused while the table was 94%
+      // free.
+      CHECK(pf.table == 0);
+      CHECK(!pf.capacity_limited());
+    }
+
+    // And all of them are actually there -- a probe that silently placed two
+    // coords in one slot, or dropped one, would show up as a short active set.
+    vr::Result<std::vector<vol::BlockIndex>> pactive =
+        pmap.compact_active_blocks();
+    CHECK(pactive.ok());
+    CHECK(pactive.value().size() == kDeepChain);
+  }
+
   // --- Move-only ------------------------------------------------------------
   // Move-construct: the source empties, the destination lives.
   vol::VoxelHashMap moved = std::move(map);
