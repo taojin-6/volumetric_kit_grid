@@ -27,12 +27,10 @@ layout(set = 0, binding = 2) coherent buffer HeapCounter { uint heap_counter; };
 layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
 
-// Fail-reason slots (mirror hash_ops.metal): [0]=total, [1]=lock contention,
-// [2]=chain full, [3]=heap empty.
-const int kFailTotal = 0;
-const int kFailLock = 1;
-const int kFailChain = 2;
-const int kFailHeap = 3;
+// The fail-reason slots (kFailTotal / kFailLock / kFailChain / kFailHeap) come
+// from hash_common.glsl -- the delete kernel reports through the same buffer,
+// so the slot layout is shared rather than owned by this header. Every failure
+// an allocate kernel reports is retryable, so none of them touch kFailTerminal.
 
 const uint kHeapEmpty = 0xFFFFFFFFu;
 
@@ -116,12 +114,17 @@ bool block_exists(ivec3 coord) {
   return false;
 }
 
-bool allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
+// Returns -1 on success, else the fail reason. Reporting the *reason* rather
+// than a bool is what keeps the report honest: the only way this fails is an
+// empty heap, and the only way allocate_in_overflow fails is an empty heap OR a
+// table with no free entry -- two different answers to "should the caller grow
+// the map", which the caller now acts on (AllocFailures::capacity_limited).
+int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
   int voxel_block_ptr = preset_ptr;
   if (preset_ptr == kNoPresetPtr) {
     uint block_idx = consume_heap();
     if (block_idx == kHeapEmpty) {
-      return false;
+      return kFailHeap;
     }
     voxel_block_ptr = int(block_idx * uint(pc.grid.voxels_per_block));
   }
@@ -130,11 +133,13 @@ bool allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
   entries[first_empty].offset = kNoOffset;
   memoryBarrierBuffer();  // pos/offset visible before ptr becomes non-free
   atomicExchange(entries[first_empty].ptr, voxel_block_ptr);
-  return true;
+  return -1;
 }
 
-bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
-                          int preset_ptr) {
+// Returns -1 on success, else kFailHeap (no block left on the heap) or
+// kFailTable (scanned every entry and found no free non-anchor slot).
+int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
+                         int preset_ptr) {
   uint bucket_size = uint(pc.grid.bucket_size);
   uint total_entries = uint(pc.grid.num_buckets) * bucket_size;
   uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
@@ -168,7 +173,7 @@ bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
           if (target_bucket != hash_bucket) {
             unlock_bucket(target_bucket);
           }
-          return false;
+          return kFailHeap;
         }
         voxel_block_ptr = int(block_idx * uint(pc.grid.voxels_per_block));
       }
@@ -182,7 +187,7 @@ bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
       if (target_bucket != hash_bucket) {
         unlock_bucket(target_bucket);
       }
-      return true;
+      return -1;
     }
 
     if (target_bucket != hash_bucket) {
@@ -190,7 +195,10 @@ bool allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
     }
     ++target_idx;
   }
-  return false;
+  // Every entry scanned and none free: the table is full. NOT kFailHeap, which
+  // it used to report -- and which is provably impossible on the rehash path,
+  // where preset_ptr is set and the heap is never consulted at all.
+  return kFailTable;
 }
 
 // Insert `coord` if absent, giving its block `preset_ptr` (or kNoPresetPtr to
@@ -257,15 +265,17 @@ int insert_block(ivec3 coord, int preset_ptr) {
     bool chain_at_limit = (chain_hops >= pc.grid.max_chain - 1);
     bool success = false;
     if (first_empty != -1) {
-      success = allocate_in_primary(uint(first_empty), coord, preset_ptr);
+      int reason = allocate_in_primary(uint(first_empty), coord, preset_ptr);
+      success = (reason < 0);
       if (!success) {
-        last_fail = kFailHeap;
+        last_fail = reason;
       }
     } else if (!chain_at_limit) {
-      success =
+      int reason =
           allocate_in_overflow(hash_bucket, bucket_start, coord, preset_ptr);
+      success = (reason < 0);
       if (!success) {
-        last_fail = kFailHeap;
+        last_fail = reason;
       }
     } else {
       last_fail = kFailChain;

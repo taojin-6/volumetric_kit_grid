@@ -436,8 +436,11 @@ class VR_MESH_API MarchingCubes {
   ///         a non-OK @ref Status: @ref Status::Code::InvalidArgument for a
   ///         moved-from extractor, a moved-from @p grid, or a grid missing a
   ///         `float` `tsdf`/`weight` attribute, if the active set is too large
-  ///         for a single 1-D dispatch, or if the surface needs a vertex arena
-  ///         past the device's `maxStorageBufferRange`; @ref
+  ///         for a single 1-D dispatch, or if the surface's *measured* triangle
+  ///         count needs a vertex arena past the device's
+  ///         `maxStorageBufferRange` (the predicted capacity is clamped to that
+  ///         limit rather than rejected, so an over-estimate costs one refit
+  ///         dispatch instead of failing an extract that would have fit); @ref
   ///         Status::Code::OutOfMemory if the refitted arena overflowed again
   ///         (see @ref ExtractTimings::dispatches); a backend error if a buffer
   ///         or the dispatch fails.

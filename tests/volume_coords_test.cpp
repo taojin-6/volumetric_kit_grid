@@ -6,6 +6,7 @@
 // round-half-to-even tie-breaking, the truncation-band width, and params
 // validation. Pure host math -- no device -- so it always runs.
 
+#include <cstdint>
 #include <cstdio>
 
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -107,6 +108,63 @@ int main() {
   bad = grid;
   bad.voxels_per_block = 511;  // != 8^3, a stale precomputed value.
   CHECK(!bad.validate().ok());
+
+  // --- validate() must not be defeated by the arithmetic it validates with.
+  // Each of these passed before the products were bounded/widened, and each
+  // reaches the kernels as a grid the buffer sizing and the block-pointer math
+  // are computed from.
+
+  // block_size^3 must be bounded BEFORE it is cubed: 2048^3 is 2^33, which
+  // wraps to exactly 0 in a signed 32-bit multiply, so voxels_per_block == 0
+  // agreed with it -- and every block then aliases pointer 0 (they would share
+  // one voxel range) while the host divides by it. Signed overflow is also UB
+  // in the function whose job is rejecting bad input, which the repo's own
+  // -fno-sanitize-recover UBSan leg turns into a hard abort.
+  bad = grid;
+  bad.block_size = 2048;
+  bad.voxels_per_block = 0;
+  CHECK(!bad.validate().ok());
+  // 1291^3 wraps NEGATIVE, which also slipped the int64 block-pointer check
+  // below it (a negative product is never > INT32_MAX).
+  bad = grid;
+  bad.block_size = 1291;
+  // Spelled through unsigned arithmetic because the signed literal would be a
+  // compile-time overflow (-Winteger-overflow, and this repo builds -Werror) --
+  // which is the same overflow validate() used to perform at runtime.
+  constexpr std::uint32_t kEdge = 1291;
+  bad.voxels_per_block =
+      static_cast<std::int32_t>(kEdge * kEdge * kEdge);  // wraps negative
+  CHECK(bad.voxels_per_block < 0);
+  CHECK(!bad.validate().ok());
+  // (The bound is not over-tight: the default block_size of 8 passes above.
+  // 1290 is the largest cube that fits an int32, but no grid can actually use
+  // it -- the smallest legal block pool is 2, and 2 * 1290^3 overflows the
+  // block-pointer check below it, so that edge is unreachable either way.)
+
+  // num_blocks must be compared through a WIDENED product. The narrow one wraps
+  // exactly as the uint32 multiply in VoxelHashMap::resize did, so both sides
+  // agreed on the wrapped value, the guard could never fire, and the 64-bit
+  // block-pointer check below it was dodged: 85899346 * 50 wraps to 4.
+  bad = grid;
+  bad.bucket_size = 50;
+  bad.num_buckets = 85899346;
+  bad.num_blocks = static_cast<std::int32_t>(
+      static_cast<std::uint32_t>(85899346) * static_cast<std::uint32_t>(50));
+  CHECK(bad.num_blocks == 4);  // the wrap this used to agree with
+  CHECK(!bad.validate().ok());
+
+  // bucket_size == 1 makes every slot in the table its own bucket's chain
+  // anchor, and allocate_in_overflow skips anchors -- so overflow insertion is
+  // a guaranteed no-op and the first colliding pair fails forever, which a
+  // caller reads as capacity pressure and answers by growing until it is out of
+  // memory. Rejected as the degenerate shape it is; 2 is the smallest usable.
+  bad = grid;
+  bad.bucket_size = 1;
+  bad.num_blocks = bad.num_buckets;
+  CHECK(!bad.validate().ok());
+  bad.bucket_size = 2;
+  bad.num_blocks = 2 * bad.num_buckets;
+  CHECK(bad.validate().ok());
 
   std::printf("recon volume coords test passed\n");
   return 0;

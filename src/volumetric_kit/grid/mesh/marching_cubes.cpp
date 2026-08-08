@@ -154,6 +154,13 @@ std::uint64_t arena_bytes_for(std::uint32_t capacity) {
          sizeof(Vertex);
 }
 
+// The inverse: the most triangles an arena may hold under a binding-range
+// limit. Never zero for any conformant device -- Vulkan's guaranteed floor of
+// 2^27 covers 699050 triangles at 192 B each.
+std::uint64_t max_triangles_for(std::uint64_t max_range) {
+  return max_range / (kIndicesPerTriangle * sizeof(Vertex));
+}
+
 // Read the atomic triangle count back and copy the emitted vertices into a
 // Mesh with the trivial 0,1,2,... index run (independent triangles; a later
 // shared-vertex dedup can shrink `vertices` without changing the Mesh
@@ -243,7 +250,23 @@ std::uint32_t MarchingCubes::plan_capacity(std::uint32_t num_active,
   // remeshes). A purely positional invariant inside a 340-line function is one
   // reordering away from coming back; with the floor deleted the plan reads no
   // slot at all and cannot compound in any call order.
-  return static_cast<std::uint32_t>(std::min(estimate, worst_case));
+  //
+  // Bounded below the device's binding limit too, and that is a *clamp rather
+  // than a rejection* on purpose. This number is a guess -- a density measured
+  // on the previous call, scaled by this one's active set -- so rejecting it
+  // fails extracts whose real surface fits: on a driver at Vulkan's guaranteed
+  // 2^27 the seed density plans 704000 triangles for 11000 blocks against a
+  // ceiling of 699050, for a surface that emits ~660000 and would have been
+  // fine. Worse, it failed *permanently*: tris_per_block_ is written only on
+  // the success path, so the estimate never corrected, and a scan's active set
+  // only grows, so every later extract recomputed the same rejected number.
+  // Clamped instead, the dispatch runs, the kernel reports the field's true
+  // total, and an arena that genuinely cannot fit is rejected by
+  // ensure_output_buffers against that *measured* count -- which is what the
+  // error has always claimed to mean.
+  const std::uint64_t device_cap = max_triangles_for(max_storage_buffer_range_);
+  return static_cast<std::uint32_t>(
+      std::min({estimate, worst_case, device_cap}));
 }
 
 Status MarchingCubes::claim_output_slot() {
@@ -908,6 +931,17 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     device_mesh.indirect_usage = indirect().usage();
     device_mesh.sharing_mode = indirect().sharing_mode();
     device_mesh.generation = generation_;
+    device_mesh.live_generation = &generation_;
+    if (timings != nullptr) {
+      // The arenas are retained across calls, so an extract that meshes
+      // nothing still costs whatever the ring is holding. Reporting 0 here read
+      // as "the extractor released its memory", which is the opposite of true
+      // -- and this is the instrument the ring's runaway growth was diagnosed
+      // with, so it is exactly the frame where a wrong figure misleads. The
+      // per-call counters below stay 0, which is honest: this call planned no
+      // capacity and emitted nothing.
+      timings->arena_bytes = resident_arena_bytes();
+    }
     return device_mesh;
   }
 
@@ -1146,6 +1180,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   device_mesh.triangle_count = emitted;
   device_mesh.vertex_count = emitted * kIndicesPerTriangle;
   device_mesh.generation = generation_;
+  device_mesh.live_generation = &generation_;
   if (timings != nullptr) {
     timings->active_blocks = num_active;
     timings->triangle_capacity = requested;

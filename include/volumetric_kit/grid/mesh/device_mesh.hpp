@@ -93,6 +93,36 @@ struct DeviceMesh {
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.
   std::uint64_t generation = 0;
+  /// Points at the producer's live extract counter, so @ref is_current can
+  /// compare @ref generation against it. Null on a default-constructed view.
+  ///
+  /// A *pointer* rather than a copy is the whole point: a copied number is the
+  /// snapshot @ref generation already is, and says nothing about whether the
+  /// producer has moved on. Non-owning, and it points into the producing
+  /// object, so it borrows the producer's lifetime and address exactly as the
+  /// buffer handles borrow its storage -- a view must not outlive its producer,
+  /// and must not be held across a move of it.
+  const std::uint64_t* live_generation = nullptr;
+
+  /// @return `true` when this view still names what the producer holds -- i.e.
+  ///         no later extract has overwritten, regrown, or freed the buffers.
+  ///
+  /// The check every consumer needs before it *uses* these handles, not only
+  /// before it copies them out. A stale view is not merely out of date: an
+  /// extract that grows the arena destroys the old `VkBuffer` synchronously, so
+  /// binding a superseded view is a use-after-free of a Vulkan object --
+  /// undefined with validation layers off, which is the shipping configuration
+  /// and the only one available on iOS. Without a grow it is quieter and still
+  /// wrong: the pass reads or rewrites the *current* extract's geometry under
+  /// this view's stale counts.
+  ///
+  /// Comparing buffer handles cannot substitute for this. The producer reuses
+  /// one grow-only arena per slot, so a superseded view names the very same
+  /// `VkBuffer` as the live one and compares equal while the contents have been
+  /// replaced.
+  bool is_current() const noexcept {
+    return live_generation != nullptr && *live_generation == generation;
+  }
 
   /// @return `true` when the mesh has no triangles.
   bool empty() const noexcept { return triangle_count == 0; }

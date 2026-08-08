@@ -4,10 +4,13 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "volumetric_kit/recon/core/compute_util.hpp"
+#include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
 
 namespace volumetric_kit::recon::volume {
@@ -76,10 +79,27 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
     }
   }
 
-  VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
-  VoxelBlockGrid vbg(std::move(map), &allocator);
+  const VkDeviceSize max_range =
+      max_storage_buffer_range(device.physical_device());
 
+  // Check every attribute against the binding limit before building the map or
+  // allocating anything, for the same reason the spec validation above runs
+  // first: these are the largest allocations in the repo, and rejecting one
+  // after the others have been made wastes gigabytes. Bound here rather than at
+  // the consumers because this is where the size is chosen -- tsdf integration
+  // and meshing bind these VK_WHOLE_SIZE, so what they could check is the same
+  // number decided here.
   const std::uint64_t elements = voxel_count(grid);
+  for (std::size_t i = 0; i < attr_count; ++i) {
+    const auto bytes = static_cast<VkDeviceSize>(elements) *
+                       static_cast<VkDeviceSize>(attrs[i].element_size);
+    VR_TRY(check_storage_buffer_range("VoxelBlockGrid::create: attribute array",
+                                      bytes, max_range));
+  }
+
+  VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
+  VoxelBlockGrid vbg(std::move(map), &allocator, max_range);
+
   vbg.attributes_.reserve(attr_count);
   for (std::size_t i = 0; i < attr_count; ++i) {
     const AttributeSpec& spec = attrs[i];
@@ -100,10 +120,24 @@ Result<AttributeView> VoxelBlockGrid::attribute(std::string_view name) const {
   for (const Attribute& attr : attributes_) {
     if (attr.name == name) {
       // element_count is derived from the buffer this view carries, not the
-      // live grid, so it always matches attr.buffer and never inflates past it
-      // if the map is later resized (see VoxelBlockGrid::map()).
-      return AttributeView{&attr.buffer, attr.element_size,
-                           attr.buffer.size() / attr.element_size};
+      // live grid, so it always matches attr.buffer and never inflates past it.
+      const std::uint64_t count = attr.buffer.size() / attr.element_size;
+      // ...and *because* it describes the buffer rather than the grid, it is
+      // also what makes the two comparable. Every consumer that binds an
+      // attribute comes through here, so this is the one place a desync can be
+      // caught -- and it has to be caught, because both consumers bind
+      // VK_WHOLE_SIZE over the stale, smaller buffer while the kernels address
+      // it by BlockIndex::ptr derived from the grown grid, and
+      // robustBufferAccess is enabled nowhere. Only VoxelHashMap::resize
+      // reached through map() can produce this; VoxelBlockGrid::resize grows
+      // both sides together.
+      if (count < voxel_count(map_.grid())) {
+        return Status::invalid_argument(
+            "VoxelBlockGrid::attribute: the attribute array is smaller than "
+            "the live grid's num_blocks * voxels_per_block -- the map was "
+            "resized through map() instead of VoxelBlockGrid::resize");
+      }
+      return AttributeView{&attr.buffer, attr.element_size, count};
     }
   }
   return Status::invalid_argument(
@@ -132,6 +166,31 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
         "count");
   }
 
+  // Validate the grown grid FIRST, against the same contract map_.resize will
+  // apply. It runs that check too -- but only after this function has already
+  // built every enlarged attribute buffer beside the live ones, which at the
+  // examples' defaults is gigabytes committed and then thrown away to report an
+  // invalid_argument the parameters could have been rejected on.
+  //
+  // This overlaps the maxStorageBufferRange guard below, and on real hardware
+  // that guard fires first -- an attribute array large enough to overflow the
+  // block-pointer bound is at least 8 GB, far past any device's binding limit.
+  // Kept anyway because it says something the other cannot: the grown grid is
+  // illegal *arithmetically*, on a machine of any size and a device of any
+  // limit, and it reports that rather than a limit the caller might read as
+  // "this hardware is too small".
+  VoxelGridParams grown_grid = grid;
+  grown_grid.num_buckets = new_num_buckets;
+  const std::int64_t grown_blocks =
+      static_cast<std::int64_t>(new_num_buckets) * grid.bucket_size;
+  if (grown_blocks > std::numeric_limits<std::int32_t>::max()) {
+    return Status::invalid_argument(
+        "VoxelBlockGrid::resize: new_num_buckets * bucket_size overflows a "
+        "signed 32-bit num_blocks");
+  }
+  grown_grid.num_blocks = static_cast<std::int32_t>(grown_blocks);
+  VR_TRY(grown_grid.validate());
+
   // The grown per-voxel count: new num_blocks = bucket_size * new_num_buckets
   // (the invariant VoxelHashMap::create validates), one attribute element per
   // voxel of the pool.
@@ -148,6 +207,17 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
   // addressed and the tail stays zero for future blocks. Commit only once the
   // map resize succeeds -- and map_.resize is itself all-or-nothing -- so a
   // failure leaves the grid untouched.
+  // Every doubling takes the arrays further past the binding limit, so the
+  // grown size is checked exactly as the initial one is -- before any of the
+  // (potentially multi-GB) allocations below.
+  for (const Attribute& attr : attributes_) {
+    const auto new_bytes = static_cast<VkDeviceSize>(new_elements) *
+                           static_cast<VkDeviceSize>(attr.element_size);
+    VR_TRY(check_storage_buffer_range(
+        "VoxelBlockGrid::resize: grown attribute array", new_bytes,
+        max_storage_buffer_range_));
+  }
+
   std::vector<Buffer> grown;
   grown.reserve(attributes_.size());
   for (const Attribute& attr : attributes_) {
@@ -165,6 +235,70 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
   VR_TRY(map_.resize(new_num_buckets));
   for (std::size_t i = 0; i < attributes_.size(); ++i) {
     attributes_[i].buffer = std::move(grown[i]);
+  }
+  return {};
+}
+
+Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
+                                             std::uint32_t count,
+                                             AllocFailures* out_failures) {
+  if (!valid()) {
+    return Status::invalid_argument("VoxelBlockGrid::remove: moved-from grid");
+  }
+  if (count == 0) {
+    return std::uint32_t{0};
+  }
+  if (coords == nullptr) {
+    return Status::invalid_argument("VoxelBlockGrid::remove: coords is null");
+  }
+
+  // Resolve each coord to the block pointer it currently holds. The map keys
+  // coords to pointers on the device, and the compacted active set is the
+  // existing way to read that mapping out -- no new kernel, and the dispatch is
+  // quiescent between calls, so the snapshot is exact. Only needed when the
+  // grid actually carries attributes.
+  if (!attributes_.empty()) {
+    VR_ASSIGN(std::vector<BlockIndex> active, map_.compact_active_blocks());
+    const auto voxels_per_block =
+        static_cast<std::uint64_t>(map_.grid().voxels_per_block);
+    for (std::uint32_t i = 0; i < count; ++i) {
+      for (const BlockIndex& block : active) {
+        if (block.coord != coords[i].coord) {
+          continue;
+        }
+        // Zero this block's slice of every attribute. The buffers are
+        // host-visible and mapped, and remove() is synchronous, so this is a
+        // plain memset rather than a fill dispatch.
+        const auto first = static_cast<std::uint64_t>(block.ptr);
+        for (Attribute& attr : attributes_) {
+          const std::uint64_t offset = first * attr.element_size;
+          const std::uint64_t bytes = voxels_per_block * attr.element_size;
+          if (offset + bytes > attr.buffer.size()) {
+            continue;  // an out-of-lockstep array; attribute() reports it
+          }
+          std::memset(static_cast<std::uint8_t*>(attr.buffer.mapped()) + offset,
+                      0, static_cast<std::size_t>(bytes));
+        }
+        break;
+      }
+    }
+  }
+
+  return map_.remove(coords, count, out_failures);
+}
+
+Status VoxelBlockGrid::clear() {
+  if (!valid()) {
+    return Status::invalid_argument("VoxelBlockGrid::clear: moved-from grid");
+  }
+  // Order matters only in that both must happen; the map clear is the one that
+  // can fail, so run it first and leave the attributes untouched if it does --
+  // zeroed attributes under a still-populated table would read as fused blocks
+  // that lost their data.
+  VR_TRY(map_.clear());
+  for (Attribute& attr : attributes_) {
+    std::memset(attr.buffer.mapped(), 0,
+                static_cast<std::size_t>(attr.buffer.size()));
   }
   return {};
 }

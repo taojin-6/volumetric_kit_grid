@@ -17,11 +17,20 @@
 // lock-free "absent" read would silently drop the delete. Every search here is
 // therefore authoritative under the bucket lock.
 //
-// Voxel-data clearing (the Metal path zeroed SDF/color on free) is deferred
-// until the tsdf tier lands the SDF block buffer -- there is no voxel data to
-// clear yet.
-// TODO: clear the freed block's SDF/color once the tsdf tier lands the SDF
-// buffer.
+// Voxel-data clearing (the Metal path zeroed SDF/color on free) is NOT done
+// here, and deliberately so: this kernel belongs to the block index, which
+// under the SoA decision (2026-07-05) does not know what per-voxel attribute
+// arrays -- if any -- a consumer declared, so it has nothing to bind and clear.
+// The clearing lives one tier up with the side that owns both halves, in
+// VoxelBlockGrid::remove / ::clear, which zero the freed blocks' attribute
+// ranges before the index goes back to the heap. That matters because the heap
+// is LIFO: the very next allocation re-draws the index just freed onto the
+// identical attribute range, so an uncleared block resurrects the old surface's
+// tsdf/weight at full weight and defeats the integrator's
+// first-observation-assigns colour gate.
+//
+// Reaching remove() through VoxelBlockGrid::map() therefore bypasses the
+// clearing; that is why the raw handle documents it.
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
@@ -58,14 +67,22 @@ void unlock_bucket(uint bucket) {
 }
 
 // Return a freed block index to the heap. A block that cannot be returned is a
-// capacity leak, so both exits without an append bump fail_count[0] rather than
-// dropping the block silently: the entry is already gone from the table, but the
-// non-zero failure tells the host the dispatch was not clean.
+// capacity leak, so both exits without an append report rather than dropping the
+// block silently.
+//
+// They report through kFailTerminal, NOT kFailTotal, because this failure is
+// not retryable: the entry was cleared from the table before we got here, so a
+// re-dispatch of the same coord list finds it absent and returns without
+// counting anything. Counted as a retryable failure it would read as zero
+// failures on the next round and the host would report a clean delete over a
+// permanently unreachable block index. The host accumulates this slot across
+// rounds instead (see VoxelHashMap::dispatch_with_retry).
 void append_heap(uint block_idx) {
   uint old = atomicAdd(heap_counter, 0u);  // atomic load
   for (int a = 0; a < kMaxHeapRetries; ++a) {
     if (old >= uint(pc.grid.num_blocks)) {
-      atomicAdd(fail_count[0], 1u);  // heap full: we only free what we allocated
+      // heap full: we only free what we allocated
+      atomicAdd(fail_count[kFailTerminal], 1u);
       return;
     }
     uint prev = atomicCompSwap(heap_counter, old, old + 1u);
@@ -75,7 +92,8 @@ void append_heap(uint block_idx) {
     }
     old = prev;
   }
-  atomicAdd(fail_count[0], 1u);  // counter CAS starved under contention
+  // counter CAS starved under contention
+  atomicAdd(fail_count[kFailTerminal], 1u);
 }
 
 uint block_of(int ptr) { return uint(ptr) / uint(pc.grid.voxels_per_block); }

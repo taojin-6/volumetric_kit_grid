@@ -18,8 +18,8 @@
 // tsdf_integrate.comp and volume/voxel_coords.hpp, so the extracted surface
 // aligns with the fused field. BlockIndex / Vertex are read/written through
 // scalar block layout to match the host structs byte-for-byte (BlockIndex:
-// ivec3 coord@0, ptr@12, 16 B; mesh Vertex: position@0, normal@12, color@24,
-// uv0@40, 48 B).
+// ivec3 coord@0, ptr@12, 16 B; mesh Vertex: position@0, normal@12,
+// tangent@24, uv0@40, color@48, 64 B).
 
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
