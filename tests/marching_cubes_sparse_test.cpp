@@ -228,15 +228,23 @@ bool fill_dense_block(vol::VoxelBlockGrid& g) {
 // the same field emit the same triangles in a different ORDER; each triangle's
 // arithmetic is independent of that order, so the floats themselves are
 // bit-identical and the sorted lists must match exactly.
+// Resolved through the INDEX buffer, which is what makes this comparison a
+// statement about the surface rather than about allocation order. It used to
+// read consecutive vertex triples, valid only while every triangle owned three
+// private vertices emitted in order; the kernel now claims vertices and
+// triangles from two independent atomics. It is also what lets this same
+// helper state the vertex-sharing invariant, where the triangle list must be
+// unchanged while the vertex array behind it shrinks ~4x.
 std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
   std::vector<std::array<float, 9>> tris;
-  tris.reserve(m.vertices.size() / 3);
-  for (std::size_t i = 0; i + 2 < m.vertices.size(); i += 3) {
+  tris.reserve(m.indices.size() / 3);
+  for (std::size_t i = 0; i + 2 < m.indices.size(); i += 3) {
     std::array<float, 9> t{};
     for (std::size_t k = 0; k < 3; ++k) {
-      t[k * 3 + 0] = m.vertices[i + k].position.x;
-      t[k * 3 + 1] = m.vertices[i + k].position.y;
-      t[k * 3 + 2] = m.vertices[i + k].position.z;
+      const mesh::Vertex& v = m.vertices[m.indices[i + k]];
+      t[k * 3 + 0] = v.position.x;
+      t[k * 3 + 1] = v.position.y;
+      t[k * 3 + 2] = v.position.z;
     }
     tris.push_back(t);
   }
@@ -328,12 +336,20 @@ int main() {
   // flipped table would drop this well below 1).
   int face_count = 0;
   int face_outward = 0;
-  for (std::size_t t = 0; t + 2 < sphere.vertices.size(); t += 3) {
-    const vr::Vec3f face = vr::cross(
-        sphere.vertices[t + 1].position - sphere.vertices[t].position,
-        sphere.vertices[t + 2].position - sphere.vertices[t].position);
+  // Walked through the INDEX buffer, not as consecutive vertex triples. That
+  // shorthand was valid only while the run was the identity 0,1,2,...; the
+  // kernel now allocates vertices and triangles through two independent
+  // atomics, so vertex order is not triangle order. Reading the indices is what
+  // keeps this assertion about winding rather than about allocation order --
+  // and it is what lets the same check keep its teeth once vertices are shared.
+  for (std::size_t t = 0; t + 2 < sphere.indices.size(); t += 3) {
+    const mesh::Vertex& a = sphere.vertices[sphere.indices[t + 0]];
+    const mesh::Vertex& b = sphere.vertices[sphere.indices[t + 1]];
+    const mesh::Vertex& c = sphere.vertices[sphere.indices[t + 2]];
+    const vr::Vec3f face =
+        vr::cross(b.position - a.position, c.position - a.position);
     if (vr::length(face) > 1e-8f) {
-      if (vr::dot(vr::normalize(face), sphere.vertices[t].normal) > 0.0f) {
+      if (vr::dot(vr::normalize(face), a.normal) > 0.0f) {
         ++face_outward;
       }
       ++face_count;
@@ -385,11 +401,16 @@ int main() {
   // fails by a mile. The tolerance is wide because marching cubes chords a
   // curved surface and the field is sampled at kH -- it is sized to catch a
   // factor of three, not to measure discretisation error.
+  // Through the indices, for the reason given at the winding check above: a
+  // vertex triple is a triangle only under an identity index run, which the
+  // kernel no longer produces. Keeping this assertion honest matters more than
+  // most -- it is the one that pins the counter's UNITS against a quantity no
+  // counter participates in, so it must measure the real surface.
   double area = 0.0;
-  for (std::size_t i = 0; i + 2 < sphere.vertices.size(); i += 3) {
-    const vr::Vec3f& a = sphere.vertices[i + 0].position;
-    const vr::Vec3f& b = sphere.vertices[i + 1].position;
-    const vr::Vec3f& c = sphere.vertices[i + 2].position;
+  for (std::size_t i = 0; i + 2 < sphere.indices.size(); i += 3) {
+    const vr::Vec3f& a = sphere.vertices[sphere.indices[i + 0]].position;
+    const vr::Vec3f& b = sphere.vertices[sphere.indices[i + 1]].position;
+    const vr::Vec3f& c = sphere.vertices[sphere.indices[i + 2]].position;
     area += 0.5 * static_cast<double>(vr::length(vr::cross(b - a, c - a)));
   }
   const double analytic_area = 4.0 * 3.14159265358979323846 *

@@ -111,6 +111,18 @@ struct SparsePushConstants {
   std::uint32_t capacity;
   float weight_threshold;
   std::uint32_t has_color;  // 0 = no color attribute; vertices get opaque white
+  // Vertices the arena holds. Its own budget rather than `capacity * 3`: once
+  // cells share a vertex the two stop being proportional, and sizing the arena
+  // from the triangle plan is exactly what would make sharing save nothing.
+  //
+  // Defaulted and assigned by name, not filled positionally, for the same
+  // reason the three below are: adjacent same-typed scalars make a positional
+  // slip compile clean.
+  std::uint32_t vertex_capacity = 0;
+  // 0 = three private vertices per triangle, as before sharing existed.
+  // Non-zero runs the kernel's owned-edge pass; see
+  // MarchingCubesConfig::share_vertices.
+  std::uint32_t share_vertices = 0;
   // The hash-table shape, for the kernel's on-device neighbour probe. The
   // sparse kernel resolves the 2x2x2 neighbourhood itself now, so it needs to
   // traverse the table the same way the volume tier does.
@@ -127,8 +139,12 @@ struct SparsePushConstants {
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
 // sizeof == 44 but silently drift the host<->GLSL push-constant ABI, so guard
 // each one, matching the dense PushConstants above.
-static_assert(sizeof(SparsePushConstants) == 44,
-              "SparsePushConstants must be 44 bytes");
+static_assert(sizeof(SparsePushConstants) == 52,
+              "SparsePushConstants must be 52 bytes");
+static_assert(offsetof(SparsePushConstants, vertex_capacity) == 32,
+              "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, share_vertices) == 36,
+              "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, block_size) == 0,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, voxels_per_block) == 4,
@@ -145,12 +161,33 @@ static_assert(offsetof(SparsePushConstants, weight_threshold) == 24,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, has_color) == 28,
               "SparsePushConstants layout drift");
-static_assert(offsetof(SparsePushConstants, num_buckets) == 32,
+static_assert(offsetof(SparsePushConstants, num_buckets) == 40,
               "SparsePushConstants layout drift");
-static_assert(offsetof(SparsePushConstants, bucket_size) == 36,
+static_assert(offsetof(SparsePushConstants, bucket_size) == 44,
               "SparsePushConstants layout drift");
-static_assert(offsetof(SparsePushConstants, max_chain) == 40,
+static_assert(offsetof(SparsePushConstants, max_chain) == 48,
               "SparsePushConstants layout drift");
+
+// The draw command plus one word of recon scratch: the vertex counter, at byte
+// 20, immediately past the 20-byte VkDrawIndexedIndirectCommand. Keeping it in
+// this buffer costs no second allocation per ring slot and leaves a well-formed
+// command at offset 0, which is all vkCmdDrawIndexedIndirect binds. It cannot
+// be derived from indexCount any more -- that held only while every triangle
+// owned three private vertices.
+constexpr VkDeviceSize kIndirectBufferBytes =
+    sizeof(VkDrawIndexedIndirectCommand) + sizeof(std::uint32_t);
+constexpr VkDeviceSize kVertexCountOffset =
+    sizeof(VkDrawIndexedIndirectCommand);
+
+// Read the vertex counter back out of the command buffer.
+std::uint32_t read_vertex_count(const Buffer& indirect) {
+  std::uint32_t produced = 0;
+  std::memcpy(
+      &produced,
+      static_cast<const std::byte*>(indirect.mapped()) + kVertexCountOffset,
+      sizeof(produced));
+  return produced;
+}
 
 // Bytes a vertex arena needs to hold @p capacity triangles (3 vertices each).
 std::uint64_t arena_bytes_for(std::uint32_t capacity) {
@@ -373,8 +410,7 @@ Status MarchingCubes::ensure_indirect_command() {
     VR_ASSIGN(
         indirect(),
         storage_buffer(
-            *allocator_, sizeof(VkDrawIndexedIndirectCommand),
-            HostAccess::Random,
+            *allocator_, kIndirectBufferBytes, HostAccess::Random,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
@@ -391,6 +427,13 @@ Status MarchingCubes::ensure_indirect_command() {
   reset.vertexOffset = 0;
   reset.firstInstance = 0;
   std::memcpy(indirect().mapped(), &reset, sizeof(reset));
+  // The vertex counter, immediately past the command. Reset for the same reason
+  // indexCount is: a refit re-runs the dispatch, and a counter carried over
+  // would accumulate onto the abandoned attempt's total.
+  const std::uint32_t vertex_reset = 0;
+  std::memcpy(static_cast<std::byte*>(indirect().mapped()) +
+                  sizeof(VkDrawIndexedIndirectCommand),
+              &vertex_reset, sizeof(vertex_reset));
   return {};
 }
 
@@ -501,7 +544,13 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
       storage_buffer(
           *allocator_,
           static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
-          HostAccess::SequentialWrite, config_.extra_index_usage,
+          // Random, not SequentialWrite. The host used to only ever WRITE this
+          // (an identity run it could also regenerate for free), so
+          // write-combined was right. The sparse kernel writes it now and
+          // download() reads it back, and a host read from write-combined
+          // memory is pathologically slow -- which would have shown up as a
+          // download regression rather than as an error.
+          HostAccess::Random, config_.extra_index_usage,
           config_.queue_family_count > 0 ? config_.queue_families : nullptr,
           config_.queue_family_count));
   auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
@@ -581,7 +630,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // tables (persistent) + the per-extract samples / colors / vertices /
   // counter. The sparse kernel binds eight: tables (persistent) + the
   // per-extract active blocks / hash entries / tsdf / weight / color /
-  // vertices / counter. KernelSetBuilder (core/compute_kernel.hpp) builds each
+  // vertices / command / index run -- the last because the kernel writes real
+  // indices now, rather than the host filling an identity run.
+  // KernelSetBuilder (core/compute_kernel.hpp) builds each
   // layout + pipeline and allocates its set from a shared pool sized to the
   // exact descriptor total.
   VkPushConstantRange push{};
@@ -594,7 +645,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   VR_TRY(kb.add(mc.kernel_, vr_marching_cubes_comp_spv,
                 vr_marching_cubes_comp_spv_size, 5, &push));
   VR_TRY(kb.add(mc.kernel_sparse_, vr_marching_cubes_sparse_comp_spv,
-                vr_marching_cubes_sparse_comp_spv_size, 8, &push_sparse));
+                vr_marching_cubes_sparse_comp_spv_size, 9, &push_sparse));
   VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 of both
@@ -820,16 +871,25 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   }
   Mesh mesh;
   const auto vertex_count = static_cast<std::size_t>(device_mesh.vertex_count);
+  const auto index_count =
+      static_cast<std::size_t>(device_mesh.triangle_count) *
+      kIndicesPerTriangle;
   mesh.vertices.resize(vertex_count);
-  mesh.indices.resize(vertex_count);
+  mesh.indices.resize(index_count);
   if (vertex_count > 0) {
     std::memcpy(mesh.vertices.data(), arena().mapped(),
                 vertex_count * sizeof(Vertex));
-    // Regenerated, not read back: the run is the identity 0,1,2,... and
-    // index_run() is write-combined (SequentialWrite), where host reads are
-    // pathologically slow. Generating it costs nothing and touches no device
-    // memory.
-    std::iota(mesh.indices.begin(), mesh.indices.end(), std::uint32_t{0});
+  }
+  if (index_count > 0) {
+    // READ BACK, not regenerated. The run used to be the identity 0,1,2,...,
+    // which the host could rebuild for free rather than touch device memory --
+    // but that was a property of every triangle owning three private vertices
+    // in emission order. The kernel now allocates vertices and triangles
+    // through two independent atomics, so the mapping is a property of the
+    // dispatch and only the kernel knows it; with sharing on, a vertex is
+    // referenced by several triangles and there is no run to regenerate at all.
+    std::memcpy(mesh.indices.data(), index_run().mapped(),
+                index_count * sizeof(std::uint32_t));
   }
   return mesh;
 }
@@ -1065,6 +1125,12 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                           VK_WHOLE_SIZE);
   kernel_sparse_.set.write_storage_buffer(7, indirect().handle(), 0,
                                           VK_WHOLE_SIZE);
+  // The kernel writes indices rather than the host filling an identity run: a
+  // shared vertex is referenced by several triangles and only the kernel knows
+  // which, and even unshared, vertex slots and triangle slots come from two
+  // independent atomics, so the run is no longer the identity.
+  kernel_sparse_.set.write_storage_buffer(8, index_run().handle(), 0,
+                                          VK_WHOLE_SIZE);
   if (timings != nullptr) timings->descriptor_ms = phase_clock.lap();
 
   // Run the surface, read the count, and re-run once if the arena was too
@@ -1099,6 +1165,14 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     push.num_buckets = gp.num_buckets;
     push.bucket_size = gp.bucket_size;
     push.max_chain = gp.max_chain;
+    // Assigned by name for the same reason the three above are: they are
+    // same-typed adjacent scalars, so a positional slip would compile.
+    //
+    // Sharing is not reachable from the API yet -- the arena is still sized as
+    // three vertices per triangle, which is what makes this exactly the old
+    // behaviour rather than a budget the kernel could overrun.
+    push.share_vertices = 0u;
+    push.vertex_capacity = arena_vertex_capacity();
 
     // One workgroup per block, not one thread per voxel: the kernel resolves
     // the block's 2x2x2 neighbourhood into shared memory, which only works when
@@ -1161,6 +1235,15 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     }
     kernel_sparse_.set.write_storage_buffer(6, arena().handle(), 0,
                                             VK_WHOLE_SIZE);
+    // The index run too, and it is not optional: ensure_output_buffers releases
+    // BOTH (arena_capacity() is derived from the arena, so the pair is sized
+    // and dropped together) and allocates two fresh buffers. Rebinding only the
+    // arena left binding 8 naming a destroyed VkBuffer, and the retry then
+    // wrote its indices into freed memory -- which reads back as a plausible
+    // mesh with the wrong topology rather than as a crash. Caught by the refit
+    // fixture's triangle-for-triangle check.
+    kernel_sparse_.set.write_storage_buffer(8, index_run().handle(), 0,
+                                            VK_WHOLE_SIZE);
     requested = arena_capacity();
     if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
   }
@@ -1204,7 +1287,12 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // One config creates all three, so any of them answers for the set.
   device_mesh.sharing_mode = arena().sharing_mode();
   device_mesh.triangle_count = emitted;
-  device_mesh.vertex_count = emitted * kIndicesPerTriangle;
+  // The kernel's own count, not `emitted * 3`. That identity held only while
+  // every triangle owned three private vertices; the kernel now allocates
+  // vertices through their own counter, so this is a read rather than a
+  // derivation. Clamped by the arena for the same reason the triangle count is.
+  device_mesh.vertex_count =
+      std::min(read_vertex_count(indirect()), arena_vertex_capacity());
   device_mesh.generation = generation_;
   device_mesh.live_generation = &generation_;
   if (timings != nullptr) {

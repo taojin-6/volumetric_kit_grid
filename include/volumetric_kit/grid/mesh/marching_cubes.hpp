@@ -281,6 +281,43 @@ struct MarchingCubesConfig {
   /// Extracting with every slot outstanding is a contract violation, reported
   /// rather than silently overwriting a live draw.
   std::uint32_t slot_count = 1;
+
+  /// @brief Share a vertex between the cells that meet on an edge, instead of
+  ///        giving every triangle three private ones.
+  ///
+  /// Off (the default) is what this tier always did: marching cubes appends
+  /// three vertices per triangle, so a closed surface carries roughly six times
+  /// the vertices it needs and the arena is sized for all of them.
+  ///
+  /// On, the sparse kernel shares within a block -- each cell emits a vertex
+  /// only for the three edges it *owns*, and its neighbours index that one.
+  /// Edges on a block's `+face` are still duplicated, because sharing them
+  /// would need the neighbouring workgroup's shared memory, which is why the
+  /// saving is about **4x** rather than the 6x full sharing would give.
+  /// Triangles are unaffected: a shared vertex and a duplicated one are
+  /// interpolated by the same code from the same two corner samples, so the
+  /// surface is identical and only the vertex count moves.
+  ///
+  /// @warning **Not compatible with `texture::ProjectiveTexturer`**, and that
+  ///          is a property of the texturer rather than a limitation here. It
+  ///          decides visibility per *triangle* and writes @ref Vertex::uv0 per
+  ///          *vertex*, which is well-defined only while a vertex belongs to
+  ///          one triangle. Sharing a vertex between triangles that disagree
+  ///          makes the write order decide the result. Per-vertex `uv0` is in
+  ///          any case the wrong representation for the packed multi-camera
+  ///          atlas that is planned -- a triangle whose vertices index
+  ///          different sub-rects interpolates across the pack -- so the fix is
+  ///          a per-primitive camera id, not a winner-take-all vertex atomic,
+  ///          and this flag is what keeps the two decisions independent.
+  ///          @ref MarchingCubes::create refuses this together with a grid
+  ///          whose `voxels_per_block` exceeds 512 (the kernel's shared
+  ///          per-cell table is sized for `block_size` 8, the only shape any
+  ///          in-tree caller uses).
+  ///
+  /// @note Applies to the sparse @ref extract overload only. The dense one
+  ///       meshes an arbitrary caller-supplied grid with no block structure to
+  ///       share within, and is unchanged.
+  bool share_vertices = false;
 };
 
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
@@ -666,6 +703,14 @@ class VR_MESH_API MarchingCubes {
   std::uint32_t arena_capacity() const noexcept {
     return static_cast<std::uint32_t>(arena().size() /
                                       (kIndicesPerTriangle * sizeof(Vertex)));
+  }
+
+  // Vertices the current slot's arena can actually hold. Derived from the
+  // buffer, like arena_capacity, so the two can never disagree with it -- and
+  // stated separately because vertex sharing breaks the "three per triangle"
+  // identity that let one stand in for the other.
+  std::uint32_t arena_vertex_capacity() const noexcept {
+    return static_cast<std::uint32_t>(arena().size() / sizeof(Vertex));
   }
 
   // Vertex-arena bytes the whole ring is holding -- what ExtractTimings
