@@ -194,16 +194,27 @@ struct ExtractTimings {
 //       The count still round-trips to the host, but only because *this tier*
 //       needs it to refit an undersized arena -- a consumer no longer does.
 //
-// TODO(mesh): the command lives in host-visible memory, because the refit
-// protocol reads it back on every extract and resets it before every dispatch.
-// On a unified-memory GPU that is free; on a discrete one the command processor
-// fetches those 20 bytes across PCIe on every indirect draw. Device-local would
-// invert the cost (two transfers per extract to buy a local fetch per draw), so
-// this waits for a discrete-GPU consumer to measure it rather than guessing --
-// the same wait-for-the-second-consumer rule the rest of this config follows.
-// Recorded on DeviceMesh::sharing_mode rather than left to be inferred, because
-// the hazard here is not the cost but that the cost is invisible on the only
-// hardware this repo's CI runs.
+// TODO(mesh): every buffer this tier hands out lives in host-visible memory --
+// core::storage_buffer allocates them all that way -- and that placement is a
+// bigger deal for a seam-B consumer than the usage bits above.
+//   * The command, 20 bytes, because the refit protocol reads it back on every
+//     extract and resets it before every dispatch. On a unified-memory GPU that
+//     is free; on a discrete one the command processor fetches it across PCIe
+//     on every indirect draw. Device-local would invert the cost (two transfers
+//     per extract to buy a local fetch per draw).
+//   * The arena and index run, which is the one that scales: a renderer binding
+//     them as geometry makes the vertex-input stage pull the WHOLE mesh out of
+//     system RAM on every presented frame -- ~64 MiB at the 991 k vertices
+//     `fuse_viewer` reaches on room0, with no vertex reuse until shared-vertex
+//     dedup lands. That is free on unified memory, which is the only hardware
+//     this measured on, and on a discrete GPU it would cost more than the host
+//     round trip seam B exists to delete.
+// Both wait on the same thing -- a discrete-GPU consumer to measure a
+// device-local arena plus staging against them -- rather than being guessed at,
+// the wait-for-the-second-consumer rule the rest of this config follows. It is
+// recorded here and on DeviceMesh::sharing_mode rather than left to be
+// inferred, because the hazard is not the cost but that the cost is invisible
+// on the only hardware this repo's CI runs.
 struct MarchingCubesConfig {
   /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER`.
   VkBufferUsageFlags extra_vertex_usage = 0;
@@ -349,6 +360,17 @@ class VR_MESH_API MarchingCubes {
   /// value than the newest reported is ignored rather than un-releasing
   /// anything. With a single slot this records the value and changes no
   /// behaviour -- there, a @ref DeviceMesh still dies at the next extract.
+  ///
+  /// Being a single high-water mark is what shapes the consumer's side of the
+  /// contract, so it is worth stating plainly: above one slot, **this** -- not
+  /// @ref DeviceMesh::is_current -- is what bounds a view's life. A view stays
+  /// good until its own generation is reported here, which is why a ring
+  /// consumer can hold and draw a view the producer has already run past. The
+  /// flip side is that a generation the consumer takes and then abandons keeps
+  /// its slot until some *newer* generation is reported, because the mark
+  /// cannot skip one; a consumer that can drop a taken mesh must therefore
+  /// bound how many it drops, or it exhausts the ring and every later extract
+  /// is refused.
   ///
   /// @warning **The caller must synchronize this against the extracting
   ///          thread.** It is not atomic, and the natural consumer is on
