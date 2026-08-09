@@ -30,6 +30,44 @@ ivec3 mcCornerShift(int corner) {
                corner_offset[corner * 3 + 2]);
 }
 
+// Which cell owns edge `edge`, and along which axis it runs.
+//
+// Every marching-cubes edge is the +x/+y/+z edge of exactly one cell: the one
+// at the componentwise MINIMUM of its two endpoint corners. That cell is `delta`
+// steps from the cell asking, so a vertex-sharing kernel can name an edge by
+// (owner cell, axis) and have every cell touching it agree -- which is the whole
+// basis of sharing.
+//
+// DERIVED from the tables rather than tabulated beside them, deliberately. A
+// fourth mirror of the edge/corner numbering is exactly the drift hazard the
+// volume tier hit with hash_lookup.glsl: a divergence would silently resolve the
+// wrong owner and split vertices that should share, under Status::ok. Here the
+// answer is a pure function of `edge_to_vert` + `corner_offset`, so it cannot
+// disagree with them.
+void mcEdgeOwner(int edge, out ivec3 delta, out int axis) {
+  ivec3 sa = mcCornerShift(edge_to_vert[edge * 2 + 0]);
+  ivec3 sb = mcCornerShift(edge_to_vert[edge * 2 + 1]);
+  delta = min(sa, sb);
+  ivec3 d = abs(sa - sb);  // exactly one component is 1 -- edges are axis-aligned
+  axis = d.x != 0 ? 0 : (d.y != 0 ? 1 : 2);
+}
+
+// Write one vertex at an already-claimed slot. The appearance fields are the
+// same constants mcEmitCell writes, kept here so the two emitters cannot drift:
+// uv0 is the "use vertex colour" sentinel until projective texturing runs, and
+// tangent is the placeholder the renderer's slot needs (meshing has no surface
+// parameterisation to derive a real one from, and a slot left unwritten would
+// carry whatever the previous, larger mesh put there).
+void mcWriteVertex(uint slot, vec3 position, vec3 normal, vec3 color) {
+  vertices[slot].position = position;
+  vertices[slot].normal = normal;
+  vertices[slot].tangent = vec4(1.0, 0.0, 0.0, 1.0);
+  vertices[slot].uv0 = vec2(-1.0);
+  vertices[slot].color = vec4(color, 1.0);
+}
+
+// Clamped iso-crossing ratio along the edge sa -> sb. Guards the near-tangent
+
 // Clamped iso-crossing ratio along the edge sa -> sb. Guards the near-tangent
 // case so the ratio stays finite (mirrors the prior engine's copysign(kEpsilon)
 // guard); clamp keeps the interpolant on the segment.
@@ -52,6 +90,28 @@ vec3 mcCellNormal(float sdf[8]) {
            (sdf[4] + sdf[5] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[2] + sdf[3]));
   float glen = length(grad);
   return glen > 1e-6 ? grad / glen : vec3(0.0, 0.0, 1.0);
+}
+
+// The position + colour of the iso-crossing on edge `edge` of the cell whose
+// eight corner samples are `sdf` / `corner_color` and whose base voxel is
+// `base_voxel`. Shared by the owned-edge pass and the duplicate path, so a
+// shared vertex and a duplicated one land on bit-identical coordinates: both
+// resolve the edge's endpoints to the same GLOBAL voxels and interpolate the
+// same two samples, which is what makes sharing a pure vertex-count change and
+// leaves every triangle exactly where it was.
+void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8], vec3 origin,
+                  ivec3 base_voxel, float voxel_size, float iso, uint has_color,
+                  out vec3 position, out vec3 color) {
+  int a = edge_to_vert[edge * 2 + 0];
+  int b = edge_to_vert[edge * 2 + 1];
+  float ratio = mcEdgeRatio(sdf[a], sdf[b], iso);
+  vec3 pa = origin + vec3(base_voxel + mcCornerShift(a)) * voxel_size;
+  vec3 pb = origin + vec3(base_voxel + mcCornerShift(b)) * voxel_size;
+  position = mix(pa, pb, ratio);
+  // LINEAR working values (each kernel decodes at the gather), because this is
+  // an average -- the 2026-08-02 colour decision. White is 1.0 either way.
+  color = has_color != 0u ? mix(corner_color[a], corner_color[b], ratio)
+                          : vec3(1.0);
 }
 
 // Emit the cell's triangles into `vertices[]` / `index_count`. Corner c's world
