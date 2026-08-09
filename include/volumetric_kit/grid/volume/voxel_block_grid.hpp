@@ -140,6 +140,25 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return The grid + hash-table parameters this grid was built with.
   const VoxelGridParams& grid() const noexcept { return map_.grid(); }
 
+  /// @brief A counter bumped whenever a block STOPS being live: @ref remove and
+  ///        @ref clear.
+  ///
+  /// Exists so a consumer that caches something keyed by block slot can ask
+  /// whether that cache still describes this grid, which it otherwise cannot:
+  /// a removed block's slot goes back to a LIFO heap and is re-drawn by the
+  /// next allocation, so the same slot silently comes to mean a different
+  /// block at a different coordinate. `tsdf::TsdfIntegrator`'s dirty-block
+  /// flags are the first such cache, and the reason this is here.
+  ///
+  /// @ref resize deliberately does **not** bump it: it preserves every block's
+  /// index, so a slot-keyed cache stays correct across a grow (which is the
+  /// whole point of the index-preserving rehash). Reaching @ref
+  /// VoxelHashMap::remove or @ref VoxelHashMap::clear through @ref map() does
+  /// not bump it either -- that is the raw path, and it is already documented
+  /// there as the one whose damage cannot be detected after the fact.
+  /// @return The count of removal events since @ref create; never decreases.
+  std::uint64_t topology_epoch() const noexcept { return topology_epoch_; }
+
   /// @brief Look up an attribute's backing store by name.
   ///
   /// Also the one place the attribute arrays are checked against the live grid,
@@ -231,6 +250,9 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
+  // Bumped by remove() / clear(); see topology_epoch(). Not bumped by resize(),
+  // which preserves block indices.
+  std::uint64_t topology_epoch_ = 0;
   // The device's maxStorageBufferRange, read once at create(). An attribute
   // array is the largest buffer this repo allocates and is bound whole, so it
   // is the one most likely to exceed what a single binding may cover -- at the
