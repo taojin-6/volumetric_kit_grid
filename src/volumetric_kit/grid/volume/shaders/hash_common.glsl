@@ -65,23 +65,13 @@ const uint kHashPrimeZ = 83492791u;
 // cannot hang the GPU; the host retries any failed allocations across dispatches.
 const int kMaxSpinRetries = 128;
 const int kMaxHeapRetries = 256;
-// How far an overflow insert probes for a free non-anchor slot before giving up
-// and reporting kFailTable. Bounded for the same reason as the two caps above,
-// which allocate_in_overflow did not honour: it scanned all num_buckets *
-// bucket_size entries, taking a contended atomicCompSwap per slot to test it, so
-// the cost of one insert grew with the table and with its occupancy. At 31480 of
-// 32768 blocks on an M5 iPad Pro that hung the GPU outright
-// (kIOGPUCommandBufferCallbackErrorHang), which also killed the renderer sharing
-// the device.
-//
-// 256 rather than smaller: a bounded probe can only fail where an exhaustive one
-// would have succeeded, so the number is chosen to make that vanishingly rare
-// while the table is healthy. Skipping anchors leaves ~224 candidates, so with
-// occupancy p the probe fails at about p^224 -- ~1e-35 at 70% (the point at
-// which a caller should already be growing) and still ~1e-5 at 85%. It only
-// starts giving up in the regime where growing is the right answer anyway, which
-// is the whole point.
-const uint kMaxOverflowProbes = 256u;
+// allocate_in_overflow's scan is deliberately NOT capped alongside these two.
+// Capping it bounds the iteration count by giving up the only thing kFailTable
+// is good for -- proof that no slot is free -- and a caller that reads "nothing
+// free nearby" as "the table is full" grows the map, doubling every attribute
+// array, over a table that is merely clustered. What made that scan hang the
+// GPU was its cost per slot, not the number of slots; see the comment on
+// allocate_in_overflow, which fixes the cost instead.
 
 // --- Fail-count slots. A host/device ABI (VoxelHashMap::dispatch_with_retry
 // reads them), so they live here beside the other shared constants rather than
@@ -101,7 +91,7 @@ const int kFailLock = 1;      // lock contention
 const int kFailChain = 2;     // collision chain full
 const int kFailHeap = 3;      // block heap empty
 const int kFailTerminal = 4;  // non-retryable; host accumulates across rounds
-const int kFailTable = 5;     // nothing free within kMaxOverflowProbes
+const int kFailTable = 5;     // no free non-anchor slot anywhere in the table
 const int kFailSlots = 6;
 
 // --- Push constants: the grid shape + one kernel-specific argument. ---

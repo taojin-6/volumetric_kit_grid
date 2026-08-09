@@ -42,6 +42,36 @@ namespace {
 
 using Coord = std::tuple<int, int, int>;
 
+// Find `n` distinct block coords that all hash to `target_bucket`, so they land
+// in one primary bucket and its collision chain. Mirrors the helper in
+// volume_diagnostics_test.cpp, and bounded for the same reason: an open
+// `for (int x = 1; out.size() < n; ++x)` terminates only by success, so
+// changing a hash prime, a bucket count, or the fixed y/z pair turns a failing
+// test into an infinite loop with signed-overflow UB instead of a red build. A
+// short return fails the caller's CHECK, which is a diagnosis.
+//
+// Sweeps from 1 rather than 0 to keep (0,0,0) out of every fixture: it is also
+// the value a freshly-initialised `HashEntry::pos` holds, and block_exists
+// documents that coord as the one a stale read could false-match.
+std::vector<vol::BlockIndex> coords_in_bucket(int target_bucket,
+                                              int num_buckets, std::size_t n) {
+  std::vector<vol::BlockIndex> out;
+  for (int x = 1; x < 64 && out.size() < n; ++x) {
+    for (int y = 1; y < 64 && out.size() < n; ++y) {
+      for (int z = 1; z < 64 && out.size() < n; ++z) {
+        const vr::Vec3i c(x, y, z);
+        if (static_cast<int>(vol::hash_bucket(c, num_buckets)) ==
+            target_bucket) {
+          vol::BlockIndex block{};
+          block.coord = c;
+          out.push_back(block);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 int main() {
@@ -184,16 +214,12 @@ int main() {
     // Seven coords that all hash to bucket 0 -- more than bucket_size (4), so
     // the surplus must spill into the overflow chain.
     const std::size_t kColliding = 7;
-    std::vector<vol::BlockIndex> cc;
+    std::vector<vol::BlockIndex> cc =
+        coords_in_bucket(0, cg.num_buckets, kColliding);
+    CHECK(cc.size() == kColliding);
     std::set<Coord> cwant;
-    for (int x = 1; cc.size() < kColliding; ++x) {
-      vr::Vec3i coord(x, 0, 0);
-      if (vol::hash_bucket(coord, cg.num_buckets) == 0u) {
-        vol::BlockIndex block{};
-        block.coord = coord;
-        cc.push_back(block);
-        cwant.insert({x, 0, 0});
-      }
+    for (const vol::BlockIndex& block : cc) {
+      cwant.insert({block.coord.x, block.coord.y, block.coord.z});
     }
 
     // Insert one per dispatch: a single dispatch of same-bucket coords has all
@@ -252,20 +278,13 @@ int main() {
             static_cast<VkDeviceSize>(grid.bucket_size) *
             sizeof(vol::HashEntry));
 
-  // --- The overflow probe is bounded, but not so tight it refuses room
-  // -------- allocate_in_overflow probes at most kMaxOverflowProbes (256) slots
-  // instead of scanning the whole table, because the exhaustive scan took a
-  // contended atomic per slot and hung the GPU at high occupancy. The risk that
-  // introduces is the opposite failure: giving up while free slots exist. This
-  // pins that it does not.
-  //
-  // The table above cannot show it -- 32 entries is smaller than the probe
-  // window, so `min(total_entries, kMaxOverflowProbes)` makes it behave exactly
-  // as the unbounded version did. This one is deliberately *larger* than the
-  // window (2048 entries), and drives one bucket's overflow chain to nearly
-  // max_chain so ~120 inserts must each find a free slot by probing past a
-  // growing run of occupied ones. Occupancy stays ~6%, so every one of them is
-  // a slot the old scan would have found and the bounded probe must too.
+  // --- The overflow sweep reaches, and its capacity reasons are exact -------
+  // allocate_in_overflow sweeps the WHOLE table for a free non-anchor slot.
+  // What had made that unaffordable was its cost per slot -- a contended
+  // atomicCompSwap taken before it had even looked -- so it now reads each
+  // candidate unlocked first and locks only one that looks free. Two properties
+  // need pinning: that the sweep really does reach a distant slot, and that
+  // when it does fail it names the cause it can prove.
   {
     vol::VoxelGridParams pg{};
     pg.voxel_size = 0.005f;
@@ -274,46 +293,136 @@ int main() {
     pg.trunc_dist = 0.04f;
     pg.bucket_size = 8;
     pg.num_buckets = 256;
-    pg.num_blocks = 2048;  // bucket_size * num_buckets, > kMaxOverflowProbes
-    pg.max_chain = 128;
+    pg.num_blocks = 2048;  // bucket_size * num_buckets
+    pg.max_chain = 512;    // > kDeepChain, so the chain is never the limit
 
     vr::Result<vol::VoxelHashMap> pmap_result =
         vol::VoxelHashMap::create(device.value(), allocator.value(), pg);
     CHECK(pmap_result.ok());
     vol::VoxelHashMap pmap = std::move(pmap_result).value();
 
-    // 120 coords on one bucket: under max_chain (128), so the chain itself is
-    // never the limit and any failure here is the probe giving up.
-    const std::size_t kDeepChain = 120;
-    std::vector<vol::BlockIndex> pc_coords;
-    for (int x = 1; pc_coords.size() < kDeepChain; ++x) {
-      vr::Vec3i coord(x, 7, 3);
-      if (vol::hash_bucket(coord, pg.num_buckets) == 0u) {
-        vol::BlockIndex block{};
-        block.coord = coord;
-        pc_coords.push_back(block);
-      }
-    }
+    // Reach. One bucket's chain is driven to 300 on a table that stays ~85%
+    // free, so every insert is a slot an exhaustive sweep finds and a windowed
+    // one does not. The depth is the discriminator: overflow nodes pack in from
+    // the bucket's end skipping one anchor per 8 slots, so the 292nd sits 333
+    // iterations out -- past any fixed window that would have been small enough
+    // to be worth having. A cap of 256 fails this at roughly the 232nd coord.
+    const std::size_t kDeepChain = 300;
+    std::vector<vol::BlockIndex> deep =
+        coords_in_bucket(0, pg.num_buckets, kDeepChain);
+    CHECK(deep.size() == kDeepChain);
 
     // One per dispatch, as above: a single dispatch of same-bucket coords
     // contends the spin lock and legitimately reports retryable failures, which
     // would muddle what this is measuring.
-    for (const vol::BlockIndex& block : pc_coords) {
-      vol::AllocFailures pf{};
-      vr::Result<std::uint32_t> f = pmap.allocate(&block, 1, &pf);
+    for (const vol::BlockIndex& block : deep) {
+      vr::Result<std::uint32_t> f = pmap.allocate(&block, 1);
       CHECK(f.ok() && f.value() == 0);
-      // The point of the test: no slot was refused while the table was 94%
-      // free.
-      CHECK(pf.table == 0);
-      CHECK(!pf.capacity_limited());
     }
 
-    // And all of them are actually there -- a probe that silently placed two
-    // coords in one slot, or dropped one, would show up as a short active set.
+    // All 300 landed, each on its own block.
     vr::Result<std::vector<vol::BlockIndex>> pactive =
         pmap.compact_active_blocks();
     CHECK(pactive.ok());
     CHECK(pactive.value().size() == kDeepChain);
+    std::set<int> pptrs;
+    for (const vol::BlockIndex& block : pactive.value()) {
+      pptrs.insert(block.ptr);
+    }
+    CHECK(pptrs.size() == kDeepChain);
+
+    // ...and the chain that links them is traversable, which the size check
+    // above cannot show: compact_active_blocks is a flat per-slot scan that
+    // never walks `offset`, so a node written with a broken link still appears
+    // in the active set and still counts 300. Re-allocating the whole set in
+    // ONE dispatch has to find every one of them by hopping the chain, so a bad
+    // link re-inserts instead and the count grows.
+    vr::Result<std::uint32_t> prefail =
+        pmap.allocate(deep.data(), static_cast<std::uint32_t>(deep.size()));
+    CHECK(prefail.ok() && prefail.value() == 0);
+    vr::Result<std::vector<vol::BlockIndex>> pactive2 =
+        pmap.compact_active_blocks();
+    CHECK(pactive2.ok());
+    CHECK(pactive2.value().size() == kDeepChain);
+
+    vr::Result<std::vector<vol::HashEntry>> pentries = pmap.read_entries();
+    CHECK(pentries.ok());
+    const auto panchor = static_cast<std::size_t>(pg.bucket_size - 1);
+    CHECK(pentries.value()[panchor].offset != vol::kNoOffset);
+
+    // Occupancy is readable without the O(total slots) diagnostics scan -- the
+    // cheap signal a caller needs to grow *before* it starts failing.
+    vr::Result<float> plf = pmap.load_factor();
+    CHECK(plf.ok());
+    CHECK(plf.value() > 0.14f && plf.value() < 0.15f);  // 300 / 2048
+  }
+
+  // Exactness of the two capacity reasons, on a table small enough to sweep by
+  // hand: 2 buckets x 2 entries. Slot 1 and slot 3 are the per-bucket chain
+  // anchors, which an overflow insert skips, so slots 0 and 2 are the only ones
+  // it may ever take.
+  {
+    vol::VoxelGridParams tg{};
+    tg.voxel_size = 0.005f;
+    tg.block_size = 8;
+    tg.voxels_per_block = 512;
+    tg.trunc_dist = 0.04f;
+    tg.bucket_size = 2;
+    tg.num_buckets = 2;
+    tg.num_blocks = 4;  // bucket_size * num_buckets
+    tg.max_chain = 8;
+
+    vr::Result<vol::VoxelHashMap> tmap_result =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), tg);
+    CHECK(tmap_result.ok());
+    vol::VoxelHashMap tmap = std::move(tmap_result).value();
+
+    std::vector<vol::BlockIndex> b0 = coords_in_bucket(0, tg.num_buckets, 4);
+    CHECK(b0.size() == 4);
+
+    // Three coords on bucket 0 take its primary pair (slots 0 and 1 -- the
+    // anchor is closed only to *overflow*) and then spill into slot 2. One
+    // block is left on the heap and one slot is free, but that slot is bucket
+    // 1's anchor.
+    for (std::size_t i = 0; i < 3; ++i) {
+      vr::Result<std::uint32_t> f = tmap.allocate(&b0[i], 1);
+      CHECK(f.ok() && f.value() == 0);
+    }
+
+    // So the fourth sweeps all four slots and legitimately finds nothing it may
+    // use. kFailTable is the whole claim under test: not kFailHeap (a block is
+    // still on the heap, and load_factor proves it), and not a sweep that gave
+    // up early -- a windowed probe reports the same code for "I stopped
+    // looking", which is what makes the reason unusable for deciding to grow.
+    vr::Result<float> tlf = tmap.load_factor();
+    CHECK(tlf.ok() && tlf.value() < 1.0f);
+    vol::AllocFailures tf{};
+    vr::Result<std::uint32_t> f4 = tmap.allocate(&b0[3], 1, &tf);
+    CHECK(f4.ok() && f4.value() > 0);
+    CHECK(tf.table > 0);
+    CHECK(tf.heap == 0);
+    CHECK(tf.capacity_limited());
+
+    // Fill that last anchor through bucket 1's primary path, emptying the heap.
+    std::vector<vol::BlockIndex> b1 = coords_in_bucket(1, tg.num_buckets, 1);
+    CHECK(b1.size() == 1);
+    vr::Result<std::uint32_t> f5 = tmap.allocate(&b1[0], 1);
+    CHECK(f5.ok() && f5.value() == 0);
+    vr::Result<float> tfull = tmap.load_factor();
+    CHECK(tfull.ok() && tfull.value() == 1.0f);
+
+    // Now the identical insert must report kFailHeap instead. Nothing about the
+    // sweep changed for it -- the same four slots reach the same conclusion --
+    // so this pins the early-out that answers an empty heap with one atomic
+    // load rather than a full sweep, and pins that it attributes the failure
+    // the way allocate_in_primary already names this same state. Without the
+    // early-out the sweep runs to exhaustion and reports `table` here, failing
+    // the pair.
+    vol::AllocFailures hf{};
+    vr::Result<std::uint32_t> f6 = tmap.allocate(&b0[3], 1, &hf);
+    CHECK(f6.ok() && f6.value() > 0);
+    CHECK(hf.heap > 0);
+    CHECK(hf.table == 0);
   }
 
   // --- Move-only ------------------------------------------------------------
