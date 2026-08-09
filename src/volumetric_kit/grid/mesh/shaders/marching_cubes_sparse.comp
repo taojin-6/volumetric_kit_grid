@@ -1,12 +1,24 @@
 #version 450
 
-// Marching-cubes extraction straight off the sparse VoxelBlockGrid: one
-// WORKGROUP per active block, striding over the block's voxels, where each voxel
-// is the base corner of one marching-cubes cell. A cell whose base sits at a
-// block's +face reaches its far corners into neighbouring blocks, so the block's
-// 2x2x2 +neighbourhood (itself plus its seven +x/+y/+z neighbours, -1 when
-// unallocated) is resolved into shared memory once per workgroup and read by
-// every voxel.
+// Marching-cubes extraction straight off the sparse VoxelBlockGrid, with three
+// PRIVATE vertices per triangle: one WORKGROUP per active block, striding over
+// the block's voxels, where each voxel is the base corner of one marching-cubes
+// cell. A cell whose base sits at a block's +face reaches its far corners into
+// neighbouring blocks, so the block's 2x2x2 +neighbourhood (itself plus its
+// seven +x/+y/+z neighbours, -1 when unallocated) is resolved into shared memory
+// once per workgroup and read by every voxel.
+//
+// This is the DEFAULT kernel and what this tier has always done. Its sibling,
+// marching_cubes_sparse_shared.comp, shares a vertex between the cells that meet
+// on an edge; MarchingCubes::create builds exactly one of the two, chosen by
+// MarchingCubesConfig::share_vertices. Two kernels rather than one with a push
+// constant, because a `shared` array is reserved at pipeline creation whatever a
+// push constant later says -- see the note in marching_cubes_sparse_common.glsl,
+// which is where everything the two do identically lives.
+//
+// Because every triangle owns three consecutive vertices at `tri * 3`, the index
+// run over this kernel's output IS the identity 0,1,2,...: the host fills it once
+// per grow and MarchingCubes::download regenerates it rather than reading back.
 //
 // It is resolved *here* rather than handed over by the host, which is what the
 // workgroup-per-block shape exists for. The meshing dispatch is quiescent -- no
@@ -44,12 +56,7 @@ layout(local_size_x = 256) in;
 // The hash entries + the read-only traversal that resolves a neighbouring
 // block's voxel-array base, which also supplies the shared BlockIndex /
 // HashEntry layouts and hash constants from the volume tier's hash_common.glsl
-// (one definition, not a mirror -- see hash_lookup.glsl). This binding used to
-// carry a host-built neighbour_ptr[block * 8 + octant] table, which cost an
-// O(active_blocks * 8) serial pass of unordered_map lookups on the CPU: 102 ms
-// of a 133 ms extract at 107k blocks on an M5 iPad Pro, against 26 ms for this
-// kernel's own dispatch. The table is built here instead, 8 probes per
-// workgroup.
+// (one definition, not a mirror -- see hash_lookup.glsl).
 #define VR_HASH_ENTRIES_BINDING 2
 #include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
@@ -71,7 +78,7 @@ layout(set = 0, binding = 0, scalar) readonly buffer Tables {
 };
 // The compacted active blocks -- one WORKGROUP per block, so the 2x2x2
 // neighbourhood can be resolved once into shared memory and amortised over every
-// voxel of the block (see s_neighbour below).
+// voxel of the block (see s_neighbour in marching_cubes_sparse_common.glsl).
 layout(set = 0, binding = 1, scalar) readonly buffer Active {
   BlockIndex active_blocks[];
 };
@@ -85,32 +92,12 @@ layout(set = 0, binding = 5, scalar) readonly buffer Color { uint color_attr[]; 
 layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
   Vertex vertices[];
 };
-// The draw command, plus one word of recon scratch past it.
-//
-// `index_count` IS VkDrawIndexedIndirectCommand::indexCount -- the kernel counts
-// into the command rather than into a number a host would build one from. The
-// three middle fields are host-written once per extract and untouched here.
-//
-// `vertex_count` sits at byte 20, immediately AFTER the 20-byte command, so the
-// vertex allocator needs no second buffer, no second binding and no second
-// per-slot allocation -- and `vkCmdDrawIndexedIndirect` still reads a
-// well-formed command at offset 0, which is all a consumer binds. It cannot be
-// derived from `index_count` any more: that was only ever true because every
-// triangle owned three private vertices.
-layout(set = 0, binding = 7, scalar) buffer DrawCommand {
-  uint index_count;
-  uint instance_count;
-  uint first_index;
-  int vertex_offset;
-  uint first_instance;
-  uint vertex_count;
-};
-// The real index buffer. Until vertex sharing this was the identity run
-// 0,1,2,... written once per grow by the host, because every triangle owned
-// three private vertices in emission order. A shared vertex is referenced by
-// several triangles from several cells, so the indices are a property of the
-// field and only the kernel knows them.
-layout(set = 0, binding = 8, scalar) writeonly buffer Indices { uint indices[]; };
+// The draw command's indexCount, which the kernel counts into directly -- see
+// mcEmitCell. The rest of VkDrawIndexedIndirectCommand is host-written once per
+// extract and untouched here, as is the vertex counter the host keeps at byte 20
+// (only the sharing kernel allocates through it; here the vertex total is
+// exactly three per triangle and the host derives it).
+layout(set = 0, binding = 7, scalar) buffer DrawCommand { uint index_count; };
 
 layout(push_constant, scalar) uniform PushConstants {
   int block_size;          // voxels per block edge
@@ -118,19 +105,17 @@ layout(push_constant, scalar) uniform PushConstants {
   float voxel_size;        // metres between adjacent voxels
   float iso;               // iso-value to extract
   uint num_active_blocks;  // active_blocks length
-  uint capacity;           // max triangles the index buffer holds
+  uint capacity;           // max triangles the index run holds
   float weight_threshold;  // corners below this weight invalidate the cell
   uint has_color;          // 0 = no color input; vertices get opaque white
-  uint vertex_capacity;    // max vertices the arena holds
-  // 0 = every triangle gets three private vertices, as before sharing existed.
-  // Non-zero runs the owned-edge pass below, so cells within a block share a
-  // vertex on every edge they have in common.
-  //
-  // A push constant rather than a second kernel: "off" is not a second code
-  // path, it just SKIPS phase 1, after which every edge finds its owner slot
-  // empty and takes the duplicate path -- which is exactly what the kernel did
-  // before. One branch, one kernel, one set of numerics to keep correct.
-  uint share_vertices;
+  // Vertices the arena holds. Declared but UNUSED here, and that is deliberate:
+  // this block is one ABI shared with marching_cubes_sparse_shared.comp and
+  // SparsePushConstants on the host, so omitting a field would shift every
+  // offset after it. This kernel needs no bound of its own -- it writes
+  // `vertices[tri * 3 + k]` under `tri < capacity`, and the host keeps the two
+  // budgets locked at exactly three vertices per triangle whenever sharing is
+  // off (see ensure_output_buffers).
+  uint vertex_capacity;
   // The hash-table shape, for the on-device neighbour probe. Passed rather than
   // read from a VoxelGridParams block because hash_common.glsl's `pc` would
   // collide with this one -- see hash_lookup.glsl.
@@ -139,257 +124,36 @@ layout(push_constant, scalar) uniform PushConstants {
   int max_chain;
 } pc;
 
-// Local voxel index within a block (x-fastest), matching the attribute layout
-// BlockIndex::ptr + local the tsdf integrator writes.
-int localIndex(ivec3 lc, int bs) {
-  return lc.x + bs * (lc.y + bs * lc.z);
-}
-
-// mcCornerShift / mcCellNormal / mcEmitCell + the near-tangent edge guard, over
-// the Tables / Vertices / Counter bindings declared above.
+// mcCornerShift / mcCellNormal / mcEdgeVertex / mcEmitCell + the near-tangent
+// edge guard, over the Tables / Vertices / DrawCommand bindings declared above.
 #include "marching_cubes_common.glsl"
 
-// This block's 2x2x2 +neighbourhood: s_neighbour[ox + 2*oy + 4*oz] is the voxel-
-// array base of the neighbour that owns corners spilling in that direction, or -1
-// when it is unallocated. Resolved once per workgroup and read by every voxel,
-// which is the whole point of one-workgroup-per-block: 8 probes serve
-// voxels_per_block cells.
-shared int s_neighbour[8];
+// localIndex / mcLocalBase / s_neighbour / mcResolveNeighbourhood / mcGather --
+// everything this kernel and the sharing one do identically.
+#include "marching_cubes_sparse_common.glsl"
 
-// The vertex this block emitted for each cell's three OWNED edges (+x, +y, +z
-// from the cell's base corner), or kNoVertex. Every marching-cubes edge is the
-// owned edge of exactly one cell (mcEdgeOwner), so a cell finds a neighbour's
-// already-emitted vertex here instead of emitting its own -- which is the whole
-// of in-block sharing.
-//
-// Sized for block_size 8, the only shape any in-tree caller uses and the largest
-// this can hold: a shared array needs a compile-time size while voxels_per_block
-// is a push constant. MarchingCubes::create REFUSES share_vertices above it
-// rather than letting a larger block index past the end -- the library checks
-// what the caller cannot see (the 2026-08-04 rule).
-const uint kMaxSharedCells = 512u;
-const int kNoVertex = -1;
-shared int s_edge_vtx[kMaxSharedCells * 3u];
-// Phase 1's classification, so phase 2 can skip an empty or invalid cell
-// without re-reading eight corners -- and, for a cell whose edges are all
-// shared, without touching global memory at all. Bit 8 is "all corners valid";
-// bits 0..7 are the cube index.
-shared uint s_case[kMaxSharedCells];
-
-// The cell base voxel for a local index, in this block's frame (x-fastest, as
-// tsdf wrote).
-ivec3 mcLocalBase(uint local, int bs) {
-  return ivec3(int(local % uint(bs)), int((local / uint(bs)) % uint(bs)),
-               int(local / uint(bs * bs)));
-}
-
-// Gather a cell's eight corners through the shared neighbourhood.
-//
-// A corner at local coordinate bs on an axis spills into the +neighbour block on
-// that axis: octant selects which of the 2x2x2 neighbourhood holds it, and the
-// residual indexes within it. A corner in an unallocated neighbour (ptr < 0) or
-// an unintegrated voxel (weight below threshold) invalidates the whole cell --
-// no extrapolation.
-//
-// `base` may be the +1 layer (a component == bs) when a cell reaches for an edge
-// whose owner lies outside the block, so corners reach bs + 1. That still lands
-// inside the 2x2x2 neighbourhood -- octant is `c / bs`, which is 1 for anything
-// in [bs, 2*bs), and bs + 1 < 2*bs for every legal block size.
-bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
-              out int cube_index) {
-  cube_index = 0;
-  for (int i = 0; i < 8; ++i) {
-    ivec3 c = base + mcCornerShift(i);
-    ivec3 octant = c / bs;
-    ivec3 lc = c - octant * bs;
-    int oi = octant.x + 2 * octant.y + 4 * octant.z;
-    int nptr = s_neighbour[oi];
-    if (nptr < 0) {
-      return false;  // neighbour block not allocated
-    }
-    uint si = uint(nptr) + uint(localIndex(lc, bs));
-    if (weight[si] < pc.weight_threshold) {
-      return false;  // unintegrated voxel
-    }
-    sdf[i] = tsdf[si];
-    if (pc.has_color != 0u) {
-      // color_attr == 0 is the tsdf integrator's "colour never observed"
-      // sentinel: a fused colour is packed with alpha 0xFF, so any observed
-      // colour is non-zero. A depth-integrated but colour-unobserved corner
-      // falls back to opaque white rather than dragging the interpolated vertex
-      // toward black, mirroring the integrator's first-observation-assigns
-      // anti-darkening rule. Decoded to LINEAR working values here, because the
-      // edge interpolation is an average (the 2026-08-02 decision); white is
-      // 1.0 in either space, so the sentinel branch is unaffected.
-      uint packed = color_attr[si];
-      corner_color[i] = packed != 0u ? vrUnpackSrgbToLinear(packed) : vec3(1.0);
-    }
-    if (sdf[i] < pc.iso) {
-      cube_index |= (1 << i);
-    }
-  }
-  return true;
-}
-
-// Claim one vertex slot and write it, returning the index -- or kNoVertex when
-// the arena is full.
-//
-// Past `vertex_capacity` the vertex is DROPPED but still counted, exactly as
-// mcEmitCell does for triangles: `vertex_count` must end as the field's true
-// total or the host's refit would undershoot again. A dropped vertex makes every
-// triangle referencing it undrawable, which the emit path handles by declining
-// to write that triangle while still counting its indices.
-int mcClaimVertex(vec3 position, vec3 normal, vec3 color) {
-  uint slot = atomicAdd(vertex_count, 1u);
-  if (slot >= pc.vertex_capacity) {
-    return kNoVertex;
-  }
-  mcWriteVertex(slot, position, normal, color);
-  return int(slot);
-}
-
-// Phase 1: classify the cell and emit a vertex on each of its three OWNED edges.
-//
-// Owned edges are the ones running +x/+y/+z from the cell's base corner, i.e.
-// corner 0 to corners 1/3/4 under this repo's corner numbering (the prior
-// engine's, ported verbatim). Every edge in the field is owned by exactly one
-// cell, so after this pass every in-block edge that carries a crossing has a
-// vertex, and phase 2 does no work for it but a lookup.
-void mcOwnedEdgePass(BlockIndex block, int bs, uint local, int owned_edge[3]) {
+// Mesh one cell: gather its eight corners through the neighbourhood, then hand
+// the shared per-cell body its triangles.
+void mcMeshCell(BlockIndex block, int bs, uint local) {
   ivec3 base = mcLocalBase(local, bs);
   float sdf[8];
   vec3 corner_color[8];
   int cube_index;
   if (!mcGather(bs, base, sdf, corner_color, cube_index)) {
-    s_case[local] = 0u;  // invalid: bit 8 clear
-    return;
+    return;  // a corner is unallocated or unintegrated: no surface to close
   }
-  s_case[local] = uint(cube_index) | 0x100u;
   if (cube_index == 0 || cube_index == 255) {
-    return;  // no crossing anywhere in this cell, so none on its owned edges
+    return;  // no sign change -> no surface in this cell
   }
+
+  // World positions anchor on the base block's global voxel with a zero origin
+  // (node convention), so a boundary cell's far corners land at the neighbour's
+  // voxels without a second coord lookup. The shared body computes the gradient
+  // normal, reverses winding, and interpolates colour.
   ivec3 base_voxel = block.coord * bs + base;
-  // One normal per cell, as before. A shared vertex therefore carries the
-  // gradient of the cell that OWNS its edge rather than of each cell that draws
-  // it -- the prior engine's behaviour, and the reason sharing changes vertex
-  // normals even though it leaves every triangle where it was. A genuine
-  // per-vertex normal (the gradient at the crossing) is a further change and is
-  // deliberately not folded in here; it deserves its own measurement.
-  // TODO(mesh): per-vertex normals now that vertices are shared.
   vec3 normal = mcCellNormal(sdf);
-  for (int axis = 0; axis < 3; ++axis) {
-    int edge = owned_edge[axis];
-    int a = edge_to_vert[edge * 2 + 0];
-    int b = edge_to_vert[edge * 2 + 1];
-    // Sign change across this edge, read off the cube index we just built.
-    bool inside_a = (cube_index & (1 << a)) != 0;
-    bool inside_b = (cube_index & (1 << b)) != 0;
-    if (inside_a == inside_b) {
-      continue;
-    }
-    vec3 position;
-    vec3 color;
-    mcEdgeVertex(edge, sdf, corner_color, vec3(0.0), base_voxel, pc.voxel_size,
-                 pc.iso, pc.has_color, position, color);
-    s_edge_vtx[local * 3u + uint(axis)] =
-        mcClaimVertex(position, normal, color);
-  }
-}
-
-// Phase 2: emit this cell's triangles as indices into the shared vertices.
-//
-// An edge whose owner cell lies inside this block is a lookup. One whose owner
-// lies outside -- the block's +face, where sharing would need the neighbouring
-// workgroup's shared memory -- is DUPLICATED: emitted inline from this cell's
-// own corners. That is the accepted cost of in-block-only sharing, and it is
-// why the win is ~4x rather than the ~6x full sharing would give.
-//
-// With pc.share_vertices == 0 phase 1 never ran, so every slot is kNoVertex and
-// every edge takes the duplicate path -- which is precisely what this kernel did
-// before sharing existed.
-void mcTrianglePass(BlockIndex block, int bs, uint local, bool sharing) {
-  ivec3 base = mcLocalBase(local, bs);
-
-  int cube_index;
-  float sdf[8];
-  vec3 corner_color[8];
-  bool have_corners = false;
-  if (sharing) {
-    uint c = s_case[local];
-    if ((c & 0x100u) == 0u) {
-      return;  // phase 1 found an invalid corner
-    }
-    cube_index = int(c & 0xFFu);
-  } else {
-    if (!mcGather(bs, base, sdf, corner_color, cube_index)) {
-      return;
-    }
-    have_corners = true;
-  }
-  if (cube_index == 0 || cube_index == 255) {
-    return;
-  }
-
-  ivec3 base_voxel = block.coord * bs + base;
-  vec3 normal = vec3(0.0, 0.0, 1.0);
-  if (have_corners) {
-    normal = mcCellNormal(sdf);
-  }
-
-  for (int t = 0; tri_table[cube_index * 16 + t] != -1; t += 3) {
-    // Resolve the three corners of this triangle to vertex indices first, then
-    // claim the index slots -- so a triangle is counted exactly once whether or
-    // not its vertices had to be duplicated.
-    int vi[3];
-    bool ok = true;
-    for (int k = 0; k < 3; ++k) {
-      int edge = tri_table[cube_index * 16 + t + k];
-      ivec3 delta;
-      int axis;
-      mcEdgeOwner(edge, delta, axis);
-      ivec3 owner = base + delta;
-      int slot = kNoVertex;
-      bool in_block = sharing && all(lessThan(owner, ivec3(bs)));
-      if (in_block) {
-        uint oi = uint(owner.x + bs * (owner.y + bs * owner.z));
-        slot = s_edge_vtx[oi * 3u + uint(axis)];
-      }
-      if (slot == kNoVertex) {
-        // Duplicate: this cell's own corners describe the same edge, so the
-        // position is bit-identical to what the owner would have produced.
-        // Gathered lazily -- a cell whose edges are all shared never touches
-        // global memory here.
-        if (!have_corners) {
-          int ignored;
-          if (!mcGather(bs, base, sdf, corner_color, ignored)) {
-            ok = false;
-            break;
-          }
-          have_corners = true;
-          normal = mcCellNormal(sdf);
-        }
-        vec3 position;
-        vec3 color;
-        mcEdgeVertex(edge, sdf, corner_color, vec3(0.0), base_voxel,
-                     pc.voxel_size, pc.iso, pc.has_color, position, color);
-        slot = mcClaimVertex(position, normal, color);
-      }
-      vi[k] = slot;
-      if (slot == kNoVertex) {
-        ok = false;  // arena full; counted below, not written
-      }
-    }
-    uint first = atomicAdd(index_count, kIndicesPerTriangle);
-    uint tri = first / kIndicesPerTriangle;
-    if (!ok || tri >= pc.capacity) {
-      continue;  // dropped, still counted -- see mcEmitCell's contract
-    }
-    // Reversed winding (0, 2, 1) so the CCW front face points along the outward
-    // gradient, matching mcEmitCell and what gfx expects.
-    indices[first + 0u] = uint(vi[0]);
-    indices[first + 1u] = uint(vi[2]);
-    indices[first + 2u] = uint(vi[1]);
-  }
+  mcEmitCell(cube_index, sdf, corner_color, vec3(0.0), base_voxel, pc.voxel_size,
+             normal, pc.iso, pc.has_color, pc.capacity);
 }
 
 void main() {
@@ -399,8 +163,7 @@ void main() {
   // rather than gl_LocalInvocationID.x, and the full dimension product rather
   // than gl_WorkGroupSize.x, because the two agree only while local_size_y/z
   // are 1. That is true today (the emitted SPIR-V is `LocalSize 256 1 1`) and
-  // nothing states it, so a later y/z dimension -- for the in-block vertex
-  // sharing that is this kernel's next step, or to cut the idle lanes noted
+  // nothing states it, so a later y/z dimension -- to cut the idle lanes noted
   // below -- would silently race 8*Ny*Nz writers onto the 8 s_neighbour slots
   // and re-mesh every voxel Ny*Nz times through the append atomic. Both forms
   // compile; only this one stays correct.
@@ -417,32 +180,7 @@ void main() {
   }
   BlockIndex block = active_blocks[block_i];
 
-  // Threads 0..7 each resolve one octant. Octant 0 is this block, already known.
-  //
-  // TODO(mesh): this prologue, not an occupancy change, is what the on-device
-  // probe costs -- 8 of `group_threads` lanes each walking a bucket while the
-  // rest wait at the barrier, serialised ahead of every cell in the block. The
-  // dispatch measured +25% (25.9 -> 32.2 ms) on the M5 iPad Pro when the host
-  // table went away, and the flat grid it replaced was NOT more densely packed:
-  // at block_size 8, voxels_per_block is 512 = 2*256, so `gid / 512` was already
-  // constant across each 256-thread group and every workgroup belonged to one
-  // block. Only the group count changed (2 per block -> 1). So the levers are
-  // the probe -- spreading the 8 across subgroups, or one lane per bucket slot
-  // with a reduction -- not the cell or block count. Left unmeasured rather than
-  // guessed at; the repo's own lesson is to profile the phase before optimising
-  // it. Note that an early exit on the first free slot is NOT one of the levers:
-  // see the primary-scan note on vrFindBlockPtr.
-  if (tid < 8u) {
-    uint oi = tid;
-    if (oi == 0u) {
-      s_neighbour[0] = block.ptr;
-    } else {
-      ivec3 off = ivec3(int(oi & 1u), int((oi >> 1) & 1u), int((oi >> 2) & 1u));
-      s_neighbour[oi] =
-          vrFindBlockPtr(block.coord + off, pc.num_buckets, pc.bucket_size,
-                         pc.max_chain);
-    }
-  }
+  mcResolveNeighbourhood(block, tid);
   barrier();
 
   // Stride over the block's voxels rather than assuming one thread each: the
@@ -461,42 +199,7 @@ void main() {
   // ComputePipeline::create, and every in-tree caller uses block_size 8, where
   // this shape is a win. TODO(mesh): revisit if a consumer ships a smaller
   // block.
-  // Sharing needs phase 1's shared arrays, which are sized for kMaxSharedCells.
-  // The host refuses a larger block outright, so this is belt-and-braces against
-  // a push constant that disagrees with the pipeline it was built for.
-  bool sharing = pc.share_vertices != 0u && vpb <= kMaxSharedCells;
-
-  if (sharing) {
-    // The three edges a cell owns, derived from the tables rather than
-    // tabulated (see mcEdgeOwner). Hoisted out of the per-cell loops: it is a
-    // property of the numbering, identical for every cell and every block.
-    int owned_edge[3] = int[3](-1, -1, -1);
-    for (int e = 0; e < 12; ++e) {
-      ivec3 delta;
-      int axis;
-      mcEdgeOwner(e, delta, axis);
-      if (delta == ivec3(0)) {
-        owned_edge[axis] = e;
-      }
-    }
-
-    for (uint local = tid; local < vpb; local += group_threads) {
-      s_edge_vtx[local * 3u + 0u] = kNoVertex;
-      s_edge_vtx[local * 3u + 1u] = kNoVertex;
-      s_edge_vtx[local * 3u + 2u] = kNoVertex;
-      s_case[local] = 0u;
-    }
-    barrier();
-
-    for (uint local = tid; local < vpb; local += group_threads) {
-      mcOwnedEdgePass(block, bs, local, owned_edge);
-    }
-    // Every owned edge in this block must be resolved before any cell reads a
-    // neighbour's slot -- this barrier is the whole of what makes sharing safe.
-    barrier();
-  }
-
   for (uint local = tid; local < vpb; local += group_threads) {
-    mcTrianglePass(block, bs, local, sharing);
+    mcMeshCell(block, bs, local);
   }
 }
