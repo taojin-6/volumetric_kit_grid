@@ -272,6 +272,48 @@ class VR_VOLUME_API VoxelHashMap {
   ///         non-OK @ref Status if the map is moved-from.
   Result<std::vector<HashEntry>> read_entries();
 
+  /// @brief The device hash-entry array, for a kernel that resolves blocks by
+  ///        coordinate itself instead of being handed a host-built table.
+  ///
+  /// Published because the alternative is worse. A consumer that needs the
+  /// neighbourhood of N blocks otherwise pays an O(N) serial host pass of
+  /// coordinate lookups plus an upload -- 102 ms of a 133 ms mesh extract at
+  /// 107k blocks, measured on an M5 iPad Pro -- to hand the GPU a table it
+  /// could have built itself in parallel. `volume/shaders/hash_lookup.glsl` is
+  /// the read-only traversal to bind this with; it mirrors `block_exists` and
+  /// takes the table shape (`num_buckets` / `bucket_size` / `max_chain`) as
+  /// arguments.
+  ///
+  /// @warning Read-only, and only safe while **nothing is mutating the table**
+  /// --
+  ///          no allocate / remove / clear / resize dispatch in flight. Probing
+  ///          concurrently with an insert would race the bucket locks this
+  ///          accessor deliberately does not expose. A meshing pass qualifies
+  ///          because it is quiescent by construction; a pass that also
+  ///          allocates does not.
+  /// @warning **Do not cache the handle.** A completed @ref resize replaces the
+  ///          entry buffer outright -- the old allocation is destroyed, so a
+  ///          handle held in a persistent descriptor set then names freed
+  ///          memory, which is a validation-layer-only diagnostic and undefined
+  ///          with layers off. Both shipped examples resize mid-scan on
+  ///          block-heap overflow. Re-fetch on every use, exactly as @ref
+  ///          AttributeView requires across a @ref VoxelBlockGrid::resize; a
+  ///          move of the map has the same effect.
+  /// @return The entry buffer, or `VK_NULL_HANDLE` on a moved-from map.
+  VkBuffer entries_buffer() const noexcept;
+
+  /// @brief Bytes in @ref entries_buffer, for a `VK_WHOLE_SIZE`-free binding.
+  ///
+  /// Pair it with @ref entries_buffer: bind the range rather than
+  /// `VK_WHOLE_SIZE` so the consumer can check it against the device's
+  /// `maxStorageBufferRange` first. That limit matters here -- the table is
+  /// `num_buckets * bucket_size * sizeof(HashEntry)` and @ref resize doubles
+  /// `num_buckets`, while Vulkan guarantees only 2^27 (128 MiB), which is what
+  /// Android-class drivers report and no driver this repo tests on does.
+  /// @return The size in bytes, or 0 on a moved-from map (so the pair stays
+  ///         consistent: a null handle never carries a non-zero range).
+  VkDeviceSize entries_buffer_size() const noexcept;
+
   /// @brief Compute occupancy + health statistics (active / overflow / chain
   ///        length + heap utilization).
   ///

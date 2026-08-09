@@ -56,9 +56,10 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 ///
 /// @note This dense entry point is the path-proving building block; the
 ///       @ref MarchingCubes::extract overload taking a @ref
-///       volume::VoxelBlockGrid meshes the real sparse volume (with cross-block
-///       neighbour sampling at block boundaries). The per-cell kernel is
-///       identical -- only the corner-sampling differs.
+///       volume::VoxelBlockGrid meshes the real sparse volume (whose cells at a
+///       block boundary sample corners out of the neighbouring blocks, resolved
+///       by an on-device hash probe). The per-cell kernel is identical -- only
+///       the corner-sampling differs.
 struct DenseGrid {
   Vec3i dims{};             ///< Sample count per axis (cells = `dims - 1`).
   float voxel_size = 0.0f;  ///< Metres between adjacent samples.
@@ -90,9 +91,7 @@ struct DenseGrid {
 struct ExtractTimings {
   /// Compacting the hash map's active block list (a dispatch + readback).
   double compact_ms = 0.0;
-  /// Building the host-side 2x2x2 neighbour lookup table.
-  double neighbour_lut_ms = 0.0;
-  /// Allocating + filling the active-block and neighbour input buffers.
+  /// Allocating + filling the active-block input buffer.
   double input_upload_ms = 0.0;
   /// Sizing the vertex arena + resetting the draw command, including a refit
   /// after an undersized guess (see @ref dispatches). Near zero once the
@@ -139,8 +138,8 @@ struct ExtractTimings {
 
   /// @return The sum of every phase, in milliseconds.
   double total_ms() const noexcept {
-    return compact_ms + neighbour_lut_ms + input_upload_ms + arena_alloc_ms +
-           descriptor_ms + dispatch_ms + readback_ms;
+    return compact_ms + input_upload_ms + arena_alloc_ms + descriptor_ms +
+           dispatch_ms + readback_ms;
   }
 };
 
@@ -408,15 +407,27 @@ class VR_MESH_API MarchingCubes {
   /// @brief Extract the @p iso iso-surface straight off a sparse
   ///        @ref volume::VoxelBlockGrid, meshing every active block.
   ///
-  /// Runs one invocation per voxel of each active block (the block iteration
-  /// the `tsdf` integrator uses), each voxel the base corner of one
-  /// marching-cubes cell. A cell on a block's `+face` reaches its far corners
-  /// into neighbouring blocks; those samples are resolved through a host-built
-  /// 2x2x2 neighbour table (this block plus its seven `+x/+y/+z` neighbours,
-  /// built from the compacted active set), so the kernel needs no device-side
-  /// hash probe. The per-cell body is identical to the dense @ref extract --
-  /// independent triangles, one gradient normal per cell, reversed winding, and
-  /// the same hybrid @ref Vertex::color / @ref Vertex::uv0 appearance.
+  /// Runs one **workgroup** per active block, striding over the block's voxels,
+  /// each voxel the base corner of one marching-cubes cell. A cell on a block's
+  /// `+face` reaches its far corners into neighbouring blocks; the kernel
+  /// resolves that 2x2x2 neighbourhood (this block plus its seven `+x/+y/+z`
+  /// neighbours) **itself**, probing @p grid's hash table on-device, eight
+  /// probes amortised over the block's cells. The per-cell body is identical to
+  /// the dense @ref extract -- independent triangles, one gradient normal per
+  /// cell, reversed winding, and the same hybrid @ref Vertex::color /
+  /// @ref Vertex::uv0 appearance.
+  ///
+  /// @warning The probe is lock-free and unfenced, so this call requires
+  ///          @p grid's hash table to be **quiescent**: no `allocate` /
+  ///          `remove` / `clear` / `resize` dispatch on it may be in flight, on
+  ///          this thread or any other. Within one thread that holds by
+  ///          construction (every `volume` dispatch blocks on its fence), so it
+  ///          binds only a caller that fuses and meshes concurrently -- which
+  ///          must serialise the two itself. The same precondition as
+  ///          @ref volume::VoxelHashMap::entries_buffer, stated here because
+  ///          this is where a caller meets it; the host-built neighbour table
+  ///          this replaced needed it too, having read the same table through a
+  ///          compacted snapshot.
   ///
   /// @param grid  A grid carrying `float` `tsdf` + `weight` attributes (see
   /// @ref
