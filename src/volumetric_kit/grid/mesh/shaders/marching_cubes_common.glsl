@@ -30,9 +30,53 @@ ivec3 mcCornerShift(int corner) {
                corner_offset[corner * 3 + 2]);
 }
 
+// Which cell owns edge `edge`, and along which axis it runs.
+//
+// Every marching-cubes edge is the +x/+y/+z edge of exactly one cell: the one
+// at the componentwise MINIMUM of its two endpoint corners. That cell is `delta`
+// steps from the cell asking, so a vertex-sharing kernel can name an edge by
+// (owner cell, axis) and have every cell touching it agree -- which is the whole
+// basis of sharing.
+//
+// DERIVED from the tables rather than tabulated beside them, deliberately. A
+// fourth mirror of the edge/corner numbering is exactly the drift hazard the
+// volume tier hit with hash_lookup.glsl: a divergence would silently resolve the
+// wrong owner and split vertices that should share, under Status::ok. Here the
+// answer is a pure function of `edge_to_vert` + `corner_offset`, so it cannot
+// disagree with them.
+void mcEdgeOwner(int edge, out ivec3 delta, out int axis) {
+  ivec3 sa = mcCornerShift(edge_to_vert[edge * 2 + 0]);
+  ivec3 sb = mcCornerShift(edge_to_vert[edge * 2 + 1]);
+  delta = min(sa, sb);
+  ivec3 d = abs(sa - sb);  // exactly one component is 1 -- edges are axis-aligned
+  axis = d.x != 0 ? 0 : (d.y != 0 ? 1 : 2);
+}
+
+// Write one vertex at an already-claimed slot. The appearance fields are the
+// same constants mcEmitCell writes, kept here so the two emitters cannot drift:
+// uv0 is the "use vertex colour" sentinel until projective texturing runs, and
+// tangent is the placeholder the renderer's slot needs (meshing has no surface
+// parameterisation to derive a real one from, and a slot left unwritten would
+// carry whatever the previous, larger mesh put there).
+void mcWriteVertex(uint slot, vec3 position, vec3 normal, vec3 color) {
+  vertices[slot].position = position;
+  vertices[slot].normal = normal;
+  vertices[slot].tangent = vec4(1.0, 0.0, 0.0, 1.0);
+  vertices[slot].uv0 = vec2(-1.0);
+  vertices[slot].color = vec4(color, 1.0);
+}
+
 // Clamped iso-crossing ratio along the edge sa -> sb. Guards the near-tangent
 // case so the ratio stays finite (mirrors the prior engine's copysign(kEpsilon)
 // guard); clamp keeps the interpolant on the segment.
+//
+// NOT symmetric under swapping its endpoints, which is why mcEdgeVertex below
+// orders them canonically before calling it. `1 - mcEdgeRatio(sb, sa, iso)`
+// equals `mcEdgeRatio(sa, sb, iso)` only in exact arithmetic, and under the
+// near-tangent guard not even approximately: at sa = -1e-9, sb = +1e-9, iso = 0
+// the guard forces denom to +1e-6 one way and -1e-6 the other, and BOTH
+// directions come out at ratio ~1e-3 -- i.e. hugging whichever endpoint was
+// passed first, a full edge apart.
 float mcEdgeRatio(float sa, float sb, float iso) {
   float denom = sb - sa;
   if (abs(denom) < 1e-6) {
@@ -52,6 +96,51 @@ vec3 mcCellNormal(float sdf[8]) {
            (sdf[4] + sdf[5] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[2] + sdf[3]));
   float glen = length(grad);
   return glen > 1e-6 ? grad / glen : vec3(0.0, 0.0, 1.0);
+}
+
+// The position + colour of the iso-crossing on edge `edge` of the cell whose
+// eight corner samples are `sdf` / `corner_color` and whose base voxel is
+// `base_voxel`. The ONE interpolator: mcEmitCell calls it, and so do both
+// halves of the sparse kernel's vertex sharing (the owned-edge pass and the
+// +face duplicate path), so a shared vertex and a duplicated one land on
+// bit-identical coordinates -- which is what makes sharing a pure vertex-count
+// change and leaves every triangle exactly where it was.
+//
+// Bit-identical needs the endpoints in a CANONICAL ORDER, not merely resolved
+// to the same global voxels, and that is what the swap below is for. kEdgeToVert
+// lists edges 2/3/6/7 max-corner-first, so one cell's owned +y edge (edge 3 =
+// corners {3,0}) is its neighbour's edge 1 (corners {1,2}) -- the same segment,
+// traversed in opposite directions. `mix` and mcEdgeRatio are both
+// direction-dependent (see mcEdgeRatio's note: under the near-tangent guard the
+// two directions land at OPPOSITE ENDS of the edge), so without this the two
+// emitters would disagree, by ulps normally and by a whole voxel on a tangent
+// cell. Ordering by corner shift is exactly the rule mcEdgeOwner uses to name
+// the edge, so the two cannot disagree about which end is which.
+void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8], vec3 origin,
+                  ivec3 base_voxel, float voxel_size, float iso, uint has_color,
+                  out vec3 position, out vec3 color) {
+  int a = edge_to_vert[edge * 2 + 0];
+  int b = edge_to_vert[edge * 2 + 1];
+  ivec3 shift_a = mcCornerShift(a);
+  ivec3 shift_b = mcCornerShift(b);
+  // Edges are axis-aligned, so the shifts differ in exactly one component (0 vs
+  // 1): `any(greaterThan(...))` is true precisely when `a` is the high end.
+  if (any(greaterThan(shift_a, shift_b))) {
+    int swap_corner = a;
+    a = b;
+    b = swap_corner;
+    ivec3 swap_shift = shift_a;
+    shift_a = shift_b;
+    shift_b = swap_shift;
+  }
+  float ratio = mcEdgeRatio(sdf[a], sdf[b], iso);
+  vec3 pa = origin + vec3(base_voxel + shift_a) * voxel_size;
+  vec3 pb = origin + vec3(base_voxel + shift_b) * voxel_size;
+  position = mix(pa, pb, ratio);
+  // LINEAR working values (each kernel decodes at the gather), because this is
+  // an average -- the 2026-08-02 colour decision. White is 1.0 either way.
+  color = has_color != 0u ? mix(corner_color[a], corner_color[b], ratio)
+                          : vec3(1.0);
 }
 
 // Emit the cell's triangles into `vertices[]` / `index_count`. Corner c's world
@@ -101,20 +190,14 @@ void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
     vec3 p[3];
     vec3 col[3];
     for (int k = 0; k < 3; ++k) {
-      int edge = tri_table[cube_index * 16 + t + k];
-      int a = edge_to_vert[edge * 2 + 0];
-      int b = edge_to_vert[edge * 2 + 1];
-      float ratio = mcEdgeRatio(sdf[a], sdf[b], iso);
-      vec3 pa = origin + vec3(base_voxel + mcCornerShift(a)) * voxel_size;
-      vec3 pb = origin + vec3(base_voxel + mcCornerShift(b)) * voxel_size;
-      p[k] = mix(pa, pb, ratio);
-      // Interpolate color at the same ratio; opaque white where no color input.
-      // `corner_color` arrives LINEAR (each kernel decodes at the gather), so
-      // this mix -- an average -- happens in linear working values and
-      // Vertex::color leaves linear, which is what glTF COLOR_0 means and what
-      // the renderer shades in. White is 1.0 in either space.
-      col[k] = has_color != 0u ? mix(corner_color[a], corner_color[b], ratio)
-                               : vec3(1.0);
+      // Through mcEdgeVertex, not open-coded here. It was a verbatim copy of
+      // that function's body, and the copy is what let the two emitters drift:
+      // the sparse kernel's sharing path calls mcEdgeVertex, so a vertex it
+      // shares and one this loop duplicates have to agree BIT FOR BIT or the
+      // "sharing moves only the vertex count" invariant is false. One call
+      // site, one canonical endpoint order, one near-tangent guard.
+      mcEdgeVertex(tri_table[cube_index * 16 + t + k], sdf, corner_color, origin,
+                   base_voxel, voxel_size, iso, has_color, p[k], col[k]);
     }
     uint vbase = tri * 3u;
     vertices[vbase + 0u].position = p[0];

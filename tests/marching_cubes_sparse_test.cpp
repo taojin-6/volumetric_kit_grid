@@ -228,15 +228,23 @@ bool fill_dense_block(vol::VoxelBlockGrid& g) {
 // the same field emit the same triangles in a different ORDER; each triangle's
 // arithmetic is independent of that order, so the floats themselves are
 // bit-identical and the sorted lists must match exactly.
+// Resolved through the INDEX buffer, which is what makes this comparison a
+// statement about the surface rather than about allocation order. It used to
+// read consecutive vertex triples, valid only while every triangle owned three
+// private vertices emitted in order; the kernel now claims vertices and
+// triangles from two independent atomics. It is also what lets this same
+// helper state the vertex-sharing invariant, where the triangle list must be
+// unchanged while the vertex array behind it shrinks ~4x.
 std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
   std::vector<std::array<float, 9>> tris;
-  tris.reserve(m.vertices.size() / 3);
-  for (std::size_t i = 0; i + 2 < m.vertices.size(); i += 3) {
+  tris.reserve(m.indices.size() / 3);
+  for (std::size_t i = 0; i + 2 < m.indices.size(); i += 3) {
     std::array<float, 9> t{};
     for (std::size_t k = 0; k < 3; ++k) {
-      t[k * 3 + 0] = m.vertices[i + k].position.x;
-      t[k * 3 + 1] = m.vertices[i + k].position.y;
-      t[k * 3 + 2] = m.vertices[i + k].position.z;
+      const mesh::Vertex& v = m.vertices[m.indices[i + k]];
+      t[k * 3 + 0] = v.position.x;
+      t[k * 3 + 1] = v.position.y;
+      t[k * 3 + 2] = v.position.z;
     }
     tris.push_back(t);
   }
@@ -328,12 +336,20 @@ int main() {
   // flipped table would drop this well below 1).
   int face_count = 0;
   int face_outward = 0;
-  for (std::size_t t = 0; t + 2 < sphere.vertices.size(); t += 3) {
-    const vr::Vec3f face = vr::cross(
-        sphere.vertices[t + 1].position - sphere.vertices[t].position,
-        sphere.vertices[t + 2].position - sphere.vertices[t].position);
+  // Walked through the INDEX buffer, not as consecutive vertex triples. That
+  // shorthand was valid only while the run was the identity 0,1,2,...; the
+  // kernel now allocates vertices and triangles through two independent
+  // atomics, so vertex order is not triangle order. Reading the indices is what
+  // keeps this assertion about winding rather than about allocation order --
+  // and it is what lets the same check keep its teeth once vertices are shared.
+  for (std::size_t t = 0; t + 2 < sphere.indices.size(); t += 3) {
+    const mesh::Vertex& a = sphere.vertices[sphere.indices[t + 0]];
+    const mesh::Vertex& b = sphere.vertices[sphere.indices[t + 1]];
+    const mesh::Vertex& c = sphere.vertices[sphere.indices[t + 2]];
+    const vr::Vec3f face =
+        vr::cross(b.position - a.position, c.position - a.position);
     if (vr::length(face) > 1e-8f) {
-      if (vr::dot(vr::normalize(face), sphere.vertices[t].normal) > 0.0f) {
+      if (vr::dot(vr::normalize(face), a.normal) > 0.0f) {
         ++face_outward;
       }
       ++face_count;
@@ -385,11 +401,16 @@ int main() {
   // fails by a mile. The tolerance is wide because marching cubes chords a
   // curved surface and the field is sampled at kH -- it is sized to catch a
   // factor of three, not to measure discretisation error.
+  // Through the indices, for the reason given at the winding check above: a
+  // vertex triple is a triangle only under an identity index run, which the
+  // kernel no longer produces. Keeping this assertion honest matters more than
+  // most -- it is the one that pins the counter's UNITS against a quantity no
+  // counter participates in, so it must measure the real surface.
   double area = 0.0;
-  for (std::size_t i = 0; i + 2 < sphere.vertices.size(); i += 3) {
-    const vr::Vec3f& a = sphere.vertices[i + 0].position;
-    const vr::Vec3f& b = sphere.vertices[i + 1].position;
-    const vr::Vec3f& c = sphere.vertices[i + 2].position;
+  for (std::size_t i = 0; i + 2 < sphere.indices.size(); i += 3) {
+    const vr::Vec3f& a = sphere.vertices[sphere.indices[i + 0]].position;
+    const vr::Vec3f& b = sphere.vertices[sphere.indices[i + 1]].position;
+    const vr::Vec3f& c = sphere.vertices[sphere.indices[i + 2]].position;
     area += 0.5 * static_cast<double>(vr::length(vr::cross(b - a, c - a)));
   }
   const double analytic_area = 4.0 * 3.14159265358979323846 *
@@ -646,6 +667,200 @@ int main() {
   CHECK(refit_mc.extract(dense_block, 0.0f, &reused_stats).ok());
   CHECK(reused_stats.dispatches == 1);
   CHECK(reused_stats.emitted_triangles == refit_timings.emitted_triangles);
+
+  // --- Vertex sharing --------------------------------------------------------
+  // Nothing above reaches MarchingCubesConfig::share_vertices: it selects a
+  // second compiled kernel, so with no test constructing that config the whole
+  // owned-edge pass, its barrier, the shared-slot lookup, the block-face
+  // duplicate path and the host's separate vertex budget were dead to ctest --
+  // `bool sharing = false;` left every suite green.
+  mesh::MarchingCubesConfig share_config;
+  share_config.share_vertices = true;
+  vr::Result<mesh::MarchingCubes> share_result = mesh::MarchingCubes::create(
+      device.value(), allocator.value(), share_config);
+  CHECK(share_result.ok());
+  mesh::MarchingCubes share_mc = std::move(share_result).value();
+
+  mesh::ExtractTimings share_timings;
+  vr::Result<mesh::Mesh> share_mesh_result =
+      share_mc.extract(grid, 0.0f, &share_timings);
+  CHECK(share_mesh_result.ok());
+  const mesh::Mesh share_mesh = std::move(share_mesh_result).value();
+
+  // THE invariant, and the one worth having: sharing moves the vertex count and
+  // nothing else. Compared through the index buffer on exact position floats,
+  // so it is a statement about the surface -- and it is what catches a
+  // traversal-direction mismatch between the two emitters. kEdgeToVert lists
+  // edges 2/3/6/7 max-corner-first, so an owner cell and the neighbour that
+  // duplicates the same edge walk it in OPPOSITE directions unless
+  // mcEdgeVertex orders the endpoints canonically; `mix` and the near-tangent
+  // guard are both direction-dependent, and under the guard the two land at
+  // opposite ends of the edge -- a whole voxel apart.
+  CHECK(share_mesh.triangle_count() == sphere.triangle_count());
+  CHECK(canonical_triangles(share_mesh) == canonical_triangles(sphere));
+
+  // The unshared mesh is three private vertices per triangle; the shared one is
+  // materially fewer. Asserted as a ratio rather than a fixed number so it
+  // states the property (in-block sharing, ~4x) instead of pinning this
+  // fixture's arithmetic -- but tightly enough that a kernel which shared
+  // nothing, or shared only within a cell, would fail.
+  CHECK(sphere.vertices.size() == sphere.indices.size());  // 3 per triangle
+  CHECK(share_mesh.vertices.size() * 2 < sphere.vertices.size());
+  CHECK(share_timings.emitted_vertices == share_mesh.vertices.size());
+  CHECK(share_timings.emitted_triangles == share_mesh.triangle_count());
+  // Every index addresses a live vertex. With sharing this is a real check
+  // rather than a restatement: the run is written by the kernel from a vertex
+  // counter independent of the triangle counter.
+  for (std::uint32_t i : share_mesh.indices) {
+    CHECK(i < share_mesh.vertices.size());
+  }
+  // At least one vertex really is shared -- i.e. some index appears more than
+  // once. Implied by the count ratio above, but stated directly because it is
+  // the property, and a mesh of unique-but-fewer vertices would be a different
+  // bug.
+  {
+    std::vector<std::uint32_t> uses(share_mesh.vertices.size(), 0);
+    for (std::uint32_t i : share_mesh.indices) ++uses[i];
+    std::size_t multi = 0;
+    for (std::uint32_t u : uses) {
+      CHECK(u > 0);  // no vertex emitted and then referenced by nothing
+      if (u > 1) ++multi;
+    }
+    CHECK(multi > share_mesh.vertices.size() / 2);
+  }
+
+  // The device view says so, which is what texture::ProjectiveTexturer refuses
+  // on -- per-triangle visibility cannot be written to a per-vertex uv0 that
+  // several triangles share.
+  vr::Result<mesh::DeviceMesh> share_device =
+      share_mc.extract_device(grid, 0.0f);
+  CHECK(share_device.ok());
+  CHECK(share_device.value().shares_vertices);
+  CHECK(share_device.value().vertex_count == share_timings.emitted_vertices);
+  CHECK(share_mc.download(share_device.value()).ok());
+
+  vr::Result<mesh::DeviceMesh> plain_device =
+      extractor.extract_device(grid, 0.0f);
+  CHECK(plain_device.ok());
+  CHECK(!plain_device.value().shares_vertices);
+  CHECK(plain_device.value().vertex_count ==
+        plain_device.value().triangle_count * 3);
+
+  // A dropped vertex must be counted ONCE, by the cell that owns its edge, and
+  // not re-claimed by every cell that references it. Forced through the same
+  // sign-alternating block that forces the triangle refit: the seed budget is
+  // ~45 vertices per block against ~1000 the field needs, so the first dispatch
+  // drops nearly all of them.
+  //
+  // The assertion is a MAGNITUDE, because the shape passes either way: the
+  // second dispatch has room, so its counter is the true total whatever the
+  // first one reported. What the first one reports is what the arena is REFIT
+  // to, and the arena is grow-only -- so re-claiming per reference reports
+  // ~3 vertices per triangle instead of the true ~0.75 and pins an arena ~6x
+  // the surface, which is more than not sharing at all.
+  vr::Result<mesh::MarchingCubes> share_refit_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                  share_config);
+  CHECK(share_refit_result.ok());
+  mesh::MarchingCubes share_refit_mc = std::move(share_refit_result).value();
+  mesh::ExtractTimings share_refit_timings;
+  CHECK(share_refit_mc.extract(dense_block, 0.0f, &share_refit_timings).ok());
+  CHECK(share_refit_timings.dispatches ==
+        2);  // planned short, measured, re-ran
+  CHECK(share_refit_timings.emitted_vertices > 0);
+  CHECK(share_refit_timings.vertex_capacity >=
+        share_refit_timings.emitted_vertices);
+  CHECK(share_refit_timings.vertex_capacity <=
+        2 * share_refit_timings.emitted_vertices);
+
+  // Growing one output buffer must not resize the other. They used to be
+  // released and reallocated together -- justified by arena_capacity() coming
+  // off the ARENA, which stopped being true when sharing moved it to the index
+  // run -- and the coupling then grew the buffer that FITTED to 1.5x what it
+  // already held, compounding on every such event: numerically the ring runaway
+  // the slot-independence decision exists to prevent, one buffer over.
+  //
+  // Reachable only where the two budgets are out of proportion, which is what
+  // sharing makes them: this extractor holds ~0.75 vertices per triangle, and
+  // the DENSE overload (which shares nothing, and shares this extractor's
+  // slot) asks for exactly 3. Sized from the measured capacities so the case is
+  // constructed rather than hoped for -- the arena must be short and the index
+  // run must not.
+  mesh::ExtractTimings before_dense;
+  CHECK(share_mc.extract(grid, 0.0f, &before_dense).ok());
+  CHECK(before_dense.vertex_capacity > 0 && before_dense.triangle_capacity > 0);
+  {
+    // Triangles whose 3-per-triangle vertices overflow the held arena while
+    // fitting the held index run: anything strictly between the two bounds.
+    const std::uint64_t lower = before_dense.vertex_capacity / 3;
+    const std::uint64_t upper = before_dense.triangle_capacity;
+    CHECK(lower < upper);  // sharing is what makes this window exist
+    const std::uint64_t target_tris = (lower + upper) / 2;
+    int dims = 2;
+    while (static_cast<std::uint64_t>(dims - 1) * (dims - 1) * (dims - 1) * 5 <
+           target_tris) {
+      ++dims;
+    }
+    const std::uint64_t dense_tris =
+        static_cast<std::uint64_t>(dims - 1) * (dims - 1) * (dims - 1) * 5;
+    // Non-vacuous by construction, and checked rather than assumed: if the
+    // capacities ever drift out of this window the test fails loudly instead of
+    // quietly proving nothing.
+    CHECK(dense_tris * 3 > before_dense.vertex_capacity);
+    CHECK(dense_tris <= before_dense.triangle_capacity);
+
+    std::vector<vol::Voxel> sub(static_cast<std::size_t>(dims) * dims * dims);
+    for (int z = 0; z < dims; ++z) {
+      for (int y = 0; y < dims; ++y) {
+        for (int x = 0; x < dims; ++x) {
+          const vr::Vec3f p(static_cast<float>(x) * kH,
+                            static_cast<float>(y) * kH,
+                            static_cast<float>(z) * kH);
+          vol::Voxel& v =
+              sub[static_cast<std::size_t>(x + dims * (y + dims * z))];
+          v.sdf = sphere_sdf(p);
+          v.weight = 1.0f;
+        }
+      }
+    }
+    mesh::DenseGrid sub_grid;
+    sub_grid.dims = vr::Vec3i(dims, dims, dims);
+    sub_grid.voxel_size = kH;
+    sub_grid.origin = vr::Vec3f(0.0f, 0.0f, 0.0f);
+    CHECK(share_mc.extract(sub.data(), sub.size(), sub_grid, 0.0f).ok());
+
+    mesh::ExtractTimings after_dense;
+    CHECK(share_mc.extract(grid, 0.0f, &after_dense).ok());
+    // The arena grew (the dense call needed three vertices per triangle)...
+    CHECK(after_dense.vertex_capacity > before_dense.vertex_capacity);
+    // ...and the index run, which already fitted, was left exactly alone.
+    CHECK(after_dense.triangle_capacity == before_dense.triangle_capacity);
+  }
+
+  // A block this kernel's compile-time cell table cannot index is refused up
+  // front, not meshed wrong: the shared array is sized for block_size 8, and an
+  // out-of-bounds threadgroup write is invisible to every validation layer and
+  // reads back as a plausible mesh.
+  vol::VoxelGridParams big_block_gp = sphere_grid_params();
+  big_block_gp.block_size = 16;
+  big_block_gp.voxels_per_block = 16 * 16 * 16;  // 4096 > the kernel's 512
+  big_block_gp.num_buckets = 32;
+  big_block_gp.num_blocks = 256;  // = bucket_size * num_buckets
+  vr::Result<vol::VoxelBlockGrid> big_block_result =
+      vol::VoxelBlockGrid::create(device.value(), allocator.value(),
+                                  big_block_gp, attrs, 2);
+  CHECK(big_block_result.ok());
+  vol::VoxelBlockGrid big_block_grid = std::move(big_block_result).value();
+  vol::BlockIndex big_block{};
+  big_block.coord = vr::Vec3i(0, 0, 0);
+  vr::Result<std::uint32_t> big_block_failed =
+      big_block_grid.map().allocate(&big_block, 1);
+  CHECK(big_block_failed.ok());
+  CHECK(big_block_failed.value() == 0);
+  CHECK(!share_mc.extract(big_block_grid, 0.0f).ok());
+  // The same grid is fine without sharing -- the refusal is the kernel's table,
+  // not the block size.
+  CHECK(arena_mc.extract(big_block_grid, 0.0f).ok());
 
   // --- Argument validation ---------------------------------------------------
   // A grid missing the tsdf/weight attributes is rejected (a bare grid here).

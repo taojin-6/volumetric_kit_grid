@@ -95,12 +95,13 @@ static_assert(std::is_standard_layout_v<Vertex>,
 /// triangle
 ///        indices (three per triangle), matching gfx's ingestion shape.
 ///
-/// The first marching-cubes slice emits independent triangles -- three fresh
-/// vertices per triangle, no shared-edge deduplication -- so @ref indices is
-/// the trivial `0,1,2,...` run and `indices.size() == vertices.size()`. The
-/// index array is carried regardless so a later edge-hash dedup slice can
-/// shrink
-/// @ref vertices without changing this container or its consumers.
+/// `indices.size()` is always three per triangle. Whether it equals
+/// `vertices.size()` is **not** a property of this container: marching cubes
+/// emits independent triangles by default -- three fresh vertices each, so
+/// @ref indices is the trivial `0,1,2,...` run -- but
+/// @ref MarchingCubesConfig::share_vertices lets several triangles index one
+/// vertex, which is exactly the case the index array was carried for. Walk the
+/// triangles through @ref indices, never as consecutive vertex triples.
 struct Mesh {
   std::vector<Vertex> vertices;        ///< Interleaved vertices.
   std::vector<std::uint32_t> indices;  ///< Triangle indices (3 per triangle).

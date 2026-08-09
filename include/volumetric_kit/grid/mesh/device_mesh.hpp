@@ -39,10 +39,10 @@ namespace volumetric_kit::recon::mesh {
 /// therefore stamps a counter it bumps on every extract, and
 /// `MarchingCubes::download` accepts only its current value.
 ///
-/// The vertices are independent triangles (no shared vertices), so the index
-/// buffer is the identity run `0, 1, 2, ...`; it exists because the consuming
-/// kernels address vertices through it, and because the renderer wants a real
-/// index buffer at the interop seam.
+/// The index buffer exists because the consuming kernels address vertices
+/// through it, and because the renderer wants a real one at the interop seam.
+/// Whether it is the identity run `0, 1, 2, ...` depends on @ref
+/// shares_vertices -- do not assume either way.
 struct DeviceMesh {
   VkBuffer vertices = VK_NULL_HANDLE;  ///< Interleaved `Vertex` array.
   VkBuffer indices = VK_NULL_HANDLE;   ///< `uint32` indices, 3 per triangle.
@@ -56,8 +56,27 @@ struct DeviceMesh {
   /// same thing for a consumer that wants to know; the command exists so one
   /// does not have to.
   VkBuffer indirect = VK_NULL_HANDLE;
-  std::uint32_t vertex_count = 0;    ///< Live vertices (`3 * triangles`).
+  /// Live vertices in @ref vertices. `3 * triangle_count` when @ref
+  /// shares_vertices is false and roughly a quarter of that when it is true --
+  /// read it, do not derive it.
+  std::uint32_t vertex_count = 0;
   std::uint32_t triangle_count = 0;  ///< Live triangles.
+  /// Whether several triangles may index the same vertex.
+  ///
+  /// False (the default and what this tier always did) means every triangle
+  /// owns three private vertices written consecutively, so @ref indices is the
+  /// identity run `0, 1, 2, ...` and @ref vertex_count is `3 * triangle_count`.
+  /// True is @ref MarchingCubesConfig::share_vertices: neither holds.
+  ///
+  /// Published because a *consumer* has to act on it and cannot otherwise ask.
+  /// `texture::ProjectiveTexturer` decides visibility per triangle and writes
+  /// `Vertex::uv0` per vertex, which is well-defined only while a vertex
+  /// belongs to one triangle -- so it refuses a mesh carrying this rather than
+  /// letting the write order decide the result. Same reason @ref vertex_usage
+  /// and @ref sharing_mode are here: the producer's configuration is not
+  /// visible from a `VkBuffer`, and an obligation stated in prose is not a
+  /// contract.
+  bool shares_vertices = false;
   /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
   /// plus whatever the producer's consumer asked for. Carried so a consumer can
   /// *check* that the binding it is about to make is permitted, rather than

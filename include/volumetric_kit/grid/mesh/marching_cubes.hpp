@@ -31,8 +31,7 @@ class Allocator;
 
 namespace volumetric_kit::recon::mesh {
 
-/// @brief Indices one extracted triangle contributes: three, since marching
-///        cubes emits independent triangles and the index run is the identity.
+/// @brief Indices one extracted triangle contributes: three.
 ///
 /// Named because it is the conversion between the two units this tier trades
 /// in. The kernel's append atomic bumps the draw command's `indexCount` by
@@ -82,12 +81,13 @@ struct DenseGrid {
 /// @ref dispatch_ms covers host record *plus* device execution rather than
 /// either alone.
 ///
-/// Meshing is whole-volume, and the arena is fitted to the surface rather than
-/// to the 5-triangles-per-cell ceiling, so the counters explain the spans:
-/// @ref triangle_capacity is what the dispatch ran with (the arena's full
-/// capacity, so `emitted_triangles / triangle_capacity` is its fill ratio),
-/// @ref dispatches says whether the call had to refit and re-run, and
-/// @ref arena_bytes is what the extractor is holding.
+/// Meshing is whole-volume, and the buffers are fitted to the surface rather
+/// than to the 5-triangles-per-cell ceiling, so the counters explain the spans:
+/// @ref triangle_capacity / @ref vertex_capacity are what the dispatch ran with
+/// (one slot's index run and vertex arena, so each pairs with its `emitted_`
+/// counter as that buffer's fill ratio), @ref dispatches says whether the call
+/// had to refit and re-run, and @ref arena_bytes is what the extractor is
+/// holding across the whole ring.
 struct ExtractTimings {
   /// Compacting the hash map's active block list (a dispatch + readback).
   double compact_ms = 0.0;
@@ -118,22 +118,40 @@ struct ExtractTimings {
   /// reporting 2 means the planner is not tracking the surface -- which is
   /// invisible in @ref dispatch_ms alone, since that sums both.
   std::uint32_t dispatches = 0;
-  /// Triangle capacity the dispatch ran with -- the retained arena's full
-  /// capacity, so `emitted_triangles / triangle_capacity` is its fill ratio.
+  /// Triangle capacity the dispatch ran with -- one slot's index run, so
+  /// `emitted_triangles / triangle_capacity` is that buffer's fill ratio.
   std::uint32_t triangle_capacity = 0;
   /// Triangles the kernel actually emitted.
   std::uint32_t emitted_triangles = 0;
-  /// Bytes the extractor's vertex arenas currently hold, summed over every
-  /// slot. This is *resident* size, not this call's allocation: an arena is
-  /// retained across extracts, so a steady-state call allocates nothing and
-  /// still reports it, and a grown arena can exceed what @ref
-  /// triangle_capacity alone would need.
+  /// Vertex capacity the dispatch ran with -- one slot's vertex arena, so
+  /// `emitted_vertices / vertex_capacity` is that buffer's fill ratio.
+  ///
+  /// Reported separately from @ref triangle_capacity because the two stop being
+  /// proportional under @ref MarchingCubesConfig::share_vertices, which is the
+  /// whole point of that flag. The arena is the buffer that dominates
+  /// @ref arena_bytes, so it is the one whose fill actually explains the
+  /// memory.
+  std::uint32_t vertex_capacity = 0;
+  /// Vertices the kernel actually emitted -- exactly `3 * emitted_triangles`
+  /// with sharing off, and roughly a quarter of that with it on.
+  std::uint32_t emitted_vertices = 0;
+  /// Bytes the extractor's output buffers currently hold -- vertex arenas *and*
+  /// index runs -- summed over every slot. This is *resident* size, not this
+  /// call's allocation: the buffers are retained across extracts, so a
+  /// steady-state call allocates nothing and still reports them, and a grown
+  /// buffer can exceed what this call's capacities alone would need.
   ///
   /// Summed rather than reporting the slot this call wrote, because each of
-  /// @ref MarchingCubesConfig::slot_count slots carries its own arena -- one of
+  /// @ref MarchingCubesConfig::slot_count slots carries its own pair -- one of
   /// them is what the *next* extract may grow, not what the extractor costs.
-  /// The index runs are not included (they are a sixteenth of an arena, four
-  /// bytes per index against a 64-byte vertex).
+  ///
+  /// The index runs are included, which they were not while a triangle owned
+  /// three private vertices and the run was a sixteenth of the arena it
+  /// covered. Vertex sharing removes exactly that proportionality: at the ~750
+  /// vertices per 1000 triangles in-block sharing settles at, the arena is
+  /// ~48 B/triangle against the run's 12 B, so leaving the run out would
+  /// under-report resident output memory by ~20% -- on the instrument the
+  /// ring's runaway growth was diagnosed with.
   std::uint64_t arena_bytes = 0;
 
   /// @return The sum of every phase, in milliseconds.
@@ -205,10 +223,22 @@ struct ExtractTimings {
 //   * The arena and index run, which is the one that scales: a renderer binding
 //     them as geometry makes the vertex-input stage pull the WHOLE mesh out of
 //     system RAM on every presented frame -- ~64 MiB at the 991 k vertices
-//     `fuse_viewer` reaches on room0, with no vertex reuse until shared-vertex
-//     dedup lands. That is free on unified memory, which is the only hardware
-//     this measured on, and on a discrete GPU it would cost more than the host
-//     round trip seam B exists to delete.
+//     `fuse_viewer` reaches on room0, and ~16 MiB of that once
+//     share_vertices is on, since the fetch is per vertex and in-block sharing
+//     removes ~4 in 5 of them. That is free on unified memory, which is the
+//     only hardware this measured on, and on a discrete GPU it would cost more
+//     than the host round trip seam B exists to delete.
+//   * The index run's ACCESS PATTERN moves with share_vertices, and that is a
+//     second, independent placement decision. Off, the run is the identity and
+//     the host only ever writes it, so it is allocated SequentialWrite -- which
+//     on a discrete GPU asks VMA for device-local host-visible (BAR) memory,
+//     exactly right for the buffer a renderer binds as INDEX_BUFFER. On, only
+//     the kernel knows the mapping, so download() has to read it back and the
+//     run becomes HostAccess::Random -- plain HOST_CACHED system RAM, no
+//     device-local bit, on the buffer the draw fetches every frame. Recorded
+//     rather than resolved: the honest fix is a device-local run plus a staging
+//     copy for the host path, which is the same measurement the two bullets
+//     above wait on.
 // Both wait on the same thing -- a discrete-GPU consumer to measure a
 // device-local arena plus staging against them -- rather than being guessed at,
 // the wait-for-the-second-consumer rule the rest of this config follows. It is
@@ -281,6 +311,61 @@ struct MarchingCubesConfig {
   /// Extracting with every slot outstanding is a contract violation, reported
   /// rather than silently overwriting a live draw.
   std::uint32_t slot_count = 1;
+
+  /// @brief Share a vertex between the cells that meet on an edge, instead of
+  ///        giving every triangle three private ones.
+  ///
+  /// Off (the default) is what this tier always did: marching cubes appends
+  /// three vertices per triangle, so a closed surface carries roughly six times
+  /// the vertices it needs and the arena is sized for all of them.
+  ///
+  /// On, the sparse kernel shares within a block -- each cell emits a vertex
+  /// only for the three edges it *owns*, and its neighbours index that one.
+  /// Edges on a block's `+face` are still duplicated, because sharing them
+  /// would need the neighbouring workgroup's shared memory, which is why the
+  /// saving is about **4x** rather than the 6x full sharing would give.
+  /// Triangles are unaffected: a shared vertex and a duplicated one are
+  /// interpolated by the same code from the same two corner samples, in the
+  /// same canonical endpoint order, so the surface is bit-identical and only
+  /// the vertex count moves.
+  ///
+  /// Read at @ref MarchingCubes::create and fixed for that object's lifetime:
+  /// it selects which of two compiled kernels is built, rather than switching a
+  /// branch inside one. Sharing needs ~8 KiB of `shared` arrays, and a `shared`
+  /// array is reserved at pipeline creation whatever a push constant later says
+  /// -- so a single kernel would make the *off* path pay sharing's threadgroup
+  /// budget, and its residency, for a feature it does not use.
+  ///
+  /// Two consequences a consumer can observe. The index run stops being the
+  /// identity `0,1,2,...` (a vertex belongs to several triangles now), which is
+  /// published as @ref DeviceMesh::shares_vertices; and
+  /// @ref ExtractTimings::emitted_vertices stops being `3 * emitted_triangles`.
+  ///
+  /// @warning **Not compatible with `texture::ProjectiveTexturer`**, and that
+  ///          is a property of the texturer rather than a limitation here. It
+  ///          decides visibility per *triangle* and writes @ref Vertex::uv0 per
+  ///          *vertex*, which is well-defined only while a vertex belongs to
+  ///          one triangle. Sharing a vertex between triangles that disagree
+  ///          makes the write order decide the result. Per-vertex `uv0` is in
+  ///          any case the wrong representation for the packed multi-camera
+  ///          atlas that is planned -- a triangle whose vertices index
+  ///          different sub-rects interpolates across the pack -- so the fix is
+  ///          a per-primitive camera id, not a winner-take-all vertex atomic,
+  ///          and this flag is what keeps the two decisions independent. The
+  ///          texturer **refuses** a mesh carrying
+  ///          @ref DeviceMesh::shares_vertices rather than leaving this to the
+  ///          reader.
+  ///
+  /// @note Refused per *extract*, not at @ref MarchingCubes::create, for a grid
+  ///       whose `voxels_per_block` exceeds 512 -- the sharing kernel's shared
+  ///       per-cell table is sized for `block_size` 8, the only shape any
+  ///       in-tree caller uses, and the block size arrives with the grid rather
+  ///       than with this config. Both sparse @ref extract overloads report it.
+  ///
+  /// @note Applies to the sparse @ref extract overloads only. The dense one
+  ///       meshes an arbitrary caller-supplied grid with no block structure to
+  ///       share within, and is unchanged -- including its identity index run.
+  bool share_vertices = false;
 };
 
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
@@ -576,12 +661,16 @@ class VR_MESH_API MarchingCubes {
   // see MarchingCubesConfig::slot_count.
   struct Slot {
     Buffer arena;
-    // The identity index run 0,1,2,... covering @ref arena. The kernels emit
-    // independent triangles, so this never varies in content -- it is filled
-    // once per grow and then reused, which is why it can live beside the arena
-    // instead of being rebuilt per call. It exists because the consuming
-    // passes (projective texturing, and the renderer at the interop seam)
-    // address vertices through an index buffer.
+    // The index run covering @ref arena. It exists because the consuming passes
+    // (projective texturing, and the renderer at the interop seam) address
+    // vertices through an index buffer.
+    //
+    // WHO fills it depends on MarchingCubesConfig::share_vertices. Off, every
+    // triangle owns three private vertices written at `tri * 3`, so the run is
+    // the identity 0,1,2,..., never varies in content, and the host fills it
+    // once per grow. On, a vertex is referenced by several triangles from
+    // several cells and only the kernel knows which, so the kernel writes it
+    // every dispatch and download() reads it back.
     Buffer index_run;
     // The `VkDrawIndexedIndirectCommand` this slot's draw is issued from, and
     // the atomic the kernel counts into: `indexCount` is field 0, so the two
@@ -651,6 +740,17 @@ class VR_MESH_API MarchingCubes {
   // to kSeedTrisPerBlock.
   std::uint32_t tris_per_block_ = 0;
 
+  // Vertices the last completed sparse extract emitted per 1000 triangles, and
+  // the input to the next call's arena budget. Scaled by 1000 rather than kept
+  // as a float so the plan is exactly reproducible. 0 = nothing measured yet,
+  // which falls back to kSeedVertsPer1000.
+  //
+  // Without sharing this settles at exactly 3000 and the arena is sized as it
+  // always was. With sharing it converges toward ~750: a closed surface has
+  // about half as many vertices as triangles, less what a block seam
+  // duplicates.
+  std::uint32_t verts_per_1000_tris_ = 0;
+
   // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
   // and a set allocated from the shared pool_ (see @ref ComputeKernel): the
   // dense analytic-grid path and the sparse VoxelBlockGrid path.
@@ -658,23 +758,50 @@ class VR_MESH_API MarchingCubes {
   ComputeKernel kernel_sparse_;
   DescriptorPool pool_;
 
-  // Triangle capacity the current slot's arena is sized for (0 when it holds no
-  // buffer). Derived rather than stored so the capacity can never disagree with
-  // the buffer it describes; the division is exact because the arena is only
-  // ever allocated as a whole number of triangles.
+  // Triangles the current slot's INDEX RUN can hold (0 when it holds no
+  // buffer). Derived from the buffer rather than stored, so the capacity can
+  // never disagree with what it describes; the division is exact because the
+  // run is only ever allocated as a whole number of triangles.
   //
+  // Read off the index run and not the arena, which is where it used to come
+  // from: that was valid only while the arena held exactly three vertices per
+  // triangle. Vertex sharing breaks that proportionality, so each capacity now
+  // comes from the buffer that actually bounds it.
   std::uint32_t arena_capacity() const noexcept {
-    return static_cast<std::uint32_t>(arena().size() /
-                                      (kIndicesPerTriangle * sizeof(Vertex)));
+    return static_cast<std::uint32_t>(
+        index_run().size() / (kIndicesPerTriangle * sizeof(std::uint32_t)));
   }
 
-  // Vertex-arena bytes the whole ring is holding -- what ExtractTimings
-  // reports. Every slot carries its own arena, so the current one's size is
-  // this object's cost divided by slot_count_, not its cost.
-  std::uint64_t resident_arena_bytes() const noexcept {
+  // Vertices the current slot's arena can actually hold. Derived from the
+  // buffer, like arena_capacity, so the two can never disagree with it -- and
+  // stated separately because vertex sharing breaks the "three per triangle"
+  // identity that let one stand in for the other.
+  std::uint32_t arena_vertex_capacity() const noexcept {
+    return static_cast<std::uint32_t>(arena().size() / sizeof(Vertex));
+  }
+
+  // Triangles the current slot can actually MESH, which is what the dispatch is
+  // pushed and what the emitted count is clamped to.
+  //
+  // Not simply arena_capacity(): with sharing off the kernel writes each
+  // triangle's three vertices at `tri * 3`, so the arena bounds the triangle
+  // count too -- and the two buffers grow independently now, so the index run
+  // can legitimately hold more triangles than the arena has vertices for.
+  // Sharing on, the kernel claims vertices through a counter it bounds itself,
+  // so the run is the only limit.
+  std::uint32_t usable_triangle_capacity() const noexcept {
+    if (config_.share_vertices) return arena_capacity();
+    return std::min(arena_capacity(),
+                    arena_vertex_capacity() / kIndicesPerTriangle);
+  }
+
+  // Output bytes the whole ring is holding -- what ExtractTimings::arena_bytes
+  // reports. Every slot carries its own arena AND index run, so the current
+  // slot's size is a fraction of this object's cost, not its cost.
+  std::uint64_t resident_output_bytes() const noexcept {
     std::uint64_t total = 0;
     for (std::size_t i = 0; i < slot_count_; ++i)
-      total += slots_[i].arena.size();
+      total += slots_[i].arena.size() + slots_[i].index_run.size();
     return total;
   }
 
@@ -727,7 +854,20 @@ class VR_MESH_API MarchingCubes {
   // It does NOT stamp the claimed slot: that belongs beside the DeviceMesh a
   // publishing return builds, so a call that fails here or after leaves the
   // slot exactly as claimable as it found it.
-  Status ensure_output_buffers(std::uint32_t capacity);
+  Status ensure_output_buffers(std::uint32_t triangle_capacity,
+                               std::uint32_t vertex_capacity);
+
+  // Vertices to budget for a dispatch planned at @p triangle_capacity
+  // triangles: the last extract's measured density, seeded when there is none.
+  // Reads no slot, for the same reason plan_capacity does not -- a budget that
+  // consulted the buffer it is about to grow ratchets across the output ring.
+  std::uint32_t plan_vertex_capacity(std::uint32_t triangle_capacity) const;
+
+  // The most triangles whose vertices fit one storage-buffer binding, under the
+  // same density plan_vertex_capacity uses -- so plan_capacity can bound its
+  // request by BOTH output buffers and never hand ensure_output_buffers a
+  // vertex request it would reject rather than clamp.
+  std::uint64_t triangles_fitting_arena() const;
 
   // Create this slot's draw command if it has none, and reset it to "draw
   // nothing yet": indexCount 0 for the kernel to accumulate into, and the four
@@ -746,7 +886,7 @@ class VR_MESH_API MarchingCubes {
   // index run. The success path is already in range by construction (the loop
   // exits only when the count fits), so this is the *failure* paths' guarantee,
   // not theirs.
-  void clamp_indirect_to_arena() noexcept;
+  void disarm_indirect_command() noexcept;
 };
 
 }  // namespace volumetric_kit::recon::mesh
