@@ -83,11 +83,12 @@ struct DeviceMesh {
   /// Apple, where Metal has no ownership concept, getting it wrong is undefined
   /// in the way that appears to work.
   ///
-  /// @note What is deliberately *not* published is the memory placement: this
-  ///       tier's buffers are host-visible, because it reads the command back
-  ///       and resets it on every extract. That is free on a unified-memory GPU
-  ///       and costs a PCIe fetch per indirect draw on a discrete one -- a
-  ///       recorded trade rather than a hidden one; see the `TODO(mesh)` on
+  /// @note What is deliberately *not* published is the memory placement: all
+  ///       three buffers are host-visible. That is free on a unified-memory GPU
+  ///       and costs a PCIe fetch per indirect draw on a discrete one -- and,
+  ///       for a consumer binding @ref vertices and @ref indices as geometry, a
+  ///       whole-mesh fetch out of system RAM per drawn frame. A recorded trade
+  ///       rather than a hidden one; see the `TODO(mesh)` on
   ///       @ref MarchingCubesConfig.
   VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
   /// Which extract on the producing object this view came from. Producers
@@ -104,17 +105,33 @@ struct DeviceMesh {
   /// and must not be held across a move of it.
   const std::uint64_t* live_generation = nullptr;
 
-  /// @return `true` when this view still names what the producer holds -- i.e.
-  ///         no later extract has overwritten, regrown, or freed the buffers.
+  /// @return `true` when this view is the producer's *newest* extract.
   ///
-  /// The check every consumer needs before it *uses* these handles, not only
-  /// before it copies them out. A stale view is not merely out of date: an
-  /// extract that grows the arena destroys the old `VkBuffer` synchronously, so
-  /// binding a superseded view is a use-after-free of a Vulkan object --
-  /// undefined with validation layers off, which is the shipping configuration
-  /// and the only one available on iOS. Without a grow it is quieter and still
-  /// wrong: the pass reads or rewrites the *current* extract's geometry under
-  /// this view's stale counts.
+  /// **This is the single-slot validity rule, not the ring's.** At
+  /// `MarchingCubesConfig::slot_count == 1` the two coincide and this is the
+  /// check every consumer needs before it *uses* these handles, not only
+  /// before it copies them out: one arena is reused in place, so a later
+  /// extract has overwritten it -- or, if it grew, destroyed the old
+  /// `VkBuffer` synchronously, making a bind a use-after-free of a Vulkan
+  /// object, undefined with validation layers off (the shipping configuration,
+  /// and the only one available on iOS).
+  ///
+  /// Above one slot, "newest" and "still mine" come apart, and this predicate
+  /// answers the first. A ring consumer *expects* to hold older generations --
+  /// that is what the extra slots buy -- and its validity condition is instead
+  /// "not yet released": a view stays good until the consumer itself passes
+  /// its generation to @ref MarchingCubes::release_through. That condition is
+  /// the consumer's own declaration, so the producer cannot check it and this
+  /// predicate must not be read as it; a ring consumer that gated on
+  /// `is_current()` would drop every frame its producer had already run ahead
+  /// of. `fuse_viewer` is the worked example.
+  ///
+  /// @warning Not synchronized. It dereferences the producer's live counter,
+  ///          which the producing thread increments on every extract, so
+  ///          calling it while another thread may be extracting is a data
+  ///          race. Producer-thread use only -- which is where the tier's own
+  ///          callers (@ref MarchingCubes::download,
+  ///          @ref ProjectiveTexturer::texture) sit.
   ///
   /// Comparing buffer handles cannot substitute for this. The producer reuses
   /// one grow-only arena per slot, so a superseded view names the very same
