@@ -61,11 +61,18 @@ struct AllocFailures {
   std::uint32_t lock = 0;   ///< Lost bucket-lock races: contention, not size.
   std::uint32_t chain = 0;  ///< Collision chain full: a capacity limit.
   std::uint32_t heap = 0;   ///< Block heap empty: a capacity limit.
-  /// No free entry anywhere in the table: a capacity limit, and a distinct one.
-  /// Kept apart from @ref heap because the two are not interchangeable -- the
-  /// rehash path presets each block's pointer and never touches the heap, so
-  /// @ref heap is *provably impossible* there and reporting it would name a
-  /// cause that cannot have occurred.
+  /// No free non-anchor slot anywhere in the table: a capacity limit, and a
+  /// distinct one. Kept apart from @ref heap because the two are not
+  /// interchangeable -- the rehash path presets each block's pointer and never
+  /// touches the heap, so @ref heap is *provably impossible* there and
+  /// reporting it would name a cause that cannot have occurred.
+  ///
+  /// "Anywhere" is literal: the overflow scan is uncapped, and a sweep that
+  /// skipped a free-looking slot because another thread held its bucket reports
+  /// @ref lock instead. So a count here is proof the table is out of usable
+  /// slots, never a merely *clustered* table mistaken for a full one -- which
+  /// matters because the caller's answer to it is to grow, doubling every
+  /// attribute array.
   std::uint32_t table = 0;
   /// Non-retryable failures, summed over every round. Reported only by
   /// @ref VoxelHashMap::remove, where a block index that could not be returned
@@ -313,6 +320,28 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The size in bytes, or 0 on a moved-from map (so the pair stays
   ///         consistent: a null handle never carries a non-zero range).
   VkDeviceSize entries_buffer_size() const noexcept;
+
+  /// @brief The map's occupancy as a fraction of its block capacity -- a
+  ///        constant-time read, safe to call every frame.
+  ///
+  /// The complement of the free-block heap, `1 - heap_free / num_blocks`, taken
+  /// from the host-mapped heap counter with a 4-byte copy and no dispatch. It
+  /// is also the fraction of hash slots in use -- the same quantity
+  /// @ref HashDiagnostics::load_factor reports, derived from the heap counter
+  /// instead of a slot scan -- because @ref VoxelGridParams::validate forces
+  /// `num_blocks == bucket_size * num_buckets` and every occupied slot holds
+  /// exactly one heap block.
+  ///
+  /// This is what lets a caller **grow before it fails**. @ref diagnostics
+  /// reports the same number alongside chain health, but scans every slot on
+  /// the host (1.5M at the example defaults) and so cannot run per frame; and
+  /// growing only once @ref AllocFailures::capacity_limited fires means the map
+  /// necessarily spends time at the occupancy where collision chains are
+  /// longest and every insert is slowest. Grow on a threshold well under 1.0 --
+  /// linear probing degrades sharply past ~0.7 -- rather than at the cliff.
+  /// @return The occupancy in `[0, 1]`, or a non-OK @ref Status if the map is
+  ///         moved-from.
+  Result<float> load_factor() const;
 
   /// @brief Compute occupancy + health statistics (active / overflow / chain
   ///        length + heap utilization).

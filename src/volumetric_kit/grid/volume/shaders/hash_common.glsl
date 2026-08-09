@@ -65,6 +65,13 @@ const uint kHashPrimeZ = 83492791u;
 // cannot hang the GPU; the host retries any failed allocations across dispatches.
 const int kMaxSpinRetries = 128;
 const int kMaxHeapRetries = 256;
+// allocate_in_overflow's scan is deliberately NOT capped alongside these two.
+// Capping it bounds the iteration count by giving up the only thing kFailTable
+// is good for -- proof that no slot is free -- and a caller that reads "nothing
+// free nearby" as "the table is full" grows the map, doubling every attribute
+// array, over a table that is merely clustered. What made that scan hang the
+// GPU was its cost per slot, not the number of slots; see the comment on
+// allocate_in_overflow, which fixes the cost instead.
 
 // --- Fail-count slots. A host/device ABI (VoxelHashMap::dispatch_with_retry
 // reads them), so they live here beside the other shared constants rather than
@@ -84,7 +91,7 @@ const int kFailLock = 1;      // lock contention
 const int kFailChain = 2;     // collision chain full
 const int kFailHeap = 3;      // block heap empty
 const int kFailTerminal = 4;  // non-retryable; host accumulates across rounds
-const int kFailTable = 5;     // no free entry anywhere in the table
+const int kFailTable = 5;     // no free non-anchor slot anywhere in the table
 const int kFailSlots = 6;
 
 // --- Push constants: the grid shape + one kernel-specific argument. ---

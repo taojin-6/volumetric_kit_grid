@@ -116,9 +116,10 @@ bool block_exists(ivec3 coord) {
 
 // Returns -1 on success, else the fail reason. Reporting the *reason* rather
 // than a bool is what keeps the report honest: the only way this fails is an
-// empty heap, and the only way allocate_in_overflow fails is an empty heap OR a
-// table with no free entry -- two different answers to "should the caller grow
-// the map", which the caller now acts on (AllocFailures::capacity_limited).
+// empty heap, while allocate_in_overflow fails on an empty heap, a table with no
+// free non-anchor entry, or bucket-lock contention -- and those are different
+// answers to "should the caller grow the map", which the caller now acts on
+// (AllocFailures::capacity_limited).
 int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
   int voxel_block_ptr = preset_ptr;
   if (preset_ptr == kNoPresetPtr) {
@@ -136,8 +137,28 @@ int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
   return -1;
 }
 
-// Returns -1 on success, else kFailHeap (no block left on the heap) or
-// kFailTable (scanned every entry and found no free non-anchor slot).
+// Returns -1 on success, else kFailHeap (no block left on the heap), kFailLock
+// (a free-looking slot was skipped because another thread held its bucket) or
+// kFailTable (scanned every entry and every non-anchor slot was occupied).
+//
+// The scan is exhaustive, so kFailTable is proof rather than a guess -- which is
+// what makes growing the right answer to it. What makes an exhaustive scan
+// affordable is the ORDER of the two tests below: a candidate's ptr is read
+// unlocked first and skipped when occupied, so only a slot that looks free costs
+// the contended atomicCompSwap that locks its bucket. The reverse order -- lock,
+// then look -- spent two atomics and two device-scope fences on EVERY slot, so
+// at 96% occupancy one insert paid ~430 of each, x27 band blocks per depth
+// pixel. At 31480 of 32768 blocks on an M5 iPad Pro that hung the GPU outright
+// (kIOGPUCommandBufferCallbackErrorHang), taking the renderer sharing the device
+// with it.
+//
+// Reading unlocked is safe because it can only err conservatively: alloc and
+// free run in SEPARATE dispatches, so within one dispatch a slot moves only free
+// -> occupied. A stale "free" therefore costs one wasted lock and is caught by
+// the authoritative re-test under it, and a stale "occupied" cannot happen at
+// all -- so the filter never skips a slot that is genuinely free. (block_exists
+// reads unlocked for the same reason but needs an acquire barrier before
+// comparing `pos`; this filter reads no second field, so it needs none.)
 int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
                          int preset_ptr) {
   uint bucket_size = uint(pc.grid.bucket_size);
@@ -145,6 +166,23 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
   uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
   uint target_idx = bucket_start + bucket_size;
 
+  // An empty heap makes the whole scan futile, and validate() is what makes
+  // that provable: it forces num_blocks == bucket_size * num_buckets ==
+  // total_entries, and on this path every occupied slot consumed exactly one
+  // heap block, so "no block left" and "no slot left" are the same statement.
+  // One atomic load settles it instead of a full sweep -- which is the state the
+  // iPad hang was actually in, every insert paying the maximum scan to discover
+  // nothing. It also keeps the ATTRIBUTION right: without it the sweep runs to
+  // exhaustion and reports kFailTable for a table whose demonstrable cause is an
+  // empty heap, while allocate_in_primary calls that identical condition
+  // kFailHeap -- one physical state with two names depending on which helper
+  // happened to hit it. Guarded to the heap path, so kFailHeap stays provably
+  // impossible on the rehash preset, which never consults the heap.
+  if (preset_ptr == kNoPresetPtr && atomicAdd(heap_counter, 0u) == 0u) {
+    return kFailHeap;
+  }
+
+  bool lost_lock = false;
   for (uint attempts = 0u; attempts < total_entries; ++attempts) {
     if (target_idx >= total_entries) {
       target_idx = 0u;
@@ -155,12 +193,20 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
       continue;
     }
 
+    // The unlocked filter: everything below runs only for a slot that looked
+    // free, which at high occupancy is a small fraction of the table.
+    if (entries[target_idx].ptr != kFreeEntry) {
+      ++target_idx;
+      continue;
+    }
+
     uint target_bucket = target_idx / bucket_size;
     bool have_lock = (target_bucket == hash_bucket);
     if (!have_lock) {
       have_lock = try_lock_bucket(target_bucket, 1);
     }
     if (!have_lock) {
+      lost_lock = true;  // a free-looking slot this thread never got to test
       ++target_idx;
       continue;
     }
@@ -195,16 +241,21 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
     }
     ++target_idx;
   }
-  // Every entry scanned and none free: the table is full. NOT kFailHeap, which
-  // it used to report -- and which is provably impossible on the rehash path,
-  // where preset_ptr is set and the heap is never consulted at all.
-  return kFailTable;
+  // Scanned every entry. A slot skipped only because another thread held its
+  // bucket was never actually tested, so this thread has NOT established that
+  // the table is full: that is contention, it is retryable, and saying so beats
+  // telling the caller to grow a map that may be nearly empty. Only a clean
+  // sweep earns kFailTable. NOT kFailHeap, which this used to report -- and
+  // which is provably impossible on the rehash path, where preset_ptr is set
+  // and the heap is never consulted at all.
+  return lost_lock ? kFailLock : kFailTable;
 }
 
 // Insert `coord` if absent, giving its block `preset_ptr` (or kNoPresetPtr to
 // draw a fresh block off the heap). Returns -1 on success (or already present),
-// else the fail reason (kFailLock / kFailChain / kFailHeap). Shared by normal
-// allocation (fresh heap pointer) and rehash (each block's pointer preserved).
+// else the fail reason (kFailLock / kFailChain / kFailHeap / kFailTable). Shared
+// by normal allocation (fresh heap pointer) and rehash (each block's pointer
+// preserved).
 int insert_block(ivec3 coord, int preset_ptr) {
   int last_fail = kFailLock;
   for (int attempt = 0; attempt < 5; ++attempt) {
@@ -284,6 +335,17 @@ int insert_block(ivec3 coord, int preset_ptr) {
     unlock_bucket(hash_bucket);
     if (success) {
       return -1;
+    }
+    // Only contention is worth another attempt. Alloc and free run in SEPARATE
+    // dispatches, so within this one the heap never grows and a slot never goes
+    // occupied -> free: kFailHeap, kFailTable and kFailChain are all monotone.
+    // Nor can another thread resolve one by inserting this coord itself -- it
+    // would need the same block, slot or chain room this thread just found
+    // missing -- so block_exists cannot start returning true either. Re-running
+    // the chain walk and a full-table scan four more times changes nothing, and
+    // that wasted work lands exactly when the device is closest to being lost.
+    if (last_fail != kFailLock) {
+      break;
     }
   }
   return last_fail;

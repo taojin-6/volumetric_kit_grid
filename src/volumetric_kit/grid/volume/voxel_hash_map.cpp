@@ -576,17 +576,26 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     VR_ASSIGN(Buffer snapshot,
               upload_to_binding(rehash_.set, 4, active.data(),
                                 VkDeviceSize(count) * sizeof(BlockIndex)));
+    // Keep the per-reason split rather than passing nullptr: this is the one
+    // failure a caller cannot answer by growing (it *is* the grow), so the
+    // reason is the only thing that makes it diagnosable -- chain overflow in
+    // the new table reads very differently from residual lock contention.
     std::uint32_t failed = 0;
+    AllocFailures rehash_failures{};
     for (int pass = 0; pass < kReinsertPasses; ++pass) {
       VR_ASSIGN(failed, dispatch_with_retry(rehash_, count, group_count(count),
-                                            nullptr));
+                                            &rehash_failures));
       if (failed == 0) {
         break;
       }
     }
     if (failed != 0) {
       return Status::out_of_memory(
-          "VoxelHashMap::resize: rehash failed after growing");
+          "VoxelHashMap::resize: rehash failed after growing (" +
+          std::to_string(failed) + " of " + std::to_string(count) +
+          " blocks; lock=" + std::to_string(rehash_failures.lock) +
+          " chain=" + std::to_string(rehash_failures.chain) +
+          " table=" + std::to_string(rehash_failures.table) + ")");
     }
     // The rehash drew nothing from the heap, so init_table's "all free" heap
     // still lists the preserved indices; rebuild it to hold only the genuinely
@@ -611,6 +620,19 @@ Result<std::vector<HashEntry>> VoxelHashMap::read_entries() {
   std::memcpy(entries.data(), entries_.mapped(),
               static_cast<std::size_t>(total) * sizeof(HashEntry));
   return entries;
+}
+
+Result<float> VoxelHashMap::load_factor() const {
+  if (!valid()) {
+    return Status::invalid_argument(
+        "VoxelHashMap::load_factor: moved-from map");
+  }
+  std::uint32_t heap_free = 0;
+  std::memcpy(&heap_free, heap_counter_.mapped(), sizeof(std::uint32_t));
+  // num_blocks > 0 by VoxelGridParams::validate (bucket_size >= 2,
+  // num_buckets > 0, and their product is num_blocks).
+  return 1.0f -
+         static_cast<float>(heap_free) / static_cast<float>(grid_.num_blocks);
 }
 
 Result<HashDiagnostics> VoxelHashMap::diagnostics() {
