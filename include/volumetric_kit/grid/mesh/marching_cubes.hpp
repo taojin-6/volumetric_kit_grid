@@ -688,6 +688,17 @@ class VR_MESH_API MarchingCubes {
   // to kSeedTrisPerBlock.
   std::uint32_t tris_per_block_ = 0;
 
+  // Vertices the last completed sparse extract emitted per 1000 triangles, and
+  // the input to the next call's arena budget. Scaled by 1000 rather than kept
+  // as a float so the plan is exactly reproducible. 0 = nothing measured yet,
+  // which falls back to kSeedVertsPer1000.
+  //
+  // Without sharing this settles at exactly 3000 and the arena is sized as it
+  // always was. With sharing it converges toward ~750: a closed surface has
+  // about half as many vertices as triangles, less what a block seam
+  // duplicates.
+  std::uint32_t verts_per_1000_tris_ = 0;
+
   // The two marching-cubes kernels -- each its descriptor-set layout, pipeline,
   // and a set allocated from the shared pool_ (see @ref ComputeKernel): the
   // dense analytic-grid path and the sparse VoxelBlockGrid path.
@@ -700,9 +711,14 @@ class VR_MESH_API MarchingCubes {
   // the buffer it describes; the division is exact because the arena is only
   // ever allocated as a whole number of triangles.
   //
+  // Triangles the current slot can hold -- read off the INDEX RUN, which is the
+  // buffer sized in triangles. It used to come from the arena, valid only while
+  // the arena held exactly three vertices per triangle. Vertex sharing breaks
+  // that proportionality, so each capacity is now derived from the buffer that
+  // actually bounds it and neither can drift from its buffer.
   std::uint32_t arena_capacity() const noexcept {
-    return static_cast<std::uint32_t>(arena().size() /
-                                      (kIndicesPerTriangle * sizeof(Vertex)));
+    return static_cast<std::uint32_t>(
+        index_run().size() / (kIndicesPerTriangle * sizeof(std::uint32_t)));
   }
 
   // Vertices the current slot's arena can actually hold. Derived from the
@@ -772,7 +788,14 @@ class VR_MESH_API MarchingCubes {
   // It does NOT stamp the claimed slot: that belongs beside the DeviceMesh a
   // publishing return builds, so a call that fails here or after leaves the
   // slot exactly as claimable as it found it.
-  Status ensure_output_buffers(std::uint32_t capacity);
+  Status ensure_output_buffers(std::uint32_t triangle_capacity,
+                               std::uint32_t vertex_capacity);
+
+  // Vertices to budget for a dispatch planned at @p triangle_capacity
+  // triangles: the last extract's measured density, seeded when there is none.
+  // Reads no slot, for the same reason plan_capacity does not -- a budget that
+  // consulted the buffer it is about to grow ratchets across the output ring.
+  std::uint32_t plan_vertex_capacity(std::uint32_t triangle_capacity) const;
 
   // Create this slot's draw command if it has none, and reset it to "draw
   // nothing yet": indexCount 0 for the kernel to accumulate into, and the four

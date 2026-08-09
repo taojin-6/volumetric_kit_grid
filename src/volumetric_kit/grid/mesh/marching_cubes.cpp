@@ -56,6 +56,20 @@ static_assert(offsetof(VkDrawIndexedIndirectCommand, indexCount) == 0,
 // extractor's whole lifetime, since the arena never shrinks.
 constexpr std::uint64_t kSeedTrisPerBlock = 64;
 
+// Vertices per 1000 triangles to assume before anything has been measured.
+//
+// Deliberately OPTIMISTIC -- below the ~750 in-block sharing settles at --
+// because the arena is grow-only: a first extract that over-allocates never
+// gives the memory back, which would defeat the point. Under-shooting instead
+// costs one refit dispatch, which is the backstop the capacity plan already
+// has. Unshared extracts never consult this; they know the answer is 3000.
+constexpr std::uint32_t kSeedVertsPer1000 = 700;
+
+// Cells the sparse kernel's shared owned-edge table holds -- block_size 8.
+// Mirrors kMaxSharedCells in marching_cubes_sparse.comp; the two must agree,
+// and the host is what refuses a grid the kernel could not index.
+constexpr std::uint32_t kMaxSharedCells = 512;
+
 // A corner with weight at or below this is treated as unintegrated, and any
 // cell touching it is skipped. Small and positive so a never-integrated voxel
 // (weight 0) is excluded while any genuine integration counts. The `tsdf` tier
@@ -189,17 +203,31 @@ std::uint32_t read_vertex_count(const Buffer& indirect) {
   return produced;
 }
 
-// Bytes a vertex arena needs to hold @p capacity triangles (3 vertices each).
-std::uint64_t arena_bytes_for(std::uint32_t capacity) {
-  return static_cast<std::uint64_t>(capacity) * kIndicesPerTriangle *
-         sizeof(Vertex);
+// Bytes a vertex arena needs to hold @p vertex_capacity VERTICES.
+//
+// Vertices, not triangles. The two were interchangeable while every triangle
+// owned three private ones, and the whole point of vertex sharing is that they
+// stop being: the arena is now sized by its own budget and the index run by the
+// triangle count, independently.
+std::uint64_t arena_bytes_for(std::uint64_t vertex_capacity) {
+  return vertex_capacity * sizeof(Vertex);
 }
 
-// The inverse: the most triangles an arena may hold under a binding-range
-// limit. Never zero for any conformant device -- Vulkan's guaranteed floor of
-// 2^27 covers 699050 triangles at 192 B each.
+// Bytes the index run needs to hold @p triangle_capacity triangles.
+std::uint64_t index_run_bytes_for(std::uint64_t triangle_capacity) {
+  return triangle_capacity * kIndicesPerTriangle * sizeof(std::uint32_t);
+}
+
+// The most VERTICES an arena may hold under a binding-range limit. Never zero
+// for any conformant device -- Vulkan's guaranteed floor of 2^27 covers
+// 2097152 vertices at 64 B each.
+std::uint64_t max_vertices_for(std::uint64_t max_range) {
+  return max_range / sizeof(Vertex);
+}
+
+// The most triangles an index run may hold under the same limit.
 std::uint64_t max_triangles_for(std::uint64_t max_range) {
-  return max_range / (kIndicesPerTriangle * sizeof(Vertex));
+  return max_range / (kIndicesPerTriangle * sizeof(std::uint32_t));
 }
 
 // Read the atomic triangle count back and copy the emitted vertices into a
@@ -449,14 +477,45 @@ void MarchingCubes::clamp_indirect_to_arena() noexcept {
   std::memcpy(indirect().mapped(), &indices, sizeof(indices));
 }
 
-Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
+std::uint32_t MarchingCubes::plan_vertex_capacity(
+    std::uint32_t triangle_capacity) const {
+  // Without sharing this is exact, not estimated: every triangle owns three
+  // private vertices, so budgeting anything else would either waste the arena
+  // or force a refit on every call.
+  if (!config_.share_vertices) {
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(triangle_capacity) * kIndicesPerTriangle,
+        0xFFFFFFFFull));
+  }
+  const std::uint64_t per_1000 =
+      verts_per_1000_tris_ != 0 ? verts_per_1000_tris_ : kSeedVertsPer1000;
+  // Rounded up and never zero: a capacity of 0 drops every vertex and refits
+  // forever.
+  const std::uint64_t estimate =
+      (static_cast<std::uint64_t>(triangle_capacity) * per_1000 + 999) / 1000;
+  return static_cast<std::uint32_t>(
+      std::min(std::max<std::uint64_t>(estimate, 1),
+               max_vertices_for(max_storage_buffer_range_)));
+}
+
+Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
+                                            std::uint32_t vertex_capacity) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
   // rejected because the growth policy overshot.
-  if (arena_bytes_for(capacity) > max_storage_buffer_range_) {
+  if (arena_bytes_for(vertex_capacity) > max_storage_buffer_range_) {
     return Status::invalid_argument(
         "MarchingCubes::extract: a vertex arena for " +
-        std::to_string(capacity) +
+        std::to_string(vertex_capacity) +
+        " vertices exceeds the device maxStorageBufferRange");
+  }
+  // The index run has its own limit, not implied by the arena's: sharing
+  // shrinks the vertices and leaves the triangles alone, so on a heavily shared
+  // surface the run is what reaches the ceiling first.
+  if (index_run_bytes_for(triangle_capacity) > max_storage_buffer_range_) {
+    return Status::invalid_argument(
+        "MarchingCubes::extract: an index run for " +
+        std::to_string(triangle_capacity) +
         " triangles exceeds the device maxStorageBufferRange");
   }
   // No slot stamp here, deliberately. Marking the slot outstanding is the
@@ -475,7 +534,10 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // accumulates onto the first's.
   VR_TRY(ensure_indirect_command());
 
-  if (arena().valid() && capacity <= arena_capacity()) {
+  // Both must fit to reuse: two buffers, two budgets.
+  if (arena().valid() && index_run().valid() &&
+      triangle_capacity <= arena_capacity() &&
+      vertex_capacity <= arena_vertex_capacity()) {
     return {};  // the steady state -- no allocation at all
   }
   // Grow geometrically rather than to the exact request: the active set climbs
@@ -489,14 +551,24 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // narrowing: 1.5x a near-uint32 capacity does not fit a uint32, and
   // truncating first could turn an over-large request into a small one that
   // passes the byte check.
-  const std::uint64_t grown =
-      std::max<std::uint64_t>(capacity, arena_capacity()) * 3 / 2;
-  const bool headroom_fits =
-      grown <= 0xFFFFFFFFull &&
-      arena_bytes_for(static_cast<std::uint32_t>(grown)) <=
-          max_storage_buffer_range_;
+  // Each budget grows on its own: triangles and vertices move together only
+  // when nothing is shared.
+  const std::uint64_t grown_tris =
+      std::max<std::uint64_t>(triangle_capacity, arena_capacity()) * 3 / 2;
+  const bool tri_headroom_fits =
+      grown_tris <= 0xFFFFFFFFull &&
+      index_run_bytes_for(grown_tris) <= max_storage_buffer_range_;
   const std::uint32_t grown_capacity =
-      headroom_fits ? static_cast<std::uint32_t>(grown) : capacity;
+      tri_headroom_fits ? static_cast<std::uint32_t>(grown_tris)
+                        : triangle_capacity;
+  const std::uint64_t grown_verts =
+      std::max<std::uint64_t>(vertex_capacity, arena_vertex_capacity()) * 3 / 2;
+  const bool vert_headroom_fits =
+      grown_verts <= 0xFFFFFFFFull &&
+      arena_bytes_for(grown_verts) <= max_storage_buffer_range_;
+  const std::uint32_t grown_vertex_capacity =
+      vert_headroom_fits ? static_cast<std::uint32_t>(grown_verts)
+                         : vertex_capacity;
 
   // Drop the old arena BEFORE allocating the new one, so the grow asks the
   // driver for one arena rather than two. VMA pools an emptied block instead of
@@ -527,7 +599,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
       Buffer grown_arena,
       storage_buffer(
           *allocator_,
-          static_cast<VkDeviceSize>(arena_bytes_for(grown_capacity)),
+          static_cast<VkDeviceSize>(arena_bytes_for(grown_vertex_capacity)),
           HostAccess::Random, config_.extra_vertex_usage,
           config_.queue_family_count > 0 ? config_.queue_families : nullptr,
           config_.queue_family_count));
@@ -537,13 +609,11 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
   // mapped buffer: no staging copy, and only on a grow. SequentialWrite because
   // this fill is the only host access it ever gets -- download() regenerates
   // the run on the host rather than reading back from write-combined memory.
-  const std::size_t index_count =
-      static_cast<std::size_t>(grown_capacity) * kIndicesPerTriangle;
   VR_ASSIGN(
       Buffer indices_buf,
       storage_buffer(
           *allocator_,
-          static_cast<VkDeviceSize>(index_count * sizeof(std::uint32_t)),
+          static_cast<VkDeviceSize>(index_run_bytes_for(grown_capacity)),
           // Random, not SequentialWrite. The host used to only ever WRITE this
           // (an identity run it could also regenerate for free), so
           // write-combined was right. The sparse kernel writes it now and
@@ -553,9 +623,6 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t capacity) {
           HostAccess::Random, config_.extra_index_usage,
           config_.queue_family_count > 0 ? config_.queue_families : nullptr,
           config_.queue_family_count));
-  auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
-  std::iota(indices, indices + index_count, std::uint32_t{0});
-
   arena() = std::move(grown_arena);
   index_run() = std::move(indices_buf);
   return {};
@@ -773,7 +840,10 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
     std::memset(colors_buf.mapped(), 0, sizeof(std::uint32_t));
   }
 
-  VR_TRY(ensure_output_buffers(capacity));
+  // The dense kernel still emits three private vertices per triangle through
+  // mcEmitCell -- there is no block structure to share within -- so its vertex
+  // budget is exact rather than planned.
+  VR_TRY(ensure_output_buffers(capacity, capacity * kIndicesPerTriangle));
 
   kernel_.set.write_storage_buffer(1, samples_buf.handle(), 0, VK_WHOLE_SIZE);
   kernel_.set.write_storage_buffer(2, colors_buf.handle(), 0, VK_WHOLE_SIZE);
@@ -1012,6 +1082,19 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   const volume::VoxelGridParams& gp = grid.grid();
   const std::int32_t bs = gp.block_size;
   const auto vpb = static_cast<std::uint32_t>(gp.voxels_per_block);
+  // Sharing keeps one vertex slot per cell per axis in THREADGROUP memory,
+  // which needs a compile-time size, so the kernel's table is sized for
+  // block_size 8 -- the only shape any in-tree caller uses. Refused rather than
+  // silently ignored: the kernel would index past the end of a shared array,
+  // which no validation layer sees and which reads back as a plausible mesh.
+  // Checked here rather than in create() because the grid, and therefore the
+  // block size, only arrives with the extract.
+  if (config_.share_vertices && vpb > kMaxSharedCells) {
+    return Status::invalid_argument(
+        "MarchingCubes::extract: share_vertices needs voxels_per_block <= " +
+        std::to_string(kMaxSharedCells) + " (this grid has " +
+        std::to_string(vpb) + ")");
+  }
   const auto num_active = static_cast<std::uint32_t>(active.size());
 
   // One invocation per voxel of each active block; worst-case 5 triangles each.
@@ -1090,7 +1173,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
       static_cast<std::size_t>(num_active) * sizeof(volume::BlockIndex));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
-  VR_TRY(ensure_output_buffers(capacity));
+  VR_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity)));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
@@ -1145,7 +1228,9 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // keeps `requested <= arena_capacity()` true by construction, which is what
   // bounds the vertex count published below.
   std::uint32_t requested = arena_capacity();
+  std::uint32_t requested_verts = arena_vertex_capacity();
   std::uint32_t produced = 0;
+  std::uint32_t produced_verts = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
     SparsePushConstants push{bs,
                              static_cast<std::int32_t>(vpb),
@@ -1168,10 +1253,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // Assigned by name for the same reason the three above are: they are
     // same-typed adjacent scalars, so a positional slip would compile.
     //
-    // Sharing is not reachable from the API yet -- the arena is still sized as
-    // three vertices per triangle, which is what makes this exactly the old
-    // behaviour rather than a budget the kernel could overrun.
-    push.share_vertices = 0u;
+    push.share_vertices = config_.share_vertices ? 1u : 0u;
     push.vertex_capacity = arena_vertex_capacity();
 
     // One workgroup per block, not one thread per voxel: the kernel resolves
@@ -1202,8 +1284,14 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     std::memcpy(&produced_command, indirect().mapped(),
                 sizeof(produced_command));
     produced = produced_command.indexCount / kIndicesPerTriangle;
+    // The vertex counter is its own overflow condition. With sharing the two
+    // counts are not proportional, so a plan can be right about the triangles
+    // and wrong about the vertices -- and a triangle whose vertex was dropped
+    // is counted but not written, so trusting the triangle count alone would
+    // publish a mesh with holes in it.
+    produced_verts = read_vertex_count(indirect());
     if (timings != nullptr) timings->readback_ms += phase_clock.lap();
-    if (produced <= requested) {
+    if (produced <= requested && produced_verts <= requested_verts) {
       break;  // everything the field emitted is in the arena
     }
     // From here the command names more indices than the arena holds -- the
@@ -1229,7 +1317,9 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // reject the refit against maxStorageBufferRange, or fail the allocation
     // outright after having already freed the old arena -- in which case
     // arena_capacity() is 0 and the clamp writes exactly that.
-    if (Status refit = ensure_output_buffers(produced); !refit.ok()) {
+    if (Status refit = ensure_output_buffers(
+            produced, std::max(produced_verts, plan_vertex_capacity(produced)));
+        !refit.ok()) {
       clamp_indirect_to_arena();
       return refit;
     }
@@ -1245,6 +1335,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     kernel_sparse_.set.write_storage_buffer(8, index_run().handle(), 0,
                                             VK_WHOLE_SIZE);
     requested = arena_capacity();
+    requested_verts = arena_vertex_capacity();
     if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
   }
   // Clamped against the arena itself, not against `requested`: this count is
@@ -1260,6 +1351,14 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // plan falls back to the seed.
   tris_per_block_ = static_cast<std::uint32_t>(
       (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
+  // The vertex density this surface actually had, for the next call's arena
+  // budget. Recorded only for a non-empty surface, so a frame that meshed
+  // nothing cannot drive the next plan to zero.
+  if (emitted > 0) {
+    verts_per_1000_tris_ = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(produced_verts) * 1000 + emitted - 1) /
+        emitted);
+  }
 
   // Nothing to clamp here, and that is a property worth stating rather than a
   // line worth adding: the loop breaks only on `produced <= requested`, and
