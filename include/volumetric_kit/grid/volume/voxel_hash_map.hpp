@@ -234,16 +234,20 @@ class VR_VOLUME_API VoxelHashMap {
                                AllocFailures* out_failures = nullptr);
 
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
-  /// @param metrics  Optional @ref StageMetrics collecting a
-  ///                 `"  ..active set"` @ref StageMetrics::kBreakdownPrefix row
-  ///                 -- host and device. A *breakdown* row rather than a stage
-  ///                 of its own because the caller that wants it is a fusion
-  ///                 tier calling this inside its own stage: `tsdf`'s
-  ///                 `"integrate"` host row wraps this dispatch, so without a
-  ///                 sub-row that device time is invisible and the gap between
-  ///                 `integrate`'s two halves reads as submit overhead when it
-  ///                 is a second kernel. Breakdown rows are skipped by
-  ///                 @ref StageMetrics::total_cpu_ms, so nothing double-counts.
+  /// @param metrics  Optional @ref StageMetrics collecting an `"active set"`
+  ///                 row -- host and device. Named with @ref
+  ///                 StageMetrics::kBreakdownPrefix when a @ref StageScope is
+  ///                 already open on @p metrics and plainly when it is not,
+  ///                 because which of the two it is depends on the caller, not
+  ///                 on this operation: `tsdf`'s `"integrate"` host row wraps
+  ///                 this dispatch, so as a sub-row of that its host half must
+  ///                 not be summed again (and without the sub-row its device
+  ///                 time would be invisible, leaving the gap between
+  ///                 `integrate`'s halves reading as submit overhead when it is
+  ///                 a second kernel) -- while a caller that compacts at top
+  ///                 level is asking for a stage, and a prefixed row there
+  ///                 would be left out of @ref StageMetrics::total_cpu_ms
+  ///                 entirely.
   /// @return The active blocks (order unspecified), or a non-OK @ref Status.
   Result<std::vector<BlockIndex>> compact_active_blocks(
       StageMetrics* metrics = nullptr);
@@ -258,19 +262,25 @@ class VR_VOLUME_API VoxelHashMap {
   /// consume so only camera-visible blocks are processed.
   /// @param planes  Six inward-normal frustum planes (@ref
   /// make_frustum_planes).
+  /// @param metrics  As @ref compact_active_blocks, under the same row name:
+  ///                 this is the same round trip against a smaller set, so a
+  ///                 caller that switches to it to make the trip cheaper must
+  ///                 be able to read what that bought rather than watch the row
+  ///                 disappear.
   /// @return The visible active blocks (order unspecified), or a non-OK
   ///         @ref Status if a buffer or the dispatch fails / the map is
   ///         moved-from.
   Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
-      const FrustumPlanes& planes);
+      const FrustumPlanes& planes, StageMetrics* metrics = nullptr);
 
   /// @brief @ref compact_active_blocks_in_frustum for a depth camera: derives
   ///        the frustum from @p camera's intrinsics, `[min_depth, max_depth]`
   ///        range, and pose, then culls.
   /// @param camera  The same camera passed to @ref allocate_from_depth.
+  /// @param metrics  As @ref compact_active_blocks.
   /// @return The visible active blocks, or a non-OK @ref Status.
   Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
-      const DepthCameraParams& camera);
+      const DepthCameraParams& camera, StageMetrics* metrics = nullptr);
 
   /// @brief Reset the table to empty (re-runs the init kernel).
   /// @return An OK @ref Status, or a non-OK one if the init dispatch fails or
@@ -364,11 +374,26 @@ class VR_VOLUME_API VoxelHashMap {
   /// the host (1.5M at the example defaults) and so cannot run per frame; and
   /// growing only once @ref AllocFailures::capacity_limited fires means the map
   /// necessarily spends time at the occupancy where collision chains are
-  /// longest and every insert is slowest. Grow on a threshold well under 1.0 --
-  /// linear probing degrades sharply past ~0.7 -- rather than at the cliff.
+  /// longest and every insert is slowest. Grow at @ref kGrowThreshold rather
+  /// than at the cliff.
   /// @return The occupancy in `[0, 1]`, or a non-OK @ref Status if the map is
   ///         moved-from.
   Result<float> load_factor() const;
+
+  /// @brief The @ref load_factor a caller should grow at rather than run past.
+  ///
+  /// Linear probing degrades sharply beyond this: each insert walks a longer
+  /// chain, and `allocate_from_depth`'s overflow scan -- exhaustive by design,
+  /// see the 2026-08-08 decision -- pays a contended atomic for every slot it
+  /// walks. Well under 1.0 on purpose; the point is to leave the band where
+  /// the map is both slowest and likeliest to fail, not to sit at its edge.
+  ///
+  /// A named constant here rather than a number each caller picks, because it
+  /// is a property of this table: a UI drawing its own ceiling, or an embedder
+  /// refusing to allocate past one, otherwise ends up disagreeing with the
+  /// guidance @ref load_factor gives right above it -- and neither side is
+  /// obviously the wrong one to a reader who sees only one.
+  static constexpr float kGrowThreshold = 0.7f;
 
   /// @brief Compute occupancy + health statistics (active / overflow / chain
   ///        length + heap utilization).
@@ -409,6 +434,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @p stage, when non-null, collects the dispatch's device span.
   Result<std::vector<BlockIndex>> collect_compacted(const ComputeKernel& kernel,
                                                     GpuStageScope* stage);
+
+  /// The row label both compaction entry points report under, carrying
+  /// @ref StageMetrics::kBreakdownPrefix or not according to whether @p metrics
+  /// already has a stage open.
+  static const char* active_set_row(const StageMetrics* metrics) noexcept;
 
   /// Dispatch @p kernel (push arg = @p arg) over @p groups groups,
   /// re-dispatching while the shared `fail_counts_[kFailTotal]` tally keeps
