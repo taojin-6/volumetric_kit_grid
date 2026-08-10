@@ -11,14 +11,20 @@
 // index would corrupt every boundary cell and diverge. Also verifies the sphere
 // shape (radius, outward normals, winding), cross-block colour interpolation,
 // the vertex-arena growth policy, the refit-and-re-run path an undersized
-// arena takes, and the empty / argument-validation / moved-from paths. Exits 0
-// (skip) where no device is present.
+// arena takes -- over one block and over a run of 27, where the arena boundary
+// falls inside one block's span and past others entirely -- that a block's
+// triangles land CONTIGUOUSLY in the arena on both paths, that the block size
+// is an allocation detail the surface does not depend on (the same field at
+// block_size 8 and 16 meshes identically), and the empty /
+// argument-validation / moved-from paths. Exits 0 (skip) where no device is
+// present.
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -185,21 +191,44 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
   return true;
 }
 
-// Allocate ONE block and fill it with a sign-alternating field, so every cell
-// has mixed corner signs and emits several triangles: ~1400 triangles from one
-// block, against the ~64 per block a first extract plans for. That gap is what
-// makes the refit-and-re-run path fire deterministically rather than by
-// numeric accident. Returns false on any device error.
-bool fill_dense_block(vol::VoxelBlockGrid& g) {
-  vol::BlockIndex b{};
-  b.coord = vr::Vec3i(0, 0, 0);
-  vr::Result<std::uint32_t> failed = g.map().allocate(&b, 1);
+// Allocate a @p span cubed run of blocks and fill every voxel with a
+// sign-alternating field, so every cell has mixed corner signs and emits
+// several triangles: ~1400 triangles per block of 8, against the ~64 per block
+// a first extract plans for. That gap is what makes the refit-and-re-run path
+// fire deterministically rather than by numeric accident. Returns false on any
+// device error.
+//
+// The checkerboard is keyed on the GLOBAL voxel coordinate rather than the
+// block-local one, so it is continuous across block boundaries. That costs
+// nothing at span 1 (block (0,0,0)'s local and global coordinates agree) and
+// buys two things: a multi-block run meshes its interior seams like any real
+// field, and the SAME field can be written into grids with different block
+// sizes and must extract to the same surface -- which is what pins the kernel's
+// per-block cell cache, whose only effect is supposed to be speed.
+//
+// Reads the block size from the grid rather than assuming kBlock, for that
+// second use.
+bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
+  const int bs = g.grid().block_size;
+  const float h = g.grid().voxel_size;
+  std::vector<vol::BlockIndex> blocks;
+  for (int cz = 0; cz < span; ++cz) {
+    for (int cy = 0; cy < span; ++cy) {
+      for (int cx = 0; cx < span; ++cx) {
+        vol::BlockIndex b{};
+        b.coord = vr::Vec3i(cx, cy, cz);
+        blocks.push_back(b);
+      }
+    }
+  }
+  vr::Result<std::uint32_t> failed = g.map().allocate(
+      blocks.data(), static_cast<std::uint32_t>(blocks.size()));
   if (!failed || failed.value() != 0) {
     return false;
   }
   vr::Result<std::vector<vol::BlockIndex>> active =
       g.map().compact_active_blocks();
-  if (!active || active.value().size() != 1) {
+  if (!active || active.value().size() != blocks.size()) {
     return false;
   }
   vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
@@ -209,18 +238,76 @@ bool fill_dense_block(vol::VoxelBlockGrid& g) {
   }
   auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
   auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
-  const vol::BlockIndex& blk = active.value().front();
-  for (int lz = 0; lz < kBlock; ++lz) {
-    for (int ly = 0; ly < kBlock; ++ly) {
-      for (int lx = 0; lx < kBlock; ++lx) {
-        const int local = lx + kBlock * (ly + kBlock * lz);
-        const auto idx = static_cast<std::size_t>(blk.ptr) + local;
-        tptr[idx] = ((lx + ly + lz) % 2 == 0) ? -0.5f * kH : 0.5f * kH;
-        wptr[idx] = 1.0f;
+  for (const vol::BlockIndex& blk : active.value()) {
+    for (int lz = 0; lz < bs; ++lz) {
+      for (int ly = 0; ly < bs; ++ly) {
+        for (int lx = 0; lx < bs; ++lx) {
+          const int local = lx + bs * (ly + bs * lz);
+          const vr::Vec3i voxel = blk.coord * bs + vr::Vec3i(lx, ly, lz);
+          const auto idx = static_cast<std::size_t>(blk.ptr) + local;
+          tptr[idx] =
+              ((voxel.x + voxel.y + voxel.z) % 2 == 0) ? -0.5f * h : 0.5f * h;
+          wptr[idx] = 1.0f;
+        }
       }
     }
   }
   return true;
+}
+
+// How a mesh's triangles are laid out in the arena relative to the blocks that
+// produced them: how many distinct blocks it spans, and how many times the
+// owning block CHANGES walking the index buffer in order. Per-block grouping
+// gives EXACTLY `distinct - 1` transitions -- spans are contiguous and
+// disjoint, so the owner changes once per span boundary and nowhere else --
+// while full interleaving gives nearly one per triangle.
+//
+// Exactly, not approximately, because attributing a triangle by its CENTROID is
+// exact here. The three vertices lie on the edges of one marching-cubes cell,
+// so the centroid lies in that cell's closed cube; the cell's base voxel
+// belongs to the block and the cube reaches at most to the block's far
+// boundary, so the only centroid that could land in the NEXT block is one
+// exactly on that boundary -- which takes all three vertices on the cell's far
+// face, i.e. three sign changes around a 4-cycle, and sign changes around a
+// cycle come in pairs. Two on the far face is the parity-legal maximum, and
+// that centroid still sits a third of a voxel short of the boundary, which no
+// float rounding closes.
+//
+// The owning block is keyed by its three coordinates rather than a packed
+// integer: a packed key is injective only while coordinates stay non-negative
+// and small, and a collision would lower BOTH numbers -- loosening the
+// assertion at exactly the moment attribution stopped distinguishing blocks.
+struct BlockLayout {
+  std::size_t triangles = 0;
+  std::size_t distinct = 0;
+  std::size_t transitions = 0;
+};
+
+BlockLayout block_layout(const mesh::Mesh& m, int block_size,
+                         float voxel_size) {
+  const float block_span = static_cast<float>(block_size) * voxel_size;
+  std::vector<std::array<long long, 3>> owner;
+  owner.reserve(m.indices.size() / 3);
+  for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
+    vr::Vec3f c(0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < 3; ++k) {
+      c = c + m.vertices[m.indices[t + k]].position;
+    }
+    c = c / 3.0f;
+    owner.push_back({static_cast<long long>(std::floor(c.x / block_span)),
+                     static_cast<long long>(std::floor(c.y / block_span)),
+                     static_cast<long long>(std::floor(c.z / block_span))});
+  }
+  BlockLayout out;
+  out.triangles = owner.size();
+  out.distinct =
+      std::set<std::array<long long, 3>>(owner.begin(), owner.end()).size();
+  for (std::size_t i = 1; i < owner.size(); ++i) {
+    if (owner[i] != owner[i - 1]) {
+      ++out.transitions;
+    }
+  }
+  return out;
 }
 
 // A mesh's triangles as a sorted, directly comparable list of their nine
@@ -331,6 +418,29 @@ int main() {
   const auto nv = static_cast<double>(sphere.vertices.size());
   CHECK(std::fabs(radius_sum / nv - kRadius) < 0.25 * kH);  // no radial bias
   CHECK(outward_sum / nv > 0.9);
+
+  // --- A block's triangles are CONTIGUOUS in the arena -----------------------
+  //
+  // Stage 2's actual deliverable, and nothing else here can see it: the golden
+  // sparse-vs-dense equivalence below compares triangles as a SET, so it passes
+  // identically whether a block's triangles are grouped or scattered the length
+  // of the arena. Under the per-triangle append they interleaved with every
+  // other block in flight, and per-block ranges are the precondition for
+  // meshing only the blocks a fuse changed.
+  //
+  // Asserted EXACTLY -- see block_layout for why centroid attribution admits no
+  // slack here, and why a loose bound would be the wrong instrument: the
+  // failure this guards against (a span overrun, or a block emitting through
+  // two spans) moves the count by one, not by an order of magnitude.
+  {
+    const BlockLayout layout = block_layout(sphere, kBlock, kH);
+    // The sphere must actually straddle many blocks, or "grouped" is vacuous.
+    CHECK(layout.distinct >= 20);
+    // ... and there must be many more triangles than blocks, or the assertion
+    // below is satisfied by arithmetic rather than by grouping.
+    CHECK(layout.triangles > 4 * layout.distinct);
+    CHECK(layout.transitions == layout.distinct - 1);
+  }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
   // flipped table would drop this well below 1).
@@ -631,7 +741,7 @@ int main() {
                                   2);
   CHECK(dense_block_result.ok());
   vol::VoxelBlockGrid dense_block = std::move(dense_block_result).value();
-  CHECK(fill_dense_block(dense_block));
+  CHECK(fill_dense_blocks(dense_block, 1));
 
   mesh::ExtractTimings refit_timings;
   vr::Result<mesh::Mesh> refit_mesh_result =
@@ -658,6 +768,69 @@ int main() {
   CHECK(settled_timings.dispatches == 1);
   CHECK(settled_timings.emitted_triangles == refit_timings.emitted_triangles);
   CHECK(canonical_triangles(refit_mesh) == canonical_triangles(settled_mesh));
+
+  // --- ...and the same overflow across MANY blocks ---------------------------
+  //
+  // A distinct path since the kernel began reserving one span per block, and
+  // the single-block fixture above cannot reach it. With one block every drop
+  // is a suffix of one span, which is what the per-triangle append did
+  // everywhere. With 27 blocks the arena boundary falls in three different
+  // places at once: blocks whose span fits entirely, ONE whose span straddles
+  // `capacity` (its first triangles written, its last dropped), and blocks
+  // whose span begins wholly past it -- the case the kernel now rejects up
+  // front rather than one triangle at a time.
+  //
+  // The demand is what makes it deterministic: 27 blocks x ~1400 triangles
+  // against the ~64 per block a first extract plans, so every one of those
+  // three cases is occupied rather than hoped for.
+  vr::Result<vol::VoxelBlockGrid> dense_run_result =
+      vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp, attrs,
+                                  2);
+  CHECK(dense_run_result.ok());
+  vol::VoxelBlockGrid dense_run = std::move(dense_run_result).value();
+  CHECK(fill_dense_blocks(dense_run, 3));
+
+  vr::Result<mesh::MarchingCubes> run_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value());
+  CHECK(run_result.ok());
+  mesh::MarchingCubes run_mc = std::move(run_result).value();
+
+  mesh::ExtractTimings run_timings;
+  vr::Result<mesh::Mesh> run_mesh_result =
+      run_mc.extract(dense_run, 0.0f, &run_timings);
+  CHECK(run_mesh_result.ok());
+  const mesh::Mesh run_mesh = std::move(run_mesh_result).value();
+  CHECK(run_timings.active_blocks == 27);
+  CHECK(run_timings.dispatches == 2);  // planned short, measured, re-ran
+  CHECK(run_timings.emitted_triangles > run_timings.active_blocks * 64);
+  // Nothing lost and nothing duplicated by the overflow: the retry emitted
+  // exactly the count the overflowing pass reported, which is the whole
+  // contract that pass exists to uphold.
+  CHECK(run_mesh.triangle_count() == run_timings.emitted_triangles);
+  CHECK(run_timings.triangle_capacity >= run_timings.emitted_triangles);
+
+  // The same field again, now planned in one dispatch, must be the same
+  // surface triangle-for-triangle -- so a span dropped at the boundary was
+  // dropped, not misplaced into a neighbouring block's.
+  mesh::ExtractTimings run_settled_timings;
+  vr::Result<mesh::Mesh> run_settled_result =
+      run_mc.extract(dense_run, 0.0f, &run_settled_timings);
+  CHECK(run_settled_result.ok());
+  const mesh::Mesh run_settled = std::move(run_settled_result).value();
+  CHECK(run_settled_timings.dispatches == 1);
+  CHECK(canonical_triangles(run_mesh) == canonical_triangles(run_settled));
+
+  // And contiguity survives a refit: the assertion above runs only on a clean
+  // first extract, where no span was ever truncated. Same exact figure here --
+  // `distinct - 1`, against the ~48 000 transitions full interleaving would
+  // give at this triangle count -- because truncating a span at the arena
+  // boundary shortens it without splitting it.
+  {
+    const BlockLayout layout = block_layout(run_settled, kBlock, kH);
+    CHECK(layout.distinct >= 20);
+    CHECK(layout.triangles > 4 * layout.distinct);
+    CHECK(layout.transitions == layout.distinct - 1);
+  }
 
   // Reusing one ExtractTimings across calls must not accumulate: every field is
   // overwritten, so the second call's spans are its own. (dispatch_ms and
@@ -843,7 +1016,7 @@ int main() {
   // reads back as a plausible mesh.
   vol::VoxelGridParams big_block_gp = sphere_grid_params();
   big_block_gp.block_size = 16;
-  big_block_gp.voxels_per_block = 16 * 16 * 16;  // 4096 > the kernel's 512
+  big_block_gp.voxels_per_block = 16 * 16 * 16;  // 4096 > the kernel's 1024
   big_block_gp.num_buckets = 32;
   big_block_gp.num_blocks = 256;  // = bucket_size * num_buckets
   vr::Result<vol::VoxelBlockGrid> big_block_result =
@@ -851,16 +1024,51 @@ int main() {
                                   big_block_gp, attrs, 2);
   CHECK(big_block_result.ok());
   vol::VoxelBlockGrid big_block_grid = std::move(big_block_result).value();
-  vol::BlockIndex big_block{};
-  big_block.coord = vr::Vec3i(0, 0, 0);
-  vr::Result<std::uint32_t> big_block_failed =
-      big_block_grid.map().allocate(&big_block, 1);
-  CHECK(big_block_failed.ok());
-  CHECK(big_block_failed.value() == 0);
+  // FILLED, not merely allocated. An allocated-but-unintegrated block has
+  // weight 0 at every corner, so every cell is rejected at the gather and the
+  // block emits nothing -- which means the default kernel returns at its
+  // "nothing reserved" check and the uncached tail this grid exists to reach
+  // never runs. With the field written, cells 1024..4095 fall past the four
+  // slots the kernel's per-cell cache holds and take the second full gather
+  // instead of the cheap register rejection, and only then is the uncached
+  // branch exercised at all.
+  CHECK(fill_dense_blocks(big_block_grid, 1));
   CHECK(!share_mc.extract(big_block_grid, 0.0f).ok());
   // The same grid is fine without sharing -- the refusal is the kernel's table,
   // not the block size.
-  CHECK(arena_mc.extract(big_block_grid, 0.0f).ok());
+  mesh::ExtractTimings big_timings_16;
+  vr::Result<mesh::Mesh> big_mesh_16_result =
+      arena_mc.extract(big_block_grid, 0.0f, &big_timings_16);
+  CHECK(big_mesh_16_result.ok());
+  const mesh::Mesh big_mesh_16 = std::move(big_mesh_16_result).value();
+  CHECK(big_timings_16.active_blocks == 1);
+  CHECK(big_mesh_16.triangle_count() > 0);
+  // The shortfall is REPORTED rather than refused: correct mesh, ~1.8 gathers
+  // per cell instead of ~1.1, and nothing else could tell a caller so.
+  CHECK(big_timings_16.uncached_cells_per_block == 4096 - 1024);
+
+  // The block size is an allocation detail, so the SAME field divided into
+  // eight blocks of 8 must extract to the same surface. This is what pins the
+  // per-cell cache as an optimisation: it changes which cells are rejected
+  // cheaply and which are gathered twice, and must change nothing else. The
+  // outer +face cells reach a corner at voxel 16, unallocated under either
+  // division, so both meshes stop in the same place.
+  vol::VoxelGridParams split_gp = sphere_grid_params();
+  split_gp.num_buckets = 32;
+  split_gp.num_blocks = 256;
+  vr::Result<vol::VoxelBlockGrid> split_result = vol::VoxelBlockGrid::create(
+      device.value(), allocator.value(), split_gp, attrs, 2);
+  CHECK(split_result.ok());
+  vol::VoxelBlockGrid split_grid = std::move(split_result).value();
+  CHECK(fill_dense_blocks(split_grid, 2));  // 2x2x2 blocks of 8 = the same 16^3
+  mesh::ExtractTimings split_timings;
+  vr::Result<mesh::Mesh> split_mesh_result =
+      arena_mc.extract(split_grid, 0.0f, &split_timings);
+  CHECK(split_mesh_result.ok());
+  const mesh::Mesh split_mesh = std::move(split_mesh_result).value();
+  CHECK(split_timings.active_blocks == 8);
+  CHECK(split_timings.uncached_cells_per_block == 0);  // 512 cells, all cached
+  CHECK(canonical_triangles(big_mesh_16) == canonical_triangles(split_mesh));
 
   // --- Argument validation ---------------------------------------------------
   // A grid missing the tsdf/weight attributes is rejected (a bare grid here).

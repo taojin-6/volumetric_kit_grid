@@ -123,6 +123,26 @@ struct ExtractTimings {
   std::uint32_t triangle_capacity = 0;
   /// Triangles the kernel actually emitted.
   std::uint32_t emitted_triangles = 0;
+  /// Cells per block the sparse kernel could **not** cache a triangle count
+  /// for, so they were gathered twice instead of once -- correct, measurably
+  /// slower, and otherwise invisible.
+  ///
+  /// The sparse kernel visits a cell twice: once to count (signs only), once to
+  /// emit. Between them it caches each cell's triangle count in one byte of a
+  /// private register, so the ~92% of cells that emit nothing are rejected
+  /// without touching memory rather than by a second gather. That cache holds
+  /// four counts per invocation, which covers `block_size` 8 whole; a block
+  /// with more cells than it holds still meshes **correctly**, but every cell
+  /// past it pays a second full gather -- at `block_size` 16 that is 75% of the
+  /// block, roughly 1.8 gathers per cell against 1.1.
+  ///
+  /// Reported rather than refused, because nothing is wrong with the mesh --
+  /// but a limit the caller cannot see is this library's to surface (see the
+  /// 2026-08-04 decision). **0 for `block_size` 8**, the only shape any in-tree
+  /// caller uses, and 0 for the dense @ref extract and under
+  /// @ref MarchingCubesConfig::share_vertices, neither of which uses that cache
+  /// (sharing is *refused* above its own limit instead).
+  std::uint32_t uncached_cells_per_block = 0;
   /// Vertex capacity the dispatch ran with -- one slot's vertex arena, so
   /// `emitted_vertices / vertex_capacity` is that buffer's fill ratio.
   ///
@@ -375,10 +395,25 @@ struct MarchingCubesConfig {
 /// Built on the `core` compute foundation (@ref Allocator, @ref Buffer,
 /// @ref ComputeKernel, @ref Device::submit_single_time), mirroring the volume
 /// tier's @ref volume::VoxelHashMap. The kernel runs one invocation per cell,
-/// builds the cube index from the eight corner signs, interpolates a vertex on
-/// each crossed edge, and appends independent triangles through an atomic bump
-/// counter -- the simple, correct form; shared-edge dedup and an incremental
-/// block-mesh pool are later slices (the TODOs below).
+/// builds the cube index from the eight corner signs, and interpolates a vertex
+/// on each crossed edge; an incremental block-mesh pool is a later slice (the
+/// TODOs below). How the triangles reach the arena differs by path:
+///
+/// - The **dense** @ref extract appends each triangle independently through an
+///   atomic bump counter -- it has no block structure to reserve against.
+/// - The **sparse** @ref extract runs one workgroup per active block, which
+///   counts the block's triangles, reserves one span for all of them with a
+///   single atomic, and only then writes. A block's triangles therefore land
+///   **contiguously** in the arena rather than interleaved with every other
+///   block's in flight. That is the precondition for meshing only the blocks a
+///   fuse changed -- with an interleaved arena there is no range to leave in
+///   place -- and it costs ~10% on the dispatch, taken deliberately (see the
+///   2026-08-09 incremental-extraction decision). Contiguity is a property of
+///   this default path only: @ref MarchingCubesConfig::share_vertices selects a
+///   kernel that still appends per triangle. It is not yet published as a
+///   per-block range a caller could index with, so nothing outside the
+///   extractor can depend on it.
+///
 /// Normals come from the SDF gradient -- one
 /// central difference over the cell's eight corners, shared by that cell's
 /// vertices -- so they point outward (increasing distance). Each vertex also

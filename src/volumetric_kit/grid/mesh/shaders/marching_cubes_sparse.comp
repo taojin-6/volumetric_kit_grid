@@ -20,6 +20,13 @@
 // run over this kernel's output IS the identity 0,1,2,...: the host fills it once
 // per grow and MarchingCubes::download regenerates it rather than reading back.
 //
+// Emission is PER BLOCK: the block counts its triangles, reserves one span for
+// all of them with a single global atomicAdd, and only then writes. So a block's
+// triangles are contiguous in the arena instead of interleaved with every other
+// block's, which is what a range can describe and therefore the precondition for
+// meshing only the blocks a fuse changed. See the phase notes further down for
+// what it costs (a second visit, cheaper than the first).
+//
 // It is resolved *here* rather than handed over by the host, which is what the
 // workgroup-per-block shape exists for. The meshing dispatch is quiescent -- no
 // concurrent allocation -- so a probe needs no bucket lock, and 8 probes amortise
@@ -92,8 +99,9 @@ layout(set = 0, binding = 5, scalar) readonly buffer Color { uint color_attr[]; 
 layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
   Vertex vertices[];
 };
-// The draw command's indexCount, which the kernel counts into directly -- see
-// mcEmitCell. The rest of VkDrawIndexedIndirectCommand is host-written once per
+// The draw command's indexCount, which the kernel counts into directly -- one
+// atomicAdd per block, in PHASE TWO below, of the whole block's count. The rest
+// of VkDrawIndexedIndirectCommand is host-written once per
 // extract and untouched here, as is the vertex counter the host keeps at byte 20
 // (only the sharing kernel allocates through it; here the vertex total is
 // exactly three per triangle and the host derives it).
@@ -124,36 +132,101 @@ layout(push_constant, scalar) uniform PushConstants {
   int max_chain;
 } pc;
 
-// mcCornerShift / mcCellNormal / mcEdgeVertex / mcEmitCell + the near-tangent
-// edge guard, over the Tables / Vertices / DrawCommand bindings declared above.
+// mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
+// mcWriteTriangle + the near-tangent edge guard, over the Tables / Vertices /
+// DrawCommand bindings declared above. (mcEmitCell, the per-triangle appender,
+// lives there too but is the DENSE kernel's; this one reserves a span per block
+// and writes through mcWriteTriangle directly.)
 #include "marching_cubes_common.glsl"
 
-// localIndex / mcLocalBase / s_neighbour / mcResolveNeighbourhood / mcGather --
-// everything this kernel and the sharing one do identically.
+// localIndex / mcLocalBase / s_neighbour / mcResolveNeighbourhood /
+// mcCornerStorage / mcGather / mcCellSigns -- everything this kernel and the
+// sharing one do identically.
 #include "marching_cubes_sparse_common.glsl"
 
-// Mesh one cell: gather its eight corners through the neighbourhood, then hand
-// the shared per-cell body its triangles.
-void mcMeshCell(BlockIndex block, int bs, uint local) {
-  ivec3 base = mcLocalBase(local, bs);
-  float sdf[8];
-  vec3 corner_color[8];
-  int cube_index;
-  if (!mcGather(bs, base, sdf, corner_color, cube_index)) {
-    return;  // a corner is unallocated or unintegrated: no surface to close
-  }
-  if (cube_index == 0 || cube_index == 255) {
-    return;  // no sign change -> no surface in this cell
-  }
+// ---------------------------------------------------------------------------
+// Per-block contiguous emission.
+//
+// The block counts its triangles, reserves ONE span for all of them with a
+// single global atomicAdd, and only then writes -- instead of every triangle
+// claiming its own slot. A block's triangles then land CONTIGUOUSLY. Under the
+// per-triangle append they interleaved with every other block in flight, so a
+// block's output was scattered the length of the arena and no range could
+// describe it. Per-block ranges are the precondition for meshing only the blocks
+// a fuse changed: without them there is nothing to leave in place.
+//
+// That is the ONLY thing it buys, and the first draft of this note claimed a
+// second: that the three 64-byte vertex writes of a triangle now coalesce. They
+// do not, because they already did -- the per-triangle append also wrote a
+// triangle's vertices at `tri * 3, +1, +2` and interleaved only whole triangles.
+// The per-VERTEX interleaving a vertex-sharing review measured as costing
+// coalescing is in the sharing kernel, which this does not touch. Nor is the
+// index run monotonic within a block: `s_cursor` still hands out slots in
+// whatever order cells reach it. Measured on room0 at `--voxel 0.012`, Release,
+// interleaved samples: the restructure COSTS ~10% on the extract dispatch
+// (1.17 -> 1.28 ms). It is justified as the precondition and not as a speedup;
+// see the 2026-08-09 incremental-extraction decision in DECISIONS.md, which
+// also records what did and did not move that number.
+//
+// The cost is that a cell is visited twice, and the two visits are deliberately
+// asymmetric so it is far less than twice the work:
+//
+//   PHASE ONE runs over 100% of cells and needs only the cube index, so it
+//   gathers SIGNS ONLY (mcCellSigns) -- no sdf/colour array copy-out, no sRGB
+//   decode -- and caches each cell's triangle count in one byte of a private
+//   register.
+//   PHASE THREE re-gathers in full, but only the ~8% of cells that actually
+//   emit (the emit rate measured flat across a 4x resolution sweep); the other
+//   ~92% are rejected on that byte, without touching memory of any kind.
+// ---------------------------------------------------------------------------
 
-  // World positions anchor on the base block's global voxel with a zero origin
-  // (node convention), so a boundary cell's far corners land at the neighbour's
-  // voxels without a second coord lookup. The shared body computes the gradient
-  // normal, reverses winding, and interpolates colour.
-  ivec3 base_voxel = block.coord * bs + base;
-  vec3 normal = mcCellNormal(sdf);
-  mcEmitCell(cube_index, sdf, corner_color, vec3(0.0), base_voxel, pc.voxel_size,
-             normal, pc.iso, pc.has_color, pc.capacity);
+// Triangles this block's cells produce, the block's first triangle slot, and the
+// cursor handing out slots within the reserved span.
+shared uint s_block_tris;
+shared uint s_block_base;
+shared uint s_cursor;
+
+// Per-cell TRIANGLE COUNT, carried from phase one to phase three so phase three
+// can reject a cell without re-gathering its eight corners -- and, since the
+// count is what the rejection tests, without walking `tri_table` either. Caching
+// the cube index instead would make the rejection an SSBO read on the ~92% of
+// cells that emit nothing, which is the path that has to be cheap.
+//
+// PRIVATE, not `shared`, and that is the whole of it: both phases walk the block
+// with the SAME strided loop from the same `tid`, so the cell at slot k --
+// `tid + k * group_threads` -- is handled by one invocation in both phases. The
+// writer is the only reader, so a `shared` array would buy nothing and cost an
+// atomicOr (four cells to a word, four different threads) plus a zeroing pass
+// before the barrier. A count is 0..5, so four of them pack into one uint that
+// stays in a register, and the cache adds ZERO bytes of `shared`.
+//
+// Zero bytes matters *here* and not in the vertex-sharing kernel, because this
+// is the DEFAULT path: the 2026-08-08 decision split the two precisely so it
+// would not carry sharing's ~8 KiB threadgroup budget, and a two-phase emitter
+// must not reintroduce it by the back door.
+//
+// A block with more cells than the slots reach still meshes correctly: phase
+// three re-gathers the uncached tail (see the loop below), which is slower but
+// not wrong. Every in-tree caller uses block_size 8, where 512 cells over 256
+// threads is two slots and nothing is uncached.
+//
+// Slower, and by enough to matter -- at block_size 16, 3072 of a block's 4096
+// cells fall past the four slots and are gathered in FULL twice, so the ~1.08
+// gathers per cell this design is chosen for becomes ~1.77. Nothing about that
+// is visible from a correct-looking mesh, so the host mirrors this reach
+// (kMaxCachedCells in marching_cubes.cpp) and reports the shortfall as
+// ExtractTimings::uncached_cells_per_block: a limit the caller cannot see is
+// the library's to check, not to document (the 2026-08-04 decision). It is a
+// REPORT and not a refusal, unlike the sharing kernel's kMaxSharedCells --
+// there an oversized block would index past a shared array, here it only costs
+// time.
+const uint kCachedSlots = 4u;  // 8-bit counts to a uint
+
+// Which strided iteration `local` is, i.e. which byte of the cache holds it.
+// Both phases derive it the same way from the same `tid`; `group_threads` is a
+// compile-time constant, so this is a shift.
+uint mcCacheSlot(uint local, uint tid, uint group_threads) {
+  return (local - tid) / group_threads;
 }
 
 void main() {
@@ -180,9 +253,33 @@ void main() {
   }
   BlockIndex block = active_blocks[block_i];
 
+  // Zero the reservation state alongside resolving the neighbourhood -- one
+  // barrier opens both. s_block_base is zeroed here rather than only on the
+  // path that reserves, so it is never read uninitialised. The triangle-count
+  // cache takes no pass of its own: it is a private uint, cleared where it is
+  // declared below, which is a register write and not a threadgroup one.
+  if (tid == 0u) {
+    s_block_tris = 0u;
+    s_block_base = 0u;
+    s_cursor = 0u;
+  }
   mcResolveNeighbourhood(block, tid);
   barrier();
 
+  // PHASE ONE -- count, and cache each cell's TRIANGLE COUNT for phase three.
+  //
+  // Signs only (mcCellSigns): this loop runs over every cell in the block, and
+  // the count needs nothing but the cube index. Gathering in full here -- the
+  // eight sdf values copied out of an `out float[8]`, and up to 24 sRGB decodes
+  // for colours a count cannot use -- would be paid on 100% of cells to be
+  // thrown away on ~92% of them.
+  //
+  // The COUNT is what is cached, not the cube index it came from, and that is
+  // deliberate: the count is what phase three's rejection tests, so caching it
+  // makes that rejection a shared-memory read, where caching the cube index
+  // would make it an SSBO walk of `tri_table` on the ~92% of cells that emit
+  // nothing. It also fits in one byte (0..5) where a cube index needs two.
+  //
   // Stride over the block's voxels rather than assuming one thread each: the
   // workgroup is a fixed 256 while voxels_per_block is block_size^3 from the
   // grid params, so this is correct for any block size instead of only 8 (512,
@@ -199,7 +296,112 @@ void main() {
   // ComputePipeline::create, and every in-tree caller uses block_size 8, where
   // this shape is a win. TODO(mesh): revisit if a consumer ships a smaller
   // block.
+  uint mine = 0u;
+  uint cache = 0u;  // this invocation's first kCachedSlots counts, one per byte
   for (uint local = tid; local < vpb; local += group_threads) {
-    mcMeshCell(block, bs, local);
+    int n = mcCellTriangleCount(mcCellSigns(bs, mcLocalBase(local, bs)));
+    if (n != 0) {
+      uint slot = mcCacheSlot(local, tid, group_threads);
+      if (slot < kCachedSlots) {
+        cache |= uint(n) << (slot * 8u);
+      }
+      mine += uint(n);
+    }
+  }
+  if (mine != 0u) {
+    atomicAdd(s_block_tris, mine);
+  }
+  barrier();
+
+  // PHASE TWO -- one atomic for the whole block.
+  //
+  // `index_count` is bumped by the block's FULL count whatever `capacity` holds,
+  // so it still ends as kIndicesPerTriangle times the field's true triangle
+  // total -- the contract the host refits against. Triangles past the arena are
+  // simply not written, which is a stronger form of the old
+  // count-but-drop: overflow can no longer make the reported total a lower bound
+  // by abandoning a cell early, because the count is taken before any slot is.
+  // TODO(mesh): stage 3 (dirty-only dispatch) needs the block-to-range mapping
+  // this line computes and drops -- `active_blocks[block_i]` owns triangles
+  // [s_block_base, s_block_base + s_block_tris). It is not derivable on the
+  // host, because the atomic hands spans out in workgroup arrival order rather
+  // than block order. Publishing it is a ninth binding, a host allocation and a
+  // DeviceMesh field, which is stage 3's scope and not this one's: stage 2 is
+  // defined as byte-identical geometry with no new invariants (the 2026-08-09
+  // decision), and a range nothing consumes yet would be an unverifiable one.
+  if (tid == 0u && s_block_tris != 0u) {
+    s_block_base =
+        atomicAdd(index_count, s_block_tris * kIndicesPerTriangle) /
+        kIndicesPerTriangle;
+  }
+  barrier();
+
+  // Nothing reserved, or the whole reservation lies past the arena. The second
+  // is newly PROVABLE per block and worth proving: every slot this block hands
+  // out is >= s_block_base, so if that is already past capacity not one
+  // triangle of this block can be written, and the alternative is a full
+  // re-gather per emitting cell to drop each triangle individually at the
+  // bottom of the loop. That is the common case on a first extract and on every
+  // refit, where the arena is planned at ~64 triangles per block against a
+  // field that can emit ~1400. Both tests are uniform across the workgroup and
+  // no barrier follows, so returning here is safe.
+  if (s_block_tris == 0u || s_block_base >= pc.capacity) {
+    return;
+  }
+  uint block_end = s_block_base + s_block_tris;
+
+  // PHASE THREE -- emit into the reserved span.
+  for (uint local = tid; local < vpb; local += group_threads) {
+    // The cheap rejection, and the reason phase one caches at all: a cell with
+    // no triangles is skipped WITHOUT gathering its eight corners, which is
+    // ~92% of them. Cells past the four slots fall through and gather.
+    uint slot = mcCacheSlot(local, tid, group_threads);
+    if (slot < kCachedSlots && ((cache >> (slot * 8u)) & 0xFFu) == 0u) {
+      continue;
+    }
+    ivec3 base = mcLocalBase(local, bs);
+    float sdf[8];
+    vec3 corner_color[8];
+    int cube_index;
+    if (!mcGather(bs, base, sdf, corner_color, cube_index)) {
+      continue;
+    }
+    // Recomputed from the cube index just gathered rather than read back from
+    // the cache, even though phase one put the same number there. The cache is
+    // a REJECTION HINT; this is the count that must match the `tri_table` row
+    // mcWriteTriangle is about to walk, and only a count derived from this
+    // cube_index is guaranteed to. With the all-inside/all-outside case already
+    // rejected on a register, it costs one table read on the ~8% of cells that
+    // reach here.
+    int n = mcCellTriangleCount(cube_index);
+    if (n == 0) {
+      continue;
+    }
+    // Slots within this block's span. The cursor is shared, so the order cells
+    // land in is still unspecified -- but every slot it hands out is inside the
+    // span, because the span was sized from the same counts.
+    //
+    // "The same counts" is a convention between two different gathers --
+    // mcCellSigns in phase one, mcGather here -- and not something the code
+    // enforces, so this bound is what makes a disagreement between them fail
+    // SAFE. Without it a span that overran would write over the next block's
+    // triangles, with a correct-looking indexCount and no error anywhere: the
+    // per-triangle append this replaced could not overrun by construction,
+    // because counting and writing were one act, and that guarantee has to be
+    // paid for somewhere.
+    uint first = s_block_base + atomicAdd(s_cursor, uint(n));
+    if (first + uint(n) > block_end) {
+      continue;
+    }
+    vec3 normal = mcCellNormal(sdf);
+    for (int t = 0; t < n; ++t) {
+      uint tri = first + uint(t);
+      if (tri >= pc.capacity) {
+        break;  // counted in phase one, dropped here -- and `tri` only grows
+      }
+      mcWriteTriangle(cube_index, t, sdf, corner_color, vec3(0.0),
+                      block.coord * bs + base, pc.voxel_size, normal, pc.iso,
+                      pc.has_color, tri);
+    }
   }
 }

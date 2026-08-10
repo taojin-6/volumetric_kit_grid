@@ -11,10 +11,16 @@
 // shares a vertex between the cells that meet on an edge. Sharing needs ~8 KiB
 // of `shared` arrays, and a `shared` array is reserved at pipeline creation
 // whatever a push constant later says -- so folding the two into one kernel
-// made the DEFAULT path pay sharing's threadgroup budget (32 B -> 8224 B, which
+// made the DEFAULT path pay sharing's threadgroup budget (44 B -> 8428 B, which
 // bounds residency to 3 workgroups on Apple's ~32 KiB and to 1 at Vulkan's
 // guaranteed 16 KiB floor) plus its per-corner vertex atomic, for a feature it
 // does not use. MarchingCubes::create builds exactly one of the two.
+//
+// Both figures are SPIR-V-verified and both move as the kernels grow, so treat
+// the gap rather than the endpoints as the decision: 44 B is s_neighbour plus
+// the default kernel's three-word block reservation, and the default kernel
+// keeps its per-cell triangle-count cache in a private register precisely so
+// this side of the gap stays a rounding error.
 //
 // The cost of two kernels is two copies of the code that is genuinely common,
 // which is what this header exists to prevent: the neighbour probe and the
@@ -78,33 +84,53 @@ void mcResolveNeighbourhood(BlockIndex block, uint tid) {
   }
 }
 
-// Gather a cell's eight corners through the shared neighbourhood.
+// Resolve one corner voxel to its slot in the per-voxel attribute arrays.
 //
 // A corner at local coordinate bs on an axis spills into the +neighbour block on
 // that axis: octant selects which of the 2x2x2 neighbourhood holds it, and the
-// residual indexes within it. A corner in an unallocated neighbour (ptr < 0) or
-// an unintegrated voxel (weight below threshold) invalidates the whole cell --
-// no extrapolation.
+// residual indexes within it. False when that neighbour is unallocated (ptr < 0)
+// -- a corner with no block behind it invalidates the whole cell, no
+// extrapolation -- and `si` is then 0 rather than undefined.
 //
-// `base` may be the +1 layer (a component == bs) when a cell reaches for an edge
+// `c` may be the +1 layer (a component == bs) when a cell reaches for an edge
 // whose owner lies outside the block, so corners reach bs + 1. That still lands
 // inside the 2x2x2 neighbourhood -- octant is `c / bs`, which is 1 for anything
 // in [bs, 2*bs), and bs + 1 < 2*bs for every legal block size.
+//
+// THE cross-block addressing, and one copy of it: both gathers below resolve a
+// corner through here, so the sign-only count and the full gather cannot land on
+// different voxels. They must not, because the count reserves the span the
+// gather writes into.
+bool mcCornerStorage(int bs, ivec3 c, out uint si) {
+  si = 0u;
+  ivec3 octant = c / bs;
+  ivec3 lc = c - octant * bs;
+  int nptr = s_neighbour[octant.x + 2 * octant.y + 4 * octant.z];
+  if (nptr < 0) {
+    return false;
+  }
+  si = uint(nptr) + uint(localIndex(lc, bs));
+  return true;
+}
+
+// Gather a cell's eight corners through the shared neighbourhood: sdf values,
+// linear colours, and the cube index. False when a corner is unavailable --
+// its block unallocated, or the voxel unintegrated (weight below threshold).
+//
+// On that failure `cube_index` comes back 0, NOT the partial mask the loop had
+// accumulated over the corners it did reach. That is load-bearing rather than
+// tidy: mcCellTriangleCount reads 0 as "no triangles", so a caller that ignores
+// the bool still cannot count, reserve, or emit for a cell whose corners were
+// never all read.
 bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
               out int cube_index) {
   cube_index = 0;
   for (int i = 0; i < 8; ++i) {
-    ivec3 c = base + mcCornerShift(i);
-    ivec3 octant = c / bs;
-    ivec3 lc = c - octant * bs;
-    int oi = octant.x + 2 * octant.y + 4 * octant.z;
-    int nptr = s_neighbour[oi];
-    if (nptr < 0) {
-      return false;  // neighbour block not allocated
-    }
-    uint si = uint(nptr) + uint(localIndex(lc, bs));
-    if (weight[si] < pc.weight_threshold) {
-      return false;  // unintegrated voxel
+    uint si;
+    if (!mcCornerStorage(bs, base + mcCornerShift(i), si) ||
+        weight[si] < pc.weight_threshold) {
+      cube_index = 0;  // drop the partial mask -- see the note above
+      return false;
     }
     sdf[i] = tsdf[si];
     if (pc.has_color != 0u) {
@@ -124,6 +150,40 @@ bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
     }
   }
   return true;
+}
+
+// The cube index ALONE -- what a caller that only needs a cell's TRIANGLE COUNT
+// has to read. 0 for a cell whose corners are unavailable, exactly as mcGather
+// returns on failure, so an invalid cell and an empty one need no separate
+// encoding.
+//
+// Separate from mcGather rather than a flag on it because what it drops is the
+// expensive part, and the sparse kernel's counting phase runs over 100% of
+// cells: no `out float[8]` / `out vec3[8]` copy-out (GLSL passes arrays by
+// value, so each is a real 128-byte copy at every call), and no colour decode --
+// vrUnpackSrgbToLinear is a transfer curve per corner, up to 24 of them per
+// cell, for values a count cannot use.
+//
+// The sign test below is the one line this shares with mcGather by convention
+// rather than by construction, and the two must agree exactly: the count taken
+// here reserves the span mcGather's caller then writes into. Both read
+// `tsdf[si] < pc.iso` over the same quiescent buffer through the same
+// mcCornerStorage, so they can only diverge if the two lines are edited apart --
+// and the emitter bounds its writes to the reserved span, so even that drops
+// triangles rather than writing over the next block's.
+int mcCellSigns(int bs, ivec3 base) {
+  int cube_index = 0;
+  for (int i = 0; i < 8; ++i) {
+    uint si;
+    if (!mcCornerStorage(bs, base + mcCornerShift(i), si) ||
+        weight[si] < pc.weight_threshold) {
+      return 0;
+    }
+    if (tsdf[si] < pc.iso) {
+      cube_index |= (1 << i);
+    }
+  }
+  return cube_index;
 }
 
 #endif  // VR_MARCHING_CUBES_SPARSE_COMMON_GLSL
