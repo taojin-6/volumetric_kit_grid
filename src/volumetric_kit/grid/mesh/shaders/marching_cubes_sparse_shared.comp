@@ -278,14 +278,27 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
   vec3 normal = vec3(0.0, 0.0, 1.0);
   bool have_corners = false;
 
-  for (int t = 0; tri_table[cube_index * 16 + t] != -1; t += 3) {
+  // TODO(mesh): this kernel still appends PER TRIANGLE through the global
+  // `index_count`, so its output interleaves across blocks and no per-block
+  // range describes it -- the default kernel's per-block reservation is exactly
+  // what incremental extraction is built on, and `share_vertices` is therefore
+  // the one path a dirty-only dispatch cannot use. Restructuring it is a
+  // separate change: sharing claims VERTICES from a second atomic as well, so a
+  // block would have to reserve two spans, and the arena the vertex span comes
+  // from is the one the seam-B ring hands to gfx.
+  //
+  // `e` indexes TABLE ENTRIES, not triangles -- the row is walked three entries
+  // at a time. mcWriteTriangle's `t` counts triangles and multiplies by three
+  // itself, so passing this variable there would read three times too far along
+  // the row and emit plausible, wrong geometry. Named apart for that reason.
+  for (int e = 0; tri_table[cube_index * 16 + e] != -1; e += 3) {
     // Resolve the three corners of this triangle to vertex indices first, then
     // claim the index slots -- so a triangle is counted exactly once whether or
     // not its vertices had to be duplicated.
     int vi[3];
     bool ok = true;
     for (int k = 0; k < 3; ++k) {
-      int edge = tri_table[cube_index * 16 + t + k];
+      int edge = tri_table[cube_index * 16 + e + k];
       ivec4 owner_info = s_edge_owner[edge];
       ivec3 owner = base + owner_info.xyz;
       int axis = owner_info.w;

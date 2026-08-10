@@ -80,6 +80,26 @@ constexpr std::uint32_t kSeedVertsPer1000 = 700;
 // indexing past the shared array.
 constexpr std::uint32_t kMaxSharedCells = 512;
 
+// Mirrors kMaxCachedCells in marching_cubes_sparse.comp: the cells whose
+// triangle count that kernel can cache between its counting and emitting
+// phases.
+//
+// REPORTED rather than refused, which is the whole difference from
+// kMaxSharedCells above. A block with more cells than this still meshes
+// correctly -- the emitting phase gathers the uncached tail in full a second
+// time instead of rejecting it on a shared byte -- so refusing would break a
+// configuration that works. But at block_size 16 that is 87.5% of a block's
+// cells gathered twice, roughly 1.88 gathers per cell against the 1.08 the
+// two-phase split is chosen for, and nothing about a correct mesh says so.
+// Surfaced as ExtractTimings::uncached_cells_per_block, because a limit the
+// caller cannot see is this library's to check rather than to document (the
+// 2026-08-04 decision).
+//
+// Drift here is benign in both directions and cannot corrupt a mesh, unlike the
+// sharing constant: too low over-reports a slow path that is not slow, too high
+// under-reports one that is. Neither changes what the kernel emits.
+constexpr std::uint32_t kMaxCachedCells = 512;
+
 // A corner with weight at or below this is treated as unintegrated, and any
 // cell touching it is skipped. Small and positive so a never-integrated voxel
 // (weight 0) is excluded while any genuine integration counts. The `tsdf` tier
@@ -1548,6 +1568,13 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     timings->active_blocks = num_active;
     timings->triangle_capacity = requested;
     timings->emitted_triangles = emitted;
+    // 0 in every in-tree configuration (block_size 8 -> 512 cells). Nonzero
+    // only for a grid whose block outgrows the kernel's cache, and then it is
+    // the count of cells per block that pay a second full gather.
+    timings->uncached_cells_per_block =
+        config_.share_vertices || vpb <= kMaxCachedCells
+            ? 0u
+            : vpb - kMaxCachedCells;
     timings->vertex_capacity = requested_verts;
     timings->emitted_vertices = device_mesh.vertex_count;
     // What the extractor is holding, not what this call asked for: the arenas

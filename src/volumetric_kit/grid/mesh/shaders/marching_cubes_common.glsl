@@ -52,8 +52,10 @@ void mcEdgeOwner(int edge, out ivec3 delta, out int axis) {
   axis = d.x != 0 ? 0 : (d.y != 0 ? 1 : 2);
 }
 
-// Write one vertex at an already-claimed slot. The appearance fields are the
-// same constants mcEmitCell writes, kept here so the two emitters cannot drift:
+// Write one vertex at an already-claimed slot. The appearance fields are
+// constants, kept in this one body so no emitter can drift from another --
+// mcWriteTriangle reaches them for every private vertex, and the sharing kernel
+// for every shared one:
 // uv0 is the "use vertex colour" sentinel until projective texturing runs, and
 // tangent is the placeholder the renderer's slot needs (meshing has no surface
 // parameterisation to derive a real one from, and a slot left unwritten would
@@ -143,34 +145,26 @@ void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8], vec3 origin,
                           : vec3(1.0);
 }
 
-// Emit the cell's triangles into `vertices[]` / `index_count`. Corner c's world
-// position is `origin + (base_voxel + cornerShift(c)) * voxel_size`, so the
-// caller passes the cell's integer base voxel and both kernels keep their exact
-// original arithmetic (the dense kernel supplies its grid `origin`; the sparse
-// kernel anchors on the base block's global voxel with a zero origin, so a
-// boundary cell's far corners land on the neighbour's voxels without a second
-// coordinate lookup). `sdf` / `corner_color` are the eight gathered corner
-// values; `corner_color` is ignored when has_color == 0 (vertices get opaque
-// white). `corner_color` is in LINEAR working values -- each kernel decodes the
-// canonical 8-bit attribute at the gather -- because the edge interpolation
-// below is an average. Triangles emit with reversed winding (0, 2, 1) so the CCW front face
-// points along the outward gradient `normal` -- the orientation gfx expects;
-// color follows the same reversal so each vertex keeps its own edge's color,
-// and uv0 stays the "use vertex color" sentinel until projective texturing
-// runs. Past `capacity` a triangle is dropped but still counted, so index_count
-// always ends as kIndicesPerTriangle times the field's true TRIANGLE total --
-// counted in indices, because it is the draw command's indexCount. That is the
-// contract the host sizes its arena from when it fits the arena to the surface
-// rather than to the 5-tri/cell worst case, and re-runs after an undersized
-// guess; the host divides by kIndicesPerTriangle to recover the triangle count,
-// and bounds the counter against uint32 in indices for the same reason.
 // How many triangles cell `cube_index` contributes.
 //
 // Separable from the emission because the count is a property of the cube index
 // ALONE -- it needs no interpolation and no world position -- which is what lets
 // the sparse kernel count a whole block, reserve one span for it, and only then
 // write. `tri_table` rows are -1-terminated in groups of three.
+//
+// The all-inside / all-outside reject stays a comparison on two registers, and
+// is not left to the table's own -1. Both are correct today, but only one of
+// them stays correct independently of the SSBO the host uploads: a truncated or
+// edited `McTables` would silently give the sparse path a different answer here
+// while the dense kernel -- which keeps the same guard inline before it ever
+// calls this -- stayed right, and the dense path is the oracle every
+// equivalence test in this tier compares against. It is also the cheap half of
+// the sparse kernel's counting phase, which runs over 100% of cells while ~92%
+// of them are exactly this case.
 int mcCellTriangleCount(int cube_index) {
+  if (cube_index == 0 || cube_index == 255) {
+    return 0;  // no sign change -> no surface in this cell
+  }
   int n = 0;
   while (tri_table[cube_index * 16 + n * 3] != -1) {
     ++n;
@@ -179,7 +173,7 @@ int mcCellTriangleCount(int cube_index) {
 }
 
 // Write the cell's `t`-th triangle (counted in triangles, not table entries)
-// into the already-claimed slot `tri`.
+// into the already-claimed slot `tri`, as three private vertices at `tri * 3`.
 //
 // Split out of mcEmitCell so that a caller reserving a contiguous run up front
 // -- the sparse kernel, which reserves one span per block -- writes through
@@ -188,9 +182,29 @@ int mcCellTriangleCount(int cube_index) {
 // once already, and here a drift would put a shared and a private vertex on
 // different coordinates while every triangle count still matched.
 //
+// THE PRECONDITIONS, stated here because this is now the entry point a third
+// caller would reach for and neither is checkable from inside:
+//
+//   * Corner c's world position is `origin + (base_voxel + cornerShift(c)) *
+//     voxel_size`, so the caller passes the cell's integer base voxel and each
+//     kernel keeps its exact original arithmetic -- the dense kernel supplies
+//     its grid `origin`; the sparse kernel passes a ZERO origin and anchors on
+//     the base block's global voxel, so a boundary cell's far corners land on
+//     the neighbour's voxels without a second coordinate lookup. Mixing the two
+//     -- a nonzero origin with a block-relative base voxel -- compiles and
+//     produces a surface displaced by the origin.
+//   * `corner_color` is in LINEAR working values (each kernel decodes the
+//     canonical 8-bit attribute at the gather, the 2026-08-02 colour decision),
+//     because the edge interpolation below is an average. Passing encoded sRGB
+//     compiles and darkens every interpolated vertex. It is ignored entirely
+//     when has_color == 0, where vertices get opaque white.
+//
+// Neither shows up as a wrong triangle count, which is what the tests key on.
+//
 // Winding is reversed (0, 2, 1) so the CCW front face points along the outward
 // gradient `normal` -- the orientation gfx expects; colour follows the same
-// reversal so each vertex keeps its own edge's colour.
+// reversal so each vertex keeps its own edge's colour, and uv0 stays the "use
+// vertex colour" sentinel until projective texturing runs.
 void mcWriteTriangle(int cube_index, int t, float sdf[8], vec3 corner_color[8],
                      vec3 origin, ivec3 base_voxel, float voxel_size,
                      vec3 normal, float iso, uint has_color, uint tri) {
@@ -212,10 +226,19 @@ void mcWriteTriangle(int cube_index, int t, float sdf[8], vec3 corner_color[8],
 //
 // The sparse kernel deliberately does NOT come through here -- it reserves one
 // span per block and calls mcWriteTriangle directly, so its triangles land
-// contiguously instead of interleaving with every other block's. Both end with
-// `index_count` at kIndicesPerTriangle times the field's true TRIANGLE total,
-// which is the contract the host sizes its arena from and refits against;
-// counted in indices because it is the draw command's indexCount.
+// contiguously instead of interleaving with every other block's.
+//
+// Both uphold ONE contract, by different means: past `capacity` a triangle is
+// dropped but still COUNTED, so `index_count` always ends as
+// kIndicesPerTriangle times the field's true triangle total rather than a lower
+// bound -- counted in indices, because it is the draw command's indexCount.
+// That is what the host sizes its arena from when it fits the arena to the
+// surface instead of the 5-tri/cell worst case, and what it refits against
+// after an undersized guess; it divides by kIndicesPerTriangle to recover the
+// triangle count, and bounds the counter against uint32 in indices for the same
+// reason. Here the count survives a drop because the loop bound is the cell's
+// full triangle count; in the sparse kernel it survives because the whole
+// block's count is taken, and added to `index_count`, before any slot is.
 void mcEmitCell(int cube_index, float sdf[8], vec3 corner_color[8], vec3 origin,
                 ivec3 base_voxel, float voxel_size, vec3 normal, float iso,
                 uint has_color, uint capacity) {
