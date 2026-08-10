@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -331,6 +332,54 @@ int main() {
   const auto nv = static_cast<double>(sphere.vertices.size());
   CHECK(std::fabs(radius_sum / nv - kRadius) < 0.25 * kH);  // no radial bias
   CHECK(outward_sum / nv > 0.9);
+
+  // --- A block's triangles are CONTIGUOUS in the arena -----------------------
+  //
+  // Stage 2's actual deliverable, and nothing else here can see it: the golden
+  // sparse-vs-dense equivalence below compares triangles as a SET, so it passes
+  // identically whether a block's triangles are grouped or scattered the length
+  // of the arena. Under the per-triangle append they interleaved with every
+  // other block in flight, and per-block ranges are the precondition for
+  // meshing only the blocks a fuse changed.
+  //
+  // Asserted as a MAGNITUDE, not a shape. A triangle is attributed to a block
+  // through its centroid, which is exact for every triangle strictly inside its
+  // cell and can misplace one that lies flat on a cell's upper face -- so a
+  // handful of misattributions must not fail the test, while the thing it
+  // exists to catch is off by three orders of magnitude: perfect grouping gives
+  // `distinct - 1` transitions, and full interleaving gives nearly one per
+  // triangle.
+  {
+    const float block_span = static_cast<float>(kBlock) * kH;
+    std::vector<long long> owner;  // owning block per triangle, in arena order
+    owner.reserve(sphere.indices.size() / 3);
+    for (std::size_t t = 0; t + 2 < sphere.indices.size(); t += 3) {
+      vr::Vec3f c(0.0f, 0.0f, 0.0f);
+      for (int k = 0; k < 3; ++k) {
+        c = c + sphere.vertices[sphere.indices[t + k]].position;
+      }
+      c = c / 3.0f;
+      const auto bx = static_cast<long long>(std::floor(c.x / block_span));
+      const auto by = static_cast<long long>(std::floor(c.y / block_span));
+      const auto bz = static_cast<long long>(std::floor(c.z / block_span));
+      owner.push_back((bz * 256 + by) * 256 + bx);
+    }
+    CHECK(!owner.empty());
+
+    std::set<long long> distinct(owner.begin(), owner.end());
+    std::size_t transitions = 0;
+    for (std::size_t i = 1; i < owner.size(); ++i) {
+      if (owner[i] != owner[i - 1]) {
+        ++transitions;
+      }
+    }
+    // The sphere must actually straddle many blocks, or "grouped" is vacuous.
+    CHECK(distinct.size() >= 20);
+    // ... and there must be many more triangles than blocks, or the bound below
+    // is satisfied by arithmetic rather than by grouping.
+    CHECK(owner.size() > 4 * (distinct.size() + 16));
+    CHECK(transitions <= distinct.size() + 16);
+  }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
   // flipped table would drop this well below 1).
