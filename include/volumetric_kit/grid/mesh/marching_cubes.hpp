@@ -409,8 +409,8 @@ struct MarchingCubesConfig {
 // TODO(mesh): an incremental block-mesh pool, re-meshing only the blocks the
 // integrator touched instead of the whole volume each call. Deferred
 // deliberately, not forgotten: profiling put the dispatch itself at ~2 ms, so
-// the pool would optimise what was already fast (CLAUDE.md's ExtractTimings
-// finding).
+// the pool would optimise what was already fast (DECISIONS.md's ExtractTimings
+// finding, under "Measured lessons").
 class VR_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and
