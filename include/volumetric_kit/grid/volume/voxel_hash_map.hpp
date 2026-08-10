@@ -16,8 +16,10 @@
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
+#include "volumetric_kit/recon/core/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
 #include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -156,9 +158,6 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param depth   Row-major depth image in **metres**, `width * height`
   ///                samples (the caller applies any raw sensor depth-scale).
   /// @param camera  Intrinsics, valid-depth range, dimensions, and pose.
-  /// @return The number of block allocations that failed (0 = all succeeded),
-  ///         or a non-OK @ref Status if a buffer or the dispatch fails, or the
-  ///         map is moved-from / @p depth is null.
   /// @param out_failures  Optional: receives the per-reason split. **Consult it
   ///                      before growing the map.** A non-zero count does *not*
   ///                      by itself mean bucket/heap pressure -- this is the
@@ -168,9 +167,26 @@ class VR_VOLUME_API VoxelHashMap {
   ///                      table with ample room. @ref
   ///                      AllocFailures::capacity_limited is the test @ref
   ///                      resize answers.
+  /// @param metrics  Optional @ref StageMetrics collecting an `"allocate"` host
+  ///                  row and, from timestamp spans around the dispatches, its
+  ///                  device half. `nullptr` measures nothing. The retry loop
+  ///                  contributes one span per round and they **accumulate**
+  ///                  under one name, which is the honest total: a contended
+  ///                  frame genuinely dispatches several times, and reporting
+  ///                  only the last would hide exactly the cost that makes
+  ///                  contention worth seeing.
+  ///
+  ///                  Because rows accumulate by name, a caller that *also*
+  ///                  wraps this call in a `StageScope("allocate")` of its own
+  ///                  counts the host span twice. Wrap only what this does not
+  ///                  cover -- a @ref resize between retries, say -- and give
+  ///                  that its own row.
+  /// @return The number of block allocations that failed (0 = all succeeded),
+  ///         or a non-OK @ref Status if a buffer or the dispatch fails, or the
+  ///         map is moved-from / @p depth is null.
   Result<std::uint32_t> allocate_from_depth(
       const float* depth, const DepthCameraParams& camera,
-      AllocFailures* out_failures = nullptr);
+      AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
 
   /// @brief Allocate voxel blocks from a world-space point cloud.
   ///
@@ -218,8 +234,19 @@ class VR_VOLUME_API VoxelHashMap {
                                AllocFailures* out_failures = nullptr);
 
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
+  /// @param metrics  Optional @ref StageMetrics collecting a
+  ///                 `"  ..active set"` @ref StageMetrics::kBreakdownPrefix row
+  ///                 -- host and device. A *breakdown* row rather than a stage
+  ///                 of its own because the caller that wants it is a fusion
+  ///                 tier calling this inside its own stage: `tsdf`'s
+  ///                 `"integrate"` host row wraps this dispatch, so without a
+  ///                 sub-row that device time is invisible and the gap between
+  ///                 `integrate`'s two halves reads as submit overhead when it
+  ///                 is a second kernel. Breakdown rows are skipped by
+  ///                 @ref StageMetrics::total_cpu_ms, so nothing double-counts.
   /// @return The active blocks (order unspecified), or a non-OK @ref Status.
-  Result<std::vector<BlockIndex>> compact_active_blocks();
+  Result<std::vector<BlockIndex>> compact_active_blocks(
+      StageMetrics* metrics = nullptr);
 
   /// @brief Compact only the active blocks intersecting @p planes -- the
   ///        per-frame streamed working set for a camera view.
@@ -379,8 +406,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// over every hash slot, then read back the appended @ref BlockIndex list.
   /// Used by @ref compact_active_blocks (plain) and
   /// @ref compact_active_blocks_in_frustum (whose set also carries the planes).
-  Result<std::vector<BlockIndex>> collect_compacted(
-      const ComputeKernel& kernel);
+  /// @p stage, when non-null, collects the dispatch's device span.
+  Result<std::vector<BlockIndex>> collect_compacted(const ComputeKernel& kernel,
+                                                    GpuStageScope* stage);
 
   /// Dispatch @p kernel (push arg = @p arg) over @p groups groups,
   /// re-dispatching while the shared `fail_counts_[kFailTotal]` tally keeps
@@ -389,10 +417,15 @@ class VR_VOLUME_API VoxelHashMap {
   /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
   /// added to the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
+  /// @p stage, when non-null, collects one span per round; they accumulate
+  /// under its one label, which is the honest total for a frame that genuinely
+  /// dispatched several times. A round that fails leaves the rounds before it
+  /// recorded, and the scope publishes them on the way out -- they ran.
   Result<std::uint32_t> dispatch_with_retry(const ComputeKernel& kernel,
                                             std::uint32_t arg,
                                             std::uint32_t groups,
-                                            AllocFailures* out_failures);
+                                            AllocFailures* out_failures,
+                                            GpuStageScope* stage = nullptr);
 
   /// Create a transient host-visible buffer holding @p bytes of @p data and
   /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
@@ -456,6 +489,9 @@ class VR_VOLUME_API VoxelHashMap {
   // order is not yet load-bearing), but this keeps the safe ordering if that
   // ever changes.
   DescriptorPool pool_;
+  // Device spans for this tier's dispatches; idle -- no query written -- until
+  // a caller passes a StageMetrics.
+  GpuTimer gpu_timer_;
   // One ComputeKernel per shader -- its descriptor-set layout, pipeline, and
   // the set allocated from the shared pool_ (see @ref ComputeKernel). The
   // KernelSetBuilder in create() builds all seven and sizes pool_ to them.

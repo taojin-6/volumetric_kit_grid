@@ -307,6 +307,15 @@ Mesh collect_mesh(const Buffer& vertices, const Buffer& indirect,
 // Stopwatch for the opt-in ExtractTimings. Reading the clock is cheap, but it
 // is skipped entirely when the caller wants no measurement, so the untimed path
 // costs one branch per phase.
+//
+// TODO(mesh): give these phases a device half, but NOT one timed submit each.
+// A timed submit costs ~0.13 ms more than an untimed one on MoltenVK (the first
+// vkCmdWriteTimestamp in a command buffer -- measured, see the 2026-08-09
+// timings decision), and four of six phases here run at or under that, so
+// per-phase timing would report the profiler rather than the extract. Bracket
+// several dispatches inside one timed submit with GpuTimer::begin/end and a
+// single resolve() after it, which is the shape Device::submit_single_time's
+// doc points at.
 class PhaseClock {
  public:
   explicit PhaseClock(bool enabled) : enabled_(enabled) { restart(); }
