@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/buffer.hpp"
@@ -525,15 +526,14 @@ class VR_MESH_API MarchingCubes {
   /// -- and meaningful only for the blocks in the active set of the extract
   /// that wrote it. A slot means nothing against a different grid, and nothing
   /// after a `remove()` or `clear()`: the block heap is LIFO, so a reused slot
-  /// names a different block. Anchoring a span table across extracts is
-  /// therefore the caller's job until this tier does it, and a slot the last
-  /// extract did not mesh reads as an empty span rather than as geometry.
+  /// names a different block. @ref block_span_valid is what answers that per
+  /// slot, and it is the answer to trust -- a slot the last extract did not
+  /// mesh reads as an empty span here, which is indistinguishable from a block
+  /// that meshed and emitted nothing.
   ///
-  /// A block that meshed and emitted nothing also records an empty span. That
-  /// is a different statement from never having been meshed, and this accessor
-  /// deliberately does not distinguish them -- the caller knows its own active
-  /// set, and a stamp that did distinguish them would be state nothing yet
-  /// reads.
+  /// That distinction is exactly what the per-slot stamp behind
+  /// @ref block_span_valid carries, so ask it rather than inferring from an
+  /// empty span.
   ///
   /// @warning **Borrowed, and invalidated by the next @ref extract or
   ///          @ref extract_device on this object** -- exactly like a
@@ -575,6 +575,36 @@ class VR_MESH_API MarchingCubes {
   std::uint64_t block_spans_generation() const noexcept {
     return block_spans_generation_;
   }
+
+  /// @brief Does slot @p slot carry a span this extractor actually wrote?
+  ///
+  /// False for a slot no extract has meshed since the table was anchored, and
+  /// false for **every** slot once the anchor breaks -- a different grid, or a
+  /// `remove()` / `clear()` that moved @ref
+  /// volume::VoxelBlockGrid::topology_epoch. The heap is LIFO, so a reused slot
+  /// names a different block and its span would otherwise be read as that
+  /// block's geometry, under `Status::ok`.
+  ///
+  /// A `resize()` does **not** break it: resizing preserves block indices, so
+  /// the spans stay true and the table simply grows.
+  ///
+  /// Takes the grid rather than trusting the caller to re-extract after a
+  /// topology change: between a `remove()` and the next extract the stamps are
+  /// still set, so a query that did not re-check the anchor would report a
+  /// stale span as live. That is a staleness the caller cannot see, which makes
+  /// it this tier's to check (the 2026-08-04 rule).
+  ///
+  /// This is the per-*slot* half of the question; @ref block_spans_generation
+  /// is the per-*table* half, and this answers false whenever that one is 0 --
+  /// so it can never report a slot live while @ref block_spans returns
+  /// `nullptr`. Always false when
+  /// @ref MarchingCubesConfig::track_block_spans is off, since then there is no
+  /// table to be valid.
+  ///
+  /// @param grid The grid the spans are expected to describe.
+  /// @param slot `volume::BlockIndex::ptr / voxels_per_block`.
+  bool block_span_valid(const volume::VoxelBlockGrid& grid,
+                        std::uint32_t slot) const noexcept;
 
   /// @brief Report that every mesh up to and including @p generation has been
   ///        read, so its slot may be written again.
@@ -810,6 +840,31 @@ class VR_MESH_API MarchingCubes {
   // DeviceMesh::generation, which is the point: it is what makes the one table
   // safe to read beside a ring of arenas.
   std::uint64_t block_spans_generation_ = 0;
+  // What `block_spans_` is anchored to. A slot only names a block against a
+  // particular grid and topology epoch, so both are recorded and both are
+  // checked -- the same shape the tsdf tier uses for its dirty flags, and for
+  // the same reason: the block heap is LIFO, so after a remove() a reused slot
+  // names a DIFFERENT block and every span keyed by it is a lie that still
+  // typechecks.
+  //
+  // Where block_spans_generation_ retires the WHOLE table when it stops
+  // describing the mesh this object handed out, these retire individual slots
+  // that no longer name the block their span was written for. Both are needed:
+  // the first is about which extract the table belongs to, the second about
+  // which block a slot means.
+  const volume::VoxelBlockGrid* span_grid_ = nullptr;
+  std::uint64_t span_epoch_ = 0;
+  // Which extract last wrote each slot's span, against `span_serial_`. Zero is
+  // "never written since the anchor", which is what a newly allocated block
+  // reads -- distinct from a block that meshed and emitted nothing, whose span
+  // is empty but stamped.
+  //
+  // Empty unless config_.track_block_spans is on: this is num_blocks * 8 bytes
+  // of HOST memory (12 MB at VoxelGridParams::defaults), so it falls under the
+  // same "nothing measured for a caller who did not ask" rule as the table it
+  // describes.
+  std::vector<std::uint64_t> span_stamp_;
+  std::uint64_t span_serial_ = 0;
 
   // The vertex arena + the draw command the kernels append through, kept ACROSS
   // extract calls and grown only when a call needs more than the last one.
@@ -1033,16 +1088,21 @@ class VR_MESH_API MarchingCubes {
   Status ensure_output_buffers(std::uint32_t triangle_capacity,
                                std::uint32_t vertex_capacity);
 
-  // Grow the span table to @p num_blocks entries, carrying the existing spans
-  // forward and zeroing only the new tail. A no-op unless
-  // config_.track_block_spans is on, and never shrinks: num_blocks only rises,
-  // because a VoxelHashMap::resize preserves block indices.
+  // Re-anchor the span table on @p grid and grow it to that grid's num_blocks,
+  // carrying the existing spans forward and zeroing only the new tail. A no-op
+  // unless config_.track_block_spans is on, and never shrinks: num_blocks only
+  // rises, because a VoxelHashMap::resize preserves block indices.
+  //
+  // Takes the grid rather than a block count because the anchor and the size
+  // both come from it, and they have to move together: a table grown for one
+  // grid while still stamped for another would report another grid's slots as
+  // live.
   //
   // Separate from ensure_output_buffers because the two are sized by different
   // things -- that one by the surface this call measured, this one by the grid
   // it is meshing -- but called beside it, so both allocations land in the same
   // ExtractTimings row.
-  Status ensure_block_spans(std::uint32_t num_blocks);
+  Status ensure_block_spans(const volume::VoxelBlockGrid& grid);
 
   // Vertices to budget for a dispatch planned at @p triangle_capacity
   // triangles: the last extract's measured density, seeded when there is none.

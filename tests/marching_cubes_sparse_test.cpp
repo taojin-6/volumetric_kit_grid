@@ -611,6 +611,26 @@ int main() {
     CHECK(extractor.block_span_capacity() >=
           static_cast<std::uint32_t>(active.value().size()));
 
+    // The anchor. A span is keyed by block SLOT, which names a block only
+    // against a particular grid and topology epoch -- the heap is LIFO, so
+    // after a remove() a reused slot names a DIFFERENT block and its span would
+    // read as that block's geometry under Status::ok.
+    const auto vpb = static_cast<std::uint32_t>(kBlock * kBlock * kBlock);
+    const std::uint32_t some_slot =
+        static_cast<std::uint32_t>(active.value().front().ptr) / vpb;
+    CHECK(extractor.block_span_valid(grid, some_slot));
+    // EXACTLY the active blocks are valid -- no slot the extract never meshed
+    // reports a span, and none it did meshed is missing one. (Which slots those
+    // are is not guessable: the block heap is LIFO, so `ptr` is handed out from
+    // the top and the last slot is an allocated block, not a free one.)
+    std::size_t valid = 0;
+    for (std::uint32_t i = 0; i < extractor.block_span_capacity(); ++i) {
+      if (extractor.block_span_valid(grid, i)) {
+        ++valid;
+      }
+    }
+    CHECK(valid == active.value().size());
+
     // A SECOND extract republishes it. Everything above ran against an
     // extractor's first and only extract, which is the one call where a table
     // that is never cleared and a table that is correctly rewritten look
@@ -634,6 +654,11 @@ int main() {
     CHECK(extractor.extract(tiny.data(), tiny.size(), tiny_grid, 0.0f).ok());
     CHECK(extractor.block_spans() == nullptr);
     CHECK(extractor.block_spans_generation() == 0);
+    // The two halves of the question agree: retiring the table has to retire
+    // every slot with it, or a caller gets a slot reported live beside a null
+    // pointer. The per-slot stamps are untouched here -- it is the whole-table
+    // test that closes this.
+    CHECK(!extractor.block_span_valid(grid, some_slot));
 
     // ... and the next sparse extract brings it back, so retiring the table is
     // not a one-way door.
@@ -641,6 +666,7 @@ int main() {
     CHECK(revived.ok());
     CHECK(
         spans_describe(extractor, revived.value(), active.value(), kBlock, kH));
+    CHECK(extractor.block_span_valid(grid, some_slot));
   }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
@@ -1546,6 +1572,59 @@ int main() {
   vr::Result<mesh::Mesh> reextract = moved.extract(grid, 0.0f);
   CHECK(reextract.ok());
   CHECK(!std::move(reextract).value().empty());
+
+  // --- The span anchor breaks on a topology change ---------------------------
+  //
+  // LAST, because it mutates the shared grid: remove() takes a block out of the
+  // active set, so every extract after it meshes a different surface. Placed
+  // earlier, this failed the sharing path's triangle-count equivalence -- but
+  // only SOMETIMES, because the victim is whichever block compaction happened
+  // to put last and removing one that carries no surface changes nothing. A
+  // test that fails on some runs is worse than one that fails on all of them.
+  //
+  // Checked against the GRID rather than against the last extract: between a
+  // remove() and the next extract the stamps are still set, so a query trusting
+  // them alone would call a stale span live.
+  //
+  // Through the GRID's remove, not the map's -- VoxelHashMap::remove reached
+  // via map() frees the index WITHOUT bumping topology_epoch, as its header
+  // says, and would defeat this anchor in silence. That is the trap, and why
+  // the grid wraps it.
+  {
+    // Its OWN grid and extractor. Everything above has been moved from, had
+    // blocks removed, or been pointed at another grid by now -- and a span
+    // table describing the last grid it saw is the anchor working, not a
+    // wrinkle to route around.
+    vr::Result<vol::VoxelBlockGrid> anchor_grid_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
+                                    attrs, 2);
+    CHECK(anchor_grid_result.ok());
+    vol::VoxelBlockGrid anchor_grid = std::move(anchor_grid_result).value();
+    CHECK(fill_sphere_grid(anchor_grid, /*with_color=*/false));
+
+    mesh::MarchingCubesConfig anchor_config;
+    anchor_config.track_block_spans = true;
+    vr::Result<mesh::MarchingCubes> anchor_mc_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                    anchor_config);
+    CHECK(anchor_mc_result.ok());
+    mesh::MarchingCubes anchor_mc = std::move(anchor_mc_result).value();
+    CHECK(anchor_mc.extract(anchor_grid, 0.0f).ok());
+
+    vr::Result<std::vector<vol::BlockIndex>> live =
+        anchor_grid.map().compact_active_blocks();
+    CHECK(live.ok());
+    CHECK(!live.value().empty());
+    const auto vpb = static_cast<std::uint32_t>(kBlock * kBlock * kBlock);
+    const std::uint32_t slot =
+        static_cast<std::uint32_t>(live.value().front().ptr) / vpb;
+    CHECK(anchor_mc.block_span_valid(anchor_grid, slot));
+
+    vol::BlockIndex victim = live.value().back();
+    vr::Result<std::uint32_t> removed = anchor_grid.remove(&victim, 1);
+    CHECK(removed.ok());
+    CHECK(!anchor_mc.block_span_valid(anchor_grid, slot));
+  }
 
   std::printf(
       "recon mesh sparse marching-cubes test passed: meshed a sphere across "

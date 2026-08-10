@@ -492,6 +492,18 @@ void MarchingCubes::free_slot_of(std::uint64_t generation) noexcept {
   }
 }
 
+bool MarchingCubes::block_span_valid(const volume::VoxelBlockGrid& grid,
+                                     std::uint32_t slot) const noexcept {
+  // The whole-table test first, so this can never disagree with block_spans():
+  // an extract that published nothing -- a failure, an empty active set, or a
+  // dense call -- retires the table while leaving the previous extract's stamps
+  // standing, and a slot reported live beside a null pointer is a contradiction
+  // a caller would resolve the wrong way.
+  return block_spans_generation_ != 0 && span_grid_ == &grid &&
+         span_epoch_ == grid.topology_epoch() && slot < span_stamp_.size() &&
+         span_stamp_[slot] != 0;
+}
+
 const BlockSpan* MarchingCubes::block_spans() const noexcept {
   // Host-visible and mapped, so this is the buffer itself rather than a copy.
   // It is therefore BORROWED: a grow move-assigns block_spans_, whose
@@ -611,8 +623,29 @@ std::uint32_t MarchingCubes::plan_vertex_capacity(
                max_vertices_for(max_storage_buffer_range_)));
 }
 
-Status MarchingCubes::ensure_block_spans(std::uint32_t num_blocks) {
-  if (!config_.track_block_spans || num_blocks <= block_span_capacity()) {
+Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
+  if (!config_.track_block_spans) return {};
+
+  // Re-anchor before anything reads a span. A different grid, or a topology
+  // epoch that moved, means every slot may now name a different block -- so the
+  // stamps go, not just the ones for blocks that were removed. Cheap enough to
+  // do unconditionally: it is a compare, and the clear only runs when it fails.
+  //
+  // A resize() does NOT land here: it preserves block indices and deliberately
+  // does not move topology_epoch, which is the same property that lets the
+  // buffer below carry its old spans forward.
+  if (span_grid_ != &grid || span_epoch_ != grid.topology_epoch()) {
+    std::fill(span_stamp_.begin(), span_stamp_.end(), std::uint64_t{0});
+    span_grid_ = &grid;
+    span_epoch_ = grid.topology_epoch();
+  }
+  ++span_serial_;
+
+  const auto num_blocks = static_cast<std::uint32_t>(grid.grid().num_blocks);
+  if (num_blocks <= block_span_capacity()) {
+    // Still grown to match: a first extract on a grid the table already covers
+    // allocates nothing but must still have a stamp per slot.
+    span_stamp_.resize(block_span_capacity(), 0);
     return {};
   }
   const VkDeviceSize bytes =
@@ -643,6 +676,10 @@ Status MarchingCubes::ensure_block_spans(std::uint32_t num_blocks) {
   }
   std::memset(dst + old_bytes, 0, static_cast<std::size_t>(bytes) - old_bytes);
   block_spans_ = std::move(grown);
+  // Grown to match, and grown with ZEROES: a slot the table did not previously
+  // cover has been meshed by no extract, which is exactly what stamp 0 says --
+  // the host-side counterpart of the zeroed byte tail above.
+  span_stamp_.resize(block_span_capacity(), 0);
   return {};
 }
 
@@ -1430,7 +1467,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // bindings" while arena_alloc_ms read clean -- and this is a tier whose
   // optimisation decisions are made off these rows (see DECISIONS.md, "Measured
   // lessons"). It is an allocation, so it is timed as one.
-  VR_TRY(ensure_block_spans(static_cast<std::uint32_t>(gp.num_blocks)));
+  VR_TRY(ensure_block_spans(grid));
   VR_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity)));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
@@ -1669,6 +1706,20 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // is what lets a consumer holding one ask whether the single table still
   // describes it -- the arenas are a ring and this is not.
   if (config_.track_block_spans) block_spans_generation_ = generation_;
+
+  // ... and the same reasoning stamps the spans: every block this dispatch
+  // meshed now carries one, and none of them is stamped until the dispatch that
+  // wrote them is known to have succeeded. Stamped from the active set rather
+  // than read back from the device, because the host chose that set -- the
+  // device only says where each block's geometry went, not which blocks it was
+  // asked about.
+  for (const volume::BlockIndex& b : active) {
+    const auto slot =
+        static_cast<std::uint32_t>(b.ptr) / static_cast<std::uint32_t>(vpb);
+    if (slot < span_stamp_.size()) {
+      span_stamp_[slot] = span_serial_;
+    }
+  }
 
   DeviceMesh device_mesh;
   device_mesh.vertices = arena().handle();
