@@ -473,17 +473,24 @@ Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
   return active;
 }
 
+// "active set" rather than "compact": rows merge by content, and the mesh tier
+// already publishes a "  ..compact" breakdown for the same call inside its own
+// extract. Two stages' compactions summed under one row is the collision
+// kBreakdownPrefix exists to avoid, not to cause.
+//
+// Which of the two names applies is the caller's nesting, not this call's:
+// under a fusion tier's open stage the host span is already counted by that
+// stage's row, so the sub-row must carry the prefix to stay out of
+// total_cpu_ms; at top level the same row would then be counted by no total at
+// all, so it is named as the stage it is.
+const char* VoxelHashMap::active_set_row(const StageMetrics* metrics) noexcept {
+  return metrics != nullptr && metrics->in_stage() ? "  ..active set"
+                                                   : "active set";
+}
+
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
     StageMetrics* metrics) {
-  // A breakdown row: the caller that asks for it is a fusion tier whose own
-  // stage row already wraps this call, and kBreakdownPrefix is what keeps the
-  // sub-row out of that tier's total while still showing where the device time
-  // went.
-  // "active set" rather than "compact": rows merge by content, and the mesh
-  // tier already publishes a "  ..compact" breakdown for the same call inside
-  // its own extract. Two stages' compactions summed under one row is the
-  // collision kBreakdownPrefix exists to avoid, not to cause.
-  GpuStageScope stage(metrics, gpu_timer_, "  ..active set");
+  GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
   if (!valid()) {
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
@@ -492,7 +499,8 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
-    const FrustumPlanes& planes) {
+    const FrustumPlanes& planes, StageMetrics* metrics) {
+  GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
   if (!valid()) {
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks_in_frustum: moved-from map");
@@ -500,14 +508,16 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
   // The six planes are per-call; rewrite them into the persistent buffer bound
   // once at binding 3 of the frustum set (like camera_params_).
   std::memcpy(frustum_planes_.mapped(), planes.data(), sizeof(FrustumPlanes));
-  return collect_compacted(compact_frustum_, nullptr);
+  return collect_compacted(compact_frustum_, &stage);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
-    const DepthCameraParams& camera) {
-  return compact_active_blocks_in_frustum(make_frustum_planes(
-      camera.fx, camera.fy, camera.cx, camera.cy, camera.width, camera.height,
-      camera.min_depth, camera.max_depth, camera.cam_to_world));
+    const DepthCameraParams& camera, StageMetrics* metrics) {
+  return compact_active_blocks_in_frustum(
+      make_frustum_planes(camera.fx, camera.fy, camera.cx, camera.cy,
+                          camera.width, camera.height, camera.min_depth,
+                          camera.max_depth, camera.cam_to_world),
+      metrics);
 }
 
 Status VoxelHashMap::clear() {
