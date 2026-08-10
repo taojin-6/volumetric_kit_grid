@@ -142,11 +142,10 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   map.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
-  // The device-span collector. Created here rather than lazily: a query pool of
-  // a few timestamps costs nothing, and a diagnostic that can fail on first use
-  // is worse than one that costs a handful of bytes. VR_ASSIGN, not a discarded
-  // Result -- a default-constructed timer is silently unavailable, so dropping
-  // the failure would make every device row vanish with nothing to say why.
+  // The device-span collector, created once rather than per call: a query pool
+  // of a few timestamps costs nothing and a diagnostic that can fail on first
+  // use is worse. A pool that will not allocate degrades to unavailable inside
+  // create() rather than failing here -- see GpuTimer.
   VR_ASSIGN(map.gpu_timer_, GpuTimer::create(device));
   map.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
 
@@ -310,7 +309,7 @@ void VoxelHashMap::rebuild_heap_excluding(
 // and the caller sees a non-zero count exactly when something did not complete.
 Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     const ComputeKernel& kernel, std::uint32_t arg, std::uint32_t groups,
-    AllocFailures* out_failures, GpuTimer* timer, const char* label) {
+    AllocFailures* out_failures, GpuStageScope* stage) {
   const PushConstants push{grid_, arg};
   constexpr int kMaxRounds = 10;
   constexpr int kStallLimit = 2;  // consecutive no-progress rounds -> give up
@@ -321,7 +320,7 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
   for (int round = 0; round < kMaxRounds; ++round) {
     std::memset(fail_counts_.mapped(), 0, kFailSlots * sizeof(std::uint32_t));
     VR_TRY(dispatch(*device_, kernel, &push, sizeof(push), groups,
-                    max_workgroup_count_x_, timer, label));
+                    max_workgroup_count_x_, stage));
     std::uint32_t slots[kFailSlots] = {};
     std::memcpy(slots, fail_counts_.mapped(), sizeof(slots));
     failures = slots[kFailTotal];
@@ -398,8 +397,9 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const float* depth, const DepthCameraParams& camera,
     AllocFailures* out_failures, StageMetrics* metrics) {
   // Before the validity check, so a refused call still costs its row -- a stage
-  // silent on failure reads as one that did not run. Inert when null.
-  StageScope host_span(metrics, "allocate");
+  // silent on failure reads as one that did not run. Inert when null, and it
+  // publishes both halves on every return below, including the failing ones.
+  GpuStageScope stage(metrics, gpu_timer_, "allocate");
   if (!valid()) {
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: moved-from map");
@@ -434,16 +434,8 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
             upload_to_binding(depth_.set, 4, depth, depth_bytes));
   std::memcpy(camera_params_.mapped(), &camera, sizeof(DepthCameraParams));
 
-  VR_ASSIGN(const std::uint32_t failed,
-            dispatch_with_retry(
-                depth_, pixels, group_count(pixels), out_failures,
-                metrics != nullptr ? &gpu_timer_ : nullptr, "allocate"));
-  // Publishing ends the window, so the rounds this call dispatched cannot be
-  // re-emitted into a later frame's metrics -- see GpuTimer::report_into.
-  if (metrics != nullptr) {
-    gpu_timer_.report_into(*metrics);
-  }
-  return failed;
+  return dispatch_with_retry(depth_, pixels, group_count(pixels), out_failures,
+                             &stage);
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_points(
@@ -460,7 +452,7 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
-    const ComputeKernel& kernel) {
+    const ComputeKernel& kernel, GpuStageScope* stage) {
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
@@ -468,7 +460,7 @@ Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
 
   const PushConstants push{grid_, capacity};
   VR_TRY(dispatch(*device_, kernel, &push, sizeof(push),
-                  group_count(total_entries()), max_workgroup_count_x_));
+                  group_count(total_entries()), max_workgroup_count_x_, stage));
 
   std::uint32_t count = 0;
   std::memcpy(&count, active_count_.mapped(), sizeof(std::uint32_t));
@@ -481,12 +473,22 @@ Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
   return active;
 }
 
-Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks() {
+Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
+    StageMetrics* metrics) {
+  // A breakdown row: the caller that asks for it is a fusion tier whose own
+  // stage row already wraps this call, and kBreakdownPrefix is what keeps the
+  // sub-row out of that tier's total while still showing where the device time
+  // went.
+  // "active set" rather than "compact": rows merge by content, and the mesh
+  // tier already publishes a "  ..compact" breakdown for the same call inside
+  // its own extract. Two stages' compactions summed under one row is the
+  // collision kBreakdownPrefix exists to avoid, not to cause.
+  GpuStageScope stage(metrics, gpu_timer_, "  ..active set");
   if (!valid()) {
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
-  return collect_compacted(compact_);
+  return collect_compacted(compact_, &stage);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
@@ -498,7 +500,7 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
   // The six planes are per-call; rewrite them into the persistent buffer bound
   // once at binding 3 of the frustum set (like camera_params_).
   std::memcpy(frustum_planes_.mapped(), planes.data(), sizeof(FrustumPlanes));
-  return collect_compacted(compact_frustum_);
+  return collect_compacted(compact_frustum_, nullptr);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
