@@ -291,7 +291,12 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
   // at a time. mcWriteTriangle's `t` counts triangles and multiplies by three
   // itself, so passing this variable there would read three times too far along
   // the row and emit plausible, wrong geometry. Named apart for that reason.
-  for (int e = 0; tri_table[cube_index * 16 + e] != -1; e += 3) {
+  // Bounded by the row as well as its -1, for the reason kMaxTrianglesPerCell
+  // is declared: the terminator is host-uploaded data, and this kernel has no
+  // per-block span to fail safe against.
+  for (int e = 0; e < kMaxTrianglesPerCell * 3 &&
+                  tri_table[cube_index * 16 + e] != -1;
+       e += 3) {
     // Resolve the three corners of this triangle to vertex indices first, then
     // claim the index slots -- so a triangle is counted exactly once whether or
     // not its vertices had to be duplicated.

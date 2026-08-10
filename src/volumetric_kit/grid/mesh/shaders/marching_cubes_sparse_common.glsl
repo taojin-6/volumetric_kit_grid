@@ -11,10 +11,16 @@
 // shares a vertex between the cells that meet on an edge. Sharing needs ~8 KiB
 // of `shared` arrays, and a `shared` array is reserved at pipeline creation
 // whatever a push constant later says -- so folding the two into one kernel
-// made the DEFAULT path pay sharing's threadgroup budget (32 B -> 8224 B, which
+// made the DEFAULT path pay sharing's threadgroup budget (44 B -> 8428 B, which
 // bounds residency to 3 workgroups on Apple's ~32 KiB and to 1 at Vulkan's
 // guaranteed 16 KiB floor) plus its per-corner vertex atomic, for a feature it
 // does not use. MarchingCubes::create builds exactly one of the two.
+//
+// Both figures are SPIR-V-verified and both move as the kernels grow, so treat
+// the gap rather than the endpoints as the decision: 44 B is s_neighbour plus
+// the default kernel's three-word block reservation, and the default kernel
+// keeps its per-cell triangle-count cache in a private register precisely so
+// this side of the gap stays a rounding error.
 //
 // The cost of two kernels is two copies of the code that is genuinely common,
 // which is what this header exists to prevent: the neighbour probe and the

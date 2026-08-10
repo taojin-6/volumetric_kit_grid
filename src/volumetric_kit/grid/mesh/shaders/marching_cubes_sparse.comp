@@ -162,19 +162,22 @@ layout(push_constant, scalar) uniform PushConstants {
 // The per-VERTEX interleaving a vertex-sharing review measured as costing
 // coalescing is in the sharing kernel, which this does not touch. Nor is the
 // index run monotonic within a block: `s_cursor` still hands out slots in
-// whatever order cells reach it. Measured, the restructure COSTS ~13% on the
-// extract dispatch. It is justified as the precondition and not as a speedup;
-// see the 2026-08-09 incremental-extraction decision in DECISIONS.md.
+// whatever order cells reach it. Measured on room0 at `--voxel 0.012`, Release,
+// interleaved samples: the restructure COSTS ~10% on the extract dispatch
+// (1.17 -> 1.28 ms). It is justified as the precondition and not as a speedup;
+// see the 2026-08-09 incremental-extraction decision in DECISIONS.md, which
+// also records what did and did not move that number.
 //
 // The cost is that a cell is visited twice, and the two visits are deliberately
 // asymmetric so it is far less than twice the work:
 //
 //   PHASE ONE runs over 100% of cells and needs only the cube index, so it
 //   gathers SIGNS ONLY (mcCellSigns) -- no sdf/colour array copy-out, no sRGB
-//   decode -- and caches each cell's triangle count in one byte.
+//   decode -- and caches each cell's triangle count in one byte of a private
+//   register.
 //   PHASE THREE re-gathers in full, but only the ~8% of cells that actually
 //   emit (the emit rate measured flat across a 4x resolution sweep); the other
-//   ~92% are rejected on a shared-memory byte.
+//   ~92% are rejected on that byte, without touching memory of any kind.
 // ---------------------------------------------------------------------------
 
 // Triangles this block's cells produce, the block's first triangle slot, and the
@@ -183,51 +186,47 @@ shared uint s_block_tris;
 shared uint s_block_base;
 shared uint s_cursor;
 
-// Per-cell TRIANGLE COUNT, cached between the two phases so phase three can
-// reject a cell without re-gathering its eight corners -- and, since the count
-// is what the rejection tests, without walking `tri_table` either. Caching the
-// cube index instead would make the rejection an SSBO read on the ~92% of cells
-// that emit nothing, which is the path that has to be cheap.
+// Per-cell TRIANGLE COUNT, carried from phase one to phase three so phase three
+// can reject a cell without re-gathering its eight corners -- and, since the
+// count is what the rejection tests, without walking `tri_table` either. Caching
+// the cube index instead would make the rejection an SSBO read on the ~92% of
+// cells that emit nothing, which is the path that has to be cheap.
 //
-// A count is 0..5, so it is one byte, packed four to a uint: 512 B for the
-// default block_size 8, against the ~8 KiB of `shared` the vertex-sharing kernel
-// needs. Keeping it small matters *here* and not there, because this is the
-// DEFAULT kernel -- the 2026-08-08 decision split the two precisely so the
-// default path would not carry sharing's threadgroup budget, and a two-phase
-// emitter must not reintroduce it by the back door.
+// PRIVATE, not `shared`, and that is the whole of it: both phases walk the block
+// with the SAME strided loop from the same `tid`, so the cell at slot k --
+// `tid + k * group_threads` -- is handled by one invocation in both phases. The
+// writer is the only reader, so a `shared` array would buy nothing and cost an
+// atomicOr (four cells to a word, four different threads) plus a zeroing pass
+// before the barrier. A count is 0..5, so four of them pack into one uint that
+// stays in a register, and the cache adds ZERO bytes of `shared`.
 //
-// A block with more cells than this still meshes correctly: phase three
-// re-gathers the uncached tail (see the loop below), which is slower but not
-// wrong. Every in-tree caller uses block_size 8, where nothing is uncached.
+// Zero bytes matters *here* and not in the vertex-sharing kernel, because this
+// is the DEFAULT path: the 2026-08-08 decision split the two precisely so it
+// would not carry sharing's ~8 KiB threadgroup budget, and a two-phase emitter
+// must not reintroduce it by the back door.
 //
-// Slower, and by enough to matter -- at block_size 16 87.5% of a block's cells
-// fall past the cache and are gathered in FULL twice, so the ~1.08 gathers per
-// cell this design is chosen for becomes ~1.88. Nothing about that is visible
-// from a correct-looking mesh, so the host mirrors this constant
+// A block with more cells than the slots reach still meshes correctly: phase
+// three re-gathers the uncached tail (see the loop below), which is slower but
+// not wrong. Every in-tree caller uses block_size 8, where 512 cells over 256
+// threads is two slots and nothing is uncached.
+//
+// Slower, and by enough to matter -- at block_size 16, 3072 of a block's 4096
+// cells fall past the four slots and are gathered in FULL twice, so the ~1.08
+// gathers per cell this design is chosen for becomes ~1.77. Nothing about that
+// is visible from a correct-looking mesh, so the host mirrors this reach
 // (kMaxCachedCells in marching_cubes.cpp) and reports the shortfall as
 // ExtractTimings::uncached_cells_per_block: a limit the caller cannot see is
 // the library's to check, not to document (the 2026-08-04 decision). It is a
-// REPORT and not a refusal, unlike the sharing kernel's identically-valued
-// kMaxSharedCells -- there an oversized block would index past a shared array,
-// here it only costs time.
-const uint kMaxCachedCells = 512u;
-const uint kCacheWords = kMaxCachedCells / 4u;
-shared uint s_tri_cache[kCacheWords];
+// REPORT and not a refusal, unlike the sharing kernel's kMaxSharedCells --
+// there an oversized block would index past a shared array, here it only costs
+// time.
+const uint kCachedSlots = 4u;  // 8-bit counts to a uint
 
-// Cache / read a cell's triangle count. atomicOr because adjacent cells share a
-// word and are handled by different threads; the words are zeroed before the
-// barrier that opens phase one, so an OR is enough to place a byte.
-//
-// Called only for a NONZERO count. The word starts zeroed and the byte is
-// already 0, so ORing a zero is bit-identical to skipping it -- and it is the
-// ~92% case, four lanes of every SIMD group contending on one word to write
-// nothing.
-void mcCacheTriCount(uint local, int n) {
-  atomicOr(s_tri_cache[local >> 2u], uint(n) << ((local & 3u) * 8u));
-}
-
-uint mcCachedTriCount(uint local) {
-  return (s_tri_cache[local >> 2u] >> ((local & 3u) * 8u)) & 0xFFu;
+// Which strided iteration `local` is, i.e. which byte of the cache holds it.
+// Both phases derive it the same way from the same `tid`; `group_threads` is a
+// compile-time constant, so this is a shift.
+uint mcCacheSlot(uint local, uint tid, uint group_threads) {
+  return (local - tid) / group_threads;
 }
 
 void main() {
@@ -254,17 +253,15 @@ void main() {
   }
   BlockIndex block = active_blocks[block_i];
 
-  // Zero the reservation state and the triangle-count cache before any
-  // phase-one thread ORs into it, alongside resolving the neighbourhood -- one
-  // barrier opens all three. s_block_base is zeroed here rather than only on
-  // the path that reserves, so it is never read uninitialised.
+  // Zero the reservation state alongside resolving the neighbourhood -- one
+  // barrier opens both. s_block_base is zeroed here rather than only on the
+  // path that reserves, so it is never read uninitialised. The triangle-count
+  // cache takes no pass of its own: it is a private uint, cleared where it is
+  // declared below, which is a register write and not a threadgroup one.
   if (tid == 0u) {
     s_block_tris = 0u;
     s_block_base = 0u;
     s_cursor = 0u;
-  }
-  for (uint w = tid; w < kCacheWords; w += group_threads) {
-    s_tri_cache[w] = 0u;
   }
   mcResolveNeighbourhood(block, tid);
   barrier();
@@ -300,11 +297,13 @@ void main() {
   // this shape is a win. TODO(mesh): revisit if a consumer ships a smaller
   // block.
   uint mine = 0u;
+  uint cache = 0u;  // this invocation's first kCachedSlots counts, one per byte
   for (uint local = tid; local < vpb; local += group_threads) {
     int n = mcCellTriangleCount(mcCellSigns(bs, mcLocalBase(local, bs)));
     if (n != 0) {
-      if (local < kMaxCachedCells) {
-        mcCacheTriCount(local, n);
+      uint slot = mcCacheSlot(local, tid, group_threads);
+      if (slot < kCachedSlots) {
+        cache |= uint(n) << (slot * 8u);
       }
       mine += uint(n);
     }
@@ -355,8 +354,9 @@ void main() {
   for (uint local = tid; local < vpb; local += group_threads) {
     // The cheap rejection, and the reason phase one caches at all: a cell with
     // no triangles is skipped WITHOUT gathering its eight corners, which is
-    // ~92% of them. Cells past the cache fall through and gather.
-    if (local < kMaxCachedCells && mcCachedTriCount(local) == 0u) {
+    // ~92% of them. Cells past the four slots fall through and gather.
+    uint slot = mcCacheSlot(local, tid, group_threads);
+    if (slot < kCachedSlots && ((cache >> (slot * 8u)) & 0xFFu) == 0u) {
       continue;
     }
     ivec3 base = mcLocalBase(local, bs);

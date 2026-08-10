@@ -80,16 +80,19 @@ constexpr std::uint32_t kSeedVertsPer1000 = 700;
 // indexing past the shared array.
 constexpr std::uint32_t kMaxSharedCells = 512;
 
-// Mirrors kMaxCachedCells in marching_cubes_sparse.comp: the cells whose
-// triangle count that kernel can cache between its counting and emitting
-// phases.
+// How many of a block's cells marching_cubes_sparse.comp can carry a triangle
+// count for between its counting and emitting phases: kCachedSlots (4 counts to
+// a private uint) times the kernel's fixed 256-thread workgroup, since the two
+// phases stride the block identically and slot k of thread t is cell
+// t + k * 256. Both factors are stated in the shader beside the cache; this is
+// their product and the shape of it is why it is written as one.
 //
 // REPORTED rather than refused, which is the whole difference from
 // kMaxSharedCells above. A block with more cells than this still meshes
 // correctly -- the emitting phase gathers the uncached tail in full a second
-// time instead of rejecting it on a shared byte -- so refusing would break a
-// configuration that works. But at block_size 16 that is 87.5% of a block's
-// cells gathered twice, roughly 1.88 gathers per cell against the 1.08 the
+// time instead of rejecting it on a cached byte -- so refusing would break a
+// configuration that works. But at block_size 16 that is 75% of a block's
+// cells gathered twice, roughly 1.77 gathers per cell against the 1.08 the
 // two-phase split is chosen for, and nothing about a correct mesh says so.
 // Surfaced as ExtractTimings::uncached_cells_per_block, because a limit the
 // caller cannot see is this library's to check rather than to document (the
@@ -98,7 +101,7 @@ constexpr std::uint32_t kMaxSharedCells = 512;
 // Drift here is benign in both directions and cannot corrupt a mesh, unlike the
 // sharing constant: too low over-reports a slow path that is not slow, too high
 // under-reports one that is. Neither changes what the kernel emits.
-constexpr std::uint32_t kMaxCachedCells = 512;
+constexpr std::uint32_t kMaxCachedCells = 4 * 256;
 
 // A corner with weight at or below this is treated as unintegrated, and any
 // cell touching it is skipped. Small and positive so a never-integrated voxel
@@ -812,7 +815,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // per dispatch. Sharing needs ~8 KiB of `shared` arrays, and a `shared` array
   // is reserved when the pipeline is created whatever a push constant later
   // says: folding both into one kernel made the default path pay sharing's
-  // threadgroup budget (32 B -> 8224 B, which bounds residency to 3 workgroups
+  // threadgroup budget (44 B -> 8428 B, which bounds residency to 3 workgroups
   // on Apple's ~32 KiB and to 1 at Vulkan's guaranteed 16 KiB floor) and its
   // per-corner vertex atomic, for a feature it does not use.
   VkPushConstantRange push{};

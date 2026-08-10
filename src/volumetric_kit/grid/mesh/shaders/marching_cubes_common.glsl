@@ -161,12 +161,23 @@ void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8], vec3 origin,
 // equivalence test in this tier compares against. It is also the cheap half of
 // the sparse kernel's counting phase, which runs over 100% of cells while ~92%
 // of them are exactly this case.
+// The walk is bounded by the row as well as by its terminator, and the bound is
+// not belt-and-braces. `tri_table` is an SSBO the host uploads, so the -1 that
+// stops this loop is DATA; the 0..5 range is what the sparse kernel packs into
+// an 8-bit cache field and, since it reserves per block, what sizes a whole
+// block's arena span. A row that lost its terminator would not merely spin --
+// it would walk into `corner_offset` (no robustBufferAccess anywhere in this
+// tier) and hand out a span the block then overruns. Five is a property of
+// marching cubes, not of the upload: 15 of a row's 16 entries, the sixteenth
+// always -1.
+const int kMaxTrianglesPerCell = 5;
+
 int mcCellTriangleCount(int cube_index) {
   if (cube_index == 0 || cube_index == 255) {
     return 0;  // no sign change -> no surface in this cell
   }
   int n = 0;
-  while (tri_table[cube_index * 16 + n * 3] != -1) {
+  while (n < kMaxTrianglesPerCell && tri_table[cube_index * 16 + n * 3] != -1) {
     ++n;
   }
   return n;

@@ -257,18 +257,26 @@ bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
 
 // How a mesh's triangles are laid out in the arena relative to the blocks that
 // produced them: how many distinct blocks it spans, and how many times the
-// owning block CHANGES walking the index buffer in order. Perfect per-block
-// grouping gives `distinct - 1` transitions; full interleaving gives nearly one
-// per triangle -- three orders of magnitude apart on any real mesh, which is
-// why callers assert a magnitude rather than an exact figure.
+// owning block CHANGES walking the index buffer in order. Per-block grouping
+// gives EXACTLY `distinct - 1` transitions -- spans are contiguous and
+// disjoint, so the owner changes once per span boundary and nowhere else --
+// while full interleaving gives nearly one per triangle.
 //
-// A triangle is attributed to a block through its CENTROID, exact for every
-// triangle strictly inside its cell and capable of misplacing one that lies
-// flat on a cell's upper face, so a handful of misattributions must not fail a
-// caller's bound. The owning block is keyed by its three coordinates rather
-// than a packed integer: a packed key is injective only while coordinates stay
-// non-negative and small, and a collision would lower BOTH numbers -- loosening
-// the bound at exactly the moment attribution stopped distinguishing blocks.
+// Exactly, not approximately, because attributing a triangle by its CENTROID is
+// exact here. The three vertices lie on the edges of one marching-cubes cell,
+// so the centroid lies in that cell's closed cube; the cell's base voxel
+// belongs to the block and the cube reaches at most to the block's far
+// boundary, so the only centroid that could land in the NEXT block is one
+// exactly on that boundary -- which takes all three vertices on the cell's far
+// face, i.e. three sign changes around a 4-cycle, and sign changes around a
+// cycle come in pairs. Two on the far face is the parity-legal maximum, and
+// that centroid still sits a third of a voxel short of the boundary, which no
+// float rounding closes.
+//
+// The owning block is keyed by its three coordinates rather than a packed
+// integer: a packed key is injective only while coordinates stay non-negative
+// and small, and a collision would lower BOTH numbers -- loosening the
+// assertion at exactly the moment attribution stopped distinguishing blocks.
 struct BlockLayout {
   std::size_t triangles = 0;
   std::size_t distinct = 0;
@@ -420,18 +428,18 @@ int main() {
   // other block in flight, and per-block ranges are the precondition for
   // meshing only the blocks a fuse changed.
   //
-  // Asserted as a MAGNITUDE, not a shape -- see block_layout for why the
-  // attribution is approximate and why a handful of misattributions must not
-  // fail the test.
+  // Asserted EXACTLY -- see block_layout for why centroid attribution admits no
+  // slack here, and why a loose bound would be the wrong instrument: the
+  // failure this guards against (a span overrun, or a block emitting through
+  // two spans) moves the count by one, not by an order of magnitude.
   {
     const BlockLayout layout = block_layout(sphere, kBlock, kH);
-    CHECK(layout.triangles > 0);
     // The sphere must actually straddle many blocks, or "grouped" is vacuous.
     CHECK(layout.distinct >= 20);
-    // ... and there must be many more triangles than blocks, or the bound below
-    // is satisfied by arithmetic rather than by grouping.
-    CHECK(layout.triangles > 4 * (layout.distinct + 16));
-    CHECK(layout.transitions <= layout.distinct + 16);
+    // ... and there must be many more triangles than blocks, or the assertion
+    // below is satisfied by arithmetic rather than by grouping.
+    CHECK(layout.triangles > 4 * layout.distinct);
+    CHECK(layout.transitions == layout.distinct - 1);
   }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
@@ -813,15 +821,15 @@ int main() {
   CHECK(canonical_triangles(run_mesh) == canonical_triangles(run_settled));
 
   // And contiguity survives a refit: the assertion above runs only on a clean
-  // first extract, where no span was ever truncated. Same bound, and it is not
-  // a loose one -- both meshes come out at exactly `distinct - 1` transitions,
-  // the perfect-grouping figure, against the ~48 000 that full interleaving
-  // would give here.
+  // first extract, where no span was ever truncated. Same exact figure here --
+  // `distinct - 1`, against the ~48 000 transitions full interleaving would
+  // give at this triangle count -- because truncating a span at the arena
+  // boundary shortens it without splitting it.
   {
     const BlockLayout layout = block_layout(run_settled, kBlock, kH);
     CHECK(layout.distinct >= 20);
-    CHECK(layout.triangles > 4 * (layout.distinct + 16));
-    CHECK(layout.transitions <= layout.distinct + 16);
+    CHECK(layout.triangles > 4 * layout.distinct);
+    CHECK(layout.transitions == layout.distinct - 1);
   }
 
   // Reusing one ExtractTimings across calls must not accumulate: every field is
@@ -1008,7 +1016,7 @@ int main() {
   // reads back as a plausible mesh.
   vol::VoxelGridParams big_block_gp = sphere_grid_params();
   big_block_gp.block_size = 16;
-  big_block_gp.voxels_per_block = 16 * 16 * 16;  // 4096 > the kernel's 512
+  big_block_gp.voxels_per_block = 16 * 16 * 16;  // 4096 > the kernel's 1024
   big_block_gp.num_buckets = 32;
   big_block_gp.num_blocks = 256;  // = bucket_size * num_buckets
   vr::Result<vol::VoxelBlockGrid> big_block_result =
@@ -1020,11 +1028,10 @@ int main() {
   // weight 0 at every corner, so every cell is rejected at the gather and the
   // block emits nothing -- which means the default kernel returns at its
   // "nothing reserved" check and the uncached tail this grid exists to reach
-  // never runs. With the field written, cells 512..4095 fall past the kernel's
-  // per-cell cache and take the second full gather instead of the cheap
-  // shared-memory rejection, and only then is the branch that indexes that
-  // cache exercised at all -- an out-of-bounds threadgroup read there is
-  // invisible to every validation layer.
+  // never runs. With the field written, cells 1024..4095 fall past the four
+  // slots the kernel's per-cell cache holds and take the second full gather
+  // instead of the cheap register rejection, and only then is the uncached
+  // branch exercised at all.
   CHECK(fill_dense_blocks(big_block_grid, 1));
   CHECK(!share_mc.extract(big_block_grid, 0.0f).ok());
   // The same grid is fine without sharing -- the refusal is the kernel's table,
@@ -1036,9 +1043,9 @@ int main() {
   const mesh::Mesh big_mesh_16 = std::move(big_mesh_16_result).value();
   CHECK(big_timings_16.active_blocks == 1);
   CHECK(big_mesh_16.triangle_count() > 0);
-  // The shortfall is REPORTED rather than refused: correct mesh, ~1.9 gathers
+  // The shortfall is REPORTED rather than refused: correct mesh, ~1.8 gathers
   // per cell instead of ~1.1, and nothing else could tell a caller so.
-  CHECK(big_timings_16.uncached_cells_per_block == 4096 - 512);
+  CHECK(big_timings_16.uncached_cells_per_block == 4096 - 1024);
 
   // The block size is an allocation detail, so the SAME field divided into
   // eight blocks of 8 must extract to the same surface. This is what pins the

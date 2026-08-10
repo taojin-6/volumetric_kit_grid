@@ -128,13 +128,13 @@ struct ExtractTimings {
   /// slower, and otherwise invisible.
   ///
   /// The sparse kernel visits a cell twice: once to count (signs only), once to
-  /// emit. Between them it caches each cell's triangle count in one byte of
-  /// `shared`, so the ~92% of cells that emit nothing are rejected on a
-  /// shared-memory read rather than a second gather. That cache is sized at
-  /// compile time for `block_size` 8; a block with more cells than it holds
-  /// still meshes **correctly**, but every cell past it pays a second full
-  /// gather -- at `block_size` 16 that is 87.5% of the block, roughly 1.9
-  /// gathers per cell against 1.1.
+  /// emit. Between them it caches each cell's triangle count in one byte of a
+  /// private register, so the ~92% of cells that emit nothing are rejected
+  /// without touching memory rather than by a second gather. That cache holds
+  /// four counts per invocation, which covers `block_size` 8 whole; a block
+  /// with more cells than it holds still meshes **correctly**, but every cell
+  /// past it pays a second full gather -- at `block_size` 16 that is 75% of the
+  /// block, roughly 1.8 gathers per cell against 1.1.
   ///
   /// Reported rather than refused, because nothing is wrong with the mesh --
   /// but a limit the caller cannot see is this library's to surface (see the
@@ -407,7 +407,7 @@ struct MarchingCubesConfig {
 ///   **contiguously** in the arena rather than interleaved with every other
 ///   block's in flight. That is the precondition for meshing only the blocks a
 ///   fuse changed -- with an interleaved arena there is no range to leave in
-///   place -- and it costs ~13% on the dispatch, taken deliberately (see the
+///   place -- and it costs ~10% on the dispatch, taken deliberately (see the
 ///   2026-08-09 incremental-extraction decision). Contiguity is a property of
 ///   this default path only: @ref MarchingCubesConfig::share_vertices selects a
 ///   kernel that still appends per triangle. It is not yet published as a
