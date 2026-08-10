@@ -452,6 +452,22 @@ struct MarchingCubesConfig {
 // before that on a desktop profile putting the dispatch at ~2 ms -- "the pool
 // would optimise what was already fast" -- which a device measurement
 // overturned.
+
+/// @brief Where one block's geometry landed in the extract that meshed it.
+///
+/// Counted in vertices and in TRIANGLES -- not indices -- because a triangle is
+/// what a block owns and what a re-mesh replaces; multiply by
+/// @ref kIndicesPerTriangle for the index run. The four numbers are independent
+/// under @ref MarchingCubesConfig::share_vertices and locked at `v = 3t`
+/// without it, which is exactly the ratio sharing breaks.
+struct BlockSpan {
+  std::uint32_t vertex_base = 0;
+  std::uint32_t vertex_count = 0;
+  std::uint32_t triangle_base = 0;
+  std::uint32_t triangle_count = 0;
+};
+static_assert(sizeof(BlockSpan) == 16, "BlockSpan must be 16 bytes");
+
 class VR_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and
@@ -467,6 +483,31 @@ class VR_MESH_API MarchingCubes {
   ///         allocation fails.
   static Result<MarchingCubes> create(Device& device, Allocator& allocator,
                                       const MarchingCubesConfig& config = {});
+
+  /// @brief Where the last extract put each block's geometry.
+  ///
+  /// Indexed by **block slot** -- `volume::BlockIndex::ptr / voxels_per_block`
+  /// -- and meaningful only for the blocks in the active set of the extract
+  /// that wrote it. A slot means nothing against a different grid, and nothing
+  /// after a `remove()` or `clear()`: the block heap is LIFO, so a reused slot
+  /// names a different block. Anchoring a span table across extracts is
+  /// therefore the caller's job until this tier does it, and a slot the last
+  /// extract did not mesh still holds whatever an earlier one left there.
+  ///
+  /// A block that meshed and emitted nothing records an empty span. That is a
+  /// different statement from never having been meshed, and this accessor
+  /// deliberately does not distinguish them -- the caller knows its own active
+  /// set, and a stamp that did distinguish them would be state nothing yet
+  /// reads.
+  ///
+  /// @return `block_span_capacity()` entries, or `nullptr` on a moved-from
+  ///         extractor or before the first sparse extract.
+  const BlockSpan* block_spans() const noexcept;
+
+  /// @brief Entries @ref block_spans addresses.
+  std::uint32_t block_span_capacity() const noexcept {
+    return block_span_capacity_;
+  }
 
   /// @brief Report that every mesh up to and including @p generation has been
   ///        read, so its slot may be written again.
@@ -682,6 +723,15 @@ class VR_MESH_API MarchingCubes {
   // push flag tells the kernel to ignore it). Mirrors the tsdf integrator's
   // color dummy.
   Buffer color_dummy_;
+  // Per-block spans, indexed by block slot (`BlockIndex::ptr /
+  // voxels_per_block`) and sized to the grid's `num_blocks`. Grown on demand,
+  // never shrunk, and NOT per slot: it describes where the *current* extract
+  // put each block, which is one dispatch's worth of state rather than a mesh a
+  // consumer still holds.
+  Buffer block_spans_;
+  // Entries `block_spans_` holds. Kept beside the buffer rather than derived
+  // from its byte size so the two cannot disagree about the element type.
+  std::uint32_t block_span_capacity_ = 0;
 
   // The vertex arena + the draw command the kernels append through, kept ACROSS
   // extract calls and grown only when a call needs more than the last one.

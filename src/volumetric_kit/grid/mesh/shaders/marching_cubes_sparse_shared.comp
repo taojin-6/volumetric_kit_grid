@@ -132,6 +132,23 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand {
 // referenced by several triangles from several cells.
 layout(set = 0, binding = 8, scalar) writeonly buffer Indices { uint indices[]; };
 
+// Where this block's output landed, keyed by block SLOT (ptr / voxels_per_block)
+// -- vertex base, vertex count, triangle base, triangle count.
+//
+// The mapping the reservation above computes and used to drop. It is not
+// derivable on the host: the atomic hands spans out in workgroup ARRIVAL order,
+// not block order, so nothing outside this dispatch knows which range belongs to
+// which block. Publishing it is what lets a later extract leave a clean block's
+// geometry in place and re-mesh only what a fuse changed.
+//
+// Keyed by slot because a slot is a dense index into a fixed table where a coord
+// would need a device-side hash. A slot only means something against a
+// particular grid and topology epoch -- the host anchors it, exactly as the tsdf
+// tier anchors its dirty flags.
+layout(set = 0, binding = 9, scalar) writeonly buffer BlockSpans {
+  uvec4 block_spans[];
+};
+
 layout(push_constant, scalar) uniform PushConstants {
   int block_size;          // voxels per block edge
   int voxels_per_block;    // block_size^3
@@ -633,6 +650,10 @@ void main() {
       s_ibase = atomicAdd(index_count, s_ttotal * kIndicesPerTriangle) /
                 kIndicesPerTriangle;
     }
+    // Four independent numbers here, where the default kernel's are locked at
+    // v = 3t: sharing is exactly what breaks that ratio.
+    block_spans[uint(block.ptr) / uint(pc.voxels_per_block)] =
+        uvec4(s_vbase, s_vtotal, s_ibase, s_ttotal);
   }
   barrier();
 

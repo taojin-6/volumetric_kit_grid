@@ -107,6 +107,23 @@ layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
 // exactly three per triangle and the host derives it).
 layout(set = 0, binding = 7, scalar) buffer DrawCommand { uint index_count; };
 
+// Where this block's output landed, keyed by block SLOT (ptr / voxels_per_block)
+// -- vertex base, vertex count, triangle base, triangle count.
+//
+// The mapping the reservation above computes and used to drop. It is not
+// derivable on the host: the atomic hands spans out in workgroup ARRIVAL order,
+// not block order, so nothing outside this dispatch knows which range belongs to
+// which block. Publishing it is what lets a later extract leave a clean block's
+// geometry in place and re-mesh only what a fuse changed.
+//
+// Keyed by slot because a slot is a dense index into a fixed table where a coord
+// would need a device-side hash. A slot only means something against a
+// particular grid and topology epoch -- the host anchors it, exactly as the tsdf
+// tier anchors its dirty flags.
+layout(set = 0, binding = 8, scalar) writeonly buffer BlockSpans {
+  uvec4 block_spans[];
+};
+
 layout(push_constant, scalar) uniform PushConstants {
   int block_size;          // voxels per block edge
   int voxels_per_block;    // block_size^3
@@ -329,10 +346,18 @@ void main() {
   // DeviceMesh field, which is stage 3's scope and not this one's: stage 2 is
   // defined as byte-identical geometry with no new invariants (the 2026-08-09
   // decision), and a range nothing consumes yet would be an unverifiable one.
-  if (tid == 0u && s_block_tris != 0u) {
-    s_block_base =
-        atomicAdd(index_count, s_block_tris * kIndicesPerTriangle) /
-        kIndicesPerTriangle;
+  if (tid == 0u) {
+    if (s_block_tris != 0u) {
+      s_block_base =
+          atomicAdd(index_count, s_block_tris * kIndicesPerTriangle) /
+          kIndicesPerTriangle;
+    }
+    // Published for every meshed block, including one that emits nothing: "meshed
+    // and empty" is a different statement from "never meshed", and only the
+    // host's anchor expresses the second. s_block_base is zero-initialised, so
+    // an empty block records an empty span rather than a stale one.
+    block_spans[uint(block.ptr) / uint(pc.voxels_per_block)] =
+        uvec4(s_block_base * 3u, s_block_tris * 3u, s_block_base, s_block_tris);
   }
   barrier();
 

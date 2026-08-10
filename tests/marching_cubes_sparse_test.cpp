@@ -284,6 +284,69 @@ struct BlockLayout {
   std::size_t transitions = 0;
 };
 
+// Does the published span table exactly describe @p m?
+//
+// This is what makes the table verifiable at all rather than state nothing
+// reads. Three properties, and the third is the one with teeth:
+//   1. the counts sum to the mesh,
+//   2. the ranges PARTITION it -- disjoint, and covering [0, total) with no
+//   gap,
+//   3. every triangle inside a block's range actually belongs to that block,
+//      by the same centroid attribution block_layout uses.
+// (1) and (2) would both hold if the kernel published plausible arithmetic that
+// pointed at the wrong geometry; (3) is what ties a span to its block.
+bool spans_describe(const mesh::MarchingCubes& mc, const mesh::Mesh& m,
+                    const std::vector<vol::BlockIndex>& active, int block_size,
+                    float voxel_size) {
+  const auto vpb =
+      static_cast<std::uint32_t>(block_size * block_size * block_size);
+  const mesh::BlockSpan* spans = mc.block_spans();
+  if (spans == nullptr) {
+    return false;
+  }
+  const float block_span = static_cast<float>(block_size) * voxel_size;
+
+  std::vector<bool> tri_seen(m.indices.size() / 3, false);
+  std::uint64_t tri_total = 0;
+  std::uint64_t vert_total = 0;
+  for (const vol::BlockIndex& b : active) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(b.ptr) / vpb;
+    if (slot >= mc.block_span_capacity()) {
+      return false;
+    }
+    const mesh::BlockSpan sp = spans[slot];
+    tri_total += sp.triangle_count;
+    vert_total += sp.vertex_count;
+    for (std::uint32_t i = 0; i < sp.triangle_count; ++i) {
+      const std::size_t t = sp.triangle_base + i;
+      if (t >= tri_seen.size() || tri_seen[t]) {
+        return false;  // out of range, or two blocks claim the same triangle
+      }
+      tri_seen[t] = true;
+      vr::Vec3f c(0.0f, 0.0f, 0.0f);
+      for (int k = 0; k < 3; ++k) {
+        c = c +
+            m.vertices[m.indices[t * 3 + static_cast<std::size_t>(k)]].position;
+      }
+      c = c / 3.0f;
+      if (static_cast<long long>(std::floor(c.x / block_span)) != b.coord.x ||
+          static_cast<long long>(std::floor(c.y / block_span)) != b.coord.y ||
+          static_cast<long long>(std::floor(c.z / block_span)) != b.coord.z) {
+        return false;  // the span points at another block's geometry
+      }
+    }
+  }
+  if (tri_total != tri_seen.size() || vert_total != m.vertices.size()) {
+    return false;  // a triangle or vertex belongs to no block
+  }
+  for (bool seen : tri_seen) {
+    if (!seen) {
+      return false;
+    }
+  }
+  return true;
+}
+
 BlockLayout block_layout(const mesh::Mesh& m, int block_size,
                          float voxel_size) {
   const float block_span = static_cast<float>(block_size) * voxel_size;
@@ -501,6 +564,16 @@ int main() {
     // below is satisfied by arithmetic rather than by grouping.
     CHECK(layout.triangles > 4 * layout.distinct);
     CHECK(layout.transitions == layout.distinct - 1);
+  }
+
+  // The published span table describes that layout exactly -- the mapping the
+  // reservation computes, which is not derivable on the host because the atomic
+  // hands spans out in workgroup arrival order rather than block order.
+  {
+    vr::Result<std::vector<vol::BlockIndex>> active =
+        grid.map().compact_active_blocks();
+    CHECK(active.ok());
+    CHECK(spans_describe(extractor, sphere, active.value(), kBlock, kH));
   }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
@@ -965,6 +1038,15 @@ int main() {
     CHECK(spans.gaps == 0);
     CHECK(spans.overlaps == 0);
     CHECK(spans.covered == share_mesh.vertices.size());
+
+    // ... and its published table describes it, with vertex counts that are NOT
+    // three per triangle -- the case the default path cannot exercise. The
+    // ranges above are inferred from the mesh; this is what the kernel claims.
+    vr::Result<std::vector<vol::BlockIndex>> active =
+        grid.map().compact_active_blocks();
+    CHECK(active.ok());
+    CHECK(spans_describe(share_mc, share_mesh, active.value(), kBlock, kH));
+    CHECK(share_mesh.vertices.size() != share_mesh.indices.size());
   }
   CHECK(share_timings.emitted_vertices == share_mesh.vertices.size());
   CHECK(share_timings.emitted_triangles == share_mesh.triangle_count());

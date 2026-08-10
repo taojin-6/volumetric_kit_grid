@@ -484,6 +484,15 @@ void MarchingCubes::free_slot_of(std::uint64_t generation) noexcept {
   }
 }
 
+const BlockSpan* MarchingCubes::block_spans() const noexcept {
+  // Host-visible and mapped, so this is the buffer itself rather than a copy --
+  // the caller reads at most block_span_capacity() entries and the mapping
+  // outlives every one of them.
+  return block_span_capacity_ == 0
+             ? nullptr
+             : static_cast<const BlockSpan*>(block_spans_.mapped());
+}
+
 void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   // Monotonic: an older report never un-releases a slot. A consumer finishing
   // frames out of order, or reporting a stale value after a newer one, would
@@ -842,7 +851,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                 config.share_vertices
                     ? vr_marching_cubes_sparse_shared_comp_spv_size
                     : vr_marching_cubes_sparse_comp_spv_size,
-                config.share_vertices ? 9 : 8, &push_sparse));
+                config.share_vertices ? 10 : 9, &push_sparse));
   VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 of both
@@ -1363,6 +1372,24 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                           VK_WHOLE_SIZE);
   kernel_sparse_.set.write_storage_buffer(7, indirect().handle(), 0,
                                           VK_WHOLE_SIZE);
+  // The span table is sized by the GRID, not by the surface, so it is grown
+  // here rather than in ensure_output_buffers -- which sizes everything else
+  // from the triangle count. num_blocks only ever rises (resize preserves block
+  // indices and grows the table), so this is grow-only like the arena.
+  const auto num_blocks = static_cast<std::uint32_t>(gp.num_blocks);
+  if (num_blocks > block_span_capacity_) {
+    VR_ASSIGN(block_spans_,
+              storage_buffer(
+                  *allocator_,
+                  static_cast<VkDeviceSize>(num_blocks) * sizeof(BlockSpan),
+                  HostAccess::Random));
+    block_span_capacity_ = num_blocks;
+  }
+  // Binding 8 without sharing, 9 with -- the sharing kernel spends 8 on the
+  // index run it writes itself.
+  kernel_sparse_.set.write_storage_buffer(
+      config_.share_vertices ? 9 : 8, block_spans_.handle(), 0, VK_WHOLE_SIZE);
+
   if (config_.share_vertices) {
     // The sharing kernel's ninth binding. It writes the indices itself, because
     // a shared vertex is referenced by several triangles from several cells and
