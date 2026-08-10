@@ -12,6 +12,7 @@
 
 #include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
+#include "volumetric_kit/recon/core/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash.hpp"
 
@@ -141,6 +142,12 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   map.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
+  // The device-span collector. Created here rather than lazily: a query pool of
+  // a few timestamps costs nothing, and a diagnostic that can fail on first use
+  // is worse than one that costs a handful of bytes. VR_ASSIGN, not a discarded
+  // Result -- a default-constructed timer is silently unavailable, so dropping
+  // the failure would make every device row vanish with nothing to say why.
+  VR_ASSIGN(map.gpu_timer_, GpuTimer::create(device));
   map.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
 
   // Build every kernel's layout + pipeline and size the shared pool_ to them
@@ -303,7 +310,7 @@ void VoxelHashMap::rebuild_heap_excluding(
 // and the caller sees a non-zero count exactly when something did not complete.
 Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     const ComputeKernel& kernel, std::uint32_t arg, std::uint32_t groups,
-    AllocFailures* out_failures) {
+    AllocFailures* out_failures, GpuTimer* timer, const char* label) {
   const PushConstants push{grid_, arg};
   constexpr int kMaxRounds = 10;
   constexpr int kStallLimit = 2;  // consecutive no-progress rounds -> give up
@@ -314,7 +321,7 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
   for (int round = 0; round < kMaxRounds; ++round) {
     std::memset(fail_counts_.mapped(), 0, kFailSlots * sizeof(std::uint32_t));
     VR_TRY(dispatch(*device_, kernel, &push, sizeof(push), groups,
-                    max_workgroup_count_x_));
+                    max_workgroup_count_x_, timer, label));
     std::uint32_t slots[kFailSlots] = {};
     std::memcpy(slots, fail_counts_.mapped(), sizeof(slots));
     failures = slots[kFailTotal];
@@ -389,7 +396,10 @@ Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const float* depth, const DepthCameraParams& camera,
-    AllocFailures* out_failures) {
+    AllocFailures* out_failures, StageMetrics* metrics) {
+  // Before the validity check, so a refused call still costs its row -- a stage
+  // silent on failure reads as one that did not run. Inert when null.
+  StageScope host_span(metrics, "allocate");
   if (!valid()) {
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: moved-from map");
@@ -424,7 +434,16 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
             upload_to_binding(depth_.set, 4, depth, depth_bytes));
   std::memcpy(camera_params_.mapped(), &camera, sizeof(DepthCameraParams));
 
-  return dispatch_with_retry(depth_, pixels, group_count(pixels), out_failures);
+  VR_ASSIGN(const std::uint32_t failed,
+            dispatch_with_retry(
+                depth_, pixels, group_count(pixels), out_failures,
+                metrics != nullptr ? &gpu_timer_ : nullptr, "allocate"));
+  // Publishing ends the window, so the rounds this call dispatched cannot be
+  // re-emitted into a later frame's metrics -- see GpuTimer::report_into.
+  if (metrics != nullptr) {
+    gpu_timer_.report_into(*metrics);
+  }
+  return failed;
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_points(

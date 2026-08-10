@@ -16,8 +16,10 @@
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
+#include "volumetric_kit/recon/core/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
 #include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -168,9 +170,17 @@ class VR_VOLUME_API VoxelHashMap {
   ///                      table with ample room. @ref
   ///                      AllocFailures::capacity_limited is the test @ref
   ///                      resize answers.
+  /// @param metrics  Optional @ref StageMetrics collecting an `"allocate"` host
+  ///                  row and, from timestamp spans around the dispatches, its
+  ///                  device half. `nullptr` measures nothing. The retry loop
+  ///                  contributes one span per round and they **accumulate**
+  ///                  under one name, which is the honest total: a contended
+  ///                  frame genuinely dispatches several times, and reporting
+  ///                  only the last would hide exactly the cost that makes
+  ///                  contention worth seeing.
   Result<std::uint32_t> allocate_from_depth(
       const float* depth, const DepthCameraParams& camera,
-      AllocFailures* out_failures = nullptr);
+      AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
 
   /// @brief Allocate voxel blocks from a world-space point cloud.
   ///
@@ -389,10 +399,17 @@ class VR_VOLUME_API VoxelHashMap {
   /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
   /// added to the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
+  // `metrics` only selects whether the timer runs; the spans land in gpu_timer_
+  // and the caller publishes them, so a retry loop's rounds accumulate.
+  /// @p timer, when non-null, collects one span per round; they accumulate
+  /// under one label, which is the honest total for a frame that genuinely
+  /// dispatched several times.
   Result<std::uint32_t> dispatch_with_retry(const ComputeKernel& kernel,
                                             std::uint32_t arg,
                                             std::uint32_t groups,
-                                            AllocFailures* out_failures);
+                                            AllocFailures* out_failures,
+                                            GpuTimer* timer = nullptr,
+                                            const char* label = nullptr);
 
   /// Create a transient host-visible buffer holding @p bytes of @p data and
   /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
@@ -465,6 +482,9 @@ class VR_VOLUME_API VoxelHashMap {
   // allocate-from-coords and -from-points have the same 6-binding shape but
   // each owns its kernel; depth adds the camera-params buffer at binding 6 (7
   // bindings).
+  // Device spans for this tier's dispatches; idle until a caller asks.
+  GpuTimer gpu_timer_;
+
   ComputeKernel init_;
   ComputeKernel allocate_;
   ComputeKernel compact_;
