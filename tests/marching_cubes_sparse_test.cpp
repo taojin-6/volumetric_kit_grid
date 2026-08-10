@@ -879,6 +879,22 @@ int main() {
   // nothing, or shared only within a cell, would fail.
   CHECK(sphere.vertices.size() == sphere.indices.size());  // 3 per triangle
   CHECK(share_mesh.vertices.size() * 2 < sphere.vertices.size());
+
+  // ... and this kernel's triangles are per-block contiguous too, which is what
+  // lets a dirty-only dispatch describe a block's output as a range. It was NOT
+  // true here until now: the default kernel reserved a span per block while
+  // this one still appended per triangle through the global counter, so
+  // `share_vertices` was the one path incremental extraction could not use.
+  //
+  // Exactly `distinct - 1` transitions, the same bound the unshared path is
+  // held to -- spans are contiguous and disjoint, so the owner changes once per
+  // boundary and nowhere else.
+  {
+    const BlockLayout layout = block_layout(share_mesh, kBlock, kH);
+    CHECK(layout.distinct >= 20);
+    CHECK(layout.triangles > 4 * layout.distinct);
+    CHECK(layout.transitions == layout.distinct - 1);
+  }
   CHECK(share_timings.emitted_vertices == share_mesh.vertices.size());
   CHECK(share_timings.emitted_triangles == share_mesh.triangle_count());
   // Every index addresses a live vertex. With sharing this is a real check
