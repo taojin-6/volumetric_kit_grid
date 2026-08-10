@@ -597,8 +597,8 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // needed no growth at all, and the next such grow multiplied the inflated
   // value again -- numerically the ring runaway the 2026-08-03
   // slot-independence decision exists to prevent, reintroduced one buffer over.
-  // It also refaulted the arena, the phase CLAUDE.md measured at 49.8 ms of a
-  // 55 ms extract.
+  // It also refaulted the arena, the phase DECISIONS.md measured at 49.8 ms of
+  // a 55 ms extract.
   const bool grow_index_run =
       !index_run().valid() || triangle_capacity > arena_capacity();
   const bool grow_arena =
