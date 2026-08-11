@@ -133,6 +133,12 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand {
   uint first_instance;
   uint vertex_count;
   uint sharing_applied;
+  // Declared but UNWRITTEN here, mirroring marching_cubes_sparse.comp's own
+  // declaration of this buffer: incremental extraction refuses share_vertices,
+  // so this kernel never re-meshes a subset and never has a count to report.
+  // Named rather than omitted so the two kernels describe the same bytes --
+  // the host resets all three scratch words for either.
+  uint remeshed_blocks;
 };
 // The real index buffer -- a property of this dispatch, since a shared vertex is
 // referenced by several triangles from several cells.
@@ -166,6 +172,13 @@ layout(push_constant, scalar) uniform PushConstants {
   // MarchingCubesConfig::track_block_spans, the way has_color gates the colour
   // attribute.
   uint write_spans;
+  // Declared but UNUSED here: one ABI shared with marching_cubes_sparse.comp and
+  // SparsePushConstants, so omitting a field the sibling declares would leave
+  // the two disagreeing about the block's size. Incremental extraction refuses
+  // share_vertices for now -- a relocated block would have to retire vertices it
+  // does not own three-per-triangle.
+  uint incremental;
+  uint dirty_capacity;
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeOwner / mcEdgeVertex + the near-tangent
