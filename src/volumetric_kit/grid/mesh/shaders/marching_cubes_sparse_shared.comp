@@ -13,15 +13,38 @@
 // marching_cubes_sparse_common.glsl; the per-cell numerics are
 // marching_cubes_common.glsl, which the dense kernel also includes.
 //
-// Two passes over the block's cells, separated by one barrier:
-//   1. mcOwnedEdgePass -- each cell classifies itself and emits a vertex on
-//      each of the three edges it OWNS (+x/+y/+z from its base corner). Every
-//      edge in the field is owned by exactly one cell (mcEdgeOwner), so after
-//      this pass every in-block edge carrying a crossing has exactly one vertex.
-//   2. mcTrianglePass -- each cell emits its triangles as indices into those
-//      vertices. An edge whose owner lies outside the block (the +face) is
-//      DUPLICATED inline, which is why the saving is ~4x rather than the ~6x
-//      full sharing would give.
+// FOUR passes over the block's cells, either side of one reservation. The block
+// counts what it will produce,
+// reserves ONE vertex range and ONE triangle range with a single atomicAdd each,
+// and only then writes -- so its output is contiguous in both buffers instead of
+// interleaved with every other block in flight, which is what a per-block range
+// can describe and therefore the precondition for meshing only the blocks a fuse
+// changed. Two ranges rather than the default kernel's one, because a shared
+// vertex breaks `v = 3t`.
+//
+// The phase numbering below is main()'s, so that phase TWO -- the reservation
+// itself, one atomic on one lane and no pass over the cells at all -- keeps a
+// number here and in the code.
+//
+//   1.  mcCountCell -- classify (signs only, into `s_case`) and count the
+//       vertices this cell OWNS and the triangles it will emit.
+//   1b. mcCountDuplicates -- count the vertices it will DUPLICATE. A separate
+//       pass because a duplicate is decided by the OWNER cell's state, which
+//       phase 1 is still writing.
+//   3.  mcOwnedEdgePass -- emit a vertex on each of the three edges the cell
+//       OWNS (+x/+y/+z from its base corner). Every edge in the field is owned
+//       by exactly one cell (mcEdgeOwner), so after this pass every in-block
+//       edge carrying a crossing has exactly one vertex.
+//   4.  mcTrianglePass -- emit the cell's triangles as indices into those
+//       vertices. An edge whose owner lies outside the block (the +face), or
+//       whose owner emitted nothing, is DUPLICATED inline -- which is why the
+//       saving is ~4x rather than the ~6x full sharing would give.
+//
+// The two counting passes run over 100% of the block's cells, so they read the
+// eight corner SIGNS (mcCellSigns) and nothing else: no `out float[8]` /
+// `out vec3[8]` copy-out and no sRGB decode, for values a count cannot use.
+// Passes 3 and 4 read pass 1's `s_case` and gather in full only the cells that
+// actually produce something (~8% of them).
 //
 // Unlike the default kernel, the index run here is NOT the identity: a vertex is
 // referenced by several triangles from several cells and only this kernel knows
@@ -135,7 +158,7 @@ layout(push_constant, scalar) uniform PushConstants {
 #include "marching_cubes_sparse_common.glsl"
 
 // The vertex this block emitted for each cell's three OWNED edges (+x, +y, +z
-// from the cell's base corner), or one of the two sentinels below.
+// from the cell's base corner), or kNoVertex below.
 //
 // Sized for block_size 8, the only shape any in-tree caller uses and the largest
 // this can hold: a shared array needs a compile-time size while voxels_per_block
@@ -145,21 +168,56 @@ layout(push_constant, scalar) uniform PushConstants {
 // reporting through `sharing_applied` so the two constants cannot drift in
 // silence.
 const uint kMaxSharedCells = 512u;
-// No vertex on this edge: it carries no crossing, or its owner cell is invalid,
-// or the owner lies outside this block. A referencing cell duplicates.
+// No vertex on this edge: it carries no crossing, or its owner cell emitted
+// nothing, or the owner lies outside this block. A referencing cell duplicates.
+// Also what mcClaimVertex returns when the block's own reservation is already
+// spent -- see there.
 const int kNoVertex = -1;
-// The owner DID have a vertex here and the arena was full, so it was counted and
-// dropped. Distinct from kNoVertex on purpose: a referencing cell must not claim
-// a replacement, or `vertex_count` stops being the field's true total and the
-// host's refit -- which sizes a grow-only arena from it -- overshoots by however
-// many triangles referenced the dropped vertex. See mcClaimVertex.
-const int kVertexDropped = -2;
+// There is deliberately no kVertexDropped any more. It existed because a
+// per-vertex global atomic gave a dropped vertex no usable slot, so a
+// referencing cell would claim a replacement and double-count -- reporting
+// V_owned + ~3T instead of the true ~0.75T, MORE than not sharing at all, and
+// the host would then refit a grow-only arena to that. Per-block reservation
+// removes the failure at its source: the block counts first and reserves once,
+// so every vertex has a deterministic slot whether or not it lands inside the
+// arena, and the totals are exact by construction rather than by bookkeeping. A
+// slot past `vertex_capacity` is simply not written, and the triangles that
+// reference it decline to draw -- see mcTrianglePass.
+
+// Per-block spans. The block counts its vertices and triangles, reserves ONE
+// range of each with a single global atomicAdd, and only then writes -- so a
+// block's output is contiguous in both buffers instead of interleaved with every
+// other block in flight. That is what a per-block range can describe, and
+// therefore the precondition for meshing only the blocks a fuse changed. The
+// default kernel got this shape already; sharing needs TWO ranges because a
+// shared vertex breaks `v = 3t`.
+shared uint s_vtotal;   // vertices this block will create (owned + duplicated)
+shared uint s_ttotal;   // triangles this block will emit
+shared uint s_vbase;    // first vertex slot, from the global counter
+shared uint s_ibase;    // first triangle slot, from the global counter
+shared uint s_vcursor;  // hands out slots within [s_vbase, s_vbase + s_vtotal)
+shared uint s_icursor;  // ... and within the triangle range
 shared int s_edge_vtx[kMaxSharedCells * 3u];
-// Phase 1's classification, so phase 2 can skip an empty or invalid cell
-// without re-reading eight corners -- and, for a cell whose edges are all
-// shared, without touching global memory at all. Bit 8 is "all corners valid";
-// bits 0..7 are the cube index. Written on every path through phase 1, so it
-// needs no separate zero-init pass.
+// Phase 1's classification, so every later pass can skip a cell that produces
+// nothing without re-reading eight corners -- and, for a cell whose edges are
+// all shared, without touching global memory at all. Bits 0..7 are the cube
+// index, 0 when the cell is invalid exactly as mcCellSigns returns; bits 8+ are
+// mcCellTriangleCount of it, 0..5.
+//
+// Caching the COUNT beside the index is what lets phase 4 claim a cell's whole
+// triangle run with ONE shared atomic instead of one per triangle, and what
+// lets phases 2 and 4 walk a `tri_table` row by count rather than each
+// re-finding its -1 terminator -- so the row's terminator is walked in exactly
+// one place, mcCellTriangleCount, which is also where that walk is bounded
+// against a truncated host upload.
+//
+// `(s_case >> kCaseTriShift) == 0` is then the single test for "this cell emits
+// nothing", true of an invalid cell, an all-outside one and an all-inside one
+// alike -- and the SAME test in all three passes, which is what stops the
+// counting and emitting passes disagreeing about which cells they cover.
+// Written on every path through phase 1, so it needs no separate zero-init
+// pass.
+const uint kCaseTriShift = 8u;
 shared uint s_case[kMaxSharedCells];
 // mcEdgeOwner's answer for each of the 12 edges: (delta.xyz, axis). A pure
 // function of the tables, identical for every cell and every block, so it is
@@ -171,37 +229,120 @@ shared ivec4 s_edge_owner[12];
 // this numbering, derived rather than tabulated for the reason mcEdgeOwner is.
 shared int s_owned_edge[3];
 
-// Claim one vertex slot and write it, returning the index -- or kNoVertex when
-// the arena is full.
+// Claim one vertex slot from the block's reserved range and write it, returning
+// the index -- or kNoVertex when the range is already spent.
 //
-// Past `vertex_capacity` the vertex is DROPPED but still counted, exactly as
-// mcEmitCell does for triangles: `vertex_count` must end as the field's true
-// total or the host's refit would undershoot again. A dropped vertex makes every
-// triangle referencing it undrawable, which the emit path handles by declining
-// to write that triangle while still counting its indices.
+// Past `vertex_capacity` the vertex is not written, but the slot is still
+// consumed and still returned. `vertex_count` therefore ends as the field's true
+// total whatever the arena holds -- the contract the host refits against -- and
+// a triangle referencing an unwritten slot declines to draw, which
+// mcTrianglePass decides by testing the range rather than by a sentinel.
 //
-// "The field's true total" is why a dropped OWNED vertex is recorded as
-// kVertexDropped rather than kNoVertex: counted once by its owner, and never
-// re-claimed by the cells that reference it. Left as kNoVertex, every such cell
-// would take the duplicate path and claim again, so an overflowing dispatch
-// would report V_owned + ~3T instead of the true ~0.75T -- MORE than not sharing
-// at all -- and the host would then refit a grow-only arena to that.
+// THE BOUND against the block's own reservation is what makes a disagreement
+// between the counting and emitting passes fail SAFE, exactly as the sibling
+// kernel's span bound does. The two are separate walks over one cached
+// classification rather than one act, and one escape exists -- mcOwnedEdgePass'
+// "cannot happen" gather, which fails in the UNDER-reservation direction,
+// because an owner that emits nothing sends every cell referencing its edges
+// down the duplicate path instead. Without this test the surplus would be
+// written over the NEXT block's vertices, with exact counters and no error
+// anywhere.
 int mcClaimVertex(vec3 position, vec3 normal, vec3 color) {
-  uint slot = atomicAdd(vertex_count, 1u);
-  if (slot >= pc.vertex_capacity) {
-    return kNoVertex;
+  uint claimed = atomicAdd(s_vcursor, 1u);
+  if (claimed >= s_vtotal) {
+    return kNoVertex;  // over-consumption: drop rather than overrun
   }
-  mcWriteVertex(slot, position, normal, color);
+  uint slot = s_vbase + claimed;
+  if (slot < pc.vertex_capacity) {
+    mcWriteVertex(slot, position, normal, color);
+  }
+  // Returned even when it lies past the arena: the slot is what a referencing
+  // cell must NOT re-claim, and mcTrianglePass tests the range before drawing.
   return int(slot);
 }
 
-// Phase 1: classify the cell and emit a vertex on each of its three OWNED edges.
+// PHASE ONE: classify the cell and count what it will produce -- nothing is
+// written and nothing is interpolated.
+//
+// Counting needs the cube index alone, which is why both ranges can be sized
+// before a single vertex exists, and why this reads mcCellSigns rather than
+// mcGather: it is the pass that runs over 100% of the block's cells, and a full
+// gather would copy eight sdf values out of every one of them -- plus up to 24
+// sRGB decodes -- for a count that uses none of it. The emit passes below
+// re-gather only the ~8% that produce something.
+//
+// Accumulated into the caller's registers across the whole strided loop and
+// pushed to the shared totals once per lane, not once per cell.
+void mcCountCell(int bs, uint local, inout uint verts, inout uint tris) {
+  int cube_index = mcCellSigns(bs, mcLocalBase(local, bs));
+  int n = mcCellTriangleCount(cube_index);
+  s_case[local] = uint(cube_index) | (uint(n) << kCaseTriShift);
+  if (n == 0) {
+    return;
+  }
+
+  // Vertices this cell OWNS: one per owned edge carrying a sign change.
+  for (int axis = 0; axis < 3; ++axis) {
+    int edge = s_owned_edge[axis];
+    bool inside_a = (cube_index & (1 << edge_to_vert[edge * 2 + 0])) != 0;
+    bool inside_b = (cube_index & (1 << edge_to_vert[edge * 2 + 1])) != 0;
+    if (inside_a != inside_b) {
+      ++verts;
+    }
+  }
+  tris += uint(n);
+}
+
+// PHASE ONE-B: count the vertices this cell will DUPLICATE.
+//
+// Separate from mcCountCell, and it has to be: a duplicate is decided by the
+// OWNER cell's state, which mcCountCell is still writing. Reading `s_case` in
+// the same pass that fills it races, and the race is invisible on a fixture
+// whose surface never meets an unintegrated voxel -- it under-reserves the
+// block's range, and the cursor then walks off the end of it.
+//
+// An edge is duplicated when its owner lies outside the block (the +face, where
+// sharing would need the neighbouring workgroup) or when the owner emits no
+// vertex at all. The second is not an edge case: an owner reaches corners the
+// referencing cell does not, so at the frontier of the integrated region it can
+// fail its gather while its neighbour succeeds. `(s_case >> kCaseTriShift) == 0`
+// is the SAME test mcOwnedEdgePass returns on, so the two cannot disagree about
+// which owners emitted; and an owner that DID emit always agrees about this
+// particular crossing, because both cells read the same two voxels for the edge.
+//
+// The row is walked by the count phase 1 cached, from the same table and the
+// same cached classification mcTrianglePass walks, so the two cannot disagree
+// about how many slots to reserve and how many to consume.
+uint mcCountDuplicates(int bs, uint local) {
+  uint c = s_case[local];
+  uint n = c >> kCaseTriShift;
+  if (n == 0u) {
+    return 0u;
+  }
+  int row = int(c & 0xFFu) * 16;
+  ivec3 base = mcLocalBase(local, bs);
+
+  uint dupes = 0u;
+  for (uint t = 0u; t < n; ++t) {
+    int e = row + int(t) * 3;
+    for (int k = 0; k < 3; ++k) {
+      ivec3 owner = base + s_edge_owner[tri_table[e + k]].xyz;
+      if (!all(lessThan(owner, ivec3(bs))) ||
+          (s_case[localIndex(owner, bs)] >> kCaseTriShift) == 0u) {
+        ++dupes;
+      }
+    }
+  }
+  return dupes;
+}
+
+// PHASE THREE: emit a vertex on each of the cell's three OWNED edges.
 //
 // Owned edges are the ones running +x/+y/+z from the cell's base corner, i.e.
 // corner 0 to corners 1/3/4 under this repo's corner numbering (the prior
 // engine's, ported verbatim). Every edge in the field is owned by exactly one
 // cell, so after this pass every in-block edge that carries a crossing has a
-// vertex, and phase 2 does no work for it but a lookup.
+// vertex, and phase four does no work for it but a lookup.
 void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
   // Cleared here rather than in a separate pass: this function writes every
   // slot it does not clear, and it runs over exactly the cells this thread will
@@ -211,17 +352,26 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
   s_edge_vtx[local * 3u + 1u] = kNoVertex;
   s_edge_vtx[local * 3u + 2u] = kNoVertex;
 
+  // Classified by mcCountCell, so a cell that emits nothing -- invalid, or with
+  // no crossing anywhere in it, so none on its owned edges either -- costs one
+  // shared read and no gather at all. That is most of them.
+  uint c = s_case[local];
+  if ((c >> kCaseTriShift) == 0u) {
+    return;
+  }
+  int cube_index = int(c & 0xFFu);
+
   ivec3 base = mcLocalBase(local, bs);
   float sdf[8];
   vec3 corner_color[8];
-  int cube_index;
-  if (!mcGather(bs, base, sdf, corner_color, cube_index)) {
-    s_case[local] = 0u;  // invalid: bit 8 clear
+  int regathered;
+  if (!mcGather(bs, base, sdf, corner_color, regathered)) {
+    // Cannot happen: mcCellSigns resolved the same eight corners through the
+    // same mcCornerStorage over the same quiescent buffers, and returned
+    // non-zero. If it ever does, this cell emits none of the vertices it was
+    // counted for, the cells referencing its edges duplicate instead, and
+    // mcClaimVertex's bound is what keeps the surplus inside this block.
     return;
-  }
-  s_case[local] = uint(cube_index) | 0x100u;
-  if (cube_index == 0 || cube_index == 255) {
-    return;  // no crossing anywhere in this cell, so none on its owned edges
   }
   ivec3 base_voxel = block.coord * bs + base;
   // One normal per cell, as before. A shared vertex therefore carries the
@@ -246,13 +396,12 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
     vec3 color;
     mcEdgeVertex(edge, sdf, corner_color, vec3(0.0), base_voxel, pc.voxel_size,
                  pc.iso, pc.has_color, position, color);
-    int slot = mcClaimVertex(position, normal, color);
-    s_edge_vtx[local * 3u + uint(axis)] =
-        slot != kNoVertex ? slot : kVertexDropped;
+    // Always a real slot now, in range or not -- see mcClaimVertex.
+    s_edge_vtx[local * 3u + uint(axis)] = mcClaimVertex(position, normal, color);
   }
 }
 
-// Phase 2: emit this cell's triangles as indices into the shared vertices.
+// PHASE FOUR: emit this cell's triangles as indices into the shared vertices.
 //
 // An edge whose owner cell lies inside this block is a lookup. One whose owner
 // lies outside -- the block's +face, where sharing would need the neighbouring
@@ -261,13 +410,11 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
 // why the win is ~4x rather than the ~6x full sharing would give.
 void mcTrianglePass(BlockIndex block, int bs, uint local) {
   uint c = s_case[local];
-  if ((c & 0x100u) == 0u) {
-    return;  // phase 1 found an invalid corner
+  uint n = c >> kCaseTriShift;
+  if (n == 0u) {
+    return;  // invalid, or no crossing anywhere in this cell
   }
-  int cube_index = int(c & 0xFFu);
-  if (cube_index == 0 || cube_index == 255) {
-    return;
-  }
+  int row = int(c & 0xFFu) * 16;
 
   ivec3 base = mcLocalBase(local, bs);
   ivec3 base_voxel = block.coord * bs + base;
@@ -278,45 +425,50 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
   vec3 normal = vec3(0.0, 0.0, 1.0);
   bool have_corners = false;
 
-  // TODO(mesh): this kernel still appends PER TRIANGLE through the global
-  // `index_count`, so its output interleaves across blocks and no per-block
-  // range describes it -- the default kernel's per-block reservation is exactly
-  // what incremental extraction is built on, and `share_vertices` is therefore
-  // the one path a dirty-only dispatch cannot use. Restructuring it is a
-  // separate change: sharing claims VERTICES from a second atomic as well, so a
-  // block would have to reserve two spans, and the arena the vertex span comes
-  // from is the one the seam-B ring hands to gfx.
+  // Triangles come from the block's reserved range, not from a per-triangle
+  // global atomic, so this kernel's output is now per-block contiguous in BOTH
+  // buffers -- which is what a dirty-only dispatch needs in order to leave a
+  // clean block's geometry in place.
   //
-  // `e` indexes TABLE ENTRIES, not triangles -- the row is walked three entries
-  // at a time. mcWriteTriangle's `t` counts triangles and multiplies by three
-  // itself, so passing this variable there would read three times too far along
-  // the row and emit plausible, wrong geometry. Named apart for that reason.
-  // Bounded by the row as well as its -1, for the reason kMaxTrianglesPerCell
-  // is declared: the terminator is host-uploaded data, and this kernel has no
-  // per-block span to fail safe against.
-  for (int e = 0; e < kMaxTrianglesPerCell * 3 &&
-                  tri_table[cube_index * 16 + e] != -1;
-       e += 3) {
+  // ONE shared atomic for the cell's whole run, off the count phase 1 cached --
+  // not one per triangle, which at room0 scale is ~766k threadgroup atomics
+  // against ~320k. The cursor is shared, so the order cells land in is
+  // unspecified; every slot it hands out is inside the range, because the range
+  // was sized from this same count.
+  //
+  // The bound is what makes a disagreement between the counting and emitting
+  // passes fail SAFE, and it is the reason the count is cached rather than
+  // recomputed here from a second walk of the row. Without it a run that overran
+  // would write over the NEXT block's triangles, with a correct-looking
+  // indexCount and no error anywhere: the per-triangle append this replaced
+  // could not overrun by construction, because counting and writing were one
+  // act, and that guarantee has to be paid for somewhere.
+  uint claimed = atomicAdd(s_icursor, n);
+  if (claimed + n > s_ttotal) {
+    return;
+  }
+  uint first_tri = s_ibase + claimed;
+
+  for (uint t = 0u; t < n; ++t) {
+    // `e` indexes TABLE ENTRIES, not triangles -- the row is walked three
+    // entries at a time, and mcCellTriangleCount is what bounded that walk
+    // against a truncated host upload when the count was taken.
+    int e = row + int(t) * 3;
     // Resolve the three corners of this triangle to vertex indices first, then
-    // claim the index slots -- so a triangle is counted exactly once whether or
-    // not its vertices had to be duplicated.
+    // write -- so a triangle is emitted exactly once whether or not its
+    // vertices had to be duplicated.
     int vi[3];
     bool ok = true;
     for (int k = 0; k < 3; ++k) {
-      int edge = tri_table[cube_index * 16 + e + k];
+      int edge = tri_table[e + k];
       ivec4 owner_info = s_edge_owner[edge];
       ivec3 owner = base + owner_info.xyz;
       int axis = owner_info.w;
       int slot = kNoVertex;
       if (all(lessThan(owner, ivec3(bs)))) {
-        uint oi = uint(owner.x + bs * (owner.y + bs * owner.z));
-        slot = s_edge_vtx[oi * 3u + uint(axis)];
+        slot = s_edge_vtx[uint(localIndex(owner, bs)) * 3u + uint(axis)];
       }
-      if (slot == kVertexDropped) {
-        // The owner claimed and lost it to a full arena, and already counted
-        // it. Claiming again here would double-count.
-        ok = false;
-      } else if (slot == kNoVertex) {
+      if (slot == kNoVertex) {
         // Duplicate: this cell's own corners describe the same edge, and
         // mcEdgeVertex orders that edge's endpoints canonically, so the
         // position is bit-identical to what the owner would have produced.
@@ -334,17 +486,26 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
         mcEdgeVertex(edge, sdf, corner_color, vec3(0.0), base_voxel,
                      pc.voxel_size, pc.iso, pc.has_color, position, color);
         slot = mcClaimVertex(position, normal, color);
-        if (slot == kNoVertex) {
-          ok = false;  // arena full; counted below, not written
-        }
+      }
+      // The vertex was never written, so a triangle referencing it cannot be
+      // drawn: reserved but past the arena, or -- the fail-safe -- past the
+      // block's own reservation, which mcClaimVertex reports as kNoVertex.
+      // Counted already, in the phase that sized the range.
+      //
+      // UNSIGNED, so both land above `vertex_capacity`: `slot` round-trips
+      // through `int`, and a signed compare would read kNoVertex as -1 and any
+      // slot at or beyond 2^31 as negative -- publishing an index far outside a
+      // 64-byte-stride arena with robustBufferAccess enabled nowhere.
+      if (uint(slot) >= pc.vertex_capacity) {
+        ok = false;
       }
       vi[k] = slot;
     }
-    uint first = atomicAdd(index_count, kIndicesPerTriangle);
-    uint tri = first / kIndicesPerTriangle;
+    uint tri = first_tri + t;
     if (!ok || tri >= pc.capacity) {
-      continue;  // dropped, still counted -- see mcEmitCell's contract
+      continue;  // dropped; the counters already carry it
     }
+    uint first = tri * kIndicesPerTriangle;
     // Reversed winding (0, 2, 1) so the CCW front face points along the outward
     // gradient, matching mcEmitCell and what gfx expects.
     indices[first + 0u] = uint(vi[0]);
@@ -385,6 +546,14 @@ void main() {
     sharing_applied = sharing ? 1u : 0u;
   }
 
+  if (tid == 0u) {
+    s_vtotal = 0u;
+    s_ttotal = 0u;
+    s_vbase = 0u;
+    s_ibase = 0u;
+    s_vcursor = 0u;
+    s_icursor = 0u;
+  }
   mcResolveNeighbourhood(block, tid);
   // Derived once per workgroup by the first 12 lanes, under the same barrier as
   // the neighbourhood: mcEdgeOwner is a pure function of the tables, so having
@@ -415,6 +584,80 @@ void main() {
     return;
   }
 
+  // PHASE ONE -- classify every cell and size both ranges. Writes nothing but
+  // `s_case`. Both counts are accumulated per LANE across the whole strided
+  // loop and pushed once, as the sibling kernel does, rather than per cell.
+  uint my_verts = 0u;
+  uint my_tris = 0u;
+  for (uint local = tid; local < vpb; local += group_threads) {
+    mcCountCell(bs, local, my_verts, my_tris);
+  }
+  if (my_verts != 0u) {
+    atomicAdd(s_vtotal, my_verts);
+  }
+  if (my_tris != 0u) {
+    atomicAdd(s_ttotal, my_tris);
+  }
+  // Every cell's classification must be visible before any cell asks whether its
+  // edge owners will emit.
+  barrier();
+  uint my_dupes = 0u;
+  for (uint local = tid; local < vpb; local += group_threads) {
+    my_dupes += mcCountDuplicates(bs, local);
+  }
+  if (my_dupes != 0u) {
+    atomicAdd(s_vtotal, my_dupes);
+  }
+  barrier();
+
+  // PHASE TWO -- one atomic per counter for the whole block.
+  //
+  // Both counters are bumped by the block's FULL totals whatever the arena
+  // holds, so each still ends as the field's true total -- the contract the host
+  // refits an undersized arena against. It is a stronger form of the old
+  // count-but-drop: the totals are taken before any slot is, so an overflow can
+  // no longer make either one a lower bound by abandoning a cell part-way.
+  // TODO(mesh): stage 3 (dirty-only dispatch) needs the block-to-range mapping
+  // these two lines compute and drop -- `active_blocks[block_i]` owns vertices
+  // [s_vbase, s_vbase + s_vtotal) and triangles [s_ibase, s_ibase + s_ttotal).
+  // Neither is derivable on the host, because the atomics hand ranges out in
+  // workgroup arrival order rather than block order. Publishing them is a new
+  // binding, a host allocation and a DeviceMesh field, which is stage 3's scope
+  // and not this one's -- the same deferral marked in marching_cubes_sparse.comp,
+  // and here it is two ranges rather than one.
+  if (tid == 0u) {
+    if (s_vtotal != 0u) {
+      s_vbase = atomicAdd(vertex_count, s_vtotal);
+    }
+    if (s_ttotal != 0u) {
+      s_ibase = atomicAdd(index_count, s_ttotal * kIndicesPerTriangle) /
+                kIndicesPerTriangle;
+    }
+  }
+  barrier();
+
+  // Nothing reserved, or a whole reservation lies past its arena. The second is
+  // newly PROVABLE per block and worth proving on both buffers: every slot this
+  // block hands out is >= its base, so a base already past capacity means not
+  // one vertex -- and therefore not one triangle -- of this block can be
+  // written, where the alternative is a full re-gather per emitting cell to
+  // drop each triangle individually at the bottom of the loop. That is the
+  // common case on a first extract and on every refit, where the arena is
+  // planned at ~64 triangles per block against a field that can emit ~1400.
+  // Both counters were bumped by the block's FULL totals above, so returning
+  // here costs the host's refit nothing.
+  //
+  // Safe because all three terms are read from `shared` AFTER the barrier and
+  // are therefore identical in every invocation: the workgroup returns
+  // all-or-none. There IS a barrier below, so that is the property that matters
+  // -- a per-lane term added to this condition would leave part of the group at
+  // it, which is undefined in SPIR-V and in practice a hang.
+  if (s_ttotal == 0u || s_ibase >= pc.capacity ||
+      s_vbase >= pc.vertex_capacity) {
+    return;
+  }
+
+  // PHASE THREE -- emit a vertex on every owned edge, into the reserved range.
   for (uint local = tid; local < vpb; local += group_threads) {
     mcOwnedEdgePass(block, bs, local);
   }
@@ -422,6 +665,7 @@ void main() {
   // neighbour's slot -- this barrier is the whole of what makes sharing safe.
   barrier();
 
+  // PHASE FOUR -- emit triangles as indices into those vertices.
   for (uint local = tid; local < vpb; local += group_threads) {
     mcTrianglePass(block, bs, local);
   }
