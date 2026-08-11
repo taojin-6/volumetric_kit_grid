@@ -67,6 +67,24 @@ constexpr std::uint64_t kSeedTrisPerBlock = 64;
 // has. Unshared extracts never consult this; they know the answer is 3000.
 constexpr std::uint32_t kSeedVertsPer1000 = 700;
 
+// Arena occupancy, as a multiple of the live surface, at which an incremental
+// extract stops being worth its memory and the next one is made full.
+//
+// An incremental pass retires a relocated block's old range by writing
+// zero-area triangles over it rather than by compacting the arena -- compaction
+// needs a prefix sum over every block, so a host-driven pass, which is the
+// thing this whole design exists to avoid. Nothing else reclaims them, so
+// occupancy is monotone non-decreasing while the surface is not, and without a
+// ceiling the arena grows until it stops fitting one storage binding.
+//
+// A full extract rewrites the arena from zero, so it IS the compaction, and
+// this is what schedules one. 2 is chosen as the point where the dead triangles
+// outweigh the live ones: at that ratio the arena is twice the mesh, half the
+// draw is degenerate, and one full re-mesh buys both back. Tighter and a steady
+// trickle of relocations forces a full pass every few frames; looser and the
+// resident cost is what the retained arena was meant to bound.
+constexpr std::uint64_t kMaxArenaOccupancy = 2;
+
 // Cells the sharing kernel's shared owned-edge table holds -- block_size 8.
 //
 // Mirrors kMaxSharedCells in marching_cubes_sparse_shared.comp, and a comment
@@ -193,10 +211,10 @@ struct SparsePushConstants {
   std::uint32_t dirty_capacity = 0;
 };
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
-// sizeof == 52 but silently drift the host<->GLSL push-constant ABI, so guard
-// each one, matching the dense PushConstants above.
+// sizeof unchanged but silently drift the host<->GLSL push-constant ABI, so
+// guard each one, matching the dense PushConstants above.
 static_assert(sizeof(SparsePushConstants) == 60,
-              "SparsePushConstants must be 52 bytes");
+              "SparsePushConstants must be 60 bytes");
 static_assert(offsetof(SparsePushConstants, vertex_capacity) == 32,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, block_size) == 0,
@@ -221,11 +239,11 @@ static_assert(offsetof(SparsePushConstants, bucket_size) == 40,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, max_chain) == 44,
               "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, write_spans) == 48,
+              "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, incremental) == 52,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, dirty_capacity) == 56,
-              "SparsePushConstants layout drift");
-static_assert(offsetof(SparsePushConstants, write_spans) == 48,
               "SparsePushConstants layout drift");
 
 // The draw command plus two words of recon scratch, starting at byte 20,
@@ -243,8 +261,17 @@ constexpr VkDeviceSize kVertexCountOffset =
     sizeof(VkDrawIndexedIndirectCommand);
 constexpr VkDeviceSize kSharingAppliedOffset =
     kVertexCountOffset + sizeof(std::uint32_t);
-constexpr VkDeviceSize kIndirectBufferBytes =
+//   * Blocks an incremental dispatch actually re-meshed, which is the number
+//     the whole feature trades against and the one thing about it the host
+//     cannot derive: the dilation from the changed set to the re-mesh set
+//     happens on-device, off shared memory. Bumped once per re-meshed
+//     workgroup by the default kernel and only while pc.incremental is set --
+//     a full pass re-meshes its whole active set, which the host already knows,
+//     and 107k atomics to restate it is not free.
+constexpr VkDeviceSize kRemeshedBlocksOffset =
     kSharingAppliedOffset + sizeof(std::uint32_t);
+constexpr VkDeviceSize kIndirectBufferBytes =
+    kRemeshedBlocksOffset + sizeof(std::uint32_t);
 
 // Read one of the scratch words back out of the command buffer.
 std::uint32_t read_scratch(const Buffer& indirect, VkDeviceSize offset) {
@@ -562,7 +589,7 @@ void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   released_through_ = std::max(released_through_, generation);
 }
 
-Status MarchingCubes::ensure_indirect_command() {
+Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles) {
   if (!indirect().valid()) {
     // INDIRECT_BUFFER beside STORAGE_BUFFER: the kernel counts into field 0
     // through the storage binding, and a renderer issues
@@ -585,23 +612,23 @@ Status MarchingCubes::ensure_indirect_command() {
   // from -- one instance, no index or vertex offset, and the identity index run
   // means firstIndex is always 0.
   VkDrawIndexedIndirectCommand reset{};
-  // Seeded, not zeroed, for an incremental pass: the arena still holds every
-  // clean block's triangles in [0, watermark), and the kernel's atomic hands
-  // out APPEND slots past that. Consumed here rather than read from a member on
-  // every path, so a dense extract or a later full one cannot inherit it.
-  reset.indexCount = indirect_seed_triangles_ * kIndicesPerTriangle;
-  indirect_seed_triangles_ = 0;
+  // Seeded, not zeroed, for an incremental pass: the arena still holds that
+  // many triangles from the last extract, and the kernel's atomic hands out
+  // APPEND slots past them. Every other caller passes 0, which is the plain
+  // reset this has always been.
+  reset.indexCount = seed_triangles * kIndicesPerTriangle;
   reset.instanceCount = 1;
   reset.firstIndex = 0;
   reset.vertexOffset = 0;
   reset.firstInstance = 0;
   std::memcpy(indirect().mapped(), &reset, sizeof(reset));
-  // The two scratch words past the command. Reset for the same reason
+  // The three scratch words past the command. Reset for the same reason
   // indexCount is: a refit re-runs the dispatch, and a counter carried over
   // would accumulate onto the abandoned attempt's total. `sharing_applied` for
   // a stronger reason -- it is a report the host *fails* on, so it must not be
-  // able to read as a stale success.
-  const std::uint32_t scratch_reset[2] = {0, 0};
+  // able to read as a stale success -- and `remeshed_blocks` because a full
+  // pass never writes it, so a stale value would be published as this call's.
+  const std::uint32_t scratch_reset[3] = {0, 0, 0};
   std::memcpy(static_cast<std::byte*>(indirect().mapped()) + kVertexCountOffset,
               scratch_reset, sizeof(scratch_reset));
   return {};
@@ -727,7 +754,8 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
 }
 
 Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
-                                            std::uint32_t vertex_capacity) {
+                                            std::uint32_t vertex_capacity,
+                                            std::uint32_t seed_triangles) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
   // rejected because the growth policy overshot.
@@ -760,7 +788,12 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // the reuse early-return below, and must stay there: a refit that reallocated
   // nothing still has to hand the retry a zeroed count, or the second dispatch
   // accumulates onto the first's.
-  VR_TRY(ensure_indirect_command());
+  //
+  // It happens BELOW the two range guards above, which is why the seed is a
+  // parameter rather than a member: either guard returns without resetting
+  // anything, and a seed latched on the object would then survive to be
+  // inherited by a later dense or empty extract over an arena it had rewritten.
+  VR_TRY(ensure_indirect_command(seed_triangles));
 
   // Two buffers, two budgets, and each is grown ON ITS OWN.
   //
@@ -955,13 +988,20 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
 
   // Two kernels share one pool. The dense kernel binds five storage buffers:
   // tables (persistent) + the per-extract samples / colors / vertices /
-  // command. The sparse kernel binds nine: tables (persistent) + the
-  // per-extract active blocks / hash entries / tsdf / weight / color /
-  // vertices / command / block spans -- plus a tenth, the index run, when it is
-  // the sharing variant, which writes real indices where the default one leaves
-  // the host's identity run alone. The spans move to binding 9 there, since
-  // sharing spends 8 on that index run; the count below and the two shaders'
-  // literals are the only statement of that, so they are maintained together.
+  // command. Both sparse variants bind TEN, and they are the same ten only up
+  // to binding 7 -- tables (persistent) + the per-extract active blocks / hash
+  // entries / tsdf / weight / color / vertices / command. After that the two
+  // disagree, which is why the count is unconditional and the assignment is
+  // not:
+  //
+  //   default   8 = block spans, 9 = the dirty-block flags it dilates
+  //   sharing   8 = the index run it writes itself, 9 = block spans
+  //
+  // The sharing variant has no dirty binding because incremental extraction
+  // refuses it (see extract_device_incremental), and the default one has no
+  // index-run binding because its run is the identity the host filled on the
+  // last grow. The count here and the two shaders' `binding =` literals are the
+  // only statement of any of this, so they are maintained together.
   // KernelSetBuilder (core/compute_kernel.hpp) builds each
   // layout + pipeline and allocates its set from a shared pool sized to the
   // exact descriptor total.
@@ -1107,6 +1147,14 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   // readable would point them at geometry that is no longer there -- the exact
   // staleness disarm_indirect_command() exists to prevent for the draw command.
   block_spans_generation_ = 0;
+  // And the arena's incremental state, for the same reason and more directly:
+  // this overload is about to overwrite the very arena a watermark describes,
+  // with a kernel that knows nothing about blocks or spans. Left standing, the
+  // next extract_device_incremental would seed its draw command with a count of
+  // triangles this pass replaced and publish the dense mesh's vertices as the
+  // clean blocks' contribution. Nothing in the span table says "not mine"; this
+  // is what does.
+  arena_state_ = ArenaState{};
 
   // Per-extract buffers (sized to this grid): the samples in, the vertex arena
   // out (3 vertices per triangle at worst-case capacity), and the atomic
@@ -1289,19 +1337,23 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
 Result<DeviceMesh> MarchingCubes::extract_device_incremental(
     volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks& dirty,
     ExtractTimings* timings) {
-  // The request, not the decision. extract_device below decides whether an
+  // The request, not the decision. extract_device_impl decides whether an
   // incremental pass is actually SOUND -- spans anchored to this grid, a live
-  // watermark, no sharing -- and falls back to a full extract when it is not,
-  // which is why this is one line and not a second copy of that function.
-  pending_dirty_ = dirty;
-  Result<DeviceMesh> result = extract_device(grid, iso, timings);
-  pending_dirty_ = DirtyBlocks{};
-  return result;
+  // watermark, flags the integrator vouches for, no sharing, an arena that
+  // survives -- and falls back to a full extract when it is not, which is why
+  // this is one line and not a second copy of that function.
+  return extract_device_impl(grid, iso, &dirty, timings);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
+  return extract_device_impl(grid, iso, nullptr, timings);
+}
+
+Result<DeviceMesh> MarchingCubes::extract_device_impl(
+    volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
+    ExtractTimings* timings) {
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
   // failed call then reports zeros rather than a previous call's numbers.
@@ -1361,6 +1413,18 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // that the counters carry the block's full total for the refit below. After
   // any of those four the table names triangles at bases the arena never held.
   block_spans_generation_ = 0;
+  // What the arena held going in, snapshotted before the line below retires it
+  // -- this is the only read of it, and the predicate far below is built out of
+  // this copy rather than the member.
+  const ArenaState prev_arena = arena_state_;
+  // Retired for exactly the reasons the span generation above is, and it has to
+  // be retired on the SAME statement rather than on each branch: this call may
+  // fail after having dispatched (the unrecoverable overflow, a failed refit
+  // that has already freed the old arena), and every one of those exits leaves
+  // the arena holding something no watermark describes. Cleared up front and
+  // re-established only on the publishing return, so there is no exit that can
+  // strand it.
+  arena_state_ = ArenaState{};
 
   // The active set drives the dispatch (one workgroup per block). An empty map
   // means nothing to mesh.
@@ -1389,8 +1453,9 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // that is the entire point of publishing one -- so inheriting the previous
     // extract's live indexCount would silently redraw the previous mesh out of
     // whichever arena this slot happens to hold. Zeroed, it draws nothing,
-    // which is what an empty mesh means.
-    VR_TRY(ensure_indirect_command());
+    // which is what an empty mesh means -- and zero is what this path passes,
+    // rather than what it happens to find, since the seed is a parameter.
+    VR_TRY(ensure_indirect_command(0));
     // Stamped here and not a line earlier: this is the last fallible statement,
     // so from here the DeviceMesh below is certain to be handed out. A stamp
     // above a return that never publishes is a slot nothing can release.
@@ -1523,35 +1588,70 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // bindings" while arena_alloc_ms read clean -- and this is a tier whose
   // optimisation decisions are made off these rows (see DECISIONS.md, "Measured
   // lessons"). It is an allocation, so it is timed as one.
-  VR_TRY(ensure_block_spans(grid));
   // Whether this pass may re-mesh only the changed blocks, decided HERE rather
   // than by the caller: every clause is something the caller cannot see.
   //
-  //  - flags bound at all (the plain extract_device never sets them);
+  //  - flags bound at all (the plain extract_device passes none), non-empty,
+  //    and anchored to THIS grid's topology -- the integrator answers the last
+  //    two, and returns a null handle rather than flags it will not vouch for;
   //  - spans tracked, since the kernel reads a block's own range from them;
   //  - not sharing, since a shared vertex is not owned three-per-triangle, so a
   //    relocated block cannot retire what it leaves behind;
   //  - one slot, since the arena must persist across the call and a ring hands
-  //    each extract a different one;
-  //  - a live watermark AND spans still anchored to this grid's topology -- the
-  //    first extract has neither, and a remove()/clear() retires both.
+  //    each extract a different one (the TODO(mesh) on the class);
+  //  - an arena state from a published extract, still anchored to this grid's
+  //    topology and to the span table as that extract left it. The first
+  //    extract has none, a remove()/clear() moves the epoch, and a dense
+  //    extract or any failure since cleared it outright;
+  //  - an arena this call will not have to GROW, since a grow reallocates
+  //    without copying and the clean blocks' triangles live in the old buffer.
+  //    Decided here rather than discovered inside ensure_output_buffers, which
+  //    is a single call that seeds the draw command on its way past the point
+  //    of no return.
+  //
+  // Read off `prev_arena` rather than the members, and decided ABOVE
+  // ensure_block_spans, which re-anchors span_epoch_ and bumps span_serial_ on
+  // every call: a clause compared after it would be comparing this call's own
+  // anchor with itself, which is a tautology that passes for a table written
+  // for a topology that has since moved.
   //
   // Any clause failing means a FULL extract, which re-establishes all of them.
   // Falling back rather than refusing is the point: a caller fusing a live scan
   // cannot predict a topology change, and the correct response to one is to
-  // re-mesh everything, not to fail.
-  const bool incremental =
-      pending_dirty_.flags != VK_NULL_HANDLE && config_.track_block_spans &&
-      !config_.share_vertices && slot_count_ == 1 && watermark_ != 0 &&
-      span_epoch_ == grid.topology_epoch();
-  if (!incremental) {
-    // A full pass rewrites the arena from zero, so any watermark from before it
-    // names triangles that are about to be overwritten.
-    watermark_ = 0;
-  }
-  indirect_seed_triangles_ = watermark_;
+  // re-mesh everything, not to fail. Which one the caller got is published as
+  // ExtractTimings::incremental, since none of this is visible from outside.
+  const std::uint32_t planned_verts = plan_vertex_capacity(capacity);
+  bool incremental =
+      dirty != nullptr && dirty->flags != VK_NULL_HANDLE &&
+      dirty->capacity != 0 && dirty->epoch == grid.topology_epoch() &&
+      config_.track_block_spans && !config_.share_vertices &&
+      slot_count_ == 1 && prev_arena.watermark != 0 &&
+      prev_arena.epoch == grid.topology_epoch() &&
+      prev_arena.serial == span_serial_ && arena().valid() &&
+      planned_verts <= arena_vertex_capacity() && capacity <= arena_capacity();
 
-  VR_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity)));
+  // The flags are the second binding in this extract whose buffer ANOTHER tier
+  // sized, and they get the same treatment the hash entries above do: bound
+  // with the range the push constant claims rather than VK_WHOLE_SIZE, and
+  // checked against the device limit first. The kernel reads every slot below
+  // `dirty_capacity`, so binding the whole buffer would leave a caller's
+  // over-stated capacity as an out-of-bounds device read -- robustBufferAccess
+  // is enabled nowhere in this repo. Bound to the stated range instead, an
+  // over-statement is a descriptor whose range exceeds its buffer, which the
+  // validation layers name at the binding site.
+  const VkDeviceSize dirty_bytes =
+      incremental
+          ? static_cast<VkDeviceSize>(dirty->capacity) * sizeof(std::uint32_t)
+          : 0;
+  if (incremental) {
+    VR_TRY(check_storage_buffer_range(
+        "MarchingCubes::extract: dirty block flags", dirty_bytes,
+        static_cast<VkDeviceSize>(max_storage_buffer_range_)));
+  }
+
+  VR_TRY(ensure_block_spans(grid));
+  VR_TRY(ensure_output_buffers(capacity, planned_verts,
+                               incremental ? prev_arena.watermark : 0u));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
@@ -1600,8 +1700,8 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // 1-element dummy the colour slot uses when this pass is full: a descriptor
     // must be bound either way, and a full pass never reads it.
     kernel_sparse_.set.write_storage_buffer(
-        9, incremental ? pending_dirty_.flags : color_dummy_.handle(), 0,
-        VK_WHOLE_SIZE);
+        9, incremental ? dirty->flags : color_dummy_.handle(), 0,
+        incremental ? dirty_bytes : VK_WHOLE_SIZE);
   }
 
   if (config_.share_vertices) {
@@ -1653,8 +1753,10 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // same-typed adjacent scalars, so a positional slip would compile.
     push.vertex_capacity = requested_verts;
     push.write_spans = config_.track_block_spans ? 1u : 0u;
+    // Read from the loop variable, not from the decision above it: the refit
+    // below turns the retry into a full pass, and this is what carries that.
     push.incremental = incremental ? 1u : 0u;
-    push.dirty_capacity = incremental ? pending_dirty_.capacity : 0u;
+    push.dirty_capacity = incremental ? dirty->capacity : 0u;
 
     // One workgroup per block, not one thread per voxel: the kernel resolves
     // the block's 2x2x2 neighbourhood into shared memory, which only works when
@@ -1736,6 +1838,17 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // reject the refit against maxStorageBufferRange, or fail the allocation
     // outright after having already freed the old arena -- in which case
     // arena_capacity() is 0 and the clamp writes exactly that.
+    //
+    // The retry is a FULL pass, whatever this one was, and the seed it is given
+    // is 0 to match. Three independent reasons, any one of which is enough:
+    // attempt 0 has already overwritten the span table for every block it
+    // processed, so no block can still read the range it held BEFORE this call;
+    // the refit may reallocate the arena, which discards the clean blocks'
+    // triangles outright; and the retained run's own triangles are among those
+    // this dispatch over-counted, so seeding the retry with them would count
+    // them twice. Clearing the flag here is what makes all three moot -- a full
+    // pass re-establishes the arena, the spans and the watermark together.
+    incremental = false;
     if (Status refit = ensure_output_buffers(
             produced, std::max(produced_verts, plan_vertex_capacity(produced)));
         !refit.ok()) {
@@ -1763,28 +1876,6 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // bound run on, so bound it by the buffers that have to hold it rather than
   // by a variable that tracks them.
   const std::uint32_t emitted = std::min(produced, usable_triangle_capacity());
-
-  // The arena now holds `emitted` triangles, every clean block's included, and
-  // the next incremental pass appends past them. Set on BOTH paths: a full
-  // extract is what establishes the watermark an incremental one needs, which
-  // is why the first call against a grid can only be full.
-  watermark_ = emitted;
-
-  // Record the density this surface actually had, so the next call's plan
-  // scales it by that call's active set instead of discovering the size by
-  // overflowing. Rounded up, so any non-empty surface records at least one
-  // triangle per block; a surface that emitted nothing records 0, and the next
-  // plan falls back to the seed.
-  tris_per_block_ = static_cast<std::uint32_t>(
-      (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
-  // The vertex density this surface actually had, for the next call's arena
-  // budget. Recorded only for a non-empty surface, so a frame that meshed
-  // nothing cannot drive the next plan to zero.
-  if (emitted > 0) {
-    verts_per_1000_tris_ = static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(produced_verts) * 1000 + emitted - 1) /
-        emitted);
-  }
 
   // Nothing to clamp here, and that is a property worth stating rather than a
   // line worth adding: the loop breaks only on `produced <= requested`, and
@@ -1820,6 +1911,15 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // spans must measure nothing. Its cost lands in arena_alloc_ms, with the
   // allocation it maintains -- the only row that would otherwise be invisible
   // to total_ms(), which sums the six phases rather than wrapping the call.
+  // Triangles the SURFACE has, as against `emitted`, which is what the ARENA
+  // holds. The two differ only on an incremental pass, and there they differ
+  // permanently: a relocating block appends its new range and retires its old
+  // one to zero-area triangles, which are never reclaimed, so occupancy is
+  // monotone where the surface is not. Summed off the spans -- the same table
+  // the kernel just wrote, and a clean block's entry is the one its last
+  // extract left, which is exactly its current range -- rather than read from
+  // a counter, because no counter distinguishes the two.
+  std::uint32_t live = emitted;
   if (config_.track_block_spans) {
     block_spans_generation_ = generation_;
     // Both bounds hoisted: they are loop-invariant, and the array is allocated
@@ -1827,14 +1927,75 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // one per active block.
     const std::uint32_t stamps =
         span_stamp_ != nullptr ? block_span_capacity() : 0;
+    const auto* spans = static_cast<const BlockSpan*>(block_spans_.mapped());
+    std::uint64_t live_sum = 0;
     for (const volume::BlockIndex& b : active) {
       const auto slot =
           static_cast<std::uint32_t>(b.ptr) / static_cast<std::uint32_t>(vpb);
       if (slot < stamps) {
         span_stamp_[slot] = span_serial_;
       }
+      if (incremental && slot < block_span_capacity()) {
+        live_sum += spans[slot].triangle_count;
+      }
+    }
+    // Clamped by occupancy, which bounds it by construction: a span describes a
+    // range inside the arena, so the live total cannot exceed what the arena
+    // holds. The clamp is against the table having been written by something
+    // other than this call's dispatch, which the stamps make unreadable but do
+    // not make impossible to sum.
+    if (incremental) {
+      live = std::min(static_cast<std::uint32_t>(
+                          std::min<std::uint64_t>(live_sum, 0xFFFFFFFFull)),
+                      emitted);
     }
     if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
+  }
+
+  // Record the density this surface actually had, so the next call's plan
+  // scales it by that call's active set instead of discovering the size by
+  // overflowing. Rounded up, so any non-empty surface records at least one
+  // triangle per block; a surface that emitted nothing records 0, and the next
+  // plan falls back to the seed.
+  //
+  // From `live`, never from `emitted`. Feeding occupancy back in makes the
+  // estimate ratchet: it is monotone non-decreasing on the incremental path, so
+  // each pass plans a larger arena than the last on evidence its own retired
+  // triangles produced, grows geometrically to 1.5x that, and never corrects --
+  // and plan_capacity's own comment describes where an over-plan ends, at a
+  // request rejected against maxStorageBufferRange for a surface that fits.
+  tris_per_block_ = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(live) + num_active - 1) / num_active);
+  // The vertex density this surface actually had, for the next call's arena
+  // budget. Recorded only for a non-empty surface, so a frame that meshed
+  // nothing cannot drive the next plan to zero.
+  if (emitted > 0) {
+    verts_per_1000_tris_ = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(produced_verts) * 1000 + emitted - 1) /
+        emitted);
+  }
+
+  // Re-establish what the next extract is allowed to trust, at the one point
+  // where it is certainly true: this call is about to hand out a mesh, so the
+  // arena holds `emitted` triangles described by a span table anchored to this
+  // grid and stamped with this serial.
+  //
+  // Withheld when the arena has drifted too far past the surface it describes.
+  // Retirement writes zero-area triangles rather than compacting -- compacting
+  // would need a prefix sum over every block, so a host-driven pass -- and
+  // nothing else reclaims them, so occupancy would climb until the arena stops
+  // fitting. Dropping the state here makes the NEXT extract full, and a full
+  // pass rewrites the arena from zero, which is the compaction. The ratio is
+  // the whole policy: too tight and every frame is a full re-mesh, too loose
+  // and the arena carries more dead triangles than live ones. Only the spans
+  // can answer it, so it is only checked where they were summed.
+  const bool over_occupied =
+      config_.track_block_spans &&
+      static_cast<std::uint64_t>(live) * kMaxArenaOccupancy < emitted;
+  if (!over_occupied) {
+    arena_state_.watermark = emitted;
+    arena_state_.epoch = grid.topology_epoch();
+    arena_state_.serial = span_serial_;
   }
 
   DeviceMesh device_mesh;
@@ -1866,6 +2027,19 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   device_mesh.live_generation = &generation_;
   if (timings != nullptr) {
     timings->active_blocks = num_active;
+    // What this call actually did, not what it was asked for: every clause of
+    // the predicate above is invisible to the caller, and each turns the
+    // feature off either silently (a fallback) or permanently (a config flag),
+    // so a run that quietly re-meshes everything would otherwise read exactly
+    // like one that does not. `dispatches` cannot carry this -- it counts refit
+    // rounds and reads 1 on both paths.
+    timings->incremental = incremental;
+    // The kernel's own count, and only the kernel's: the dilation from the
+    // changed set to the re-mesh set runs on-device off shared memory, so the
+    // host has no way to derive it. 0 on a full pass, where the answer is
+    // active_blocks and the atomic to restate it is not free.
+    timings->remeshed_blocks =
+        incremental ? read_scratch(indirect(), kRemeshedBlocksOffset) : 0u;
     timings->triangle_capacity = requested;
     timings->emitted_triangles = emitted;
     // 0 in every in-tree configuration (block_size 8 -> 512 cells). Nonzero

@@ -106,12 +106,30 @@ layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
   Vertex vertices[];
 };
 // The draw command's indexCount, which the kernel counts into directly -- one
-// atomicAdd per block, in PHASE TWO below, of the whole block's count. The rest
-// of VkDrawIndexedIndirectCommand is host-written once per
-// extract and untouched here, as is the vertex counter the host keeps at byte 20
-// (only the sharing kernel allocates through it; here the vertex total is
-// exactly three per triangle and the host derives it).
-layout(set = 0, binding = 7, scalar) buffer DrawCommand { uint index_count; };
+// atomicAdd per block, in PHASE TWO below, of the whole block's count. The four
+// fields after it are host-written once per extract and untouched here, as is
+// `vertex_count` (only the sharing kernel allocates through it; here the vertex
+// total is exactly three per triangle and the host derives it) and
+// `sharing_applied` (only the sharing kernel reports it).
+//
+// Declared in full down to the one word this kernel does write. A struct that
+// stopped at index_count could not name a later field, and naming it by byte
+// offset is what the scalar-layout ABI exists to avoid.
+layout(set = 0, binding = 7, scalar) buffer DrawCommand {
+  uint index_count;
+  uint instance_count;
+  uint first_index;
+  int vertex_offset;
+  uint first_instance;
+  uint vertex_count;     // the sharing kernel's; untouched here
+  uint sharing_applied;  // the sharing kernel's; untouched here
+  // Blocks this dispatch re-meshed, bumped once per re-meshing workgroup while
+  // pc.incremental is set. The host has no way to derive it: the dilation from
+  // the changed set to the re-mesh set happens below, off shared memory. Left
+  // at the host's zero on a full pass, where the answer is num_active_blocks
+  // and one atomic per workgroup to restate it is not free.
+  uint remeshed_blocks;
+};
 
 // Where each block's output landed; see marching_cubes_block_span.glsl for the
 // struct and why it is declared there. Binding 8 here, 9 in the sharing kernel.
@@ -384,6 +402,14 @@ void main() {
   // the barrier above), and no barrier follows, so the early return is legal.
   if (pc.incremental != 0u && s_dirty == 0u) {
     return;
+  }
+  // Past the gate, so this counts blocks that are actually re-meshed -- the
+  // number the whole trade is measured against. One atomic per surviving
+  // workgroup, and only on an incremental pass: the blocks that reach here are
+  // the small set, and a full pass would pay it for every block to report a
+  // count the host already has.
+  if (pc.incremental != 0u && tid == 0u) {
+    atomicAdd(remeshed_blocks, 1u);
   }
 
   // PHASE ONE -- count, and cache each cell's TRIANGLE COUNT for phase three.

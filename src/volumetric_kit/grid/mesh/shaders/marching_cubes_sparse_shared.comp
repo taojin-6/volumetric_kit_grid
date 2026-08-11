@@ -133,6 +133,12 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand {
   uint first_instance;
   uint vertex_count;
   uint sharing_applied;
+  // Declared but UNWRITTEN here, mirroring marching_cubes_sparse.comp's own
+  // declaration of this buffer: incremental extraction refuses share_vertices,
+  // so this kernel never re-meshes a subset and never has a count to report.
+  // Named rather than omitted so the two kernels describe the same bytes --
+  // the host resets all three scratch words for either.
+  uint remeshed_blocks;
 };
 // The real index buffer -- a property of this dispatch, since a shared vertex is
 // referenced by several triangles from several cells.
