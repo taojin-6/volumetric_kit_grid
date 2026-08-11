@@ -117,8 +117,23 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand { uint index_count; };
 // struct and why it is declared there. Binding 8 here, 9 in the sharing kernel.
 // A 1-element dummy when pc.write_spans is 0, so the descriptor stays valid for
 // a caller who did not ask for a table.
-layout(set = 0, binding = 8, scalar) writeonly buffer BlockSpans {
+layout(set = 0, binding = 8, scalar) buffer BlockSpans {
   BlockSpan block_spans[];
+};
+// One flag per block slot, produced by the tsdf tier's opt-in dirty tracking and
+// read here rather than taken back through the host. Bound only when
+// pc.incremental != 0; a 1-element dummy otherwise, the color_dummy_ pattern.
+//
+// This is the CHANGED set, not the re-mesh set. A cell reads corners at
+// `base + {0,1}^3`, so a block whose voxels changed invalidates the mesh of
+// every block in its `{0,-1}^3` octant -- which, read from this end, is: this
+// block re-meshes when any of its OWN `+{0,1}^3` neighbourhood is flagged. That
+// neighbourhood is exactly `s_neighbour`, already resolved for the corner
+// gather, so the dilation costs eight shared reads and no host pass. Doing it on
+// the host instead would mean a readback, a set union and an upload, on the
+// tier whose host-built table the 2026-08-08 decision deleted.
+layout(set = 0, binding = 9, scalar) readonly buffer DirtyFlags {
+  uint dirty_flags[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -148,6 +163,14 @@ layout(push_constant, scalar) uniform PushConstants {
   // MarchingCubesConfig::track_block_spans, the way has_color gates the colour
   // attribute.
   uint write_spans;
+  // Re-mesh only the blocks whose neighbourhood a fuse changed, writing each
+  // into the range it already owns. Appended at the END for the reason
+  // write_spans is: this block is one ABI shared with the sharing kernel and
+  // SparsePushConstants.
+  uint incremental;
+  // Slots `dirty_flags` addresses. A block past it is treated as dirty -- the
+  // conservative direction, and it re-meshes rather than going stale.
+  uint dirty_capacity;
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
@@ -202,6 +225,16 @@ layout(push_constant, scalar) uniform PushConstants {
 // cursor handing out slots within the reserved span.
 shared uint s_block_tris;
 shared uint s_block_base;
+// Does any block in this block's +{0,1}^3 neighbourhood carry a change? Set by
+// the same eight lanes that resolve the neighbourhood, so the dilation is read
+// off state the gather already needs.
+shared uint s_dirty;
+// The range this block held before this extract, and whether it may be reused.
+// `s_reuse` is false on a first extract, after a topology change, and whenever
+// the new count outgrows the old range -- each of which appends instead.
+shared uint s_old_base;
+shared uint s_old_count;
+shared bool s_reuse;
 shared uint s_cursor;
 
 // Per-cell TRIANGLE COUNT, carried from phase one to phase three so phase three
@@ -247,6 +280,41 @@ uint mcCacheSlot(uint local, uint tid, uint group_threads) {
   return (local - tid) / group_threads;
 }
 
+// Give back the triangles this block no longer occupies.
+//
+// Two cases, and both leave live geometry behind if skipped, because the draw
+// covers the whole arena rather than a compacted list:
+//   - reused a range and SHRANK: the tail past the new count still holds the
+//     previous extract's triangles;
+//   - RELOCATED, or emptied entirely: the whole old range does.
+//
+// Retired by writing three identical vertices -- a zero-area triangle, culled
+// before rasterisation -- rather than by compacting the index run, which would
+// need a prefix sum over every block and so a pass the host would have to
+// drive. That costs 192 B per dead triangle against the 12 B it would take if
+// this kernel owned its index run; it does not, and the run being the identity
+// is what keeps the whole path free of host work. TODO(mesh): revisit if
+// relocation turns out to be common rather than rare.
+void mcRetireOldRange(uint tid, uint group_threads) {
+  if (pc.incremental == 0u) {
+    return;
+  }
+  // Both cases end at the old range's end; only the start differs -- a reuse
+  // retires the tail it no longer fills, a relocation or an emptied block all
+  // of it.
+  uint dead_first = s_reuse ? s_block_base + s_block_tris : s_old_base;
+  uint dead_end = s_old_base + s_old_count;
+  for (uint tri = dead_first + tid; tri < dead_end; tri += group_threads) {
+    if (tri >= pc.capacity) {
+      break;
+    }
+    uint vbase = tri * 3u;
+    mcWriteVertex(vbase + 0u, vec3(0.0), vec3(0.0, 0.0, 1.0), vec3(1.0));
+    mcWriteVertex(vbase + 1u, vec3(0.0), vec3(0.0, 0.0, 1.0), vec3(1.0));
+    mcWriteVertex(vbase + 2u, vec3(0.0), vec3(0.0, 0.0, 1.0), vec3(1.0));
+  }
+}
+
 void main() {
   int bs = pc.block_size;
   uint vpb = uint(pc.voxels_per_block);
@@ -280,9 +348,43 @@ void main() {
     s_block_tris = 0u;
     s_block_base = 0u;
     s_cursor = 0u;
+    s_dirty = 0u;
   }
   mcResolveNeighbourhood(block, tid);
   barrier();
+
+  // Dilate the changed set into the re-mesh set, on the eight blocks
+  // `s_neighbour` already holds. A neighbour that is unallocated (-1) cannot
+  // have changed; one past `dirty_capacity` is treated as changed, which
+  // re-meshes a block that might not need it rather than leaving it stale.
+  if (pc.incremental != 0u && tid < 8u) {
+    int nptr = s_neighbour[tid];
+    if (nptr >= 0) {
+      uint nslot = uint(nptr) / uint(pc.voxels_per_block);
+      if (nslot >= pc.dirty_capacity || dirty_flags[nslot] != 0u) {
+        atomicOr(s_dirty, 1u);
+      }
+    }
+  }
+  // The range this block held going in. Read by one lane under the same barrier
+  // as the dilation, so both are visible together below.
+  if (pc.incremental != 0u && tid == 0u) {
+    BlockSpan prev = block_spans[uint(block.ptr) / uint(pc.voxels_per_block)];
+    s_old_base = prev.triangle_base;
+    s_old_count = prev.triangle_count;
+  }
+  barrier();
+
+  // A clean block keeps every triangle it already has, at the offsets the span
+  // table already names -- so this returns WITHOUT touching the arena, the
+  // counters or its span. That is the whole of what incremental extraction
+  // buys, and it is one branch because stage 2 made a block's output a range.
+  //
+  // Uniform across the workgroup (s_dirty is threadgroup state written before
+  // the barrier above), and no barrier follows, so the early return is legal.
+  if (pc.incremental != 0u && s_dirty == 0u) {
+    return;
+  }
 
   // PHASE ONE -- count, and cache each cell's TRIANGLE COUNT for phase three.
   //
@@ -340,7 +442,21 @@ void main() {
   // count-but-drop: overflow can no longer make the reported total a lower bound
   // by abandoning a cell early, because the count is taken before any slot is.
   if (tid == 0u) {
-    if (s_block_tris != 0u) {
+    // Write into the range this block already owns when the new count fits it.
+    // That is what makes the extract incremental in MEMORY as well as in work:
+    // the arena stops growing by the whole surface every frame, and a clean
+    // neighbour's triangles are never moved out from under a draw.
+    //
+    // It is also the operation that can be SEEN. An in-place write lands on
+    // bytes an outstanding generation may still be drawing -- every index stays
+    // in range and every vertex stays a real vertex, so it is not a memory
+    // error, but a viewer can catch one block mid-update. Whether that is
+    // acceptable is what running this on device answers; the fallback if it is
+    // not is copy-on-write, which is strictly more machinery.
+    s_reuse = pc.incremental != 0u && s_block_tris <= s_old_count;
+    if (s_reuse) {
+      s_block_base = s_old_base;
+    } else if (s_block_tris != 0u) {
       s_block_base =
           atomicAdd(index_count, s_block_tris * kIndicesPerTriangle) /
           kIndicesPerTriangle;
@@ -387,6 +503,14 @@ void main() {
   // field that can emit ~1400. Both tests are uniform across the workgroup and
   // no barrier follows, so returning here is safe.
   if (s_block_tris == 0u || s_block_base >= pc.capacity) {
+    // Retire FIRST, then leave. A block whose surface left it entirely reaches
+    // here with nothing to emit and everything to give back -- and returning
+    // straight out stranded its whole previous range, which the arena still
+    // holds and the draw still covers. It read as ten extra triangles of a
+    // sphere that had moved, which is exactly the shape of bug an incremental
+    // extract exists to create: geometry nobody wrote this frame and nobody
+    // erased either.
+    mcRetireOldRange(tid, group_threads);
     return;
   }
   uint block_end = s_block_base + s_block_tris;
@@ -445,4 +569,7 @@ void main() {
                       pc.has_color, tri);
     }
   }
+
+  // PHASE FOUR -- give back what this block no longer occupies.
+  mcRetireOldRange(tid, group_threads);
 }

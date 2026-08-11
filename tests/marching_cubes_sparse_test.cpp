@@ -31,6 +31,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -134,7 +135,7 @@ vol::VoxelGridParams sphere_grid_params() {
 // one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
 // false on any device error.
 bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
-                      float weight_value = 1.0f) {
+                      float weight_value = 1.0f, float radius = kRadius) {
   std::vector<vol::BlockIndex> blocks;
   for (int cz = 0; cz < kBlocks; ++cz) {
     for (int cy = 0; cy < kBlocks; ++cy) {
@@ -180,7 +181,7 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
           const vr::Vec3i voxel = b.coord * kBlock + vr::Vec3i(lx, ly, lz);
           const vr::Vec3f world = vr::Vec3f(voxel) * kH;
           const auto idx = static_cast<std::size_t>(b.ptr) + local;
-          tptr[idx] = sphere_sdf(world);
+          tptr[idx] = vr::length(world - sphere_center()) - radius;
           wptr[idx] = weight_value;
           if (cptr != nullptr) {
             cptr[idx] = pack_rgb(grad_color(world));
@@ -384,6 +385,30 @@ std::size_t count_valid_spans(const mesh::MarchingCubes& mc,
     }
   }
   return n;
+}
+
+// Drop the zero-area triangles an incremental extract leaves behind.
+//
+// Retiring a range writes three identical vertices rather than compacting the
+// index run -- see the kernel's phase four -- so a block that shrank or
+// relocated leaves degenerate triangles in the arena. They are culled before
+// rasterisation and they are not geometry, but `download` copies the arena, so
+// a comparison against a full extract has to ignore them. Returns the count
+// dropped, because "none were left" is itself worth asserting: it says the
+// retire pass never ran.
+std::size_t drop_degenerate(std::vector<std::array<float, 9>>& tris) {
+  const std::size_t before = tris.size();
+  tris.erase(std::remove_if(tris.begin(), tris.end(),
+                            [](const std::array<float, 9>& t) {
+                              for (int i = 0; i < 3; ++i) {
+                                if (t[i] != t[3 + i] || t[i] != t[6 + i]) {
+                                  return false;
+                                }
+                              }
+                              return true;
+                            }),
+             tris.end());
+  return before - tris.size();
 }
 
 BlockLayout block_layout(const mesh::Mesh& m, int block_size,
@@ -1725,6 +1750,98 @@ int main() {
     vol::VoxelBlockGrid taken = std::move(other_grid);
     CHECK(count_valid_spans(anchor_mc, other_grid) == 0);
     CHECK(count_valid_spans(anchor_mc, taken) == other_live.value().size());
+  }
+
+  // --- Incremental extraction: the skip is observable, not inferred ----------
+  //
+  // Comparing an incremental extract against a full one over the SAME field
+  // proves nothing: a pass that silently fell back to full returns the
+  // identical mesh, and so does one that skipped correctly. So the field is
+  // CHANGED under the extractor between passes, with the flags still saying
+  // nothing moved.
+  //
+  //   flags all zero, field changed  -> every block takes the early return, so
+  //     the mesh must still be the OLD surface. A fallback to full, or a dirty
+  //     test that reads the wrong way, returns the new one and fails here.
+  //   flags all one, same new field  -> every block re-meshes into the range it
+  //     already owns, so in-place reuse, the span read and the retire pass all
+  //     run, and the mesh must now be the NEW surface.
+  //
+  // Compared as triangle sets, since a re-mesh may reorder within a block.
+  {
+    vr::Result<vol::VoxelBlockGrid> inc_grid_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
+                                    attrs, 2);
+    CHECK(inc_grid_result.ok());
+    vol::VoxelBlockGrid inc_grid = std::move(inc_grid_result).value();
+    CHECK(fill_sphere_grid(inc_grid, /*with_color=*/false));
+
+    mesh::MarchingCubesConfig inc_config;
+    inc_config.track_block_spans =
+        true;  // what an incremental pass re-meshes against
+    vr::Result<mesh::MarchingCubes> inc_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), inc_config);
+    CHECK(inc_result.ok());
+    mesh::MarchingCubes inc_mc = std::move(inc_result).value();
+
+    // The first extract can only be full -- there is no watermark yet -- and it
+    // is what establishes the spans and the arena the next one reuses.
+    vr::Result<mesh::Mesh> first = inc_mc.extract(inc_grid, 0.0f);
+    CHECK(first.ok());
+    const std::vector<std::array<float, 9>> old_surface =
+        canonical_triangles(first.value());
+    CHECK(!old_surface.empty());
+
+    // A visibly different sphere, written straight into the same blocks.
+    const float kGrown = kRadius * 1.15f;
+    CHECK(fill_sphere_grid(inc_grid, /*with_color=*/false, 1.0f, kGrown));
+
+    // One flag per block slot, as the tsdf tier publishes them. Built here
+    // rather than by fusing: the contract is a buffer, and this is a test of
+    // the extractor rather than of the integrator.
+    const auto slots = static_cast<std::uint32_t>(gp.num_blocks);
+    vr::Result<vr::Buffer> flags_result = vr::storage_buffer(
+        allocator.value(),
+        static_cast<VkDeviceSize>(slots) * sizeof(std::uint32_t),
+        vr::HostAccess::SequentialWrite);
+    CHECK(flags_result.ok());
+    vr::Buffer flags = std::move(flags_result).value();
+    auto* flag_ptr = static_cast<std::uint32_t*>(flags.mapped());
+
+    for (std::uint32_t i = 0; i < slots; ++i) flag_ptr[i] = 0u;
+    vr::Result<mesh::DeviceMesh> clean = inc_mc.extract_device_incremental(
+        inc_grid, 0.0f, mesh::DirtyBlocks{flags.handle(), slots});
+    CHECK(clean.ok());
+    vr::Result<mesh::Mesh> clean_host = inc_mc.download(clean.value());
+    CHECK(clean_host.ok());
+    CHECK(canonical_triangles(clean_host.value()) == old_surface);
+
+    for (std::uint32_t i = 0; i < slots; ++i) flag_ptr[i] = 1u;
+    vr::Result<mesh::DeviceMesh> dirty = inc_mc.extract_device_incremental(
+        inc_grid, 0.0f, mesh::DirtyBlocks{flags.handle(), slots});
+    CHECK(dirty.ok());
+    vr::Result<mesh::Mesh> dirty_host = inc_mc.download(dirty.value());
+    CHECK(dirty_host.ok());
+    std::vector<std::array<float, 9>> new_surface =
+        canonical_triangles(dirty_host.value());
+    // The grown sphere makes some blocks outgrow the range they held and others
+    // shrink inside it, so both halves of the retire pass run -- and leave the
+    // degenerates this drops. Asserting some were dropped is what keeps that
+    // pass covered rather than merely compiled.
+    const std::size_t retired = drop_degenerate(new_surface);
+    CHECK(retired > 0);
+    CHECK(!new_surface.empty());
+    CHECK(new_surface != old_surface);  // the field really did change
+
+    // And what remains is exactly the surface a full extract of the new field
+    // gives -- so relocation, in-place reuse and retirement together lose and
+    // invent nothing.
+    vr::Result<mesh::Mesh> reference = inc_mc.extract(inc_grid, 0.0f);
+    CHECK(reference.ok());
+    std::vector<std::array<float, 9>> ref_tris =
+        canonical_triangles(reference.value());
+    CHECK(drop_degenerate(ref_tris) == 0);  // a full extract retires nothing
+    CHECK(new_surface == ref_tris);
   }
 
   std::printf(

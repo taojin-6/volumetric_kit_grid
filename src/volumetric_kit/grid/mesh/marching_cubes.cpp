@@ -185,11 +185,17 @@ struct SparsePushConstants {
   // told to skip the store rather than being pointed at a table that is not
   // there. Assigned by name, like the four above.
   std::uint32_t write_spans = 0;
+  // Re-mesh only blocks whose +{0,1}^3 neighbourhood a fuse changed, reusing
+  // each block's existing range where the new count fits it.
+  std::uint32_t incremental = 0;
+  // Slots the bound dirty-flag buffer addresses. A block past it is treated as
+  // changed, so a table that is somehow short re-meshes rather than goes stale.
+  std::uint32_t dirty_capacity = 0;
 };
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
 // sizeof == 52 but silently drift the host<->GLSL push-constant ABI, so guard
 // each one, matching the dense PushConstants above.
-static_assert(sizeof(SparsePushConstants) == 52,
+static_assert(sizeof(SparsePushConstants) == 60,
               "SparsePushConstants must be 52 bytes");
 static_assert(offsetof(SparsePushConstants, vertex_capacity) == 32,
               "SparsePushConstants layout drift");
@@ -214,6 +220,10 @@ static_assert(offsetof(SparsePushConstants, num_buckets) == 36,
 static_assert(offsetof(SparsePushConstants, bucket_size) == 40,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, max_chain) == 44,
+              "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, incremental) == 52,
+              "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, dirty_capacity) == 56,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, write_spans) == 48,
               "SparsePushConstants layout drift");
@@ -575,7 +585,12 @@ Status MarchingCubes::ensure_indirect_command() {
   // from -- one instance, no index or vertex offset, and the identity index run
   // means firstIndex is always 0.
   VkDrawIndexedIndirectCommand reset{};
-  reset.indexCount = 0;
+  // Seeded, not zeroed, for an incremental pass: the arena still holds every
+  // clean block's triangles in [0, watermark), and the kernel's atomic hands
+  // out APPEND slots past that. Consumed here rather than read from a member on
+  // every path, so a dense extract or a later full one cannot inherit it.
+  reset.indexCount = indirect_seed_triangles_ * kIndicesPerTriangle;
+  indirect_seed_triangles_ = 0;
   reset.instanceCount = 1;
   reset.firstIndex = 0;
   reset.vertexOffset = 0;
@@ -973,7 +988,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                 config.share_vertices
                     ? vr_marching_cubes_sparse_shared_comp_spv_size
                     : vr_marching_cubes_sparse_comp_spv_size,
-                config.share_vertices ? 10 : 9, &push_sparse));
+                10, &push_sparse));
   VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 of both
@@ -1271,6 +1286,19 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   return mesh;
 }
 
+Result<DeviceMesh> MarchingCubes::extract_device_incremental(
+    volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks& dirty,
+    ExtractTimings* timings) {
+  // The request, not the decision. extract_device below decides whether an
+  // incremental pass is actually SOUND -- spans anchored to this grid, a live
+  // watermark, no sharing -- and falls back to a full extract when it is not,
+  // which is why this is one line and not a second copy of that function.
+  pending_dirty_ = dirty;
+  Result<DeviceMesh> result = extract_device(grid, iso, timings);
+  pending_dirty_ = DirtyBlocks{};
+  return result;
+}
+
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
@@ -1496,6 +1524,33 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // optimisation decisions are made off these rows (see DECISIONS.md, "Measured
   // lessons"). It is an allocation, so it is timed as one.
   VR_TRY(ensure_block_spans(grid));
+  // Whether this pass may re-mesh only the changed blocks, decided HERE rather
+  // than by the caller: every clause is something the caller cannot see.
+  //
+  //  - flags bound at all (the plain extract_device never sets them);
+  //  - spans tracked, since the kernel reads a block's own range from them;
+  //  - not sharing, since a shared vertex is not owned three-per-triangle, so a
+  //    relocated block cannot retire what it leaves behind;
+  //  - one slot, since the arena must persist across the call and a ring hands
+  //    each extract a different one;
+  //  - a live watermark AND spans still anchored to this grid's topology -- the
+  //    first extract has neither, and a remove()/clear() retires both.
+  //
+  // Any clause failing means a FULL extract, which re-establishes all of them.
+  // Falling back rather than refusing is the point: a caller fusing a live scan
+  // cannot predict a topology change, and the correct response to one is to
+  // re-mesh everything, not to fail.
+  const bool incremental =
+      pending_dirty_.flags != VK_NULL_HANDLE && config_.track_block_spans &&
+      !config_.share_vertices && slot_count_ == 1 && watermark_ != 0 &&
+      span_epoch_ == grid.topology_epoch();
+  if (!incremental) {
+    // A full pass rewrites the arena from zero, so any watermark from before it
+    // names triangles that are about to be overwritten.
+    watermark_ = 0;
+  }
+  indirect_seed_triangles_ = watermark_;
+
   VR_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity)));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
@@ -1540,6 +1595,15 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                             VK_WHOLE_SIZE);
   }
 
+  if (!config_.share_vertices) {
+    // The changed-block flags the kernel dilates on-device, or the same
+    // 1-element dummy the colour slot uses when this pass is full: a descriptor
+    // must be bound either way, and a full pass never reads it.
+    kernel_sparse_.set.write_storage_buffer(
+        9, incremental ? pending_dirty_.flags : color_dummy_.handle(), 0,
+        VK_WHOLE_SIZE);
+  }
+
   if (config_.share_vertices) {
     // The sharing kernel's ninth binding. It writes the indices itself, because
     // a shared vertex is referenced by several triangles from several cells and
@@ -1564,6 +1628,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   std::uint32_t requested = usable_triangle_capacity();
   std::uint32_t requested_verts = arena_vertex_capacity();
   std::uint32_t produced = 0;
+
   std::uint32_t produced_verts = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
     SparsePushConstants push{bs,
@@ -1588,6 +1653,8 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // same-typed adjacent scalars, so a positional slip would compile.
     push.vertex_capacity = requested_verts;
     push.write_spans = config_.track_block_spans ? 1u : 0u;
+    push.incremental = incremental ? 1u : 0u;
+    push.dirty_capacity = incremental ? pending_dirty_.capacity : 0u;
 
     // One workgroup per block, not one thread per voxel: the kernel resolves
     // the block's 2x2x2 neighbourhood into shared memory, which only works when
@@ -1696,6 +1763,12 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // bound run on, so bound it by the buffers that have to hold it rather than
   // by a variable that tracks them.
   const std::uint32_t emitted = std::min(produced, usable_triangle_capacity());
+
+  // The arena now holds `emitted` triangles, every clean block's included, and
+  // the next incremental pass appends past them. Set on BOTH paths: a full
+  // extract is what establishes the watermark an incremental one needs, which
+  // is why the first call against a grid can only be full.
+  watermark_ = emitted;
 
   // Record the density this surface actually had, so the next call's plan
   // scales it by that call's active set instead of discovering the size by

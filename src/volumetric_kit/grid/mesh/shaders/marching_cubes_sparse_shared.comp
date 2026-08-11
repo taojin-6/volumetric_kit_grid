@@ -166,6 +166,13 @@ layout(push_constant, scalar) uniform PushConstants {
   // MarchingCubesConfig::track_block_spans, the way has_color gates the colour
   // attribute.
   uint write_spans;
+  // Declared but UNUSED here: one ABI shared with marching_cubes_sparse.comp and
+  // SparsePushConstants, so omitting a field the sibling declares would leave
+  // the two disagreeing about the block's size. Incremental extraction refuses
+  // share_vertices for now -- a relocated block would have to retire vertices it
+  // does not own three-per-triangle.
+  uint incremental;
+  uint dirty_capacity;
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeOwner / mcEdgeVertex + the near-tangent

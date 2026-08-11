@@ -533,6 +533,22 @@ static_assert(std::is_trivially_copyable_v<BlockSpan>,
 // before that on a desktop profile putting the dispatch at ~2 ms -- "the pool
 // would optimise what was already fast" -- which a device measurement
 // overturned.
+/// @brief The blocks a fuse changed, as the device buffer holding them.
+///
+/// Deliberately opaque: `tsdf` produces this and `mesh` only reads it, so
+/// passing the handle rather than the integrator keeps `mesh` off `tsdf`
+/// entirely. Fill it from `TsdfIntegrator::dirty_flags_buffer()` and
+/// `dirty_flags_capacity()`.
+///
+/// One `uint32_t` per **block slot** (`BlockIndex::ptr / voxels_per_block`),
+/// non-zero where that block's voxels changed. This is the *changed* set; the
+/// extractor dilates it into the re-mesh set on-device, since a cell reads
+/// corners at `base + {0,1}^3`.
+struct DirtyBlocks {
+  VkBuffer flags = VK_NULL_HANDLE;
+  std::uint32_t capacity = 0;
+};
+
 class VR_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and
@@ -805,6 +821,36 @@ class VR_MESH_API MarchingCubes {
   Result<Mesh> extract(volume::VoxelBlockGrid& grid, float iso = 0.0f,
                        ExtractTimings* timings = nullptr);
 
+  /// @brief Extract, re-meshing only the blocks @p dirty says a fuse changed.
+  ///
+  /// The blocks whose `+{0,1}^3` neighbourhood carries no change keep the
+  /// triangles they already have, at the offsets @ref block_spans already
+  /// names, and cost one workgroup that returns before gathering a single
+  /// corner. A changed block re-meshes into the range it already owns when the
+  /// new count fits, and appends past the watermark when it does not.
+  ///
+  /// **Falls back to a full extract**, silently and by design, whenever an
+  /// incremental one would be wrong rather than merely slower: the first
+  /// extract against a grid, one whose spans a topology change retired, or an
+  /// arena that had to grow (which reallocates, discarding the geometry the
+  /// clean blocks were relying on). A caller that wants to know which it got
+  /// reads @ref ExtractTimings::dispatches.
+  ///
+  /// @warning An in-place re-mesh writes bytes an outstanding generation may
+  ///          still be drawing. Every index stays in range and every vertex
+  ///          stays a real vertex, so this is not a memory error -- but a
+  ///          consumer holding a @ref DeviceMesh across the call can catch one
+  ///          block mid-update. That is the trade this overload exists to make
+  ///          measurable; @ref extract_device is unchanged and does not make
+  ///          it.
+  ///
+  /// Requires @ref MarchingCubesConfig::track_block_spans, and refuses
+  /// @ref MarchingCubesConfig::share_vertices -- a shared vertex is not owned
+  /// three-per-triangle, so a relocated block cannot retire what it leaves.
+  Result<DeviceMesh> extract_device_incremental(
+      volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks& dirty,
+      ExtractTimings* timings = nullptr);
+
   /// @brief Extract as @ref extract does, but leave the result in this
   ///        extractor's device buffers instead of copying it to the host.
   ///
@@ -938,6 +984,17 @@ class VR_MESH_API MarchingCubes {
   // assignment is specified as release-then-reset, which is self-safe.
   std::unique_ptr<std::uint64_t[]> span_stamp_;
   std::uint64_t span_serial_ = 0;
+  // Triangles the arena holds from the previous incremental extract, so the
+  // next one appends past them instead of restarting at zero. Zero means "no
+  // incremental state", which is what makes the first extract against a grid a
+  // full one. Both of these are scalars, so they survive a self-move like every
+  // other member here.
+  std::uint32_t watermark_ = 0;
+  // The flags for the call in progress; empty outside one.
+  DirtyBlocks pending_dirty_{};
+  // Triangles the next command reset seeds indexCount with, consumed by that
+  // reset so no later path inherits it.
+  std::uint32_t indirect_seed_triangles_ = 0;
 
   // The vertex arena + the draw command the kernels append through, kept ACROSS
   // extract calls and grown only when a call needs more than the last one.
