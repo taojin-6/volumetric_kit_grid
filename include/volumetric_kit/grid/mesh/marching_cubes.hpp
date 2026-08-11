@@ -426,12 +426,17 @@ struct MarchingCubesConfig {
   ///       @ref DeviceMesh -- along with a consumer needing to know whether
   ///       `v = 3t` when it sizes an arena -- not a residual incompatibility.
   ///
-  /// @note @ref MarchingCubes::extract_device_incremental **does** still refuse
-  ///       this, for a reason of its own rather than a downstream consumer's: a
-  ///       relocated block retires the range it leaves behind, which it can
-  ///       only do while it owns its vertices three-per-triangle. It falls back
-  ///       to a full extract rather than failing, and says so through
-  ///       @ref ExtractTimings::incremental.
+  /// @note @ref MarchingCubes::extract_device_incremental runs under this. It
+  ///       used to fall back to a full extract, on the grounds that a relocated
+  ///       block can only retire what it leaves behind while it owns its
+  ///       vertices three-per-triangle. That reads the cost backwards: this
+  ///       kernel owns its index run, so it retires a dead triangle in 12 bytes
+  ///       against the default kernel's 192, and the dead vertices need no
+  ///       retiring at all because in-block sharing leaves them unreachable
+  ///       once no triangle names them. What it does need is both counts
+  ///       fitting before a block reuses its ranges in place, since the two are
+  ///       reserved independently and a triangle indexes into the vertex range
+  ///       beside it.
   ///
   /// @note Refused per *extract*, not at @ref MarchingCubes::create, for a grid
   ///       whose `voxels_per_block` exceeds 512 -- the sharing kernel's shared
@@ -896,9 +901,6 @@ class VR_MESH_API MarchingCubes {
   /// - an overflow refit, whose retry has already lost the pre-call spans;
   /// - an arena whose occupancy has drifted too far past its live surface,
   ///   where a full pass is what compacts the retired triangles away;
-  /// - @ref MarchingCubesConfig::share_vertices, since a shared vertex is not
-  ///   owned three-per-triangle, so a relocated block cannot retire what it
-  ///   leaves behind;
   /// - @ref MarchingCubesConfig::slot_count above one (see the `TODO(mesh)`
   ///   above this class), since the retained triangles are in the slot the
   ///   *last* extract filled and a ring hands this one a different slot.
@@ -913,6 +915,18 @@ class VR_MESH_API MarchingCubes {
   ///          block mid-update. That is the trade this overload exists to make
   ///          measurable; @ref extract_device is unchanged and does not make
   ///          it.
+  ///
+  /// Runs under @ref MarchingCubesConfig::share_vertices, which reuses **two**
+  /// ranges rather than one: a triangle indexes into the vertex range beside
+  /// it, so a block reuses in place only when *both* counts fit and relocates
+  /// both when either does not. Retirement is cheaper there, not dearer -- that
+  /// kernel owns its index run, so a dead triangle is retired by pointing its
+  /// three indices at one vertex (12 bytes, zero area, culled before
+  /// rasterisation), where the default kernel's run is the identity it cannot
+  /// touch and it must overwrite 192 bytes of vertices to say the same thing.
+  /// The dead *vertices* need no writing at all: sharing is in-block, so once
+  /// no triangle references them they are unreachable rather than merely
+  /// unused.
   ///
   /// @param grid     The sparse volume to mesh, as @ref extract_device takes
   ///                 it.
@@ -1092,6 +1106,14 @@ class VR_MESH_API MarchingCubes {
     // arena's. The epoch alone does not catch that: a resize deliberately
     // does not move it.
     std::uint64_t serial = 0;
+    // Vertices the arena holds, the counterpart of `watermark` for the buffer
+    // sharing actually binds on. Its own number rather than one derived from
+    // the triangle count, because share_vertices breaks v = 3t -- which is the
+    // whole reason that kernel allocates vertices through a counter of its
+    // own. Without sharing it tracks 3 * watermark and nothing reads it: that
+    // kernel writes each triangle's three vertices at `tri * 3` and never
+    // touches the counter.
+    std::uint32_t vertex_watermark = 0;
   };
   ArenaState arena_state_{};
 
@@ -1343,11 +1365,12 @@ class VR_MESH_API MarchingCubes {
   // publishing return builds, so a call that fails here or after leaves the
   // slot exactly as claimable as it found it.
   //
-  // @p seed_triangles is forwarded to ensure_indirect_command; every caller but
-  // the incremental one passes 0.
+  // @p seed_triangles and @p seed_vertices are forwarded to
+  // ensure_indirect_command; every caller but the incremental one passes 0.
   Status ensure_output_buffers(std::uint32_t triangle_capacity,
                                std::uint32_t vertex_capacity,
-                               std::uint32_t seed_triangles = 0);
+                               std::uint32_t seed_triangles = 0,
+                               std::uint32_t seed_vertices = 0);
 
   // Re-anchor the span table on @p grid and grow it to that grid's num_blocks,
   // carrying the existing spans forward and zeroing only the new tail. A no-op
@@ -1392,7 +1415,15 @@ class VR_MESH_API MarchingCubes {
   // inherited a live indexCount over an arena it had rewritten, which is the
   // exact staleness the reset exists to prevent. Passed explicitly, there is
   // nothing to strand.
-  Status ensure_indirect_command(std::uint32_t seed_triangles);
+  //
+  // @p seed_vertices does the same for the vertex counter in the scratch word
+  // past the command, and is a separate number for the same reason
+  // ArenaState::vertex_watermark is: sharing breaks v = 3t, so the vertices an
+  // incremental pass appends past cannot be derived from the triangles. Only
+  // the sharing kernel allocates through that counter, so every other caller
+  // passes 0 and the word stays the plain zero it has always been.
+  Status ensure_indirect_command(std::uint32_t seed_triangles,
+                                 std::uint32_t seed_vertices);
 
   // Bound the command's indexCount by what the arena can actually hold.
   //

@@ -1773,8 +1773,10 @@ int main() {
   //     already owns, so in-place reuse, the span read and the retire pass all
   //     run, and the mesh must now be the NEW surface.
   //
-  // Compared as triangle sets, since a re-mesh may reorder within a block.
-  {
+  // Compared as triangle sets, since a re-mesh may reorder within a block. Run
+  // for BOTH kernels: sharing is what the only device consumer uses, and it is
+  // the one whose retire pass touches indices instead of vertices.
+  for (int share_pass = 0; share_pass < 2; ++share_pass) {
     vr::Result<vol::VoxelBlockGrid> inc_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
                                     attrs, 2);
@@ -1785,6 +1787,9 @@ int main() {
     mesh::MarchingCubesConfig inc_config;
     inc_config.track_block_spans =
         true;  // what an incremental pass re-meshes against
+    // The point of the loop: pass 0 is the default emitter, pass 1 the sharing
+    // one. Without this the two iterations are the same kernel run twice.
+    inc_config.share_vertices = share_pass == 1;
     vr::Result<mesh::MarchingCubes> inc_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), inc_config);
     CHECK(inc_result.ok());
