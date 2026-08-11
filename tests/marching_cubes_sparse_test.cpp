@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <set>
 #include <utility>
 #include <vector>
@@ -306,6 +307,66 @@ BlockLayout block_layout(const mesh::Mesh& m, int block_size,
     if (owner[i] != owner[i - 1]) {
       ++out.transitions;
     }
+  }
+  return out;
+}
+
+// The same block attribution, applied to the VERTEX arena: which vertex indices
+// each block's triangles reference.
+//
+// Needed because BlockLayout walks the index run and is therefore blind to
+// where the vertices went. The sharing kernel reserves TWO ranges per block,
+// and putting its vertex claims back on the global counter -- leaving the
+// triangle span exactly as it is -- interleaves the arena again while every
+// transition count above still passes.
+//
+// A block's own cells are the only ones that can reference the vertices it
+// created: an in-block edge is looked up in this block's table, and one whose
+// owner lies outside is duplicated locally. Marching cubes puts every crossed
+// edge in its own cell's triangle row, so every vertex a block creates is
+// referenced by a triangle of that block, and the set below is exactly the
+// range the block reserved.
+struct VertexSpans {
+  std::size_t blocks = 0;
+  std::size_t gaps = 0;      // blocks whose indices are not one dense range
+  std::size_t overlaps = 0;  // ranges intersecting the one before them
+  std::size_t covered = 0;   // vertices lying inside some block's range
+};
+
+VertexSpans vertex_spans(const mesh::Mesh& m, int block_size,
+                         float voxel_size) {
+  const float block_span = static_cast<float>(block_size) * voxel_size;
+  std::map<std::array<long long, 3>, std::set<std::uint32_t>> used;
+  for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
+    vr::Vec3f c(0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < 3; ++k) {
+      c = c + m.vertices[m.indices[t + k]].position;
+    }
+    c = c / 3.0f;
+    std::set<std::uint32_t>& block =
+        used[{static_cast<long long>(std::floor(c.x / block_span)),
+              static_cast<long long>(std::floor(c.y / block_span)),
+              static_cast<long long>(std::floor(c.z / block_span))}];
+    for (int k = 0; k < 3; ++k) {
+      block.insert(m.indices[t + k]);
+    }
+  }
+
+  VertexSpans out;
+  out.blocks = used.size();
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+  ranges.reserve(used.size());
+  for (const auto& entry : used) {
+    const std::uint32_t lo = *entry.second.begin();
+    const std::uint32_t hi = *entry.second.rbegin();
+    const std::size_t extent = static_cast<std::size_t>(hi - lo) + 1;
+    if (entry.second.size() != extent) ++out.gaps;
+    out.covered += extent;
+    ranges.push_back({lo, hi});
+  }
+  std::sort(ranges.begin(), ranges.end());
+  for (std::size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i].first <= ranges[i - 1].second) ++out.overlaps;
   }
   return out;
 }
@@ -889,11 +950,21 @@ int main() {
   // Exactly `distinct - 1` transitions, the same bound the unshared path is
   // held to -- spans are contiguous and disjoint, so the owner changes once per
   // boundary and nowhere else.
+  //
+  // And the arena the same way, which the transition count above cannot see:
+  // each block's vertices are one dense range, the ranges do not overlap, and
+  // together they tile the whole arena.
   {
     const BlockLayout layout = block_layout(share_mesh, kBlock, kH);
     CHECK(layout.distinct >= 20);
     CHECK(layout.triangles > 4 * layout.distinct);
     CHECK(layout.transitions == layout.distinct - 1);
+
+    const VertexSpans spans = vertex_spans(share_mesh, kBlock, kH);
+    CHECK(spans.blocks == layout.distinct);
+    CHECK(spans.gaps == 0);
+    CHECK(spans.overlaps == 0);
+    CHECK(spans.covered == share_mesh.vertices.size());
   }
   CHECK(share_timings.emitted_vertices == share_mesh.vertices.size());
   CHECK(share_timings.emitted_triangles == share_mesh.triangle_count());
@@ -953,7 +1024,11 @@ int main() {
   CHECK(share_refit_result.ok());
   mesh::MarchingCubes share_refit_mc = std::move(share_refit_result).value();
   mesh::ExtractTimings share_refit_timings;
-  CHECK(share_refit_mc.extract(dense_block, 0.0f, &share_refit_timings).ok());
+  vr::Result<mesh::Mesh> share_refit_result_mesh =
+      share_refit_mc.extract(dense_block, 0.0f, &share_refit_timings);
+  CHECK(share_refit_result_mesh.ok());
+  const mesh::Mesh share_refit_mesh =
+      std::move(share_refit_result_mesh).value();
   CHECK(share_refit_timings.dispatches ==
         2);  // planned short, measured, re-ran
   CHECK(share_refit_timings.emitted_vertices > 0);
@@ -961,6 +1036,78 @@ int main() {
         share_refit_timings.emitted_vertices);
   CHECK(share_refit_timings.vertex_capacity <=
         2 * share_refit_timings.emitted_vertices);
+  // And the MESH the refit returned, not just its magnitudes. This fixture is
+  // the only one that reaches the duplicate count at all -- the sphere's edge
+  // owners are all valid, so its `else` branch never fires -- and a mesh nobody
+  // looks at made both of that branch's guards deletable with the suite green.
+  // The unshared extract of the same field is the oracle: an owner miscounted
+  // is a vertex slot over-consumed, which the reservation bound turns into
+  // dropped geometry rather than a write into the next block's range.
+  //
+  // Bounds FIRST, then the geometry: a triangle the kernel counted but declined
+  // to write leaves its three index slots holding whatever the VMA block last
+  // did, and `canonical_triangles` resolves every index through the vertex
+  // array. Checked the other way round, the diagnosis is a bus error inside a
+  // test helper rather than a named line.
+  for (std::uint32_t i : share_refit_mesh.indices) {
+    CHECK(i < share_refit_mesh.vertices.size());
+  }
+  CHECK(canonical_triangles(share_refit_mesh) ==
+        canonical_triangles(settled_mesh));
+
+  // --- ...and the same, shared, across MANY blocks ---------------------------
+  //
+  // `dense_block` is ONE block, so a cursor that overran its reservation has no
+  // next block to land in: unobservable there in principle, whichever way the
+  // count is wrong. Twenty-seven of them, refitting, is where both ranges have
+  // a neighbour to run into.
+  vr::Result<mesh::MarchingCubes> share_run_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                  share_config);
+  CHECK(share_run_result.ok());
+  mesh::MarchingCubes share_run_mc = std::move(share_run_result).value();
+
+  mesh::ExtractTimings share_run_timings;
+  vr::Result<mesh::Mesh> share_run_result_mesh =
+      share_run_mc.extract(dense_run, 0.0f, &share_run_timings);
+  CHECK(share_run_result_mesh.ok());
+  const mesh::Mesh share_run_mesh = std::move(share_run_result_mesh).value();
+  CHECK(share_run_timings.active_blocks == 27);
+  CHECK(share_run_timings.dispatches == 2);  // planned short, measured, re-ran
+  for (std::uint32_t i : share_run_mesh.indices) {
+    CHECK(i < share_run_mesh.vertices.size());
+  }
+  CHECK(canonical_triangles(share_run_mesh) ==
+        canonical_triangles(run_settled));
+  {
+    const BlockLayout layout = block_layout(share_run_mesh, kBlock, kH);
+    CHECK(layout.distinct >= 20);
+    CHECK(layout.transitions == layout.distinct - 1);
+
+    const VertexSpans spans = vertex_spans(share_run_mesh, kBlock, kH);
+    CHECK(spans.blocks == layout.distinct);
+    CHECK(spans.gaps == 0);
+    CHECK(spans.overlaps == 0);
+    CHECK(spans.covered == share_run_mesh.vertices.size());
+  }
+
+  // Both ranges survive the refit: the same field planned in one dispatch is
+  // the same surface, and still one range each per block.
+  mesh::ExtractTimings share_run_settled_timings;
+  vr::Result<mesh::Mesh> share_run_settled_result =
+      share_run_mc.extract(dense_run, 0.0f, &share_run_settled_timings);
+  CHECK(share_run_settled_result.ok());
+  const mesh::Mesh share_run_settled =
+      std::move(share_run_settled_result).value();
+  CHECK(share_run_settled_timings.dispatches == 1);
+  CHECK(canonical_triangles(share_run_settled) ==
+        canonical_triangles(share_run_mesh));
+  {
+    const VertexSpans spans = vertex_spans(share_run_settled, kBlock, kH);
+    CHECK(spans.gaps == 0);
+    CHECK(spans.overlaps == 0);
+    CHECK(spans.covered == share_run_settled.vertices.size());
+  }
 
   // Growing one output buffer must not resize the other. They used to be
   // released and reallocated together -- justified by arena_capacity() coming

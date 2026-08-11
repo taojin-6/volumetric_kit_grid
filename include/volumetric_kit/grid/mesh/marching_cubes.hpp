@@ -402,17 +402,18 @@ struct MarchingCubesConfig {
 /// - The **dense** @ref extract appends each triangle independently through an
 ///   atomic bump counter -- it has no block structure to reserve against.
 /// - The **sparse** @ref extract runs one workgroup per active block, which
-///   counts the block's triangles, reserves one span for all of them with a
-///   single atomic, and only then writes. A block's triangles therefore land
+///   counts the block's output, reserves one range for all of it with a single
+///   atomic, and only then writes. A block's triangles therefore land
 ///   **contiguously** in the arena rather than interleaved with every other
 ///   block's in flight. That is the precondition for meshing only the blocks a
 ///   fuse changed -- with an interleaved arena there is no range to leave in
 ///   place -- and it costs ~10% on the dispatch, taken deliberately (see the
-///   2026-08-09 incremental-extraction decision). Contiguity is a property of
-///   this default path only: @ref MarchingCubesConfig::share_vertices selects a
-///   kernel that still appends per triangle. It is not yet published as a
-///   per-block range a caller could index with, so nothing outside the
-///   extractor can depend on it.
+///   2026-08-09 incremental-extraction decision). **Both** sparse kernels do
+///   it: @ref MarchingCubesConfig::share_vertices selects one that reserves two
+///   ranges rather than one, since a shared vertex breaks `v = 3t`, and it
+///   measured no cost there. Neither is yet published as a per-block range a
+///   caller could index with, so nothing outside the extractor can depend on
+///   it.
 ///
 /// Normals come from the SDF gradient -- one
 /// central difference over the cell's eight corners, shared by that cell's
@@ -444,10 +445,13 @@ struct MarchingCubesConfig {
 // TODO(mesh): an incremental block-mesh pool, re-meshing only the blocks the
 // integrator touched instead of the whole volume each call. Decided and staged
 // as of 2026-08-09 (DECISIONS.md); the input is
-// TsdfIntegrator::dirty_remesh_blocks and the precondition is per-block
-// contiguous emission in both sparse kernels. It was deferred before that on a
-// desktop profile putting the dispatch at ~2 ms -- "the pool would optimise
-// what was already fast" -- which a device measurement overturned.
+// TsdfIntegrator::dirty_remesh_blocks and the precondition -- per-block
+// contiguous emission in both sparse kernels -- is now met, so what is left is
+// publishing the block-to-range mapping each kernel computes and drops (a
+// TODO(mesh) in each) and dispatching over the dirty set. It was deferred
+// before that on a desktop profile putting the dispatch at ~2 ms -- "the pool
+// would optimise what was already fast" -- which a device measurement
+// overturned.
 class VR_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and

@@ -11,7 +11,7 @@
 // shares a vertex between the cells that meet on an edge. Sharing needs ~8 KiB
 // of `shared` arrays, and a `shared` array is reserved at pipeline creation
 // whatever a push constant later says -- so folding the two into one kernel
-// made the DEFAULT path pay sharing's threadgroup budget (44 B -> 8428 B, which
+// made the DEFAULT path pay sharing's threadgroup budget (44 B -> 8452 B, which
 // bounds residency to 3 workgroups on Apple's ~32 KiB and to 1 at Vulkan's
 // guaranteed 16 KiB floor) plus its per-corner vertex atomic, for a feature it
 // does not use. MarchingCubes::create builds exactly one of the two.
