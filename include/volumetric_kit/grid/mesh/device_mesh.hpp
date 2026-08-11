@@ -68,14 +68,19 @@ struct DeviceMesh {
   /// identity run `0, 1, 2, ...` and @ref vertex_count is `3 * triangle_count`.
   /// True is @ref MarchingCubesConfig::share_vertices: neither holds.
   ///
-  /// Published because a *consumer* has to act on it and cannot otherwise ask.
-  /// `texture::ProjectiveTexturer` decides visibility per triangle and writes
-  /// `Vertex::uv0` per vertex, which is well-defined only while a vertex
-  /// belongs to one triangle -- so it refuses a mesh carrying this rather than
-  /// letting the write order decide the result. Same reason @ref vertex_usage
-  /// and @ref sharing_mode are here: the producer's configuration is not
-  /// visible from a `VkBuffer`, and an obligation stated in prose is not a
-  /// contract.
+  /// Published because a *consumer* has to act on it and cannot otherwise ask:
+  /// the producer's configuration is not visible from a `VkBuffer`, and an
+  /// obligation stated in prose is not a contract. Same reason
+  /// @ref vertex_usage and @ref sharing_mode are here.
+  ///
+  /// What acts on it today is **sizing**, not compatibility -- a consumer
+  /// budgeting a vertex arena needs to know whether `v = 3t` still holds.
+  /// `texture::ProjectiveTexturer` used to refuse a mesh carrying this, because
+  /// it decided visibility per triangle while writing `Vertex::uv0` per vertex;
+  /// it dispatches per vertex now, so there is one writer per vertex and it
+  /// refuses nothing. A packed multi-camera atlas will need a per-*primitive*
+  /// camera id and will care again, for a reason no encoding of `uv0` can
+  /// address.
   bool shares_vertices = false;
   /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
   /// plus whatever the producer's consumer asked for. Carried so a consumer can
