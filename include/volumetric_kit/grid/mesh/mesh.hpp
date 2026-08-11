@@ -31,15 +31,27 @@ namespace volumetric_kit::recon::mesh {
 /// `layout(scalar)` definition in lockstep.
 ///
 /// @ref color and @ref uv0 encode the **hybrid** color path shared with the
-/// renderer's `HybridMeshPipeline`: where projective texturing won a triangle a
-/// camera, @ref uv0 holds an atlas coordinate; where it did not, @ref uv0 is
-/// the
-/// `(-1, -1)` sentinel and the shader falls back to @ref color (the color TSDF
-/// integration fused into the volume, interpolated here). Marching cubes fills
-/// @ref color and leaves @ref uv0 at the sentinel; the projective-texturing
-/// pass (a later slice) overwrites @ref uv0 for textured triangles. @ref
-/// tangent is here only to hold the renderer's layout in place: meshing cannot
-/// derive one, so the kernel writes a fixed placeholder into it.
+/// renderer's `HybridMeshPipeline`, and the rule that selects between them is a
+/// **sign test**: a @ref uv0 with a negative `x` means "no atlas, use @ref
+/// color" (the color TSDF integration fused into the volume, interpolated
+/// here), and any other value is an atlas coordinate. Marching cubes fills
+/// @ref color and leaves @ref uv0 at `(-1, -1)`; @ref
+/// texture::ProjectiveTexturer overwrites every @ref uv0 against one posed
+/// frame.
+///
+/// **Never test `uv0 == (-1, -1)`.** A negative @ref uv0 also *carries* its
+/// atlas coordinate, encoded as `-uv - 1`, so an untextured vertex the camera
+/// could still see reads as something like `(-1.62, -1.31)` -- which that
+/// equality misses, leaving a real coordinate to be sampled at a negative uv.
+/// The encoding exists so a triangle mixing the two classes interpolates
+/// between two real coordinates instead of collapsing toward the atlas origin;
+/// see @ref texture::ProjectiveTexturer for the three values and what each
+/// means. A writer that must emit a plain coordinate (a glTF `TEXCOORD_0`
+/// accessor, say) has to decode the carried ones rather than pass them
+/// through.
+///
+/// @ref tangent is here only to hold the renderer's layout in place: meshing
+/// cannot derive one, so the kernel writes a fixed placeholder into it.
 struct Vertex {
   Vec3f position;  ///< World-space position (metres).
   Vec3f normal;    ///< Unit surface normal (an arbitrary unit axis where the
@@ -49,8 +61,10 @@ struct Vertex {
                    ///< has no surface parameterisation to derive one from, so
                    ///< every vertex gets the same placeholder the host
                    ///< converter used to synthesize. See the layout note above.
-  Vec2f uv0;       ///< Atlas texture coordinate, or the `(-1, -1)` sentinel
-                   ///< meaning "no atlas; use @ref color".
+  Vec2f uv0;       ///< Atlas texture coordinate when `x >= 0`; **any** negative
+                   ///< value means "no atlas; use @ref color". Test the sign,
+                   ///< never `== (-1, -1)` -- see the note above, which the
+                   ///< `-uv - 1` carried form makes load-bearing.
   Vec4f color;     ///< Per-vertex RGBA in **linear** working values (linear
                    ///< BT.709/D65), opaque (alpha 1) -- the vertex-color
                    ///< fallback used where @ref uv0 is the sentinel. Linear

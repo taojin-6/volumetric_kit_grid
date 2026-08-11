@@ -1324,9 +1324,11 @@ int main() {
     CHECK(multi > share_mesh.vertices.size() / 2);
   }
 
-  // The device view says so, which is what texture::ProjectiveTexturer refuses
-  // on -- per-triangle visibility cannot be written to a per-vertex uv0 that
-  // several triangles share.
+  // The device view says so, which is how a consumer sizes against a shared
+  // mesh without inspecting the buffers -- vertex_count is no longer
+  // `3 * triangle_count`. It is not an incompatibility: texture::
+  // ProjectiveTexturer decides visibility per vertex and textures this mesh
+  // like any other (see texture_device_mesh_test).
   vr::Result<mesh::DeviceMesh> share_device =
       share_mc.extract_device(grid, 0.0f);
   CHECK(share_device.ok());
