@@ -589,7 +589,8 @@ void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   released_through_ = std::max(released_through_, generation);
 }
 
-Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles) {
+Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
+                                              std::uint32_t seed_vertices) {
   if (!indirect().valid()) {
     // INDIRECT_BUFFER beside STORAGE_BUFFER: the kernel counts into field 0
     // through the storage binding, and a renderer issues
@@ -628,7 +629,14 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles) {
   // a stronger reason -- it is a report the host *fails* on, so it must not be
   // able to read as a stale success -- and `remeshed_blocks` because a full
   // pass never writes it, so a stale value would be published as this call's.
-  const std::uint32_t scratch_reset[3] = {0, 0, 0};
+  //
+  // The vertex counter is SEEDED rather than zeroed, exactly as indexCount is
+  // and for the same reason: with sharing the arena still holds every clean
+  // block's vertices below the watermark, and the kernel's atomic has to hand
+  // out APPEND slots past them. Only that kernel allocates through this word,
+  // so every other caller passes 0 and this is the plain reset it has always
+  // been.
+  const std::uint32_t scratch_reset[3] = {seed_vertices, 0, 0};
   std::memcpy(static_cast<std::byte*>(indirect().mapped()) + kVertexCountOffset,
               scratch_reset, sizeof(scratch_reset));
   return {};
@@ -755,7 +763,8 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
 
 Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
                                             std::uint32_t vertex_capacity,
-                                            std::uint32_t seed_triangles) {
+                                            std::uint32_t seed_triangles,
+                                            std::uint32_t seed_vertices) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
   // rejected because the growth policy overshot.
@@ -793,7 +802,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // parameter rather than a member: either guard returns without resetting
   // anything, and a seed latched on the object would then survive to be
   // inherited by a later dense or empty extract over an arena it had rewritten.
-  VR_TRY(ensure_indirect_command(seed_triangles));
+  VR_TRY(ensure_indirect_command(seed_triangles, seed_vertices));
 
   // Two buffers, two budgets, and each is grown ON ITS OWN.
   //
@@ -1028,7 +1037,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                 config.share_vertices
                     ? vr_marching_cubes_sparse_shared_comp_spv_size
                     : vr_marching_cubes_sparse_comp_spv_size,
-                10, &push_sparse));
+                config.share_vertices ? 11 : 10, &push_sparse));
   VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 of both
@@ -1455,7 +1464,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // whichever arena this slot happens to hold. Zeroed, it draws nothing,
     // which is what an empty mesh means -- and zero is what this path passes,
     // rather than what it happens to find, since the seed is a parameter.
-    VR_TRY(ensure_indirect_command(0));
+    VR_TRY(ensure_indirect_command(0, 0));
     // Stamped here and not a line earlier: this is the last fallible statement,
     // so from here the DeviceMesh below is certain to be handed out. A stamp
     // above a return that never publishes is a slot nothing can release.
@@ -1595,8 +1604,6 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   //    and anchored to THIS grid's topology -- the integrator answers the last
   //    two, and returns a null handle rather than flags it will not vouch for;
   //  - spans tracked, since the kernel reads a block's own range from them;
-  //  - not sharing, since a shared vertex is not owned three-per-triangle, so a
-  //    relocated block cannot retire what it leaves behind;
   //  - one slot, since the arena must persist across the call and a ring hands
   //    each extract a different one (the TODO(mesh) on the class);
   //  - an arena state from a published extract, still anchored to this grid's
@@ -1607,7 +1614,19 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   //    without copying and the clean blocks' triangles live in the old buffer.
   //    Decided here rather than discovered inside ensure_output_buffers, which
   //    is a single call that seeds the draw command on its way past the point
-  //    of no return.
+  //    of no return. BOTH buffers, and under sharing that is two independent
+  //    tests rather than one restated: sharing shrinks the vertices and leaves
+  //    the triangles alone, so either can be the one that has to grow.
+  //
+  // Sharing is NOT a clause. It used to be, on the grounds that a relocated
+  // block cannot retire what it leaves behind unless it owns its vertices
+  // three-per-triangle -- which reads the cost backwards. That kernel writes
+  // its own index run, so it retires a dead triangle by pointing three indices
+  // at one vertex, 12 bytes against the default kernel's 192; and its dead
+  // vertices need no retiring at all, since in-block sharing leaves them
+  // unreachable once no triangle names them. What sharing does add is that the
+  // two ranges are reserved independently, which the kernel answers by reusing
+  // in place only when BOTH counts fit.
   //
   // Read off `prev_arena` rather than the members, and decided ABOVE
   // ensure_block_spans, which re-anchors span_epoch_ and bumps span_serial_ on
@@ -1624,9 +1643,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   bool incremental =
       dirty != nullptr && dirty->flags != VK_NULL_HANDLE &&
       dirty->capacity != 0 && dirty->epoch == grid.topology_epoch() &&
-      config_.track_block_spans && !config_.share_vertices &&
-      slot_count_ == 1 && prev_arena.watermark != 0 &&
-      prev_arena.epoch == grid.topology_epoch() &&
+      config_.track_block_spans && slot_count_ == 1 &&
+      prev_arena.watermark != 0 && prev_arena.epoch == grid.topology_epoch() &&
       prev_arena.serial == span_serial_ && arena().valid() &&
       planned_verts <= arena_vertex_capacity() && capacity <= arena_capacity();
 
@@ -1650,8 +1668,14 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   }
 
   VR_TRY(ensure_block_spans(grid));
-  VR_TRY(ensure_output_buffers(capacity, planned_verts,
-                               incremental ? prev_arena.watermark : 0u));
+  VR_TRY(ensure_output_buffers(
+      capacity, planned_verts, incremental ? prev_arena.watermark : 0u,
+      // Only the sharing kernel allocates vertices through the scratch
+      // counter; the default one writes each triangle's three at `tri * 3`
+      // and never touches it, so seeding it there would arm a number nothing
+      // reads.
+      incremental && config_.share_vertices ? prev_arena.vertex_watermark
+                                            : 0u));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
@@ -1695,14 +1719,20 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
                                             VK_WHOLE_SIZE);
   }
 
-  if (!config_.share_vertices) {
-    // The changed-block flags the kernel dilates on-device, or the same
-    // 1-element dummy the colour slot uses when this pass is full: a descriptor
-    // must be bound either way, and a full pass never reads it.
-    kernel_sparse_.set.write_storage_buffer(
-        9, incremental ? dirty->flags : color_dummy_.handle(), 0,
-        incremental ? dirty_bytes : VK_WHOLE_SIZE);
-  }
+  // The changed-block flags the kernel dilates on-device, or the same
+  // 1-element dummy the colour slot uses when this pass is full: a descriptor
+  // must be bound either way, and a full pass never reads it. Binding 9
+  // without sharing, 10 with -- that kernel spends 8 on the index run it
+  // writes itself and 9 on the spans.
+  //
+  // Bound to `dirty_bytes` rather than VK_WHOLE_SIZE for the incremental case,
+  // as the hash entries above are: the kernel reads every slot below
+  // `dirty_capacity`, so a caller's over-stated capacity would otherwise be an
+  // out-of-bounds device read.
+  kernel_sparse_.set.write_storage_buffer(
+      config_.share_vertices ? 10 : 9,
+      incremental ? dirty->flags : color_dummy_.handle(), 0,
+      incremental ? dirty_bytes : VK_WHOLE_SIZE);
 
   if (config_.share_vertices) {
     // The sharing kernel's ninth binding. It writes the indices itself, because
@@ -1920,6 +1950,12 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // extract left, which is exactly its current range -- rather than read from
   // a counter, because no counter distinguishes the two.
   std::uint32_t live = emitted;
+  // The same distinction on the vertex axis, and under sharing it is a separate
+  // number rather than 3x this one. Both kernels write `vertex_count`, so the
+  // sum costs the same add either way -- the default one records `3 * tris`,
+  // which keeps `live_verts` in step with `live` and the ratio below at its
+  // constant.
+  std::uint32_t live_verts = produced_verts;
   if (config_.track_block_spans) {
     block_spans_generation_ = generation_;
     // Both bounds hoisted: they are loop-invariant, and the array is allocated
@@ -1929,6 +1965,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
         span_stamp_ != nullptr ? block_span_capacity() : 0;
     const auto* spans = static_cast<const BlockSpan*>(block_spans_.mapped());
     std::uint64_t live_sum = 0;
+    std::uint64_t live_vert_sum = 0;
     for (const volume::BlockIndex& b : active) {
       const auto slot =
           static_cast<std::uint32_t>(b.ptr) / static_cast<std::uint32_t>(vpb);
@@ -1937,6 +1974,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       }
       if (incremental && slot < block_span_capacity()) {
         live_sum += spans[slot].triangle_count;
+        live_vert_sum += spans[slot].vertex_count;
       }
     }
     // Clamped by occupancy, which bounds it by construction: a span describes a
@@ -1948,6 +1986,9 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       live = std::min(static_cast<std::uint32_t>(
                           std::min<std::uint64_t>(live_sum, 0xFFFFFFFFull)),
                       emitted);
+      live_verts = std::min(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                live_vert_sum, 0xFFFFFFFFull)),
+                            produced_verts);
     }
     if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
   }
@@ -1989,13 +2030,31 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // the whole policy: too tight and every frame is a full re-mesh, too loose
   // and the arena carries more dead triangles than live ones. Only the spans
   // can answer it, so it is only checked where they were summed.
+  //
+  // BOTH axes, and under sharing that is two independent questions rather than
+  // one asked twice. The two buffers are reserved separately and drift apart:
+  // a relocating block retires its triangles by writing degenerates, which
+  // keeps them occupying index slots, while its vertices are simply left
+  // unreachable and never written at all. So the vertex arena can be the one
+  // carrying the dead weight while the index run still looks healthy, or the
+  // reverse -- and either buffer reaching maxStorageBufferRange ends the same
+  // way. Withholding on the worse of the two compacts whichever it is. Without
+  // sharing the second test is the first restated (live_verts is 3 * live and
+  // produced_verts is 3 * emitted), so it costs a comparison and changes
+  // nothing.
   const bool over_occupied =
       config_.track_block_spans &&
-      static_cast<std::uint64_t>(live) * kMaxArenaOccupancy < emitted;
+      (static_cast<std::uint64_t>(live) * kMaxArenaOccupancy < emitted ||
+       static_cast<std::uint64_t>(live_verts) * kMaxArenaOccupancy <
+           produced_verts);
   if (!over_occupied) {
     arena_state_.watermark = emitted;
     arena_state_.epoch = grid.topology_epoch();
     arena_state_.serial = span_serial_;
+    // The vertex counterpart, and the number the sharing kernel's atomic
+    // appends past. Recorded on both paths so a later `share_vertices` reader
+    // never sees a watermark pair only half established.
+    arena_state_.vertex_watermark = produced_verts;
   }
 
   DeviceMesh device_mesh;

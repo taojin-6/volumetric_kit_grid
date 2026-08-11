@@ -148,8 +148,16 @@ layout(set = 0, binding = 8, scalar) writeonly buffer Indices { uint indices[]; 
 // struct and why it is declared there. Binding 9 here rather than 8, which this
 // kernel spends on the index run above. A 1-element dummy when pc.write_spans is
 // 0, so the descriptor stays valid for a caller who did not ask for a table.
-layout(set = 0, binding = 9, scalar) writeonly buffer BlockSpans {
+layout(set = 0, binding = 9, scalar) buffer BlockSpans {
   BlockSpan block_spans[];
+};
+// The tsdf tier's per-slot changed flags, dilated on-device exactly as the
+// sibling kernel dilates them -- a block re-meshes when any of its own
+// `+{0,1}^3` neighbourhood is flagged, which is `dirty_remesh_blocks`'
+// `{0,-1}^3` relation read from the other end. Bound only when
+// pc.incremental != 0; a 1-element dummy otherwise.
+layout(set = 0, binding = 10, scalar) readonly buffer DirtyFlags {
+  uint dirty_flags[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -226,7 +234,16 @@ shared uint s_vtotal;   // vertices this block will create (owned + duplicated)
 shared uint s_ttotal;   // triangles this block will emit
 shared uint s_vbase;    // first vertex slot, from the global counter
 shared uint s_ibase;    // first triangle slot, from the global counter
-shared uint s_vcursor;  // hands out slots within [s_vbase, s_vbase + s_vtotal)
+shared uint s_vcursor;
+// Does any block in this block's +{0,1}^3 neighbourhood carry a change, and
+// what did this block hold going in? Both read under the barrier that already
+// publishes the neighbourhood, so neither costs one of its own.
+shared uint s_dirty;
+shared uint s_old_vbase;
+shared uint s_old_vcount;
+shared uint s_old_ibase;
+shared uint s_old_icount;
+shared bool s_reuse;  // hands out slots within [s_vbase, s_vbase + s_vtotal)
 shared uint s_icursor;  // ... and within the triangle range
 shared int s_edge_vtx[kMaxSharedCells * 3u];
 // Phase 1's classification, so every later pass can skip a cell that produces
@@ -545,6 +562,41 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
   }
 }
 
+// Give back the triangles this block no longer occupies.
+//
+// CHEAPER here than in the sibling kernel, and by an order of magnitude, for the
+// one reason sharing exists: this kernel writes its own index run. A dead
+// triangle is retired by pointing its three indices at one vertex -- 12 bytes,
+// zero area, culled before rasterisation -- where the default kernel, whose run
+// is the identity it cannot touch, has to overwrite 192 bytes of vertices to say
+// the same thing. So the retirement cost that argued against relocation there
+// mostly disappears here.
+//
+// The dead VERTICES need no writing at all: nothing outside this block indexes
+// them (sharing is in-block, the +face is duplicated), so once no triangle
+// references them they are unreachable, not merely unused.
+//
+// Index 0 rather than the block's own base, because a block that emitted nothing
+// has no base to point at, and vertex 0 exists whenever the arena does.
+void mcRetireOldRange(uint tid, uint group_threads) {
+  if (pc.incremental == 0u) {
+    return;
+  }
+  // A reuse retires the tail it no longer fills; a relocation, or a block whose
+  // surface left entirely, retires all of it. Both end where the old range did.
+  uint dead_first = s_reuse ? s_ibase + s_ttotal : s_old_ibase;
+  uint dead_end = s_old_ibase + s_old_icount;
+  for (uint tri = dead_first + tid; tri < dead_end; tri += group_threads) {
+    if (tri >= pc.capacity) {
+      break;
+    }
+    uint base = tri * kIndicesPerTriangle;
+    indices[base + 0u] = 0u;
+    indices[base + 1u] = 0u;
+    indices[base + 2u] = 0u;
+  }
+}
+
 void main() {
   int bs = pc.block_size;
   uint vpb = uint(pc.voxels_per_block);
@@ -584,8 +636,41 @@ void main() {
     s_ibase = 0u;
     s_vcursor = 0u;
     s_icursor = 0u;
+    s_dirty = 0u;
   }
+  // Between invocation 0's `s_dirty = 0u` above and the atomicOr below, which
+  // invocations 0..7 reach. Without it those are a race: a lane that ORs its
+  // bit in before lane 0 zeroes the word has its result clobbered, and the
+  // block takes the clean early-return below while its surface has moved --
+  // stale triangles under Status::ok. mcResolveNeighbourhood contains no
+  // barrier of its own (its header says the caller must supply one), so this
+  // is the only thing separating the two. The sibling kernel has it at exactly
+  // this point.
+  //
+  // Latent where lanes 0..7 share one SIMD group, as on Apple; live on any
+  // implementation with a smaller subgroup or independent thread scheduling.
+  barrier();
   mcResolveNeighbourhood(block, tid);
+  // Dilate the changed set over the eight blocks s_neighbour resolves anyway. A
+  // neighbour that is unallocated cannot have changed; one past dirty_capacity
+  // counts as changed, which re-meshes a block that may not need it rather than
+  // leaving it stale.
+  if (pc.incremental != 0u && tid < 8u) {
+    int nptr = s_neighbour[tid];
+    if (nptr >= 0) {
+      uint nslot = uint(nptr) / uint(pc.voxels_per_block);
+      if (nslot >= pc.dirty_capacity || dirty_flags[nslot] != 0u) {
+        atomicOr(s_dirty, 1u);
+      }
+    }
+  }
+  if (pc.incremental != 0u && tid == 0u) {
+    BlockSpan prev = block_spans[uint(block.ptr) / uint(pc.voxels_per_block)];
+    s_old_vbase = prev.vertex_base;
+    s_old_vcount = prev.vertex_count;
+    s_old_ibase = prev.triangle_base;
+    s_old_icount = prev.triangle_count;
+  }
   // Derived once per workgroup by the first 12 lanes, under the same barrier as
   // the neighbourhood: mcEdgeOwner is a pure function of the tables, so having
   // all 256 lanes run its 12-iteration, 96-load loop -- and then call it again
@@ -607,12 +692,29 @@ void main() {
   // grid params, so this is correct for any block size instead of only 8. See
   // the sibling kernel's note for the idle-lane and group-count costs below
   // block_size 8, which apply here unchanged.
+  // A clean block keeps the vertices AND triangles it already has, at the two
+  // ranges its span names, so this returns without touching either arena, the
+  // counters or its span. Uniform across the workgroup and no barrier follows.
+  if (pc.incremental != 0u && s_dirty == 0u) {
+    return;
+  }
+
   if (!sharing) {
     // Unreachable in practice -- the host refuses this grid before dispatching
     // -- so it meshes nothing rather than carrying a second emission path that
     // no test could reach. `sharing_applied` above is what turns it into a
     // clean host-side error.
     return;
+  }
+  // Past both gates, so this counts blocks that are actually re-meshed -- the
+  // number the whole trade is measured against, and the one the host publishes
+  // as ExtractTimings::remeshed_blocks. Counted here and not before the
+  // `sharing` return, so a block the kernel declined is not reported as one it
+  // re-meshed. One atomic per surviving workgroup, and only on an incremental
+  // pass: a full pass would pay it for every block to report a count the host
+  // already has.
+  if (pc.incremental != 0u && tid == 0u) {
+    atomicAdd(remeshed_blocks, 1u);
   }
 
   // PHASE ONE -- classify every cell and size both ranges. Writes nothing but
@@ -649,12 +751,25 @@ void main() {
   // count-but-drop: the totals are taken before any slot is, so an overflow can
   // no longer make either one a lower bound by abandoning a cell part-way.
   if (tid == 0u) {
-    if (s_vtotal != 0u) {
-      s_vbase = atomicAdd(vertex_count, s_vtotal);
-    }
-    if (s_ttotal != 0u) {
-      s_ibase = atomicAdd(index_count, s_ttotal * kIndicesPerTriangle) /
-                kIndicesPerTriangle;
+    // Reuse the ranges this block already owns when BOTH new counts fit. Both,
+    // not either: the two are allocated independently and a triangle indexes
+    // into the vertex range beside it, so reusing one while relocating the
+    // other would leave the kept range's triangles pointing at vertices that
+    // moved. That is the coupling sharing adds over the sibling kernel, where
+    // v = 3t makes one test serve both.
+    s_reuse = pc.incremental != 0u && s_vtotal <= s_old_vcount &&
+              s_ttotal <= s_old_icount;
+    if (s_reuse) {
+      s_vbase = s_old_vbase;
+      s_ibase = s_old_ibase;
+    } else {
+      if (s_vtotal != 0u) {
+        s_vbase = atomicAdd(vertex_count, s_vtotal);
+      }
+      if (s_ttotal != 0u) {
+        s_ibase = atomicAdd(index_count, s_ttotal * kIndicesPerTriangle) /
+                  kIndicesPerTriangle;
+      }
     }
     // The block-to-range mapping stage 3 (dirty-only dispatch) re-meshes
     // against: `active_blocks[block_i]` owns vertices [s_vbase, s_vbase +
@@ -699,8 +814,14 @@ void main() {
   // all-or-none. There IS a barrier below, so that is the property that matters
   // -- a per-lane term added to this condition would leave part of the group at
   // it, which is undefined in SPIR-V and in practice a hang.
+  // Retire FIRST, then leave -- the sibling kernel shipped this bug and the
+  // decisive test caught it as ten stale triangles of a sphere that had moved.
+  // A block whose surface left it entirely arrives here with nothing to emit and
+  // everything to give back, and returning straight out strands its whole
+  // previous range, which the arenas still hold and the draw still covers.
   if (s_ttotal == 0u || s_ibase >= pc.capacity ||
       s_vbase >= pc.vertex_capacity) {
+    mcRetireOldRange(tid, group_threads);
     return;
   }
 
@@ -716,4 +837,7 @@ void main() {
   for (uint local = tid; local < vpb; local += group_threads) {
     mcTrianglePass(block, bs, local);
   }
+
+  // PHASE FIVE -- give back what this block no longer occupies.
+  mcRetireOldRange(tid, group_threads);
 }
