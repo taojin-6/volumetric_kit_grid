@@ -100,6 +100,14 @@ class VR_VOLUME_API VoxelBlockGrid {
   // while map_ (whose members self-guard) survives, leaving valid() == true
   // with the attributes gone. The guard below keeps a self-assigned grid
   // intact.
+  //
+  // Being hand-written, it must name EVERY member, and a forgotten one is
+  // silent: the topology epoch used to be a member here and was not assigned,
+  // so a move-assigned grid took on another grid's blocks while still reporting
+  // the destination's old epoch -- and every slot-keyed cache anchored to it
+  // stayed "valid" across the swap. It now lives in map_ (see topology_epoch),
+  // which is moved, so that particular member cannot be dropped again; the
+  // obligation for anything added below still stands.
   ~VoxelBlockGrid() = default;
   VoxelBlockGrid(VoxelBlockGrid&&) noexcept = default;
   VoxelBlockGrid& operator=(VoxelBlockGrid&& other) noexcept {
@@ -131,7 +139,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///            the next allocation resurrects it. Use @ref remove. This one
   ///            cannot be detected after the fact -- the stale data is
   ///            indistinguishable from fused data -- which is why it is
-  ///            wrapped rather than checked.
+  ///            wrapped rather than checked. It does move @ref topology_epoch,
+  ///            though, so a slot-keyed *cache* is invalidated either way; it
+  ///            is the per-voxel attribute data, and only that, which the
+  ///            wrapper exists to clear.
   /// @return The block index.
   VoxelHashMap& map() noexcept { return map_; }
   /// @overload
@@ -140,24 +151,22 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return The grid + hash-table parameters this grid was built with.
   const VoxelGridParams& grid() const noexcept { return map_.grid(); }
 
-  /// @brief A counter bumped whenever a block STOPS being live: @ref remove and
-  ///        @ref clear.
+  /// @brief A token identifying this grid's current block-index assignment; it
+  ///        changes whenever a block stops being live.
   ///
-  /// Exists so a consumer that caches something keyed by block slot can ask
-  /// whether that cache still describes this grid, which it otherwise cannot:
-  /// a removed block's slot goes back to a LIFO heap and is re-drawn by the
-  /// next allocation, so the same slot silently comes to mean a different
-  /// block at a different coordinate. `tsdf::TsdfIntegrator`'s dirty-block
-  /// flags are the first such cache, and the reason this is here.
+  /// @ref VoxelHashMap::topology_epoch, which is where it lives and where the
+  /// contract is stated. Forwarded rather than duplicated so that the raw path
+  /// cannot dodge it: @ref VoxelHashMap::remove and @ref VoxelHashMap::clear
+  /// reached through @ref map() move this exactly as the wrappers here do,
+  /// where a counter owned by this class was moved only by the wrappers and
+  /// left every anchor built on it defeatable in silence.
   ///
-  /// @ref resize deliberately does **not** bump it: it preserves every block's
-  /// index, so a slot-keyed cache stays correct across a grow (which is the
-  /// whole point of the index-preserving rehash). Reaching @ref
-  /// VoxelHashMap::remove or @ref VoxelHashMap::clear through @ref map() does
-  /// not bump it either -- that is the raw path, and it is already documented
-  /// there as the one whose damage cannot be detected after the fact.
-  /// @return The count of removal events since @ref create; never decreases.
-  std::uint64_t topology_epoch() const noexcept { return topology_epoch_; }
+  /// @ref resize deliberately does **not** move it: it preserves every block's
+  /// index, so a slot-keyed cache stays correct across a grow.
+  /// @return The token; compare for equality only -- it counts nothing.
+  std::uint64_t topology_epoch() const noexcept {
+    return map_.topology_epoch();
+  }
 
   /// @brief Look up an attribute's backing store by name.
   ///
@@ -250,9 +259,6 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
-  // Bumped by remove() / clear(); see topology_epoch(). Not bumped by resize(),
-  // which preserves block indices.
-  std::uint64_t topology_epoch_ = 0;
   // The device's maxStorageBufferRange, read once at create(). An attribute
   // array is the largest buffer this repo allocates and is bound whole, so it
   // is the one most likely to exceed what a single binding may cover -- at the

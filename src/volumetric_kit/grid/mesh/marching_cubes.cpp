@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -492,6 +493,35 @@ void MarchingCubes::free_slot_of(std::uint64_t generation) noexcept {
   }
 }
 
+bool MarchingCubes::block_span_valid(const volume::VoxelBlockGrid& grid,
+                                     std::uint32_t slot) const noexcept {
+  // Both objects first, and for the same reason the other public accessors
+  // check them: a moved-from extractor owns no table, and a moved-from grid
+  // owns no blocks while still answering topology_epoch() with the token it
+  // was anchored on -- so without this, the corpse of a grid reports its slots
+  // live and the object that took its blocks does not.
+  if (!valid() || !grid.valid()) return false;
+  // Then the whole-table test, so this can never disagree with block_spans():
+  // an extract that published nothing -- a failure, an empty active set, or a
+  // dense call -- retires the table while leaving the previous extract's stamps
+  // standing, and a slot reported live beside a null pointer is a contradiction
+  // a caller would resolve the wrong way.
+  //
+  // Then the anchor, then the stamp. The stamp is compared for EQUALITY with
+  // the serial of the extract whose table is published, not merely for being
+  // non-zero: "ever meshed" is not the question. Nothing clears a stamp on the
+  // way past, so a block dropped out of the active set keeps the stamp its last
+  // extract wrote, and a non-zero test would report a span whose bases index an
+  // arena a later extract has entirely rewritten -- another block's geometry,
+  // under Status::ok. Equality makes the answer "meshed by *this* table's
+  // extract", which is the only reading a caller can use, and it is what lets
+  // a re-anchor cost nothing: a stamp from before it can never equal the
+  // serial after it.
+  return block_spans_generation_ != 0 && span_epoch_ == grid.topology_epoch() &&
+         slot < block_span_capacity() && span_stamp_ != nullptr &&
+         span_stamp_[slot] == span_serial_;
+}
+
 const BlockSpan* MarchingCubes::block_spans() const noexcept {
   // Host-visible and mapped, so this is the buffer itself rather than a copy.
   // It is therefore BORROWED: a grow move-assigns block_spans_, whose
@@ -611,10 +641,32 @@ std::uint32_t MarchingCubes::plan_vertex_capacity(
                max_vertices_for(max_storage_buffer_range_)));
 }
 
-Status MarchingCubes::ensure_block_spans(std::uint32_t num_blocks) {
-  if (!config_.track_block_spans || num_blocks <= block_span_capacity()) {
-    return {};
-  }
+Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
+  if (!config_.track_block_spans) return {};
+
+  // Re-anchor before anything reads a span, and note what this does NOT do:
+  // nothing is cleared, on either side. The serial below moves on every extract
+  // and a stamp is only ever equal to the one that wrote it, so every stamp
+  // standing from before this call already fails block_span_valid's equality
+  // test -- clearing them would be a 12 MB write to reach a state that already
+  // holds. The span buffer keeps its old contents for the same reason: an entry
+  // no stamp vouches for is unreadable through the documented path, and zeroing
+  // 24 MB to make it unreadable twice buys nothing. (The grow below still
+  // zeroes the tail it adds -- that memory is uninitialized, not merely stale.)
+  //
+  // The token alone is the anchor: it is drawn from a process-wide counter, so
+  // it names one table's one topology across the whole program. A grid pointer
+  // beside it would add nothing and take away a guarantee -- a destroyed grid
+  // leaves a dangling pointer that a later grid at the same address matches,
+  // and no comparison against it can tell the two apart.
+  //
+  // A resize() does NOT move the token: it preserves block indices, which is
+  // the same property that lets the buffer below carry its old spans forward.
+  span_epoch_ = grid.topology_epoch();
+  ++span_serial_;
+
+  const auto num_blocks = static_cast<std::uint32_t>(grid.grid().num_blocks);
+  if (num_blocks <= block_span_capacity()) return {};
   const VkDeviceSize bytes =
       static_cast<VkDeviceSize>(num_blocks) * sizeof(BlockSpan);
   VR_ASSIGN(Buffer grown,
@@ -642,7 +694,20 @@ Status MarchingCubes::ensure_block_spans(std::uint32_t num_blocks) {
     std::memcpy(dst, block_spans_.mapped(), old_bytes);
   }
   std::memset(dst + old_bytes, 0, static_cast<std::size_t>(bytes) - old_bytes);
+  const std::uint32_t old_slots = block_span_capacity();
   block_spans_ = std::move(grown);
+
+  // The stamps grow with it, and in lockstep: their count is not stored but
+  // READ OFF block_span_capacity(), so allocating one without the other would
+  // make the array's length a lie rather than a mismatch anything could catch.
+  // Zero-initialized by make_unique, which is the host-side counterpart of the
+  // zeroed byte tail above -- a slot the table did not previously cover has
+  // been meshed by no extract, and no serial is ever 0.
+  auto grown_stamps = std::make_unique<std::uint64_t[]>(num_blocks);
+  if (old_slots > 0 && span_stamp_ != nullptr) {
+    std::copy_n(span_stamp_.get(), old_slots, grown_stamps.get());
+  }
+  span_stamp_ = std::move(grown_stamps);
   return {};
 }
 
@@ -1430,7 +1495,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // bindings" while arena_alloc_ms read clean -- and this is a tier whose
   // optimisation decisions are made off these rows (see DECISIONS.md, "Measured
   // lessons"). It is an allocation, so it is timed as one.
-  VR_TRY(ensure_block_spans(static_cast<std::uint32_t>(gp.num_blocks)));
+  VR_TRY(ensure_block_spans(grid));
   VR_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity)));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
@@ -1668,7 +1733,36 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // which they become readable. The generation is the DeviceMesh's own, which
   // is what lets a consumer holding one ask whether the single table still
   // describes it -- the arenas are a ring and this is not.
-  if (config_.track_block_spans) block_spans_generation_ = generation_;
+  //
+  // ... and the same reasoning stamps the spans: every block this dispatch
+  // meshed now carries one, and none of them is stamped until the dispatch that
+  // wrote them is known to have succeeded. Stamped from the active set rather
+  // than read back from the device, because the host chose that set -- the
+  // device only says where each block's geometry went, not which blocks it was
+  // asked about.
+  //
+  // Under the same gate as everything else about the table, and not merely
+  // because the array is null without it: this loop is a division and a store
+  // per active block (~107k of them on room0), and a caller who did not ask for
+  // spans must measure nothing. Its cost lands in arena_alloc_ms, with the
+  // allocation it maintains -- the only row that would otherwise be invisible
+  // to total_ms(), which sums the six phases rather than wrapping the call.
+  if (config_.track_block_spans) {
+    block_spans_generation_ = generation_;
+    // Both bounds hoisted: they are loop-invariant, and the array is allocated
+    // in lockstep with the table it parallels, so this is one test rather than
+    // one per active block.
+    const std::uint32_t stamps =
+        span_stamp_ != nullptr ? block_span_capacity() : 0;
+    for (const volume::BlockIndex& b : active) {
+      const auto slot =
+          static_cast<std::uint32_t>(b.ptr) / static_cast<std::uint32_t>(vpb);
+      if (slot < stamps) {
+        span_stamp_[slot] = span_serial_;
+      }
+    }
+    if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
+  }
 
   DeviceMesh device_mesh;
   device_mesh.vertices = arena().handle();
