@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/buffer.hpp"
@@ -386,7 +387,56 @@ struct MarchingCubesConfig {
   ///       meshes an arbitrary caller-supplied grid with no block structure to
   ///       share within, and is unchanged -- including its identity index run.
   bool share_vertices = false;
+
+  /// @brief Publish @ref MarchingCubes::block_spans -- where each block's
+  ///        geometry landed -- for the sparse @ref MarchingCubes::extract
+  ///        overloads.
+  ///
+  /// Off by default because it is not free and most callers never read it. The
+  /// table is sized by the **grid**, not by the surface: `num_blocks` entries
+  /// of 16 bytes, which is 24 MB at @ref volume::VoxelGridParams::defaults and
+  /// doubles with every @ref volume::VoxelHashMap::resize, held for this
+  /// object's lifetime and counted in @ref ExtractTimings::arena_bytes. With
+  /// this off the kernel is told not to write it and nothing is allocated, so a
+  /// caller who did not ask measures nothing -- the same bargain
+  /// `tsdf::TsdfIntegratorConfig::track_dirty_blocks` strikes for the flags it
+  /// gates, and for the same reason.
+  ///
+  /// @note Applies to the sparse @ref extract overloads only. The dense one
+  ///       meshes a caller-supplied grid with no block structure to describe.
+  bool track_block_spans = false;
 };
+
+/// @brief Where one block's geometry landed in the extract that meshed it.
+///
+/// Counted in vertices and in TRIANGLES -- not indices -- because a triangle is
+/// what a block owns and what a re-mesh replaces; multiply by
+/// @ref kIndicesPerTriangle for the index run. The four numbers are independent
+/// under @ref MarchingCubesConfig::share_vertices and locked at `v = 3t`
+/// without it, which is exactly the ratio sharing breaks.
+///
+/// Mirrored field-for-field by the `BlockSpan` of
+/// `shaders/marching_cubes_block_span.glsl`, which both sparse kernels write
+/// **by field name**. The offsets below pin that ABI: four same-typed members
+/// make every permutation the same size, so `sizeof` alone cannot see a
+/// transposition (see the 2026-07-05 scalar-block-layout decision).
+struct BlockSpan {
+  std::uint32_t vertex_base = 0;     ///< First vertex the block owns.
+  std::uint32_t vertex_count = 0;    ///< Vertices it owns from there.
+  std::uint32_t triangle_base = 0;   ///< First **triangle**, not index.
+  std::uint32_t triangle_count = 0;  ///< Triangles it owns from there.
+};
+static_assert(sizeof(BlockSpan) == 16, "BlockSpan must be 16 bytes");
+static_assert(offsetof(BlockSpan, vertex_base) == 0, "BlockSpan ABI");
+static_assert(offsetof(BlockSpan, vertex_count) == 4, "BlockSpan ABI");
+static_assert(offsetof(BlockSpan, triangle_base) == 8, "BlockSpan ABI");
+static_assert(offsetof(BlockSpan, triangle_count) == 12, "BlockSpan ABI");
+// block_spans() reinterprets mapped device memory as an array of these, which
+// is defined only for a trivially copyable standard-layout type.
+static_assert(std::is_standard_layout_v<BlockSpan>,
+              "BlockSpan must be standard layout");
+static_assert(std::is_trivially_copyable_v<BlockSpan>,
+              "BlockSpan must be trivially copyable");
 
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
 ///        into a host @ref Mesh -- from a dense @ref DenseGrid or straight off
@@ -411,9 +461,10 @@ struct MarchingCubesConfig {
 ///   2026-08-09 incremental-extraction decision). **Both** sparse kernels do
 ///   it: @ref MarchingCubesConfig::share_vertices selects one that reserves two
 ///   ranges rather than one, since a shared vertex breaks `v = 3t`, and it
-///   measured no cost there. Neither is yet published as a per-block range a
-///   caller could index with, so nothing outside the extractor can depend on
-///   it.
+///   measured no cost there. Either range is published as
+///   @ref block_spans when @ref MarchingCubesConfig::track_block_spans asks for
+///   it, which is how a caller outside the extractor indexes a block's
+///   geometry.
 ///
 /// Normals come from the SDF gradient -- one
 /// central difference over the cell's eight corners, shared by that cell's
@@ -467,6 +518,63 @@ class VR_MESH_API MarchingCubes {
   ///         allocation fails.
   static Result<MarchingCubes> create(Device& device, Allocator& allocator,
                                       const MarchingCubesConfig& config = {});
+
+  /// @brief Where the last successful sparse extract put each block's geometry.
+  ///
+  /// Indexed by **block slot** -- `volume::BlockIndex::ptr / voxels_per_block`
+  /// -- and meaningful only for the blocks in the active set of the extract
+  /// that wrote it. A slot means nothing against a different grid, and nothing
+  /// after a `remove()` or `clear()`: the block heap is LIFO, so a reused slot
+  /// names a different block. Anchoring a span table across extracts is
+  /// therefore the caller's job until this tier does it, and a slot the last
+  /// extract did not mesh reads as an empty span rather than as geometry.
+  ///
+  /// A block that meshed and emitted nothing also records an empty span. That
+  /// is a different statement from never having been meshed, and this accessor
+  /// deliberately does not distinguish them -- the caller knows its own active
+  /// set, and a stamp that did distinguish them would be state nothing yet
+  /// reads.
+  ///
+  /// @warning **Borrowed, and invalidated by the next @ref extract or
+  ///          @ref extract_device on this object** -- exactly like a
+  ///          @ref DeviceMesh, and for the same reason: a grid whose
+  ///          `num_blocks` grew reallocates this table, which frees the pages
+  ///          this points at. Do not cache the pointer across a call. Compare
+  ///          @ref block_spans_generation against the
+  ///          @ref DeviceMesh::generation you hold to know whether the table
+  ///          still describes *your* mesh -- above one
+  ///          @ref MarchingCubesConfig::slot_count it will not, because the
+  ///          arena is per slot and this table is not.
+  ///
+  /// @return `block_span_capacity()` entries, or `nullptr` when
+  ///         @ref MarchingCubesConfig::track_block_spans is off, on a
+  ///         moved-from extractor, before the first sparse extract, or when the
+  ///         last extract (sparse or dense) did not leave a table describing it
+  ///         -- a failed one, or one that meshed nothing.
+  const BlockSpan* block_spans() const noexcept;
+
+  /// @brief Entries @ref block_spans addresses.
+  ///
+  /// Derived from the buffer rather than tracked beside it, so the count and
+  /// the pointer cannot disagree -- including on a moved-from extractor, where
+  /// the defaulted move leaves both empty.
+  std::uint32_t block_span_capacity() const noexcept {
+    return static_cast<std::uint32_t>(block_spans_.size() / sizeof(BlockSpan));
+  }
+
+  /// @brief The generation @ref block_spans describes, or 0 if it describes
+  ///        nothing.
+  ///
+  /// The same counter @ref DeviceMesh::generation carries, so the two are
+  /// directly comparable: a consumer holding generation `g` learns that the
+  /// table is about some *other* extract the moment this stops equalling `g`.
+  /// There is one table for the whole ring -- it is one dispatch's worth of
+  /// state, not a mesh a consumer still holds -- so at
+  /// @ref MarchingCubesConfig::slot_count above one this is the check that
+  /// keeps a span from being read against the wrong slot's arena.
+  std::uint64_t block_spans_generation() const noexcept {
+    return block_spans_generation_;
+  }
 
   /// @brief Report that every mesh up to and including @p generation has been
   ///        read, so its slot may be written again.
@@ -682,6 +790,26 @@ class VR_MESH_API MarchingCubes {
   // push flag tells the kernel to ignore it). Mirrors the tsdf integrator's
   // color dummy.
   Buffer color_dummy_;
+  // Per-block spans, indexed by block slot (`BlockIndex::ptr /
+  // voxels_per_block`) and sized to the grid's `num_blocks`. Grown on demand,
+  // never shrunk, and NOT per slot: it describes where the *current* extract
+  // put each block, which is one dispatch's worth of state rather than a mesh a
+  // consumer still holds. Allocated only when config_.track_block_spans is on;
+  // otherwise the kernel is told not to write it and block_spans_dummy_ keeps
+  // the binding valid.
+  Buffer block_spans_;
+  // A 1-element stand-in bound at the span binding when tracking is off, so
+  // that descriptor stays valid without paying num_blocks * 16 bytes for a
+  // table nobody asked for. Mirrors color_dummy_ above, and the `write_spans`
+  // push flag is what keeps the kernel off it.
+  Buffer block_spans_dummy_;
+  // The generation block_spans_ describes; 0 when it describes nothing. Set
+  // only once an extract has succeeded, and cleared by anything that leaves the
+  // table not describing the mesh this object last handed out -- a failed
+  // sparse extract, an empty one, or a dense one. Comparable against
+  // DeviceMesh::generation, which is the point: it is what makes the one table
+  // safe to read beside a ring of arenas.
+  std::uint64_t block_spans_generation_ = 0;
 
   // The vertex arena + the draw command the kernels append through, kept ACROSS
   // extract calls and grown only when a call needs more than the last one.
@@ -839,8 +967,15 @@ class VR_MESH_API MarchingCubes {
   // Output bytes the whole ring is holding -- what ExtractTimings::arena_bytes
   // reports. Every slot carries its own arena AND index run, so the current
   // slot's size is a fraction of this object's cost, not its cost.
+  //
+  // The span table counts too, and it is not a rounding error: it is sized by
+  // the GRID rather than by the surface (num_blocks * 16, which is 24 MB at
+  // VoxelGridParams::defaults against room0's ~38 MB of triangles), it is held
+  // for this object's lifetime, and this is the instrument the ring's runaway
+  // growth was diagnosed with. Omitting a component of what stays resident is
+  // the same defect that folding the index runs in here fixed.
   std::uint64_t resident_output_bytes() const noexcept {
-    std::uint64_t total = 0;
+    std::uint64_t total = block_spans_.size();
     for (std::size_t i = 0; i < slot_count_; ++i)
       total += slots_[i].arena.size() + slots_[i].index_run.size();
     return total;
@@ -897,6 +1032,17 @@ class VR_MESH_API MarchingCubes {
   // slot exactly as claimable as it found it.
   Status ensure_output_buffers(std::uint32_t triangle_capacity,
                                std::uint32_t vertex_capacity);
+
+  // Grow the span table to @p num_blocks entries, carrying the existing spans
+  // forward and zeroing only the new tail. A no-op unless
+  // config_.track_block_spans is on, and never shrinks: num_blocks only rises,
+  // because a VoxelHashMap::resize preserves block indices.
+  //
+  // Separate from ensure_output_buffers because the two are sized by different
+  // things -- that one by the surface this call measured, this one by the grid
+  // it is meshing -- but called beside it, so both allocations land in the same
+  // ExtractTimings row.
+  Status ensure_block_spans(std::uint32_t num_blocks);
 
   // Vertices to budget for a dispatch planned at @p triangle_capacity
   // triangles: the last extract's measured density, seeded when there is none.

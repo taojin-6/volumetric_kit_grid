@@ -53,6 +53,12 @@
 // Cross-tier: the one transfer curve, from core.
 #include "volumetric_kit/recon/core/shaders/color_common.glsl"
 
+// The per-block span record, shared with the sharing kernel. Included ahead of
+// the buffer blocks below, which is why it cannot live in
+// marching_cubes_sparse_common.glsl (that one reads `pc` and the attribute
+// buffers, so it has to come after them).
+#include "marching_cubes_block_span.glsl"
+
 // One workgroup per block. 256 is fixed rather than sized from
 // voxels_per_block, which is a push constant and so cannot set local_size
 // without a specialization constant. That is exact at the default block_size 8
@@ -107,6 +113,14 @@ layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
 // exactly three per triangle and the host derives it).
 layout(set = 0, binding = 7, scalar) buffer DrawCommand { uint index_count; };
 
+// Where each block's output landed; see marching_cubes_block_span.glsl for the
+// struct and why it is declared there. Binding 8 here, 9 in the sharing kernel.
+// A 1-element dummy when pc.write_spans is 0, so the descriptor stays valid for
+// a caller who did not ask for a table.
+layout(set = 0, binding = 8, scalar) writeonly buffer BlockSpans {
+  BlockSpan block_spans[];
+};
+
 layout(push_constant, scalar) uniform PushConstants {
   int block_size;          // voxels per block edge
   int voxels_per_block;    // block_size^3
@@ -130,6 +144,10 @@ layout(push_constant, scalar) uniform PushConstants {
   int num_buckets;
   int bucket_size;
   int max_chain;
+  // 0 = the span binding is a 1-element dummy; do not store through it. Gates
+  // MarchingCubesConfig::track_block_spans, the way has_color gates the colour
+  // attribute.
+  uint write_spans;
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
@@ -321,18 +339,41 @@ void main() {
   // simply not written, which is a stronger form of the old
   // count-but-drop: overflow can no longer make the reported total a lower bound
   // by abandoning a cell early, because the count is taken before any slot is.
-  // TODO(mesh): stage 3 (dirty-only dispatch) needs the block-to-range mapping
-  // this line computes and drops -- `active_blocks[block_i]` owns triangles
-  // [s_block_base, s_block_base + s_block_tris). It is not derivable on the
-  // host, because the atomic hands spans out in workgroup arrival order rather
-  // than block order. Publishing it is a ninth binding, a host allocation and a
-  // DeviceMesh field, which is stage 3's scope and not this one's: stage 2 is
-  // defined as byte-identical geometry with no new invariants (the 2026-08-09
-  // decision), and a range nothing consumes yet would be an unverifiable one.
-  if (tid == 0u && s_block_tris != 0u) {
-    s_block_base =
-        atomicAdd(index_count, s_block_tris * kIndicesPerTriangle) /
-        kIndicesPerTriangle;
+  if (tid == 0u) {
+    if (s_block_tris != 0u) {
+      s_block_base =
+          atomicAdd(index_count, s_block_tris * kIndicesPerTriangle) /
+          kIndicesPerTriangle;
+    }
+    // The block-to-range mapping stage 3 (dirty-only dispatch) re-meshes
+    // against: `active_blocks[block_i]` owns triangles [s_block_base,
+    // s_block_base + s_block_tris), and this line is the only place that is
+    // known -- the atomic hands ranges out in workgroup arrival order rather
+    // than block order, so the host cannot derive it.
+    //
+    // Published for every meshed block, including one that emits nothing:
+    // "meshed and empty" is a different statement from "never meshed", and only
+    // the host's anchor expresses the second. s_block_base is zero-initialised,
+    // so an empty block records an empty span rather than a stale one.
+    //
+    // Written BEFORE the capacity guard below, which is deliberate and is why
+    // the host retires the whole table on a failed extract: the counters carry
+    // the block's full total whatever the arena holds, so a span written here
+    // can name triangles a too-small arena never took. The successful retry
+    // republishes every one of them.
+    //
+    // Assigned by NAME. `s_block_base` is a triangle index only because the
+    // atomic result was divided by kIndicesPerTriangle above, and the vertex
+    // fields are that same base scaled by three; positionally, nothing in the
+    // four says which is which.
+    if (pc.write_spans != 0u) {
+      BlockSpan span;
+      span.vertex_base = s_block_base * 3u;
+      span.vertex_count = s_block_tris * 3u;
+      span.triangle_base = s_block_base;
+      span.triangle_count = s_block_tris;
+      block_spans[uint(block.ptr) / uint(pc.voxels_per_block)] = span;
+    }
   }
   barrier();
 

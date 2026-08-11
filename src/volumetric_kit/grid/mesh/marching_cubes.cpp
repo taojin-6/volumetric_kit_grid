@@ -178,12 +178,18 @@ struct SparsePushConstants {
   std::int32_t num_buckets = 0;
   std::int32_t bucket_size = 0;
   std::int32_t max_chain = 0;
+  // 0 = the span binding is the 1-element dummy; do not write it. Gates
+  // MarchingCubesConfig::track_block_spans, the way `has_color` gates the
+  // colour attribute: the binding must stay valid either way, so the kernel is
+  // told to skip the store rather than being pointed at a table that is not
+  // there. Assigned by name, like the four above.
+  std::uint32_t write_spans = 0;
 };
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
-// sizeof == 44 but silently drift the host<->GLSL push-constant ABI, so guard
+// sizeof == 52 but silently drift the host<->GLSL push-constant ABI, so guard
 // each one, matching the dense PushConstants above.
-static_assert(sizeof(SparsePushConstants) == 48,
-              "SparsePushConstants must be 48 bytes");
+static_assert(sizeof(SparsePushConstants) == 52,
+              "SparsePushConstants must be 52 bytes");
 static_assert(offsetof(SparsePushConstants, vertex_capacity) == 32,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, block_size) == 0,
@@ -207,6 +213,8 @@ static_assert(offsetof(SparsePushConstants, num_buckets) == 36,
 static_assert(offsetof(SparsePushConstants, bucket_size) == 40,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, max_chain) == 44,
+              "SparsePushConstants layout drift");
+static_assert(offsetof(SparsePushConstants, write_spans) == 48,
               "SparsePushConstants layout drift");
 
 // The draw command plus two words of recon scratch, starting at byte 20,
@@ -484,6 +492,27 @@ void MarchingCubes::free_slot_of(std::uint64_t generation) noexcept {
   }
 }
 
+const BlockSpan* MarchingCubes::block_spans() const noexcept {
+  // Host-visible and mapped, so this is the buffer itself rather than a copy.
+  // It is therefore BORROWED: a grow move-assigns block_spans_, whose
+  // operator= destroys the current state first, so the next extract over a
+  // grown grid unmaps and frees the very pages a cached pointer names. The
+  // caller is told so, and block_spans_generation() is the check that makes the
+  // staleness visible rather than merely documented -- a lifetime the caller
+  // cannot see is this library's to check (2026-08-04).
+  //
+  // Refused outright while no extract has left a table describing its own
+  // output. That is what keeps the three failure exits below honest: each
+  // publishes spans before its capacity guard -- deliberately, since the
+  // counters must carry the block's FULL total for the host's refit -- so after
+  // a failure the table names triangles at bases the arena never held.
+  // Returning nullptr costs one comparison and makes reading them impossible,
+  // where disarming the draw command only stopped them being *drawn*.
+  return block_spans_generation_ == 0 || block_span_capacity() == 0
+             ? nullptr
+             : static_cast<const BlockSpan*>(block_spans_.mapped());
+}
+
 void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   // Monotonic: an older report never un-releases a slot. A consumer finishing
   // frames out of order, or reporting a stale value after a newer one, would
@@ -580,6 +609,41 @@ std::uint32_t MarchingCubes::plan_vertex_capacity(
   return static_cast<std::uint32_t>(
       std::min(std::max<std::uint64_t>(estimate, 1),
                max_vertices_for(max_storage_buffer_range_)));
+}
+
+Status MarchingCubes::ensure_block_spans(std::uint32_t num_blocks) {
+  if (!config_.track_block_spans || num_blocks <= block_span_capacity()) {
+    return {};
+  }
+  const VkDeviceSize bytes =
+      static_cast<VkDeviceSize>(num_blocks) * sizeof(BlockSpan);
+  VR_ASSIGN(Buffer grown,
+            storage_buffer(*allocator_, bytes, HostAccess::Random));
+
+  // Carry the existing spans forward and zero only the new tail, mirroring
+  // TsdfIntegrator::prepare_dirty_flags -- the sibling slot-keyed table, grown
+  // by the same event for the same reason. The grow is driven by
+  // VoxelHashMap::resize, which PRESERVES each block's index, and
+  // VoxelBlockGrid::topology_epoch deliberately does not move across it
+  // precisely so a slot-keyed cache stays correct; replacing the table
+  // wholesale would discard every span on the one event the volume tier
+  // guarantees they survive, and silently, on exactly the frames a growing scan
+  // brings in the most new surface.
+  //
+  // The tail is ZEROED rather than left as VMA hands it over. Only the blocks
+  // in an extract's active set are written, so on a first extract that is a few
+  // thousand of 1.5M entries at VoxelGridParams::defaults; the rest are what
+  // the accessor publishes as readable, and driver-garbage bases index the
+  // arena anywhere. An empty span is a truthful "this block owns no geometry".
+  const auto old_bytes =
+      static_cast<std::size_t>(block_span_capacity()) * sizeof(BlockSpan);
+  auto* dst = static_cast<std::uint8_t*>(grown.mapped());
+  if (old_bytes > 0) {
+    std::memcpy(dst, block_spans_.mapped(), old_bytes);
+  }
+  std::memset(dst + old_bytes, 0, static_cast<std::size_t>(bytes) - old_bytes);
+  block_spans_ = std::move(grown);
+  return {};
 }
 
 Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
@@ -811,11 +875,13 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
 
   // Two kernels share one pool. The dense kernel binds five storage buffers:
   // tables (persistent) + the per-extract samples / colors / vertices /
-  // command. The sparse kernel binds eight: tables (persistent) + the
+  // command. The sparse kernel binds nine: tables (persistent) + the
   // per-extract active blocks / hash entries / tsdf / weight / color /
-  // vertices / command -- plus a ninth, the index run, when it is the sharing
-  // variant, which writes real indices where the default one leaves the host's
-  // identity run alone.
+  // vertices / command / block spans -- plus a tenth, the index run, when it is
+  // the sharing variant, which writes real indices where the default one leaves
+  // the host's identity run alone. The spans move to binding 9 there, since
+  // sharing spends 8 on that index run; the count below and the two shaders'
+  // literals are the only statement of that, so they are maintained together.
   // KernelSetBuilder (core/compute_kernel.hpp) builds each
   // layout + pipeline and allocates its set from a shared pool sized to the
   // exact descriptor total.
@@ -842,7 +908,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                 config.share_vertices
                     ? vr_marching_cubes_sparse_shared_comp_spv_size
                     : vr_marching_cubes_sparse_comp_spv_size,
-                config.share_vertices ? 9 : 8, &push_sparse));
+                config.share_vertices ? 10 : 9, &push_sparse));
   VR_ASSIGN(mc.pool_, kb.build());
 
   // Upload the lookup tables once and bind them at set binding 0 of both
@@ -867,6 +933,22 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   std::memset(mc.color_dummy_.mapped(), 0, sizeof(std::uint32_t));
   mc.kernel_sparse_.set.write_storage_buffer(5, mc.color_dummy_.handle(), 0,
                                              VK_WHOLE_SIZE);
+
+  // The same trick for the span table when nobody asked for one. The binding
+  // exists in both kernels unconditionally -- a descriptor a pipeline declares
+  // has to be written whether or not the shader reaches it -- so an opt-out
+  // needs something valid there. One BlockSpan, and the `write_spans` push flag
+  // keeps the kernel from storing through it, which is what makes the opt-out
+  // actually cost nothing rather than merely cost less.
+  if (!config.track_block_spans) {
+    VR_ASSIGN(mc.block_spans_dummy_,
+              storage_buffer(allocator, sizeof(BlockSpan),
+                             HostAccess::SequentialWrite));
+    std::memset(mc.block_spans_dummy_.mapped(), 0, sizeof(BlockSpan));
+    mc.kernel_sparse_.set.write_storage_buffer(config.share_vertices ? 9 : 8,
+                                               mc.block_spans_dummy_.handle(),
+                                               0, VK_WHOLE_SIZE);
+  }
 
   return mc;
 }
@@ -939,6 +1021,12 @@ Result<Mesh> MarchingCubes::extract(const volume::Voxel* samples,
   // succeeds.
   VR_TRY(claim_output_slot());
   ++generation_;
+  // A dense extract describes no blocks, so it retires the span table the same
+  // way the bump above retires a DeviceMesh. It claims the same slot and can
+  // reallocate the same arena, so leaving the last sparse extract's spans
+  // readable would point them at geometry that is no longer there -- the exact
+  // staleness disarm_indirect_command() exists to prevent for the draw command.
+  block_spans_generation_ = 0;
 
   // Per-extract buffers (sized to this grid): the samples in, the vertex arena
   // out (3 vertices per triangle at worst-case capacity), and the atomic
@@ -1172,6 +1260,14 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // never later.
   VR_TRY(claim_output_slot());
   ++generation_;
+  // Retired here, and re-stamped only once this call is certain to hand a mesh
+  // out. Cleared up front rather than on each failing return because there are
+  // four ways down from here that publish nothing -- an empty active set, the
+  // sharing refusal, the unrecoverable overflow, a failed refit -- and both
+  // kernels write a block's span BEFORE their capacity guard, deliberately, so
+  // that the counters carry the block's full total for the refit below. After
+  // any of those four the table names triangles at bases the arena never held.
+  block_spans_generation_ = 0;
 
   // The active set drives the dispatch (one workgroup per block). An empty map
   // means nothing to mesh.
@@ -1328,6 +1424,13 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
       static_cast<std::size_t>(num_active) * sizeof(volume::BlockIndex));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
+  // Both output allocations inside the SAME lap. The span table used to be
+  // grown down among the descriptor writes, which charged a 24 MB allocation
+  // and its page faults to a row documented as "writing the kernel's descriptor
+  // bindings" while arena_alloc_ms read clean -- and this is a tier whose
+  // optimisation decisions are made off these rows (see DECISIONS.md, "Measured
+  // lessons"). It is an allocation, so it is timed as one.
+  VR_TRY(ensure_block_spans(static_cast<std::uint32_t>(gp.num_blocks)));
   VR_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity)));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
@@ -1363,6 +1466,15 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                           VK_WHOLE_SIZE);
   kernel_sparse_.set.write_storage_buffer(7, indirect().handle(), 0,
                                           VK_WHOLE_SIZE);
+  // Binding 8 without sharing, 9 with -- the sharing kernel spends 8 on the
+  // index run it writes itself. Only when tracking is on: with it off, create()
+  // bound the 1-element dummy at this same binding once and nothing rebinds it.
+  if (config_.track_block_spans) {
+    kernel_sparse_.set.write_storage_buffer(config_.share_vertices ? 9 : 8,
+                                            block_spans_.handle(), 0,
+                                            VK_WHOLE_SIZE);
+  }
+
   if (config_.share_vertices) {
     // The sharing kernel's ninth binding. It writes the indices itself, because
     // a shared vertex is referenced by several triangles from several cells and
@@ -1410,6 +1522,7 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
     // Assigned by name for the same reason the three above are: they are
     // same-typed adjacent scalars, so a positional slip would compile.
     push.vertex_capacity = requested_verts;
+    push.write_spans = config_.track_block_spans ? 1u : 0u;
 
     // One workgroup per block, not one thread per voxel: the kernel resolves
     // the block's 2x2x2 neighbourhood into shared memory, which only works when
@@ -1550,6 +1663,12 @@ Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
   // carrying a generation no DeviceMesh ever named whenever a call fails after
   // it, and nothing can release a generation the caller was never given.
   slots_[slot_].generation = generation_;
+  // And the span table, for the same reason and at the same moment: from here
+  // the spans describe the mesh being returned, so this is the one point at
+  // which they become readable. The generation is the DeviceMesh's own, which
+  // is what lets a consumer holding one ask whether the single table still
+  // describes it -- the arenas are a ring and this is not.
+  if (config_.track_block_spans) block_spans_generation_ = generation_;
 
   DeviceMesh device_mesh;
   device_mesh.vertices = arena().handle();

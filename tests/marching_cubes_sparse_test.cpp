@@ -284,6 +284,93 @@ struct BlockLayout {
   std::size_t transitions = 0;
 };
 
+// Does the published span table exactly describe @p m?
+//
+// This is what makes the table verifiable at all rather than state nothing
+// reads. Four properties, and the last two are the ones with teeth:
+//   1. the counts sum to the mesh,
+//   2. the triangle ranges PARTITION it -- disjoint, and covering [0, total)
+//      with no gap,
+//   3. every triangle inside a block's range actually belongs to that block,
+//      by the same centroid attribution block_layout uses,
+//   4. every vertex those triangles reference lies in the same span's VERTEX
+//      range.
+// (1) and (2) would both hold if the kernel published plausible arithmetic that
+// pointed at the wrong geometry; (3) is what ties a span to its block, and (4)
+// is the only thing anywhere that reads BlockSpan::vertex_base.
+bool spans_describe(const mesh::MarchingCubes& mc, const mesh::Mesh& m,
+                    const std::vector<vol::BlockIndex>& active, int block_size,
+                    float voxel_size) {
+  const auto vpb =
+      static_cast<std::uint32_t>(block_size * block_size * block_size);
+  const mesh::BlockSpan* spans = mc.block_spans();
+  if (spans == nullptr || m.indices.empty()) {
+    return false;  // nothing published, or nothing to describe
+  }
+  const float block_span = static_cast<float>(block_size) * voxel_size;
+
+  std::vector<bool> tri_seen(m.indices.size() / 3, false);
+  std::uint64_t tri_total = 0;
+  std::uint64_t vert_total = 0;
+  for (const vol::BlockIndex& b : active) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(b.ptr) / vpb;
+    if (slot >= mc.block_span_capacity()) {
+      return false;
+    }
+    const mesh::BlockSpan sp = spans[slot];
+    tri_total += sp.triangle_count;
+    vert_total += sp.vertex_count;
+    for (std::uint32_t i = 0; i < sp.triangle_count; ++i) {
+      // Widened BEFORE the addition, not after. Both operands are uint32, so
+      // `sp.triangle_base + i` is evaluated at unsigned int rank and converted
+      // only then: a base near UINT32_MAX would wrap to a small `t` and pass
+      // the range test below, turning a corrupt span into a mis-attribution
+      // report that reads like a kernel bug.
+      const std::size_t t = static_cast<std::size_t>(sp.triangle_base) + i;
+      if (t >= tri_seen.size() || tri_seen[t]) {
+        return false;  // out of range, or two blocks claim the same triangle
+      }
+      tri_seen[t] = true;
+      vr::Vec3f c(0.0f, 0.0f, 0.0f);
+      for (int k = 0; k < 3; ++k) {
+        // The index values are device output too, and under share_vertices they
+        // are written by the kernel rather than being the host's identity run
+        // -- so they are checked here rather than trusted. Without this the
+        // dereference below is the first thing an out-of-range index touches,
+        // and it aborts inside this helper under ASan, pointing the reader at
+        // the span table instead of at the index run.
+        const std::uint32_t vi = m.indices[t * 3 + static_cast<std::size_t>(k)];
+        if (vi >= m.vertices.size()) {
+          return false;
+        }
+        // ... and it lies in the VERTEX range the same span claims. This is the
+        // only thing that reads vertex_base at all: the counts summing and the
+        // triangle ranges tiling both hold with vertex_base left at 0 for every
+        // block, and under share_vertices the vertex range is independently
+        // reserved, so it is exactly where a second atomic can drift from the
+        // first. A block's own cells are the only ones that can reference the
+        // vertices it created -- an in-block edge resolves in this block's
+        // table, one owned outside is duplicated locally.
+        if (vi < sp.vertex_base || vi - sp.vertex_base >= sp.vertex_count) {
+          return false;
+        }
+        c = c + m.vertices[vi].position;
+      }
+      c = c / 3.0f;
+      if (static_cast<long long>(std::floor(c.x / block_span)) != b.coord.x ||
+          static_cast<long long>(std::floor(c.y / block_span)) != b.coord.y ||
+          static_cast<long long>(std::floor(c.z / block_span)) != b.coord.z) {
+        return false;  // the span points at another block's geometry
+      }
+    }
+  }
+  // Every triangle is claimed exactly once: `tri_seen` refuses a second claim
+  // above, so a count equal to the total means the ranges tile it. A separate
+  // sweep for unseen entries would be dead code -- N distinct claims over N
+  // slots leaves none.
+  return tri_total == tri_seen.size() && vert_total == m.vertices.size();
+}
+
 BlockLayout block_layout(const mesh::Mesh& m, int block_size,
                          float voxel_size) {
   const float block_span = static_cast<float>(block_size) * voxel_size;
@@ -430,8 +517,13 @@ int main() {
     return 1;
   }
 
-  vr::Result<mesh::MarchingCubes> mc_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value());
+  // The main extractor asks for the span table; most of the fixtures below do
+  // not, which is the point -- track_block_spans is off by default and the
+  // suite exercises both sides of that.
+  mesh::MarchingCubesConfig spans_config;
+  spans_config.track_block_spans = true;
+  vr::Result<mesh::MarchingCubes> mc_result = mesh::MarchingCubes::create(
+      device.value(), allocator.value(), spans_config);
   if (!mc_result) {
     std::fprintf(stderr, "MarchingCubes::create failed: %s\n",
                  mc_result.status().message().c_str());
@@ -501,6 +593,54 @@ int main() {
     // below is satisfied by arithmetic rather than by grouping.
     CHECK(layout.triangles > 4 * layout.distinct);
     CHECK(layout.transitions == layout.distinct - 1);
+  }
+
+  // The published span table describes that layout exactly -- the mapping the
+  // reservation computes, which is not derivable on the host because the atomic
+  // hands spans out in workgroup arrival order rather than block order.
+  {
+    vr::Result<std::vector<vol::BlockIndex>> active =
+        grid.map().compact_active_blocks();
+    CHECK(active.ok());
+    CHECK(spans_describe(extractor, sphere, active.value(), kBlock, kH));
+    // The table describes the extract that wrote it, and says which one that
+    // was. A consumer holding a DeviceMesh compares this against its own
+    // generation -- there is one table for the whole ring, so above one slot
+    // this is what keeps a span from being read against another slot's arena.
+    CHECK(extractor.block_spans_generation() != 0);
+    CHECK(extractor.block_span_capacity() >=
+          static_cast<std::uint32_t>(active.value().size()));
+
+    // A SECOND extract republishes it. Everything above ran against an
+    // extractor's first and only extract, which is the one call where a table
+    // that is never cleared and a table that is correctly rewritten look
+    // identical.
+    const std::uint64_t first_gen = extractor.block_spans_generation();
+    vr::Result<mesh::Mesh> again_result = extractor.extract(grid, 0.0f);
+    CHECK(again_result.ok());
+    const mesh::Mesh again = std::move(again_result).value();
+    CHECK(spans_describe(extractor, again, active.value(), kBlock, kH));
+    CHECK(extractor.block_spans_generation() > first_gen);
+
+    // A DENSE extract on the same extractor claims the same slot and can
+    // reallocate the same arena, so it retires the table rather than leaving
+    // spans that name geometry which is no longer there. The draw command gets
+    // the same treatment for the same reason.
+    const std::vector<vol::Voxel> tiny(8, vol::Voxel{-1.0f, 1.0f});
+    mesh::DenseGrid tiny_grid;
+    tiny_grid.dims = vr::Vec3i(2, 2, 2);
+    tiny_grid.voxel_size = kH;
+    tiny_grid.origin = vr::Vec3f(0.0f, 0.0f, 0.0f);
+    CHECK(extractor.extract(tiny.data(), tiny.size(), tiny_grid, 0.0f).ok());
+    CHECK(extractor.block_spans() == nullptr);
+    CHECK(extractor.block_spans_generation() == 0);
+
+    // ... and the next sparse extract brings it back, so retiring the table is
+    // not a one-way door.
+    vr::Result<mesh::Mesh> revived = extractor.extract(grid, 0.0f);
+    CHECK(revived.ok());
+    CHECK(
+        spans_describe(extractor, revived.value(), active.value(), kBlock, kH));
   }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
@@ -720,6 +860,135 @@ int main() {
   vr::Result<mesh::Mesh> empty_mesh = extractor.extract(empty_grid, 0.0f);
   CHECK(empty_mesh.ok());
   CHECK(std::move(empty_mesh).value().empty());
+  // An empty extract publishes no table either. It returns before any dispatch,
+  // so the spans still standing are the previous extract's -- describing a mesh
+  // this call did not hand out, against a slot it has already claimed.
+  CHECK(extractor.block_spans() == nullptr);
+  CHECK(extractor.block_spans_generation() == 0);
+
+  // --- track_block_spans is off by default -----------------------------------
+  // The table is sized by the GRID (num_blocks * 16, which is 24 MB at
+  // VoxelGridParams::defaults and doubles with every resize), so a caller who
+  // never reads it must not pay for it -- the bargain
+  // TsdfIntegratorConfig::track_dirty_blocks strikes for the same table shape.
+  // Asserted through arena_bytes, which is what makes "costs nothing" a
+  // measurable claim rather than a comment: it counts the span table, so an
+  // ungated allocation would show up here.
+  // Two FRESH extractors differing in nothing but the flag, each run once over
+  // the same grid. Comparing `extractor` against a new one would compare two
+  // different extract histories -- the arenas are grow-only, so the one that
+  // has meshed more is larger for reasons that have nothing to do with the
+  // table -- and the difference here has to be attributable to the flag alone.
+  {
+    mesh::MarchingCubesConfig gated_config;
+    gated_config.track_block_spans = true;
+    vr::Result<mesh::MarchingCubes> gated_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), gated_config);
+    CHECK(gated_result.ok());
+    mesh::MarchingCubes gated = std::move(gated_result).value();
+    vr::Result<mesh::MarchingCubes> ungated_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value());
+    CHECK(ungated_result.ok());
+    mesh::MarchingCubes ungated = std::move(ungated_result).value();
+
+    mesh::ExtractTimings gated_timings;
+    mesh::ExtractTimings ungated_timings;
+    vr::Result<mesh::Mesh> gated_mesh =
+        gated.extract(grid, 0.0f, &gated_timings);
+    vr::Result<mesh::Mesh> ungated_mesh =
+        ungated.extract(grid, 0.0f, &ungated_timings);
+    CHECK(gated_mesh.ok());
+    CHECK(ungated_mesh.ok());
+    // The same surface either way: the kernel skipping the store changes
+    // nothing it emits, which is what makes the flag a pure opt-out.
+    CHECK(ungated_mesh.value().triangle_count() == sphere.triangle_count());
+    CHECK(canonical_triangles(ungated_mesh.value()) ==
+          canonical_triangles(gated_mesh.value()));
+
+    CHECK(ungated.block_spans() == nullptr);
+    CHECK(ungated.block_span_capacity() == 0);
+    CHECK(ungated.block_spans_generation() == 0);
+    CHECK(gated.block_span_capacity() ==
+          static_cast<std::uint32_t>(gp.num_blocks));
+
+    // EXACTLY the table, and no more: same grid, same surface, same plan, so
+    // every other resident byte is identical and the whole difference is the
+    // one allocation. An equality rather than a bound, because that is the
+    // claim -- and because arena_bytes silently omitting the table (it counted
+    // only the arenas and index runs) is one of the things being fixed here.
+    CHECK(gated_timings.arena_bytes ==
+          ungated_timings.arena_bytes +
+              static_cast<std::uint64_t>(gp.num_blocks) *
+                  sizeof(mesh::BlockSpan));
+  }
+
+  // --- The span table survives a grid GROW -----------------------------------
+  // A VoxelHashMap::resize raises num_blocks, so the table has to grow with it;
+  // and because resize PRESERVES each block's index (which is why
+  // topology_epoch deliberately does not move across one), a slot means the
+  // same block on both sides. The grow therefore carries the old spans forward
+  // and zeroes only the new tail, exactly as
+  // TsdfIntegrator::prepare_dirty_flags does for the sibling slot-keyed table
+  // -- replacing it wholesale would discard every span on the one event the
+  // volume tier guarantees they survive.
+  {
+    vr::Result<vol::VoxelBlockGrid> grow_grid_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
+                                    attrs, 2);
+    CHECK(grow_grid_result.ok());
+    vol::VoxelBlockGrid grow_grid = std::move(grow_grid_result).value();
+    CHECK(fill_sphere_grid(grow_grid, /*with_color=*/false));
+
+    mesh::MarchingCubesConfig grow_config;
+    grow_config.track_block_spans = true;
+    vr::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), grow_config);
+    CHECK(grow_result.ok());
+    mesh::MarchingCubes grow_mc = std::move(grow_result).value();
+
+    vr::Result<mesh::Mesh> before = grow_mc.extract(grow_grid, 0.0f);
+    CHECK(before.ok());
+    CHECK(grow_mc.block_span_capacity() ==
+          static_cast<std::uint32_t>(gp.num_blocks));
+    vr::Result<std::vector<vol::BlockIndex>> active_before =
+        grow_grid.map().compact_active_blocks();
+    CHECK(active_before.ok());
+    CHECK(spans_describe(grow_mc, before.value(), active_before.value(), kBlock,
+                         kH));
+
+    CHECK(grow_grid.resize(gp.num_buckets * 2).ok());
+    // Same blocks, same slots -- the resize preserves indices, so this is the
+    // property that makes carrying the table forward meaningful rather than
+    // merely harmless.
+    vr::Result<std::vector<vol::BlockIndex>> active_after =
+        grow_grid.map().compact_active_blocks();
+    CHECK(active_after.ok());
+    CHECK(active_after.value().size() == active_before.value().size());
+
+    vr::Result<mesh::Mesh> after = grow_mc.extract(grow_grid, 0.0f);
+    CHECK(after.ok());
+    CHECK(grow_mc.block_span_capacity() ==
+          static_cast<std::uint32_t>(gp.num_blocks) * 2);
+    CHECK(spans_describe(grow_mc, after.value(), active_after.value(), kBlock,
+                         kH));
+    // The grown tail is ZEROED, not whatever VMA handed over: only blocks in an
+    // extract's active set are written, and every other entry is published as
+    // readable. An empty span is a truthful "this block owns no geometry"; a
+    // driver-garbage base indexes the arena anywhere.
+    const mesh::BlockSpan* grown = grow_mc.block_spans();
+    CHECK(grown != nullptr);
+    std::size_t nonempty = 0;
+    for (std::uint32_t i = 0; i < grow_mc.block_span_capacity(); ++i) {
+      if (grown[i].triangle_count != 0 || grown[i].vertex_count != 0 ||
+          grown[i].triangle_base != 0 || grown[i].vertex_base != 0) {
+        ++nonempty;
+      }
+    }
+    // Every non-empty entry is an active block's; the whole tail past them is
+    // zero. (One active block can legitimately mesh to nothing and record an
+    // empty span, so this is a bound rather than an equality.)
+    CHECK(nonempty <= active_after.value().size());
+  }
 
   // --- Vertex-arena growth policy --------------------------------------------
   // The arena is retained between extracts and only ever grown, so its size is
@@ -910,6 +1179,7 @@ int main() {
   // `bool sharing = false;` left every suite green.
   mesh::MarchingCubesConfig share_config;
   share_config.share_vertices = true;
+  share_config.track_block_spans = true;
   vr::Result<mesh::MarchingCubes> share_result = mesh::MarchingCubes::create(
       device.value(), allocator.value(), share_config);
   CHECK(share_result.ok());
@@ -965,6 +1235,15 @@ int main() {
     CHECK(spans.gaps == 0);
     CHECK(spans.overlaps == 0);
     CHECK(spans.covered == share_mesh.vertices.size());
+
+    // ... and its published table describes it, with vertex counts that are NOT
+    // three per triangle -- the case the default path cannot exercise. The
+    // ranges above are inferred from the mesh; this is what the kernel claims.
+    vr::Result<std::vector<vol::BlockIndex>> active =
+        grid.map().compact_active_blocks();
+    CHECK(active.ok());
+    CHECK(spans_describe(share_mc, share_mesh, active.value(), kBlock, kH));
+    CHECK(share_mesh.vertices.size() != share_mesh.indices.size());
   }
   CHECK(share_timings.emitted_vertices == share_mesh.vertices.size());
   CHECK(share_timings.emitted_triangles == share_mesh.triangle_count());
@@ -1246,12 +1525,24 @@ int main() {
   CHECK(!extractor.extract(empty_grid, 0.0f).ok());
 
   // --- Move-only extractor ---------------------------------------------------
+  // The source must be left EMPTY, not merely invalid: this class's
+  // rule-of-zero moves are correct only while nothing caches a copy of an owned
+  // member's state, and the span table is the newest place that could go wrong.
+  // A block_span_capacity() tracked in a uint32 beside the buffer would survive
+  // the move and report a live capacity next to the null pointer below -- the
+  // exact shape a caller sizing its loop from the capacity walks off the end
+  // of.
+  CHECK(extractor.block_span_capacity() > 0);
   mesh::MarchingCubes moved = std::move(extractor);
   CHECK(!extractor.valid());
+  CHECK(extractor.block_spans() == nullptr);
+  CHECK(extractor.block_span_capacity() == 0);
   CHECK(moved.valid());
+  CHECK(moved.block_span_capacity() > 0);
   mesh::MarchingCubes* alias = &moved;
   moved = std::move(*alias);  // self-move: intact
   CHECK(moved.valid());
+  CHECK(moved.block_span_capacity() > 0);
   vr::Result<mesh::Mesh> reextract = moved.extract(grid, 0.0f);
   CHECK(reextract.ok());
   CHECK(!std::move(reextract).value().empty());
