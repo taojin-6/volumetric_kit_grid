@@ -404,6 +404,39 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The statistics, or a non-OK @ref Status (e.g. moved-from map).
   Result<HashDiagnostics> diagnostics();
 
+  /// @brief A token identifying this table's *current* block-index assignment:
+  ///        it changes whenever a block stops being live (@ref remove, @ref
+  ///        clear).
+  ///
+  /// Exists so a consumer that caches something keyed by block slot can ask
+  /// whether that cache still describes this table, which it otherwise cannot:
+  /// a removed block's index goes back to a LIFO heap and is re-drawn by the
+  /// next allocation, so the same slot silently comes to mean a different block
+  /// at a different coordinate. `tsdf::TsdfIntegrator`'s dirty-block flags and
+  /// `mesh::MarchingCubes`' span table are the two such caches.
+  ///
+  /// It lives *here*, on the table that hands block indices out and takes them
+  /// back, rather than on @ref VoxelBlockGrid -- which is what makes it
+  /// impossible to free an index without moving it. A counter kept one tier up
+  /// was bumped by @ref VoxelBlockGrid::remove and silently *not* by this
+  /// `remove` reached through @ref VoxelBlockGrid::map, so the raw path
+  /// defeated every anchor built on it in perfect silence.
+  ///
+  /// **Globally unique, not a per-map count.** Each value is drawn once from a
+  /// process-wide counter -- at @ref create as well as at every removal -- so
+  /// no two tables, and no two topologies of one table, ever share one. That is
+  /// what lets an anchor be *just* this token: a cache holding the token of a
+  /// destroyed map cannot be revived by a new map built at the same address,
+  /// the ABA a raw pointer comparison has no way to see. Consequently it does
+  /// not count anything; only equality with a previously read value is
+  /// meaningful.
+  ///
+  /// @ref resize deliberately does **not** move it: it preserves every block's
+  /// index, so a slot-keyed cache stays correct across a grow (which is the
+  /// whole point of the index-preserving rehash).
+  /// @return The token; 0 only on a moved-from map, which no live token equals.
+  std::uint64_t topology_epoch() const noexcept { return topology_epoch_; }
+
   /// @return The grid + hash-table parameters this map was built with.
   const VoxelGridParams& grid() const noexcept { return grid_; }
   /// @return `true` if this owns a live table (`false` when moved-from).
@@ -411,6 +444,11 @@ class VR_VOLUME_API VoxelHashMap {
 
  private:
   VoxelHashMap() = default;
+
+  /// Draw the next process-wide unique @ref topology_epoch value. Never
+  /// returns 0, so a default-initialized member is distinguishable from every
+  /// live token.
+  static std::uint64_t next_topology_epoch() noexcept;
 
   /// Run the init kernel, resetting every slot to empty (used by create +
   /// clear).
@@ -485,6 +523,12 @@ class VR_VOLUME_API VoxelHashMap {
   Device* device_ = nullptr;
   Allocator* allocator_ = nullptr;
   VoxelGridParams grid_{};
+  // Re-drawn from the process-wide counter by create / remove / clear; see
+  // topology_epoch(). A scalar, so the defaulted move copies it into the
+  // destination -- which is right: the destination *is* the table the token
+  // named. It is left set on the moved-from map too, and harmlessly so, since
+  // valid() is what says that map owns nothing.
+  std::uint64_t topology_epoch_ = 0;
   // Cached maxComputeWorkGroupCount[0] -- the device cap on a 1-D dispatch's
   // groupCountX; every dispatch rejects an input that would exceed it.
   std::uint32_t max_workgroup_count_x_ = 0;

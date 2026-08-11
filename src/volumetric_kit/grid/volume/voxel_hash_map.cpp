@@ -4,6 +4,7 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -108,6 +109,12 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   map.device_ = &device;
   map.allocator_ = &allocator;
   map.grid_ = grid;
+  // Drawn here and not left at 0, so this table's very first topology is
+  // already distinct from every other table's -- including one that lived at
+  // this address and has since been destroyed. A per-map count starting at 0
+  // would make a fresh map indistinguishable from a dead one whose cache is
+  // still anchored (see topology_epoch()).
+  map.topology_epoch_ = next_topology_epoch();
 
   // Persistent buffers + scratch (host-visible for this slice; device-local +
   // staging is a follow-up perf pass -- see the header TODO). Built as a bundle
@@ -447,6 +454,12 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_points(
 Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
                                            std::uint32_t count,
                                            AllocFailures* out_failures) {
+  // Moved BEFORE the dispatch and unconditionally: this is the only place a
+  // block index is handed back to the heap, so a slot-keyed cache is stale the
+  // moment the kernel runs -- whether it removes every coord, some of them, or
+  // reports failures. A caller that reads the token between the dispatch and a
+  // check placed after it would read the pre-removal value.
+  topology_epoch_ = next_topology_epoch();
   return run_input_kernel("VoxelHashMap::remove", coords, sizeof(BlockIndex),
                           count, delete_, out_failures);
 }
@@ -524,7 +537,26 @@ Status VoxelHashMap::clear() {
   if (!valid()) {
     return Status::invalid_argument("VoxelHashMap::clear: moved-from map");
   }
+  // Every index is about to go back to the heap, so every slot-keyed cache is
+  // stale. Drawn before init_table for the same reason remove draws before its
+  // dispatch. init_table itself must NOT draw: resize calls it too, and a
+  // resize preserves block indices (see topology_epoch()).
+  topology_epoch_ = next_topology_epoch();
   return init_table();
+}
+
+std::uint64_t VoxelHashMap::next_topology_epoch() noexcept {
+  // Process-wide, so a token identifies a table's topology across the whole
+  // program rather than within one object -- which is what makes an anchor
+  // holding a stale token unrevivable by any later map. Atomic because nothing
+  // stops two threads from building or mutating two different grids at once;
+  // relaxed because the only thing required of it is that the values differ,
+  // not that they order anything.
+  //
+  // Pre-incremented from 0, so the first token is 1 and a default-initialized
+  // (moved-from, or never-created) member never equals a live one.
+  static std::atomic<std::uint64_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 Status VoxelHashMap::resize(std::int32_t new_num_buckets) {

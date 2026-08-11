@@ -284,9 +284,9 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
     }
   }
 
-  // Bumped even if the map reports failures: a partial removal has still freed
-  // slots, so a slot-keyed cache is stale either way (see topology_epoch()).
-  ++topology_epoch_;
+  // The topology epoch moves inside VoxelHashMap::remove -- where the index is
+  // actually freed -- so there is nothing to bump here, and no way for the raw
+  // map() path to skip it (see VoxelHashMap::topology_epoch).
   return map_.remove(coords, count, out_failures);
 }
 
@@ -298,8 +298,7 @@ Status VoxelBlockGrid::clear() {
   // can fail, so run it first and leave the attributes untouched if it does --
   // zeroed attributes under a still-populated table would read as fused blocks
   // that lost their data.
-  VR_TRY(map_.clear());
-  ++topology_epoch_;  // every slot is free now; see topology_epoch()
+  VR_TRY(map_.clear());  // moves the topology epoch; see topology_epoch()
   for (Attribute& attr : attributes_) {
     std::memset(attr.buffer.mapped(), 0,
                 static_cast<std::size_t>(attr.buffer.size()));
