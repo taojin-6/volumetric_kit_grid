@@ -133,11 +133,12 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand {
   uint first_instance;
   uint vertex_count;
   uint sharing_applied;
-  // Declared but UNWRITTEN here, mirroring marching_cubes_sparse.comp's own
-  // declaration of this buffer: incremental extraction refuses share_vertices,
-  // so this kernel never re-meshes a subset and never has a count to report.
-  // Named rather than omitted so the two kernels describe the same bytes --
-  // the host resets all three scratch words for either.
+  // Blocks this dispatch actually re-meshed, bumped once per surviving
+  // workgroup on an incremental pass and left at the host's zero on a full one
+  // (where the host already knows the count). The number the whole trade is
+  // measured against, published as ExtractTimings::remeshed_blocks. Both
+  // kernels describe the same bytes here -- the host resets all three scratch
+  // words for either.
   uint remeshed_blocks;
 };
 // The real index buffer -- a property of this dispatch, since a shared vertex is
@@ -180,12 +181,16 @@ layout(push_constant, scalar) uniform PushConstants {
   // MarchingCubesConfig::track_block_spans, the way has_color gates the colour
   // attribute.
   uint write_spans;
-  // Declared but UNUSED here: one ABI shared with marching_cubes_sparse.comp and
-  // SparsePushConstants, so omitting a field the sibling declares would leave
-  // the two disagreeing about the block's size. Incremental extraction refuses
-  // share_vertices for now -- a relocated block would have to retire vertices it
-  // does not own three-per-triangle.
+  // 1 = re-mesh only the blocks the dilation below marks changed, reusing each
+  // block's existing ranges where both new counts fit and appending past the
+  // watermark where they do not. One ABI shared with marching_cubes_sparse.comp
+  // and SparsePushConstants, so both kernels declare both fields whether or not
+  // a given pass reads them -- omitting one would leave the two disagreeing
+  // about the block's size.
   uint incremental;
+  // Slots in the dirty-flag buffer. A neighbour at or past this counts as
+  // changed, which re-meshes a block that may not need it rather than leaving
+  // it stale.
   uint dirty_capacity;
 } pc;
 
@@ -234,7 +239,8 @@ shared uint s_vtotal;   // vertices this block will create (owned + duplicated)
 shared uint s_ttotal;   // triangles this block will emit
 shared uint s_vbase;    // first vertex slot, from the global counter
 shared uint s_ibase;    // first triangle slot, from the global counter
-shared uint s_vcursor;
+shared uint s_vcursor;  // hands out slots within [s_vbase, s_vbase + s_vtotal)
+shared uint s_icursor;  // ... and within [s_ibase, s_ibase + s_ttotal)
 // Does any block in this block's +{0,1}^3 neighbourhood carry a change, and
 // what did this block hold going in? Both read under the barrier that already
 // publishes the neighbourhood, so neither costs one of its own.
@@ -243,8 +249,12 @@ shared uint s_old_vbase;
 shared uint s_old_vcount;
 shared uint s_old_ibase;
 shared uint s_old_icount;
-shared bool s_reuse;  // hands out slots within [s_vbase, s_vbase + s_vtotal)
-shared uint s_icursor;  // ... and within the triangle range
+// Whether BOTH new counts fit the ranges this block already owns, so it can
+// rewrite them where they lie instead of appending past the watermark. Both
+// and not either: the two ranges are reserved independently, and a triangle
+// indexes into the vertex range beside it, so keeping one while relocating the
+// other leaves the kept range's triangles naming vertices that moved.
+shared bool s_reuse;
 shared int s_edge_vtx[kMaxSharedCells * 3u];
 // Phase 1's classification, so every later pass can skip a cell that produces
 // nothing without re-reading eight corners -- and, for a cell whose edges are
@@ -550,10 +560,29 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
       vi[k] = slot;
     }
     uint tri = first_tri + t;
-    if (!ok || tri >= pc.capacity) {
-      continue;  // dropped; the counters already carry it
+    if (tri >= pc.capacity) {
+      continue;  // past the arena; there is no slot to write at all
     }
     uint first = tri * kIndicesPerTriangle;
+    if (!ok) {
+      // Dropped -- a vertex this triangle needs was never written -- but the
+      // slot itself is INSIDE the arena, so leaving it is not the same as
+      // skipping it. On a REUSE it still holds the previous extract's indices,
+      // which are in range and so fault nothing, but they now name three
+      // unrelated vertices of the new surface and draw a full-area triangle
+      // across the block. mcRetireOldRange cannot reach it: that pass starts at
+      // `s_ibase + s_ttotal`, deliberately excluding the live sub-range this
+      // slot sits inside.
+      //
+      // So retire it here, with the same degenerate the retire pass writes. On
+      // a relocation the slot is fresh arena instead of stale, where the same
+      // write is what keeps an uninitialised triple from being drawn. The
+      // counters already carry this triangle either way.
+      indices[first + 0u] = 0u;
+      indices[first + 1u] = 0u;
+      indices[first + 2u] = 0u;
+      continue;
+    }
     // Reversed winding (0, 2, 1) so the CCW front face points along the outward
     // gradient, matching mcEmitCell and what gfx expects.
     indices[first + 0u] = uint(vi[0]);
@@ -787,6 +816,30 @@ void main() {
     // sharing is exactly what breaks that ratio -- and `s_ibase` is a triangle
     // base only because the atomic result was divided by kIndicesPerTriangle
     // two lines up.
+    //
+    // The counts written are the LIVE ones, which on a shrinking reuse are
+    // smaller than the reservation this block still physically owns: the tail
+    // between them is retired to degenerates below and then forgotten, because
+    // nothing here records that it was ever ours. That is deliberate, and it is
+    // the definition every other reader needs -- `block_spans()` publishes a
+    // live range to consumers, and the host sums these for the occupancy ratio
+    // that decides when to compact. The cost is paid by the NEXT pass: a block
+    // that shrinks and then grows back inside its original reservation reads
+    // the shrunk count as `s_old_*`, fails the reuse test against it, and
+    // relocates where it could have stayed.
+    //
+    // TODO(mesh): a surface oscillating around a threshold therefore relocates
+    // on every up-tick, each one appending a fresh range and retiring the old
+    // one. Bounded, not unbounded -- kMaxArenaOccupancy withholds the arena
+    // state once occupancy passes 2x live, and the next full pass compacts --
+    // so what is unknown is the RATE, not whether it terminates. Recording the
+    // reservation as well as the live count (a private per-slot table; not
+    // these four fields, whose ABI is pinned) would remove the relocation
+    // entirely, and is worth building only once relocation is measured to be
+    // common rather than rare. That measurement is the one CLAUDE.md already
+    // parks beside degenerate retirement, and room0 cannot supply it: it
+    // re-meshes 81.67% of its blocks per window, so nearly everything
+    // relocates there for reasons that have nothing to do with this.
     if (pc.write_spans != 0u) {
       BlockSpan span;
       span.vertex_base = s_vbase;

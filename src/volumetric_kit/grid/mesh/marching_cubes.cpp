@@ -1348,7 +1348,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_incremental(
     ExtractTimings* timings) {
   // The request, not the decision. extract_device_impl decides whether an
   // incremental pass is actually SOUND -- spans anchored to this grid, a live
-  // watermark, flags the integrator vouches for, no sharing, an arena that
+  // watermark, flags the integrator vouches for, one slot, an arena that
   // survives -- and falls back to a full extract when it is not, which is why
   // this is one line and not a second copy of that function.
   return extract_device_impl(grid, iso, &dirty, timings);
