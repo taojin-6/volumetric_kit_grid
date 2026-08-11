@@ -57,6 +57,12 @@
 // Cross-tier: the one transfer curve, from core.
 #include "volumetric_kit/recon/core/shaders/color_common.glsl"
 
+// The per-block span record, shared with the default kernel. Included ahead of
+// the buffer blocks below, which is why it cannot live in
+// marching_cubes_sparse_common.glsl (that one reads `pc` and the attribute
+// buffers, so it has to come after them).
+#include "marching_cubes_block_span.glsl"
+
 // One workgroup per block. 256 is fixed rather than sized from
 // voxels_per_block, which is a push constant and so cannot set local_size
 // without a specialization constant. That is exact at the default block_size 8
@@ -132,21 +138,12 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand {
 // referenced by several triangles from several cells.
 layout(set = 0, binding = 8, scalar) writeonly buffer Indices { uint indices[]; };
 
-// Where this block's output landed, keyed by block SLOT (ptr / voxels_per_block)
-// -- vertex base, vertex count, triangle base, triangle count.
-//
-// The mapping the reservation above computes and used to drop. It is not
-// derivable on the host: the atomic hands spans out in workgroup ARRIVAL order,
-// not block order, so nothing outside this dispatch knows which range belongs to
-// which block. Publishing it is what lets a later extract leave a clean block's
-// geometry in place and re-mesh only what a fuse changed.
-//
-// Keyed by slot because a slot is a dense index into a fixed table where a coord
-// would need a device-side hash. A slot only means something against a
-// particular grid and topology epoch -- the host anchors it, exactly as the tsdf
-// tier anchors its dirty flags.
+// Where each block's output landed; see marching_cubes_block_span.glsl for the
+// struct and why it is declared there. Binding 9 here rather than 8, which this
+// kernel spends on the index run above. A 1-element dummy when pc.write_spans is
+// 0, so the descriptor stays valid for a caller who did not ask for a table.
 layout(set = 0, binding = 9, scalar) writeonly buffer BlockSpans {
-  uvec4 block_spans[];
+  BlockSpan block_spans[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -165,6 +162,10 @@ layout(push_constant, scalar) uniform PushConstants {
   int num_buckets;
   int bucket_size;
   int max_chain;
+  // 0 = the span binding is a 1-element dummy; do not store through it. Gates
+  // MarchingCubesConfig::track_block_spans, the way has_color gates the colour
+  // attribute.
+  uint write_spans;
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeOwner / mcEdgeVertex + the near-tangent
@@ -634,14 +635,6 @@ void main() {
   // refits an undersized arena against. It is a stronger form of the old
   // count-but-drop: the totals are taken before any slot is, so an overflow can
   // no longer make either one a lower bound by abandoning a cell part-way.
-  // TODO(mesh): stage 3 (dirty-only dispatch) needs the block-to-range mapping
-  // these two lines compute and drop -- `active_blocks[block_i]` owns vertices
-  // [s_vbase, s_vbase + s_vtotal) and triangles [s_ibase, s_ibase + s_ttotal).
-  // Neither is derivable on the host, because the atomics hand ranges out in
-  // workgroup arrival order rather than block order. Publishing them is a new
-  // binding, a host allocation and a DeviceMesh field, which is stage 3's scope
-  // and not this one's -- the same deferral marked in marching_cubes_sparse.comp,
-  // and here it is two ranges rather than one.
   if (tid == 0u) {
     if (s_vtotal != 0u) {
       s_vbase = atomicAdd(vertex_count, s_vtotal);
@@ -650,10 +643,30 @@ void main() {
       s_ibase = atomicAdd(index_count, s_ttotal * kIndicesPerTriangle) /
                 kIndicesPerTriangle;
     }
-    // Four independent numbers here, where the default kernel's are locked at
-    // v = 3t: sharing is exactly what breaks that ratio.
-    block_spans[uint(block.ptr) / uint(pc.voxels_per_block)] =
-        uvec4(s_vbase, s_vtotal, s_ibase, s_ttotal);
+    // The block-to-range mapping stage 3 (dirty-only dispatch) re-meshes
+    // against: `active_blocks[block_i]` owns vertices [s_vbase, s_vbase +
+    // s_vtotal) and triangles [s_ibase, s_ibase + s_ttotal). Neither is
+    // derivable on the host, because the atomics hand ranges out in workgroup
+    // arrival order rather than block order.
+    //
+    // Written BEFORE the early-out below, for the reason the default kernel's
+    // copy of this states: the counters carry the block's full totals whatever
+    // the arenas hold, so a span published here can outrun them. The host
+    // retires the whole table unless the extract succeeds.
+    //
+    // Assigned by NAME, and here that earns its keep twice over: these are four
+    // INDEPENDENT numbers where the default kernel's are locked at v = 3t --
+    // sharing is exactly what breaks that ratio -- and `s_ibase` is a triangle
+    // base only because the atomic result was divided by kIndicesPerTriangle
+    // two lines up.
+    if (pc.write_spans != 0u) {
+      BlockSpan span;
+      span.vertex_base = s_vbase;
+      span.vertex_count = s_vtotal;
+      span.triangle_base = s_ibase;
+      span.triangle_count = s_ttotal;
+      block_spans[uint(block.ptr) / uint(pc.voxels_per_block)] = span;
+    }
   }
   barrier();
 
