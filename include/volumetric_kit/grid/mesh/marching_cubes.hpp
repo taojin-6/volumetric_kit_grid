@@ -379,20 +379,28 @@ struct MarchingCubesConfig {
   /// published as @ref DeviceMesh::shares_vertices; and
   /// @ref ExtractTimings::emitted_vertices stops being `3 * emitted_triangles`.
   ///
-  /// @warning **Not compatible with `texture::ProjectiveTexturer`**, and that
-  ///          is a property of the texturer rather than a limitation here. It
-  ///          decides visibility per *triangle* and writes @ref Vertex::uv0 per
-  ///          *vertex*, which is well-defined only while a vertex belongs to
-  ///          one triangle. Sharing a vertex between triangles that disagree
-  ///          makes the write order decide the result. Per-vertex `uv0` is in
-  ///          any case the wrong representation for the packed multi-camera
-  ///          atlas that is planned -- a triangle whose vertices index
-  ///          different sub-rects interpolates across the pack -- so the fix is
-  ///          a per-primitive camera id, not a winner-take-all vertex atomic,
-  ///          and this flag is what keeps the two decisions independent. The
-  ///          texturer **refuses** a mesh carrying
-  ///          @ref DeviceMesh::shares_vertices rather than leaving this to the
-  ///          reader.
+  /// @note Compatible with `texture::ProjectiveTexturer`, which it was not
+  ///       until that pass moved to a per-*vertex* dispatch. The
+  ///       incompatibility was never really about sharing: the texturer decided
+  ///       visibility per *triangle* and wrote @ref Vertex::uv0 per *vertex*,
+  ///       so a vertex belonging to several triangles that disagreed was
+  ///       written by whichever thread ran last. Every input to that verdict is
+  ///       a property of the vertex alone, so the pass now dispatches one
+  ///       thread per vertex -- one writer each, nothing to race -- and refuses
+  ///       nothing. It also got cheaper doing it, since a shared vertex used to
+  ///       be projected once per referencing triangle.
+  ///
+  ///       What it costs is the all-three-vertices gate: a triangle straddling
+  ///       the visibility boundary is no longer refused whole, so the textured
+  ///       region grows by up to one triangle at an occlusion silhouette. See
+  ///       `texture::ProjectiveTexturer` for the encoding that bounds it.
+  ///
+  /// @note A packed multi-camera atlas is a different matter and still wants a
+  ///       per-*primitive* camera id: a triangle whose vertices index different
+  ///       sub-rects of a pack cannot be expressed per vertex under any
+  ///       encoding. That is the reason this flag stays published on
+  ///       @ref DeviceMesh -- along with a consumer needing to know whether
+  ///       `v = 3t` when it sizes an arena -- not a residual incompatibility.
   ///
   /// @note Refused per *extract*, not at @ref MarchingCubes::create, for a grid
   ///       whose `voxels_per_block` exceeds 512 -- the sharing kernel's shared
