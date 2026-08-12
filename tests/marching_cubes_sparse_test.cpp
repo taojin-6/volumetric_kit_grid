@@ -2041,6 +2041,51 @@ int main() {
       CHECK(canonical_triangles(host.value()) == shrunk_surface);
     }
 
+    // (d) A CULLED extract in between -- the sibling of (b), and the one the
+    //     first cut of the caller-supplied set missed. A culled pass rebuilds
+    //     the arena from the blocks it was handed and so stamps spans for only
+    //     those; every other block keeps a range naming the arena that pass
+    //     replaced. Left publishing arena state, the next incremental call
+    //     passed every clause of the predicate -- watermark live, epoch
+    //     unmoved, serial equal, since the serial it compares is the culled
+    //     call's own -- and re-meshed against a table describing an arena that
+    //     was gone: half the sphere returned with Status::ok and
+    //     `incremental == 1`, and a dirty block outside the cull wrote over
+    //     live triangles belonging to blocks the pass had promised to keep.
+    //
+    //     Run with all-zero flags, exactly like (a) and (b): a correct fallback
+    //     re-meshes everything and returns the shrunk sphere, while a pass that
+    //     wrongly went incremental keeps whatever the culled arena holds. The
+    //     two differ by the whole culled-away half, so this cannot pass by
+    //     accident.
+    {
+      vr::Result<std::vector<vol::BlockIndex>> live =
+          inc_grid.map().compact_active_blocks();
+      CHECK(live.ok());
+      std::vector<vol::BlockIndex> visible;
+      for (const vol::BlockIndex& b : live.value()) {
+        if (b.coord.x < kBlocks / 2) visible.push_back(b);
+      }
+      CHECK(!visible.empty());
+      CHECK(visible.size() < live.value().size());
+
+      mesh::ExtractTimings cull_t{};
+      vr::Result<mesh::DeviceMesh> culled = inc_mc.extract_device(
+          inc_grid, 0.0f, inc_grid.block_list(visible), &cull_t);
+      CHECK(culled.ok());
+      CHECK(cull_t.active_blocks == visible.size());
+      CHECK(!cull_t.incremental);
+
+      mesh::ExtractTimings rt{};
+      vr::Result<mesh::DeviceMesh> dm =
+          inc_mc.extract_device_incremental(inc_grid, 0.0f, dirty_blocks, &rt);
+      CHECK(dm.ok());
+      CHECK(!rt.incremental);
+      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
+      CHECK(host.ok());
+      CHECK(canonical_triangles(host.value()) == shrunk_surface);
+    }
+
     // (c) A topology change. remove() re-draws the grid's epoch and puts the
     //     freed indices back on the LIFO list, so a slot now names a different
     //     block and BOTH the flags and the spans describe geometry that is
@@ -2168,6 +2213,14 @@ int main() {
     std::sort(merged.begin(), merged.end());
     CHECK(merged == full_tris);
 
+    // block_list() is the anchored spelling of the triple above, and it has to
+    // agree with it exactly -- it is what the docs now send callers to, so a
+    // drift here is a drift in the only pairing that cannot be mispaired.
+    const vol::BlockList made = cull_grid.block_list(lo);
+    CHECK(made.blocks == lo.data());
+    CHECK(made.count == lo_list.count);
+    CHECK(made.epoch == lo_list.epoch);
+
     // An empty set is a camera looking at nothing, not an error.
     const vol::BlockList none{nullptr, 0, cull_grid.topology_epoch()};
     mesh::ExtractTimings none_t{};
@@ -2177,9 +2230,54 @@ int main() {
     CHECK(none_dm.value().empty());
     CHECK(none_t.active_blocks == 0);
 
+    // And so is a DEFAULT-constructed one, which is how a caller spells "the
+    // cull kept nothing" without having a grid in hand. Its epoch is 0 and
+    // next_topology_epoch() never returns 0, so an unconditional epoch check
+    // makes exactly this value the one input that can never be accepted --
+    // refusing on the frames the camera sees nothing while the fully-spelled
+    // empty list above works. An empty list names no block, so there is
+    // nothing about it that can be stale.
+    const vol::BlockList defaulted{};
+    CHECK(defaulted.epoch != cull_grid.topology_epoch());
+    mesh::ExtractTimings def_t{};
+    vr::Result<mesh::DeviceMesh> def_dm =
+        cull_mc.extract_device(cull_grid, 0.0f, defaulted, &def_t);
+    CHECK(def_dm.ok());
+    CHECK(def_dm.value().empty());
+    CHECK(def_t.active_blocks == 0);
+
     // A null pointer with a non-zero count is.
     const vol::BlockList bad{nullptr, 4, cull_grid.topology_epoch()};
     CHECK(!cull_mc.extract_device(cull_grid, 0.0f, bad).ok());
+
+    // A count larger than the grid's block heap is too. The epoch cannot see
+    // this -- it moves only on create/remove/clear, never on allocate or resize
+    // -- so a caller re-compacting into a shorter vector while a cached count
+    // still names last frame's larger one passes every other check, and the
+    // extract would memcpy off the end of the caller's array and upload
+    // whatever followed it as BlockIndex entries.
+    const vol::BlockList oversized{
+        all.value().data(),
+        static_cast<std::uint32_t>(cull_grid.grid().num_blocks) + 1,
+        cull_grid.topology_epoch()};
+    CHECK(!cull_mc.extract_device(cull_grid, 0.0f, oversized).ok());
+
+    // Every one of those refusals is a ROLLBACK, which the contract now states:
+    // they are checked above the output-slot claim and the generation bump, so
+    // a mesh handed out earlier is still valid afterwards. A consumer culling a
+    // frame behind refuses on every frame after a remove(), and would otherwise
+    // have to re-extract and redraw on each one.
+    {
+      mesh::ExtractTimings live_t{};
+      vr::Result<mesh::DeviceMesh> live_dm =
+          cull_mc.extract_device(cull_grid, 0.0f, lo_list, &live_t);
+      CHECK(live_dm.ok());
+      CHECK(cull_mc.download(live_dm.value()).ok());
+      CHECK(!cull_mc.extract_device(cull_grid, 0.0f, bad).ok());
+      CHECK(!cull_mc.extract_device(cull_grid, 0.0f, oversized).ok());
+      // Still this extractor's newest extract: nothing was claimed or bumped.
+      CHECK(cull_mc.download(live_dm.value()).ok());
+    }
 
     // A list compacted before a topology change is REFUSED rather than meshed.
     // The block heap is LIFO, so a remove() has handed those block pointers to
@@ -2194,6 +2292,20 @@ int main() {
                                whole.epoch};
     CHECK(stale.epoch != cull_grid.topology_epoch());
     CHECK(!cull_mc.extract_device(cull_grid, 0.0f, stale).ok());
+    // And that one rolls back too, so a mesh taken after the remove survives a
+    // stale-list refusal -- the epoch refusal is the one a live consumer hits
+    // most, on every frame until its cull catches up.
+    {
+      vr::Result<std::vector<vol::BlockIndex>> now =
+          cull_grid.map().compact_active_blocks();
+      CHECK(now.ok());
+      mesh::ExtractTimings pre_t{};
+      vr::Result<mesh::DeviceMesh> pre_dm = cull_mc.extract_device(
+          cull_grid, 0.0f, cull_grid.block_list(now.value()), &pre_t);
+      CHECK(pre_dm.ok());
+      CHECK(!cull_mc.extract_device(cull_grid, 0.0f, stale).ok());
+      CHECK(cull_mc.download(pre_dm.value()).ok());
+    }
   }
 
   std::printf(

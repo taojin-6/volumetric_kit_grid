@@ -228,43 +228,137 @@ int main() {
   // nothing), so it would hand this a GL-convention [-1,1] matrix and the test
   // would then assert the very confusion the overload's @warning is about.
   CHECK(map.clear().ok());
-  vr::Result<std::uint32_t> vfail =
-      map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
+  // Two blocks the earlier sections do not need, each pinning one thing the
+  // six above structurally cannot.
+  //
+  // kNearBand sits entirely between the [0,1] near plane (0.1) and the [-1,1]
+  // one (2nf/(n+f) = 0.196 for this n and f), so it is the only witness that
+  // separates the two conventions. None of the six lies in that band -- they
+  // sit at world z 1.0, 1.0, 4.8, -1.0, 8.0 and 4.0 lateral -- so substituting
+  // perspectiveRH_NO for perspectiveRH_ZO left every assertion here green while
+  // the @warning claimed the test pinned the convention.
+  //
+  // kJustBehind sits just behind the eye, where a margin larger than z_near
+  // used to reach: the margin was added to all six planes, so at margin > 0.1
+  // the near plane moved behind the camera and the also-widened side planes
+  // admitted a cone of geometry behind it. kBehind is too far back (1.0 m) to
+  // catch that -- it needs a block within the margin.
+  const vr::Vec3i kNearBand(0, 0, 3);     // world z [0.12, 0.16]
+  const vr::Vec3i kJustBehind(0, 0, -3);  // world z [-0.12, -0.08]
+  std::vector<vol::BlockIndex> vp_coords = coords;
+  for (const vr::Vec3i& c : {kNearBand, kJustBehind}) {
+    vol::BlockIndex b{};
+    b.coord = c;
+    vp_coords.push_back(b);
+  }
+  vr::Result<std::uint32_t> vfail = map.allocate(
+      vp_coords.data(), static_cast<std::uint32_t>(vp_coords.size()));
   CHECK(vfail.ok() && vfail.value() == 0);
-  // lookAtRH from the origin toward world +Z with up = world -Y puts camera
-  // right on world +X and camera down on world +Y: the OpenCV basis the pinhole
-  // overload assumes, so the two describe the same frustum in the same place.
-  const vr::Mat4f view_proj =
-      glm::perspectiveRH_ZO(2.0f * std::atan(0.5f), 1.0f, 0.1f, 5.0f) *
+  // lookAtRH from the origin toward world +Z with up = world -Y. Camera right
+  // is world +X and camera down world +Y, so the two overloads describe the
+  // same frustum in the same place -- but only because this projection is
+  // symmetric in y. The basis is NOT the pinhole overload's: this lookAt gives
+  // camera +Y = world -Y and camera +Z = world -Z, where the pinhole overload
+  // under an identity cam_to_world has camera +Y = world +Y. The blocks below
+  // cannot tell the two apart, and nothing here should be read as claiming
+  // they do.
+  const float kFovY = 2.0f * std::atan(0.5f);
+  const vr::Mat4f view =
       glm::lookAtRH(vr::Vec3f(0.0f, 0.0f, 0.0f), vr::Vec3f(0.0f, 0.0f, 1.0f),
                     vr::Vec3f(0.0f, -1.0f, 0.0f));
+  const vr::Mat4f view_proj =
+      glm::perspectiveRH_ZO(kFovY, 1.0f, 0.1f, 5.0f) * view;
 
   // Exact, so kEdge is CULLED here -- it survives the pinhole overload only on
   // that one's built-in ~10% side widening, and this is what pins the
-  // difference. A near-plane convention slip ([-1,1] read as [0,1]) also lands
-  // here: it clips at the eye rather than at 0.1, which keeps kBehind.
-  const std::set<Coord> vp_want = {{0, 0, 25}, {0, 0, 120}};
+  // difference. kNearBand is kept: it is in front of the [0,1] near plane.
+  const std::set<Coord> vp_want = {{0, 0, 25}, {0, 0, 120}, {0, 0, 3}};
   vr::Result<std::vector<vol::BlockIndex>> vp_visible =
       map.compact_active_blocks_in_frustum(vol::make_frustum_planes(view_proj));
   CHECK(vp_visible.ok());
   if (check_result(vp_visible.value(), vp_want) != 0) return 1;
+
+  // The same camera through a GL-convention [-1, 1] projection, which is what
+  // the @warning is about. Reading row 2 as the near plane there puts it at the
+  // harmonic mean of near and far rather than at the eye, so it over-culls a
+  // shell about one near-distance thick -- and kNearBand, which lies in exactly
+  // that shell, is the block that goes missing. Everything else answers the
+  // same, which is why this needed a block of its own.
+  const vr::Mat4f view_proj_gl =
+      glm::perspectiveRH_NO(kFovY, 1.0f, 0.1f, 5.0f) * view;
+  std::set<Coord> gl_want = vp_want;
+  gl_want.erase({0, 0, 3});
+  vr::Result<std::vector<vol::BlockIndex>> vp_gl =
+      map.compact_active_blocks_in_frustum(
+          vol::make_frustum_planes(view_proj_gl));
+  CHECK(vp_gl.ok());
+  if (check_result(vp_gl.value(), gl_want) != 0) return 1;
 
   // The margin is a distance in metres, which is the whole reason it is
   // normalized in: kEdge's box sits ~0.035 m outside the exact right plane, so
   // 0.1 m recovers it and nothing else -- kBehind (~1.06 m out), kFar (~3.0 m)
   // and kSide (~3.1 m) stay culled. A margin applied before normalizing, or one
   // folded into the focal lengths, would not scale this way.
-  const std::set<Coord> margin_want = {{0, 0, 25}, {14, 0, 25}, {0, 0, 120}};
+  const std::set<Coord> margin_want = {
+      {0, 0, 25}, {14, 0, 25}, {0, 0, 120}, {0, 0, 3}};
   vr::Result<std::vector<vol::BlockIndex>> vp_margin =
       map.compact_active_blocks_in_frustum(
           vol::make_frustum_planes(view_proj, 0.1f));
   CHECK(vp_margin.ok());
   if (check_result(vp_margin.value(), margin_want) != 0) return 1;
 
+  // A margin FIVE TIMES the near distance, which is where the near plane used
+  // to end up behind the eye. It must widen the frustum sideways and outward
+  // and still keep the camera on the outside of it: kJustBehind is 0.08 m
+  // behind the eye and well inside a 0.5 m lateral widening, so it survives if
+  // and only if the near plane moved back with the rest. kBehind, 0.96 m back,
+  // is outside the widening either way and cannot witness this.
+  vr::Result<std::vector<vol::BlockIndex>> vp_wide =
+      map.compact_active_blocks_in_frustum(
+          vol::make_frustum_planes(view_proj, 0.5f));
+  CHECK(vp_wide.ok());
+  if (check_result(vp_wide.value(), margin_want) != 0) return 1;
+
+  // The same statement made directly on the planes, since no block in this
+  // fixture is far enough out laterally to witness a 0.5 m widening and near
+  // enough to stay in: every plane but the near one moves by exactly the
+  // margin, and the near one does not move at all. Read off the arrays rather
+  // than inferred from the survivors, so "the margin did nothing" and "the
+  // margin did the right thing" cannot be confused.
+  const vol::FrustumPlanes exact = vol::make_frustum_planes(view_proj);
+  const vol::FrustumPlanes widened = vol::make_frustum_planes(view_proj, 0.5f);
+  for (std::size_t i = 0; i < exact.size(); ++i) {
+    const float moved = widened[i].w - exact[i].w;
+    // Index 4 is the near plane; see make_frustum_planes' @return.
+    CHECK(std::fabs(moved - (i == 4 ? 0.0f : 0.5f)) < 1e-5f);
+    // And the normals are untouched either way -- the offset is a d-shift, not
+    // a re-derivation.
+    CHECK(std::fabs(widened[i].x - exact[i].x) < 1e-6f);
+    CHECK(std::fabs(widened[i].y - exact[i].y) < 1e-6f);
+    CHECK(std::fabs(widened[i].z - exact[i].z) < 1e-6f);
+  }
+
+  // A degenerate matrix -- an all-zero Mat4f is what `Mat4f{}` gives, and
+  // vector_types.hpp already warns that the identity must be spelled
+  // `Mat4f(1.0f)`. Every plane comes out zero-length, so there is no unit
+  // normal for a metre offset to mean anything against, and adding one anyway
+  // made the test `margin_m >= 0`: at any negative margin that rejects
+  // everything, which is an empty mesh every frame with Status::ok. The
+  // degenerate branch adds no margin, so this keeps every block instead --
+  // conservative, and the direction a cull should fail in.
+  vr::Result<std::vector<vol::BlockIndex>> vp_degenerate =
+      map.compact_active_blocks_in_frustum(
+          vol::make_frustum_planes(vr::Mat4f(0.0f), -1e-7f));
+  CHECK(vp_degenerate.ok());
+  CHECK(vp_degenerate.value().size() == vp_coords.size());
+
   std::printf(
       "recon volume frustum test passed: identity view kept %zu/6 (widening + "
       "near-far edges), posed view kept %zu/4 (pose transform exercised), "
-      "view_proj kept %zu/6 exact and %zu/6 at a 0.1 m margin\n",
-      want.size(), pwant.size(), vp_want.size(), margin_want.size());
+      "view_proj kept %zu/8 exact, %zu/8 under a GL [-1,1] projection and "
+      "%zu/8 at a 0.1 m margin; a 0.5 m margin kept the camera outside the "
+      "frustum and a degenerate matrix culled nothing\n",
+      want.size(), pwant.size(), vp_want.size(), gl_want.size(),
+      margin_want.size());
   return 0;
 }

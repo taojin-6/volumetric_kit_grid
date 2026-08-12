@@ -189,6 +189,11 @@ layout(push_constant, scalar) uniform PushConstants {
   // Slots `dirty_flags` addresses. A block past it is treated as dirty -- the
   // conservative direction, and it re-meshes rather than going stale.
   uint dirty_capacity;
+  // Block slots the grid's heap holds, so a BlockIndex::ptr this kernel did not
+  // produce can be bounded in one comparison. Appended at the END for the
+  // reason dirty_capacity was: this block is one ABI shared with the sibling
+  // sparse kernel and SparsePushConstants on the host.
+  uint num_block_slots;
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
@@ -356,6 +361,19 @@ void main() {
     return;
   }
   BlockIndex block = active_blocks[block_i];
+
+  // A caller-supplied active set can name a block slot this grid never handed
+  // out: the host bounds the LIST LENGTH in O(1), but bounding every ptr is
+  // O(count) of host work per frame, which the extract deliberately does not
+  // spend. Left unbounded, a fabricated ptr is an out-of-bounds STORE into
+  // block_spans below, not merely a read of the wrong voxels -- and
+  // robustBufferAccess is enabled nowhere in this repo. The condition is
+  // uniform across the workgroup (every thread reads the same `block`), so this
+  // returns as a whole group and reaches no barrier divergently.
+  if (block.ptr < 0 ||
+      uint(block.ptr) / uint(pc.voxels_per_block) >= pc.num_block_slots) {
+    return;
+  }
 
   // Zero the reservation state alongside resolving the neighbourhood -- one
   // barrier opens both. s_block_base is zeroed here rather than only on the

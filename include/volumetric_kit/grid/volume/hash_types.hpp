@@ -68,18 +68,33 @@ static_assert(offsetof(BlockIndex, ptr) == 12, "BlockIndex layout drift");
 /// directly and the block heap is LIFO, so a `remove()` / `clear()` between the
 /// compaction and the pass that consumes this hands the same `ptr` to a
 /// *different* block -- leaving a list that still typechecks, still indexes in
-/// range, and names geometry that is gone. Fill it from
-/// @ref VoxelBlockGrid::topology_epoch in the same breath as the compaction,
-/// the way `mesh::DirtyBlocks` is filled off the integrator that wrote its
-/// flags; a consumer compares it against the grid it is handed rather than
-/// trusting the two to have been fetched together.
+/// range, and names geometry that is gone. Prefer
+/// @ref VoxelBlockGrid::block_list, which stamps the epoch off the grid that
+/// owns the blocks so the two cannot be mispaired; a consumer compares it
+/// against the grid it is handed rather than trusting the two to have been
+/// fetched together.
+///
+/// @warning Non-owning in @ref blocks *and* unversioned in @ref count: nothing
+///          here notices a vector that was reassigned, reallocated by a
+///          `push_back`, or refilled shorter while this list still names its
+///          old length -- and the epoch cannot catch any of them, since
+///          allocate and resize deliberately leave the topology token alone.
+///          Rebuild the list beside every change to the storage it names, do
+///          not cache one across frames.
+///          TODO(volume): an owning `CompactedBlocks { std::vector<BlockIndex>;
+///          epoch; view() }` returned straight from the compaction entry points
+///          would make all three unrepresentable rather than documented.
 struct BlockList {
   /// The compacted blocks. Null only when @ref count is 0.
   const BlockIndex* blocks = nullptr;
   /// How many blocks @ref blocks addresses. Zero is a legal empty set (a
-  /// camera looking at nothing), not an error.
+  /// camera looking at nothing), not an error -- and an empty list names no
+  /// block, so it is exempt from the @ref epoch check a consumer makes. That is
+  /// what lets a default-constructed `BlockList{}` mean "nothing visible"
+  /// rather than being refused for carrying an epoch (0) no live grid has.
   std::uint32_t count = 0;
   /// The @ref VoxelBlockGrid::topology_epoch the list was compacted at.
+  /// Meaningless, and unchecked, when @ref count is 0.
   std::uint64_t epoch = 0;
 };
 
