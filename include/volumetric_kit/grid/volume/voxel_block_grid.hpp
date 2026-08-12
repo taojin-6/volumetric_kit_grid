@@ -168,6 +168,26 @@ class VR_VOLUME_API VoxelBlockGrid {
     return map_.topology_epoch();
   }
 
+  /// @brief Anchor a compacted block list to this grid, ready to pass to a
+  ///        consumer that meshes a subset.
+  ///
+  /// The pairing @ref BlockList documents as a discipline, made a call instead:
+  /// the pointer, the count and the epoch all come from one expression, so the
+  /// epoch cannot be fetched from a different grid, read a frame early, or
+  /// simply forgotten -- and a forgotten one is not a compile error, since
+  /// @ref BlockList::epoch has a default that no live grid ever equals.
+  ///
+  /// @warning Borrowing, not owning: @p blocks must outlive the returned list
+  ///          and must not be reallocated under it. Call this beside the
+  ///          consumer rather than caching the result.
+  /// @param blocks  A compacted active set, typically straight from
+  ///                @ref VoxelHashMap::compact_active_blocks_in_frustum.
+  /// @return The list, stamped with this grid's current @ref topology_epoch.
+  BlockList block_list(const std::vector<BlockIndex>& blocks) const noexcept {
+    return BlockList{blocks.data(), static_cast<std::uint32_t>(blocks.size()),
+                     topology_epoch()};
+  }
+
   /// @brief Look up an attribute's backing store by name.
   ///
   /// Also the one place the attribute arrays are checked against the live grid,

@@ -2041,6 +2041,51 @@ int main() {
       CHECK(canonical_triangles(host.value()) == shrunk_surface);
     }
 
+    // (d) A CULLED extract in between -- the sibling of (b), and the one the
+    //     first cut of the caller-supplied set missed. A culled pass rebuilds
+    //     the arena from the blocks it was handed and so stamps spans for only
+    //     those; every other block keeps a range naming the arena that pass
+    //     replaced. Left publishing arena state, the next incremental call
+    //     passed every clause of the predicate -- watermark live, epoch
+    //     unmoved, serial equal, since the serial it compares is the culled
+    //     call's own -- and re-meshed against a table describing an arena that
+    //     was gone: half the sphere returned with Status::ok and
+    //     `incremental == 1`, and a dirty block outside the cull wrote over
+    //     live triangles belonging to blocks the pass had promised to keep.
+    //
+    //     Run with all-zero flags, exactly like (a) and (b): a correct fallback
+    //     re-meshes everything and returns the shrunk sphere, while a pass that
+    //     wrongly went incremental keeps whatever the culled arena holds. The
+    //     two differ by the whole culled-away half, so this cannot pass by
+    //     accident.
+    {
+      vr::Result<std::vector<vol::BlockIndex>> live =
+          inc_grid.map().compact_active_blocks();
+      CHECK(live.ok());
+      std::vector<vol::BlockIndex> visible;
+      for (const vol::BlockIndex& b : live.value()) {
+        if (b.coord.x < kBlocks / 2) visible.push_back(b);
+      }
+      CHECK(!visible.empty());
+      CHECK(visible.size() < live.value().size());
+
+      mesh::ExtractTimings cull_t{};
+      vr::Result<mesh::DeviceMesh> culled = inc_mc.extract_device(
+          inc_grid, 0.0f, inc_grid.block_list(visible), &cull_t);
+      CHECK(culled.ok());
+      CHECK(cull_t.active_blocks == visible.size());
+      CHECK(!cull_t.incremental);
+
+      mesh::ExtractTimings rt{};
+      vr::Result<mesh::DeviceMesh> dm =
+          inc_mc.extract_device_incremental(inc_grid, 0.0f, dirty_blocks, &rt);
+      CHECK(dm.ok());
+      CHECK(!rt.incremental);
+      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
+      CHECK(host.ok());
+      CHECK(canonical_triangles(host.value()) == shrunk_surface);
+    }
+
     // (c) A topology change. remove() re-draws the grid's epoch and puts the
     //     freed indices back on the LIFO list, so a slot now names a different
     //     block and BOTH the flags and the spans describe geometry that is
@@ -2066,10 +2111,208 @@ int main() {
     }
   }
 
+  // --- Caller-supplied active set (the mesh half of frustum culling) ---------
+  // extract_device over a BlockList the caller compacted, instead of the whole
+  // map this extractor would compact itself. The decisive check is a PARTITION:
+  // split the active set in two, mesh each half separately, and require the two
+  // triangle sets to merge back into the full mesh exactly. Every cell's base
+  // corner lies in exactly one block, so the halves must be disjoint AND
+  // exhaustive -- a seam triangle dropped where a block's 2x2x2 neighbourhood
+  // reaches into a block that was NOT dispatched shows up as a short merge, and
+  // a duplicated one as a long merge. Meshing a subset and eyeballing that it
+  // is "smaller" would catch neither.
+  {
+    vr::Result<vol::VoxelBlockGrid> cull_grid_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
+                                    attrs, 2);
+    CHECK(cull_grid_result.ok());
+    vol::VoxelBlockGrid cull_grid = std::move(cull_grid_result).value();
+    CHECK(fill_sphere_grid(cull_grid, /*with_color=*/false));
+
+    vr::Result<mesh::MarchingCubes> cull_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
+    CHECK(cull_result.ok());
+    mesh::MarchingCubes cull_mc = std::move(cull_result).value();
+
+    mesh::ExtractTimings full_t{};
+    vr::Result<mesh::Mesh> full = cull_mc.extract(cull_grid, 0.0f, &full_t);
+    CHECK(full.ok());
+    const std::vector<std::array<float, 9>> full_tris =
+        canonical_triangles(full.value());
+    CHECK(!full_tris.empty());
+    CHECK(full_t.active_blocks ==
+          static_cast<std::uint32_t>(kBlocks * kBlocks * kBlocks));
+
+    // Handing over the WHOLE active set must reproduce the internal compaction
+    // bit for bit -- the list is the only thing that changed, so any difference
+    // here is the new path taking a different route to the same dispatch.
+    vr::Result<std::vector<vol::BlockIndex>> all =
+        cull_grid.map().compact_active_blocks();
+    CHECK(all.ok());
+    CHECK(all.value().size() == full_t.active_blocks);
+    const vol::BlockList whole{all.value().data(),
+                               static_cast<std::uint32_t>(all.value().size()),
+                               cull_grid.topology_epoch()};
+    mesh::ExtractTimings whole_t{};
+    vr::Result<mesh::DeviceMesh> whole_dm =
+        cull_mc.extract_device(cull_grid, 0.0f, whole, &whole_t);
+    CHECK(whole_dm.ok());
+    vr::Result<mesh::Mesh> whole_mesh = cull_mc.download(whole_dm.value());
+    CHECK(whole_mesh.ok());
+    CHECK(canonical_triangles(whole_mesh.value()) == full_tris);
+    CHECK(whole_t.active_blocks == full_t.active_blocks);
+    // No compaction happened here, so the row must read 0 rather than carrying
+    // the previous call's figure or timing the caller's own compaction.
+    CHECK(whole_t.compact_ms == 0.0);
+    // A caller-supplied set never turns an extract incremental, whatever else
+    // is true of the extractor.
+    CHECK(!whole_t.incremental);
+
+    // Two complementary halves, split on the block coordinate the way a frustum
+    // would split on visibility.
+    std::vector<vol::BlockIndex> lo;
+    std::vector<vol::BlockIndex> hi;
+    for (const vol::BlockIndex& b : all.value()) {
+      (b.coord.x < kBlocks / 2 ? lo : hi).push_back(b);
+    }
+    CHECK(!lo.empty() && !hi.empty());
+    CHECK(lo.size() + hi.size() == all.value().size());
+
+    const vol::BlockList lo_list{lo.data(),
+                                 static_cast<std::uint32_t>(lo.size()),
+                                 cull_grid.topology_epoch()};
+    mesh::ExtractTimings lo_t{};
+    vr::Result<mesh::DeviceMesh> lo_dm =
+        cull_mc.extract_device(cull_grid, 0.0f, lo_list, &lo_t);
+    CHECK(lo_dm.ok());
+    vr::Result<mesh::Mesh> lo_mesh = cull_mc.download(lo_dm.value());
+    CHECK(lo_mesh.ok());
+
+    const vol::BlockList hi_list{hi.data(),
+                                 static_cast<std::uint32_t>(hi.size()),
+                                 cull_grid.topology_epoch()};
+    mesh::ExtractTimings hi_t{};
+    vr::Result<mesh::DeviceMesh> hi_dm =
+        cull_mc.extract_device(cull_grid, 0.0f, hi_list, &hi_t);
+    CHECK(hi_dm.ok());
+    vr::Result<mesh::Mesh> hi_mesh = cull_mc.download(hi_dm.value());
+    CHECK(hi_mesh.ok());
+
+    CHECK(lo_t.active_blocks == lo.size());
+    CHECK(hi_t.active_blocks == hi.size());
+    std::vector<std::array<float, 9>> merged =
+        canonical_triangles(lo_mesh.value());
+    const std::vector<std::array<float, 9>> hi_tris =
+        canonical_triangles(hi_mesh.value());
+    // Each half is a real, strictly smaller piece of the surface: the partition
+    // check below passes trivially if one half meshed everything.
+    CHECK(!merged.empty() && !hi_tris.empty());
+    CHECK(merged.size() < full_tris.size());
+    CHECK(hi_tris.size() < full_tris.size());
+    merged.insert(merged.end(), hi_tris.begin(), hi_tris.end());
+    std::sort(merged.begin(), merged.end());
+    CHECK(merged == full_tris);
+
+    // block_list() is the anchored spelling of the triple above, and it has to
+    // agree with it exactly -- it is what the docs now send callers to, so a
+    // drift here is a drift in the only pairing that cannot be mispaired.
+    const vol::BlockList made = cull_grid.block_list(lo);
+    CHECK(made.blocks == lo.data());
+    CHECK(made.count == lo_list.count);
+    CHECK(made.epoch == lo_list.epoch);
+
+    // An empty set is a camera looking at nothing, not an error.
+    const vol::BlockList none{nullptr, 0, cull_grid.topology_epoch()};
+    mesh::ExtractTimings none_t{};
+    vr::Result<mesh::DeviceMesh> none_dm =
+        cull_mc.extract_device(cull_grid, 0.0f, none, &none_t);
+    CHECK(none_dm.ok());
+    CHECK(none_dm.value().empty());
+    CHECK(none_t.active_blocks == 0);
+
+    // And so is a DEFAULT-constructed one, which is how a caller spells "the
+    // cull kept nothing" without having a grid in hand. Its epoch is 0 and
+    // next_topology_epoch() never returns 0, so an unconditional epoch check
+    // makes exactly this value the one input that can never be accepted --
+    // refusing on the frames the camera sees nothing while the fully-spelled
+    // empty list above works. An empty list names no block, so there is
+    // nothing about it that can be stale.
+    const vol::BlockList defaulted{};
+    CHECK(defaulted.epoch != cull_grid.topology_epoch());
+    mesh::ExtractTimings def_t{};
+    vr::Result<mesh::DeviceMesh> def_dm =
+        cull_mc.extract_device(cull_grid, 0.0f, defaulted, &def_t);
+    CHECK(def_dm.ok());
+    CHECK(def_dm.value().empty());
+    CHECK(def_t.active_blocks == 0);
+
+    // A null pointer with a non-zero count is.
+    const vol::BlockList bad{nullptr, 4, cull_grid.topology_epoch()};
+    CHECK(!cull_mc.extract_device(cull_grid, 0.0f, bad).ok());
+
+    // A count larger than the grid's block heap is too. The epoch cannot see
+    // this -- it moves only on create/remove/clear, never on allocate or resize
+    // -- so a caller re-compacting into a shorter vector while a cached count
+    // still names last frame's larger one passes every other check, and the
+    // extract would memcpy off the end of the caller's array and upload
+    // whatever followed it as BlockIndex entries.
+    const vol::BlockList oversized{
+        all.value().data(),
+        static_cast<std::uint32_t>(cull_grid.grid().num_blocks) + 1,
+        cull_grid.topology_epoch()};
+    CHECK(!cull_mc.extract_device(cull_grid, 0.0f, oversized).ok());
+
+    // Every one of those refusals is a ROLLBACK, which the contract now states:
+    // they are checked above the output-slot claim and the generation bump, so
+    // a mesh handed out earlier is still valid afterwards. A consumer culling a
+    // frame behind refuses on every frame after a remove(), and would otherwise
+    // have to re-extract and redraw on each one.
+    {
+      mesh::ExtractTimings live_t{};
+      vr::Result<mesh::DeviceMesh> live_dm =
+          cull_mc.extract_device(cull_grid, 0.0f, lo_list, &live_t);
+      CHECK(live_dm.ok());
+      CHECK(cull_mc.download(live_dm.value()).ok());
+      CHECK(!cull_mc.extract_device(cull_grid, 0.0f, bad).ok());
+      CHECK(!cull_mc.extract_device(cull_grid, 0.0f, oversized).ok());
+      // Still this extractor's newest extract: nothing was claimed or bumped.
+      CHECK(cull_mc.download(live_dm.value()).ok());
+    }
+
+    // A list compacted before a topology change is REFUSED rather than meshed.
+    // The block heap is LIFO, so a remove() has handed those block pointers to
+    // different blocks: every one of them is still in range, so without the
+    // epoch this extract would mesh whatever voxels now live there and report
+    // Status::ok. Done last, since it mutates the grid.
+    vol::BlockIndex corner{};
+    corner.coord = vr::Vec3i(0, 0, 0);
+    CHECK(cull_grid.remove(&corner, 1).ok());
+    const vol::BlockList stale{all.value().data(),
+                               static_cast<std::uint32_t>(all.value().size()),
+                               whole.epoch};
+    CHECK(stale.epoch != cull_grid.topology_epoch());
+    CHECK(!cull_mc.extract_device(cull_grid, 0.0f, stale).ok());
+    // And that one rolls back too, so a mesh taken after the remove survives a
+    // stale-list refusal -- the epoch refusal is the one a live consumer hits
+    // most, on every frame until its cull catches up.
+    {
+      vr::Result<std::vector<vol::BlockIndex>> now =
+          cull_grid.map().compact_active_blocks();
+      CHECK(now.ok());
+      mesh::ExtractTimings pre_t{};
+      vr::Result<mesh::DeviceMesh> pre_dm = cull_mc.extract_device(
+          cull_grid, 0.0f, cull_grid.block_list(now.value()), &pre_t);
+      CHECK(pre_dm.ok());
+      CHECK(!cull_mc.extract_device(cull_grid, 0.0f, stale).ok());
+      CHECK(cull_mc.download(pre_dm.value()).ok());
+    }
+  }
+
   std::printf(
       "recon mesh sparse marching-cubes test passed: meshed a sphere across "
-      "%d^3 blocks (%zu triangles), matched the dense path exactly, and "
-      "verified cross-block colour on-device\n",
+      "%d^3 blocks (%zu triangles), matched the dense path exactly, verified "
+      "cross-block colour on-device, and partitioned the active set into two "
+      "caller-supplied halves that merge back exactly\n",
       kBlocks, sphere.triangle_count());
   return 0;
 }
