@@ -13,12 +13,16 @@
 // Runs on the real driver (MoltenVK on Apple, the NVIDIA ICD on Linux CI).
 // Exits 0 (skip) where no device is present.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <set>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <glm/ext/matrix_clip_space.hpp>
+#include <glm/ext/matrix_transform.hpp>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -213,9 +217,54 @@ int main() {
   const std::set<Coord> pwant = {{75, 50, 75}};
   if (check_result(pvisible.value(), pwant) != 0) return 1;
 
+  // --- Render camera (view-projection matrix) -------------------------------
+  // The same six blocks and the same frustum geometry, reached through the
+  // matrix overload a *renderer's* camera has instead of pixel intrinsics.
+  // fovy = 2*atan(cy/fy) = 2*atan(0.5) at aspect 1 reproduces the fx=fy=100,
+  // cx=cy=50, 100x100 pinhole above.
+  //
+  // RH_ZO explicitly, not glm::perspective: that one follows
+  // GLM_FORCE_DEPTH_ZERO_TO_ONE, which recon does not define (it draws
+  // nothing), so it would hand this a GL-convention [-1,1] matrix and the test
+  // would then assert the very confusion the overload's @warning is about.
+  CHECK(map.clear().ok());
+  vr::Result<std::uint32_t> vfail =
+      map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
+  CHECK(vfail.ok() && vfail.value() == 0);
+  // lookAtRH from the origin toward world +Z with up = world -Y puts camera
+  // right on world +X and camera down on world +Y: the OpenCV basis the pinhole
+  // overload assumes, so the two describe the same frustum in the same place.
+  const vr::Mat4f view_proj =
+      glm::perspectiveRH_ZO(2.0f * std::atan(0.5f), 1.0f, 0.1f, 5.0f) *
+      glm::lookAtRH(vr::Vec3f(0.0f, 0.0f, 0.0f), vr::Vec3f(0.0f, 0.0f, 1.0f),
+                    vr::Vec3f(0.0f, -1.0f, 0.0f));
+
+  // Exact, so kEdge is CULLED here -- it survives the pinhole overload only on
+  // that one's built-in ~10% side widening, and this is what pins the
+  // difference. A near-plane convention slip ([-1,1] read as [0,1]) also lands
+  // here: it clips at the eye rather than at 0.1, which keeps kBehind.
+  const std::set<Coord> vp_want = {{0, 0, 25}, {0, 0, 120}};
+  vr::Result<std::vector<vol::BlockIndex>> vp_visible =
+      map.compact_active_blocks_in_frustum(vol::make_frustum_planes(view_proj));
+  CHECK(vp_visible.ok());
+  if (check_result(vp_visible.value(), vp_want) != 0) return 1;
+
+  // The margin is a distance in metres, which is the whole reason it is
+  // normalized in: kEdge's box sits ~0.035 m outside the exact right plane, so
+  // 0.1 m recovers it and nothing else -- kBehind (~1.06 m out), kFar (~3.0 m)
+  // and kSide (~3.1 m) stay culled. A margin applied before normalizing, or one
+  // folded into the focal lengths, would not scale this way.
+  const std::set<Coord> margin_want = {{0, 0, 25}, {14, 0, 25}, {0, 0, 120}};
+  vr::Result<std::vector<vol::BlockIndex>> vp_margin =
+      map.compact_active_blocks_in_frustum(
+          vol::make_frustum_planes(view_proj, 0.1f));
+  CHECK(vp_margin.ok());
+  if (check_result(vp_margin.value(), margin_want) != 0) return 1;
+
   std::printf(
       "recon volume frustum test passed: identity view kept %zu/6 (widening + "
-      "near-far edges), posed view kept %zu/4 (pose transform exercised)\n",
-      want.size(), pwant.size());
+      "near-far edges), posed view kept %zu/4 (pose transform exercised), "
+      "view_proj kept %zu/6 exact and %zu/6 at a 0.1 m margin\n",
+      want.size(), pwant.size(), vp_want.size(), margin_want.size());
   return 0;
 }

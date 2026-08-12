@@ -1351,18 +1351,24 @@ Result<DeviceMesh> MarchingCubes::extract_device_incremental(
   // watermark, flags the integrator vouches for, one slot, an arena that
   // survives -- and falls back to a full extract when it is not, which is why
   // this is one line and not a second copy of that function.
-  return extract_device_impl(grid, iso, &dirty, timings);
+  return extract_device_impl(grid, iso, &dirty, nullptr, timings);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, timings);
+  return extract_device_impl(grid, iso, nullptr, nullptr, timings);
+}
+
+Result<DeviceMesh> MarchingCubes::extract_device(
+    volume::VoxelBlockGrid& grid, float iso, const volume::BlockList& blocks,
+    ExtractTimings* timings) {
+  return extract_device_impl(grid, iso, nullptr, &blocks, timings);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device_impl(
     volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
-    ExtractTimings* timings) {
+    const volume::BlockList* blocks, ExtractTimings* timings) {
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
   // failed call then reports zeros rather than a previous call's numbers.
@@ -1373,6 +1379,38 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   if (!grid.valid()) {
     return Status::invalid_argument(
         "MarchingCubes::extract: grid is moved-from");
+  }
+  // A caller-supplied active set is checked here, above everything this call
+  // allocates and before it claims an output slot -- a refusal must leave every
+  // outstanding DeviceMesh as valid as it found it, which is the same reason
+  // claim_output_slot sits where it does.
+  //
+  // The epoch is the whole of the check that matters. A BlockIndex::ptr indexes
+  // the attribute arrays directly and the block heap is LIFO, so a remove() or
+  // clear() between the caller's compaction and this call has handed those
+  // pointers to DIFFERENT blocks: every one of them is still in range, so the
+  // extract would mesh whatever voxels now live there and report Status::ok.
+  // That is exactly the staleness the span table and the dirty flags are
+  // anchored against, and it is answered here with the same token.
+  //
+  // Not checked: that each ptr is one this grid actually handed out. It is
+  // O(count) of host work per frame -- ~107k entries on room0 -- to catch a
+  // caller who fabricated a list rather than compacting one, and the epoch
+  // already catches every way a list obtained honestly can go stale.
+  if (blocks != nullptr) {
+    if (blocks->blocks == nullptr && blocks->count != 0) {
+      return Status::invalid_argument(
+          "MarchingCubes::extract: the block list is null with a non-zero "
+          "count");
+    }
+    if (blocks->epoch != grid.topology_epoch()) {
+      return Status::invalid_argument(
+          "MarchingCubes::extract: the block list was compacted against "
+          "topology epoch " +
+          std::to_string(blocks->epoch) + ", but this grid is now at " +
+          std::to_string(grid.topology_epoch()) +
+          " (a remove()/clear() since then has re-used its block pointers)");
+    }
   }
   // The grid must carry the float tsdf + weight the sparse kernel samples; the
   // uint32 color attribute is optional (its absence -> opaque-white vertices).
@@ -1435,13 +1473,37 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // strand it.
   arena_state_ = ArenaState{};
 
-  // The active set drives the dispatch (one workgroup per block). An empty map
-  // means nothing to mesh.
+  // The active set drives the dispatch (one workgroup per block). Either the
+  // caller handed one over -- its own subset of the map, typically what a
+  // camera can see -- or this call compacts the whole map itself. Nothing below
+  // reads which: both arrive as one BlockList, and every use of it is written
+  // against a pointer and a count rather than a container.
+  //
+  // `compacted` owns the storage in the second case and must outlive every use
+  // of `active`, which borrows it. It is declared here, in the scope the whole
+  // dispatch runs in, for exactly that reason.
   PhaseClock phase_clock(timings != nullptr);
-  VR_ASSIGN(std::vector<volume::BlockIndex> active,
-            grid.map().compact_active_blocks());
-  if (timings != nullptr) timings->compact_ms = phase_clock.lap();
-  if (active.empty()) {
+  std::vector<volume::BlockIndex> compacted;
+  volume::BlockList active{};
+  if (blocks != nullptr) {
+    active = *blocks;
+  } else {
+    VR_ASSIGN(compacted, grid.map().compact_active_blocks());
+    active.blocks = compacted.data();
+    active.count = static_cast<std::uint32_t>(compacted.size());
+    // Checked against this same grid a moment ago on the other path, so the two
+    // arrive equally anchored. Read after the compaction rather than before:
+    // nothing between them can move it, and taking it from the map that just
+    // produced the list is what makes the two agree by construction.
+    active.epoch = grid.topology_epoch();
+    // Only this path writes the row. A caller-supplied set did no compaction
+    // here, and charging it for the one the CALLER made -- on its own thread,
+    // possibly for several consumers -- would be reporting work this call did
+    // not do. The clock is restarted before the upload either way, so the
+    // unmeasured span leaks into no other row.
+    if (timings != nullptr) timings->compact_ms = phase_clock.lap();
+  }
+  if (active.count == 0) {
     // Nothing to mesh -- but this path stamps the slot it claimed above exactly
     // like a real extract, so "every generation handed out lives in exactly one
     // slot" is total.
@@ -1513,7 +1575,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
         std::to_string(kMaxSharedCells) + " (this grid has " +
         std::to_string(vpb) + ")");
   }
-  const auto num_active = static_cast<std::uint32_t>(active.size());
+  const std::uint32_t num_active = active.count;
 
   // One invocation per voxel of each active block; worst-case 5 triangles each.
   // Both the thread index and the triangle capacity flow through 32-bit shader
@@ -1587,7 +1649,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
                                sizeof(volume::BlockIndex),
                            HostAccess::SequentialWrite));
   std::memcpy(
-      active_buf.mapped(), active.data(),
+      active_buf.mapped(), active.blocks,
       static_cast<std::size_t>(num_active) * sizeof(volume::BlockIndex));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
@@ -1641,7 +1703,18 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // ExtractTimings::incremental, since none of this is visible from outside.
   const std::uint32_t planned_verts = plan_vertex_capacity(capacity);
   bool incremental =
-      dirty != nullptr && dirty->flags != VK_NULL_HANDLE &&
+      // No public entry point offers both a caller-supplied set and dirty
+      // flags, and this is what keeps that true where it MATTERS rather than
+      // where it happens to hold. An incremental pass keeps the triangles of
+      // every block it does not re-mesh, and a block outside a culled set is
+      // simply not dispatched -- so it would keep its geometry below the
+      // watermark and go on being drawn, giving back the arena and draw savings
+      // the cull exists for and leaving only the dispatch one. Stated as a
+      // clause here, a future entry point that offers both gets this tier's
+      // documented answer to a combination it cannot serve -- a full extract
+      // over the caller's set, reported as ExtractTimings::incremental == false
+      // -- rather than a surprise.
+      blocks == nullptr && dirty != nullptr && dirty->flags != VK_NULL_HANDLE &&
       dirty->capacity != 0 && dirty->epoch == grid.topology_epoch() &&
       config_.track_block_spans && slot_count_ == 1 &&
       prev_arena.watermark != 0 && prev_arena.epoch == grid.topology_epoch() &&
@@ -1966,7 +2039,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     const auto* spans = static_cast<const BlockSpan*>(block_spans_.mapped());
     std::uint64_t live_sum = 0;
     std::uint64_t live_vert_sum = 0;
-    for (const volume::BlockIndex& b : active) {
+    for (std::uint32_t i = 0; i < active.count; ++i) {
+      const volume::BlockIndex& b = active.blocks[i];
       const auto slot =
           static_cast<std::uint32_t>(b.ptr) / static_cast<std::uint32_t>(vpb);
       if (slot < stamps) {

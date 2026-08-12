@@ -55,10 +55,32 @@ static_assert(sizeof(BlockIndex) == 16, "BlockIndex must be 16 bytes");
 static_assert(offsetof(BlockIndex, coord) == 0, "BlockIndex layout drift");
 static_assert(offsetof(BlockIndex, ptr) == 12, "BlockIndex layout drift");
 
-/// Lightweight, non-owning view of a compacted block array.
+/// @brief A compacted list of active blocks -- the subset of a grid the next
+///        pass should run over -- borrowed from whoever compacted it.
+///
+/// Non-owning: it names the caller's storage, typically the `std::vector` from
+/// @ref VoxelHashMap::compact_active_blocks or
+/// @ref VoxelHashMap::compact_active_blocks_in_frustum, and a consumer reads it
+/// for the duration of the call it is passed to and does not retain it.
+///
+/// @ref epoch is what makes the list safe to carry away from the map that
+/// produced it. A @ref BlockIndex::ptr addresses per-voxel attribute storage
+/// directly and the block heap is LIFO, so a `remove()` / `clear()` between the
+/// compaction and the pass that consumes this hands the same `ptr` to a
+/// *different* block -- leaving a list that still typechecks, still indexes in
+/// range, and names geometry that is gone. Fill it from
+/// @ref VoxelBlockGrid::topology_epoch in the same breath as the compaction,
+/// the way `mesh::DirtyBlocks` is filled off the integrator that wrote its
+/// flags; a consumer compares it against the grid it is handed rather than
+/// trusting the two to have been fetched together.
 struct BlockList {
+  /// The compacted blocks. Null only when @ref count is 0.
   const BlockIndex* blocks = nullptr;
-  std::int32_t count = 0;
+  /// How many blocks @ref blocks addresses. Zero is a legal empty set (a
+  /// camera looking at nothing), not an error.
+  std::uint32_t count = 0;
+  /// The @ref VoxelBlockGrid::topology_epoch the list was compacted at.
+  std::uint64_t epoch = 0;
 };
 
 /// Per-voxel signed-distance payload.

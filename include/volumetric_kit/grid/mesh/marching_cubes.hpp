@@ -966,6 +966,71 @@ class VR_MESH_API MarchingCubes {
                                     float iso = 0.0f,
                                     ExtractTimings* timings = nullptr);
 
+  /// @brief Extract as @ref extract_device does, but mesh only @p blocks --
+  ///        the caller's own compacted subset of the grid's active set.
+  ///
+  /// The motivating subset is a camera's: @ref
+  /// volume::VoxelHashMap::compact_active_blocks_in_frustum culls the active
+  /// set to what a view can see, and a scanning device that renders a small
+  /// part of a large volume then meshes only that part. Nothing here is
+  /// specific to a frustum, though -- a region of interest, a chunk queue or a
+  /// level-of-detail selection are the same call.
+  ///
+  /// This is the *only* difference from @ref extract_device: the set arrives
+  /// instead of being compacted, so @ref ExtractTimings::compact_ms reads 0 and
+  /// every other phase runs unchanged and shrinks with the set. The arena is
+  /// rebuilt from this dispatch alone, so a block outside @p blocks contributes
+  /// no triangles to the mesh and no bytes to the arena -- which is what makes
+  /// this worth doing on a memory-bound device, rather than only a cheaper
+  /// dispatch.
+  ///
+  /// @note The mesh does **not** hole at the cull boundary. The kernel resolves
+  ///       each block's 2x2x2 neighbourhood by probing the hash table
+  ///       on-device, so a block on the edge of @p blocks still samples correct
+  ///       corner values out of neighbours that were never dispatched; the
+  ///       surface simply ends there. A host-built neighbour table -- what this
+  ///       tier used before the 2026-08-08 decision -- could not have done
+  ///       this.
+  ///
+  /// @note Culling does not make the *compaction* cheaper. The frustum kernel
+  ///       still scans every hash-table slot; what shrinks is the readback, the
+  ///       upload, this dispatch, the arena, and whatever draws or textures the
+  ///       result.
+  ///
+  /// @warning Deliberately **not** offered on @ref
+  ///          extract_device_incremental, and the two do not compose today: an
+  ///          incremental pass keeps the triangles of every block it does not
+  ///          re-mesh, and a block outside @p blocks is simply not dispatched,
+  ///          so it would keep its geometry below the watermark and go on being
+  ///          drawn. That is not wrong, but it gives back the arena and draw
+  ///          savings and leaves only the dispatch one -- so the two are kept
+  ///          as separate answers to the same cost rather than stacked.
+  ///
+  /// @param grid     The sparse volume to mesh, as @ref extract_device takes
+  ///                 it.
+  /// @param iso      The iso-value to extract at (0 for a TSDF surface).
+  /// @param blocks   The blocks to mesh: a subset of @p grid's active set, with
+  ///                 @ref volume::BlockList::epoch filled from
+  ///                 `grid.topology_epoch()` when it was compacted. Read for
+  ///                 the duration of this call and not retained. An empty list
+  ///                 is legal and meshes nothing, exactly as an empty map does.
+  /// @param timings  As @ref extract_device, except @ref
+  ///                 ExtractTimings::compact_ms is 0 and @ref
+  ///                 ExtractTimings::active_blocks reports @p blocks's count --
+  ///                 which is the instrument that says what the cull bought.
+  /// @return The mesh in this extractor's device buffers, borrowed exactly as
+  ///         @ref extract_device's is, or that overload's @ref Status, plus
+  ///         @ref Status::Code::InvalidArgument when @p blocks is internally
+  ///         inconsistent (a null pointer with a non-zero count) or was
+  ///         compacted against a topology @p grid has since left behind. The
+  ///         second is refused rather than meshed: the block heap is LIFO, so a
+  ///         `remove()` since the compaction has handed those block pointers to
+  ///         different blocks, and the extract would silently mesh whatever
+  ///         voxels now live there.
+  Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid, float iso,
+                                    const volume::BlockList& blocks,
+                                    ExtractTimings* timings = nullptr);
+
   /// @brief Copy a @ref DeviceMesh's live vertices + indices into a host
   ///        @ref Mesh.
   /// @param device_mesh  A mesh from @ref extract_device on *this* extractor,
@@ -1296,8 +1361,8 @@ class VR_MESH_API MarchingCubes {
     return total;
   }
 
-  // The one sparse extract, with the two public entry points differing only in
-  // whether they have dirty flags to offer.
+  // The one sparse extract, with the three public entry points differing only
+  // in what they have to offer it: dirty flags, an active set, or neither.
   //
   // @p dirty is null for extract_device and points at the caller's struct for
   // extract_device_incremental, which is borrowed for this call alone. A
@@ -1309,10 +1374,18 @@ class VR_MESH_API MarchingCubes {
   // integrator that owned it was destroyed. As a parameter that state cannot be
   // represented.
   //
+  // @p blocks is null when this call compacts the whole active set itself, and
+  // points at the caller's subset otherwise -- borrowed for this call alone,
+  // and a parameter for the same reason @p dirty is, only more so: it is a bare
+  // host pointer into a std::vector the caller owns, so latching it on the
+  // extractor would leave a dangling read for the NEXT extract rather than a
+  // stale one for this.
+  //
   // Whether the pass is actually incremental is decided HERE, not by which
   // entry point was called: every clause is something the caller cannot see.
   Result<DeviceMesh> extract_device_impl(volume::VoxelBlockGrid& grid,
                                          float iso, const DirtyBlocks* dirty,
+                                         const volume::BlockList* blocks,
                                          ExtractTimings* timings);
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
