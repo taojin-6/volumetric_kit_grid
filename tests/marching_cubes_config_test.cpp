@@ -592,37 +592,9 @@ int main() {
     mesh::MarchingCubes host = std::move(host_result).value();
 
     for (int i = 0; i < 5; ++i) {
-      vr::Result<mesh::Mesh> host_mesh = host.extract(small, 0.0f);
+      vr::Result<mesh::Mesh> host_mesh = host.extract_host(small, 0.0f);
       CHECK(host_mesh.ok());
       CHECK(!host_mesh.value().vertices.empty());
-    }
-
-    // The dense overload shares the ring and mixes with the sparse one, so it
-    // has to release too.
-    const int dense_dim = 8;
-    std::vector<vol::Voxel> samples(
-        static_cast<std::size_t>(dense_dim * dense_dim * dense_dim));
-    for (int z = 0; z < dense_dim; ++z) {
-      for (int y = 0; y < dense_dim; ++y) {
-        for (int x = 0; x < dense_dim; ++x) {
-          const float dx = static_cast<float>(x) - 3.5f;
-          const float dy = static_cast<float>(y) - 3.5f;
-          const float dz = static_cast<float>(z) - 3.5f;
-          vol::Voxel& v = samples[static_cast<std::size_t>(
-              (z * dense_dim + y) * dense_dim + x)];
-          v.sdf = std::sqrt(dx * dx + dy * dy + dz * dz) - 2.0f;
-          v.weight = 1.0f;
-        }
-      }
-    }
-    mesh::DenseGrid dense_grid;
-    dense_grid.dims = vr::Vec3i{dense_dim, dense_dim, dense_dim};
-    dense_grid.voxel_size = 1.0f;
-    dense_grid.origin = vr::Vec3f{0.0f, 0.0f, 0.0f};
-    for (int i = 0; i < 5; ++i) {
-      vr::Result<mesh::Mesh> dense_mesh =
-          host.extract(samples.data(), samples.size(), dense_grid, 0.0f);
-      CHECK(dense_mesh.ok());
     }
 
     // ...and they must give back *their own* slot, not everything below it.
@@ -636,7 +608,7 @@ int main() {
     // off, which is the shipping configuration and the only one on iOS. The
     // loops above cannot see it -- they use a dedicated extractor and hand out
     // no DeviceMesh at all.
-    for (int overload = 0; overload < 2; ++overload) {
+    {
       mesh::MarchingCubesConfig mixed_config;
       mixed_config.slot_count = 2;
       vr::Result<mesh::MarchingCubes> mixed_result =
@@ -650,16 +622,9 @@ int main() {
       vr::Result<mesh::DeviceMesh> live = mixed.extract_device(small, 0.0f);
       CHECK(live.ok());
 
-      // A host extract takes the *other* slot and gives it straight back. Both
-      // overloads share the ring, so both are run through this.
-      if (overload == 0) {
-        vr::Result<mesh::Mesh> host_copy = mixed.extract(small, 0.0f);
-        CHECK(host_copy.ok());
-      } else {
-        vr::Result<mesh::Mesh> host_copy =
-            mixed.extract(samples.data(), samples.size(), dense_grid, 0.0f);
-        CHECK(host_copy.ok());
-      }
+      // A host extract takes the *other* slot and gives it straight back.
+      vr::Result<mesh::Mesh> host_copy = mixed.extract_host(small, 0.0f);
+      CHECK(host_copy.ok());
 
       // So a slot is free for this one -- and it must be the freed one, never
       // the one `live` names.
