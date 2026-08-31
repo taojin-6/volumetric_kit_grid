@@ -169,21 +169,26 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   push.size = sizeof(PushConstants);
 
   KernelSetBuilder kb(dev);
-  VR_TRY(kb.add(map.init_, vr_hash_init_comp_spv, vr_hash_init_comp_spv_size, 4,
-                &push));
-  VR_TRY(kb.add(map.allocate_, vr_hash_allocate_coords_comp_spv,
+  VR_TRY(kb.add(map.init_, "hash_init", vr_hash_init_comp_spv,
+                vr_hash_init_comp_spv_size, 4, &push));
+  VR_TRY(kb.add(map.allocate_, "hash_allocate_coords",
+                vr_hash_allocate_coords_comp_spv,
                 vr_hash_allocate_coords_comp_spv_size, 6, &push));
-  VR_TRY(kb.add(map.compact_, vr_hash_compact_comp_spv,
+  VR_TRY(kb.add(map.compact_, "hash_compact", vr_hash_compact_comp_spv,
                 vr_hash_compact_comp_spv_size, 3, &push));
-  VR_TRY(kb.add(map.delete_, vr_hash_delete_coords_comp_spv,
+  VR_TRY(kb.add(map.delete_, "hash_delete_coords",
+                vr_hash_delete_coords_comp_spv,
                 vr_hash_delete_coords_comp_spv_size, 6, &push));
-  VR_TRY(kb.add(map.depth_, vr_hash_allocate_depth_comp_spv,
+  VR_TRY(kb.add(map.depth_, "hash_allocate_depth",
+                vr_hash_allocate_depth_comp_spv,
                 vr_hash_allocate_depth_comp_spv_size, 7, &push));
-  VR_TRY(kb.add(map.points_, vr_hash_allocate_points_comp_spv,
+  VR_TRY(kb.add(map.points_, "hash_allocate_points",
+                vr_hash_allocate_points_comp_spv,
                 vr_hash_allocate_points_comp_spv_size, 6, &push));
-  VR_TRY(kb.add(map.compact_frustum_, vr_hash_compact_frustum_comp_spv,
+  VR_TRY(kb.add(map.compact_frustum_, "hash_compact_frustum",
+                vr_hash_compact_frustum_comp_spv,
                 vr_hash_compact_frustum_comp_spv_size, 4, &push));
-  VR_TRY(kb.add(map.rehash_, vr_hash_rehash_comp_spv,
+  VR_TRY(kb.add(map.rehash_, "hash_rehash", vr_hash_rehash_comp_spv,
                 vr_hash_rehash_comp_spv_size, 6, &push));
   VR_ASSIGN(map.pool_, kb.build());
 
@@ -235,6 +240,31 @@ void VoxelHashMap::write_persistent_bindings() {
                                             VK_WHOLE_SIZE);
   compact_frustum_.set.write_storage_buffer(3, frustum_planes_.handle(), 0,
                                             VK_WHOLE_SIZE);
+
+  // Name each buffer for a GPU capture, here rather than at create: this runs
+  // on every path that swaps a buffer in -- create AND each resize commit --
+  // so a name cannot drift from the handle it describes. (A grown table is a
+  // fresh handle, and a name lives on the handle.)
+  if (device_ != nullptr) {
+    const struct {
+      VkBuffer handle;
+      const char* name;
+    } named[] = {
+        {entries, "hash.entries"},
+        {heap, "hash.heap"},
+        {counter, "hash.heap_counter"},
+        {mutex, "hash.bucket_mutex"},
+        {fail, "hash.fail_counts"},
+        {compacted_.handle(), "hash.compacted"},
+        {active_count_.handle(), "hash.active_count"},
+        {camera_params_.handle(), "hash.camera_params"},
+        {frustum_planes_.handle(), "hash.frustum_planes"},
+    };
+    for (const auto& entry : named) {
+      device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                               debug_object_handle(entry.handle), entry.name);
+    }
+  }
 }
 
 std::uint32_t VoxelHashMap::total_entries() const noexcept {

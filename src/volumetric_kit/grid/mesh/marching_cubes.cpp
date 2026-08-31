@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -617,6 +618,7 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
+    name_slot_buffers();
   }
   // The whole command, not just the counter it starts as. indexCount is zeroed
   // for the kernel to accumulate into; the other four fields are what make the
@@ -938,7 +940,35 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // one buffer resized against the other's capacity.
   if (grow_arena) arena() = std::move(grown_arena);
   if (grow_index_run) index_run() = std::move(indices_buf);
+  // Only where a handle actually changed. Naming is idempotent and cheap, but
+  // this runs per extract, and a driver call per buffer per frame to re-state
+  // an unchanged name is pure overhead in the hot path.
+  if (grow_arena || grow_index_run) name_slot_buffers();
   return {};
+}
+
+void MarchingCubes::name_slot_buffers() const noexcept {
+  if (device_ == nullptr) {
+    return;
+  }
+  // The slot index belongs in the name: the ring hands the consumer one slot
+  // while the next extract writes another, so a capture showing "mesh.arena"
+  // three times over would not say which generation it had caught.
+  char name[32];
+  const struct {
+    const Buffer& buffer;
+    const char* form;
+  } named[] = {
+      {slots_[slot_].arena, "mesh.arena[%u]"},
+      {slots_[slot_].index_run, "mesh.index_run[%u]"},
+      {slots_[slot_].indirect, "mesh.indirect[%u]"},
+  };
+  for (const auto& entry : named) {
+    if (!entry.buffer.valid()) continue;
+    std::snprintf(name, sizeof(name), entry.form, slot_);
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             debug_object_handle(entry.buffer.handle()), name);
+  }
 }
 
 Result<MarchingCubes> MarchingCubes::create(Device& device,
@@ -1040,9 +1070,11 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   VkPushConstantRange push_sparse = push;
   push_sparse.size = sizeof(SparsePushConstants);
   KernelSetBuilder kb(dev);
-  VR_TRY(kb.add(mc.kernel_, vr_marching_cubes_comp_spv,
+  VR_TRY(kb.add(mc.kernel_, "marching_cubes_dense", vr_marching_cubes_comp_spv,
                 vr_marching_cubes_comp_spv_size, 5, &push));
   VR_TRY(kb.add(mc.kernel_sparse_,
+                config.share_vertices ? "marching_cubes_sparse_shared"
+                                      : "marching_cubes_sparse",
                 config.share_vertices ? vr_marching_cubes_sparse_shared_comp_spv
                                       : vr_marching_cubes_sparse_comp_spv,
                 config.share_vertices
@@ -1061,6 +1093,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   std::memcpy(host_tables.corner_offset, kCornerOffset, sizeof(kCornerOffset));
   std::memcpy(host_tables.edge_to_vert, kEdgeToVert, sizeof(kEdgeToVert));
   std::memcpy(mc.tables_.mapped(), &host_tables, sizeof(McTables));
+  mc.device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                              debug_object_handle(mc.tables_.handle()),
+                              "mesh.mc_tables");
   mc.kernel_.set.write_storage_buffer(0, mc.tables_.handle(), 0, VK_WHOLE_SIZE);
   mc.kernel_sparse_.set.write_storage_buffer(0, mc.tables_.handle(), 0,
                                              VK_WHOLE_SIZE);
@@ -1071,6 +1106,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   VR_ASSIGN(mc.color_dummy_, storage_buffer(allocator, sizeof(std::uint32_t),
                                             HostAccess::SequentialWrite));
   std::memset(mc.color_dummy_.mapped(), 0, sizeof(std::uint32_t));
+  mc.device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                              debug_object_handle(mc.color_dummy_.handle()),
+                              "mesh.color_dummy");
   mc.kernel_sparse_.set.write_storage_buffer(5, mc.color_dummy_.handle(), 0,
                                              VK_WHOLE_SIZE);
 
@@ -1085,6 +1123,10 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
               storage_buffer(allocator, sizeof(BlockSpan),
                              HostAccess::SequentialWrite));
     std::memset(mc.block_spans_dummy_.mapped(), 0, sizeof(BlockSpan));
+    mc.device_->set_object_name(
+        VK_OBJECT_TYPE_BUFFER,
+        debug_object_handle(mc.block_spans_dummy_.handle()),
+        "mesh.block_spans_dummy");
     mc.kernel_sparse_.set.write_storage_buffer(config.share_vertices ? 9 : 8,
                                                mc.block_spans_dummy_.handle(),
                                                0, VK_WHOLE_SIZE);
