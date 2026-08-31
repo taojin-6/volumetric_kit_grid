@@ -12,7 +12,7 @@
 /// verbatim from the prior engine so the extracted surface inherits its proven
 /// winding and sign convention. They are the single source of the tables across
 /// CPU and GLSL: the host uploads them into a device storage buffer that the
-/// @c marching_cubes.comp kernel indexes, rather than the shader carrying its
+/// marching-cubes kernels index, rather than each shader carrying its
 /// own copy -- the same one-definition discipline the volume tier applies to
 /// its POD layouts.
 ///

@@ -26,7 +26,7 @@
 // which is what this header exists to prevent: the neighbour probe and the
 // corner gather are the cross-block-correctness-critical parts, and a fix to
 // either must not be appliable to only one path. Mirrors marching_cubes_common.glsl,
-// which plays the same role for the dense/sparse pair.
+// which plays the same role for the per-cell numerics.
 //
 // The includer must, *before* the include, declare the `pc` push block (fields
 // `block_size`, `voxels_per_block`, `iso`, `weight_threshold`, `has_color`,

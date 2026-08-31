@@ -28,6 +28,17 @@
 namespace volumetric_kit::recon::mesh {
 namespace {
 
+// The public entry point a diagnostic reports under. Every extract funnels
+// through extract_device_impl, so without this the whole tier would name that
+// -- or, as it did until this was threaded, a `MarchingCubes::extract` the
+// header no longer declares, leaving a user with a message they cannot grep
+// back to any of the four entry points. Carried as a parameter rather than a
+// member so it cannot outlive the call it describes.
+constexpr const char* kEntryHost = "MarchingCubes::extract_host";
+constexpr const char* kEntryDevice = "MarchingCubes::extract_device";
+constexpr const char* kEntryIncremental =
+    "MarchingCubes::extract_device_incremental";
+
 // Worst-case triangles a single marching-cubes cell can emit (5 per the table).
 constexpr std::uint64_t kMaxTrisPerCell = 5;
 
@@ -400,7 +411,7 @@ std::uint64_t MarchingCubes::triangles_fitting_arena() const {
   return max_verts * 1000 / per_1000;
 }
 
-Status MarchingCubes::claim_output_slot() {
+Status MarchingCubes::claim_output_slot(const char* entry) {
   // Called once at the top of each extract, before anything is touched, with
   // `++generation_` as the very next statement. Both halves of that are
   // load-bearing and they pull in opposite directions, which is why they are
@@ -437,9 +448,9 @@ Status MarchingCubes::claim_output_slot() {
   // over the ring and the oldest slot is tried first. It *scans* rather than
   // taking that one on faith: "the next slot is always the oldest" holds only
   // while every claim goes on to publish a mesh, and two paths do not -- an
-  // extract that fails after claiming, and the host overloads, which give their
-  // slot straight back once the copy is taken (free_slot_of). Both leave a free
-  // slot behind the cursor, and assuming would refuse with one in hand.
+  // extract that fails after claiming, and extract_host, which gives its slot
+  // straight back once the copy is taken (free_slot_of). Both leave a free slot
+  // behind the cursor, and assuming would refuse with one in hand.
   //
   // Everything downstream is free to overwrite the slot this picks, and a grow
   // will *free* it outright, so it must have been released first.
@@ -455,8 +466,8 @@ Status MarchingCubes::claim_output_slot() {
     }
   }
   return Status::invalid_argument(
-      "MarchingCubes::extract: every output slot is still outstanding "
-      "(oldest is generation " +
+      std::string(entry) +
+      ": every output slot is still outstanding (oldest is generation " +
       std::to_string(oldest) + ", released through " +
       std::to_string(released_through_) +
       "); call release_through as meshes are finished with, or configure "
@@ -723,13 +734,14 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
 Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
                                             std::uint32_t vertex_capacity,
                                             std::uint32_t seed_triangles,
-                                            std::uint32_t seed_vertices) {
+                                            std::uint32_t seed_vertices,
+                                            const char* entry) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
   // rejected because the growth policy overshot.
   if (arena_bytes_for(vertex_capacity) > max_storage_buffer_range_) {
     return Status::invalid_argument(
-        "MarchingCubes::extract: a vertex arena for " +
+        std::string(entry) + ": a vertex arena for " +
         std::to_string(vertex_capacity) +
         " vertices exceeds the device maxStorageBufferRange");
   }
@@ -738,7 +750,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // surface the run is what reaches the ceiling first.
   if (index_run_bytes_for(triangle_capacity) > max_storage_buffer_range_) {
     return Status::invalid_argument(
-        "MarchingCubes::extract: an index run for " +
+        std::string(entry) + ": an index run for " +
         std::to_string(triangle_capacity) +
         " triangles exceeds the device maxStorageBufferRange");
   }
@@ -962,10 +974,10 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   mc.device_ = &device;
   mc.allocator_ = &allocator;
 
-  // Cache the 1-D dispatch's groupCountX ceiling so extract() can reject an
+  // Cache the 1-D dispatch's groupCountX ceiling so an extract can reject an
   // over-large grid cleanly (see dispatch()), plus the storage-buffer binding
-  // limit so extract() can reject a worst-case vertex arena that would exceed
-  // it before the allocation fails opaquely.
+  // limit so it can reject a worst-case vertex arena that would exceed it
+  // before the allocation fails opaquely.
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   mc.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
@@ -976,20 +988,22 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // unused slot costs a Buffer's worth of null handles rather than an arena.
   mc.slot_count_ = config.slot_count;
 
-  // Both sparse variants bind TEN, and they are the same ten only up
-  // to binding 7 -- tables (persistent) + the per-extract active blocks / hash
-  // entries / tsdf / weight / color / vertices / command. After that the two
-  // disagree, which is why the count is unconditional and the assignment is
-  // not:
+  // The two sparse variants agree only up to binding 7 -- tables (persistent)
+  // + the per-extract active blocks / hash entries / tsdf / weight / color /
+  // vertices / command. After that they diverge, in the count as well as in
+  // the assignment:
   //
-  //   default   8 = block spans, 9 = the dirty-block flags it dilates
-  //   sharing   8 = the index run it writes itself, 9 = block spans
+  //   default   8 = block spans, 9 = the dirty-block flags it dilates  (TEN)
+  //   sharing   8 = the index run it writes itself, 9 = block spans,
+  //             10 = the dirty-block flags                          (ELEVEN)
   //
-  // The sharing variant has no dirty binding because incremental extraction
-  // refuses it (see extract_device_incremental), and the default one has no
-  // index-run binding because its run is the identity the host filled on the
-  // last grow. The count here and the two shaders' `binding =` literals are the
-  // only statement of any of this, so they are maintained together.
+  // Both dilate the dirty set -- incremental extraction runs under
+  // share_vertices since the 2026-08-11 decision -- so the sharing variant's
+  // dirty binding is one slot later rather than absent. The default variant
+  // has no index-run binding because its run is the identity the host filled
+  // on the last grow. The count below and the two shaders' `binding =`
+  // literals are the only statement of any of this, so they are maintained
+  // together, and the count is `? 11 : 10` for that reason.
   // KernelSetBuilder (core/compute_kernel.hpp) builds each
   // layout + pipeline and allocates its set from a shared pool sized to the
   // exact descriptor total.
@@ -1017,9 +1031,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                 config.share_vertices ? 11 : 10, &push_sparse));
   VR_ASSIGN(mc.pool_, kb.build());
 
-  // Upload the lookup tables once and bind them at set binding 0 for good. The
-  // constexpr header arrays are the single source; flatten them into the shader
-  // block layout.
+  // Upload the lookup tables once and bind them at set binding 0 of the one
+  // kernel this extractor built. The constexpr header arrays are the single
+  // source; flatten them into the shader block layout.
   VR_ASSIGN(mc.tables_, storage_buffer(allocator, sizeof(McTables),
                                        HostAccess::SequentialWrite));
   McTables host_tables;
@@ -1045,12 +1059,12 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   mc.kernel_sparse_.set.write_storage_buffer(5, mc.color_dummy_.handle(), 0,
                                              VK_WHOLE_SIZE);
 
-  // The same trick for the span table when nobody asked for one. The binding
-  // exists in both kernels unconditionally -- a descriptor a pipeline declares
-  // has to be written whether or not the shader reaches it -- so an opt-out
-  // needs something valid there. One BlockSpan, and the `write_spans` push flag
-  // keeps the kernel from storing through it, which is what makes the opt-out
-  // actually cost nothing rather than merely cost less.
+  // The same trick for the span table when nobody asked for one. Whichever
+  // kernel was built declares the binding unconditionally -- a descriptor a
+  // pipeline declares has to be written whether or not the shader reaches it
+  // -- so an opt-out needs something valid there. One BlockSpan, and the
+  // `write_spans` push flag keeps the kernel from storing through it, which is
+  // what makes the opt-out actually cost nothing rather than merely cost less.
   if (!config.track_block_spans) {
     VR_ASSIGN(mc.block_spans_dummy_,
               storage_buffer(allocator, sizeof(BlockSpan),
@@ -1070,15 +1084,21 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
 
 Result<Mesh> MarchingCubes::extract_host(volume::VoxelBlockGrid& grid,
                                          float iso, ExtractTimings* timings) {
-  VR_ASSIGN(const DeviceMesh device_mesh, extract_device(grid, iso, timings));
+  // Straight to the implementation rather than through extract_device, for the
+  // name alone: everything below the entry points reports under whichever one
+  // the caller actually called, and borrowing extract_device's would tell a
+  // host-only caller to release a slot it never saw.
+  VR_ASSIGN(
+      const DeviceMesh device_mesh,
+      extract_device_impl(grid, iso, nullptr, nullptr, timings, kEntryHost));
   // The host copy is part of this call's readback, so it belongs in the phase
-  // that names it -- extract_device stamped readback_ms with the 20-byte
+  // that names it -- the device path stamped readback_ms with the 20-byte
   // command read alone, which is right for that entry point but would leave the
   // host path's ~45 MB copy uncounted in ExtractTimings::total_ms.
   PhaseClock download_clock(timings != nullptr);
   Result<Mesh> mesh = download(device_mesh);
   if (timings != nullptr) timings->readback_ms += download_clock.lap();
-  // This overload's whole product is the host copy, so the slot extract_device
+  // This call's whole product is the host copy, so the slot the extract
   // claimed and stamped is finished with as soon as download() has run -- and
   // given back whether it succeeded or not, since a failure that stranded the
   // slot would starve the ring just as surely. A host-only caller never sees a
@@ -1173,34 +1193,38 @@ Result<DeviceMesh> MarchingCubes::extract_device_incremental(
   // watermark, flags the integrator vouches for, one slot, an arena that
   // survives -- and falls back to a full extract when it is not, which is why
   // this is one line and not a second copy of that function.
-  return extract_device_impl(grid, iso, &dirty, nullptr, timings);
+  return extract_device_impl(grid, iso, &dirty, nullptr, timings,
+                             kEntryIncremental);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, nullptr, timings);
+  return extract_device_impl(grid, iso, nullptr, nullptr, timings,
+                             kEntryDevice);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(
     volume::VoxelBlockGrid& grid, float iso, const volume::BlockList& blocks,
     ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, &blocks, timings);
+  return extract_device_impl(grid, iso, nullptr, &blocks, timings,
+                             kEntryDevice);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device_impl(
     volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
-    const volume::BlockList* blocks, ExtractTimings* timings) {
+    const volume::BlockList* blocks, ExtractTimings* timings,
+    const char* entry) {
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
   // failed call then reports zeros rather than a previous call's numbers.
   if (timings != nullptr) *timings = ExtractTimings{};
   if (!valid()) {
-    return Status::invalid_argument("MarchingCubes::extract: moved-from");
+    return Status::invalid_argument(std::string(entry) + ": moved-from");
   }
   if (!grid.valid()) {
-    return Status::invalid_argument(
-        "MarchingCubes::extract: grid is moved-from");
+    return Status::invalid_argument(std::string(entry) +
+                                    ": grid is moved-from");
   }
   // A caller-supplied active set is checked here, above everything this call
   // allocates and before it claims an output slot -- a refusal must leave every
@@ -1225,7 +1249,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   if (blocks != nullptr) {
     if (blocks->blocks == nullptr && blocks->count != 0) {
       return Status::invalid_argument(
-          "MarchingCubes::extract: the block list is null with a non-zero "
+          std::string(entry) +
+          ": the block list is null with a non-zero "
           "count");
     }
     // An empty list names no block, so there is nothing about it that can be
@@ -1236,7 +1261,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // meshes nothing; that has to include this one.
     if (blocks->count != 0 && blocks->epoch != grid.topology_epoch()) {
       return Status::invalid_argument(
-          "MarchingCubes::extract: the block list was compacted against "
+          std::string(entry) +
+          ": the block list was compacted against "
           "topology epoch " +
           std::to_string(blocks->epoch) + ", but this grid is now at " +
           std::to_string(grid.topology_epoch()) +
@@ -1254,7 +1280,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // whatever followed it as BlockIndex entries.
     if (blocks->count > static_cast<std::uint32_t>(grid.grid().num_blocks)) {
       return Status::invalid_argument(
-          "MarchingCubes::extract: the block list holds " +
+          std::string(entry) + ": the block list holds " +
           std::to_string(blocks->count) +
           " blocks, more than this grid's block heap (" +
           std::to_string(grid.grid().num_blocks) + ")");
@@ -1266,16 +1292,16 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   VR_ASSIGN(volume::AttributeView weight_view, grid.attribute("weight"));
   if (tsdf_view.element_size != sizeof(float) ||
       weight_view.element_size != sizeof(float)) {
-    return Status::invalid_argument(
-        "MarchingCubes::extract: tsdf/weight must be float attributes");
+    return Status::invalid_argument(std::string(entry) +
+                                    ": tsdf/weight must be float attributes");
   }
   const bool has_color = grid.has_attribute("color");
   volume::AttributeView color_view{};
   if (has_color) {
     VR_ASSIGN(color_view, grid.attribute("color"));
     if (color_view.element_size != sizeof(std::uint32_t)) {
-      return Status::invalid_argument(
-          "MarchingCubes::extract: color must be a uint32 attribute");
+      return Status::invalid_argument(std::string(entry) +
+                                      ": color must be a uint32 attribute");
     }
   }
 
@@ -1298,7 +1324,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // succeeds. Moving it above the compact widens that to a compact failure,
   // which is the conservative direction: it retires meshes a fraction earlier,
   // never later.
-  VR_TRY(claim_output_slot());
+  VR_TRY(claim_output_slot(entry));
   ++generation_;
   // Retired here, and re-stamped only once this call is certain to hand a mesh
   // out. Cleared up front rather than on each failing return because there are
@@ -1373,7 +1399,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // grid, so it answers the same on every frame.
   if (config_.share_vertices && vpb > kMaxSharedCells) {
     return Status::invalid_argument(
-        "MarchingCubes::extract: share_vertices needs voxels_per_block <= " +
+        std::string(entry) + ": share_vertices needs voxels_per_block <= " +
         std::to_string(kMaxSharedCells) + " (this grid has " +
         std::to_string(vpb) + ")");
   }
@@ -1459,8 +1485,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // would overwrite triangles it had already emitted.
   if (threads > 0xFFFFFFFFull ||
       worst_case > 0xFFFFFFFFull / kIndicesPerTriangle) {
-    return Status::invalid_argument(
-        "MarchingCubes::extract: active set too large for this slice");
+    return Status::invalid_argument(std::string(entry) +
+                                    ": active set too large for this slice");
   }
   // The arena is sized to what the surface actually emits, not to the
   // 5-triangles-per-cell worst case. Real fields are nowhere near that bound --
@@ -1495,7 +1521,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // does about its own arena.
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
   VR_TRY(check_storage_buffer_range(
-      "MarchingCubes::extract: hash entries", entries_bytes,
+      (std::string(entry) + ": hash entries").c_str(), entries_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
 
   // Per-extract inputs: the active blocks (write-once), and the vertex arena +
@@ -1509,7 +1535,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // used to be exempt because its size came from a compaction this call made;
   // a caller-supplied set makes num_active an input, so it gets the same guard.
   VR_TRY(check_storage_buffer_range(
-      "MarchingCubes::extract: active blocks", active_bytes,
+      (std::string(entry) + ": active blocks").c_str(), active_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
   VR_ASSIGN(Buffer active_buf, storage_buffer(*allocator_, active_bytes,
                                               HostAccess::SequentialWrite));
@@ -1601,7 +1627,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
           : 0;
   if (incremental) {
     VR_TRY(check_storage_buffer_range(
-        "MarchingCubes::extract: dirty block flags", dirty_bytes,
+        (std::string(entry) + ": dirty block flags").c_str(), dirty_bytes,
         static_cast<VkDeviceSize>(max_storage_buffer_range_)));
   }
 
@@ -1612,8 +1638,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       // counter; the default one writes each triangle's three at `tri * 3`
       // and never touches it, so seeding it there would arm a number nothing
       // reads.
-      incremental && config_.share_vertices ? prev_arena.vertex_watermark
-                                            : 0u));
+      incremental && config_.share_vertices ? prev_arena.vertex_watermark : 0u,
+      entry));
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   // Bound to the range the push constant claims rather than VK_WHOLE_SIZE, the
@@ -1773,7 +1799,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       if (read_scratch(indirect(), kSharingAppliedOffset) == 0u) {
         disarm_indirect_command();
         return Status::invalid_argument(
-            "MarchingCubes::extract: the sharing kernel declined this grid -- "
+            std::string(entry) +
+            ": the sharing kernel declined this grid -- "
             "its compile-time cell table is smaller than this tier's "
             "kMaxSharedCells, so the two have drifted");
       }
@@ -1799,7 +1826,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       // that assumption is ever broken.
       disarm_indirect_command();
       return Status::out_of_memory(
-          "MarchingCubes::extract: the vertex arena still overflowed after "
+          std::string(entry) +
+          ": the vertex arena still overflowed after "
           "refitting it to the measured triangle count");
     }
     // Refit to the measured count (ensure_output_buffers adds the growth
@@ -1822,7 +1850,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // pass re-establishes the arena, the spans and the watermark together.
     incremental = false;
     if (Status refit = ensure_output_buffers(
-            produced, std::max(produced_verts, plan_vertex_capacity(produced)));
+            produced, std::max(produced_verts, plan_vertex_capacity(produced)),
+            0u, 0u, entry);
         !refit.ok()) {
       disarm_indirect_command();
       return refit;

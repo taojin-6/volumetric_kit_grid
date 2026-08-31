@@ -422,8 +422,8 @@ struct MarchingCubesConfig {
   bool share_vertices = false;
 
   /// @brief Publish @ref MarchingCubes::block_spans -- where each block's
-  ///        geometry landed -- for the sparse @ref MarchingCubes::extract
-  ///        overloads.
+  ///        geometry landed -- for every @ref MarchingCubes::extract_device
+  ///        entry point.
   ///
   /// Off by default because it is not free and most callers never read it. The
   /// table is sized by the **grid**, not by the surface: `num_blocks` entries
@@ -563,7 +563,7 @@ struct DirtyBlocks {
 ///       when a call needs more and never shrinking it -- reuse is what makes a
 ///       steady-state extract pay nothing for its output storage (it was ~90%
 ///       of a sparse extract when allocated per call), at the cost of holding
-///       the peak for this object's lifetime. The sparse @ref extract fits the
+///       the peak for this object's lifetime. An extract fits the
 ///       arena to what the surface actually emits rather than to the
 ///       5-triangles-per-cell ceiling it can never reach, so what stays
 ///       resident is the mesh's real size plus headroom. At
@@ -629,7 +629,7 @@ class VR_MESH_API MarchingCubes {
   /// arena you are about to index. Those two questions are the contract; this
   /// pointer is only how the answer is fetched.
   ///
-  /// @warning **Borrowed, and invalidated by the next @ref extract or
+  /// @warning **Borrowed, and invalidated by the next @ref extract_host or
   ///          @ref extract_device on this object** -- exactly like a
   ///          @ref DeviceMesh, and for the same reason: a grid whose
   ///          `num_blocks` grew reallocates this table, which frees the pages
@@ -752,7 +752,7 @@ class VR_MESH_API MarchingCubes {
   ///          another thread -- a renderer retires the frame that drew a mesh
   ///          on its own thread while fusion extracts on a background one
   ///          (which is exactly how `examples/viewer/fuse_viewer` is built).
-  ///          Calling it concurrently with an @ref extract or @ref
+  ///          Calling it concurrently with an @ref extract_host or @ref
   ///          extract_device on the same object is a data race. Serialize it
   ///          with whatever already guards the handoff of a @ref DeviceMesh
   ///          from the extracting thread to the consuming one; that mutex is
@@ -916,22 +916,29 @@ class VR_MESH_API MarchingCubes {
       volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks& dirty,
       ExtractTimings* timings = nullptr);
 
-  /// @brief Extract as @ref extract does, but leave the result in this
+  /// @brief Extract as @ref extract_host does, but leave the result in this
   ///        extractor's device buffers instead of copying it to the host.
   ///
   /// The pass that consumes the mesh next -- `texture::ProjectiveTexturer`, or
   /// the renderer at the interop seam -- can bind these buffers directly, so
   /// the readback and the matching re-upload both disappear. Call @ref download
-  /// when a host @ref Mesh is finally needed; @ref extract is exactly this
-  /// followed by that.
+  /// when a host @ref Mesh is finally needed.
   ///
-  /// @param grid  As @ref extract.
-  /// @param iso   As @ref extract.
-  /// @param timings  As @ref extract, except @ref ExtractTimings::readback_ms
-  ///                 covers only the 20-byte command read, not a vertex copy.
+  /// That pair is **not** @ref extract_host, and substituting it leaks a ring
+  /// slot: @ref extract_host also gives its slot back, which a caller cannot
+  /// do for it (a `Result<Mesh>` carries no generation, and @ref
+  /// release_through is the *consumer's* high-water mark, so calling it here
+  /// would retire slots another @ref DeviceMesh is still drawn from). Every
+  /// @ref DeviceMesh this hands out is the caller's to release.
+  ///
+  /// @param grid  As @ref extract_host.
+  /// @param iso   As @ref extract_host.
+  /// @param timings  As @ref extract_host, except
+  ///                 @ref ExtractTimings::readback_ms covers only the 20-byte
+  ///                 command read, not a vertex copy.
   /// @return A @ref DeviceMesh **borrowing** this extractor's buffers -- valid
   ///         only until the next extract on this object, which overwrites them
-  ///         -- or the same failures @ref extract reports (including its
+  ///         -- or the same failures @ref extract_host reports (including its
   ///         @ref Status::Code::OutOfMemory case, and its warning that a failed
   ///         call still invalidates an earlier @ref DeviceMesh).
   Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid,
@@ -1035,7 +1042,8 @@ class VR_MESH_API MarchingCubes {
   ///         there.
   ///
   ///         All three are checked before this call claims anything, so --
-  ///         unlike the failures @ref extract's `@warning` describes -- they
+  ///         unlike the failures @ref extract_host's `@warning` describes --
+  ///         they
   ///         **are** a rollback: no output slot is claimed, no generation is
   ///         bumped, and every outstanding @ref DeviceMesh stays exactly as
   ///         valid as it was. That matters because a consumer culling a frame
@@ -1092,11 +1100,11 @@ class VR_MESH_API MarchingCubes {
   MarchingCubesConfig config_{};
 
   // The marching-cubes lookup tables, uploaded once and bound at set binding 0
-  // of both kernels for every extract (the counterpart to the volume tier's
-  // persistent bindings). The input buffers are per-extract; the vertex arena
-  // and counter are retained (below). All of them are (re)written into the
-  // remaining bindings before a dispatch, so a regrown arena's new handle is
-  // always the one bound.
+  // of the one kernel this extractor built, for every extract (the counterpart
+  // to the volume tier's persistent bindings). The input buffers are
+  // per-extract; the vertex arena and counter are retained (below). All of them
+  // are (re)written into the remaining bindings before a dispatch, so a regrown
+  // arena's new handle is always the one bound.
   Buffer tables_;
   // A 1-element dummy bound to the sparse kernel's color slot when a grid
   // carries no `color` attribute, so that descriptor stays valid (the has_color
@@ -1172,8 +1180,10 @@ class VR_MESH_API MarchingCubes {
   // One struct rather than three members because the three are only ever
   // meaningful together, and every path that invalidates one invalidates all
   // three: a default-constructed value is "no incremental state", which is what
-  // makes the next extract a full one. It is cleared at the top of BOTH extract
-  // paths, beside block_spans_generation_ and for the same reason -- every
+  // makes the next extract a full one. It is cleared at the top of
+  // extract_device_impl -- which every entry point funnels through, so there
+  // is one clear site and a new entry point that bypasses it would need its
+  // own -- beside block_spans_generation_ and for the same reason: every
   // extract claims the same slot, and there are several ways down from there
   // that publish nothing -- and re-established only on the publishing return,
   // so no failure can leave it describing geometry the failed call destroyed.
@@ -1414,10 +1424,16 @@ class VR_MESH_API MarchingCubes {
   //
   // Whether the pass is actually incremental is decided HERE, not by which
   // entry point was called: every clause is something the caller cannot see.
+  //
+  // @p entry is the public name to report failures under -- the only thing
+  // about the caller this function keeps, and it keeps it because a diagnostic
+  // that names a method the header does not declare leaves a user with nothing
+  // to grep. See kEntryHost in the .cpp.
   Result<DeviceMesh> extract_device_impl(volume::VoxelBlockGrid& grid,
                                          float iso, const DirtyBlocks* dirty,
                                          const volume::BlockList* blocks,
-                                         ExtractTimings* timings);
+                                         ExtractTimings* timings,
+                                         const char* entry);
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
   // theoretical ceiling is @p worst_case triangles: the last extract's
@@ -1442,11 +1458,11 @@ class VR_MESH_API MarchingCubes {
   // exists to protect a consumer's live mesh, so it must not retire it);
   // immediately before it, so nothing fallible sits between slot_ moving and
   // generation_ moving, which is the pair download() reads as one statement.
-  Status claim_output_slot();
+  Status claim_output_slot(const char* entry);
 
   // Give back the slot stamped with @p generation without moving
-  // released_through_. The host extract overloads' answer to "this call
-  // published no DeviceMesh, so nothing outside it can release the slot":
+  // released_through_. extract_host's answer to "this call published no
+  // DeviceMesh, so nothing outside it can release the slot":
   // release_through would do it with the *consumer's* high-water mark and so
   // also retire every older slot, including one a DeviceMesh from the same
   // extractor is still being drawn out of. A no-op on generation 0, which is
@@ -1473,8 +1489,8 @@ class VR_MESH_API MarchingCubes {
   // ensure_indirect_command; every caller but the incremental one passes 0.
   Status ensure_output_buffers(std::uint32_t triangle_capacity,
                                std::uint32_t vertex_capacity,
-                               std::uint32_t seed_triangles = 0,
-                               std::uint32_t seed_vertices = 0);
+                               std::uint32_t seed_triangles,
+                               std::uint32_t seed_vertices, const char* entry);
 
   // Re-anchor the span table on @p grid and grow it to that grid's num_blocks,
   // carrying the existing spans forward and zeroing only the new tail. A no-op

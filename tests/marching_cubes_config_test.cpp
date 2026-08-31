@@ -470,8 +470,8 @@ int main() {
   // so dropping the monotonic guard changed nothing and the check passed.
   //
   // Release the whole ring first, so the high-water mark alone is what makes
-  // the slots free (their stamps stay non-zero -- only the host `extract`
-  // overloads clear a stamp). Then report a stale older value. Monotonic, the
+  // the slots free (their stamps stay non-zero -- only `extract_host` clears
+  // one). Then report a stale older value. Monotonic, the
   // mark stays put and the next extract succeeds; without std::max it drops to
   // 0, every stamp is above it, and the entire already-released ring looks
   // outstanding again -- a permanent stall.
@@ -573,16 +573,16 @@ int main() {
   CHECK(after_self_move.ok());
   CHECK(after_self_move.value().valid());
 
-  // --- The host extract overloads do not starve the ring ---------------------
-  // They claim and stamp a slot like any extract, but return Result<Mesh> --
+  // --- extract_host does not starve the ring ---------------------------------
+  // It claims and stamps a slot like any extract, but returns Result<Mesh> --
   // no generation, so a host-only caller cannot release what it never saw, and
   // download() does not release either. Left alone, slot_count calls exhaust
   // the ring and every extract after that fails permanently, quoting
-  // generations the API never handed out. The overloads therefore release
-  // their own slot once the host copy is taken.
+  // generations the API never handed out. It therefore releases its own slot
+  // once the host copy is taken.
   //
   // Deterministic, not racy: with two slots this bricks on call three. Deleting
-  // either release_through() in the host overloads fails this loop.
+  // the free_slot_of() at the end of extract_host fails this loop.
   {
     mesh::MarchingCubesConfig host_ring;
     host_ring.slot_count = 2;
@@ -596,50 +596,50 @@ int main() {
       CHECK(host_mesh.ok());
       CHECK(!host_mesh.value().vertices.empty());
     }
+  }
 
-    // ...and they must give back *their own* slot, not everything below it.
-    //
-    // Handing the slot back is required (a Result<Mesh> carries no generation,
-    // so a host-only caller could not release it), but doing it with
-    // release_through -- the *consumer's* high-water mark -- also retires every
-    // older slot. Mixed with extract_device on the same extractor, that frees a
-    // slot the consumer is still drawing out of, and the next grow runs
-    // vmaDestroyBuffer under a live draw: undefined behaviour with validation
-    // off, which is the shipping configuration and the only one on iOS. The
-    // loops above cannot see it -- they use a dedicated extractor and hand out
-    // no DeviceMesh at all.
-    {
-      mesh::MarchingCubesConfig mixed_config;
-      mixed_config.slot_count = 2;
-      vr::Result<mesh::MarchingCubes> mixed_result =
-          mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                      mixed_config);
-      CHECK(mixed_result.ok());
-      mesh::MarchingCubes mixed = std::move(mixed_result).value();
+  // ...and it must give back *its own* slot, not everything below it.
+  //
+  // Handing the slot back is required (a Result<Mesh> carries no generation, so
+  // a host-only caller could not release it), but doing it with release_through
+  // -- the *consumer's* high-water mark -- also retires every older slot. Mixed
+  // with extract_device on the same extractor, that frees a slot the consumer
+  // is still drawing out of, and the next grow runs vmaDestroyBuffer under a
+  // live draw: undefined behaviour with validation off, which is the shipping
+  // configuration and the only one on iOS. The loop above cannot see it -- it
+  // uses a dedicated extractor and hands out no DeviceMesh at all. Which is why
+  // the two mutations differ: there, deleting the release bricks the ring;
+  // here, WIDENING it to release_through passes that loop and fails only below.
+  {
+    mesh::MarchingCubesConfig mixed_config;
+    mixed_config.slot_count = 2;
+    vr::Result<mesh::MarchingCubes> mixed_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), mixed_config);
+    CHECK(mixed_result.ok());
+    mesh::MarchingCubes mixed = std::move(mixed_result).value();
 
-      // Outstanding for the rest of the block, and never released: this stands
-      // in for a renderer with the mesh bound in an in-flight draw.
-      vr::Result<mesh::DeviceMesh> live = mixed.extract_device(small, 0.0f);
-      CHECK(live.ok());
+    // Outstanding for the rest of the block, and never released: this stands
+    // in for a renderer with the mesh bound in an in-flight draw.
+    vr::Result<mesh::DeviceMesh> live = mixed.extract_device(small, 0.0f);
+    CHECK(live.ok());
 
-      // A host extract takes the *other* slot and gives it straight back.
-      vr::Result<mesh::Mesh> host_copy = mixed.extract_host(small, 0.0f);
-      CHECK(host_copy.ok());
+    // A host extract takes the *other* slot and gives it straight back.
+    vr::Result<mesh::Mesh> host_copy = mixed.extract_host(small, 0.0f);
+    CHECK(host_copy.ok());
 
-      // So a slot is free for this one -- and it must be the freed one, never
-      // the one `live` names.
-      vr::Result<mesh::DeviceMesh> next = mixed.extract_device(small, 0.0f);
-      CHECK(next.ok());
-      CHECK(next.value().vertices != live.value().vertices);
+    // So a slot is free for this one -- and it must be the freed one, never
+    // the one `live` names.
+    vr::Result<mesh::DeviceMesh> next = mixed.extract_device(small, 0.0f);
+    CHECK(next.ok());
+    CHECK(next.value().vertices != live.value().vertices);
 
-      // Both slots are outstanding again, so the ring refuses. This is the
-      // handle-independent half: with release_through in the host overload,
-      // `live`'s generation would have been marked released, `next` would have
-      // landed on `live`'s slot, and the other slot would still be free here --
-      // so this would succeed.
-      vr::Result<mesh::DeviceMesh> refused = mixed.extract_device(small, 0.0f);
-      CHECK(!refused.ok());
-    }
+    // Both slots are outstanding again, so the ring refuses. This is the
+    // handle-independent half: with release_through in extract_host, `live`'s
+    // generation would have been marked released, `next` would have landed on
+    // `live`'s slot, and the other slot would still be free here -- so this
+    // would succeed.
+    vr::Result<mesh::DeviceMesh> refused = mixed.extract_device(small, 0.0f);
+    CHECK(!refused.ok());
   }
 
   // --- An empty extract is a first-class result ------------------------------

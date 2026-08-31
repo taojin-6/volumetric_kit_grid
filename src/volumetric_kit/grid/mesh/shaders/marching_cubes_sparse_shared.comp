@@ -11,7 +11,7 @@
 // whatever a push constant later says. Everything the two do identically (the
 // neighbourhood probe, the corner gather, the block addressing) is
 // marching_cubes_sparse_common.glsl; the per-cell numerics are
-// marching_cubes_common.glsl, which the dense kernel also includes.
+// marching_cubes_common.glsl, which the default sparse kernel also includes.
 //
 // FOUR passes over the block's cells, either side of one reservation. The block
 // counts what it will produce,
@@ -211,7 +211,7 @@ layout(push_constant, scalar) uniform PushConstants {
 //
 // Sized for block_size 8, the only shape any in-tree caller uses and the largest
 // this can hold: a shared array needs a compile-time size while voxels_per_block
-// is a push constant. MarchingCubes::extract REFUSES a larger block rather than
+// is a push constant. Every MarchingCubes extract REFUSES a larger block rather
 // letting it index past the end -- the library checks what the caller cannot see
 // (the 2026-08-04 rule) -- and main() falls back to unshared as belt and braces,
 // reporting through `sharing_applied` so the two constants cannot drift in
@@ -457,7 +457,7 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
     }
     vec3 position;
     vec3 color;
-    mcEdgeVertex(edge, sdf, corner_color, vec3(0.0), base_voxel, pc.voxel_size,
+    mcEdgeVertex(edge, sdf, corner_color, base_voxel, pc.voxel_size,
                  pc.iso, pc.has_color, position, color);
     // Always a real slot now, in range or not -- see mcClaimVertex.
     s_edge_vtx[local * 3u + uint(axis)] = mcClaimVertex(position, normal, color);
@@ -546,7 +546,7 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
         }
         vec3 position;
         vec3 color;
-        mcEdgeVertex(edge, sdf, corner_color, vec3(0.0), base_voxel,
+        mcEdgeVertex(edge, sdf, corner_color, base_voxel,
                      pc.voxel_size, pc.iso, pc.has_color, position, color);
         slot = mcClaimVertex(position, normal, color);
       }
@@ -589,7 +589,7 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
       continue;
     }
     // Reversed winding (0, 2, 1) so the CCW front face points along the outward
-    // gradient, matching mcEmitCell and what gfx expects.
+    // gradient, matching mcWriteTriangle and what gfx expects.
     indices[first + 0u] = uint(vi[0]);
     indices[first + 1u] = uint(vi[2]);
     indices[first + 2u] = uint(vi[1]);
