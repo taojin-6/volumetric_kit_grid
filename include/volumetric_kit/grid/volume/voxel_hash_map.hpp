@@ -205,6 +205,47 @@ class VR_VOLUME_API VoxelHashMap {
       const Vec3f* points, std::uint32_t count,
       AllocFailures* out_failures = nullptr);
 
+  /// @brief Allocate the voxel blocks a triangle mesh's truncation band covers.
+  ///
+  /// A block is allocated when its centre lies within `trunc_dist` plus the
+  /// block's half-diagonal of some triangle -- conservative, so a block holding
+  /// **any** voxel within `trunc_dist` of the surface is never missed, which is
+  /// exactly the set a mesh-to-SDF pass then writes.
+  ///
+  /// Not expressible as @ref allocate_from_points over the vertices: that
+  /// dilates each point into the `(2*tb+1)^3` band, so a triangle wider than
+  /// that band leaves an unallocated hole through its middle -- and the band is
+  /// one block (40 mm) at the defaults, which any mesh that is not a dense scan
+  /// exceeds routinely. Nor is it a per-triangle dispatch: triangle size is
+  /// unbounded, and one lane owning a large triangle's whole bounding box is
+  /// the dispatch shape that hangs a mobile GPU. The work is therefore split
+  /// per *candidate block*, which costs a host pass over the triangles to count
+  /// them (@ref StageMetrics reports it in the row's CPU half).
+  ///
+  /// A triangle is skipped, costing nothing, when it holds a non-finite vertex
+  /// or has zero area; a zero-area triangle is dropped here rather than guarded
+  /// in the kernel because it is the one input that makes the closest-point
+  /// solve divide by zero. Already-present blocks are untouched, so overlapping
+  /// triangles de-duplicate at the table.
+  /// @param vertices      World-space vertex positions, metres.
+  /// @param vertex_count  How many @p vertices.
+  /// @param indices       `3 * triangle_count` indices into @p vertices.
+  /// @param triangle_count  How many triangles.
+  /// @param out_failures  Optional: receives the per-reason split (see
+  ///                      @ref AllocFailures). Untouched when null.
+  /// @param metrics       Optional: receives an `"allocate"` row, as
+  ///                      @ref allocate_from_depth.
+  /// @return The number of block allocations that failed (0 = all succeeded),
+  ///         or a non-OK @ref Status: @ref Status::Code::InvalidArgument for a
+  ///         moved-from map, a null @p vertices / @p indices, an index at or
+  ///         past @p vertex_count, or a candidate-block total past 2^32 (a
+  ///         mesh grossly mis-scaled against the grid -- metres read as
+  ///         millimetres, say); or whatever a buffer or the dispatch returns.
+  Result<std::uint32_t> allocate_from_triangles(
+      const Vec3f* vertices, std::uint32_t vertex_count,
+      const std::uint32_t* indices, std::uint32_t triangle_count,
+      AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
+
   /// @brief Remove voxel blocks at the given block coordinates (only `coord` is
   ///        read); absent coordinates are ignored. Returns each freed block to
   ///        the heap.
@@ -574,13 +615,15 @@ class VR_VOLUME_API VoxelHashMap {
   // points / depth+camera) is (re)written before a dispatch.
   // allocate-from-coords and -from-points have the same 6-binding shape but
   // each owns its kernel; depth adds the camera-params buffer at binding 6 (7
-  // bindings).
+  // bindings), and triangles adds indices at 6 + the prefix-sum offsets at 7
+  // (8 bindings).
   ComputeKernel init_;
   ComputeKernel allocate_;
   ComputeKernel compact_;
   ComputeKernel delete_;
   ComputeKernel depth_;
   ComputeKernel points_;
+  ComputeKernel triangles_;
   ComputeKernel compact_frustum_;
   // Re-inserts a snapshot of active blocks into the grown table preserving each
   // block's index (insert_block with the block's own pointer, not a fresh heap

@@ -1,0 +1,132 @@
+#version 450
+
+// Allocate voxel blocks covering a triangle mesh's truncation band.
+//
+// One thread per CANDIDATE BLOCK, not per triangle. The obvious decomposition --
+// a thread per triangle, looping its own bounding box -- is unusable here
+// because triangle size is unbounded: a single 20 m floor quad at the default
+// 5 mm voxels covers ~250k blocks, so one lane would own a quarter-million
+// bucket-locked inserts while its neighbours idle. That is the shape of the
+// dispatch that hung an M5 iPad (see allocate_in_overflow in
+// hash_allocate_common.glsl), and no amount of striding inside the lane fixes
+// it. So the host walks the triangles once, counts each one's candidate blocks,
+// and uploads the exclusive prefix sum at binding 7; a work item finds its
+// triangle by binary search over that array and handles exactly ONE block.
+// Work per lane is then a search plus one point-triangle distance plus at most
+// one insert, whatever the mesh looks like.
+//
+// The candidate set is the triangle's world AABB grown by trunc_dist, in blocks
+// -- which for a large slanted triangle is mostly empty space, so each candidate
+// is pruned by an actual distance test before it costs an insert: a block is
+// allocated when its centre lies within trunc_dist + the block's half-diagonal
+// of the triangle. That is conservative (a block holding any voxel within
+// trunc_dist is never rejected) and it is what keeps a big triangle from
+// allocating the solid interior of its bounding box.
+//
+// Deliberately NOT the (2*tb+1)^3 cube dilation that hash_allocate_depth and
+// hash_allocate_points apply. Those dilate a POINT, where the cube is both the
+// cheapest and tightest thing available; a triangle has a real extent, so the
+// band it needs is the one measured from the surface.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+#include "hash_allocate_common.glsl"
+// Cross-tier: the closest-point primitive, from core. The mesh-to-SDF pass
+// evaluates the field with the same function, so the blocks allocated here and
+// the voxels written there cannot drift apart.
+#include "volumetric_kit/recon/core/shaders/triangle_common.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 4: mesh vertices, tightly packed vec3 (scalar layout gives a stride
+// of 12, byte-identical to the host Vec3f array).
+layout(set = 0, binding = 4, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+// binding 6: triangle indices, 3 per triangle, into `vertices`. Bounds-checked
+// on the host (an out-of-range index here is an out-of-bounds read, and
+// robustBufferAccess is enabled nowhere in this repo).
+layout(set = 0, binding = 6, scalar) readonly buffer Indices { uint indices[]; };
+// binding 7: exclusive prefix sum of per-triangle candidate-block counts,
+// pc.arg + 1 entries. offsets[pc.arg] is the total work-item count, which is
+// how this kernel learns its own bound without a second push constant.
+layout(set = 0, binding = 7, scalar) readonly buffer Offsets { uint offsets[]; };
+
+// The triangle owning work item `gid`: the largest t with offsets[t] <= gid.
+//
+// "Largest", not "any", is what makes a skipped triangle free: the host records
+// a zero count for a degenerate or non-finite one, leaving offsets[t] ==
+// offsets[t+1], and taking the largest match steps over every such run to the
+// triangle that actually owns the item. offsets[pc.arg] is the total and gid is
+// below it, so `hi` is never itself an answer and the invariant
+// offsets[lo] <= gid < offsets[hi] holds throughout.
+uint triangle_of(uint gid, uint tri_count) {
+  uint lo = 0u;  // offsets[0] == 0 <= gid, so lo always names a valid answer
+  uint hi = tri_count;
+  while (hi - lo > 1u) {
+    uint mid = lo + (hi - lo) / 2u;
+    if (offsets[mid] <= gid) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+void main() {
+  uint tri_count = pc.arg;  // pc.arg = triangle count
+  uint total = offsets[tri_count];
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= total) {
+    return;
+  }
+
+  uint t = triangle_of(gid, tri_count);
+  uint local = gid - offsets[t];
+
+  vec3 v0 = vertices[indices[3u * t]];
+  vec3 v1 = vertices[indices[3u * t + 1u]];
+  vec3 v2 = vertices[indices[3u * t + 2u]];
+
+  // Recompute the candidate box the host counted, rather than upload it: the
+  // host mirrors worldToBlock exactly (round_half_even <-> roundEven, the same
+  // negative bias -- the invariant hash_allocate_depth already rests on), and
+  // min/max/subtract are exact in IEEE, so the two agree bit-for-bit. The
+  // `local >= n` guard below is what makes a future divergence fail SAFE: it
+  // would under-allocate a block, not decode `local` onto some unrelated
+  // coordinate and allocate geometry that is not there.
+  float trunc = pc.grid.trunc_dist;
+  vec3 lo_world = min(v0, min(v1, v2)) - vec3(trunc);
+  vec3 hi_world = max(v0, max(v1, v2)) + vec3(trunc);
+  ivec3 bmin = worldToBlock(lo_world, pc.grid);
+  ivec3 bmax = worldToBlock(hi_world, pc.grid);
+  uvec3 ext = uvec3(bmax - bmin + ivec3(1));
+
+  uint plane = ext.x * ext.y;
+  if (local >= plane * ext.z) {
+    return;
+  }
+  uint dz = local / plane;
+  uint rem = local - dz * plane;
+  uint dy = rem / ext.x;
+  uint dx = rem - dy * ext.x;
+  ivec3 coord = bmin + ivec3(int(dx), int(dy), int(dz));
+
+  // Voxels are node-centred at voxel * voxel_size, so block b holds voxels
+  // [b*bs, b*bs + bs-1] and its VOXELS span (bs-1)*voxel_size -- one voxel
+  // short of the block's nominal extent. Measuring the half-diagonal off the
+  // nominal bs*voxel_size instead would still be conservative, just needlessly
+  // looser by a voxel in each axis.
+  float span = float(pc.grid.block_size - 1) * pc.grid.voxel_size;
+  vec3 centre =
+      vec3(coord * pc.grid.block_size) * pc.grid.voxel_size + vec3(0.5 * span);
+  float half_diag = 0.5 * sqrt(3.0) * span;
+
+  vec3 closest;
+  float dist = vrPointTriangleDistance(centre, v0, v1, v2, closest);
+  if (dist > trunc + half_diag) {
+    return;
+  }
+  report_alloc_fail(allocate_block(coord));
+}
