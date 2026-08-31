@@ -36,9 +36,10 @@
 // kernel's own dispatch. Both prior CUDA and Metal implementations of this
 // pipeline resolved neighbours on-device the same way.
 //
-// Only the corner sampling below differs from the dense kernel; the per-cell body
-// (cube index, gradient normal, reversed-winding triangle emission, hybrid vertex
-// colour) is the shared marching_cubes_common.glsl both kernels include.
+// Only how a vertex slot is claimed differs from the sharing kernel; the
+// per-cell body (cube index, gradient normal, reversed-winding triangle
+// emission, hybrid vertex colour) is the shared marching_cubes_common.glsl
+// both kernels include.
 //
 // Voxels are node-centred (world = voxel * voxel_size), matching
 // tsdf_integrate.comp and volume/voxel_coords.hpp, so the extracted surface
@@ -198,9 +199,7 @@ layout(push_constant, scalar) uniform PushConstants {
 
 // mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
 // mcWriteTriangle + the near-tangent edge guard, over the Tables / Vertices /
-// DrawCommand bindings declared above. (mcEmitCell, the per-triangle appender,
-// lives there too but is the DENSE kernel's; this one reserves a span per block
-// and writes through mcWriteTriangle directly.)
+// DrawCommand bindings declared above.
 #include "marching_cubes_common.glsl"
 
 // localIndex / mcLocalBase / s_neighbour / mcResolveNeighbourhood /
@@ -608,7 +607,7 @@ void main() {
       if (tri >= pc.capacity) {
         break;  // counted in phase one, dropped here -- and `tri` only grows
       }
-      mcWriteTriangle(cube_index, t, sdf, corner_color, vec3(0.0),
+      mcWriteTriangle(cube_index, t, sdf, corner_color,
                       block.coord * bs + base, pc.voxel_size, normal, pc.iso,
                       pc.has_color, tri);
     }

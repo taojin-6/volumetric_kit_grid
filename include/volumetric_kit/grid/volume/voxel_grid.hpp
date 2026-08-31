@@ -96,7 +96,15 @@ constexpr VoxelGridParams VoxelGridParams::defaults() {
 }
 
 inline Status VoxelGridParams::validate() const {
-  if (voxel_size <= 0.0f) {
+  // `!(x > 0)` rather than `x <= 0` so a NaN is rejected too: every comparison
+  // with a NaN is false, so `<= 0` lets one straight through. It is not a
+  // theoretical input -- a metric derived from a sensor's intrinsics is one
+  // division by an unset focal length away -- and nothing downstream catches
+  // it. A NaN voxel_size reaches the meshing push constants, every vertex
+  // position comes out NaN, and the extract returns Status::ok() with a
+  // full-size mesh the renderer simply does not draw. Same shape for
+  // trunc_dist below, and for every float this struct validates.
+  if (!(voxel_size > 0.0f)) {
     return Status::invalid_argument("VoxelGridParams: voxel_size must be > 0");
   }
   if (block_size <= 0) {
@@ -118,7 +126,7 @@ inline Status VoxelGridParams::validate() const {
     return Status::invalid_argument(
         "VoxelGridParams: voxels_per_block must equal block_size^3");
   }
-  if (trunc_dist <= 0.0f) {
+  if (!(trunc_dist > 0.0f)) {
     return Status::invalid_argument("VoxelGridParams: trunc_dist must be > 0");
   }
   // Two, not one. The last entry of each bucket is that bucket's chain anchor,

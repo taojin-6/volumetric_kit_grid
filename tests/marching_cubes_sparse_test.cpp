@@ -4,20 +4,27 @@
 // GPU test for marching-cubes extraction straight off a sparse VoxelBlockGrid.
 // Writes an analytic sphere signed-distance field into a REAL block grid that
 // spans a 6x6x6 grid of blocks, so the surface crosses interior block
-// boundaries and extraction must sample corners from neighbouring blocks. The
-// decisive check is equivalence with the dense path: the same sphere at the
-// same resolution meshes the same cells with the same corner values, so the two
-// triangle counts must match exactly -- a wrong neighbour octant or lookup
-// index would corrupt every boundary cell and diverge. Also verifies the sphere
-// shape (radius, outward normals, winding), cross-block colour interpolation,
-// the vertex-arena growth policy, the refit-and-re-run path an undersized
-// arena takes -- over one block and over a run of 27, where the arena boundary
-// falls inside one block's span and past others entirely -- that a block's
-// triangles land CONTIGUOUSLY in the arena on both paths, that the block size
-// is an allocation detail the surface does not depend on (the same field at
-// block_size 8 and 16 meshes identically), and the empty /
-// argument-validation / moved-from paths. Exits 0 (skip) where no device is
-// present.
+// boundaries and extraction must sample corners from neighbouring blocks.
+//
+// Cross-block correctness -- the thing a wrong neighbour octant or lookup index
+// breaks, and which shows up as a surface silently missing at block seams -- is
+// carried by two checks, both verified to fail under exactly those mutations:
+// the block size is an allocation detail, so the same field divided into one
+// 16^3 block and into eight 8^3 blocks must mesh triangle-for-triangle
+// identically; and total triangle area must land within +-20% of the fixture's
+// analytic 4*pi*r^2, which no counter participates in and a dropped seam
+// cannot satisfy. The collision-chain case runs the same equality through a
+// table shaped to spill, which is the only thing that exercises the on-device
+// probe's chain walk at all.
+//
+// Also verifies the sphere shape (radius, outward normals, winding),
+// cross-block colour interpolation, the vertex-arena growth policy and that
+// the two output buffers grow independently, the refit-and-re-run path an
+// undersized arena takes -- over one block and over a run of 27, where the
+// arena boundary falls inside one block's span and past others entirely --
+// that a block's triangles land CONTIGUOUSLY in the arena on both paths, and
+// the empty / argument-validation / moved-from paths. Exits 0 (skip) where no
+// device is present.
 
 #include <algorithm>
 #include <array>
@@ -70,10 +77,6 @@ vr::Vec3f sphere_center() {
   return vr::Vec3f(c, c, c);
 }
 
-float sphere_sdf(vr::Vec3f world) {
-  return vr::length(world - sphere_center()) - kRadius;
-}
-
 // A linear gradient colour: world position normalized to [0,1] per axis. Linear
 // interpolation of a linear field is exact, so a vertex's colour must match the
 // gradient at that vertex's own position to within u8 quantization.
@@ -94,25 +97,6 @@ std::uint32_t pack_rgb(vr::Vec3f c) {
          (static_cast<std::uint32_t>(c.y * 255.0f + 0.5f) << 8) |
          (static_cast<std::uint32_t>(c.z * 255.0f + 0.5f) << 16) |
          (0xFFu << 24);
-}
-
-// The dense reference field over the same kN^3 samples (x-fastest).
-std::vector<vol::Voxel> make_dense_sphere() {
-  std::vector<vol::Voxel> samples(static_cast<std::size_t>(kN) * kN * kN);
-  for (int z = 0; z < kN; ++z) {
-    for (int y = 0; y < kN; ++y) {
-      for (int x = 0; x < kN; ++x) {
-        const vr::Vec3f p(static_cast<float>(x) * kH,
-                          static_cast<float>(y) * kH,
-                          static_cast<float>(z) * kH);
-        vol::Voxel& v =
-            samples[static_cast<std::size_t>(x + kN * (y + kN * z))];
-        v.sdf = sphere_sdf(p);
-        v.weight = 1.0f;
-      }
-    }
-  }
-  return samples;
 }
 
 vol::VoxelGridParams sphere_grid_params() {
@@ -582,7 +566,7 @@ int main() {
   vol::VoxelBlockGrid grid = std::move(grid_result).value();
   CHECK(fill_sphere_grid(grid, /*with_color=*/false));
 
-  vr::Result<mesh::Mesh> sparse_result = extractor.extract(grid, 0.0f);
+  vr::Result<mesh::Mesh> sparse_result = extractor.extract_host(grid, 0.0f);
   CHECK(sparse_result.ok());
   mesh::Mesh sphere = std::move(sparse_result).value();
   CHECK(!sphere.empty());
@@ -596,8 +580,12 @@ int main() {
   double radius_sum = 0.0;
   double outward_sum = 0.0;
   for (const mesh::Vertex& v : sphere.vertices) {
-    // The tangent placeholder, through the *sparse* kernel's own Vertex mirror
-    // (see the dense test for why an unwritten slot is not merely zero).
+    // The renderer's tangent slot, through the sparse kernel's own Vertex
+    // mirror. Meshing cannot derive a real tangent, so the kernel writes this
+    // placeholder -- and it MUST write it: the arena is grow-only and reused in
+    // place, so an unwritten slot carries whatever the previous, larger extract
+    // left there. gfx does not bind `tangent` today, so nothing downstream
+    // would notice; this is the only guard.
     CHECK(v.tangent.x == 1.0f && v.tangent.y == 0.0f && v.tangent.z == 0.0f &&
           v.tangent.w == 1.0f);
     const vr::Vec3f d = v.position - center;
@@ -614,12 +602,13 @@ int main() {
 
   // --- A block's triangles are CONTIGUOUS in the arena -----------------------
   //
-  // Stage 2's actual deliverable, and nothing else here can see it: the golden
-  // sparse-vs-dense equivalence below compares triangles as a SET, so it passes
-  // identically whether a block's triangles are grouped or scattered the length
-  // of the arena. Under the per-triangle append they interleaved with every
-  // other block in flight, and per-block ranges are the precondition for
-  // meshing only the blocks a fuse changed.
+  // Stage 2's actual deliverable, and nothing else here can see it: every
+  // other check in this file compares triangles as a SET (canonical_triangles)
+  // or in aggregate (area, radius), so all of them pass identically whether a
+  // block's triangles are grouped or scattered the length of the arena. Under
+  // the per-triangle append they interleaved with every other block in flight,
+  // and per-block ranges are the precondition for meshing only the blocks a
+  // fuse changed.
   //
   // Asserted EXACTLY -- see block_layout for why centroid attribution admits no
   // slack here, and why a loose bound would be the wrong instrument: the
@@ -677,7 +666,7 @@ int main() {
     // that is never cleared and a table that is correctly rewritten look
     // identical.
     const std::uint64_t first_gen = extractor.block_spans_generation();
-    vr::Result<mesh::Mesh> again_result = extractor.extract(grid, 0.0f);
+    vr::Result<mesh::Mesh> again_result = extractor.extract_host(grid, 0.0f);
     CHECK(again_result.ok());
     const mesh::Mesh again = std::move(again_result).value();
     CHECK(spans_describe(extractor, again, active.value(), kBlock, kH));
@@ -688,27 +677,31 @@ int main() {
     // above could not see.
     CHECK(count_valid_spans(extractor, grid) == active.value().size());
 
-    // A DENSE extract on the same extractor claims the same slot and can
-    // reallocate the same arena, so it retires the table rather than leaving
-    // spans that name geometry which is no longer there. The draw command gets
-    // the same treatment for the same reason.
-    const std::vector<vol::Voxel> tiny(8, vol::Voxel{-1.0f, 1.0f});
-    mesh::DenseGrid tiny_grid;
-    tiny_grid.dims = vr::Vec3i(2, 2, 2);
-    tiny_grid.voxel_size = kH;
-    tiny_grid.origin = vr::Vec3f(0.0f, 0.0f, 0.0f);
-    CHECK(extractor.extract(tiny.data(), tiny.size(), tiny_grid, 0.0f).ok());
+    // A RETIRING extract takes every slot with it, and only the whole-table
+    // gate can say so. An extract that publishes nothing -- here an empty
+    // active set, which the culled overload's own comment calls a routine
+    // per-frame outcome -- zeroes block_spans_generation_ at the top and then
+    // returns BEFORE it re-anchors span_epoch_ or bumps span_serial_, so the
+    // anchor still names this grid and every per-slot stamp still matches.
+    // Nothing but the generation clause is left to answer with, which is what
+    // makes deleting that clause visible here and nowhere else: without it a
+    // caller reads a live slot beside a null block_spans() and indexes an
+    // arena a later extract has entirely rewritten.
+    vr::Result<vol::VoxelBlockGrid> retire_result = vol::VoxelBlockGrid::create(
+        device.value(), allocator.value(), gp, attrs, 2);
+    CHECK(retire_result.ok());
+    vol::VoxelBlockGrid retire_grid = std::move(retire_result).value();
+    vr::Result<mesh::Mesh> retired = extractor.extract_host(retire_grid, 0.0f);
+    CHECK(retired.ok());
+    CHECK(std::move(retired).value().empty());
     CHECK(extractor.block_spans() == nullptr);
     CHECK(extractor.block_spans_generation() == 0);
-    // The two halves of the question agree: retiring the table has to retire
-    // every slot with it, or a caller gets a slot reported live beside a null
-    // pointer. The per-slot stamps are untouched here -- it is the whole-table
-    // test that closes this.
     CHECK(!extractor.block_span_valid(grid, some_slot));
 
-    // ... and the next sparse extract brings it back, so retiring the table is
-    // not a one-way door.
-    vr::Result<mesh::Mesh> revived = extractor.extract(grid, 0.0f);
+    // A second sparse extract republishes the table against its own geometry,
+    // which is what keeps a stale span from outliving the extract that wrote
+    // it -- and revives the slot the retiring extract above put out.
+    vr::Result<mesh::Mesh> revived = extractor.extract_host(grid, 0.0f);
     CHECK(revived.ok());
     CHECK(
         spans_describe(extractor, revived.value(), active.value(), kBlock, kH));
@@ -750,28 +743,12 @@ int main() {
     CHECK(v.uv0.x < 0.0f && v.uv0.y < 0.0f);
   }
 
-  // --- Equivalence with the dense path (the cross-block correctness proof) ---
-  // The dense grid samples the identical kN^3 field at the identical positions,
-  // so it meshes the identical cell set: base voxels [0, kN-2]^3 (the sparse
-  // +face cells at voxel kN-1 reach the unallocated block kN and are skipped,
-  // exactly the cells the dense grid also lacks). Same cells, same corner
-  // values -> identical triangle count. A mis-indexed neighbour lookup would
-  // corrupt every interior-boundary cell and break this equality.
-  const std::vector<vol::Voxel> dense = make_dense_sphere();
-  mesh::DenseGrid dense_grid;
-  dense_grid.dims = vr::Vec3i(kN, kN, kN);
-  dense_grid.voxel_size = kH;
-  dense_grid.origin = vr::Vec3f(0.0f, 0.0f, 0.0f);
-  vr::Result<mesh::Mesh> dense_result =
-      extractor.extract(dense.data(), dense.size(), dense_grid, 0.0f);
-  CHECK(dense_result.ok());
-  const mesh::Mesh dense_mesh = std::move(dense_result).value();
-  CHECK(sphere.triangle_count() == dense_mesh.triangle_count());
-
   // --- The counter's UNITS, pinned against the fixture's analytic area -------
-  // Everything above compares the kernel with itself: dense and sparse share
-  // mcEmitCell, so a mistake in what the append atomic counts moves both sides
-  // equally and every equality still holds. Measured, not assumed -- reverting
+  // Everything above compares the kernel with itself -- one extract against
+  // another, or one block division against another -- so a mistake in what the
+  // append atomic counts moves both sides equally and every equality still
+  // holds. This is the one check keyed to a quantity outside the kernel.
+  // Measured, not assumed -- reverting
   // `atomicAdd(index_count, kIndicesPerTriangle) / kIndicesPerTriangle` to a
   // plain `atomicAdd(..., 1u)` left this whole suite green.
   //
@@ -842,7 +819,7 @@ int main() {
   CHECK(chained_diag.value().max_chain_length > 0);
 
   vr::Result<mesh::Mesh> chained_mesh_result =
-      extractor.extract(chained_grid, 0.0f);
+      extractor.extract_host(chained_grid, 0.0f);
   CHECK(chained_mesh_result.ok());
   const mesh::Mesh chained_mesh = std::move(chained_mesh_result).value();
   CHECK(chained_mesh.triangle_count() == sphere.triangle_count());
@@ -863,17 +840,22 @@ int main() {
   vol::VoxelBlockGrid cgrid = std::move(cgrid_result).value();
   CHECK(fill_sphere_grid(cgrid, /*with_color=*/true));
 
-  vr::Result<mesh::Mesh> colored_result = extractor.extract(cgrid, 0.0f);
+  vr::Result<mesh::Mesh> colored_result = extractor.extract_host(cgrid, 0.0f);
   CHECK(colored_result.ok());
   const mesh::Mesh colored = std::move(colored_result).value();
   CHECK(!colored.empty());
-  CHECK(colored.triangle_count() == dense_mesh.triangle_count());
+  CHECK(colored.triangle_count() == sphere.triangle_count());
   for (const mesh::Vertex& v : colored.vertices) {
-    // Compared in ENCODED space: `Vertex::color` is linear working values while
-    // the gradient was written as canonical-encoded 8-bit, and inverting the
-    // vertex keeps the u8-floor tolerance meaningful (one code is a flat 1/255
-    // encoded, but ~0.0089 in linear near white). See the dense test for the
-    // full note.
+    // Compared in ENCODED space -- `linear_to_srgb(v.color)` against the
+    // gradient -- because `Vertex::color` is linear working values while the
+    // gradient was written as canonical-encoded 8-bit (the 2026-08-02
+    // color-space decision). Inverting the vertex rather than
+    // forward-converting the expectation keeps the tolerance meaningful: one u8
+    // code spans ~0.0089 in *linear* near white, which alone would blow a 0.005
+    // bound, while in encoded space a code is a flat 1/255 everywhere. It also
+    // stays discriminating rather than vacuous: a kernel that skipped the
+    // decode would leave `v.color` encoded, and `linear_to_srgb` of an
+    // already-encoded 0.5 is 0.735, nowhere near it.
     const vr::Vec3f expected = grad_color(v.position);
     const vr::Vec3f encoded = vr::linear_to_srgb(vr::Vec3f(v.color));
     CHECK(std::fabs(encoded.x - expected.x) < 0.005f);  // ~2.5x the u8 floor
@@ -896,7 +878,7 @@ int main() {
   CHECK(zw_result.ok());
   vol::VoxelBlockGrid zw_grid = std::move(zw_result).value();
   CHECK(fill_sphere_grid(zw_grid, /*with_color=*/false, /*weight=*/0.0f));
-  vr::Result<mesh::Mesh> zw_mesh = extractor.extract(zw_grid, 0.0f);
+  vr::Result<mesh::Mesh> zw_mesh = extractor.extract_host(zw_grid, 0.0f);
   CHECK(zw_mesh.ok());
   CHECK(std::move(zw_mesh).value().empty());
 
@@ -907,17 +889,17 @@ int main() {
   // yet every corner reads the 0 sentinel. Each vertex must fall back to opaque
   // white rather than be dragged toward black (which is what an unguarded
   // unpack of the 0 sentinel would produce). Geometry is unaffected, so the
-  // triangle count still matches the dense path.
+  // triangle count still matches the colourless extract of the same field.
   vr::Result<vol::VoxelBlockGrid> sgrid_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, cattrs, 3);
   CHECK(sgrid_result.ok());
   vol::VoxelBlockGrid sgrid = std::move(sgrid_result).value();
   CHECK(fill_sphere_grid(sgrid, /*with_color=*/false));  // colour left at 0
-  vr::Result<mesh::Mesh> sentinel_result = extractor.extract(sgrid, 0.0f);
+  vr::Result<mesh::Mesh> sentinel_result = extractor.extract_host(sgrid, 0.0f);
   CHECK(sentinel_result.ok());
   const mesh::Mesh sentinel = std::move(sentinel_result).value();
   CHECK(!sentinel.empty());
-  CHECK(sentinel.triangle_count() == dense_mesh.triangle_count());
+  CHECK(sentinel.triangle_count() == sphere.triangle_count());
   for (const mesh::Vertex& v : sentinel.vertices) {
     CHECK(v.color.x == 1.0f && v.color.y == 1.0f && v.color.z == 1.0f &&
           v.color.w == 1.0f);
@@ -929,7 +911,7 @@ int main() {
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(empty_result.ok());
   vol::VoxelBlockGrid empty_grid = std::move(empty_result).value();
-  vr::Result<mesh::Mesh> empty_mesh = extractor.extract(empty_grid, 0.0f);
+  vr::Result<mesh::Mesh> empty_mesh = extractor.extract_host(empty_grid, 0.0f);
   CHECK(empty_mesh.ok());
   CHECK(std::move(empty_mesh).value().empty());
   // An empty extract publishes no table either. It returns before any dispatch,
@@ -966,9 +948,9 @@ int main() {
     mesh::ExtractTimings gated_timings;
     mesh::ExtractTimings ungated_timings;
     vr::Result<mesh::Mesh> gated_mesh =
-        gated.extract(grid, 0.0f, &gated_timings);
+        gated.extract_host(grid, 0.0f, &gated_timings);
     vr::Result<mesh::Mesh> ungated_mesh =
-        ungated.extract(grid, 0.0f, &ungated_timings);
+        ungated.extract_host(grid, 0.0f, &ungated_timings);
     CHECK(gated_mesh.ok());
     CHECK(ungated_mesh.ok());
     // The same surface either way: the kernel skipping the store changes
@@ -1021,7 +1003,7 @@ int main() {
     CHECK(grow_result.ok());
     mesh::MarchingCubes grow_mc = std::move(grow_result).value();
 
-    vr::Result<mesh::Mesh> before = grow_mc.extract(grow_grid, 0.0f);
+    vr::Result<mesh::Mesh> before = grow_mc.extract_host(grow_grid, 0.0f);
     CHECK(before.ok());
     CHECK(grow_mc.block_span_capacity() ==
           static_cast<std::uint32_t>(gp.num_blocks));
@@ -1046,7 +1028,7 @@ int main() {
     CHECK(active_after.ok());
     CHECK(active_after.value().size() == active_before.value().size());
 
-    vr::Result<mesh::Mesh> after = grow_mc.extract(grow_grid, 0.0f);
+    vr::Result<mesh::Mesh> after = grow_mc.extract_host(grow_grid, 0.0f);
     CHECK(after.ok());
     CHECK(grow_mc.block_span_capacity() ==
           static_cast<std::uint32_t>(gp.num_blocks) * 2);
@@ -1080,8 +1062,8 @@ int main() {
   // a sparse extract). ExtractTimings::arena_bytes reports what the extractor
   // is holding, which is what makes the policy checkable from outside.
   //
-  // Checked here rather than on the dense path because the sizes must be
-  // observed, not inferred: the worst-case capacity is ~5 triangles per cell
+  // Checked by observing the sizes rather than by comparing meshes: the
+  // worst-case capacity is ~5 triangles per cell
   // while a sphere emits a small fraction of that, so an undersized arena still
   // holds every emitted triangle and comparing meshes would NOT catch a broken
   // growth policy.
@@ -1110,13 +1092,13 @@ int main() {
   };
 
   mesh::ExtractTimings small_timings;
-  CHECK(arena_mc.extract(one_grid, 0.0f, &small_timings).ok());
+  CHECK(arena_mc.extract_host(one_grid, 0.0f, &small_timings).ok());
   CHECK(small_timings.triangle_capacity > 0);
   CHECK(small_timings.arena_bytes >= needed_bytes(small_timings));
 
   // The sphere grid needs a far larger capacity: the grow path.
   mesh::ExtractTimings big_timings;
-  CHECK(arena_mc.extract(grid, 0.0f, &big_timings).ok());
+  CHECK(arena_mc.extract_host(grid, 0.0f, &big_timings).ok());
   CHECK(big_timings.triangle_capacity > small_timings.triangle_capacity);
   CHECK(big_timings.arena_bytes >= needed_bytes(big_timings));
   CHECK(big_timings.arena_bytes > small_timings.arena_bytes);
@@ -1125,7 +1107,7 @@ int main() {
   // reallocated nor shrunk, and the dispatch runs at its full capacity (so it
   // never drops a triangle the arena had room for).
   mesh::ExtractTimings reuse_timings;
-  CHECK(arena_mc.extract(one_grid, 0.0f, &reuse_timings).ok());
+  CHECK(arena_mc.extract_host(one_grid, 0.0f, &reuse_timings).ok());
   CHECK(reuse_timings.triangle_capacity == big_timings.triangle_capacity);
   CHECK(reuse_timings.arena_bytes == big_timings.arena_bytes);
   CHECK(reuse_timings.dispatches == 1);  // it already fits: no refit
@@ -1156,7 +1138,7 @@ int main() {
 
   mesh::ExtractTimings refit_timings;
   vr::Result<mesh::Mesh> refit_mesh_result =
-      refit_mc.extract(dense_block, 0.0f, &refit_timings);
+      refit_mc.extract_host(dense_block, 0.0f, &refit_timings);
   CHECK(refit_mesh_result.ok());
   const mesh::Mesh refit_mesh = std::move(refit_mesh_result).value();
   CHECK(refit_timings.dispatches == 2);  // planned short, measured, re-ran
@@ -1173,7 +1155,7 @@ int main() {
   // pass would both break.
   mesh::ExtractTimings settled_timings;
   vr::Result<mesh::Mesh> settled_result =
-      refit_mc.extract(dense_block, 0.0f, &settled_timings);
+      refit_mc.extract_host(dense_block, 0.0f, &settled_timings);
   CHECK(settled_result.ok());
   const mesh::Mesh settled_mesh = std::move(settled_result).value();
   CHECK(settled_timings.dispatches == 1);
@@ -1208,7 +1190,7 @@ int main() {
 
   mesh::ExtractTimings run_timings;
   vr::Result<mesh::Mesh> run_mesh_result =
-      run_mc.extract(dense_run, 0.0f, &run_timings);
+      run_mc.extract_host(dense_run, 0.0f, &run_timings);
   CHECK(run_mesh_result.ok());
   const mesh::Mesh run_mesh = std::move(run_mesh_result).value();
   CHECK(run_timings.active_blocks == 27);
@@ -1225,7 +1207,7 @@ int main() {
   // dropped, not misplaced into a neighbouring block's.
   mesh::ExtractTimings run_settled_timings;
   vr::Result<mesh::Mesh> run_settled_result =
-      run_mc.extract(dense_run, 0.0f, &run_settled_timings);
+      run_mc.extract_host(dense_run, 0.0f, &run_settled_timings);
   CHECK(run_settled_result.ok());
   const mesh::Mesh run_settled = std::move(run_settled_result).value();
   CHECK(run_settled_timings.dispatches == 1);
@@ -1248,7 +1230,7 @@ int main() {
   // readback_ms sum over a call's attempts internally, which is exactly why
   // they have to start from zero.)
   mesh::ExtractTimings reused_stats = refit_timings;
-  CHECK(refit_mc.extract(dense_block, 0.0f, &reused_stats).ok());
+  CHECK(refit_mc.extract_host(dense_block, 0.0f, &reused_stats).ok());
   CHECK(reused_stats.dispatches == 1);
   CHECK(reused_stats.emitted_triangles == refit_timings.emitted_triangles);
 
@@ -1268,7 +1250,7 @@ int main() {
 
   mesh::ExtractTimings share_timings;
   vr::Result<mesh::Mesh> share_mesh_result =
-      share_mc.extract(grid, 0.0f, &share_timings);
+      share_mc.extract_host(grid, 0.0f, &share_timings);
   CHECK(share_mesh_result.ok());
   const mesh::Mesh share_mesh = std::move(share_mesh_result).value();
 
@@ -1387,7 +1369,7 @@ int main() {
   mesh::MarchingCubes share_refit_mc = std::move(share_refit_result).value();
   mesh::ExtractTimings share_refit_timings;
   vr::Result<mesh::Mesh> share_refit_result_mesh =
-      share_refit_mc.extract(dense_block, 0.0f, &share_refit_timings);
+      share_refit_mc.extract_host(dense_block, 0.0f, &share_refit_timings);
   CHECK(share_refit_result_mesh.ok());
   const mesh::Mesh share_refit_mesh =
       std::move(share_refit_result_mesh).value();
@@ -1431,7 +1413,7 @@ int main() {
 
   mesh::ExtractTimings share_run_timings;
   vr::Result<mesh::Mesh> share_run_result_mesh =
-      share_run_mc.extract(dense_run, 0.0f, &share_run_timings);
+      share_run_mc.extract_host(dense_run, 0.0f, &share_run_timings);
   CHECK(share_run_result_mesh.ok());
   const mesh::Mesh share_run_mesh = std::move(share_run_result_mesh).value();
   CHECK(share_run_timings.active_blocks == 27);
@@ -1457,7 +1439,7 @@ int main() {
   // the same surface, and still one range each per block.
   mesh::ExtractTimings share_run_settled_timings;
   vr::Result<mesh::Mesh> share_run_settled_result =
-      share_run_mc.extract(dense_run, 0.0f, &share_run_settled_timings);
+      share_run_mc.extract_host(dense_run, 0.0f, &share_run_settled_timings);
   CHECK(share_run_settled_result.ok());
   const mesh::Mesh share_run_settled =
       std::move(share_run_settled_result).value();
@@ -1478,61 +1460,55 @@ int main() {
   // already held, compounding on every such event: numerically the ring runaway
   // the slot-independence decision exists to prevent, one buffer over.
   //
-  // Reachable only where the two budgets are out of proportion, which is what
-  // sharing makes them: this extractor holds ~0.75 vertices per triangle, and
-  // the DENSE overload (which shares nothing, and shares this extractor's
-  // slot) asks for exactly 3. Sized from the measured capacities so the case is
-  // constructed rather than hoped for -- the arena must be short and the index
-  // run must not.
-  mesh::ExtractTimings before_dense;
-  CHECK(share_mc.extract(grid, 0.0f, &before_dense).ok());
-  CHECK(before_dense.vertex_capacity > 0 && before_dense.triangle_capacity > 0);
+  // Reachable wherever the two budgets are out of proportion, which needs no
+  // second entry point to arrange: the arena is planned from
+  // `verts_per_1000_tris_`, LEARNED FROM THE PREVIOUS EXTRACT, so a first
+  // extract over a thin shell teaches a ratio a dense field then breaks. The
+  // sphere holds ~0.75 vertices per triangle; a field crossing the iso in every
+  // cell holds more, while its triangle count stays under what the shell's run
+  // already covers. So the arena must grow and the index run must not.
+  //
+  // Sized from the MEASURED capacities rather than hoped for: both bounds of
+  // the window are asserted before the growth is, so if the two ever drift out
+  // of it the case fails loudly instead of quietly proving nothing.
   {
-    // Triangles whose 3-per-triangle vertices overflow the held arena while
-    // fitting the held index run: anything strictly between the two bounds.
-    const std::uint64_t lower = before_dense.vertex_capacity / 3;
-    const std::uint64_t upper = before_dense.triangle_capacity;
-    CHECK(lower < upper);  // sharing is what makes this window exist
-    const std::uint64_t target_tris = (lower + upper) / 2;
-    int dims = 2;
-    while (static_cast<std::uint64_t>(dims - 1) * (dims - 1) * (dims - 1) * 5 <
-           target_tris) {
-      ++dims;
-    }
-    const std::uint64_t dense_tris =
-        static_cast<std::uint64_t>(dims - 1) * (dims - 1) * (dims - 1) * 5;
-    // Non-vacuous by construction, and checked rather than assumed: if the
-    // capacities ever drift out of this window the test fails loudly instead of
-    // quietly proving nothing.
-    CHECK(dense_tris * 3 > before_dense.vertex_capacity);
-    CHECK(dense_tris <= before_dense.triangle_capacity);
+    mesh::MarchingCubesConfig grow_config;
+    grow_config.share_vertices = true;
+    vr::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), grow_config);
+    CHECK(grow_result.ok());
+    mesh::MarchingCubes grow_mc = std::move(grow_result).value();
 
-    std::vector<vol::Voxel> sub(static_cast<std::size_t>(dims) * dims * dims);
-    for (int z = 0; z < dims; ++z) {
-      for (int y = 0; y < dims; ++y) {
-        for (int x = 0; x < dims; ++x) {
-          const vr::Vec3f p(static_cast<float>(x) * kH,
-                            static_cast<float>(y) * kH,
-                            static_cast<float>(z) * kH);
-          vol::Voxel& v =
-              sub[static_cast<std::size_t>(x + dims * (y + dims * z))];
-          v.sdf = sphere_sdf(p);
-          v.weight = 1.0f;
-        }
-      }
-    }
-    mesh::DenseGrid sub_grid;
-    sub_grid.dims = vr::Vec3i(dims, dims, dims);
-    sub_grid.voxel_size = kH;
-    sub_grid.origin = vr::Vec3f(0.0f, 0.0f, 0.0f);
-    CHECK(share_mc.extract(sub.data(), sub.size(), sub_grid, 0.0f).ok());
+    // The shell, which sizes both buffers and teaches the vertex ratio.
+    mesh::ExtractTimings before_grow;
+    CHECK(grow_mc.extract_host(grid, 0.0f, &before_grow).ok());
+    CHECK(before_grow.vertex_capacity > 0 && before_grow.triangle_capacity > 0);
 
-    mesh::ExtractTimings after_dense;
-    CHECK(share_mc.extract(grid, 0.0f, &after_dense).ok());
-    // The arena grew (the dense call needed three vertices per triangle)...
-    CHECK(after_dense.vertex_capacity > before_dense.vertex_capacity);
+    // A denser field: 2x2x2 blocks whose every cell crosses.
+    vol::VoxelGridParams grow_gp = sphere_grid_params();
+    grow_gp.num_buckets = 32;
+    grow_gp.num_blocks = 256;
+    vr::Result<vol::VoxelBlockGrid> grow_grid_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), grow_gp,
+                                    attrs, 2);
+    CHECK(grow_grid_result.ok());
+    vol::VoxelBlockGrid grow_grid = std::move(grow_grid_result).value();
+    CHECK(fill_dense_blocks(grow_grid, 2));
+
+    mesh::ExtractTimings after_grow;
+    vr::Result<mesh::Mesh> grown_result =
+        grow_mc.extract_host(grow_grid, 0.0f, &after_grow);
+    CHECK(grown_result.ok());
+    const mesh::Mesh grown = std::move(grown_result).value();
+
+    // Non-vacuous by construction, and checked rather than assumed.
+    CHECK(grown.vertices.size() > before_grow.vertex_capacity);
+    CHECK(grown.triangle_count() <= before_grow.triangle_capacity);
+
+    // The arena grew (it could not hold this surface's vertices)...
+    CHECK(after_grow.vertex_capacity > before_grow.vertex_capacity);
     // ...and the index run, which already fitted, was left exactly alone.
-    CHECK(after_dense.triangle_capacity == before_dense.triangle_capacity);
+    CHECK(after_grow.triangle_capacity == before_grow.triangle_capacity);
   }
 
   // A block this kernel's compile-time cell table cannot index is refused up
@@ -1558,12 +1534,12 @@ int main() {
   // instead of the cheap register rejection, and only then is the uncached
   // branch exercised at all.
   CHECK(fill_dense_blocks(big_block_grid, 1));
-  CHECK(!share_mc.extract(big_block_grid, 0.0f).ok());
+  CHECK(!share_mc.extract_host(big_block_grid, 0.0f).ok());
   // The same grid is fine without sharing -- the refusal is the kernel's table,
   // not the block size.
   mesh::ExtractTimings big_timings_16;
   vr::Result<mesh::Mesh> big_mesh_16_result =
-      arena_mc.extract(big_block_grid, 0.0f, &big_timings_16);
+      arena_mc.extract_host(big_block_grid, 0.0f, &big_timings_16);
   CHECK(big_mesh_16_result.ok());
   const mesh::Mesh big_mesh_16 = std::move(big_mesh_16_result).value();
   CHECK(big_timings_16.active_blocks == 1);
@@ -1588,7 +1564,7 @@ int main() {
   CHECK(fill_dense_blocks(split_grid, 2));  // 2x2x2 blocks of 8 = the same 16^3
   mesh::ExtractTimings split_timings;
   vr::Result<mesh::Mesh> split_mesh_result =
-      arena_mc.extract(split_grid, 0.0f, &split_timings);
+      arena_mc.extract_host(split_grid, 0.0f, &split_timings);
   CHECK(split_mesh_result.ok());
   const mesh::Mesh split_mesh = std::move(split_mesh_result).value();
   CHECK(split_timings.active_blocks == 8);
@@ -1601,11 +1577,11 @@ int main() {
       device.value(), allocator.value(), gp, nullptr, 0);
   CHECK(bare_result.ok());
   vol::VoxelBlockGrid bare_grid = std::move(bare_result).value();
-  CHECK(!extractor.extract(bare_grid, 0.0f).ok());
+  CHECK(!extractor.extract_host(bare_grid, 0.0f).ok());
 
   // A moved-from grid is rejected.
   vol::VoxelBlockGrid moved_grid = std::move(empty_grid);
-  CHECK(!extractor.extract(empty_grid, 0.0f).ok());
+  CHECK(!extractor.extract_host(empty_grid, 0.0f).ok());
 
   // --- Move-only extractor ---------------------------------------------------
   // The source must be left EMPTY, not merely invalid: this class's
@@ -1626,7 +1602,7 @@ int main() {
   moved = std::move(*alias);  // self-move: intact
   CHECK(moved.valid());
   CHECK(moved.block_span_capacity() > 0);
-  vr::Result<mesh::Mesh> reextract = moved.extract(grid, 0.0f);
+  vr::Result<mesh::Mesh> reextract = moved.extract_host(grid, 0.0f);
   CHECK(reextract.ok());
   CHECK(!std::move(reextract).value().empty());
 
@@ -1667,7 +1643,7 @@ int main() {
                                     anchor_config);
     CHECK(anchor_mc_result.ok());
     mesh::MarchingCubes anchor_mc = std::move(anchor_mc_result).value();
-    CHECK(anchor_mc.extract(anchor_grid, 0.0f).ok());
+    CHECK(anchor_mc.extract_host(anchor_grid, 0.0f).ok());
 
     vr::Result<std::vector<vol::BlockIndex>> live =
         anchor_grid.map().compact_active_blocks();
@@ -1704,7 +1680,7 @@ int main() {
         anchor_grid.map().compact_active_blocks();
     CHECK(after_remove.ok());
     CHECK(after_remove.value().size() == live.value().size() - 1);
-    CHECK(anchor_mc.extract(anchor_grid, 0.0f).ok());
+    CHECK(anchor_mc.extract_host(anchor_grid, 0.0f).ok());
     CHECK(anchor_mc.block_span_valid(anchor_grid, slot));  // re-meshed
     CHECK(!anchor_mc.block_span_valid(anchor_grid, victim_slot));
     // Exactly the surviving blocks, counted over the WHOLE capacity: a stamp
@@ -1731,7 +1707,7 @@ int main() {
     // see.
     CHECK(other_grid.topology_epoch() != anchor_grid.topology_epoch());
 
-    CHECK(anchor_mc.extract(other_grid, 0.0f).ok());
+    CHECK(anchor_mc.extract_host(other_grid, 0.0f).ok());
     vr::Result<std::vector<vol::BlockIndex>> other_live =
         other_grid.map().compact_active_blocks();
     CHECK(other_live.ok());
@@ -1797,7 +1773,7 @@ int main() {
 
     // The first extract can only be full -- there is no watermark yet -- and it
     // is what establishes the spans and the arena the next one reuses.
-    vr::Result<mesh::Mesh> first = inc_mc.extract(inc_grid, 0.0f);
+    vr::Result<mesh::Mesh> first = inc_mc.extract_host(inc_grid, 0.0f);
     CHECK(first.ok());
     const std::vector<std::array<float, 9>> old_surface =
         canonical_triangles(first.value());
@@ -1844,7 +1820,7 @@ int main() {
           device.value(), allocator.value(), inc_config);
       CHECK(ref_result.ok());
       mesh::MarchingCubes ref_mc = std::move(ref_result).value();
-      vr::Result<mesh::Mesh> grown = ref_mc.extract(inc_grid, 0.0f);
+      vr::Result<mesh::Mesh> grown = ref_mc.extract_host(inc_grid, 0.0f);
       CHECK(grown.ok());
       new_surface = canonical_triangles(grown.value());
       CHECK(drop_degenerate(new_surface) == 0);  // a full extract retires none
@@ -1991,7 +1967,7 @@ int main() {
           device.value(), allocator.value(), inc_config);
       CHECK(ref_result.ok());
       vr::Result<mesh::Mesh> shrunk =
-          std::move(ref_result).value().extract(inc_grid, 0.0f);
+          std::move(ref_result).value().extract_host(inc_grid, 0.0f);
       CHECK(shrunk.ok());
       shrunk_surface = canonical_triangles(shrunk.value());
       CHECK(shrunk_surface != new_surface);
@@ -2018,31 +1994,8 @@ int main() {
       CHECK(canonical_triangles(host.value()) == shrunk_surface);
     }
 
-    // (b) A DENSE extract in between. It claims the same slot and overwrites
-    //     the same arena with a kernel that knows nothing about blocks, so the
-    //     watermark it leaves behind names triangles that are gone -- and the
-    //     span table it retires is not what catches that, since a dense extract
-    //     moves no topology epoch and bumps no span serial.
-    {
-      const std::vector<vol::Voxel> tiny(8, vol::Voxel{-1.0f, 1.0f});
-      mesh::DenseGrid tiny_grid;
-      tiny_grid.dims = vr::Vec3i(2, 2, 2);
-      tiny_grid.voxel_size = kH;
-      tiny_grid.origin = vr::Vec3f(0.0f, 0.0f, 0.0f);
-      CHECK(inc_mc.extract(tiny.data(), tiny.size(), tiny_grid, 0.0f).ok());
-
-      mesh::ExtractTimings rt{};
-      vr::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, dirty_blocks, &rt);
-      CHECK(dm.ok());
-      CHECK(!rt.incremental);
-      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
-      CHECK(host.ok());
-      CHECK(canonical_triangles(host.value()) == shrunk_surface);
-    }
-
-    // (d) A CULLED extract in between -- the sibling of (b), and the one the
-    //     first cut of the caller-supplied set missed. A culled pass rebuilds
+    // (b) A CULLED extract in between, and the one the first cut of the
+    //     caller-supplied set missed. A culled pass rebuilds
     //     the arena from the blocks it was handed and so stamps spans for only
     //     those; every other block keeps a range naming the arena that pass
     //     replaced. Left publishing arena state, the next incremental call
@@ -2053,7 +2006,7 @@ int main() {
     //     `incremental == 1`, and a dirty block outside the cull wrote over
     //     live triangles belonging to blocks the pass had promised to keep.
     //
-    //     Run with all-zero flags, exactly like (a) and (b): a correct fallback
+    //     Run with all-zero flags, exactly like (a): a correct fallback
     //     re-meshes everything and returns the shrunk sphere, while a pass that
     //     wrongly went incremental keeps whatever the culled arena holds. The
     //     two differ by the whole culled-away half, so this cannot pass by
@@ -2135,7 +2088,8 @@ int main() {
     mesh::MarchingCubes cull_mc = std::move(cull_result).value();
 
     mesh::ExtractTimings full_t{};
-    vr::Result<mesh::Mesh> full = cull_mc.extract(cull_grid, 0.0f, &full_t);
+    vr::Result<mesh::Mesh> full =
+        cull_mc.extract_host(cull_grid, 0.0f, &full_t);
     CHECK(full.ok());
     const std::vector<std::array<float, 9>> full_tris =
         canonical_triangles(full.value());
@@ -2310,9 +2264,10 @@ int main() {
 
   std::printf(
       "recon mesh sparse marching-cubes test passed: meshed a sphere across "
-      "%d^3 blocks (%zu triangles), matched the dense path exactly, verified "
-      "cross-block colour on-device, and partitioned the active set into two "
-      "caller-supplied halves that merge back exactly\n",
+      "%d^3 blocks (%zu triangles), matched the same field at block_size 16 "
+      "triangle-for-triangle, verified cross-block colour on-device, and "
+      "partitioned the active set into two caller-supplied halves that merge "
+      "back exactly\n",
       kBlocks, sphere.triangle_count());
   return 0;
 }

@@ -62,7 +62,7 @@ target_include_directories(
 # runtime shader files.
 include(vr_embed)
 vr_embed_shaders(
-  recon_mesh SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes.comp"
+  recon_mesh SHADERS
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes_sparse.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes_sparse_shared.comp")
 

@@ -4,10 +4,12 @@
 // Coordinate-math tests for the sparse voxel grid: world <-> voxel <-> block
 // round-trips, the negative-coordinate block-indexing bias (the subtle part),
 // round-half-to-even tie-breaking, the truncation-band width, and params
-// validation. Pure host math -- no device -- so it always runs.
+// validation (including the NaN floats an `x <= 0` guard would admit). Pure
+// host math -- no device -- so it always runs.
 
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
@@ -165,6 +167,24 @@ int main() {
   bad.bucket_size = 2;
   bad.num_blocks = 2 * bad.num_buckets;
   CHECK(bad.validate().ok());
+
+  // NaN is rejected, not merely non-positive. Every comparison with a NaN is
+  // false, so an `x <= 0` guard passes one straight through -- and nothing
+  // downstream re-checks: a NaN voxel_size reaches the meshing push constants
+  // and comes back as a full-size mesh of NaN positions under Status::ok, which
+  // the renderer draws as nothing at all. The `!(x > 0)` form in validate() is
+  // what catches it, and this is what keeps that form from being simplified
+  // back.
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  bad = grid;
+  bad.voxel_size = nan;
+  CHECK(!bad.validate().ok());
+  bad = grid;
+  bad.trunc_dist = nan;
+  CHECK(!bad.validate().ok());
+  // Infinity is not rejected here on purpose -- it is representable, orders the
+  // way the checks assume, and no arithmetic in the tiers below turns it into a
+  // silently-wrong answer the way a NaN does.
 
   std::printf("recon volume coords test passed\n");
   return 0;
