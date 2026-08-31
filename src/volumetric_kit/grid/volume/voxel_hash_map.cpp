@@ -103,8 +103,6 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   // VoxelGridParams::validate is the single source of truth for a usable grid.
   VR_TRY(grid.validate());
 
-  const VkDevice dev = device.handle();
-
   VoxelHashMap map;
   map.device_ = &device;
   map.allocator_ = &allocator;
@@ -168,7 +166,7 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   push.offset = 0;
   push.size = sizeof(PushConstants);
 
-  KernelSetBuilder kb(dev);
+  KernelSetBuilder kb(device);
   VR_TRY(kb.add(map.init_, "hash_init", vr_hash_init_comp_spv,
                 vr_hash_init_comp_spv_size, 4, &push));
   VR_TRY(kb.add(map.allocate_, "hash_allocate_coords",

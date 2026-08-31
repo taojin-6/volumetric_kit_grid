@@ -618,7 +618,7 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
-    name_slot_buffers();
+    name_slot_buffer(indirect(), "mesh.indirect[%u]");
   }
   // The whole command, not just the counter it starts as. indexCount is zeroed
   // for the kernel to accumulate into; the other four fields are what make the
@@ -759,6 +759,15 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   std::memset(dst + old_bytes, 0, static_cast<std::size_t>(bytes) - old_bytes);
   const std::uint32_t old_slots = block_span_capacity();
   block_spans_ = std::move(grown);
+  // A fresh handle, and a debug-utils name lives on the handle -- so without
+  // this the span table goes anonymous the first time it grows, in exactly the
+  // configuration that has one at all (track_block_spans, which incremental
+  // extraction requires). Not slot-keyed: one table serves the whole ring.
+  if (device_ != nullptr) {
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             debug_object_handle(block_spans_.handle()),
+                             "mesh.block_spans");
+  }
 
   // The stamps grow with it, and in lockstep: their count is not stored but
   // READ OFF block_span_capacity(), so allocating one without the other would
@@ -940,35 +949,31 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // one buffer resized against the other's capacity.
   if (grow_arena) arena() = std::move(grown_arena);
   if (grow_index_run) index_run() = std::move(indices_buf);
-  // Only where a handle actually changed. Naming is idempotent and cheap, but
-  // this runs per extract, and a driver call per buffer per frame to re-state
-  // an unchanged name is pure overhead in the hot path.
-  if (grow_arena || grow_index_run) name_slot_buffers();
+  // Each buffer named only where its own handle changed. Naming is idempotent
+  // and cheap, but this runs per extract, and a driver call per buffer per
+  // frame to re-state an unchanged name is pure overhead in the hot path.
+  if (grow_arena) name_slot_buffer(arena(), "mesh.arena[%u]");
+  if (grow_index_run) name_slot_buffer(index_run(), "mesh.index_run[%u]");
   return {};
 }
 
-void MarchingCubes::name_slot_buffers() const noexcept {
-  if (device_ == nullptr) {
+void MarchingCubes::name_slot_buffer(const Buffer& buffer,
+                                     const char* form) const noexcept {
+  if (device_ == nullptr || !buffer.valid()) {
     return;
   }
   // The slot index belongs in the name: the ring hands the consumer one slot
   // while the next extract writes another, so a capture showing "mesh.arena"
   // three times over would not say which generation it had caught.
+  //
+  // Cast rather than %zu: slot_ is a std::size_t and the forms say %u, so the
+  // pair must be made to agree. This direction, because the value is a ring
+  // index bounded by kMaxSlots and %zu's worst case (20 digits) would not fit
+  // the buffer below.
   char name[32];
-  const struct {
-    const Buffer& buffer;
-    const char* form;
-  } named[] = {
-      {slots_[slot_].arena, "mesh.arena[%u]"},
-      {slots_[slot_].index_run, "mesh.index_run[%u]"},
-      {slots_[slot_].indirect, "mesh.indirect[%u]"},
-  };
-  for (const auto& entry : named) {
-    if (!entry.buffer.valid()) continue;
-    std::snprintf(name, sizeof(name), entry.form, slot_);
-    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                             debug_object_handle(entry.buffer.handle()), name);
-  }
+  std::snprintf(name, sizeof(name), form, static_cast<unsigned>(slot_));
+  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                           debug_object_handle(buffer.handle()), name);
 }
 
 Result<MarchingCubes> MarchingCubes::create(Device& device,
@@ -1015,8 +1020,6 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
         "); 1 is the default and the single-arena behaviour, and the ceiling "
         "is what the slot array holds");
   }
-
-  const VkDevice dev = device.handle();
 
   MarchingCubes mc;
   mc.device_ = &device;
@@ -1069,7 +1072,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   push.size = sizeof(PushConstants);
   VkPushConstantRange push_sparse = push;
   push_sparse.size = sizeof(SparsePushConstants);
-  KernelSetBuilder kb(dev);
+  KernelSetBuilder kb(device);
   VR_TRY(kb.add(mc.kernel_, "marching_cubes_dense", vr_marching_cubes_comp_spv,
                 vr_marching_cubes_comp_spv_size, 5, &push));
   VR_TRY(kb.add(mc.kernel_sparse_,

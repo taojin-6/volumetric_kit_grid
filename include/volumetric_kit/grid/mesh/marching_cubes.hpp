@@ -1318,12 +1318,13 @@ class VR_MESH_API MarchingCubes {
   // claim a slot that has never been written.
   std::uint64_t released_through_ = 0;
 
-  // Name the current slot's three buffers for a GPU capture, as
-  // "mesh.arena[2]" and so on. Called wherever one of them is (re)created --
-  // the ring grows a slot at a time and a name lives on the handle, so a grown
-  // arena is anonymous until renamed. A no-op where the device resolved no
-  // debug-utils entry points.
-  void name_slot_buffers() const noexcept;
+  // Name one of the current slot's buffers for a GPU capture: `form` is a
+  // printf form taking the slot index, as "mesh.arena[%u]". Called wherever
+  // that buffer is (re)created -- a name lives on the handle, so a grown arena
+  // is anonymous until renamed -- and one buffer at a time rather than all
+  // three, so a grow does not re-state the names of the buffers it left alone.
+  // A no-op where the device resolved no debug-utils entry points.
+  void name_slot_buffer(const Buffer& buffer, const char* form) const noexcept;
 
   Buffer& arena() noexcept { return slots_[slot_].arena; }
   const Buffer& arena() const noexcept { return slots_[slot_].arena; }
