@@ -115,6 +115,7 @@ class VR_VOLUME_API VoxelBlockGrid {
       map_ = std::move(other.map_);
       attributes_ = std::move(other.attributes_);
       max_storage_buffer_range_ = other.max_storage_buffer_range_;
+      device_ = other.device_;
       allocator_ = other.allocator_;
     }
     return *this;
@@ -264,11 +265,21 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// buffers come from (borrowed; must outlive the grid). Attributes are added
   /// by @ref create. (VoxelHashMap has no public default ctor, so the grid is
   /// built map-first rather than default-then-assign.)
-  VoxelBlockGrid(VoxelHashMap map, Allocator* allocator,
+  VoxelBlockGrid(VoxelHashMap map, Device* device, Allocator* allocator,
                  VkDeviceSize max_storage_buffer_range)
       : map_(std::move(map)),
         max_storage_buffer_range_(max_storage_buffer_range),
+        device_(device),
         allocator_(allocator) {}
+
+  /// Attach each attribute array's declared name to its buffer, so a GPU
+  /// capture shows "tsdf" rather than a raw handle.
+  ///
+  /// Called by @ref create and again by @ref resize, which replaces every
+  /// attribute buffer -- a name lives on the handle, so a grown array is
+  /// anonymous until it is renamed. A no-op where the device resolved no
+  /// debug-utils entry points.
+  void name_attribute_buffers() const noexcept;
 
   /// One named attribute array: its declared name + element size + the buffer.
   struct Attribute {
@@ -284,6 +295,11 @@ class VR_VOLUME_API VoxelBlockGrid {
   // is the one most likely to exceed what a single binding may cover -- at the
   // examples' defaults it is already 2x Vulkan's guaranteed minimum.
   VkDeviceSize max_storage_buffer_range_ = 0;
+  // Borrowed (must outlive this), and held only to name the attribute buffers
+  // for a GPU capture -- the grid dispatches through map_, which carries its
+  // own. Like allocator_, a moved-from grid keeps the pointer but reports
+  // valid() == false through map_, so it is never dereferenced.
+  Device* device_ = nullptr;
   // Borrowed (must outlive this): backs every attribute buffer, including those
   // grown by resize(). A moved-from grid keeps the pointer but reports
   // valid() == false through map_, so it is never dereferenced.

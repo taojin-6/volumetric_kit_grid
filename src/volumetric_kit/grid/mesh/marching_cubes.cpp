@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -617,6 +618,7 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
+    name_slot_buffer(indirect(), "mesh.indirect[%u]");
   }
   // The whole command, not just the counter it starts as. indexCount is zeroed
   // for the kernel to accumulate into; the other four fields are what make the
@@ -757,6 +759,15 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   std::memset(dst + old_bytes, 0, static_cast<std::size_t>(bytes) - old_bytes);
   const std::uint32_t old_slots = block_span_capacity();
   block_spans_ = std::move(grown);
+  // A fresh handle, and a debug-utils name lives on the handle -- so without
+  // this the span table goes anonymous the first time it grows, in exactly the
+  // configuration that has one at all (track_block_spans, which incremental
+  // extraction requires). Not slot-keyed: one table serves the whole ring.
+  if (device_ != nullptr) {
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             debug_object_handle(block_spans_.handle()),
+                             "mesh.block_spans");
+  }
 
   // The stamps grow with it, and in lockstep: their count is not stored but
   // READ OFF block_span_capacity(), so allocating one without the other would
@@ -938,7 +949,31 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // one buffer resized against the other's capacity.
   if (grow_arena) arena() = std::move(grown_arena);
   if (grow_index_run) index_run() = std::move(indices_buf);
+  // Each buffer named only where its own handle changed. Naming is idempotent
+  // and cheap, but this runs per extract, and a driver call per buffer per
+  // frame to re-state an unchanged name is pure overhead in the hot path.
+  if (grow_arena) name_slot_buffer(arena(), "mesh.arena[%u]");
+  if (grow_index_run) name_slot_buffer(index_run(), "mesh.index_run[%u]");
   return {};
+}
+
+void MarchingCubes::name_slot_buffer(const Buffer& buffer,
+                                     const char* form) const noexcept {
+  if (device_ == nullptr || !buffer.valid()) {
+    return;
+  }
+  // The slot index belongs in the name: the ring hands the consumer one slot
+  // while the next extract writes another, so a capture showing "mesh.arena"
+  // three times over would not say which generation it had caught.
+  //
+  // Cast rather than %zu: slot_ is a std::size_t and the forms say %u, so the
+  // pair must be made to agree. This direction, because the value is a ring
+  // index bounded by kMaxSlots and %zu's worst case (20 digits) would not fit
+  // the buffer below.
+  char name[32];
+  std::snprintf(name, sizeof(name), form, static_cast<unsigned>(slot_));
+  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                           debug_object_handle(buffer.handle()), name);
 }
 
 Result<MarchingCubes> MarchingCubes::create(Device& device,
@@ -985,8 +1020,6 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
         "); 1 is the default and the single-arena behaviour, and the ceiling "
         "is what the slot array holds");
   }
-
-  const VkDevice dev = device.handle();
 
   MarchingCubes mc;
   mc.device_ = &device;
@@ -1039,10 +1072,12 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   push.size = sizeof(PushConstants);
   VkPushConstantRange push_sparse = push;
   push_sparse.size = sizeof(SparsePushConstants);
-  KernelSetBuilder kb(dev);
-  VR_TRY(kb.add(mc.kernel_, vr_marching_cubes_comp_spv,
+  KernelSetBuilder kb(device);
+  VR_TRY(kb.add(mc.kernel_, "marching_cubes_dense", vr_marching_cubes_comp_spv,
                 vr_marching_cubes_comp_spv_size, 5, &push));
   VR_TRY(kb.add(mc.kernel_sparse_,
+                config.share_vertices ? "marching_cubes_sparse_shared"
+                                      : "marching_cubes_sparse",
                 config.share_vertices ? vr_marching_cubes_sparse_shared_comp_spv
                                       : vr_marching_cubes_sparse_comp_spv,
                 config.share_vertices
@@ -1061,6 +1096,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   std::memcpy(host_tables.corner_offset, kCornerOffset, sizeof(kCornerOffset));
   std::memcpy(host_tables.edge_to_vert, kEdgeToVert, sizeof(kEdgeToVert));
   std::memcpy(mc.tables_.mapped(), &host_tables, sizeof(McTables));
+  mc.device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                              debug_object_handle(mc.tables_.handle()),
+                              "mesh.mc_tables");
   mc.kernel_.set.write_storage_buffer(0, mc.tables_.handle(), 0, VK_WHOLE_SIZE);
   mc.kernel_sparse_.set.write_storage_buffer(0, mc.tables_.handle(), 0,
                                              VK_WHOLE_SIZE);
@@ -1071,6 +1109,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   VR_ASSIGN(mc.color_dummy_, storage_buffer(allocator, sizeof(std::uint32_t),
                                             HostAccess::SequentialWrite));
   std::memset(mc.color_dummy_.mapped(), 0, sizeof(std::uint32_t));
+  mc.device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                              debug_object_handle(mc.color_dummy_.handle()),
+                              "mesh.color_dummy");
   mc.kernel_sparse_.set.write_storage_buffer(5, mc.color_dummy_.handle(), 0,
                                              VK_WHOLE_SIZE);
 
@@ -1085,6 +1126,10 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
               storage_buffer(allocator, sizeof(BlockSpan),
                              HostAccess::SequentialWrite));
     std::memset(mc.block_spans_dummy_.mapped(), 0, sizeof(BlockSpan));
+    mc.device_->set_object_name(
+        VK_OBJECT_TYPE_BUFFER,
+        debug_object_handle(mc.block_spans_dummy_.handle()),
+        "mesh.block_spans_dummy");
     mc.kernel_sparse_.set.write_storage_buffer(config.share_vertices ? 9 : 8,
                                                mc.block_spans_dummy_.handle(),
                                                0, VK_WHOLE_SIZE);

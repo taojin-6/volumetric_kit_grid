@@ -98,7 +98,7 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
   }
 
   VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
-  VoxelBlockGrid vbg(std::move(map), &allocator, max_range);
+  VoxelBlockGrid vbg(std::move(map), &device, &allocator, max_range);
 
   vbg.attributes_.reserve(attr_count);
   for (std::size_t i = 0; i < attr_count; ++i) {
@@ -109,7 +109,22 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
     vbg.attributes_.push_back(Attribute{std::string(spec.name),
                                         spec.element_size, std::move(buffer)});
   }
+  vbg.name_attribute_buffers();
   return vbg;
+}
+
+void VoxelBlockGrid::name_attribute_buffers() const noexcept {
+  if (device_ == nullptr) {
+    return;
+  }
+  for (const Attribute& attr : attributes_) {
+    // c_str() rather than the string_view the spec was declared with: the
+    // driver reads a null-terminated string, and Attribute::name is the owned
+    // copy made at create() precisely so one outlives the declaration.
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             debug_object_handle(attr.buffer.handle()),
+                             attr.name.c_str());
+  }
 }
 
 Result<AttributeView> VoxelBlockGrid::attribute(std::string_view name) const {
@@ -236,6 +251,10 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
   for (std::size_t i = 0; i < attributes_.size(); ++i) {
     attributes_[i].buffer = std::move(grown[i]);
   }
+  // Every attribute now sits on a fresh handle, and a debug-utils name lives on
+  // the handle -- so without this a capture taken after the first grow shows
+  // exactly the arrays a bandwidth question is about as unnamed.
+  name_attribute_buffers();
   return {};
 }
 
