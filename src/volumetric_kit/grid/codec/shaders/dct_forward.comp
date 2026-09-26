@@ -1,0 +1,77 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// Forward block DCT: for each listed block, divide its SDF by trunc_dist, take
+// the orthonormal 8^3 DCT-II, and write the first K coefficients in zigzag
+// order, each rounded half-to-even after dividing by its step and clamped to
+// +-32767 (CodecParams::validate keeps the step coarse enough that the clamp
+// never engages on in-range input). Also pack the observed mask: bit v % 32 of
+// word v / 32 is set where voxel v's weight >= observed_weight.
+//
+// Re-implements the prior engine's computeDCTKernel (compute_dct.cu) with one
+// lane per line instead of one thread per voxel -- see dct_common.glsl. Output
+// is indexed by list position, not by block ptr.
+
+#extension GL_GOOGLE_include_directive : require
+#include "dct_common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
+  BlockIndex blocks[];
+};
+layout(set = 0, binding = 1, scalar) readonly buffer Tsdf { float tsdf[]; };
+layout(set = 0, binding = 2, scalar) readonly buffer Weight { float weight[]; };
+layout(set = 0, binding = 4, scalar) writeonly buffer Coefficients {
+  int coefficients[];
+};
+layout(set = 0, binding = 5, scalar) writeonly buffer Masks { uint masks[]; };
+
+shared uint s_mask[16];
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.block_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup (it depends only on the group id), so every
+  // barrier below is still reached by all of this group's lanes or none.
+  if (entry >= pc.num_blocks) {
+    return;
+  }
+  uint voxel_base = uint(blocks[entry].ptr);
+
+  s_basis[lane] = basis[lane];
+  if (lane < kMaskWords) {
+    s_mask[lane] = 0u;
+  }
+
+  // Load this lane's x-line (voxels 8*lane .. 8*lane + 7) and note which of
+  // them were observed.
+  float inv_trunc = 1.0 / pc.trunc_dist;
+  uint line_bits = 0u;
+  for (uint x = 0u; x < 8u; ++x) {
+    uint v = lane * 8u + x;
+    s_work[v] = tsdf[voxel_base + v] * inv_trunc;
+    if (weight[voxel_base + v] >= pc.observed_weight) {
+      line_bits |= 1u << x;
+    }
+  }
+  barrier();
+
+  // A line is 8 bits and a word holds 4 lines: lane r's bits land at bit
+  // (r % 4) * 8 of word r / 4, which is bit v % 32 of word v / 32 for each of
+  // its voxels v = 8r + x.
+  atomicOr(s_mask[lane >> 2u], line_bits << ((lane & 3u) * 8u));
+
+  transform_cube(lane, false);
+
+  uint k = pc.coefficient_count;
+  for (uint j = lane; j < k; j += kLanes) {
+    float q = roundEven(s_work[kHalf + zigzag[j]] / step_for(j));
+    coefficients[entry * k + j] = int(clamp(q, -32767.0, 32767.0));
+  }
+  if (lane < kMaskWords) {
+    masks[entry * kMaskWords + lane] = s_mask[lane];
+  }
+}

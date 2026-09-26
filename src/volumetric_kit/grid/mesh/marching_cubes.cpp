@@ -130,10 +130,12 @@ constexpr std::uint32_t kMaxSharedCells = 512;
 // under-reports one that is. Neither changes what the kernel emits.
 constexpr std::uint32_t kMaxCachedCells = 4 * 256;
 
-// A corner with weight at or below this is treated as unintegrated, and any
-// cell touching it is skipped. Small and positive so a never-integrated voxel
-// (weight 0) is excluded while any genuine integration counts. The `tsdf` tier
-// will surface this as a tunable knob.
+// A corner with weight below this is treated as unintegrated (the kernel's test
+// is `weight < weight_threshold`), and any cell touching it is skipped. Small
+// and positive so a never-integrated voxel (weight 0) is excluded while any
+// genuine integration counts. The `tsdf` tier will surface this as a tunable
+// knob. The codec tier's observed mask copies it (`kObservedWeight` in
+// codec/dct_transform.hpp, which may not link this tier) -- change both.
 constexpr float kWeightThreshold = 1e-6f;
 
 // The lookup tables, flattened for upload -- byte-identical to the GLSL
