@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for the codec's DctTransform: the forward kernel against a
-// double-precision host reference of the same transform, the reconstruction
-// bounds an orthonormal transform guarantees, the observed mask, batching, and
-// every refusal. Runs on the real driver (MoltenVK / NVIDIA); exits 0 (skip)
-// where no device is present.
+// double-precision host reference of the same fill and transform, the
+// reconstruction bounds an orthonormal transform guarantees, the observed mask,
+// a partially observed block, batching, and every refusal. Runs on the real
+// driver (MoltenVK / NVIDIA); exits 0 (skip) where no device is present.
 //
 // All block content is written in NORMALIZED units s in [-1, 1] (tsdf =
 // s * trunc_dist), the units the transform and the steps are defined in.
@@ -33,6 +33,7 @@
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
+using codec::detail::DctBlocks;
 using codec::detail::DctTransform;
 using codec::detail::DctTransformConfig;
 
@@ -49,6 +50,7 @@ namespace {
 constexpr float kTrunc = 0.04f;
 constexpr std::uint32_t kVpb = codec::kVoxelsPerBlock;
 using Cube = std::array<double, kVpb>;
+using Observed = std::array<bool, kVpb>;
 
 vol::VoxelGridParams small_grid(std::int32_t block_size = 8) {
   vol::VoxelGridParams gp{};
@@ -185,6 +187,59 @@ Cube reference_dct(const Cube& in, bool inverse) {
   return a;
 }
 
+// The forward kernel's fill, in double: each unobserved voxel takes the value
+// of the nearest voxel known when its pass began, along x, then y, then z, the
+// lower index on a tie; a block with nothing observed stays 0. An unobserved
+// voxel's content is never read.
+Cube reference_fill(const Cube& in, const Observed& observed) {
+  Cube s{};
+  Observed known = observed;
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    s[v] = observed[v] ? in[v] : 0.0;
+  }
+  const std::uint32_t strides[3] = {1, 8, 64};
+  for (std::uint32_t stride : strides) {
+    const Cube before = s;
+    const Observed was = known;
+    for (std::uint32_t v = 0; v < kVpb; ++v) {
+      if (was[v]) continue;
+      const int pos = int((v / stride) % 8);
+      const std::uint32_t base = v - std::uint32_t(pos) * stride;
+      for (int d = 1; d < 8; ++d) {
+        const int lo = pos - d, hi = pos + d;
+        if (lo >= 0 && was[base + std::uint32_t(lo) * stride]) {
+          s[v] = before[base + std::uint32_t(lo) * stride];
+          known[v] = true;
+          break;
+        }
+        if (hi < 8 && was[base + std::uint32_t(hi) * stride]) {
+          s[v] = before[base + std::uint32_t(hi) * stride];
+          known[v] = true;
+          break;
+        }
+      }
+    }
+  }
+  return s;
+}
+
+// What the kernel pair reconstructs from @p in, in double: transform, keep the
+// first K in zigzag order quantized half-to-even, inverse, clamp to +-1.
+Cube reference_round_trip(const Cube& in, const codec::CodecParams& params) {
+  const Cube coeffs = reference_dct(in, false);
+  const auto zigzag = codec::detail::zigzag_order();
+  Cube kept{};
+  for (std::uint32_t j = 0; j < params.coefficient_count; ++j) {
+    const double step = j == 0 ? params.dc_step : params.ac_step;
+    kept[zigzag[j]] = std::nearbyint(coeffs[zigzag[j]] / step) * step;
+  }
+  Cube out = reference_dct(kept, true);
+  for (double& x : out) {
+    x = std::clamp(x, -1.0, 1.0);
+  }
+  return out;
+}
+
 double rms_diff(const Cube& a, const Cube& b) {
   double sum = 0.0;
   for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -193,16 +248,29 @@ double rms_diff(const Cube& a, const Cube& b) {
   return std::sqrt(sum / kVpb);
 }
 
+// RMS over the observed voxels only: the ones the decoder writes back.
+double rms_observed(const Cube& a, const Cube& b, const Observed& observed) {
+  double sum = 0.0;
+  int n = 0;
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    if (observed[v]) {
+      sum += (a[v] - b[v]) * (a[v] - b[v]);
+      ++n;
+    }
+  }
+  return std::sqrt(sum / n);
+}
+
 // Check a forward output against the reference: every quantized value is
 // the reference's rounded to nearest-even, except where the reference sits so
 // close to a half-way point that float error may round it the other way --
 // and even there it is one of the two neighbours. Returns non-zero on failure;
 // counts the exact and near-half comparisons.
-int check_against_reference(const std::vector<std::int32_t>& coeffs,
-                            const Cube* content, std::size_t count,
-                            const codec::CodecParams& params, int& exact,
-                            int& near_half) {
+int check_against_reference(const DctBlocks& out, const Cube* content,
+                            std::size_t count, int& exact, int& near_half) {
   const auto zigzag = codec::detail::zigzag_order();
+  const codec::CodecParams& params = out.params;
+  const std::vector<std::int32_t>& coeffs = out.coefficients;
   const std::size_t k = params.coefficient_count;
   CHECK(coeffs.size() == count * k);
   for (std::size_t i = 0; i < count; ++i) {
@@ -246,20 +314,22 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
   params.coefficient_count = kVpb;
   params.dc_step = 1e-3f;
   params.ac_step = 2e-3f;
-  std::vector<std::int32_t> coeffs;
-  std::vector<std::uint32_t> masks;
-  CHECK(t.forward(grid, grid.block_list(blocks), params, coeffs, masks).ok());
-  CHECK(coeffs.size() == 4u * kVpb);
-  CHECK(masks.size() == 4u * codec::kMaskWordsPerBlock);
+  DctBlocks out;
+  CHECK(t.forward(grid, grid.block_list(blocks), params, out).ok());
+  CHECK(out.coefficients.size() == 4u * kVpb);
+  CHECK(out.masks.size() == 4u * codec::kMaskWordsPerBlock);
+  // The params and the band travel with the coefficients.
+  CHECK(out.params.coefficient_count == params.coefficient_count);
+  CHECK(out.params.dc_step == params.dc_step);
+  CHECK(out.trunc_dist == kTrunc);
 
   int exact = 0;
   int near_half = 0;
-  CHECK(check_against_reference(coeffs, content, 4, params, exact, near_half) ==
-        0);
+  CHECK(check_against_reference(out, content, 4, exact, near_half) == 0);
   // The exclusion is a sliver, not a loophole.
   CHECK(exact > 20 * near_half);
   // Every voxel was observed.
-  for (std::uint32_t m : masks) {
+  for (std::uint32_t m : out.masks) {
     CHECK(m == 0xFFFFFFFFu);
   }
   return 0;
@@ -286,11 +356,10 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
   params.coefficient_count = kVpb;
   params.dc_step = 0.02f;
   params.ac_step = 0.01f;
-  std::vector<std::int32_t> coeffs;
-  std::vector<std::uint32_t> masks;
+  DctBlocks out;
   const vol::BlockList list = grid.block_list(blocks);
-  CHECK(t.forward(grid, list, params, coeffs, masks).ok());
-  CHECK(t.inverse(grid, list, params, coeffs, masks).ok());
+  CHECK(t.forward(grid, list, params, out).ok());
+  CHECK(t.inverse(grid, list, out).ok());
 
   const double dc = params.dc_step, ac = params.ac_step;
   const double bound =
@@ -335,12 +404,11 @@ int truncation_matches_reference_case(vr::Device& device,
     params.coefficient_count = k;
     params.dc_step = codec::kMinStep;
     params.ac_step = codec::kMinStep;
-    std::vector<std::int32_t> coeffs;
-    std::vector<std::uint32_t> masks;
+    DctBlocks out;
     const vol::BlockList list = grid.block_list(active.value());
-    CHECK(t.forward(grid, list, params, coeffs, masks).ok());
-    CHECK(coeffs.size() == k);
-    CHECK(t.inverse(grid, list, params, coeffs, masks).ok());
+    CHECK(t.forward(grid, list, params, out).ok());
+    CHECK(out.coefficients.size() == k);
+    CHECK(t.inverse(grid, list, out).ok());
 
     double dropped = 0.0;
     for (std::uint32_t j = k; j < kVpb; ++j) {
@@ -356,8 +424,10 @@ int truncation_matches_reference_case(vr::Device& device,
   return 0;
 }
 
-// The mask marks exactly weight >= kObservedWeight, and the inverse writes an
-// observed voxel as decoded and an unobserved one as a fresh block holds it.
+// The mask marks exactly weight >= kObservedWeight, the coefficients are those
+// of the reference fill over it -- nothing at all for a block with no observed
+// voxel -- and the inverse writes an observed voxel as decoded and an
+// unobserved one as a fresh block holds it.
 int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
@@ -367,23 +437,34 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 cycles through: none, below the threshold, at it, well above.
   // Block 1 is entirely unobserved -- a mask of all zeros.
-  const float cycle[4] = {0.0f, 5e-7f, codec::detail::kObservedWeight, 3.0f};
+  const float cycle[4] = {0.0f, 5e-7f, vol::kObservedWeight, 3.0f};
   write_block(grid, blocks[0], sphere_cube(),
               [&](std::uint32_t v) { return cycle[v % 4]; });
   write_block(grid, blocks[1], random_cube(7),
               [](std::uint32_t) { return 0.0f; });
 
   codec::CodecParams params;
-  std::vector<std::int32_t> coeffs;
-  std::vector<std::uint32_t> masks;
+  DctBlocks out;
   const vol::BlockList list = grid.block_list(blocks);
-  CHECK(t.forward(grid, list, params, coeffs, masks).ok());
+  CHECK(t.forward(grid, list, params, out).ok());
   for (std::uint32_t v = 0; v < kVpb; ++v) {
-    const bool bit = ((masks[v / 32] >> (v % 32)) & 1u) != 0u;
+    const bool bit = ((out.masks[v / 32] >> (v % 32)) & 1u) != 0u;
     CHECK(bit == (v % 4 >= 2));
   }
   for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
-    CHECK(masks[codec::kMaskWordsPerBlock + w] == 0u);
+    CHECK(out.masks[codec::kMaskWordsPerBlock + w] == 0u);
+  }
+  Observed cycled{};
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    cycled[v] = v % 4 >= 2;
+  }
+  const Cube filled[2] = {reference_fill(sphere_cube(), cycled),
+                          reference_fill(random_cube(7), Observed{})};
+  int exact = 0;
+  int near_half = 0;
+  CHECK(check_against_reference(out, filled, 2, exact, near_half) == 0);
+  for (std::uint32_t j = 0; j < params.coefficient_count; ++j) {
+    CHECK(out.coefficients[params.coefficient_count + j] == 0);
   }
 
   // Poison both attributes so the inverse must write every voxel.
@@ -395,7 +476,7 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
       weight[std::uint32_t(b.ptr) + v] = 123.0f;
     }
   }
-  CHECK(t.inverse(grid, list, params, coeffs, masks).ok());
+  CHECK(t.inverse(grid, list, out).ok());
   for (std::size_t i = 0; i < 2; ++i) {
     const std::uint32_t base = std::uint32_t(blocks[i].ptr);
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -430,26 +511,25 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
   full.coefficient_count = kVpb;
   full.dc_step = codec::kMinStep;
   full.ac_step = 1e-3f;
-  std::vector<std::int32_t> coeffs;
-  std::vector<std::uint32_t> masks;
-  CHECK(t.forward(grid, list, full, coeffs, masks).ok());
+  DctBlocks out;
+  CHECK(t.forward(grid, list, full, out).ok());
   for (std::size_t i = 0; i < 2; ++i) {
     for (std::uint32_t j = 1; j < kVpb; ++j) {
-      CHECK(coeffs[i * kVpb + j] == 0);
+      CHECK(out.coefficients[i * kVpb + j] == 0);
     }
   }
   // sqrt(512) / kMinStep ~= 32767: at the edge, and inside it.
-  CHECK(coeffs[kVpb] <= codec::kMaxQuantizedMagnitude);
-  CHECK(coeffs[kVpb] >= codec::kMaxQuantizedMagnitude - 1);
+  CHECK(out.coefficients[kVpb] <= codec::kMaxQuantizedMagnitude);
+  CHECK(out.coefficients[kVpb] >= codec::kMaxQuantizedMagnitude - 1);
 
   // DC alone reconstructs the constant to within half a DC step, spread over
   // the block: |error| <= dc_step / (2 sqrt(512)).
   codec::CodecParams dc_only;
   dc_only.coefficient_count = 1;
   dc_only.dc_step = 0.01f;
-  CHECK(t.forward(grid, list, dc_only, coeffs, masks).ok());
-  CHECK(coeffs.size() == 2);
-  CHECK(t.inverse(grid, list, dc_only, coeffs, masks).ok());
+  CHECK(t.forward(grid, list, dc_only, out).ok());
+  CHECK(out.coefficients.size() == 2);
+  CHECK(t.inverse(grid, list, out).ok());
   const Cube back = read_block(grid, blocks[0]);
   const double tol = 0.01 / (2.0 * std::sqrt(512.0)) + 1e-6;
   for (double s : back) {
@@ -479,10 +559,9 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   params.coefficient_count = 4;
   params.dc_step = codec::kMinStep;
   params.ac_step = codec::kMinStep;
-  std::vector<std::int32_t> coeffs;
-  std::vector<std::uint32_t> masks;
+  DctBlocks out;
   const vol::BlockList list = grid.block_list(active.value());
-  CHECK(t.forward(grid, list, params, coeffs, masks).ok());
+  CHECK(t.forward(grid, list, params, out).ok());
   // The unclamped reconstruction does overshoot -- the premise of the case.
   Cube kept{};
   const Cube ref = reference_dct(edge, false);
@@ -493,7 +572,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   const Cube unclamped = reference_dct(kept, true);
   CHECK(*std::max_element(unclamped.begin(), unclamped.end()) > 1.2);
 
-  CHECK(t.inverse(grid, list, params, coeffs, masks).ok());
+  CHECK(t.inverse(grid, list, out).ok());
   const float* tsdf = attr(grid, "tsdf");
   bool saturated = false;
   for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -502,6 +581,67 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
     saturated = saturated || std::fabs(sdf) == kTrunc;
   }
   CHECK(saturated);
+  return 0;
+}
+
+// A fused block observed in front of its surface and half a band behind, and
+// never further back, where the fuse leaves weight 0 and tsdf 0 -- the iso
+// level. The coefficients are the reference fill's, the unobserved voxels'
+// content is never read, and the decoded surface is what the fill buys: at the
+// default K = 32 the step to 0 at the mask edge leaks into the observed voxels
+// beside it, so zeros would decode with more than twice the error.
+int partial_block_case(vr::Device& device, vr::Allocator& allocator,
+                       DctTransform& t) {
+  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  CHECK(active.ok());
+  const vol::BlockIndex block = active.value()[0];
+  // A tilted surface, normalized over a band of 4 voxels.
+  Cube truth{};
+  Observed obs{};
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    const double x = v % 8, y = (v / 8) % 8, z = v / 64;
+    const double d = (2.0 - (0.6 * z + 0.5 * x + 0.3 * y)) / std::sqrt(0.7);
+    truth[v] = std::clamp(d / 4.0, -1.0, 1.0);
+    obs[v] = d > -2.0;
+  }
+  const auto weight_of = [&](std::uint32_t v) { return obs[v] ? 2.0f : 0.0f; };
+  Cube fused = truth;
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    if (!obs[v]) fused[v] = 0.0;
+  }
+  write_block(grid, block, fused, weight_of);
+
+  const codec::CodecParams params;  // the defaults: K = 32
+  const vol::BlockList list = grid.block_list(active.value());
+  DctBlocks out;
+  CHECK(t.forward(grid, list, params, out).ok());
+  const Cube filled = reference_fill(fused, obs);
+  int exact = 0;
+  int near_half = 0;
+  CHECK(check_against_reference(out, &filled, 1, exact, near_half) == 0);
+
+  // Garbage where nothing was observed changes nothing.
+  Cube junk = fused;
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    if (!obs[v]) junk[v] = 0.7;
+  }
+  write_block(grid, block, junk, weight_of);
+  DctBlocks again;
+  CHECK(t.forward(grid, list, params, again).ok());
+  CHECK(again.coefficients == out.coefficients);
+  CHECK(again.masks == out.masks);
+
+  CHECK(t.inverse(grid, list, out).ok());
+  const double err = rms_observed(read_block(grid, block), truth, obs);
+  const double filled_err =
+      rms_observed(reference_round_trip(filled, params), truth, obs);
+  const double zero_err =
+      rms_observed(reference_round_trip(fused, params), truth, obs);
+  CHECK(std::fabs(err - filled_err) <= 5e-3);  // the kernel pair is the ref's
+  CHECK(filled_err * 2.0 < zero_err);          // and the fill is the point
   return 0;
 }
 
@@ -518,19 +658,17 @@ int order_follows_list_case(vr::Device& device, vr::Allocator& allocator,
     write_block(grid, blocks[i], random_cube(40u + std::uint32_t(i)), observed);
   }
   codec::CodecParams params;
-  std::vector<std::int32_t> a_coeffs, b_coeffs;
-  std::vector<std::uint32_t> a_masks, b_masks;
-  CHECK(
-      t.forward(grid, grid.block_list(blocks), params, a_coeffs, a_masks).ok());
+  DctBlocks a;
+  DctBlocks b;
+  CHECK(t.forward(grid, grid.block_list(blocks), params, a).ok());
   const std::vector<vol::BlockIndex> rotated = {blocks[2], blocks[0],
                                                 blocks[1]};
-  CHECK(t.forward(grid, grid.block_list(rotated), params, b_coeffs, b_masks)
-            .ok());
+  CHECK(t.forward(grid, grid.block_list(rotated), params, b).ok());
   const std::size_t k = params.coefficient_count;
   const std::size_t from[3] = {2, 0, 1};
   for (std::size_t i = 0; i < 3; ++i) {
     for (std::size_t j = 0; j < k; ++j) {
-      CHECK(b_coeffs[i * k + j] == a_coeffs[from[i] * k + j]);
+      CHECK(b.coefficients[i * k + j] == a.coefficients[from[i] * k + j]);
     }
   }
   return 0;
@@ -560,26 +698,26 @@ int batching_case(vr::Device& device, vr::Allocator& allocator,
   }
   const vol::BlockList list = grid.block_list(blocks);
   codec::CodecParams params;
-  std::vector<std::int32_t> one_coeffs, many_coeffs;
-  std::vector<std::uint32_t> one_masks, many_masks;
+  DctBlocks one;
+  DctBlocks many;
   // Batched first, and judged against the reference rather than only against
   // the single run: a freed buffer VMA hands straight back still holds the
   // previous run's output, so equality alone passes a batch that wrote
   // nothing past its first entries.
-  CHECK(batched.forward(grid, list, params, many_coeffs, many_masks).ok());
+  CHECK(batched.forward(grid, list, params, many).ok());
   int exact = 0;
   int near_half = 0;
-  CHECK(check_against_reference(many_coeffs, content.data(), content.size(),
-                                params, exact, near_half) == 0);
-  for (std::uint32_t m : many_masks) {
+  CHECK(check_against_reference(many, content.data(), content.size(), exact,
+                                near_half) == 0);
+  for (std::uint32_t m : many.masks) {
     CHECK(m == 0xFFFFFFFFu);
   }
-  CHECK(t.forward(grid, list, params, one_coeffs, one_masks).ok());
-  CHECK(one_coeffs == many_coeffs);
-  CHECK(one_masks == many_masks);
+  CHECK(t.forward(grid, list, params, one).ok());
+  CHECK(one.coefficients == many.coefficients);
+  CHECK(one.masks == many.masks);
 
   // The inverse too: every block of the last, partial batch is written.
-  CHECK(t.inverse(grid, list, params, one_coeffs, one_masks).ok());
+  CHECK(t.inverse(grid, list, one).ok());
   std::vector<Cube> single;
   for (const vol::BlockIndex& b : blocks) {
     single.push_back(read_block(grid, b));
@@ -590,14 +728,29 @@ int batching_case(vr::Device& device, vr::Allocator& allocator,
       tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
     }
   }
-  CHECK(batched.inverse(grid, list, params, many_coeffs, many_masks).ok());
+  CHECK(batched.inverse(grid, list, many).ok());
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     CHECK(read_block(grid, blocks[i]) == single[i]);
   }
   return 0;
 }
 
-// Every input the kernels would index unchecked is refused on the host.
+// A ptr of @p grid's heap that no live block holds.
+std::int32_t free_ptr(const vol::VoxelBlockGrid& grid,
+                      const std::vector<vol::BlockIndex>& live) {
+  for (std::int32_t slot = 0; slot < grid.grid().num_blocks; ++slot) {
+    const std::int32_t ptr = slot * std::int32_t(kVpb);
+    if (std::none_of(live.begin(), live.end(),
+                     [&](const vol::BlockIndex& b) { return b.ptr == ptr; })) {
+      return ptr;
+    }
+  }
+  return -1;
+}
+
+// Every input the kernels would index unchecked is refused: the grid, the
+// params and the list's shape on the host, before anything is allocated, and
+// each entry's liveness on the device.
 int refusals_case(vr::Device& device, vr::Allocator& allocator,
                   DctTransform& t) {
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
@@ -606,44 +759,84 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex> blocks = active.value();
+  for (const vol::BlockIndex& b : blocks) {
+    write_block(grid, b, random_cube(300u), observed);
+  }
   const codec::CodecParams params;
-  std::vector<std::int32_t> coeffs = {1, 2, 3};
-  std::vector<std::uint32_t> masks = {4, 5};
+  DctBlocks out;
+  out.coefficients = {1, 2, 3};
+  out.masks = {4, 5};
 
   // An empty list is a no-op success, and it empties the outputs.
-  CHECK(t.forward(grid, vol::BlockList{}, params, coeffs, masks).ok());
-  CHECK(coeffs.empty() && masks.empty());
-  CHECK(t.inverse(grid, vol::BlockList{}, params, coeffs, masks).ok());
+  CHECK(t.forward(grid, vol::BlockList{}, params, out).ok());
+  CHECK(out.coefficients.empty() && out.masks.empty());
+  CHECK(out.trunc_dist == kTrunc);
+  CHECK(t.inverse(grid, vol::BlockList{}, out).ok());
 
   // Invalid params.
   codec::CodecParams bad = params;
   bad.coefficient_count = 0;
-  CHECK(!t.forward(grid, grid.block_list(blocks), bad, coeffs, masks).ok());
+  CHECK(!t.forward(grid, grid.block_list(blocks), bad, out).ok());
 
   // Null with a count.
   vol::BlockList null_list{nullptr, 3, grid.topology_epoch()};
-  CHECK(!t.forward(grid, null_list, params, coeffs, masks).ok());
+  CHECK(!t.forward(grid, null_list, params, out).ok());
 
-  // A ptr outside the heap, negative, or not on a block boundary. Each would
-  // be an out-of-bounds device access, and a write on the inverse.
-  const std::int32_t bad_ptrs[] = {small_grid().num_blocks * 512, -512, 1};
+  // Entries that are not live blocks: a ptr outside the heap, negative, off a
+  // block boundary, a free slot, and a coord paired with another block's ptr.
+  // The first three would be out-of-bounds device accesses, and the last two
+  // in-bounds writes the inverse would make into the wrong slot.
+  const std::int32_t unused = free_ptr(grid, blocks);
+  CHECK(unused >= 0);
+  const std::int32_t bad_ptrs[] = {small_grid().num_blocks * 512, -512, 1,
+                                   unused, blocks[2].ptr};
   for (std::int32_t p : bad_ptrs) {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = p;
-    coeffs = {1};
-    CHECK(
-        !t.forward(grid, grid.block_list(forged), params, coeffs, masks).ok());
-    CHECK(coeffs.empty());  // a refusal leaves the outputs empty
+    out.coefficients = {1};
+    CHECK(!t.forward(grid, grid.block_list(forged), params, out).ok());
+    CHECK(out.coefficients.empty());  // a refusal leaves the outputs empty
   }
 
-  // Size mismatches on the inverse.
-  CHECK(t.forward(grid, grid.block_list(blocks), params, coeffs, masks).ok());
-  std::vector<std::int32_t> short_coeffs(coeffs.begin(), coeffs.end() - 1);
-  CHECK(!t.inverse(grid, grid.block_list(blocks), params, short_coeffs, masks)
-             .ok());
-  std::vector<std::uint32_t> short_masks(masks.begin(), masks.end() - 1);
-  CHECK(!t.inverse(grid, grid.block_list(blocks), params, coeffs, short_masks)
-             .ok());
+  // The inverse writes nothing for such an entry -- a free slot must stay the
+  // zeros a fresh block reads, or the next allocate hands out a block that
+  // meshes as observed -- and still decodes every live entry.
+  CHECK(t.forward(grid, grid.block_list(blocks), params, out).ok());
+  {
+    std::vector<vol::BlockIndex> forged = blocks;
+    forged[1].ptr = unused;
+    float* tsdf = attr(grid, "tsdf");
+    float* weight = attr(grid, "weight");
+    for (const vol::BlockIndex& b : blocks) {
+      for (std::uint32_t v = 0; v < kVpb; ++v) {
+        tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
+      }
+    }
+    CHECK(!t.inverse(grid, grid.block_list(forged), out).ok());
+    for (std::uint32_t v = 0; v < kVpb; ++v) {
+      CHECK(weight[std::uint32_t(unused) + v] == 0.0f);
+      CHECK(tsdf[std::uint32_t(unused) + v] == 0.0f);
+      CHECK(tsdf[std::uint32_t(blocks[0].ptr) + v] != 9.0f);
+      CHECK(tsdf[std::uint32_t(blocks[1].ptr) + v] == 9.0f);
+    }
+  }
+
+  // Coefficients the inverse cannot trust: a size that does not match the
+  // list, invalid params, and another band than the grid's.
+  {
+    DctBlocks short_coeffs = out;
+    short_coeffs.coefficients.pop_back();
+    CHECK(!t.inverse(grid, grid.block_list(blocks), short_coeffs).ok());
+    DctBlocks short_masks = out;
+    short_masks.masks.pop_back();
+    CHECK(!t.inverse(grid, grid.block_list(blocks), short_masks).ok());
+    DctBlocks bad_params = out;
+    bad_params.params.ac_step = 0.0f;
+    CHECK(!t.inverse(grid, grid.block_list(blocks), bad_params).ok());
+    DctBlocks other_band = out;
+    other_band.trunc_dist = kTrunc * 0.2f;
+    CHECK(!t.inverse(grid, grid.block_list(blocks), other_band).ok());
+  }
 
   // A list compacted before a remove() names a different block through a
   // still in-range ptr, and only the epoch can tell.
@@ -652,8 +845,8 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   gone.coord = blocks[0].coord;
   vr::Result<std::uint32_t> removed = grid.remove(&gone, 1);
   CHECK(removed.ok());
-  CHECK(!t.forward(grid, stale, params, coeffs, masks).ok());
-  CHECK(!t.inverse(grid, stale, params, coeffs, masks).ok());
+  CHECK(!t.forward(grid, stale, params, out).ok());
+  CHECK(!t.inverse(grid, stale, out).ok());
 
   // A grid with another block size.
   vr::Result<vol::VoxelBlockGrid> g4 = make_grid(device, allocator, 4);
@@ -665,11 +858,10 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   vr::Result<std::vector<vol::BlockIndex>> active4 =
       grid4.map().compact_active_blocks();
   CHECK(active4.ok());
-  CHECK(!t.forward(grid4, grid4.block_list(active4.value()), params, coeffs,
-                   masks)
-             .ok());
+  CHECK(!t.forward(grid4, grid4.block_list(active4.value()), params, out).ok());
 
-  // A grid without a weight attribute.
+  // A grid without a weight attribute -- refused for an empty list too, before
+  // anything is allocated, rather than only once there is work to bind.
   vr::Result<vol::VoxelBlockGrid> gw = make_grid(device, allocator, 8, false);
   CHECK(gw.ok());
   vol::VoxelBlockGrid no_weight = std::move(gw).value();
@@ -677,9 +869,11 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   vr::Result<std::vector<vol::BlockIndex>> active_w =
       no_weight.map().compact_active_blocks();
   CHECK(active_w.ok());
-  CHECK(!t.forward(no_weight, no_weight.block_list(active_w.value()), params,
-                   coeffs, masks)
-             .ok());
+  CHECK(
+      !t.forward(no_weight, no_weight.block_list(active_w.value()), params, out)
+           .ok());
+  CHECK(!t.forward(no_weight, vol::BlockList{}, params, out).ok());
+  CHECK(!t.inverse(no_weight, vol::BlockList{}, DctBlocks{}).ok());
   return 0;
 }
 
@@ -713,11 +907,10 @@ int moves_case(vr::Device& device, vr::Allocator& allocator) {
   vol::VoxelBlockGrid grid = std::move(g).value();
   vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
   CHECK(active.ok());
-  std::vector<std::int32_t> coeffs;
-  std::vector<std::uint32_t> masks;
+  DctBlocks out;
   const vol::BlockList list = grid.block_list(active.value());
-  CHECK(c.forward(grid, list, codec::CodecParams{}, coeffs, masks).ok());
-  CHECK(!a.forward(grid, list, codec::CodecParams{}, coeffs, masks).ok());
+  CHECK(c.forward(grid, list, codec::CodecParams{}, out).ok());
+  CHECK(!a.forward(grid, list, codec::CodecParams{}, out).ok());
   return 0;
 }
 
@@ -767,6 +960,7 @@ int main() {
   if (mask_case(dev, alloc, t) != 0) return 1;
   if (constant_case(dev, alloc, t) != 0) return 1;
   if (clamp_case(dev, alloc, t) != 0) return 1;
+  if (partial_block_case(dev, alloc, t) != 0) return 1;
   if (order_follows_list_case(dev, alloc, t) != 0) return 1;
   if (batching_case(dev, alloc, t) != 0) return 1;
   if (refusals_case(dev, alloc, t) != 0) return 1;

@@ -10,7 +10,8 @@
 // keeps, which ringing from the dropped coefficients can overshoot -- and the
 // decoded weight. An unobserved voxel gets zero tsdf and zero weight, exactly
 // what a freshly allocated block holds, so the mesher skips it as it skipped
-// the original.
+// the original. An entry that is not a live block of the grid (see
+// block_is_live) is written nothing.
 //
 // Re-implements the prior engine's computeIDCTKernel (compute_dct.cu), which
 // wrote every voxel's SDF and left weights alone; the mask is what replaces the
@@ -21,9 +22,6 @@
 
 layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
-  BlockIndex blocks[];
-};
 layout(set = 0, binding = 1, scalar) writeonly buffer Tsdf { float tsdf[]; };
 layout(set = 0, binding = 2, scalar) writeonly buffer Weight {
   float weight[];
@@ -33,14 +31,11 @@ layout(set = 0, binding = 4, scalar) readonly buffer Coefficients {
 };
 layout(set = 0, binding = 5, scalar) readonly buffer Masks { uint masks[]; };
 
-// Mirrors kDecodedWeight in dct_transform.hpp.
-const float kDecodedWeight = 1.0;
-
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.block_base + gl_WorkGroupID.x;
   // Uniform across the workgroup; see dct_forward.comp.
-  if (entry >= pc.num_blocks) {
+  if (entry >= pc.num_blocks || !block_is_live(entry, lane)) {
     return;
   }
   uint voxel_base = uint(blocks[entry].ptr);
@@ -68,6 +63,6 @@ void main() {
     bool observed = ((line_bits >> x) & 1u) != 0u;
     float sdf = clamp(s_work[kHalf + v], -1.0, 1.0) * pc.trunc_dist;
     tsdf[voxel_base + v] = observed ? sdf : 0.0;
-    weight[voxel_base + v] = observed ? kDecodedWeight : 0.0;
+    weight[voxel_base + v] = observed ? pc.decoded_weight : 0.0;
   }
 }

@@ -8,8 +8,7 @@
 // from them: a wrong zigzag order or basis would be reproduced by both sides of
 // that comparison and pass it. So the basis is checked for orthonormality and
 // known values, and the zigzag order for being a permutation that climbs in
-// total frequency and matches the prior engine's table where its first entries
-// are written out below.
+// total frequency and matches the prior engine's table, all 512 entries.
 
 #include <array>
 #include <cmath>
@@ -110,7 +109,8 @@ int zigzag_case() {
     last_sum = sum;
   }
   // The prior engine's table (zigzag_table.cuh), its first 20 entries as
-  // written there as (x, y, z) -- through the x=0 band of total frequency 4.
+  // written there as (x, y, z) -- total frequencies 0 through 3 (1 + 3 + 6 +
+  // 10), readable here; the hash below pins the other 492.
   const int prior[20][3] = {{0, 0, 0}, {0, 0, 1}, {0, 1, 0}, {1, 0, 0},
                             {0, 0, 2}, {0, 1, 1}, {0, 2, 0}, {1, 0, 1},
                             {1, 1, 0}, {2, 0, 0}, {0, 0, 3}, {0, 1, 2},
@@ -123,6 +123,14 @@ int zigzag_case() {
                                      std::uint32_t(prior[j][2])));
   }
   CHECK(order[511] == codec::detail::voxel_index(7, 7, 7));
+  // The whole table: FNV-1a over its 512 voxel indices (x + 8y + 64z), one
+  // index per step, computed from zigzag_table.cuh's kZigZagOrder when the
+  // order was ported. Any entry out of place changes it.
+  std::uint32_t hash = 2166136261u;
+  for (std::uint32_t v : order) {
+    hash = (hash ^ v) * 16777619u;
+  }
+  CHECK(hash == 0x26fa5e49u);
   return 0;
 }
 

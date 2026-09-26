@@ -33,9 +33,13 @@ struct PushConstants {
   float dc_step;
   float ac_step;
   float observed_weight;
+  float decoded_weight;
+  std::int32_t num_buckets;
+  std::int32_t bucket_size;
+  std::int32_t max_chain;
   std::uint32_t reserved;
 };
-static_assert(sizeof(PushConstants) == 32, "PushConstants must be 32 bytes");
+static_assert(sizeof(PushConstants) == 48, "PushConstants must be 48 bytes");
 static_assert(offsetof(PushConstants, block_base) == 0, "layout drift");
 static_assert(offsetof(PushConstants, num_blocks) == 4, "layout drift");
 static_assert(offsetof(PushConstants, coefficient_count) == 8, "layout drift");
@@ -43,6 +47,10 @@ static_assert(offsetof(PushConstants, trunc_dist) == 12, "layout drift");
 static_assert(offsetof(PushConstants, dc_step) == 16, "layout drift");
 static_assert(offsetof(PushConstants, ac_step) == 20, "layout drift");
 static_assert(offsetof(PushConstants, observed_weight) == 24, "layout drift");
+static_assert(offsetof(PushConstants, decoded_weight) == 28, "layout drift");
+static_assert(offsetof(PushConstants, num_buckets) == 32, "layout drift");
+static_assert(offsetof(PushConstants, bucket_size) == 36, "layout drift");
+static_assert(offsetof(PushConstants, max_chain) == 40, "layout drift");
 
 // Mirrors the `Tables` buffer in dct_common.glsl (binding 3).
 struct Tables {
@@ -51,10 +59,11 @@ struct Tables {
 };
 static_assert(sizeof(Tables) == 64 * 4 + 512 * 4, "Tables layout drift");
 
-// Bindings 0..5 of both kernels: blocks, tsdf, weight, tables, coefficients,
-// masks. One literal for both, and it must match every `binding = N` in the
-// two .comp files -- the compute core is explicit, not reflected (2026-07-05).
-constexpr std::uint32_t kBindings = 6;
+// Bindings 0..7 of both kernels: blocks, tsdf, weight, tables, coefficients,
+// masks, hash entries, rejected count. One literal for both, and it must match
+// every `binding = N` in the two .comp files and dct_common.glsl -- the compute
+// core is explicit, not reflected (2026-07-05).
+constexpr std::uint32_t kBindings = 8;
 
 Status fail(const char* op, const std::string& why) {
   return Status::invalid_argument(std::string("DctTransform::") + op + ": " +
@@ -108,13 +117,21 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
                                              VK_WHOLE_SIZE);
   t.inverse_kernel_.set.write_storage_buffer(3, t.tables_.handle(), 0,
                                              VK_WHOLE_SIZE);
+
+  VR_ASSIGN(t.rejected_, storage_buffer(allocator, sizeof(std::uint32_t)));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         debug_object_handle(t.rejected_.handle()),
+                         "codec.rejected");
+  t.forward_kernel_.set.write_storage_buffer(7, t.rejected_.handle(), 0,
+                                             VK_WHOLE_SIZE);
+  t.inverse_kernel_.set.write_storage_buffer(7, t.rejected_.handle(), 0,
+                                             VK_WHOLE_SIZE);
   return t;
 }
 
-Status DctTransform::check_inputs(const char* op,
-                                  const volume::VoxelBlockGrid& grid,
-                                  const volume::BlockList& blocks,
-                                  const CodecParams& params) const {
+Result<DctTransform::GridViews> DctTransform::check_inputs(
+    const char* op, const volume::VoxelBlockGrid& grid,
+    const volume::BlockList& blocks, const CodecParams& params) const {
   if (!valid()) {
     return fail(op, "moved-from transform");
   }
@@ -132,54 +149,35 @@ Status DctTransform::check_inputs(const char* op,
   if (!std::isfinite(gp.trunc_dist) || !(gp.trunc_dist > 0.0f)) {
     return fail(op, "the grid's trunc_dist must be finite and positive");
   }
-  if (blocks.count == 0) {
-    return {};  // an empty list names no block, so it carries no epoch
+  GridViews views;
+  VR_ASSIGN(views.tsdf, grid.attribute("tsdf"));
+  VR_ASSIGN(views.weight, grid.attribute("weight"));
+  if (views.tsdf.element_size != sizeof(float) ||
+      views.weight.element_size != sizeof(float)) {
+    return fail(op, "the grid's tsdf and weight must be 4-byte floats");
   }
-  if (blocks.blocks == nullptr) {
-    return fail(op, "the block list is null with a non-zero count");
-  }
-  if (blocks.count > static_cast<std::uint32_t>(gp.num_blocks)) {
-    return fail(op, "the block list holds more blocks than the grid's heap");
-  }
-  // A ptr addresses attribute storage directly and the heap is LIFO, so a list
-  // compacted before a remove()/clear() names a different block through the
-  // same, still in-range, ptr. The epoch is the only thing that can tell.
-  if (blocks.epoch != grid.topology_epoch()) {
-    return fail(op,
-                "the block list was compacted at another topology epoch "
-                "(rebuild it with VoxelBlockGrid::block_list)");
-  }
-  // The kernels index attribute storage with ptr unchecked, and the inverse
-  // WRITES there, so a ptr outside the heap is an out-of-bounds device write.
-  // O(count) on the host, against a dispatch that reads 4 KB per block.
-  const auto heap_voxels = static_cast<std::int64_t>(gp.num_blocks) *
-                           static_cast<std::int64_t>(kVoxelsPerBlock);
-  for (std::uint32_t i = 0; i < blocks.count; ++i) {
-    const std::int64_t ptr = blocks.blocks[i].ptr;
-    if (ptr < 0 || ptr >= heap_voxels || ptr % kVoxelsPerBlock != 0) {
-      return fail(op, "block list entry " + std::to_string(i) +
-                          " has a ptr outside the grid's heap");
-    }
-  }
-  return {};
+  // Whether each entry is a live block is the kernels' to answer (see
+  // block_is_live), so the host takes only the O(1) half.
+  VR_TRY(grid.check_block_list(blocks,
+                               (std::string("DctTransform::") + op).c_str()));
+  return views;
 }
 
 Status DctTransform::run(const char* op, ComputeKernel& kernel,
                          const volume::VoxelBlockGrid& grid,
+                         const GridViews& views,
                          const volume::BlockList& blocks,
                          const CodecParams& params, const Buffer& coefficients,
                          const Buffer& masks) {
-  VR_ASSIGN(volume::AttributeView tsdf_view, grid.attribute("tsdf"));
-  VR_ASSIGN(volume::AttributeView weight_view, grid.attribute("weight"));
-  if (tsdf_view.element_size != sizeof(float) ||
-      weight_view.element_size != sizeof(float)) {
-    return fail(op, "the grid's tsdf and weight must be 4-byte floats");
-  }
-
   const VkDeviceSize list_bytes =
       VkDeviceSize(blocks.count) * sizeof(volume::BlockIndex);
   VR_TRY(check_storage_buffer_range("DctTransform: the block list", list_bytes,
                                     max_storage_buffer_range_));
+  // Another tier sized this one (and every resize doubles it), so it is bound
+  // at its real size and range-checked, as the mesher binds it.
+  const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
+  VR_TRY(check_storage_buffer_range("DctTransform: the hash entries",
+                                    entries_bytes, max_storage_buffer_range_));
   VR_ASSIGN(Buffer list_buf,
             upload_storage_buffer(*allocator_, blocks.blocks, list_bytes));
   device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
@@ -187,20 +185,28 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
                            "codec.block_list");
 
   kernel.set.write_storage_buffer(0, list_buf.handle(), 0, VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(1, tsdf_view.buffer->handle(), 0,
+  kernel.set.write_storage_buffer(1, views.tsdf.buffer->handle(), 0,
                                   VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(2, weight_view.buffer->handle(), 0,
+  kernel.set.write_storage_buffer(2, views.weight.buffer->handle(), 0,
                                   VK_WHOLE_SIZE);
   kernel.set.write_storage_buffer(4, coefficients.handle(), 0, VK_WHOLE_SIZE);
   kernel.set.write_storage_buffer(5, masks.handle(), 0, VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(6, grid.map().entries_buffer(), 0,
+                                  entries_bytes);
 
+  const volume::VoxelGridParams& gp = grid.grid();
   PushConstants push{};
   push.num_blocks = blocks.count;
   push.coefficient_count = params.coefficient_count;
-  push.trunc_dist = grid.grid().trunc_dist;
+  push.trunc_dist = gp.trunc_dist;
   push.dc_step = params.dc_step;
   push.ac_step = params.ac_step;
-  push.observed_weight = kObservedWeight;
+  push.observed_weight = volume::kObservedWeight;
+  push.decoded_weight = kDecodedWeight;
+  push.num_buckets = gp.num_buckets;
+  push.bucket_size = gp.bucket_size;
+  push.max_chain = gp.max_chain;
+  std::memset(rejected_.mapped(), 0, sizeof(std::uint32_t));
   // Each dispatch is its own fence-waited submission whose barrier makes its
   // writes visible to the next and to the host, so the batches need no
   // ordering beyond running in turn -- and they touch disjoint list entries.
@@ -212,67 +218,81 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
     VR_TRY(dispatch(*device_, kernel, &push, sizeof(push), groups,
                     max_workgroup_count_x_));
   }
+  std::uint32_t rejected = 0;
+  std::memcpy(&rejected, rejected_.mapped(), sizeof(rejected));
+  if (rejected != 0) {
+    return fail(op, std::to_string(rejected) + " of " +
+                        std::to_string(blocks.count) +
+                        " block list entries are not live blocks of this grid "
+                        "(each coord must resolve to its ptr in the hash "
+                        "table); they were neither read nor written");
+  }
   return {};
 }
 
 Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
                              const volume::BlockList& blocks,
-                             const CodecParams& params,
-                             std::vector<std::int32_t>& coefficients,
-                             std::vector<std::uint32_t>& masks) {
-  coefficients.clear();
-  masks.clear();
-  VR_TRY(check_inputs("forward", grid, blocks, params));
-  if (blocks.count == 0) {
-    return {};
-  }
+                             const CodecParams& params, DctBlocks& out) {
+  out.params = CodecParams{};
+  out.trunc_dist = 0.0f;
+  out.coefficients.clear();
+  out.masks.clear();
+  VR_ASSIGN(GridViews views, check_inputs("forward", grid, blocks, params));
 
   const std::size_t coeff_count =
       std::size_t(blocks.count) * params.coefficient_count;
   const std::size_t mask_count = std::size_t(blocks.count) * kMaskWordsPerBlock;
-  const VkDeviceSize coeff_bytes = VkDeviceSize(coeff_count) * 4;
-  const VkDeviceSize mask_bytes = VkDeviceSize(mask_count) * 4;
-  VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
-                                    coeff_bytes, max_storage_buffer_range_));
-  VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
-                                    max_storage_buffer_range_));
-  VR_ASSIGN(Buffer coeff_buf, storage_buffer(*allocator_, coeff_bytes));
-  VR_ASSIGN(Buffer mask_buf, storage_buffer(*allocator_, mask_bytes));
-  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                           debug_object_handle(coeff_buf.handle()),
-                           "codec.coefficients");
-  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                           debug_object_handle(mask_buf.handle()),
-                           "codec.masks");
+  if (blocks.count != 0) {
+    const VkDeviceSize coeff_bytes = VkDeviceSize(coeff_count) * 4;
+    const VkDeviceSize mask_bytes = VkDeviceSize(mask_count) * 4;
+    VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
+                                      coeff_bytes, max_storage_buffer_range_));
+    VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
+                                      max_storage_buffer_range_));
+    VR_ASSIGN(Buffer coeff_buf, storage_buffer(*allocator_, coeff_bytes));
+    VR_ASSIGN(Buffer mask_buf, storage_buffer(*allocator_, mask_bytes));
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             debug_object_handle(coeff_buf.handle()),
+                             "codec.coefficients");
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             debug_object_handle(mask_buf.handle()),
+                             "codec.masks");
 
-  VR_TRY(run("forward", forward_kernel_, grid, blocks, params, coeff_buf,
-             mask_buf));
+    VR_TRY(run("forward", forward_kernel_, grid, views, blocks, params,
+               coeff_buf, mask_buf));
 
-  coefficients.resize(coeff_count);
-  masks.resize(mask_count);
-  std::memcpy(coefficients.data(), coeff_buf.mapped(), coeff_bytes);
-  std::memcpy(masks.data(), mask_buf.mapped(), mask_bytes);
+    out.coefficients.resize(coeff_count);
+    out.masks.resize(mask_count);
+    std::memcpy(out.coefficients.data(), coeff_buf.mapped(), coeff_bytes);
+    std::memcpy(out.masks.data(), mask_buf.mapped(), mask_bytes);
+  }
+  out.params = params;
+  out.trunc_dist = grid.grid().trunc_dist;
   return {};
 }
 
 Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                              const volume::BlockList& blocks,
-                             const CodecParams& params,
-                             const std::vector<std::int32_t>& coefficients,
-                             const std::vector<std::uint32_t>& masks) {
-  VR_TRY(check_inputs("inverse", grid, blocks, params));
+                             const DctBlocks& in) {
+  VR_ASSIGN(GridViews views, check_inputs("inverse", grid, blocks, in.params));
+  if (in.trunc_dist != grid.grid().trunc_dist) {
+    return fail("inverse", "the coefficients were normalized by trunc_dist " +
+                               std::to_string(in.trunc_dist) +
+                               ", but this grid's is " +
+                               std::to_string(grid.grid().trunc_dist));
+  }
   const std::size_t coeff_count =
-      std::size_t(blocks.count) * params.coefficient_count;
+      std::size_t(blocks.count) * in.params.coefficient_count;
   const std::size_t mask_count = std::size_t(blocks.count) * kMaskWordsPerBlock;
-  if (coefficients.size() != coeff_count) {
+  if (in.coefficients.size() != coeff_count) {
     return fail("inverse", "expected " + std::to_string(coeff_count) +
                                " coefficients for the list, got " +
-                               std::to_string(coefficients.size()));
+                               std::to_string(in.coefficients.size()));
   }
-  if (masks.size() != mask_count) {
+  if (in.masks.size() != mask_count) {
     return fail("inverse", "expected " + std::to_string(mask_count) +
                                " mask words for the list, got " +
-                               std::to_string(masks.size()));
+                               std::to_string(in.masks.size()));
   }
   if (blocks.count == 0) {
     return {};
@@ -286,9 +306,9 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                                     max_storage_buffer_range_));
   VR_ASSIGN(
       Buffer coeff_buf,
-      upload_storage_buffer(*allocator_, coefficients.data(), coeff_bytes));
+      upload_storage_buffer(*allocator_, in.coefficients.data(), coeff_bytes));
   VR_ASSIGN(Buffer mask_buf,
-            upload_storage_buffer(*allocator_, masks.data(), mask_bytes));
+            upload_storage_buffer(*allocator_, in.masks.data(), mask_bytes));
   device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
                            debug_object_handle(coeff_buf.handle()),
                            "codec.coefficients");
@@ -296,8 +316,8 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                            debug_object_handle(mask_buf.handle()),
                            "codec.masks");
 
-  return run("inverse", inverse_kernel_, grid, blocks, params, coeff_buf,
-             mask_buf);
+  return run("inverse", inverse_kernel_, grid, views, blocks, in.params,
+             coeff_buf, mask_buf);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

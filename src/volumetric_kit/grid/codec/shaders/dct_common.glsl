@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Tao Jin
 
 // Shared by dct_forward.comp and dct_inverse.comp: the push-constant block, the
-// basis + zigzag table buffer, the shared-memory work cube, and the one
-// separable 8-point line transform both directions are made of.
+// block list, the basis + zigzag table buffer, the live-block probe, the
+// shared-memory work cube, and the one separable 8-point line transform both
+// directions are made of.
 //
 // ONE WORKGROUP OF 64 INVOCATIONS PER BLOCK, each owning one 8-voxel line per
 // pass. A separable 8^3 transform is three passes of 64 independent 8-point
@@ -19,13 +20,14 @@
 
 #extension GL_EXT_scalar_block_layout : require
 
-// BlockIndex (and the grid struct) from the volume tier, without its push
-// constants: this kernel has its own, below.
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+// BlockIndex and the read-only hash lookup from the volume tier (one
+// definition, not a mirror -- see hash_lookup.glsl), which brings hash_common
+// without its push constants: this kernel has its own, below.
+#define VR_HASH_ENTRIES_BINDING 6
+#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
-// layout places each at its host offset (32 bytes).
+// layout places each at its host offset (48 bytes).
 layout(push_constant, scalar) uniform PushConstants {
   uint block_base;         // first list entry this dispatch covers
   uint num_blocks;         // entries in the whole list
@@ -35,9 +37,17 @@ layout(push_constant, scalar) uniform PushConstants {
   float dc_step;           // quantization steps, fractions of trunc_dist
   float ac_step;
   float observed_weight;   // weight >= this marks a voxel observed
-  uint reserved;           // keeps the block at 32 bytes; unread
+  float decoded_weight;    // what the inverse writes on an observed voxel
+  int num_buckets;         // the hash table's shape, for the live-block probe
+  int bucket_size;
+  int max_chain;
+  uint reserved;           // keeps the block at 48 bytes; unread
 }
 pc;
+
+layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
+  BlockIndex blocks[];
+};
 
 // Built on the host (dct_tables.hpp) and uploaded once, so every device
 // transforms against the same bits rather than its own cos().
@@ -48,13 +58,40 @@ layout(set = 0, binding = 3, scalar) readonly buffer Tables {
   uint zigzag[512];
 };
 
+// Entries block_is_live rejected, summed over every batch for the host to
+// report.
+layout(set = 0, binding = 7, scalar) buffer Rejected { uint rejected; };
+
 const uint kLanes = 64u;
-const uint kBlockVoxels = 512u;
 const uint kMaskWords = 16u;
 const uint kHalf = 512u;  // offset of s_work's second half
 
 shared float s_work[1024];
 shared float s_basis[64];
+shared uint s_live;
+
+// Whether list entry `entry` names a live block of this grid: its coord must
+// resolve through the hash table to exactly its ptr. That one probe subsumes a
+// ptr range check -- every ptr the table holds is a heap slot -- and catches
+// what a range check cannot: a free slot, or a coord paired with another
+// block's ptr, either of which the inverse would write into. Lane 0 probes and
+// the verdict is shared, so every lane returns on it or none does. Sound only
+// while nothing allocates into the map, the same quiescence hash_lookup.glsl
+// states.
+bool block_is_live(uint entry, uint lane) {
+  if (lane == 0u) {
+    BlockIndex b = blocks[entry];
+    int found =
+        vrFindBlockPtr(b.coord, pc.num_buckets, pc.bucket_size, pc.max_chain);
+    bool live = b.ptr >= 0 && found == b.ptr;
+    s_live = live ? 1u : 0u;
+    if (!live) {
+      atomicAdd(rejected, 1u);
+    }
+  }
+  barrier();
+  return s_live != 0u;
+}
 
 // Transform one 8-point line of the cube held in s_work[src..src+511], writing
 // it to the same line of s_work[dst..dst+511]. The line is voxels

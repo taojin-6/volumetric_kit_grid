@@ -33,18 +33,31 @@ class Device;
 
 namespace volumetric_kit::recon::codec::detail {
 
-/// @brief The weight at or above which a voxel counts as observed.
-///
-/// A **copy** of the mesh tier's private `kWeightThreshold`
-/// (marching_cubes.cpp): the mesher skips a corner whose weight is below it, so
-/// the mask must mark exactly the voxels the mesher would have used. `codec`
-/// may not link `mesh`, so the value is repeated rather than shared -- change
-/// the two together.
-inline constexpr float kObservedWeight = 1e-6f;
-
 /// The weight the inverse writes on an observed voxel: anything at or above
-/// @ref kObservedWeight meshes the same, and a decoded grid is not fused into.
+/// @ref volume::kObservedWeight meshes the same, and a decoded grid is not
+/// fused into. Pushed to the kernel, so this is its one definition.
 inline constexpr float kDecodedWeight = 1.0f;
+
+/// @brief One block list's transform: what @ref DctTransform::forward produces
+///        and @ref DctTransform::inverse consumes.
+///
+/// Carries the params and the `trunc_dist` the coefficients were made with, so
+/// the inverse checks them against its grid rather than trusting the caller to
+/// pass matching ones. The steps are fractions of `trunc_dist`, so decoding
+/// into a grid with another band would rescale every SDF and report success.
+struct DctBlocks {
+  /// The coefficient count and steps the coefficients were quantized with.
+  CodecParams params;
+  /// The grid's `trunc_dist`, which the SDF was divided by. The inverse
+  /// compares it exactly: a frame carries it bit for bit.
+  float trunc_dist = 0.0f;
+  /// `count * params.coefficient_count` values, by list position: coefficient
+  /// `j` of entry `i` is `coefficients[i * coefficient_count + j]`.
+  std::vector<std::int32_t> coefficients;
+  /// `count * kMaskWordsPerBlock` words: entry `i`'s are `masks[i * 16 ..
+  /// i * 16 + 15]`, voxel `v` (`x + 8y + 64z`) bit `v % 32` of word `v / 32`.
+  std::vector<std::uint32_t> masks;
+};
 
 /// @brief Construction-time options.
 struct DctTransformConfig {
@@ -59,13 +72,15 @@ struct DctTransformConfig {
 /// @brief The forward and inverse block DCT, as two GLSL compute kernels.
 ///
 /// One workgroup of 64 invocations per listed block; each invocation owns one
-/// 8-voxel line per separable pass. The forward kernel reads `tsdf` and
-/// `weight`, divides the SDF by `trunc_dist` (so its input is in [-1, 1]),
-/// transforms, and keeps the first `coefficient_count` coefficients in 3-D
-/// zigzag order, each rounded half-to-even after dividing by its step and
-/// clamped to ±@ref kMaxQuantizedMagnitude. It also packs one bit per voxel,
-/// set where `weight >= kObservedWeight`, into @ref kMaskWordsPerBlock words:
-/// voxel `v` (`x + 8y + 64z`) is bit `v % 32` of word `v / 32`.
+/// 8-voxel line per separable pass. The forward kernel reads `weight`, and
+/// `tsdf` where the voxel is observed (`weight >= volume::kObservedWeight`),
+/// divides that SDF by `trunc_dist` (so its input is in [-1, 1]), and fills
+/// each unobserved voxel from the nearest observed one along x, then y, then z
+/// (the lower index on a tie), so the transform sees a smooth continuation of
+/// the field rather than a step to 0 at the mask edge. It then transforms and
+/// keeps the first `coefficient_count` coefficients in 3-D zigzag order, each
+/// rounded half-to-even after dividing by its step and clamped to
+/// ±@ref kMaxQuantizedMagnitude, and packs the observed bits into the mask.
 ///
 /// The inverse undoes it: dequantizes, zero-fills the dropped coefficients,
 /// inverse-transforms, and writes each observed voxel's `tsdf` (clamped back to
@@ -74,10 +89,19 @@ struct DctTransformConfig {
 /// holds it -- zero `tsdf`, zero `weight` -- so the mesher uses exactly the
 /// voxels the encoder saw observed.
 ///
-/// Output is indexed by **list position**, not by `ptr`: coefficient `j` of
-/// list entry `i` is `coefficients[i * coefficient_count + j]`, its mask words
-/// `masks[i * 16 .. i * 16 + 15]`. The order the blocks travel in is the
-/// caller's (the encoder sorts them).
+/// Output is indexed by **list position**, not by `ptr` (see @ref DctBlocks).
+/// The order the blocks travel in is the caller's (the encoder sorts them).
+///
+/// Each workgroup first checks, through the grid's hash table, that its entry's
+/// `coord` resolves to exactly its `ptr`; one that does not is neither read nor
+/// written, and the call reports how many there were. That refuses a `ptr`
+/// outside the heap, a free slot, and a coord paired with another block's ptr,
+/// for the cost of one probe per block where a host scan would be O(count) per
+/// call. Like the mesher's probe, it needs the map quiescent: no allocate may
+/// run into the grid during a call.
+///
+/// Per-call buffers are allocated per call, as the integrator's are: at ~98 k
+/// blocks the three cost 0.03 ms of a 1.4 ms forward (Apple M5 Max, Release).
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -104,47 +128,47 @@ class VR_CODEC_API DctTransform {
   DctTransform& operator=(const DctTransform&) = delete;
 
   /// @brief Transform and quantize every block in @p blocks.
-  /// @param grid          The grid the list names; must carry 4-byte `tsdf` and
-  ///                      `weight` attributes and have `block_size` 8.
-  /// @param blocks        The blocks to transform, typically
-  ///                      `grid.block_list(grid.map().compact_active_blocks())`.
-  ///                      An empty list is a no-op success.
-  /// @param params        The coefficient count and steps.
-  /// @param coefficients  Receives `blocks.count * coefficient_count` values.
-  /// @param masks         Receives `blocks.count * 16` mask words.
+  /// @param grid    The grid the list names; must carry 4-byte `tsdf` and
+  ///                `weight` attributes and have `block_size` 8.
+  /// @param blocks  The blocks to transform, anchored with
+  ///                @ref volume::VoxelBlockGrid::block_list to a compaction the
+  ///                caller holds -- `auto active =
+  ///                grid.map().compact_active_blocks();` and then
+  ///                `grid.block_list(active.value())`. An empty list is a
+  ///                no-op success.
+  /// @param params  The coefficient count and steps.
+  /// @param out     Receives the coefficients and masks, and @p params and the
+  ///                grid's `trunc_dist` beside them.
   /// @return OK, or @ref Status::Code::InvalidArgument for a moved-from
   ///         transform, invalid @p params, a grid that is moved-from, has
   ///         another block size, a non-positive `trunc_dist`, or lacks a float
-  ///         `tsdf` / `weight`; a list that is null with a count, holds more
-  ///         blocks than the heap, carries another topology epoch, or names a
-  ///         `ptr` outside the heap; or a buffer that would exceed
-  ///         `maxStorageBufferRange`. Otherwise a buffer or dispatch failure.
-  ///         On failure the outputs are left empty.
+  ///         `tsdf` / `weight`; a list that
+  ///         @ref volume::VoxelBlockGrid::check_block_list refuses, or one with
+  ///         an entry that is not a live block of @p grid; or a buffer that
+  ///         would exceed `maxStorageBufferRange`. Otherwise a buffer or
+  ///         dispatch failure.
+  ///         On failure @p out is left empty.
   Status forward(const volume::VoxelBlockGrid& grid,
                  const volume::BlockList& blocks, const CodecParams& params,
-                 std::vector<std::int32_t>& coefficients,
-                 std::vector<std::uint32_t>& masks);
+                 DctBlocks& out);
 
   /// @brief Reconstruct every block in @p blocks from its coefficients and
   ///        mask, overwriting its `tsdf` and `weight`.
   ///
-  /// The blocks must already be allocated in @p grid; the list must be
-  /// duplicate-free (unchecked -- a repeat is two workgroups writing one
-  /// block).
-  /// @param grid          As @ref forward, written in place.
-  /// @param blocks        The blocks to reconstruct, in the order
-  ///                      @p coefficients and @p masks were produced in.
-  /// @param params        The coefficient count and steps they were quantized
-  ///                      with.
-  /// @param coefficients  `blocks.count * coefficient_count` values.
-  /// @param masks         `blocks.count * 16` mask words.
+  /// The list must be duplicate-free (unchecked -- a repeat is two workgroups
+  /// writing one block).
+  /// @param grid    As @ref forward, written in place.
+  /// @param blocks  The blocks to reconstruct, in the order @p in was produced
+  ///                in; each must be live in @p grid.
+  /// @param in      A @ref forward output, or one read back from a frame.
   /// @return OK, the same refusals as @ref forward, or
-  ///         @ref Status::Code::InvalidArgument when either input's size does
-  ///         not match the list.
+  ///         @ref Status::Code::InvalidArgument when @p in carries invalid
+  ///         params, another `trunc_dist` than @p grid, or a size that does
+  ///         not match the list. A refusal for entries that are not live comes
+  ///         from the device, after every live entry has been written; the
+  ///         others refuse before anything is.
   Status inverse(volume::VoxelBlockGrid& grid, const volume::BlockList& blocks,
-                 const CodecParams& params,
-                 const std::vector<std::int32_t>& coefficients,
-                 const std::vector<std::uint32_t>& masks);
+                 const DctBlocks& in);
 
   /// @return `true` if this owns both live pipelines (`false` when moved-from).
   bool valid() const noexcept {
@@ -154,15 +178,24 @@ class VR_CODEC_API DctTransform {
  private:
   DctTransform() = default;
 
-  /// The grid / list / params checks both directions share.
-  Status check_inputs(const char* op, const volume::VoxelBlockGrid& grid,
-                      const volume::BlockList& blocks,
-                      const CodecParams& params) const;
+  /// The attributes both kernels bind, found by @ref check_inputs.
+  struct GridViews {
+    volume::AttributeView tsdf;
+    volume::AttributeView weight;
+  };
+
+  /// The grid / list / params checks both directions share, all taken before
+  /// anything is allocated, and for an empty list too.
+  Result<GridViews> check_inputs(const char* op,
+                                 const volume::VoxelBlockGrid& grid,
+                                 const volume::BlockList& blocks,
+                                 const CodecParams& params) const;
 
   /// Upload the list, bind the per-call buffers and run @p kernel over it in
-  /// batches of at most @ref blocks_per_dispatch_ workgroups.
+  /// batches of at most @ref blocks_per_dispatch_ workgroups; refuses if any
+  /// entry was not live.
   Status run(const char* op, ComputeKernel& kernel,
-             const volume::VoxelBlockGrid& grid,
+             const volume::VoxelBlockGrid& grid, const GridViews& views,
              const volume::BlockList& blocks, const CodecParams& params,
              const Buffer& coefficients, const Buffer& masks);
 
@@ -177,7 +210,7 @@ class VR_CODEC_API DctTransform {
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // Both kernels share one layout shape (six storage buffers + the push
+  // Both kernels share one layout shape (eight storage buffers + the push
   // range) and one pool. Declared before pool_ and tables_, so those are
   // destroyed first -- the kernels' sets are freed with the pool.
   ComputeKernel forward_kernel_;
@@ -185,6 +218,9 @@ class VR_CODEC_API DctTransform {
   DescriptorPool pool_;
   // The basis + zigzag tables (binding 3 of both kernels), uploaded once.
   Buffer tables_;
+  // The count of entries the kernels found not live (binding 7 of both),
+  // zeroed before each call and read after it.
+  Buffer rejected_;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

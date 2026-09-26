@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Forward block DCT: for each listed block, divide its SDF by trunc_dist, take
-// the orthonormal 8^3 DCT-II, and write the first K coefficients in zigzag
-// order, each rounded half-to-even after dividing by its step and clamped to
-// +-32767 (CodecParams::validate keeps the step coarse enough that the clamp
-// never engages on in-range input). Also pack the observed mask: bit v % 32 of
-// word v / 32 is set where voxel v's weight >= observed_weight.
+// Forward block DCT: for each listed block, divide its observed SDF by
+// trunc_dist, fill its unobserved voxels from the observed ones, take the
+// orthonormal 8^3 DCT-II, and write the first K coefficients in zigzag order,
+// each rounded half-to-even after dividing by its step and clamped to +-32767
+// (CodecParams::validate keeps the step coarse enough that the clamp never
+// engages on in-range input). Also pack the observed mask: bit v % 32 of word
+// v / 32 is set where voxel v's weight >= observed_weight.
 //
 // Re-implements the prior engine's computeDCTKernel (compute_dct.cu) with one
 // lane per line instead of one thread per voxel -- see dct_common.glsl. Output
@@ -19,9 +20,6 @@
 
 layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
-  BlockIndex blocks[];
-};
 layout(set = 0, binding = 1, scalar) readonly buffer Tsdf { float tsdf[]; };
 layout(set = 0, binding = 2, scalar) readonly buffer Weight { float weight[]; };
 layout(set = 0, binding = 4, scalar) writeonly buffer Coefficients {
@@ -30,13 +28,66 @@ layout(set = 0, binding = 4, scalar) writeonly buffer Coefficients {
 layout(set = 0, binding = 5, scalar) writeonly buffer Masks { uint masks[]; };
 
 shared uint s_mask[16];
+// Per voxel, whether s_work holds a value for it yet: observed, or filled.
+shared uint s_known[512];
+
+// Give each unknown voxel of one line the value of the nearest voxel that was
+// known when the pass began, the lower index on a tie. A line with nothing
+// known is left for a later pass. Only this lane's line is read or written.
+void fill_line(uint base, uint stride) {
+  float val[8];
+  uint known = 0u;
+  for (uint i = 0u; i < 8u; ++i) {
+    val[i] = s_work[base + i * stride];
+    if (s_known[base + i * stride] != 0u) {
+      known |= 1u << i;
+    }
+  }
+  if (known == 0u || known == 0xFFu) {
+    return;
+  }
+  for (uint i = 0u; i < 8u; ++i) {
+    if (((known >> i) & 1u) != 0u) {
+      continue;
+    }
+    for (uint d = 1u; d < 8u; ++d) {
+      if (i >= d && ((known >> (i - d)) & 1u) != 0u) {
+        s_work[base + i * stride] = val[i - d];
+        break;
+      }
+      if (i + d < 8u && ((known >> (i + d)) & 1u) != 0u) {
+        s_work[base + i * stride] = val[i + d];
+        break;
+      }
+    }
+    s_known[base + i * stride] = 1u;
+  }
+}
+
+// Fill the unobserved voxels along x, then y, then z, on the lane-to-line
+// mapping transform_cube uses. After the three passes every voxel is known
+// unless the block has no observed voxel at all, and those stay at the 0 they
+// were loaded as. The decoder masks these voxels out whatever they hold, so the
+// fill is free to choose them, and a smooth continuation of the observed field
+// is what a truncated DCT keeps best: a fused block's unobserved voxels read 0,
+// the iso level, and the step from there to the observed band is what K = 32
+// could not represent -- that leaked 2-5x the error into the observed voxels
+// beside the mask edge. The rule is in DECISIONS.md (2026-09-26).
+void fill_unobserved(uint lane) {
+  fill_line(lane * 8u, 1u);
+  barrier();
+  fill_line((lane & 7u) + (lane >> 3u) * 64u, 8u);
+  barrier();
+  fill_line((lane & 7u) + (lane >> 3u) * 8u, 64u);
+  barrier();
+}
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.block_base + gl_WorkGroupID.x;
   // Uniform across the workgroup (it depends only on the group id), so every
   // barrier below is still reached by all of this group's lanes or none.
-  if (entry >= pc.num_blocks) {
+  if (entry >= pc.num_blocks || !block_is_live(entry, lane)) {
     return;
   }
   uint voxel_base = uint(blocks[entry].ptr);
@@ -47,13 +98,16 @@ void main() {
   }
 
   // Load this lane's x-line (voxels 8*lane .. 8*lane + 7) and note which of
-  // them were observed.
+  // them were observed. An unobserved voxel's tsdf is never read, so the
+  // coefficients depend on the observed voxels alone.
   float inv_trunc = 1.0 / pc.trunc_dist;
   uint line_bits = 0u;
   for (uint x = 0u; x < 8u; ++x) {
     uint v = lane * 8u + x;
-    s_work[v] = tsdf[voxel_base + v] * inv_trunc;
-    if (weight[voxel_base + v] >= pc.observed_weight) {
+    bool obs = weight[voxel_base + v] >= pc.observed_weight;
+    s_work[v] = obs ? tsdf[voxel_base + v] * inv_trunc : 0.0;
+    s_known[v] = obs ? 1u : 0u;
+    if (obs) {
       line_bits |= 1u << x;
     }
   }
@@ -64,6 +118,7 @@ void main() {
   // its voxels v = 8r + x.
   atomicOr(s_mask[lane >> 2u], line_bits << ((lane & 3u) * 8u));
 
+  fill_unobserved(lane);
   transform_cube(lane, false);
 
   uint k = pc.coefficient_count;

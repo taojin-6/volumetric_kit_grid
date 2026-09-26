@@ -55,6 +55,16 @@ struct AttributeView {
   std::uint64_t element_count = 0;  ///< Voxels (num_blocks * voxels_per_block).
 };
 
+/// @brief The `weight` at or above which a voxel counts as observed.
+///
+/// Small and positive, so a never-integrated voxel (weight 0) is excluded while
+/// any genuine integration counts. Defined here, the one tier both readers
+/// link, because the two must agree: the mesher skips any cell with a corner
+/// below it, and the codec's observed mask marks exactly the voxels at or above
+/// it -- a mask that disagreed would decode holes, or voxels the mesher would
+/// have skipped.
+inline constexpr float kObservedWeight = 1e-6f;
+
 /// @brief A sparse voxel block grid: the @ref VoxelHashMap block index plus a
 ///        set of named, independently-allocated per-voxel attribute arrays.
 ///
@@ -188,6 +198,29 @@ class VR_VOLUME_API VoxelBlockGrid {
     return BlockList{blocks.data(), static_cast<std::uint32_t>(blocks.size()),
                      topology_epoch()};
   }
+  /// Deleted: the list would outlive the vector it borrows, so
+  /// `block_list(map().compact_active_blocks().value())` dangles by the next
+  /// statement. Name the compaction first, then anchor it.
+  BlockList block_list(std::vector<BlockIndex>&&) const = delete;
+
+  /// @brief Check a caller-supplied @ref BlockList against this grid, for a
+  ///        consumer about to upload it and index attribute storage with it.
+  ///
+  /// Refuses a list that is null with a count; one holding more blocks than the
+  /// heap, which the epoch is blind to, since a vector re-compacted shorter
+  /// under a cached list keeps its old count through every allocate and
+  /// resize, and the upload would read past the caller's array; and one
+  /// compacted at another @ref topology_epoch, whose in-range ptrs a
+  /// `remove()` / `clear()` has handed to different blocks. An empty list names
+  /// no block, so it passes whatever its epoch: that is what lets a
+  /// default-constructed `BlockList{}` mean "nothing".
+  ///
+  /// Not checked: that each entry is a block this grid handed out. That is
+  /// O(count) per call, and every consumer answers it on the device instead.
+  /// @param blocks  The list.
+  /// @param who     Prefixes the error message (the consumer's entry point).
+  /// @return OK, or @ref Status::Code::InvalidArgument naming the refusal.
+  Status check_block_list(const BlockList& blocks, const char* who) const;
 
   /// @brief Look up an attribute's backing store by name.
   ///
