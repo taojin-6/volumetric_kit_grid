@@ -25,29 +25,45 @@
 
 namespace volumetric_kit::recon::codec::detail {
 
-/// Voxel linear index inside a block, `x + 8y + 64z` -- the order the volume
-/// tier lays a block's voxels out in (`BlockIndex::ptr + local`).
+/// One block edge, unsigned: the length of every line the separable transform
+/// runs along.
+inline constexpr std::uint32_t kEdge = static_cast<std::uint32_t>(kBlockSize);
+
+/// A voxel's linear index inside a block is `x + kStrideY * y + kStrideZ * z`
+/// -- the order the volume tier lays a block's voxels out in
+/// (`BlockIndex::ptr + local`).
+inline constexpr std::uint32_t kStrideY = kEdge;
+inline constexpr std::uint32_t kStrideZ = kEdge * kEdge;
+static_assert(kStrideZ * kEdge == kVoxelsPerBlock, "a block is kEdge^3");
+
+/// Entries in the 1-D DCT matrix, `kEdge x kEdge`.
+inline constexpr std::uint32_t kBasisSize = kEdge * kEdge;
+
+/// @return The linear index of voxel `(x, y, z)` inside a block.
 constexpr std::uint32_t voxel_index(std::uint32_t x, std::uint32_t y,
                                     std::uint32_t z) {
-  return x + y * 8u + z * 64u;
+  return x + y * kStrideY + z * kStrideZ;
 }
 
-/// @brief The orthonormal 1-D DCT-II matrix, row-major `basis[k * 8 + n]`.
+/// @brief The orthonormal 1-D DCT-II matrix, row-major `basis[k * kEdge + n]`.
 ///
-/// `basis[k][n] = a(k) * cos(pi * k * (2n + 1) / 16)`, with `a(0) = sqrt(1/8)`
-/// and `a(k) = sqrt(2/8)`. Orthonormal, so the forward transform is
-/// `X[k] = sum_n basis[k][n] * x[n]`, the inverse is its transpose, and the 3-D
-/// transform is this applied along x, then y, then z. Evaluated in double.
+/// With `N = kEdge`, `basis[k][n] = a(k) * cos(pi * k * (2n + 1) / (2N))`,
+/// `a(0) = sqrt(1/N)` and `a(k) = sqrt(2/N)`. Orthonormal, so the forward
+/// transform is `X[k] = sum_n basis[k][n] * x[n]`, the inverse is its
+/// transpose, and the 3-D transform is this applied along x, then y, then z.
+/// Evaluated in double.
 /// @tparam T  `double` for the tests' reference, `float` for the upload.
 template <typename T>
-std::array<T, 64> dct_basis() {
+std::array<T, kBasisSize> dct_basis() {
   constexpr double kPi = 3.14159265358979323846;
-  std::array<T, 64> basis{};
-  for (int k = 0; k < 8; ++k) {
-    const double alpha = k == 0 ? std::sqrt(1.0 / 8.0) : std::sqrt(2.0 / 8.0);
-    for (int n = 0; n < 8; ++n) {
-      basis[static_cast<std::size_t>(k * 8 + n)] =
-          static_cast<T>(alpha * std::cos(kPi * k * (2.0 * n + 1.0) / 16.0));
+  constexpr double n_points = kEdge;
+  std::array<T, kBasisSize> basis{};
+  for (std::uint32_t k = 0; k < kEdge; ++k) {
+    const double alpha =
+        k == 0 ? std::sqrt(1.0 / n_points) : std::sqrt(2.0 / n_points);
+    for (std::uint32_t n = 0; n < kEdge; ++n) {
+      basis[k * kEdge + n] = static_cast<T>(
+          alpha * std::cos(kPi * k * (2.0 * n + 1.0) / (2.0 * n_points)));
     }
   }
   return basis;
@@ -65,9 +81,9 @@ inline std::array<std::uint32_t, kVoxelsPerBlock> zigzag_order() {
              kVoxelsPerBlock>
       cells{};
   std::size_t i = 0;
-  for (std::uint32_t x = 0; x < 8; ++x) {
-    for (std::uint32_t y = 0; y < 8; ++y) {
-      for (std::uint32_t z = 0; z < 8; ++z) {
+  for (std::uint32_t x = 0; x < kEdge; ++x) {
+    for (std::uint32_t y = 0; y < kEdge; ++y) {
+      for (std::uint32_t z = 0; z < kEdge; ++z) {
         cells[i++] = {x, y, z};
       }
     }

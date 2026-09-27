@@ -54,8 +54,9 @@ struct DctBlocks {
   /// `count * params.coefficient_count` values, by list position: coefficient
   /// `j` of entry `i` is `coefficients[i * coefficient_count + j]`.
   std::vector<std::int32_t> coefficients;
-  /// `count * kMaskWordsPerBlock` words: entry `i`'s are `masks[i * 16 ..
-  /// i * 16 + 15]`, voxel `v` (`x + 8y + 64z`) bit `v % 32` of word `v / 32`.
+  /// `count * kMaskWordsPerBlock` words: entry `i`'s start at
+  /// `masks[i * kMaskWordsPerBlock]`, and its voxel `v` (see @ref voxel_index)
+  /// is bit `v % kMaskWordBits` of word `v / kMaskWordBits`.
   std::vector<std::uint32_t> masks;
 };
 
@@ -71,16 +72,17 @@ struct DctTransformConfig {
 
 /// @brief The forward and inverse block DCT, as two GLSL compute kernels.
 ///
-/// One workgroup of 64 invocations per listed block; each invocation owns one
-/// 8-voxel line per separable pass. The forward kernel reads `weight`, and
-/// `tsdf` where the voxel is observed (`weight >= volume::kObservedWeight`),
-/// divides that SDF by `trunc_dist` (so its input is in [-1, 1]), and fills
-/// each unobserved voxel from the nearest observed one along x, then y, then z
-/// (the lower index on a tie), so the transform sees a smooth continuation of
-/// the field rather than a step to 0 at the mask edge. It then transforms and
-/// keeps the first `coefficient_count` coefficients in 3-D zigzag order, each
-/// rounded half-to-even after dividing by its step and clamped to
-/// ±@ref kMaxQuantizedMagnitude, and packs the observed bits into the mask.
+/// One workgroup of `kEdge^2` (64) invocations per listed block; each owns one
+/// `kEdge`-voxel line per separable pass. The forward kernel reads `weight`,
+/// and `tsdf` where the voxel is observed (`weight >=
+/// volume::kObservedWeight`), divides that SDF by `trunc_dist` (so its input is
+/// in [-1, 1]), and fills each unobserved voxel from the nearest observed one
+/// along x, then y, then z (the lower index on a tie), so the transform sees a
+/// smooth continuation of the field rather than a step to 0 at the mask edge.
+/// It then transforms and keeps the first `coefficient_count` coefficients in
+/// 3-D zigzag order, each rounded half-to-even after dividing by its step and
+/// clamped to ±@ref kMaxQuantizedMagnitude, and packs the observed bits into
+/// the mask.
 ///
 /// The inverse undoes it: dequantizes, zero-fills the dropped coefficients,
 /// inverse-transforms, and writes each observed voxel's `tsdf` (clamped back to

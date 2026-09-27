@@ -20,6 +20,9 @@
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace codec = volumetric_kit::recon::codec;
+using codec::kVoxelsPerBlock;
+using codec::detail::kBasisSize;
+using codec::detail::kEdge;
 
 #define CHECK(cond)                                                        \
   do {                                                                     \
@@ -41,16 +44,22 @@ int params_validate_case() {
   CHECK(!p.validate().ok());
   p.coefficient_count = 1;
   CHECK(p.validate().ok());
-  p.coefficient_count = 512;
+  p.coefficient_count = kVoxelsPerBlock;
   CHECK(p.validate().ok());
 
+  // The bound the floor is built on is the one a coefficient can reach, to
+  // within the ulp the compile-time square root promises.
+  const double root = std::sqrt(double(kVoxelsPerBlock));
+  CHECK(std::fabs(codec::kMaxCoefficientMagnitude - root) <=
+        root * std::numeric_limits<double>::epsilon());
+
   // The floor is inclusive, and it is what keeps the clamp from engaging:
-  // the largest possible coefficient, sqrt(512), divided by the floor step
-  // rounds to no more than the clamp.
+  // the largest possible coefficient, sqrt(kVoxelsPerBlock), divided by the
+  // floor step rounds to no more than the clamp.
   p.dc_step = codec::kMinStep;
   p.ac_step = codec::kMinStep;
   CHECK(p.validate().ok());
-  CHECK(std::nearbyint(std::sqrt(512.0) / double(codec::kMinStep)) <=
+  CHECK(std::nearbyint(root / double(codec::kMinStep)) <=
         double(codec::kMaxQuantizedMagnitude));
   p.dc_step = codec::kMinStep * 0.99f;
   CHECK(!p.validate().ok());
@@ -67,26 +76,29 @@ int params_validate_case() {
 }
 
 int basis_case() {
-  const std::array<double, 64> b = codec::detail::dct_basis<double>();
+  const std::array<double, kBasisSize> b = codec::detail::dct_basis<double>();
   // Orthonormal: B * B^T = I.
-  for (int i = 0; i < 8; ++i) {
-    for (int j = 0; j < 8; ++j) {
+  for (std::uint32_t i = 0; i < kEdge; ++i) {
+    for (std::uint32_t j = 0; j < kEdge; ++j) {
       double dot = 0.0;
-      for (int n = 0; n < 8; ++n) {
-        dot += b[i * 8 + n] * b[j * 8 + n];
+      for (std::uint32_t n = 0; n < kEdge; ++n) {
+        dot += b[i * kEdge + n] * b[j * kEdge + n];
       }
       CHECK(std::fabs(dot - (i == j ? 1.0 : 0.0)) < 1e-12);
     }
   }
-  // The DC row is flat at sqrt(1/8); row 1 starts at sqrt(2/8) * cos(pi/16).
-  for (int n = 0; n < 8; ++n) {
+  // Known values, written out for the 8-point transform rather than derived
+  // from the formula under test: the DC row is flat at sqrt(1/8), and row 1
+  // starts at sqrt(2/8) * cos(pi/16).
+  static_assert(kEdge == 8, "the known values below are the 8-point DCT's");
+  for (std::uint32_t n = 0; n < kEdge; ++n) {
     CHECK(std::fabs(b[n] - std::sqrt(1.0 / 8.0)) < 1e-12);
   }
-  CHECK(std::fabs(b[8] - 0.5 * std::cos(3.14159265358979323846 / 16.0)) <
+  CHECK(std::fabs(b[kEdge] - 0.5 * std::cos(3.14159265358979323846 / 16.0)) <
         1e-12);
   // The float upload is the double table rounded, nothing more.
-  const std::array<float, 64> f = codec::detail::dct_basis<float>();
-  for (std::size_t i = 0; i < 64; ++i) {
+  const std::array<float, kBasisSize> f = codec::detail::dct_basis<float>();
+  for (std::size_t i = 0; i < kBasisSize; ++i) {
     CHECK(f[i] == static_cast<float>(b[i]));
   }
   return 0;
@@ -95,16 +107,18 @@ int basis_case() {
 int zigzag_case() {
   const auto order = codec::detail::zigzag_order();
   // A permutation of the 512 voxel indices.
-  std::array<bool, 512> seen{};
+  std::array<bool, kVoxelsPerBlock> seen{};
   for (std::uint32_t v : order) {
-    CHECK(v < 512u);
+    CHECK(v < kVoxelsPerBlock);
     CHECK(!seen[v]);
     seen[v] = true;
   }
   // Climbing in total frequency x + y + z, so a prefix of K keeps the lowest.
   int last_sum = -1;
   for (std::uint32_t v : order) {
-    const int sum = int(v % 8) + int((v / 8) % 8) + int(v / 64);
+    const int sum = int(v % kEdge) +
+                    int((v / codec::detail::kStrideY) % kEdge) +
+                    int(v / codec::detail::kStrideZ);
     CHECK(sum >= last_sum);
     last_sum = sum;
   }
@@ -122,7 +136,8 @@ int zigzag_case() {
                                      std::uint32_t(prior[j][1]),
                                      std::uint32_t(prior[j][2])));
   }
-  CHECK(order[511] == codec::detail::voxel_index(7, 7, 7));
+  CHECK(order[kVoxelsPerBlock - 1] ==
+        codec::detail::voxel_index(kEdge - 1, kEdge - 1, kEdge - 1));
   // The whole table: FNV-1a over its 512 voxel indices (x + 8y + 64z), one
   // index per step, computed from zigzag_table.cuh's kZigZagOrder when the
   // order was ported. Any entry out of place changes it.

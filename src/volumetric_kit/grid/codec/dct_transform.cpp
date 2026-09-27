@@ -37,7 +37,7 @@ struct PushConstants {
   std::int32_t num_buckets;
   std::int32_t bucket_size;
   std::int32_t max_chain;
-  std::uint32_t reserved;
+  std::int32_t max_quantized;
 };
 static_assert(sizeof(PushConstants) == 48, "PushConstants must be 48 bytes");
 static_assert(offsetof(PushConstants, block_base) == 0, "layout drift");
@@ -51,19 +51,34 @@ static_assert(offsetof(PushConstants, decoded_weight) == 28, "layout drift");
 static_assert(offsetof(PushConstants, num_buckets) == 32, "layout drift");
 static_assert(offsetof(PushConstants, bucket_size) == 36, "layout drift");
 static_assert(offsetof(PushConstants, max_chain) == 40, "layout drift");
+static_assert(offsetof(PushConstants, max_quantized) == 44, "layout drift");
 
-// Mirrors the `Tables` buffer in dct_common.glsl (binding 3).
+// The kernels' lane-to-line mapping is written for this edge (kEdge in
+// dct_common.glsl), which is why a grid with another block size is refused.
+static_assert(kBlockSize == 8, "dct_common.glsl's kEdge is 8");
+
+// Mirrors the `Tables` buffer in dct_common.glsl.
 struct Tables {
-  float basis[64];
+  float basis[kBasisSize];
   std::uint32_t zigzag[kVoxelsPerBlock];
 };
-static_assert(sizeof(Tables) == 64 * 4 + 512 * 4, "Tables layout drift");
+static_assert(sizeof(Tables) == kBasisSize * sizeof(float) +
+                                    kVoxelsPerBlock * sizeof(std::uint32_t),
+              "Tables layout drift");
 
-// Bindings 0..7 of both kernels: blocks, tsdf, weight, tables, coefficients,
-// masks, hash entries, rejected count. One literal for both, and it must match
-// every `binding = N` in the two .comp files and dct_common.glsl -- the compute
-// core is explicit, not reflected (2026-07-05).
-constexpr std::uint32_t kBindings = 8;
+// The set-0 bindings of both kernels, mirroring the VR_DCT_BINDING_* defines in
+// dct_common.glsl -- the compute core is explicit, not reflected (2026-07-05).
+enum Binding : std::uint32_t {
+  kBindingBlocks = 0,
+  kBindingTsdf = 1,
+  kBindingWeight = 2,
+  kBindingTables = 3,
+  kBindingCoefficients = 4,
+  kBindingMasks = 5,
+  kBindingEntries = 6,
+  kBindingRejected = 7,
+  kBindingCount = 8,
+};
 
 Status fail(const char* op, const std::string& why) {
   return Status::invalid_argument(std::string("DctTransform::") + op + ": " +
@@ -84,9 +99,9 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
   push_range.size = sizeof(PushConstants);
   KernelSetBuilder kb(device);
   VR_TRY(kb.add(t.forward_kernel_, "codec_dct_forward", vr_dct_forward_comp_spv,
-                vr_dct_forward_comp_spv_size, kBindings, &push_range));
+                vr_dct_forward_comp_spv_size, kBindingCount, &push_range));
   VR_TRY(kb.add(t.inverse_kernel_, "codec_dct_inverse", vr_dct_inverse_comp_spv,
-                vr_dct_inverse_comp_spv_size, kBindings, &push_range));
+                vr_dct_inverse_comp_spv_size, kBindingCount, &push_range));
   VR_ASSIGN(t.pool_, kb.build());
 
   VkPhysicalDeviceProperties props{};
@@ -102,9 +117,9 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
           : std::min(config.max_blocks_per_dispatch, t.max_workgroup_count_x_);
 
   // The tables are the same for every call, so they are uploaded once and
-  // bound once -- both kernels read them at binding 3.
+  // bound once.
   Tables tables{};
-  const std::array<float, 64> basis = dct_basis<float>();
+  const std::array<float, kBasisSize> basis = dct_basis<float>();
   const std::array<std::uint32_t, kVoxelsPerBlock> zigzag = zigzag_order();
   std::copy(basis.begin(), basis.end(), tables.basis);
   std::copy(zigzag.begin(), zigzag.end(), tables.zigzag);
@@ -113,19 +128,19 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(t.tables_.handle()),
                          "codec.dct_tables");
-  t.forward_kernel_.set.write_storage_buffer(3, t.tables_.handle(), 0,
-                                             VK_WHOLE_SIZE);
-  t.inverse_kernel_.set.write_storage_buffer(3, t.tables_.handle(), 0,
-                                             VK_WHOLE_SIZE);
+  t.forward_kernel_.set.write_storage_buffer(kBindingTables, t.tables_.handle(),
+                                             0, VK_WHOLE_SIZE);
+  t.inverse_kernel_.set.write_storage_buffer(kBindingTables, t.tables_.handle(),
+                                             0, VK_WHOLE_SIZE);
 
   VR_ASSIGN(t.rejected_, storage_buffer(allocator, sizeof(std::uint32_t)));
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(t.rejected_.handle()),
                          "codec.rejected");
-  t.forward_kernel_.set.write_storage_buffer(7, t.rejected_.handle(), 0,
-                                             VK_WHOLE_SIZE);
-  t.inverse_kernel_.set.write_storage_buffer(7, t.rejected_.handle(), 0,
-                                             VK_WHOLE_SIZE);
+  t.forward_kernel_.set.write_storage_buffer(
+      kBindingRejected, t.rejected_.handle(), 0, VK_WHOLE_SIZE);
+  t.inverse_kernel_.set.write_storage_buffer(
+      kBindingRejected, t.rejected_.handle(), 0, VK_WHOLE_SIZE);
   return t;
 }
 
@@ -141,10 +156,10 @@ Result<DctTransform::GridViews> DctTransform::check_inputs(
   }
   const volume::VoxelGridParams& gp = grid.grid();
   if (gp.block_size != kBlockSize) {
-    return fail(op,
-                "the codec transforms 8^3 blocks only, and this grid's "
-                "block_size is " +
-                    std::to_string(gp.block_size));
+    return fail(op, "the codec transforms blocks of edge " +
+                        std::to_string(kBlockSize) +
+                        " only, and this grid's block_size is " +
+                        std::to_string(gp.block_size));
   }
   if (!std::isfinite(gp.trunc_dist) || !(gp.trunc_dist > 0.0f)) {
     return fail(op, "the grid's trunc_dist must be finite and positive");
@@ -184,15 +199,18 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
                            debug_object_handle(list_buf.handle()),
                            "codec.block_list");
 
-  kernel.set.write_storage_buffer(0, list_buf.handle(), 0, VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(1, views.tsdf.buffer->handle(), 0,
+  kernel.set.write_storage_buffer(kBindingBlocks, list_buf.handle(), 0,
                                   VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(2, views.weight.buffer->handle(), 0,
+  kernel.set.write_storage_buffer(kBindingTsdf, views.tsdf.buffer->handle(), 0,
                                   VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(4, coefficients.handle(), 0, VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(5, masks.handle(), 0, VK_WHOLE_SIZE);
-  kernel.set.write_storage_buffer(6, grid.map().entries_buffer(), 0,
-                                  entries_bytes);
+  kernel.set.write_storage_buffer(kBindingWeight, views.weight.buffer->handle(),
+                                  0, VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(kBindingCoefficients, coefficients.handle(),
+                                  0, VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(kBindingMasks, masks.handle(), 0,
+                                  VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(kBindingEntries, grid.map().entries_buffer(),
+                                  0, entries_bytes);
 
   const volume::VoxelGridParams& gp = grid.grid();
   PushConstants push{};
@@ -206,6 +224,7 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
   push.num_buckets = gp.num_buckets;
   push.bucket_size = gp.bucket_size;
   push.max_chain = gp.max_chain;
+  push.max_quantized = kMaxQuantizedMagnitude;
   std::memset(rejected_.mapped(), 0, sizeof(std::uint32_t));
   // Each dispatch is its own fence-waited submission whose barrier makes its
   // writes visible to the next and to the host, so the batches need no
@@ -243,8 +262,10 @@ Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
       std::size_t(blocks.count) * params.coefficient_count;
   const std::size_t mask_count = std::size_t(blocks.count) * kMaskWordsPerBlock;
   if (blocks.count != 0) {
-    const VkDeviceSize coeff_bytes = VkDeviceSize(coeff_count) * 4;
-    const VkDeviceSize mask_bytes = VkDeviceSize(mask_count) * 4;
+    const VkDeviceSize coeff_bytes =
+        VkDeviceSize(coeff_count) * sizeof(std::int32_t);
+    const VkDeviceSize mask_bytes =
+        VkDeviceSize(mask_count) * sizeof(std::uint32_t);
     VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
                                       coeff_bytes, max_storage_buffer_range_));
     VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
@@ -298,8 +319,10 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
     return {};
   }
 
-  const VkDeviceSize coeff_bytes = VkDeviceSize(coeff_count) * 4;
-  const VkDeviceSize mask_bytes = VkDeviceSize(mask_count) * 4;
+  const VkDeviceSize coeff_bytes =
+      VkDeviceSize(coeff_count) * sizeof(std::int32_t);
+  const VkDeviceSize mask_bytes =
+      VkDeviceSize(mask_count) * sizeof(std::uint32_t);
   VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
                                     coeff_bytes, max_storage_buffer_range_));
   VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,

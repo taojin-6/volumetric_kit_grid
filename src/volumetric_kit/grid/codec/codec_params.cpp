@@ -14,8 +14,9 @@ Status check_step(const char* field, float step) {
   if (!std::isfinite(step) || !(step >= kMinStep)) {
     return Status::invalid_argument(
         std::string("CodecParams: ") + field +
-        " must be finite and >= sqrt(512)/32767 (a fraction of trunc_dist), "
-        "or a quantized coefficient could overflow its clamp");
+        " must be finite and >= " + std::to_string(kMinStep) +
+        " (a fraction of trunc_dist), or a quantized coefficient could "
+        "overflow its clamp");
   }
   return {};
 }
@@ -25,7 +26,8 @@ Status check_step(const char* field, float step) {
 Status CodecParams::validate() const {
   if (coefficient_count < 1 || coefficient_count > kVoxelsPerBlock) {
     return Status::invalid_argument(
-        "CodecParams: coefficient_count must be in [1, 512]");
+        "CodecParams: coefficient_count must be in [1, " +
+        std::to_string(kVoxelsPerBlock) + "]");
   }
   VR_TRY(check_step("dc_step", dc_step));
   VR_TRY(check_step("ac_step", ac_step));

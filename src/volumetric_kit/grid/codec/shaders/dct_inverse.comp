@@ -20,16 +20,23 @@
 #extension GL_GOOGLE_include_directive : require
 #include "dct_common.glsl"
 
-layout(local_size_x = 64) in;
+layout(local_size_x = kLanes) in;
 
-layout(set = 0, binding = 1, scalar) writeonly buffer Tsdf { float tsdf[]; };
-layout(set = 0, binding = 2, scalar) writeonly buffer Weight {
+layout(set = 0, binding = VR_DCT_BINDING_TSDF, scalar) writeonly buffer Tsdf {
+  float tsdf[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) writeonly buffer
+    Weight {
   float weight[];
 };
-layout(set = 0, binding = 4, scalar) readonly buffer Coefficients {
+layout(set = 0, binding = VR_DCT_BINDING_COEFFICIENTS, scalar) readonly buffer
+    Coefficients {
   int coefficients[];
 };
-layout(set = 0, binding = 5, scalar) readonly buffer Masks { uint masks[]; };
+layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) readonly buffer
+    Masks {
+  uint masks[];
+};
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
@@ -41,8 +48,8 @@ void main() {
   uint voxel_base = uint(blocks[entry].ptr);
 
   s_basis[lane] = basis[lane];
-  for (uint x = 0u; x < 8u; ++x) {
-    s_work[lane * 8u + x] = 0.0;
+  for (uint x = 0u; x < kEdge; ++x) {
+    s_work[x_line_base(lane) + x] = 0.0;
   }
   barrier();
 
@@ -57,9 +64,11 @@ void main() {
 
   // Write back this lane's x-line, gated by its 8 mask bits.
   uint line_bits =
-      (masks[entry * kMaskWords + (lane >> 2u)] >> ((lane & 3u) * 8u)) & 0xFFu;
-  for (uint x = 0u; x < 8u; ++x) {
-    uint v = lane * 8u + x;
+      (masks[entry * kMaskWords + lane / kLinesPerMaskWord] >>
+       ((lane % kLinesPerMaskWord) * kEdge)) &
+      kLineBits;
+  for (uint x = 0u; x < kEdge; ++x) {
+    uint v = x_line_base(lane) + x;
     bool observed = ((line_bits >> x) & 1u) != 0u;
     float sdf = clamp(s_work[kHalf + v], -1.0, 1.0) * pc.trunc_dist;
     tsdf[voxel_base + v] = observed ? sdf : 0.0;

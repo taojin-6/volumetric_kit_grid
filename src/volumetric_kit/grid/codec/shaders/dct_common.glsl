@@ -6,24 +6,53 @@
 // shared-memory work cube, and the one separable 8-point line transform both
 // directions are made of.
 //
-// ONE WORKGROUP OF 64 INVOCATIONS PER BLOCK, each owning one 8-voxel line per
-// pass. A separable 8^3 transform is three passes of 64 independent 8-point
-// transforms (along x, then y, then z), so 64 is the natural width -- and it
-// stays under Vulkan's guaranteed 128 invocations per workgroup, which the prior
-// engine's 512 threads per block (one per voxel) does not.
+// ONE WORKGROUP OF kLanes (64) INVOCATIONS PER BLOCK, each owning one kEdge-voxel
+// line per pass. A separable 8^3 transform is three passes of 64 independent
+// 8-point transforms (along x, then y, then z), so 64 is the natural width --
+// and it stays under Vulkan's guaranteed 128 invocations per workgroup, which
+// the prior engine's 512 threads per block (one per voxel) does not.
 //
-// The block's 512 values live in `s_work`, two halves of 512 floats that the
-// passes ping-pong between (4 KB of shared memory, against a guaranteed 16 KB).
+// The block's values live in `s_work`, two halves of kBlockVoxels floats that
+// the passes ping-pong between (4 KB of shared memory, against a guaranteed
+// 16 KB).
 
 #ifndef VR_DCT_COMMON_GLSL
 #define VR_DCT_COMMON_GLSL
 
 #extension GL_EXT_scalar_block_layout : require
 
+// The block geometry, mirroring kBlockSize / kVoxelsPerBlock / kMaskWordBits
+// (codec_params.hpp) and kStrideY / kStrideZ / kBasisSize (dct_tables.hpp).
+// Fixed rather than tunable: the lane-to-line mapping below is built on it, and
+// the host refuses a grid with any other block size.
+const uint kEdge = 8u;                   // voxels along one block edge
+const uint kStrideX = 1u;                // voxel v = x + kStrideY y + kStrideZ z
+const uint kStrideY = kEdge;
+const uint kStrideZ = kEdge * kEdge;
+const uint kBlockVoxels = kStrideZ * kEdge;
+const uint kBasisSize = kEdge * kEdge;   // the kEdge x kEdge 1-D DCT matrix
+const uint kLanes = kEdge * kEdge;       // lines per pass: one per invocation
+const uint kMaskWordBits = 32u;
+const uint kMaskWords = kBlockVoxels / kMaskWordBits;
+const uint kLinesPerMaskWord = kMaskWordBits / kEdge;
+const uint kLineBits = (1u << kEdge) - 1u;  // one line's bits of a mask word
+const uint kHalf = kBlockVoxels;         // offset of s_work's second half
+
+// The set-0 bindings, mirroring `Binding` in dct_transform.cpp -- the compute
+// core is explicit, not reflected (2026-07-05).
+#define VR_DCT_BINDING_BLOCKS 0
+#define VR_DCT_BINDING_TSDF 1
+#define VR_DCT_BINDING_WEIGHT 2
+#define VR_DCT_BINDING_TABLES 3
+#define VR_DCT_BINDING_COEFFICIENTS 4
+#define VR_DCT_BINDING_MASKS 5
+#define VR_DCT_BINDING_ENTRIES 6
+#define VR_DCT_BINDING_REJECTED 7
+
 // BlockIndex and the read-only hash lookup from the volume tier (one
 // definition, not a mirror -- see hash_lookup.glsl), which brings hash_common
 // without its push constants: this kernel has its own, below.
-#define VR_HASH_ENTRIES_BINDING 6
+#define VR_HASH_ENTRIES_BINDING VR_DCT_BINDING_ENTRIES
 #include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
@@ -31,7 +60,7 @@
 layout(push_constant, scalar) uniform PushConstants {
   uint block_base;         // first list entry this dispatch covers
   uint num_blocks;         // entries in the whole list
-  uint coefficient_count;  // K, in [1, 512]
+  uint coefficient_count;  // K, in [1, kBlockVoxels]
   float trunc_dist;        // metres; the SDF is divided by it (forward) and
                            // multiplied back (inverse)
   float dc_step;           // quantization steps, fractions of trunc_dist
@@ -41,33 +70,33 @@ layout(push_constant, scalar) uniform PushConstants {
   int num_buckets;         // the hash table's shape, for the live-block probe
   int bucket_size;
   int max_chain;
-  uint reserved;           // keeps the block at 48 bytes; unread
+  int max_quantized;       // the clamp on a quantized coefficient
 }
 pc;
 
-layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
+layout(set = 0, binding = VR_DCT_BINDING_BLOCKS, scalar) readonly buffer
+    Blocks {
   BlockIndex blocks[];
 };
 
 // Built on the host (dct_tables.hpp) and uploaded once, so every device
 // transforms against the same bits rather than its own cos().
-//   basis[k * 8 + n]  orthonormal 1-D DCT-II: X[k] = sum_n basis[k][n] x[n]
-//   zigzag[j]         voxel index (x + 8y + 64z) of kept coefficient j
-layout(set = 0, binding = 3, scalar) readonly buffer Tables {
-  float basis[64];
-  uint zigzag[512];
+//   basis[k * kEdge + n]  orthonormal 1-D DCT-II: X[k] = sum_n basis[k][n] x[n]
+//   zigzag[j]             voxel index of kept coefficient j
+layout(set = 0, binding = VR_DCT_BINDING_TABLES, scalar) readonly buffer
+    Tables {
+  float basis[kBasisSize];
+  uint zigzag[kBlockVoxels];
 };
 
 // Entries block_is_live rejected, summed over every batch for the host to
 // report.
-layout(set = 0, binding = 7, scalar) buffer Rejected { uint rejected; };
+layout(set = 0, binding = VR_DCT_BINDING_REJECTED, scalar) buffer Rejected {
+  uint rejected;
+};
 
-const uint kLanes = 64u;
-const uint kMaskWords = 16u;
-const uint kHalf = 512u;  // offset of s_work's second half
-
-shared float s_work[1024];
-shared float s_basis[64];
+shared float s_work[2u * kBlockVoxels];
+shared float s_basis[kBasisSize];
 shared uint s_live;
 
 // Whether list entry `entry` names a live block of this grid: its coord must
@@ -93,36 +122,47 @@ bool block_is_live(uint entry, uint lane) {
   return s_live != 0u;
 }
 
-// Transform one 8-point line of the cube held in s_work[src..src+511], writing
-// it to the same line of s_work[dst..dst+511]. The line is voxels
-// base, base + stride, ..., base + 7 * stride. Forward multiplies by the basis,
+// Transform one kEdge-point line of the cube held in s_work from `src`,
+// writing it to the same line of the cube at `dst`. The line is voxels base,
+// base + stride, ..., base + (kEdge - 1) * stride. Forward multiplies by the basis,
 // inverse by its transpose -- the basis is orthonormal, so that is its inverse.
 void transform_line(uint src, uint dst, uint base, uint stride, bool inverse) {
-  float line[8];
-  for (uint i = 0u; i < 8u; ++i) {
+  float line[kEdge];
+  for (uint i = 0u; i < kEdge; ++i) {
     line[i] = s_work[src + base + i * stride];
   }
-  for (uint o = 0u; o < 8u; ++o) {
+  for (uint o = 0u; o < kEdge; ++o) {
     float acc = 0.0;
-    for (uint i = 0u; i < 8u; ++i) {
-      acc += (inverse ? s_basis[i * 8u + o] : s_basis[o * 8u + i]) * line[i];
+    for (uint i = 0u; i < kEdge; ++i) {
+      acc += (inverse ? s_basis[i * kEdge + o] : s_basis[o * kEdge + i]) *
+             line[i];
     }
     s_work[dst + base + o * stride] = acc;
   }
 }
 
+// Lane r's line in each pass, by its first voxel: the x-line of r = y + kEdge z,
+// the y-line of r = x + kEdge z, and the z-line of r = x + kEdge y. Every
+// separable pass -- the fill's and the transform's -- runs on this mapping, so
+// each pass covers the cube once.
+uint x_line_base(uint lane) { return lane * kEdge; }
+uint y_line_base(uint lane) {
+  return lane % kEdge + (lane / kEdge) * kStrideZ;
+}
+uint z_line_base(uint lane) {
+  return lane % kEdge + (lane / kEdge) * kStrideY;
+}
+
 // The three separable passes, s_work[0..] -> [kHalf..] -> [0..] -> [kHalf..].
-// Lane r owns, per pass: the x-line starting at 8r (r = y + 8z); the y-line at
-// x + 64z (x = r % 8, z = r / 8); the z-line at x + 8y (x = r % 8, y = r / 8).
 // Every pass reads lines other lanes wrote, hence a barrier after each. The
-// caller must have filled s_work[0..511] and s_basis, and passed a barrier.
-// The result is left in s_work[kHalf..kHalf+511].
+// caller must have filled the first half of s_work and s_basis, and passed a
+// barrier. The result is left in the second half, from kHalf.
 void transform_cube(uint lane, bool inverse) {
-  transform_line(0u, kHalf, lane * 8u, 1u, inverse);
+  transform_line(0u, kHalf, x_line_base(lane), kStrideX, inverse);
   barrier();
-  transform_line(kHalf, 0u, (lane & 7u) + (lane >> 3u) * 64u, 8u, inverse);
+  transform_line(kHalf, 0u, y_line_base(lane), kStrideY, inverse);
   barrier();
-  transform_line(0u, kHalf, (lane & 7u) + (lane >> 3u) * 8u, 64u, inverse);
+  transform_line(0u, kHalf, z_line_base(lane), kStrideZ, inverse);
   barrier();
 }
 

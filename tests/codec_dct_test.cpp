@@ -49,10 +49,18 @@ namespace {
 
 constexpr float kTrunc = 0.04f;
 constexpr std::uint32_t kVpb = codec::kVoxelsPerBlock;
+using codec::detail::kEdge;
+using codec::detail::kStrideY;
+using codec::detail::kStrideZ;
+
+// A voxel's coordinates inside its block, the inverse of voxel_index.
+std::uint32_t vx(std::uint32_t v) { return v % kEdge; }
+std::uint32_t vy(std::uint32_t v) { return (v / kStrideY) % kEdge; }
+std::uint32_t vz(std::uint32_t v) { return v / kStrideZ; }
 using Cube = std::array<double, kVpb>;
 using Observed = std::array<bool, kVpb>;
 
-vol::VoxelGridParams small_grid(std::int32_t block_size = 8) {
+vol::VoxelGridParams small_grid(std::int32_t block_size = codec::kBlockSize) {
   vol::VoxelGridParams gp{};
   gp.voxel_size = 0.005f;
   gp.block_size = block_size;
@@ -60,15 +68,14 @@ vol::VoxelGridParams small_grid(std::int32_t block_size = 8) {
   gp.trunc_dist = kTrunc;
   gp.bucket_size = 8;
   gp.num_buckets = 256;
-  gp.num_blocks = 256 * 8;
+  gp.num_blocks = gp.num_buckets * gp.bucket_size;
   gp.max_chain = 128;
   return gp;
 }
 
-vr::Result<vol::VoxelBlockGrid> make_grid(vr::Device& device,
-                                          vr::Allocator& allocator,
-                                          std::int32_t block_size = 8,
-                                          bool with_weight = true) {
+vr::Result<vol::VoxelBlockGrid> make_grid(
+    vr::Device& device, vr::Allocator& allocator,
+    std::int32_t block_size = codec::kBlockSize, bool with_weight = true) {
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
   return vol::VoxelBlockGrid::create(device, allocator, small_grid(block_size),
@@ -142,7 +149,7 @@ Cube random_cube(std::uint32_t seed) {
 Cube plane_cube() {
   Cube s{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
-    const double x = v % 8, z = v / 64;
+    const double x = vx(v), z = vz(v);
     s[v] = (z - 3.5) * 0.12 + (x - 3.5) * 0.05;
   }
   return s;
@@ -151,7 +158,8 @@ Cube plane_cube() {
 Cube sphere_cube() {
   Cube s{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
-    const double x = v % 8 - 3.5, y = (v / 8) % 8 - 3.5, z = v / 64 - 3.5;
+    const double c = (kEdge - 1) / 2.0;  // the block's centre
+    const double x = vx(v) - c, y = vy(v) - c, z = vz(v) - c;
     s[v] =
         std::clamp((std::sqrt(x * x + y * y + z * z) - 2.5) * 0.3, -1.0, 1.0);
   }
@@ -167,18 +175,19 @@ Cube constant_cube(double c) {
 // --- The double-precision reference: the same separable transform. ---------
 
 Cube reference_dct(const Cube& in, bool inverse) {
-  const std::array<double, 64> b = codec::detail::dct_basis<double>();
+  const std::array<double, codec::detail::kBasisSize> b =
+      codec::detail::dct_basis<double>();
   Cube a = in;
   Cube out{};
-  const std::uint32_t strides[3] = {1, 8, 64};
+  const std::uint32_t strides[3] = {1, kStrideY, kStrideZ};
   for (std::uint32_t stride : strides) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
-      const std::uint32_t pos = (v / stride) % 8;  // this voxel's index on axis
+      const std::uint32_t pos = (v / stride) % kEdge;  // index on this axis
       const std::uint32_t base = v - pos * stride;
       double acc = 0.0;
-      for (std::uint32_t i = 0; i < 8; ++i) {
-        acc +=
-            (inverse ? b[i * 8 + pos] : b[pos * 8 + i]) * a[base + i * stride];
+      for (std::uint32_t i = 0; i < kEdge; ++i) {
+        acc += (inverse ? b[i * kEdge + pos] : b[pos * kEdge + i]) *
+               a[base + i * stride];
       }
       out[v] = acc;
     }
@@ -197,22 +206,22 @@ Cube reference_fill(const Cube& in, const Observed& observed) {
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     s[v] = observed[v] ? in[v] : 0.0;
   }
-  const std::uint32_t strides[3] = {1, 8, 64};
+  const std::uint32_t strides[3] = {1, kStrideY, kStrideZ};
   for (std::uint32_t stride : strides) {
     const Cube before = s;
     const Observed was = known;
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       if (was[v]) continue;
-      const int pos = int((v / stride) % 8);
+      const int pos = int((v / stride) % kEdge);
       const std::uint32_t base = v - std::uint32_t(pos) * stride;
-      for (int d = 1; d < 8; ++d) {
+      for (int d = 1; d < int(kEdge); ++d) {
         const int lo = pos - d, hi = pos + d;
         if (lo >= 0 && was[base + std::uint32_t(lo) * stride]) {
           s[v] = before[base + std::uint32_t(lo) * stride];
           known[v] = true;
           break;
         }
-        if (hi < 8 && was[base + std::uint32_t(hi) * stride]) {
+        if (hi < int(kEdge) && was[base + std::uint32_t(hi) * stride]) {
           s[v] = before[base + std::uint32_t(hi) * stride];
           known[v] = true;
           break;
@@ -363,7 +372,7 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
 
   const double dc = params.dc_step, ac = params.ac_step;
   const double bound =
-      std::sqrt((dc * dc / 4.0 + 511.0 * ac * ac / 4.0) / kVpb) + 1e-5;
+      std::sqrt((dc * dc / 4.0 + (kVpb - 1) * ac * ac / 4.0) / kVpb) + 1e-5;
   const float* weight = attr(grid, "weight");
   for (int i = 0; i < 4; ++i) {
     const double err =
@@ -396,7 +405,7 @@ int truncation_matches_reference_case(vr::Device& device,
   const auto zigzag = codec::detail::zigzag_order();
 
   // The cumulative sizes of the zigzag's total-frequency bands, and all 512.
-  const std::uint32_t ks[] = {1, 4, 10, 20, 35, 84, 512};
+  const std::uint32_t ks[] = {1, 4, 10, 20, 35, 84, kVpb};
   double last = 1e9;
   for (std::uint32_t k : ks) {
     write_block(grid, block, content, observed);
@@ -420,7 +429,7 @@ int truncation_matches_reference_case(vr::Device& device,
     CHECK(err <= last + 1e-4);  // more coefficients never hurt
     last = err;
   }
-  CHECK(last <= 1e-3);  // K = 512 is near-lossless
+  CHECK(last <= 1e-3);  // K = kVpb is near-lossless
   return 0;
 }
 
@@ -448,7 +457,9 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   const vol::BlockList list = grid.block_list(blocks);
   CHECK(t.forward(grid, list, params, out).ok());
   for (std::uint32_t v = 0; v < kVpb; ++v) {
-    const bool bit = ((out.masks[v / 32] >> (v % 32)) & 1u) != 0u;
+    const bool bit =
+        ((out.masks[v / codec::kMaskWordBits] >> (v % codec::kMaskWordBits)) &
+         1u) != 0u;
     CHECK(bit == (v % 4 >= 2));
   }
   for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
@@ -531,7 +542,7 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(out.coefficients.size() == 2);
   CHECK(t.inverse(grid, list, out).ok());
   const Cube back = read_block(grid, blocks[0]);
-  const double tol = 0.01 / (2.0 * std::sqrt(512.0)) + 1e-6;
+  const double tol = 0.01 / (2.0 * std::sqrt(double(kVpb))) + 1e-6;
   for (double s : back) {
     CHECK(std::fabs(s - 0.3) <= tol);
   }
@@ -551,7 +562,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   const vol::BlockIndex block = active.value()[0];
   Cube edge{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
-    edge[v] = v / 64 < 4 ? 1.0 : -1.0;
+    edge[v] = vz(v) < kEdge / 2 ? 1.0 : -1.0;
   }
   write_block(grid, block, edge, observed);
 
@@ -602,7 +613,7 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
   Cube truth{};
   Observed obs{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
-    const double x = v % 8, y = (v / 8) % 8, z = v / 64;
+    const double x = vx(v), y = vy(v), z = vz(v);
     const double d = (2.0 - (0.6 * z + 0.5 * x + 0.3 * y)) / std::sqrt(0.7);
     truth[v] = std::clamp(d / 4.0, -1.0, 1.0);
     obs[v] = d > -2.0;
@@ -788,7 +799,8 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   // in-bounds writes the inverse would make into the wrong slot.
   const std::int32_t unused = free_ptr(grid, blocks);
   CHECK(unused >= 0);
-  const std::int32_t bad_ptrs[] = {small_grid().num_blocks * 512, -512, 1,
+  const std::int32_t vpb = std::int32_t(kVpb);
+  const std::int32_t bad_ptrs[] = {small_grid().num_blocks * vpb, -vpb, 1,
                                    unused, blocks[2].ptr};
   for (std::int32_t p : bad_ptrs) {
     std::vector<vol::BlockIndex> forged = blocks;
@@ -862,7 +874,8 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
 
   // A grid without a weight attribute -- refused for an empty list too, before
   // anything is allocated, rather than only once there is work to bind.
-  vr::Result<vol::VoxelBlockGrid> gw = make_grid(device, allocator, 8, false);
+  vr::Result<vol::VoxelBlockGrid> gw =
+      make_grid(device, allocator, codec::kBlockSize, false);
   CHECK(gw.ok());
   vol::VoxelBlockGrid no_weight = std::move(gw).value();
   CHECK(no_weight.map().allocate(one.data(), 1).ok());
