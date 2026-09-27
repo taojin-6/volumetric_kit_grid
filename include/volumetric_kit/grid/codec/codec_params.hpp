@@ -7,6 +7,7 @@
 /// @brief The knobs of the per-frame TSDF geometry codec: how many DCT
 ///        coefficients each block keeps and how coarsely they are quantized.
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -14,21 +15,6 @@
 #include "volumetric_kit/recon/core/result.hpp"
 
 namespace volumetric_kit::recon::codec {
-
-namespace detail {
-
-/// `sqrt(x)` for `x >= 0` at compile time, which `std::sqrt` is not in C++17,
-/// to within an ulp: Newton's iteration from above, which decreases to the
-/// root and stops once a step no longer moves it down.
-constexpr double constexpr_sqrt(double x) {
-  double r = x > 1.0 ? x : 1.0;
-  for (double next = 0.5 * (r + x / r); next < r; next = 0.5 * (r + x / r)) {
-    r = next;
-  }
-  return r;
-}
-
-}  // namespace detail
 
 /// The only block edge the codec transforms. Its zigzag order and cosine table
 /// are 8-specific, so a grid with another `block_size` is refused, never
@@ -55,24 +41,17 @@ static_assert(kVoxelsPerBlock % kMaskWordBits == 0,
 inline constexpr std::int32_t kMaxQuantizedMagnitude =
     std::numeric_limits<std::int16_t>::max();
 
-/// @brief The largest magnitude one of a block's DCT coefficients can take,
-///        `sqrt(kVoxelsPerBlock)` (~22.63).
+/// @brief The smallest quantization step the codec accepts, as a fraction of
+///        `trunc_dist`: `sqrt(kVoxelsPerBlock) / kMaxQuantizedMagnitude`.
 ///
 /// The transform is orthonormal and runs on SDF normalized into [-1, 1], so
 /// every coefficient is a dot product of a unit basis vector with a vector of
-/// norm at most `sqrt(kVoxelsPerBlock)`.
-inline constexpr double kMaxCoefficientMagnitude =
-    detail::constexpr_sqrt(kVoxelsPerBlock);
-
-/// @brief The smallest quantization step the codec accepts, as a fraction of
-///        `trunc_dist`: @ref kMaxCoefficientMagnitude over
-///        @ref kMaxQuantizedMagnitude.
-///
-/// A step at or above it keeps every quantized value inside
-/// @ref kMaxQuantizedMagnitude, so the clamp is a guard against float drift and
-/// never a silent loss. @ref CodecParams::validate refuses anything finer.
-inline constexpr float kMinStep =
-    static_cast<float>(kMaxCoefficientMagnitude / kMaxQuantizedMagnitude);
+/// norm at most `sqrt(kVoxelsPerBlock)` (~22.63). A step at or above this
+/// therefore keeps every quantized value inside @ref kMaxQuantizedMagnitude, so
+/// the clamp is a guard against float drift and never a silent loss.
+/// @ref CodecParams::validate refuses anything finer.
+inline const float kMinStep = static_cast<float>(
+    std::sqrt(double(kVoxelsPerBlock)) / kMaxQuantizedMagnitude);
 
 /// @brief How a frame's blocks are transformed and quantized.
 ///

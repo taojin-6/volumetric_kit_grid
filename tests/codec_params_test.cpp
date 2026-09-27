@@ -47,19 +47,14 @@ int params_validate_case() {
   p.coefficient_count = kVoxelsPerBlock;
   CHECK(p.validate().ok());
 
-  // The bound the floor is built on is the one a coefficient can reach, to
-  // within the ulp the compile-time square root promises.
-  const double root = std::sqrt(double(kVoxelsPerBlock));
-  CHECK(std::fabs(codec::kMaxCoefficientMagnitude - root) <=
-        root * std::numeric_limits<double>::epsilon());
-
   // The floor is inclusive, and it is what keeps the clamp from engaging:
   // the largest possible coefficient, sqrt(kVoxelsPerBlock), divided by the
   // floor step rounds to no more than the clamp.
   p.dc_step = codec::kMinStep;
   p.ac_step = codec::kMinStep;
   CHECK(p.validate().ok());
-  CHECK(std::nearbyint(root / double(codec::kMinStep)) <=
+  CHECK(std::nearbyint(std::sqrt(double(kVoxelsPerBlock)) /
+                       double(codec::kMinStep)) <=
         double(codec::kMaxQuantizedMagnitude));
   p.dc_step = codec::kMinStep * 0.99f;
   CHECK(!p.validate().ok());
