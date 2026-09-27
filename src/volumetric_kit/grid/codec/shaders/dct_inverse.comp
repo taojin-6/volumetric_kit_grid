@@ -1,0 +1,77 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// Inverse block DCT: for each listed block, dequantize its K zigzag-ordered
+// coefficients into an otherwise-zero cube, inverse-transform, and write the
+// block back. An observed voxel (its mask bit set) gets the reconstructed SDF,
+// scaled by trunc_dist and clamped to +-trunc_dist -- the range the integrator
+// keeps, which ringing from the dropped coefficients can overshoot -- and the
+// decoded weight. An unobserved voxel gets zero tsdf and zero weight, exactly
+// what a freshly allocated block holds, so the mesher skips it as it skipped
+// the original. An entry that is not a live block of the grid (see
+// block_is_live) is written nothing.
+//
+// Re-implements the prior engine's computeIDCTKernel (compute_dct.cu), which
+// wrote every voxel's SDF and left weights alone; the mask is what replaces the
+// weights it did not have to send.
+
+#extension GL_GOOGLE_include_directive : require
+#include "dct_common.glsl"
+
+layout(local_size_x = kLanes) in;
+
+layout(set = 0, binding = VR_DCT_BINDING_TSDF, scalar) writeonly buffer Tsdf {
+  float tsdf[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) writeonly buffer
+    Weight {
+  float weight[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_COEFFICIENTS, scalar) readonly buffer
+    Coefficients {
+  int coefficients[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) readonly buffer
+    Masks {
+  uint masks[];
+};
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.block_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup; see dct_forward.comp.
+  if (entry >= pc.num_blocks || !block_is_live(entry, lane)) {
+    return;
+  }
+  uint voxel_base = uint(blocks[entry].ptr);
+
+  s_basis[lane] = basis[lane];
+  for (uint x = 0u; x < kEdge; ++x) {
+    s_work[x_line_base(lane) + x] = 0.0;
+  }
+  barrier();
+
+  // Scatter the kept coefficients to their zigzag positions; the rest stay 0.
+  uint k = pc.coefficient_count;
+  for (uint j = lane; j < k; j += kLanes) {
+    s_work[zigzag[j]] = float(coefficients[entry * k + j]) * step_for(j);
+  }
+  barrier();
+
+  transform_cube(lane, true);
+
+  // Write back this lane's x-line, gated by its 8 mask bits.
+  uint line_bits =
+      (masks[entry * kMaskWords + lane / kLinesPerMaskWord] >>
+       ((lane % kLinesPerMaskWord) * kEdge)) &
+      kLineBits;
+  for (uint x = 0u; x < kEdge; ++x) {
+    uint v = x_line_base(lane) + x;
+    bool observed = ((line_bits >> x) & 1u) != 0u;
+    float sdf = clamp(s_work[kHalf + v], -1.0, 1.0) * pc.trunc_dist;
+    tsdf[voxel_base + v] = observed ? sdf : 0.0;
+    weight[voxel_base + v] = observed ? pc.decoded_weight : 0.0;
+  }
+}

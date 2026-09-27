@@ -325,4 +325,30 @@ Status VoxelBlockGrid::clear() {
   return {};
 }
 
+Status VoxelBlockGrid::check_block_list(const BlockList& blocks,
+                                        const char* who) const {
+  if (blocks.blocks == nullptr && blocks.count != 0) {
+    return Status::invalid_argument(
+        std::string(who) + ": the block list is null with a non-zero count");
+  }
+  // Exempt when empty: a default-constructed list's epoch is 0, which
+  // next_topology_epoch() never returns, so the comparison could only fail.
+  if (blocks.count != 0 && blocks.epoch != topology_epoch()) {
+    return Status::invalid_argument(
+        std::string(who) +
+        ": the block list was compacted against topology epoch " +
+        std::to_string(blocks.epoch) + ", but this grid is now at " +
+        std::to_string(topology_epoch()) +
+        " (a remove()/clear() since then has re-used its block pointers)");
+  }
+  if (blocks.count > static_cast<std::uint32_t>(grid().num_blocks)) {
+    return Status::invalid_argument(
+        std::string(who) + ": the block list holds " +
+        std::to_string(blocks.count) +
+        " blocks, more than this grid's block heap (" +
+        std::to_string(grid().num_blocks) + ")");
+  }
+  return {};
+}
+
 }  // namespace volumetric_kit::recon::volume

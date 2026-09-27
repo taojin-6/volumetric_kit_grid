@@ -130,11 +130,11 @@ constexpr std::uint32_t kMaxSharedCells = 512;
 // under-reports one that is. Neither changes what the kernel emits.
 constexpr std::uint32_t kMaxCachedCells = 4 * 256;
 
-// A corner with weight at or below this is treated as unintegrated, and any
-// cell touching it is skipped. Small and positive so a never-integrated voxel
-// (weight 0) is excluded while any genuine integration counts. The `tsdf` tier
-// will surface this as a tunable knob.
-constexpr float kWeightThreshold = 1e-6f;
+// A corner with weight below this is treated as unintegrated (the kernel's test
+// is `weight < weight_threshold`), and any cell touching it is skipped. The
+// volume tier defines it, so the codec's observed mask reads the same value.
+// The `tsdf` tier will surface this as a tunable knob.
+constexpr float kWeightThreshold = volume::kObservedWeight;
 
 // The lookup tables, flattened for upload -- byte-identical to the GLSL
 // `Tables` block (scalar layout, all-int so std430 and scalar agree). One
@@ -1244,47 +1244,13 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // caller who fabricated a list rather than compacting one, and the epoch
   // already catches every way a list obtained honestly can go stale. What the
   // epoch does NOT catch is a count that outran its array, so the O(1) half of
-  // that bound is taken below, and the kernel takes the per-block half in the
-  // one comparison it can afford (see `num_block_slots`).
+  // that bound -- the count against the heap, which collect_compacted used to
+  // guarantee by clamping its own -- is taken by check_block_list with the
+  // epoch, and the kernel takes the per-block half in the one comparison it can
+  // afford (see `num_block_slots`). An empty list passes, so a
+  // default-constructed BlockList stays the spelling of "nothing is visible".
   if (blocks != nullptr) {
-    if (blocks->blocks == nullptr && blocks->count != 0) {
-      return Status::invalid_argument(
-          std::string(entry) +
-          ": the block list is null with a non-zero "
-          "count");
-    }
-    // An empty list names no block, so there is nothing about it that can be
-    // stale -- and refusing it on the epoch would make the natural spelling of
-    // "nothing is visible", a default-constructed BlockList, an error: its
-    // epoch defaults to 0 and next_topology_epoch() never returns 0, so the
-    // comparison below can only fail. An empty set is documented as legal and
-    // meshes nothing; that has to include this one.
-    if (blocks->count != 0 && blocks->epoch != grid.topology_epoch()) {
-      return Status::invalid_argument(
-          std::string(entry) +
-          ": the block list was compacted against "
-          "topology epoch " +
-          std::to_string(blocks->epoch) + ", but this grid is now at " +
-          std::to_string(grid.topology_epoch()) +
-          " (a remove()/clear() since then has re-used its block pointers)");
-    }
-    // The bound the deleted compact_active_blocks() path guaranteed by
-    // construction, restored as an explicit O(1) test: collect_compacted clamps
-    // its own count to num_blocks, and a std::vector's data() and size() agree
-    // by definition, so `num_active <= num_blocks` used to be free. A
-    // caller-supplied count is neither, and the epoch is blind to it --
-    // topology_epoch moves only on create/remove/clear, never on allocate or
-    // resize, so a vector re-compacted shorter while a cached BlockList keeps
-    // last frame's larger count passes every check above. Left unbounded, that
-    // count drives a memcpy off the end of the caller's array and uploads
-    // whatever followed it as BlockIndex entries.
-    if (blocks->count > static_cast<std::uint32_t>(grid.grid().num_blocks)) {
-      return Status::invalid_argument(
-          std::string(entry) + ": the block list holds " +
-          std::to_string(blocks->count) +
-          " blocks, more than this grid's block heap (" +
-          std::to_string(grid.grid().num_blocks) + ")");
-    }
+    VR_TRY(grid.check_block_list(*blocks, entry));
   }
   // The grid must carry the float tsdf + weight the sparse kernel samples; the
   // uint32 color attribute is optional (its absence -> opaque-white vertices).
