@@ -133,8 +133,7 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
         per_block, per_block > 0 ? kRawBytesPerBlock / per_block : 0.0,
         c.accuracy.rms * 1e3, c.accuracy.p95 * 1e3, c.accuracy.max * 1e3,
         c.accuracy.beyond_reach, c.coverage.rms * 1e3, c.coverage.beyond_reach,
-        f,
-        row_ms(enc_rows, "codec encode"), row_ms(dec_rows, "codec decode"));
+        f, row_ms(enc_rows, "codec encode"), row_ms(dec_rows, "codec decode"));
   }
   return {};
 }
