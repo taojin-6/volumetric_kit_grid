@@ -58,8 +58,13 @@ d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
   };
   std::set<vr::Vec3i, decltype(less)> coords(less);
   while (coords.size() < n) {
-    vr::Vec3i start(int(rng.below(200)) - 100, int(rng.below(60)) - 30,
-                    int(rng.below(60)) - 30);
+    // One draw per statement: the order a function's arguments are evaluated
+    // in is unspecified (GCC and Clang disagree), and a fixture must be the
+    // same frame on every compiler.
+    const int sx = int(rng.below(200)) - 100;
+    const int sy = int(rng.below(60)) - 30;
+    const int sz = int(rng.below(60)) - 30;
+    const vr::Vec3i start(sx, sy, sz);
     const std::uint32_t run = 1 + rng.below(12);
     for (std::uint32_t i = 0; i < run && coords.size() < n; ++i) {
       coords.insert(vr::Vec3i(start.x + int(i), start.y, start.z));
@@ -367,10 +372,14 @@ int section_rules_case() {
   t = s;
   put_u32(t[1].body, 0, get_u32(t[1].body, 0) + 2);
   CHECK(refused_as(assemble(good, t), C::InvalidArgument));
-  // A payload that does not decode is refused, not returned.
+  // A segment whose stream is malformed is refused, not returned: zeroing its
+  // initial state puts it below L, which no encoder can produce. (An
+  // arbitrary flipped byte is NOT guaranteed to be refused -- one in raw bits
+  // decodes to a different, valid frame; see codec_rans_test.)
   t = s;
-  t[2].body[t[2].body.size() / 2] ^= 0x5A;
-  CHECK(!read(assemble(good, t)).ok());
+  t[2].body[0] = 0;
+  t[2].body[1] = 0;
+  CHECK(refused_as(assemble(good, t), C::InvalidArgument));
   return 0;
 }
 
