@@ -578,8 +578,11 @@ class VR_VOLUME_API VoxelHashMap {
   // whole, so an over-large one is invalid usage rather than a slow path.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // Persistent device buffers. TODO(volume): these are host-visible for this
-  // slice; a device-local + staging path is a follow-up perf pass.
+  // Persistent device buffers. TODO(volume): all but the bucket locks are
+  // host-visible for this slice; a device-local + staging path is a follow-up
+  // perf pass. The locks are device-local already, since only the kernels
+  // touch them and their spin is what a discrete GPU pays for most (the
+  // 2026-09-28 measured lesson).
   Buffer entries_;
   Buffer heap_;
   Buffer heap_counter_;

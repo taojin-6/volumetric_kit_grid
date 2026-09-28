@@ -83,9 +83,15 @@ Result<PersistentBuffers> make_persistent_buffers(Allocator& allocator,
                                                      sizeof(std::uint32_t)));
   VR_ASSIGN(bufs.heap_counter,
             storage_buffer(allocator, sizeof(std::uint32_t)));
+  // Device-local, unlike the rest: only hash_init writes it and only the
+  // kernels spin on it, and a spin lock in host-visible memory is an atomic
+  // across PCIe per attempt on a discrete GPU. That took 1.97 s to allocate a
+  // 5 000-triangle sheet on an RTX 5090 (3.4 ms device-local) and stalled a
+  // 320 000-triangle one past the driver's watchdog (the 2026-09-28 measured
+  // lesson).
   VR_ASSIGN(bufs.bucket_mutex,
-            storage_buffer(allocator,
-                           VkDeviceSize(num_buckets) * sizeof(std::int32_t)));
+            device_storage_buffer(
+                allocator, VkDeviceSize(num_buckets) * sizeof(std::int32_t)));
   VR_ASSIGN(bufs.fail_counts,
             storage_buffer(allocator, kFailSlots * sizeof(std::uint32_t)));
   VR_ASSIGN(bufs.compacted, storage_buffer(allocator, VkDeviceSize(num_blocks) *
@@ -116,8 +122,9 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   // still anchored (see topology_epoch()).
   map.topology_epoch_ = next_topology_epoch();
 
-  // Persistent buffers + scratch (host-visible for this slice; device-local +
-  // staging is a follow-up perf pass -- see the header TODO). Built as a bundle
+  // Persistent buffers + scratch (host-visible for this slice but for the
+  // bucket locks; device-local + staging is a follow-up perf pass -- see the
+  // header TODO). Built as a bundle
   // and moved in together so the sizing lives in one place (make_persistent_-
   // buffers), shared with resize().
   VR_ASSIGN(PersistentBuffers bufs, make_persistent_buffers(allocator, grid));
