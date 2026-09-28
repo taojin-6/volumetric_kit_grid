@@ -86,11 +86,9 @@ inline void orient_outward(Mesh& m, vr::Vec3f centre) {
   }
 }
 
-// A cube of side `side` at `origin`, 12 triangles, with its (1,1,1) corner
-// pushed in to 0.6 of the way along the diagonal: concave edges and a concave
-// vertex, the case a convex fixture cannot reach, and the sharp features a
-// K-coefficient block transform smooths.
-inline Mesh dented_cube(vr::Vec3f origin, float side) {
+// A cube of side `side` at `origin`, 12 triangles, wound outward: flat faces
+// and the 90-degree edges and corners a K-coefficient block transform smooths.
+inline Mesh cube(vr::Vec3f origin, float side) {
   Mesh m;
   for (int k = 0; k < 8; ++k) {
     const vr::Vec3f unit(float((k == 1 || k == 2 || k == 5 || k == 6)),
@@ -104,6 +102,15 @@ inline Mesh dented_cube(vr::Vec3f origin, float side) {
     m.i.insert(m.i.end(), {q[0], q[1], q[2], q[0], q[2], q[3]});
   }
   orient_outward(m, origin + vr::Vec3f(0.5f * side));
+  return m;
+}
+
+// The cube with its (1,1,1) corner pushed in to 0.6 of the way along the
+// diagonal: concave edges and a concave vertex, the case a convex fixture
+// cannot reach. It is oriented before it is dented, and moving a vertex does
+// not change a winding.
+inline Mesh dented_cube(vr::Vec3f origin, float side) {
+  Mesh m = cube(origin, side);
   m.v[6] = origin + vr::Vec3f(0.6f * side);
   return m;
 }
