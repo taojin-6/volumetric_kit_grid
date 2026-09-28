@@ -228,8 +228,12 @@ int main() {
         0);
   CHECK((big_mesh.value().index_usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) != 0);
 
-  // --- The default is exactly STORAGE_BUFFER ---------------------------------
-  // A recon-only consumer pays for nothing it does not use.
+  // --- The default is exactly STORAGE_BUFFER and the transfer bits ----------
+  // A recon-only consumer pays for nothing it does not use; the transfer bits
+  // are how the host reaches the device-local buffers at all.
+  constexpr VkBufferUsageFlags kBase = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   vr::Result<mesh::MarchingCubes> plain_result =
       mesh::MarchingCubes::create(device.value(), allocator.value());
   CHECK(plain_result.ok());
@@ -237,8 +241,8 @@ int main() {
 
   vr::Result<mesh::DeviceMesh> plain_mesh = plain.extract_device(small, 0.0f);
   CHECK(plain_mesh.ok());
-  CHECK(plain_mesh.value().vertex_usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-  CHECK(plain_mesh.value().index_usage == VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+  CHECK(plain_mesh.value().vertex_usage == kBase);
+  CHECK(plain_mesh.value().index_usage == kBase);
   // The command is unconditional, not config-gated: a recon-only consumer still
   // gets one. Asserted on the *default* extractor specifically, because every
   // other command assertion here runs through a configured one -- gating the
@@ -246,8 +250,7 @@ int main() {
   // DeviceMesh carried a null handle.
   CHECK(plain_mesh.value().indirect != VK_NULL_HANDLE);
   CHECK(plain_mesh.value().indirect_usage ==
-        (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
+        (kBase | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
   // Default config names no families, so all three stay EXCLUSIVE -- bit for
   // bit what this tier allocated before any of it existed.
   CHECK(plain_mesh.value().sharing_mode == VK_SHARING_MODE_EXCLUSIVE);

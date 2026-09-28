@@ -10,11 +10,13 @@
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -46,9 +48,9 @@ constexpr std::uint64_t kMaxTrisPerCell = 5;
 // and reads it back, the GLSL kernel aliases its first field as the append
 // atomic (`buffer DrawCommand { uint index_count; ... }`, offset 0 under scalar
 // block layout), and the renderer's vkCmdDrawIndexedIndirect consumes the whole
-// struct. Vulkan fixes this layout, but the raw 4-byte write in
-// disarm_indirect_command() and the two 20-byte reads assume it here, and this
-// file already pins every other cross-language struct the same way.
+// struct. Vulkan fixes this layout, but the 4-byte fill in
+// disarm_indirect_command() and the IndirectWords readback assume it here, and
+// this file already pins every other cross-language struct the same way.
 static_assert(sizeof(VkDrawIndexedIndirectCommand) == 20,
               "VkDrawIndexedIndirectCommand must be 20 bytes -- the kernel's "
               "DrawCommand mirror and the host reset/readback assume it");
@@ -269,13 +271,21 @@ constexpr VkDeviceSize kRemeshedBlocksOffset =
 constexpr VkDeviceSize kIndirectBufferBytes =
     kRemeshedBlocksOffset + sizeof(std::uint32_t);
 
-// Read one of the scratch words back out of the command buffer.
-std::uint32_t read_scratch(const Buffer& indirect, VkDeviceSize offset) {
-  std::uint32_t value = 0;
-  std::memcpy(&value, static_cast<const std::byte*>(indirect.mapped()) + offset,
-              sizeof(value));
-  return value;
-}
+// The whole command buffer as the host resets it and reads it back, in one
+// transfer each way.
+struct IndirectWords {
+  VkDrawIndexedIndirectCommand command;
+  std::uint32_t vertex_count;
+  std::uint32_t sharing_applied;
+  std::uint32_t remeshed_blocks;
+};
+static_assert(sizeof(IndirectWords) == kIndirectBufferBytes &&
+                  offsetof(IndirectWords, vertex_count) == kVertexCountOffset &&
+                  offsetof(IndirectWords, sharing_applied) ==
+                      kSharingAppliedOffset &&
+                  offsetof(IndirectWords, remeshed_blocks) ==
+                      kRemeshedBlocksOffset,
+              "IndirectWords must mirror the command buffer's layout");
 
 // Bytes a vertex arena needs to hold @p vertex_capacity VERTICES.
 //
@@ -429,9 +439,8 @@ Status MarchingCubes::claim_output_slot(const char* entry) {
   // current slot on the strength of a *generation* comparison. Anything
   // fallible in between leaves a window where slot_ has moved and generation_
   // has not, so an outstanding DeviceMesh passes the currency check and is
-  // copied out of a slot that may never have been sized -- a memcpy from
-  // Buffer::mapped() == nullptr, or from an older, smaller arena once the ring
-  // has turned.
+  // copied out of a slot that may never have been sized, or from an older,
+  // smaller arena once the ring has turned.
   //
   // Once per extract, not once per call, is structural now rather than
   // conditional: ensure_output_buffers runs twice when a call refits against
@@ -549,7 +558,8 @@ void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   released_through_ = std::max(released_through_, generation);
 }
 
-Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
+Status MarchingCubes::ensure_indirect_command(CommandBatch& batch,
+                                              std::uint32_t seed_triangles,
                                               std::uint32_t seed_vertices) {
   if (!indirect().valid()) {
     // INDIRECT_BUFFER beside STORAGE_BUFFER: the kernel counts into field 0
@@ -561,8 +571,8 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
     // surely as it reads the arena, so it takes the same sharing treatment.
     VR_ASSIGN(
         indirect(),
-        storage_buffer(
-            *allocator_, kIndirectBufferBytes, HostAccess::Random,
+        device_storage_buffer(
+            *allocator_, kIndirectBufferBytes,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
@@ -573,17 +583,16 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
   // result a *drawable* command rather than a number a host has to build one
   // from -- one instance, no index or vertex offset, and the identity index run
   // means firstIndex is always 0.
-  VkDrawIndexedIndirectCommand reset{};
+  IndirectWords reset{};
   // Seeded, not zeroed, for an incremental pass: the arena still holds that
   // many triangles from the last extract, and the kernel's atomic hands out
   // APPEND slots past them. Every other caller passes 0, which is the plain
   // reset this has always been.
-  reset.indexCount = seed_triangles * kIndicesPerTriangle;
-  reset.instanceCount = 1;
-  reset.firstIndex = 0;
-  reset.vertexOffset = 0;
-  reset.firstInstance = 0;
-  std::memcpy(indirect().mapped(), &reset, sizeof(reset));
+  reset.command.indexCount = seed_triangles * kIndicesPerTriangle;
+  reset.command.instanceCount = 1;
+  reset.command.firstIndex = 0;
+  reset.command.vertexOffset = 0;
+  reset.command.firstInstance = 0;
   // The three scratch words past the command. Reset for the same reason
   // indexCount is: a refit re-runs the dispatch, and a counter carried over
   // would accumulate onto the abandoned attempt's total. `sharing_applied` for
@@ -597,13 +606,12 @@ Status MarchingCubes::ensure_indirect_command(std::uint32_t seed_triangles,
   // out APPEND slots past them. Only that kernel allocates through this word,
   // so every other caller passes 0 and this is the plain reset it has always
   // been.
-  const std::uint32_t scratch_reset[3] = {seed_vertices, 0, 0};
-  std::memcpy(static_cast<std::byte*>(indirect().mapped()) + kVertexCountOffset,
-              scratch_reset, sizeof(scratch_reset));
-  return {};
+  reset.vertex_count = seed_vertices;
+  // Recorded, not written: it lands in the batch ahead of the dispatch.
+  return batch.upload(indirect(), 0, &reset, sizeof(reset));
 }
 
-void MarchingCubes::disarm_indirect_command() noexcept {
+void MarchingCubes::disarm_indirect_command() {
   if (!indirect().valid()) return;
   // Zero, not clamped to the arena. A clamp bounds how many indices a draw
   // READS; it says nothing about their VALUES, and on every path that reaches
@@ -616,9 +624,13 @@ void MarchingCubes::disarm_indirect_command() noexcept {
   // geometry".
   //
   // Field 0 only: the other four are still the drawable values the reset wrote,
-  // so the command stays well-formed and simply draws nothing.
-  const std::uint32_t none = 0;
-  std::memcpy(indirect().mapped(), &none, sizeof(none));
+  // so the command stays well-formed and simply draws nothing. Its own batch,
+  // and best effort: every caller is already returning a failure, and one the
+  // device refuses leaves nothing drawable anyway.
+  CommandBatch batch(*device_, *allocator_);
+  if (batch.fill(indirect(), 0, sizeof(std::uint32_t), 0u).ok()) {
+    (void)batch.submit();
+  }
 }
 
 std::uint32_t MarchingCubes::plan_vertex_capacity(
@@ -680,6 +692,9 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   if (num_blocks <= block_span_capacity()) return {};
   const VkDeviceSize bytes =
       static_cast<VkDeviceSize>(num_blocks) * sizeof(BlockSpan);
+  // Host-visible, unlike every other buffer here: the host is its reader
+  // (block_spans() hands out a pointer, and the live sum below walks it), and
+  // the kernel writes it once per block.
   VR_ASSIGN(Buffer grown,
             storage_buffer(*allocator_, bytes, HostAccess::Random));
 
@@ -731,7 +746,8 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   return {};
 }
 
-Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
+Status MarchingCubes::ensure_output_buffers(CommandBatch& batch,
+                                            std::uint32_t triangle_capacity,
                                             std::uint32_t vertex_capacity,
                                             std::uint32_t seed_triangles,
                                             std::uint32_t seed_vertices,
@@ -773,7 +789,7 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // parameter rather than a member: either guard returns without resetting
   // anything, and a seed latched on the object would then survive to be
   // inherited by a later empty extract over an arena it had rewritten.
-  VR_TRY(ensure_indirect_command(seed_triangles, seed_vertices));
+  VR_TRY(ensure_indirect_command(batch, seed_triangles, seed_vertices));
 
   // Two buffers, two budgets, and each is grown ON ITS OWN.
   //
@@ -841,9 +857,9 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
   // rather than a capacity claiming a buffer that was never allocated.
   //
   // These assignments call vmaDestroyBuffer *immediately* -- there is no fence
-  // wait and no deferred retire. Safe for this tier's own work, which is
-  // fence-blocked inside submit_single_time, and safe for an external consumer
-  // only because the slot was released first (MarchingCubesConfig::slot_count).
+  // wait and no deferred retire. Safe for this tier's own work, whose batches
+  // are fence-blocked at submit, and safe for an external consumer only because
+  // the slot was released first (MarchingCubesConfig::slot_count).
   Buffer grown_arena;
   Buffer indices_buf;
   if (grow_arena) {
@@ -852,10 +868,10 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
     // usage survives a reallocation (see MarchingCubesConfig).
     VR_ASSIGN(
         grown_arena,
-        storage_buffer(
+        device_storage_buffer(
             *allocator_,
             static_cast<VkDeviceSize>(arena_bytes_for(target_vertex_capacity)),
-            HostAccess::Random, config_.extra_vertex_usage,
+            config_.extra_vertex_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
   }
@@ -863,35 +879,22 @@ Status MarchingCubes::ensure_output_buffers(std::uint32_t triangle_capacity,
     index_run() = Buffer{};
     VR_ASSIGN(
         indices_buf,
-        storage_buffer(
+        device_storage_buffer(
             *allocator_,
             static_cast<VkDeviceSize>(index_run_bytes_for(target_capacity)),
-            // The access pattern follows which side writes this run.
-            //
-            // Sharing off: the kernel writes vertices at `tri * 3`, so the run
-            // IS the identity 0,1,2,... -- the host fills it once here and
-            // download() regenerates it rather than reading back, so the only
-            // host access it ever gets is this forward write. SequentialWrite
-            // is exactly that, and on a discrete GPU it also asks VMA for
-            // device-local host-visible (BAR) memory rather than plain system
-            // RAM, which matters because this is the buffer a seam-B renderer
-            // binds as its INDEX_BUFFER and fetches every presented frame.
-            //
-            // Sharing on: only the kernel knows the mapping, so download() has
-            // to read it back, and a host read from write-combined memory is
-            // pathologically slow -- which would surface as a download
-            // regression rather than an error. Booked in the placement TODO on
-            // MarchingCubesConfig, since it is the same discrete-GPU trade.
-            config_.share_vertices ? HostAccess::Random
-                                   : HostAccess::SequentialWrite,
             config_.extra_index_usage,
             config_.queue_family_count > 0 ? config_.queue_families : nullptr,
             config_.queue_family_count));
     if (!config_.share_vertices) {
-      auto* indices = static_cast<std::uint32_t*>(indices_buf.mapped());
-      const auto index_count =
-          static_cast<std::size_t>(target_capacity) * kIndicesPerTriangle;
-      std::iota(indices, indices + index_count, std::uint32_t{0});
+      // The kernel writes vertices at `tri * 3`, so the run IS the identity
+      // 0,1,2,..., staged up once per grow; download() regenerates it rather
+      // than reading it back. With sharing only the kernel knows the mapping,
+      // and it writes the run itself.
+      std::vector<std::uint32_t> identity(
+          static_cast<std::size_t>(target_capacity) * kIndicesPerTriangle);
+      std::iota(identity.begin(), identity.end(), std::uint32_t{0});
+      VR_TRY(batch.upload(indices_buf, 0, identity.data(),
+                          index_run_bytes_for(target_capacity)));
     }
   }
   // Committed after both allocations, so a failure on the second cannot leave
@@ -1034,13 +1037,15 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // Upload the lookup tables once and bind them at set binding 0 of the one
   // kernel this extractor built. The constexpr header arrays are the single
   // source; flatten them into the shader block layout.
-  VR_ASSIGN(mc.tables_, storage_buffer(allocator, sizeof(McTables),
-                                       HostAccess::SequentialWrite));
+  // Device-local, like everything the kernel reads, and filled in one batch
+  // with the two dummies below.
+  CommandBatch batch(device, allocator);
+  VR_ASSIGN(mc.tables_, device_storage_buffer(allocator, sizeof(McTables)));
   McTables host_tables;
   std::memcpy(host_tables.tri_table, kTriTable, sizeof(kTriTable));
   std::memcpy(host_tables.corner_offset, kCornerOffset, sizeof(kCornerOffset));
   std::memcpy(host_tables.edge_to_vert, kEdgeToVert, sizeof(kEdgeToVert));
-  std::memcpy(mc.tables_.mapped(), &host_tables, sizeof(McTables));
+  VR_TRY(batch.upload(mc.tables_, 0, &host_tables, sizeof(McTables)));
   mc.device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
                               debug_object_handle(mc.tables_.handle()),
                               "mesh.mc_tables");
@@ -1050,9 +1055,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // A 1-element dummy for the sparse kernel's color slot when a grid carries no
   // color attribute; bound now so binding 5 is always valid, overwritten with a
   // real color buffer per extract when one exists.
-  VR_ASSIGN(mc.color_dummy_, storage_buffer(allocator, sizeof(std::uint32_t),
-                                            HostAccess::SequentialWrite));
-  std::memset(mc.color_dummy_.mapped(), 0, sizeof(std::uint32_t));
+  VR_ASSIGN(mc.color_dummy_,
+            device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  VR_TRY(batch.fill(mc.color_dummy_, 0, sizeof(std::uint32_t), 0u));
   mc.device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
                               debug_object_handle(mc.color_dummy_.handle()),
                               "mesh.color_dummy");
@@ -1067,9 +1072,8 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // what makes the opt-out actually cost nothing rather than merely cost less.
   if (!config.track_block_spans) {
     VR_ASSIGN(mc.block_spans_dummy_,
-              storage_buffer(allocator, sizeof(BlockSpan),
-                             HostAccess::SequentialWrite));
-    std::memset(mc.block_spans_dummy_.mapped(), 0, sizeof(BlockSpan));
+              device_storage_buffer(allocator, sizeof(BlockSpan)));
+    VR_TRY(batch.fill(mc.block_spans_dummy_, 0, sizeof(BlockSpan), 0u));
     mc.device_->set_object_name(
         VK_OBJECT_TYPE_BUFFER,
         debug_object_handle(mc.block_spans_dummy_.handle()),
@@ -1078,6 +1082,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                                                mc.block_spans_dummy_.handle(),
                                                0, VK_WHOLE_SIZE);
   }
+  VR_TRY(batch.submit());
 
   return mc;
 }
@@ -1122,7 +1127,7 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   // defaulted move copies rather than zeroes, and a DeviceMesh holds raw
   // VkBuffer values copied out at extract time, so valid() is still true on it.
   // The currency check below would therefore pass on a moved-from extractor and
-  // the memcpy would run on a null Buffer::mapped(). Guarding here rather than
+  // the readback would name an empty buffer. Guarding here rather than
   // hand-writing the moves keeps the rule-of-zero note above intact -- the
   // scalars are unobservable once every entry point gates on valid().
   if (!valid()) {
@@ -1145,7 +1150,7 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   // and "this mesh lives in the current slot" are the same statement. That is
   // why those two lines are adjacent: anything fallible between them opens a
   // window where they disagree and this memcpy reads the wrong slot -- one that
-  // may never have been sized, so mapped() is null. A DeviceMesh does not carry
+  // may never have been sized. A DeviceMesh does not carry
   // its slot, so that invariant is the only thing tying the copy below to the
   // right buffer. Widening this to accept an older generation therefore means
   // indexing slots_ by it, not just relaxing the comparison.
@@ -1162,26 +1167,30 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
       kIndicesPerTriangle;
   mesh.vertices.resize(vertex_count);
   mesh.indices.resize(index_count);
+  // Copied back through a batch, never read through a mapping: the buffers are
+  // device-local, and a host read of VRAM is uncached (6.6 s for this mesh
+  // from BAR memory on an RTX 5090, the 2026-09-28 residency decision).
+  CommandBatch batch(*device_, *allocator_);
   if (vertex_count > 0) {
-    std::memcpy(mesh.vertices.data(), arena().mapped(),
-                vertex_count * sizeof(Vertex));
+    VR_TRY(batch.readback(arena(), 0,
+                          VkDeviceSize(vertex_count) * sizeof(Vertex),
+                          mesh.vertices.data()));
   }
   if (index_count > 0) {
     if (config_.share_vertices) {
       // READ BACK. A shared vertex is referenced by several triangles from
       // several cells, so the mapping is a property of the dispatch and only
       // the kernel knows it -- there is no run to regenerate.
-      std::memcpy(mesh.indices.data(), index_run().mapped(),
-                  index_count * sizeof(std::uint32_t));
+      VR_TRY(batch.readback(index_run(), 0,
+                            VkDeviceSize(index_count) * sizeof(std::uint32_t),
+                            mesh.indices.data()));
     } else {
       // Regenerated, not read back: the default kernel writes each triangle's
       // three vertices at `tri * 3`, so the run is the identity 0,1,2,...
-      // Generating it costs nothing and touches no device memory, which matters
-      // because that buffer is write-combined (SequentialWrite) where host
-      // reads are pathologically slow.
       std::iota(mesh.indices.begin(), mesh.indices.end(), std::uint32_t{0});
     }
   }
+  VR_TRY(batch.submit());
   return mesh;
 }
 
@@ -1393,7 +1402,11 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // whichever arena this slot happens to hold. Zeroed, it draws nothing,
     // which is what an empty mesh means -- and zero is what this path passes,
     // rather than what it happens to find, since the seed is a parameter.
-    VR_TRY(ensure_indirect_command(0, 0));
+    {
+      CommandBatch batch(*device_, *allocator_);
+      VR_TRY(ensure_indirect_command(batch, 0, 0));
+      VR_TRY(batch.submit());
+    }
     // Stamped here and not a line earlier: this is the last fallible statement,
     // so from here the DeviceMesh below is certain to be handed out. A stamp
     // above a return that never publishes is a slot nothing can release.
@@ -1490,9 +1503,13 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       (std::string(entry) + ": hash entries").c_str(), entries_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
 
-  // Per-extract inputs: the active blocks (write-once), and the vertex arena +
-  // atomic counter out. The hash entries and attribute buffers bind straight
-  // from the grid (no copy).
+  // Per-extract inputs: the active blocks, staged in the first attempt's batch
+  // with the command reset, and the vertex arena + atomic counter out. The hash
+  // entries and attribute buffers bind straight from the grid (no copy).
+  //
+  // TODO(mesh): without track_block_spans the host never reads the list, so
+  // it could stay on the device (VoxelHashMap::compact_active_blocks_on_device,
+  // as tsdf does) and skip its round trip.
   phase_clock.restart();
   const VkDeviceSize active_bytes =
       static_cast<VkDeviceSize>(num_active) * sizeof(volume::BlockIndex);
@@ -1503,11 +1520,14 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   VR_TRY(check_storage_buffer_range(
       (std::string(entry) + ": active blocks").c_str(), active_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
-  VR_ASSIGN(Buffer active_buf, storage_buffer(*allocator_, active_bytes,
-                                              HostAccess::SequentialWrite));
-  std::memcpy(
-      active_buf.mapped(), active.blocks,
-      static_cast<std::size_t>(num_active) * sizeof(volume::BlockIndex));
+  // The batch each attempt records into: the first one's here, and a refit
+  // makes the retry's.
+  CommandBatch first(*device_, *allocator_);
+  std::optional<CommandBatch> retry;
+  CommandBatch* batch = &first;
+  VR_ASSIGN(Buffer active_buf,
+            device_storage_buffer(*allocator_, active_bytes));
+  VR_TRY(first.upload(active_buf, 0, active.blocks, active_bytes));
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
   // Both output allocations inside the SAME lap. The span table used to be
@@ -1598,14 +1618,22 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   }
 
   VR_TRY(ensure_block_spans(grid));
-  VR_TRY(ensure_output_buffers(
-      capacity, planned_verts, incremental ? prev_arena.watermark : 0u,
-      // Only the sharing kernel allocates vertices through the scratch
-      // counter; the default one writes each triangle's three at `tri * 3`
-      // and never touches it, so seeding it there would arm a number nothing
-      // reads.
-      incremental && config_.share_vertices ? prev_arena.vertex_watermark : 0u,
-      entry));
+  // The reset is only recorded, so a failure here disarms what the last
+  // extract left in the command -- a grow may already have freed its arena.
+  if (Status sized = ensure_output_buffers(
+          first, capacity, planned_verts,
+          incremental ? prev_arena.watermark : 0u,
+          // Only the sharing kernel allocates vertices through the scratch
+          // counter; the default one writes each triangle's three at `tri * 3`
+          // and never touches it, so seeding it there would arm a number
+          // nothing reads.
+          incremental && config_.share_vertices ? prev_arena.vertex_watermark
+                                                : 0u,
+          entry);
+      !sized.ok()) {
+    disarm_indirect_command();
+    return sized;
+  }
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   // Bound to the range the push constant claims rather than VK_WHOLE_SIZE, the
@@ -1613,17 +1641,6 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // `num_active_blocks`, so the two must name the same bytes.
   kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
                                           active_bytes);
-  // TODO(mesh): the entries buffer is HOST-VISIBLE (VoxelHashMap creates it
-  // through core's storage_buffer, which is host-visible + mapped; the volume
-  // tier books device-local + staging as a follow-up). That was free while the
-  // traversal ran on the host, where the memory lives. It is still free on
-  // Apple's unified memory -- where the 102 ms -> 0 ms figure was measured, and
-  // the only hardware CI runs -- but on a discrete GPU each workgroup's 7
-  // probes become up to bucket_size + max_chain dependent, scattered 20-byte
-  // reads apiece (50 + 128 at VoxelGridParams::defaults) fetched across PCIe on
-  // a latency-exposed path. Recorded, not measured: this needs a discrete-GPU
-  // consumer, and the hazard is that the cost is invisible where it is tested.
-  // Same shape as the host-visible indirect command's TODO below.
   kernel_sparse_.set.write_storage_buffer(2, grid.map().entries_buffer(), 0,
                                           entries_bytes);
   kernel_sparse_.set.write_storage_buffer(3, tsdf_view.buffer->handle(), 0,
@@ -1693,6 +1710,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   std::uint32_t produced = 0;
 
   std::uint32_t produced_verts = 0;
+  IndirectWords words{};
   for (int attempt = 0; attempt < 2; ++attempt) {
     SparsePushConstants push{bs,
                              static_cast<std::int32_t>(vpb),
@@ -1737,32 +1755,34 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // rather than paid down, with the matching idle-lane cost, in the kernel's
     // workgroup note -- the fix is a specialization constant for local_size_x,
     // and every in-tree caller uses block_size 8.
-    VR_TRY(dispatch(*device_, kernel_sparse_, &push, sizeof(push), num_active,
-                    max_workgroup_count_x_));
+    //
+    // Only the command and its scratch words come back, in the same batch;
+    // the geometry stays where the kernel wrote it.
+    VR_TRY(batch->dispatch(kernel_sparse_, &push, sizeof(push), num_active,
+                           max_workgroup_count_x_));
+    VR_TRY(batch->readback(indirect(), 0, sizeof(words), &words));
+    if (Status ran = batch->submit(); !ran.ok()) {
+      disarm_indirect_command();
+      return ran;
+    }
     if (timings != nullptr) {
       timings->dispatch_ms += phase_clock.lap();
       ++timings->dispatches;
     }
-
-    // Only the 20-byte command comes back; the geometry stays where the kernel
-    // wrote it.
-    VkDrawIndexedIndirectCommand produced_command{};
-    std::memcpy(&produced_command, indirect().mapped(),
-                sizeof(produced_command));
-    produced = produced_command.indexCount / kIndicesPerTriangle;
+    produced = words.command.indexCount / kIndicesPerTriangle;
     if (config_.share_vertices) {
       // The vertex counter is its own overflow condition. With sharing the two
       // counts are not proportional, so a plan can be right about the triangles
       // and wrong about the vertices -- and a triangle whose vertex was dropped
       // is counted but not written, so trusting the triangle count alone would
       // publish a mesh with holes in it.
-      produced_verts = read_scratch(indirect(), kVertexCountOffset);
+      produced_verts = words.vertex_count;
       // The kernel's own statement that it shared. It is the only thing tying
       // this file's kMaxSharedCells to the GLSL constant that sizes the shared
       // table, and the failure it catches is silent: the kernel falls back to
       // meshing nothing rather than emitting an unshared surface, so without
       // this the caller would get an empty mesh and no reason.
-      if (read_scratch(indirect(), kSharingAppliedOffset) == 0u) {
+      if (words.sharing_applied == 0u) {
         disarm_indirect_command();
         return Status::invalid_argument(
             std::string(entry) +
@@ -1815,9 +1835,12 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // them twice. Clearing the flag here is what makes all three moot -- a full
     // pass re-establishes the arena, the spans and the watermark together.
     incremental = false;
+    retry.emplace(*device_, *allocator_);
+    batch = &*retry;
     if (Status refit = ensure_output_buffers(
-            produced, std::max(produced_verts, plan_vertex_capacity(produced)),
-            0u, 0u, entry);
+            *retry, produced,
+            std::max(produced_verts, plan_vertex_capacity(produced)), 0u, 0u,
+            entry);
         !refit.ok()) {
       disarm_indirect_command();
       return refit;
@@ -2086,8 +2109,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // changed set to the re-mesh set runs on-device off shared memory, so the
     // host has no way to derive it. 0 on a full pass, where the answer is
     // active_blocks and the atomic to restate it is not free.
-    timings->remeshed_blocks =
-        incremental ? read_scratch(indirect(), kRemeshedBlocksOffset) : 0u;
+    timings->remeshed_blocks = incremental ? words.remeshed_blocks : 0u;
     timings->triangle_capacity = requested;
     timings->emitted_triangles = emitted;
     // 0 in every in-tree configuration (block_size 8 -> 512 cells). Nonzero

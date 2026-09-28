@@ -107,13 +107,9 @@ struct DeviceMesh {
   /// Apple, where Metal has no ownership concept, getting it wrong is undefined
   /// in the way that appears to work.
   ///
-  /// @note What is deliberately *not* published is the memory placement: all
-  ///       three buffers are host-visible. That is free on a unified-memory GPU
-  ///       and costs a PCIe fetch per indirect draw on a discrete one -- and,
-  ///       for a consumer binding @ref vertices and @ref indices as geometry, a
-  ///       whole-mesh fetch out of system RAM per drawn frame. A recorded trade
-  ///       rather than a hidden one; see the `TODO(mesh)` on
-  ///       @ref MarchingCubesConfig.
+  /// @note The memory placement is not published because it does not vary:
+  ///       all three buffers are device-local, so a draw fetches them from
+  ///       VRAM on a discrete GPU.
   VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.

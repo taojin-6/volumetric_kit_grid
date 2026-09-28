@@ -28,6 +28,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::recon {
+class CommandBatch;
 class Device;
 class Allocator;
 }  // namespace volumetric_kit::recon
@@ -250,48 +251,19 @@ struct ExtractTimings {
 //       The count still round-trips to the host, but only because *this tier*
 //       needs it to refit an undersized arena -- a consumer no longer does.
 //
-// TODO(mesh): every buffer this tier hands out lives in host-visible memory --
-// core::storage_buffer allocates them all that way -- and that placement is a
-// bigger deal for a seam-B consumer than the usage bits above.
-//   * The command, 20 bytes, because the refit protocol reads it back on every
-//     extract and resets it before every dispatch. On a unified-memory GPU that
-//     is free; on a discrete one the command processor fetches it across PCIe
-//     on every indirect draw. Device-local would invert the cost (two transfers
-//     per extract to buy a local fetch per draw).
-//   * The arena and index run, which is the one that scales: a renderer binding
-//     them as geometry makes the vertex-input stage pull the WHOLE mesh out of
-//     system RAM on every presented frame -- ~64 MiB at the 991 k vertices
-//     `fuse_viewer` reaches on room0, and ~16 MiB of that once
-//     share_vertices is on, since the fetch is per vertex and in-block sharing
-//     removes ~4 in 5 of them. That is free on unified memory, which is the
-//     only hardware this measured on, and on a discrete GPU it would cost more
-//     than the host round trip seam B exists to delete.
-//   * The index run's ACCESS PATTERN moves with share_vertices, and that is a
-//     second, independent placement decision. Off, the run is the identity and
-//     the host only ever writes it, so it is allocated SequentialWrite -- which
-//     on a discrete GPU asks VMA for device-local host-visible (BAR) memory,
-//     exactly right for the buffer a renderer binds as INDEX_BUFFER. On, only
-//     the kernel knows the mapping, so download() has to read it back and the
-//     run becomes HostAccess::Random -- plain HOST_CACHED system RAM, no
-//     device-local bit, on the buffer the draw fetches every frame. Recorded
-//     rather than resolved: the honest fix is a device-local run plus a staging
-//     copy for the host path, which is the same measurement the two bullets
-//     above wait on.
-// Both wait on the same thing -- a discrete-GPU consumer to measure a
-// device-local arena plus staging against them -- rather than being guessed at,
-// the wait-for-the-second-consumer rule the rest of this config follows. It is
-// recorded here and on DeviceMesh::sharing_mode rather than left to be
-// inferred, because the hazard is not the cost but that the cost is invisible
-// on the only hardware this repo's CI runs.
+// Placement: every buffer this tier hands out -- arena, index run and draw
+// command -- is device-local, as a renderer binding them wants, and the host
+// reaches them only through a CommandBatch (the 2026-09-28 residency
+// decision). The span table is the exception: its reader is the host.
 struct MarchingCubesConfig {
-  /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER`.
+  /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER` and the
+  /// transfer bits every buffer here carries.
   VkBufferUsageFlags extra_vertex_usage = 0;
-  /// Added to the index run's usage, beyond `STORAGE_BUFFER`.
+  /// Added to the index run's usage, beyond the same.
   VkBufferUsageFlags extra_index_usage = 0;
-  /// Added to the indirect command's usage, beyond the `STORAGE_BUFFER` the
-  /// kernel counts through and the `INDIRECT_BUFFER` a draw reads it as (both
-  /// unconditional -- 20 bytes, and a consumer that never draws indirectly pays
-  /// a usage bit nobody reads).
+  /// Added to the indirect command's usage, beyond the same and the
+  /// `INDIRECT_BUFFER` a draw reads it as (unconditional -- 20 bytes, and a
+  /// consumer that never draws indirectly pays a usage bit nobody reads).
   VkBufferUsageFlags extra_indirect_usage = 0;
 
   /// @brief Queue families that will access this extractor's output buffers.
@@ -1489,7 +1461,11 @@ class VR_MESH_API MarchingCubes {
   //
   // @p seed_triangles and @p seed_vertices are forwarded to
   // ensure_indirect_command; every caller but the incremental one passes 0.
-  Status ensure_output_buffers(std::uint32_t triangle_capacity,
+  //
+  // The reset, and the identity index run a grow stages, are recorded into
+  // @p batch, ahead of the dispatch that batch will run.
+  Status ensure_output_buffers(CommandBatch& batch,
+                               std::uint32_t triangle_capacity,
                                std::uint32_t vertex_capacity,
                                std::uint32_t seed_triangles,
                                std::uint32_t seed_vertices, const char* entry);
@@ -1544,7 +1520,10 @@ class VR_MESH_API MarchingCubes {
   // incremental pass appends past cannot be derived from the triangles. Only
   // the sharing kernel allocates through that counter, so every other caller
   // passes 0 and the word stays the plain zero it has always been.
-  Status ensure_indirect_command(std::uint32_t seed_triangles,
+  //
+  // The reset is recorded into @p batch rather than written.
+  Status ensure_indirect_command(CommandBatch& batch,
+                                 std::uint32_t seed_triangles,
                                  std::uint32_t seed_vertices);
 
   // Bound the command's indexCount by what the arena can actually hold.
@@ -1556,8 +1535,9 @@ class VR_MESH_API MarchingCubes {
   // it hands back a command that reads past the end of both the arena and the
   // index run. The success path is already in range by construction (the loop
   // exits only when the count fits), so this is the *failure* paths' guarantee,
-  // not theirs.
-  void disarm_indirect_command() noexcept;
+  // not theirs. Its own submit, best effort, since its callers are already
+  // failing.
+  void disarm_indirect_command();
 };
 
 }  // namespace volumetric_kit::recon::mesh
