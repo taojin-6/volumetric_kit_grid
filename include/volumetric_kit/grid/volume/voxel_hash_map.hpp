@@ -27,7 +27,8 @@
 
 namespace volumetric_kit::recon {
 class Device;
-}
+class StorageInput;
+}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::volume {
 
@@ -186,6 +187,21 @@ class VR_VOLUME_API VoxelHashMap {
   ///         map is moved-from / @p depth is null.
   Result<std::uint32_t> allocate_from_depth(
       const float* depth, const DepthCameraParams& camera,
+      AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
+
+  /// @brief @ref allocate_from_depth from a depth image already on the device.
+  ///
+  /// The same allocation, but @p depth is bound where it lives -- a GPU
+  /// pre-processing pass's output -- rather than uploaded from the host.
+  /// @param depth  A storage buffer holding the image in metres, at least
+  ///               `camera.width * camera.height` floats, row-major. Borrowed
+  ///               for the call; the writer's dispatch must have finished,
+  ///               which a `dispatch` on this device guarantees.
+  /// @return As the host overload; @ref Status::Code::InvalidArgument also for
+  ///         a @p depth that is empty, not a storage buffer, or smaller than
+  ///         the image.
+  Result<std::uint32_t> allocate_from_depth(
+      const Buffer& depth, const DepthCameraParams& camera,
       AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
 
   /// @brief Allocate voxel blocks from a world-space point cloud.
@@ -535,6 +551,13 @@ class VR_VOLUME_API VoxelHashMap {
                                             std::uint32_t groups,
                                             AllocFailures* out_failures,
                                             GpuStageScope* stage = nullptr);
+
+  /// Both @ref allocate_from_depth overloads: @p depth is the host array or
+  /// the device buffer the caller passed.
+  Result<std::uint32_t> allocate_from_depth(const StorageInput& depth,
+                                            const DepthCameraParams& camera,
+                                            AllocFailures* out_failures,
+                                            StageMetrics* metrics);
 
   /// Create a transient host-visible buffer holding @p bytes of @p data and
   /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
