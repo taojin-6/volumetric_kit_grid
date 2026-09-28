@@ -243,11 +243,24 @@ int main() {
     CHECK(place(slab));
     vr::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
+    // Removal is re-driven the same way: lock contention can leave a few
+    // blocks for another pass, but no pass may lose one (terminal), and what
+    // is left must be named as contention.
+    const auto unplace = [&](const std::vector<vol::BlockIndex>& blocks) {
+      std::uint32_t left = 1;
+      for (int pass = 0; pass < 8 && left != 0; ++pass) {
+        vol::AllocFailures failures{};
+        vr::Result<std::uint32_t> r =
+            big.remove(blocks.data(), std::uint32_t(blocks.size()), &failures);
+        if (!r || failures.terminal != 0 || failures.lock != r.value()) {
+          return false;
+        }
+        left = r.value();
+      }
+      return left == 0;
+    };
     for (int cycle = 0; cycle < 3; ++cycle) {
-      vol::AllocFailures failures{};
-      vr::Result<std::uint32_t> removed =
-          big.remove(half.data(), std::uint32_t(half.size()), &failures);
-      CHECK(removed.ok() && removed.value() == 0 && failures.terminal == 0);
+      CHECK(unplace(half));
       CHECK(occupancy_is(0.25f));
       CHECK(place(half));
       CHECK(occupancy_is(0.5f));

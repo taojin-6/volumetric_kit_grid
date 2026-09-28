@@ -208,5 +208,8 @@ void main() {
       return;
     }
   }
-  atomicAdd(fail_count[0], 1u);
+  // Every attempt lost a bucket lock: retryable, and named as contention, as
+  // the allocate kernels name theirs.
+  atomicAdd(fail_count[kFailTotal], 1u);
+  atomicAdd(fail_count[kFailLock], 1u);
 }
