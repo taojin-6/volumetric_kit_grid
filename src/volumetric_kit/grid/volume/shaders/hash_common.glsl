@@ -61,11 +61,11 @@ const uint kHashPrimeX = 73856093u;
 const uint kHashPrimeY = 19349669u;
 const uint kHashPrimeZ = 83492791u;
 
-// Spin/retry caps (mirror hash_ops.metal): bounded so a contended dispatch
-// cannot hang the GPU; the host retries any failed allocations across dispatches.
+// Spin cap (mirrors hash_ops.metal): bounded so a contended dispatch cannot
+// hang the GPU; the host retries any failed allocations across dispatches. The
+// heap needs none: its counter moves by atomicAdd, which cannot lose a race.
 const int kMaxSpinRetries = 128;
-const int kMaxHeapRetries = 256;
-// allocate_in_overflow's scan is deliberately NOT capped alongside these two.
+// allocate_in_overflow's scan is deliberately NOT capped alongside it.
 // Capping it bounds the iteration count by giving up the only thing kFailTable
 // is good for -- proof that no slot is free -- and a caller that reads "nothing
 // free nearby" as "the table is full" grows the map, doubling every attribute

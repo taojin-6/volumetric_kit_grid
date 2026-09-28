@@ -66,34 +66,26 @@ void unlock_bucket(uint bucket) {
   atomicExchange(bucket_mutex[bucket], kFreeEntry);
 }
 
-// Return a freed block index to the heap. A block that cannot be returned is a
-// capacity leak, so both exits without an append report rather than dropping the
-// block silently.
+// Return a freed block index to the heap. One atomicAdd claims the slot, so
+// no append can lose a race. It was a compare-and-swap loop capped at
+// kMaxHeapRetries, and removing 2 048 blocks in one dispatch starved about 960
+// of them out of the heap for good.
 //
-// They report through kFailTerminal, NOT kFailTotal, because this failure is
-// not retryable: the entry was cleared from the table before we got here, so a
-// re-dispatch of the same coord list finds it absent and returns without
-// counting anything. Counted as a retryable failure it would read as zero
-// failures on the next round and the host would report a clean delete over a
-// permanently unreachable block index. The host accumulates this slot across
-// rounds instead (see VoxelHashMap::dispatch_with_retry).
+// A dispatch here only appends, so the counter only rises and the slot claimed
+// is this thread's alone. It passes num_blocks only if a block is freed twice,
+// which is reported through kFailTerminal, NOT kFailTotal, because it is not
+// retryable: the entry was cleared from the table before we got here, so a
+// re-dispatch of the same coord list finds it absent and counts nothing. The
+// host accumulates this slot across rounds instead (see
+// VoxelHashMap::dispatch_with_retry).
 void append_heap(uint block_idx) {
-  uint old = atomicAdd(heap_counter, 0u);  // atomic load
-  for (int a = 0; a < kMaxHeapRetries; ++a) {
-    if (old >= uint(pc.grid.num_blocks)) {
-      // heap full: we only free what we allocated
-      atomicAdd(fail_count[kFailTerminal], 1u);
-      return;
-    }
-    uint prev = atomicCompSwap(heap_counter, old, old + 1u);
-    if (prev == old) {
-      heap[old] = block_idx;
-      return;
-    }
-    old = prev;
+  uint old = atomicAdd(heap_counter, 1u);
+  if (old >= uint(pc.grid.num_blocks)) {
+    atomicAdd(heap_counter, 0xFFFFFFFFu);  // undo: we only free what we took
+    atomicAdd(fail_count[kFailTerminal], 1u);
+    return;
   }
-  // counter CAS starved under contention
-  atomicAdd(fail_count[kFailTerminal], 1u);
+  heap[old] = block_idx;
 }
 
 uint block_of(int ptr) { return uint(ptr) / uint(pc.grid.voxels_per_block); }

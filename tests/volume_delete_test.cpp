@@ -202,6 +202,54 @@ int main() {
   CHECK(ptrs_after.ok());
   CHECK(ptrs_after.value() == ptrs_before.value());
 
+  // Thousands of blocks freed in one dispatch all go back to the heap. The
+  // append was a compare-and-swap loop that gave up under contention, and
+  // removing 2 048 of 16 384 blocks lost about 960 of them for good; each
+  // cycle below would lose more.
+  {
+    vol::VoxelGridParams wide = grid;
+    wide.bucket_size = 8;
+    wide.num_buckets = 4096;
+    wide.num_blocks = 8 * 4096;
+    vr::Result<vol::VoxelHashMap> made =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), wide);
+    CHECK(made.ok());
+    vol::VoxelHashMap big = std::move(made).value();
+    std::vector<vol::BlockIndex> slab;
+    std::vector<vol::BlockIndex> half;
+    for (int i = 0; i < 16384; ++i) {
+      vol::BlockIndex block{};
+      block.coord = vr::Vec3i(i % 32, (i / 32) % 32, i / 1024);
+      slab.push_back(block);
+      if (i % 2 == 0) half.push_back(block);
+    }
+    // Allocation re-drives what lock contention turned away, as a caller does.
+    const auto place = [&](const std::vector<vol::BlockIndex>& blocks) {
+      std::uint32_t left = 1;
+      for (int pass = 0; pass < 8 && left != 0; ++pass) {
+        vr::Result<std::uint32_t> r =
+            big.allocate(blocks.data(), std::uint32_t(blocks.size()));
+        if (!r) return false;
+        left = r.value();
+      }
+      return left == 0;
+    };
+    const auto heap_free = [&]() {
+      vr::Result<vol::HashDiagnostics> d = big.diagnostics();
+      return d.ok() ? d.value().heap_free_count : -1;
+    };
+    CHECK(place(slab));
+    for (int cycle = 0; cycle < 3; ++cycle) {
+      vol::AllocFailures failures{};
+      vr::Result<std::uint32_t> removed =
+          big.remove(half.data(), std::uint32_t(half.size()), &failures);
+      CHECK(removed.ok() && removed.value() == 0 && failures.terminal == 0);
+      CHECK(heap_free() == wide.num_blocks - 8192);
+      CHECK(place(half));
+      CHECK(heap_free() == wide.num_blocks - 16384);
+    }
+  }
+
   std::printf(
       "recon volume delete test passed: removed %zu of %zu blocks, survivors "
       "verified, heap reuse restored the set\n",

@@ -42,20 +42,21 @@ const uint kHeapEmpty = 0xFFFFFFFFu;
 // survives a resize.
 const int kNoPresetPtr = -1;
 
-// Pop a free block index off the heap, or kHeapEmpty when exhausted.
+// Pop a free block index off the heap, or kHeapEmpty when exhausted. One
+// atomicAdd claims the slot, so kHeapEmpty means empty: a capped
+// compare-and-swap loop used to return it for a heap that was merely
+// contended, which a caller reads as a reason to grow the map.
+//
+// A dispatch here only pops, so the counter only falls, and a pop from an
+// empty heap is undone. While it is, the counter reads past num_blocks, which
+// fails any other pop the same way; every one is undone, so it ends at 0.
 uint consume_heap() {
-  uint old = atomicAdd(heap_counter, 0u);  // atomic load
-  for (int a = 0; a < kMaxHeapRetries; ++a) {
-    if (old == 0u) {
-      return kHeapEmpty;
-    }
-    uint prev = atomicCompSwap(heap_counter, old, old - 1u);
-    if (prev == old) {
-      return heap[old - 1u];
-    }
-    old = prev;
+  uint old = atomicAdd(heap_counter, 0xFFFFFFFFu);
+  if (old == 0u || old > uint(pc.grid.num_blocks)) {
+    atomicAdd(heap_counter, 1u);
+    return kHeapEmpty;
   }
-  return kHeapEmpty;
+  return heap[old - 1u];
 }
 
 bool try_lock_bucket(uint bucket, int max_retries) {
