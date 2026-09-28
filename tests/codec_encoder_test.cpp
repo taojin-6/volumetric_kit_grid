@@ -212,7 +212,8 @@ int moves_case(Gpu& gpu) {
   c = std::move(b);  // over a live encoder: takes b's config too
   CHECK(c.valid());
   CHECK(!b.valid());  // NOLINT(bugprone-use-after-move)
-  CHECK(c.config().params.coefficient_count == 32);
+  CHECK(c.config().params.coefficient_count ==
+        codec::CodecParams{}.coefficient_count);
   CHECK(b.config().segment_size == 0);  // NOLINT(bugprone-use-after-move)
 
   codec::Encoder* alias = &c;

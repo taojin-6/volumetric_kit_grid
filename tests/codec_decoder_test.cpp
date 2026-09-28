@@ -181,14 +181,24 @@ int mesh_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(truth.ok());
   CHECK(truth.value().triangles > 1000);
 
+  // The defaults are tuned on room0, not on this sphere, and a smooth surface
+  // is where they are weakest -- its energy is all in the low bands, which
+  // the defaults' coarse AC step quantizes as coarsely as the high ones -- so
+  // their bounds are the looser: 0.66 voxels worst and 0.070 mean on an M5
+  // Max, against 0.27 and 0.060 at the prior engine's K = 32. The two mean
+  // bounds and the defaults' worst-vertex bound are 1.2-1.35x what that GPU
+  // measures (near-lossless: 0.0026 mean) -- room for another device's
+  // rounding, and no more, so a regression shows.
   struct Setting {
     const char* name;
     codec::EncoderConfig config;
-    double max_off_voxels;  // worst vertex, in voxels
-    double tri_ratio;       // allowed triangle-count drift either way
+    double max_off_voxels;   // worst vertex, in voxels
+    double mean_off_voxels;  // mean vertex, in voxels
+    double tri_ratio;        // allowed triangle-count drift either way
   };
-  const Setting settings[] = {{"defaults (K = 32)", {}, 0.5, 0.02},
-                              {"near-lossless", near_lossless(), 0.1, 0.005}};
+  const Setting settings[] = {
+      {"defaults", {}, 0.8, 0.085, 0.02},
+      {"near-lossless", near_lossless(), 0.1, 0.0035, 0.005}};
   std::printf("source mesh: %zu triangles, max %.3g / mean %.3g voxels off\n",
               truth.value().triangles, truth.value().max_off / kVoxel,
               truth.value().mean_off / kVoxel);
@@ -213,6 +223,7 @@ int mesh_case(Gpu& gpu, codec::Decoder& dec) {
         got.value().triangles, ratio, got.value().max_off / kVoxel,
         got.value().mean_off / kVoxel);
     CHECK(got.value().max_off <= setting.max_off_voxels * kVoxel);
+    CHECK(got.value().mean_off <= setting.mean_off_voxels * kVoxel);
     CHECK(std::fabs(ratio - 1.0) <= setting.tri_ratio);
   }
   return 0;

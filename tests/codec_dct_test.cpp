@@ -598,9 +598,11 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
 // A fused block observed in front of its surface and half a band behind, and
 // never further back, where the fuse leaves weight 0 and tsdf 0 -- the iso
 // level. The coefficients are the reference fill's, the unobserved voxels'
-// content is never read, and the decoded surface is what the fill buys: at the
-// default K = 32 the step to 0 at the mask edge leaks into the observed voxels
-// beside it, so zeros would decode with more than twice the error.
+// content is never read, and the decoded surface is what the fill buys: at
+// K = 32 the step to 0 at the mask edge leaks into the observed voxels beside
+// it, so zeros would decode with more than twice the error. Pinned to the
+// prior engine's K = 32 with DC 0.25 / AC 0.05, the case the fill was built
+// for, rather than to the defaults, which room0 moved.
 int partial_block_case(vr::Device& device, vr::Allocator& allocator,
                        DctTransform& t) {
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
@@ -625,7 +627,10 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
   }
   write_block(grid, block, fused, weight_of);
 
-  const codec::CodecParams params;  // the defaults: K = 32
+  codec::CodecParams params;
+  params.coefficient_count = 32;
+  params.dc_step = 0.25f;
+  params.ac_step = 0.05f;
   const vol::BlockList list = grid.block_list(active.value());
   DctBlocks out;
   CHECK(t.forward(grid, list, params, out).ok());

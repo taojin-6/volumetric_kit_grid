@@ -57,18 +57,28 @@ inline const float kMinStep = static_cast<float>(
 ///
 /// Both steps are **fractions of the grid's `trunc_dist`**, not metres: the
 /// transform runs on SDF divided by `trunc_dist`, so one setting holds across
-/// scenes whatever their truncation band. The defaults are the prior engine's
-/// 0.01 m DC / 0.002 m AC at its 40 mm band, carried over until a room0
-/// measurement tunes them.
+/// scenes whatever their truncation band.
+///
+/// The defaults -- K = 64, one step of 0.2 for DC and AC alike -- are
+/// room0's (the 2026-09-27 measurement), and **provisional** until the
+/// per-band quantization study. Against the prior engine's K = 32 with a DC
+/// step five times its AC step, which they replaced, they are 7% smaller and
+/// 28% more accurate at 1 cm, and fit a frame interval on the host. A DC step
+/// coarser than the AC one bought nothing: the transform is orthonormal, so a
+/// unit of error costs the same in any coefficient.
+///
+/// TODO(codec): re-choose the defaults with the per-band quantization study
+/// -- a step per `x + y + z` band, judged on room0 and on the decoder test's
+/// sphere, where these lose (the 2026-09-27 decision).
 struct VR_CODEC_API CodecParams {
   /// Coefficients kept per block, taken in 3-D zigzag order (lowest `x+y+z`
   /// first). In [1, @ref kVoxelsPerBlock]; @ref kVoxelsPerBlock keeps the
   /// whole transform.
-  std::uint32_t coefficient_count = 32;
+  std::uint32_t coefficient_count = 64;
   /// Quantization step of the DC coefficient (zigzag index 0).
-  float dc_step = 0.25f;
+  float dc_step = 0.2f;
   /// Quantization step of every AC coefficient.
-  float ac_step = 0.05f;
+  float ac_step = 0.2f;
 
   /// @brief Check that every field is one the transform can honour.
   /// @return OK, or @ref Status::invalid_argument naming the field: a
