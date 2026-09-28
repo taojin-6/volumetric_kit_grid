@@ -13,10 +13,10 @@
 #include <vector>
 
 #include "codec_stream.hpp"
-#include "mesh_distance.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/eval/mesh_distance.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
@@ -62,8 +62,8 @@ inline std::vector<SweepConfig> sweep_configs() {
   return c;
 }
 
-/// @brief Run the sweep over @p source against @p reference (its mesh) and
-///        print the table.
+/// @brief Run the sweep over @p source against @p reference (its mesh),
+///        compared as @p compare says, and print the table.
 ///
 /// Each configuration runs one untimed round first: a fresh encoder's first
 /// dispatches pay one-off pipeline costs that would otherwise be read as the
@@ -82,17 +82,17 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
                                   const vr::mesh::Mesh& reference,
                                   vr::mesh::MarchingCubes& extractor,
                                   vr::volume::VoxelBlockGrid& player,
-                                  float reach, std::size_t stride) {
+                                  const vr::eval::CompareOptions& compare) {
   VR_ASSIGN(vr::codec::Decoder dec,
             vr::codec::Decoder::create(device, allocator));
-  const MeshDistance to_reference(reference, reach);  // hashed once
   int grows = 0;
   std::printf(
       "sweep (steps are fractions of trunc_dist; distances in mm):\n"
-      "  %-8s %4s %6s %6s | %8s %7s %6s | %7s %7s %7s %6s | %7s %6s | %7s "
-      "%7s\n",
+      "  %-8s %4s %6s %6s | %8s %7s %6s | %7s %7s %7s %6s | %7s %6s | %6s | "
+      "%7s %7s\n",
       "family", "K", "dc", "ac", "bytes", "B/block", "ratio", "acc rms",
-      "acc p95", "acc max", "acc>r", "cov rms", "cov>r", "enc ms", "dec ms");
+      "acc p95", "acc max", "acc>r", "cov rms", "cov>r", "F", "enc ms",
+      "dec ms");
   for (const SweepConfig& cfg : sweep_configs()) {
     vr::codec::EncoderConfig ec;
     ec.params.coefficient_count = cfg.k;
@@ -110,16 +110,18 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
     VR_ASSIGN(const vr::codec::FrameInfo info,
               vr::codec::read_frame_info(frame.data(), frame.size()));
     VR_ASSIGN(const vr::mesh::Mesh decoded, extractor.extract_host(player));
-    const MeshComparison c = compare_meshes(to_reference, decoded, stride);
+    VR_ASSIGN(const vr::eval::MeshComparison c,
+              vr::eval::compare_meshes(reference, decoded, compare));
     const double per_block =
         info.block_count > 0 ? double(frame.size()) / info.block_count : 0.0;
     std::printf(
         "  %-8s %4u %6.3f %6.3f | %8zu %7.1f %5.0fx | %7.3f %7.3f %7.3f %6zu | "
-        "%7.3f %6zu | %7.2f %7.2f\n",
+        "%7.3f %6zu | %6.4f | %7.2f %7.2f\n",
         cfg.family, cfg.k, double(cfg.dc), double(cfg.ac), frame.size(),
         per_block, per_block > 0 ? kRawBytesPerBlock / per_block : 0.0,
         c.accuracy.rms * 1e3, c.accuracy.p95 * 1e3, c.accuracy.max * 1e3,
         c.accuracy.beyond_reach, c.coverage.rms * 1e3, c.coverage.beyond_reach,
+        c.fscore.f,
         row_ms(enc_rows, "codec encode"), row_ms(dec_rows, "codec decode"));
   }
   return {};
