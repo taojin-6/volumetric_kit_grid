@@ -188,6 +188,21 @@ class VR_VOLUME_API VoxelHashMap {
       const float* depth, const DepthCameraParams& camera,
       AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
 
+  /// @brief @ref allocate_from_depth from a depth image already on the device.
+  ///
+  /// The same allocation, but @p depth is bound where it lives -- a GPU
+  /// pre-processing pass's output -- rather than uploaded from the host.
+  /// @param depth  A storage buffer holding the image in metres, at least
+  ///               `camera.width * camera.height` floats, row-major. Borrowed
+  ///               for the call; the writer's dispatch must have finished,
+  ///               which a `dispatch` on this device guarantees.
+  /// @return As the host overload; @ref Status::Code::InvalidArgument also for
+  ///         a @p depth that is empty, not a storage buffer, or smaller than
+  ///         the image.
+  Result<std::uint32_t> allocate_from_depth(
+      const Buffer& depth, const DepthCameraParams& camera,
+      AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
+
   /// @brief Allocate voxel blocks from a world-space point cloud.
   ///
   /// One thread per point finds the block containing it and dilates that into
@@ -539,6 +554,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// Create a transient host-visible buffer holding @p bytes of @p data and
   /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
   /// alive across the (synchronous) dispatch that reads it.
+  // Both allocate_from_depth overloads: exactly one of the two depths is set.
+  Result<std::uint32_t> allocate_from_depth(const float* host_depth,
+                                            const Buffer* device_depth,
+                                            const DepthCameraParams& camera,
+                                            AllocFailures* out_failures,
+                                            StageMetrics* metrics);
+
   Result<Buffer> upload_to_binding(const DescriptorSet& set,
                                    std::uint32_t binding, const void* data,
                                    VkDeviceSize bytes);

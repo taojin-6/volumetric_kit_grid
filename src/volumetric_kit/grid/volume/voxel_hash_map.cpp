@@ -446,6 +446,19 @@ Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const float* depth, const DepthCameraParams& camera,
     AllocFailures* out_failures, StageMetrics* metrics) {
+  return allocate_from_depth(depth, nullptr, camera, out_failures, metrics);
+}
+
+Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
+    const Buffer& depth, const DepthCameraParams& camera,
+    AllocFailures* out_failures, StageMetrics* metrics) {
+  return allocate_from_depth(nullptr, &depth, camera, out_failures, metrics);
+}
+
+Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
+    const float* host_depth, const Buffer* device_depth,
+    const DepthCameraParams& camera, AllocFailures* out_failures,
+    StageMetrics* metrics) {
   // Before the validity check, so a refused call still costs its row -- a stage
   // silent on failure reads as one that did not run. Inert when null, and it
   // publishes both halves on every return below, including the failing ones.
@@ -454,7 +467,7 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: moved-from map");
   }
-  if (depth == nullptr) {
+  if (host_depth == nullptr && device_depth == nullptr) {
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: depth is null");
   }
@@ -480,8 +493,17 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
   VR_TRY(check_storage_buffer_range(
       "VoxelHashMap::allocate_from_depth: the depth buffer", depth_bytes,
       max_storage_buffer_range_));
-  VR_ASSIGN(Buffer depth_buf,
-            upload_to_binding(depth_.set, 4, depth, depth_bytes));
+  Buffer depth_buf;  // the upload, alive across the (synchronous) dispatch
+  if (device_depth != nullptr) {
+    VR_TRY(check_storage_input(
+        "VoxelHashMap::allocate_from_depth: the depth buffer", *device_depth,
+        depth_bytes));
+    depth_.set.write_storage_buffer(4, device_depth->handle(), 0,
+                                    VK_WHOLE_SIZE);
+  } else {
+    VR_ASSIGN(depth_buf,
+              upload_to_binding(depth_.set, 4, host_depth, depth_bytes));
+  }
   std::memcpy(camera_params_.mapped(), &camera, sizeof(DepthCameraParams));
 
   return dispatch_with_retry(depth_, pixels, group_count(pixels), out_failures,
