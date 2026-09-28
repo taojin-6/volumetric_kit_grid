@@ -46,9 +46,6 @@
 
 namespace volumetric_kit::recon::eval {
 
-// TODO(eval): the codec's ground-truth test (#94) carries its own copy of this
-// closest-point code; move it onto eval, and drop the copy, once both land.
-
 /// @brief The point of triangle `abc` nearest to @p p: its projection onto
 ///        the face when that lands inside, and otherwise the nearest point of
 ///        the three edges.

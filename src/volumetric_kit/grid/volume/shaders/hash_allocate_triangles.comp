@@ -1,0 +1,75 @@
+#version 450
+
+// Allocate voxel blocks covering a triangle mesh's truncation band.
+//
+// One thread per CANDIDATE BLOCK, not per triangle. The obvious decomposition --
+// a thread per triangle, looping its own bounding box -- is unusable here
+// because triangle size is unbounded: a single 20 m floor quad at the default
+// 5 mm voxels covers ~250k blocks, so one lane would own a quarter-million
+// bucket-locked inserts while its neighbours idle. That is the shape of the
+// dispatch that hung an M5 iPad (see allocate_in_overflow in
+// hash_allocate_common.glsl), and no amount of striding inside the lane fixes
+// it. So the host walks the triangles once, counts each one's candidate blocks,
+// and uploads the exclusive prefix sum at binding 7; a work item finds its
+// triangle by binary search over that array and handles exactly ONE block.
+// Work per lane is then a search plus one point-triangle distance plus at most
+// one insert, whatever the mesh looks like.
+//
+// The candidate set is the triangle's world AABB grown by trunc_dist, in blocks
+// -- which for a large slanted triangle is mostly empty space, so each candidate
+// is pruned by an actual distance test before it costs an insert: a block is
+// allocated when its centre lies within trunc_dist + the block's half-diagonal
+// of the triangle. That is conservative (a block holding any voxel within
+// trunc_dist is never rejected) and it is what keeps a big triangle from
+// allocating the solid interior of its bounding box.
+//
+// Deliberately NOT the (2*tb+1)^3 cube dilation that hash_allocate_depth and
+// hash_allocate_points apply. Those dilate a POINT, where the cube is both the
+// cheapest and tightest thing available; a triangle has a real extent, so the
+// band it needs is the one measured from the surface.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+#include "hash_allocate_common.glsl"
+// The decode and the band test, shared with tsdf's mesh_bin.comp so the blocks
+// allocated here and the blocks the mesh integrator bins cannot drift apart.
+// It brings core's closest-point primitive with it.
+#define VR_TRI_OFFSETS_BINDING 7
+#include "triangle_candidates.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 4: mesh vertices, tightly packed vec3 (scalar layout gives a stride
+// of 12, byte-identical to the host Vec3f array).
+layout(set = 0, binding = 4, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+// binding 6: triangle indices, 3 per triangle, into `vertices`. Bounds-checked
+// on the host (an out-of-range index here is an out-of-bounds read, and
+// robustBufferAccess is enabled nowhere in this repo).
+layout(set = 0, binding = 6, scalar) readonly buffer Indices { uint indices[]; };
+// binding 7: the per-triangle candidate offsets, declared by
+// triangle_candidates.glsl.
+
+void main() {
+  uint tri_count = pc.arg;  // pc.arg = triangle count
+  uint total = vr_tri_offsets[tri_count];
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= total) {
+    return;
+  }
+
+  uint t = vrTriangleOf(gid, tri_count);
+  uint local = gid - vr_tri_offsets[t];
+
+  vec3 v0 = vertices[indices[3u * t]];
+  vec3 v1 = vertices[indices[3u * t + 1u]];
+  vec3 v2 = vertices[indices[3u * t + 2u]];
+
+  ivec3 coord;
+  if (!vrCandidateBlock(local, v0, v1, v2, pc.grid, coord) ||
+      !vrBlockInBand(coord, v0, v1, v2, pc.grid)) {
+    return;
+  }
+  report_alloc_fail(allocate_block(coord));
+}

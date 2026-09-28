@@ -17,7 +17,8 @@ set(_vr_volume_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(recon_volume)
 add_library(volumetric_kit::recon_volume ALIAS recon_volume)
 
-target_sources(recon_volume PRIVATE voxel_hash_map.cpp voxel_block_grid.cpp)
+target_sources(recon_volume PRIVATE triangle_candidates.cpp voxel_hash_map.cpp
+                                    voxel_block_grid.cpp)
 
 # Per-tier export header (VR_VOLUME_API / VR_VOLUME_STATIC_DEFINE), isolated
 # from recon_core's so the macros never collide on one include path.
@@ -66,6 +67,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_coords.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_depth.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_points.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_triangles.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact_frustum.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_delete_coords.comp"
