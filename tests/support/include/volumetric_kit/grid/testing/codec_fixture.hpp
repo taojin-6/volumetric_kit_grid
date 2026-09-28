@@ -55,6 +55,7 @@ struct GridShape {
   std::int32_t num_buckets = 512;
   std::int32_t max_chain = 128;
   bool weight = true;
+  bool color = false;  // a third attribute, which a frame does not carry
 };
 
 inline vr::Result<vol::VoxelBlockGrid> make_grid(Gpu& gpu,
@@ -68,10 +69,11 @@ inline vr::Result<vol::VoxelBlockGrid> make_grid(Gpu& gpu,
   gp.num_buckets = s.num_buckets;
   gp.num_blocks = s.bucket_size * s.num_buckets;
   gp.max_chain = s.max_chain;
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
-  return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs,
-                                     s.weight ? 2 : 1);
+  std::vector<vol::AttributeSpec> attrs = {{"tsdf", sizeof(float)}};
+  if (s.weight) attrs.push_back({"weight", sizeof(float)});
+  if (s.color) attrs.push_back({"color", 3});
+  return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp,
+                                     attrs.data(), attrs.size());
 }
 
 inline bool coord_less(const vr::Vec3i& a, const vr::Vec3i& b) {

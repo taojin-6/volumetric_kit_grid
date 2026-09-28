@@ -86,9 +86,11 @@ class VR_CODEC_API Encoder {
   /// @param metrics  Optional @ref StageMetrics collecting a `"codec encode"`
   ///                 row with both halves -- its device half is the transform
   ///                 -- over the breakdown rows `"  ..active set"` (the
-  ///                 compaction), `"  ..sort"`, `"  ..transform"` and
-  ///                 `"  ..entropy"` (writing the frame). `nullptr` measures
-  ///                 nothing.
+  ///                 compaction), `"  ..sort"`, `"  ..forward"` (the
+  ///                 transform, and dropping never-observed blocks) and
+  ///                 `"  ..rans encode"` (writing the frame). Named apart from
+  ///                 the @ref Decoder's, so both timed into one
+  ///                 @ref StageMetrics stay apart. `nullptr` measures nothing.
   /// @return The frame's bytes (an empty grid is a valid frame of no blocks),
   ///         or @ref Status::Code::InvalidArgument for a moved-from encoder
   ///         or a grid the transform refuses (moved-from, another block size,
@@ -97,7 +99,8 @@ class VR_CODEC_API Encoder {
   Result<std::vector<std::uint8_t>> encode(volume::VoxelBlockGrid& grid,
                                            StageMetrics* metrics = nullptr);
 
-  /// @return The configuration frames are coded with.
+  /// @return The configuration frames are coded with; all zeros when
+  ///         moved-from, which no valid encoder has.
   const EncoderConfig& config() const noexcept { return config_; }
 
   /// @return `true` if this owns a live transform (`false` when moved-from).

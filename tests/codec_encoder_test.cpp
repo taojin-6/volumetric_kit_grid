@@ -138,7 +138,7 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   const vr::StageRow* top = find_row(m, "codec encode");
   CHECK(top != nullptr);
   for (const char* sub :
-       {"  ..active set", "  ..sort", "  ..transform", "  ..entropy"}) {
+       {"  ..active set", "  ..sort", "  ..forward", "  ..rans encode"}) {
     const vr::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
@@ -197,6 +197,11 @@ int moves_case(Gpu& gpu) {
   codec::Encoder b(std::move(a));
   CHECK(b.valid());
   CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
+  // Its configuration went with it: nothing a moved-from encoder reports
+  // looks like one that could encode.
+  CHECK(a.config().params.coefficient_count == 0);  // NOLINT
+  CHECK(a.config().segment_size == 0);              // NOLINT
+  CHECK(!a.config().params.validate().ok());        // NOLINT
 
   codec::EncoderConfig other;
   other.params.coefficient_count = 8;
@@ -208,6 +213,7 @@ int moves_case(Gpu& gpu) {
   CHECK(c.valid());
   CHECK(!b.valid());  // NOLINT(bugprone-use-after-move)
   CHECK(c.config().params.coefficient_count == 32);
+  CHECK(b.config().segment_size == 0);  // NOLINT(bugprone-use-after-move)
 
   codec::Encoder* alias = &c;
   c = std::move(*alias);  // self-move, laundered past -Wself-move

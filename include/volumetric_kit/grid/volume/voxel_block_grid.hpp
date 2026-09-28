@@ -271,6 +271,11 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return `true` if an attribute of @p name was declared.
   bool has_attribute(std::string_view name) const noexcept;
 
+  /// @return How many attributes were declared at @ref create (0 when
+  ///         moved-from) -- what lets a consumer that writes only some of them
+  ///         refuse a grid whose others it would leave stale.
+  std::size_t attribute_count() const noexcept { return attributes_.size(); }
+
   /// @brief Grow the grid to @p new_num_buckets buckets, preserving every
   ///        block's per-voxel attribute data.
   ///

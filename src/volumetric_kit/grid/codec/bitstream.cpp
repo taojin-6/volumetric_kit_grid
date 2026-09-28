@@ -263,7 +263,7 @@ class ByteReader {
 };
 
 Status bad(const std::string& why) {
-  return Status::invalid_argument("read_intra_frame: " + why);
+  return Status::invalid_argument("codec frame: " + why);
 }
 
 Status bad_write(const std::string& why) {
@@ -590,20 +590,20 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   header.section_count = h.u32();
 
   if (version != kFrameVersion) {
-    return Status::unsupported("read_intra_frame: frame version " +
+    return Status::unsupported("codec frame: version " +
                                std::to_string(version) + " (this reads " +
                                std::to_string(kFrameVersion) + ")");
   }
   if (type != static_cast<std::uint32_t>(FrameType::kIntra)) {
-    return Status::unsupported("read_intra_frame: frame type " +
-                               std::to_string(type) + " (this reads intra)");
+    return Status::unsupported("codec frame: type " + std::to_string(type) +
+                               " (this reads intra)");
   }
   if (reserved != 0) {
     return bad("the reserved header byte is not zero");
   }
   if (block_size != static_cast<std::uint32_t>(kBlockSize)) {
     return Status::unsupported(
-        "read_intra_frame: block size " + std::to_string(block_size) +
+        "codec frame: block size " + std::to_string(block_size) +
         " (the codec's is " + std::to_string(kBlockSize) + ")");
   }
   if (!positive_finite(header.voxel_size) ||
@@ -629,10 +629,6 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;
   const std::uint32_t section_count = header.section_count;
-  if (n > max_blocks) {
-    return bad("the frame holds " + std::to_string(n) +
-               " blocks, more than the caller's " + std::to_string(max_blocks));
-  }
 
   // The section table, then each body's place in the frame. Lengths are summed
   // in 64 bits, and must account for every byte after the table exactly.
@@ -656,7 +652,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
     if (id >= 1 && id <= kSectionCount) {
       if ((flags & ~std::uint32_t(kSectionKnownFlags)) != 0) {
         return Status::unsupported(
-            "read_intra_frame: section " + std::to_string(id) + " sets flags " +
+            "codec frame: section " + std::to_string(id) + " sets flags " +
             std::to_string(flags) + ", which v1 does not define");
       }
       SectionBody& f = found[id - 1];
@@ -665,7 +661,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
       }
       f = SectionBody{body + offset, length};
     } else if ((flags & kSectionRequired) != 0) {
-      return Status::unsupported("read_intra_frame: unknown required section " +
+      return Status::unsupported("codec frame: unknown required section " +
                                  std::to_string(id));
     }
     // TODO(codec): the optional CRC section of the 2026-09-27 entry, should a
@@ -707,6 +703,16 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   if (total != payload_section.size) {
     return bad("the segment lengths do not add up to the PAYLOAD section");
   }
+  // Only now, with the block count consistent with the segment table: a count
+  // that is not is a corrupt frame, and one that is but exceeds the caller's
+  // room is a sound frame too big to hold -- which the caller answers by
+  // growing, not by dropping the frame.
+  if (n > max_blocks) {
+    return Status::out_of_memory("codec frame: it holds " + std::to_string(n) +
+                                 " blocks, more than the " +
+                                 std::to_string(max_blocks) +
+                                 " the caller can hold");
+  }
 
   // max_blocks bounds these in bytes, but not below what a 32-bit size_t can
   // count: n * K reaches 2^41. Past this check every index below fits.
@@ -714,7 +720,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
       std::uint64_t(n) * k > frame.blocks.coefficients.max_size() ||
       std::uint64_t(n) * kMaskWordsPerBlock > frame.blocks.masks.max_size()) {
     return Status::out_of_memory(
-        "read_intra_frame: " + std::to_string(n) + " blocks of " +
+        "codec frame: " + std::to_string(n) + " blocks of " +
         std::to_string(k) +
         " coefficients exceed this platform's address space");
   }

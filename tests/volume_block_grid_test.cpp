@@ -272,6 +272,41 @@ int main() {
     CHECK(tsdf_grown_data[reused_ptr] == 0.0f);  // and it is clean
   }
 
+  // --- Several at once, told apart by every axis: four blocks in one z
+  // plane, two removed. Each removed range is cleared and each kept one is
+  // not, so the lookup from coord to range must match all three components.
+  {
+    const vr::Vec3i quad[4] = {
+        {50, 50, 50}, {51, 50, 50}, {50, 51, 50}, {51, 51, 50}};
+    vol::BlockIndex blocks[4]{};
+    for (int i = 0; i < 4; ++i) {
+      blocks[i].coord = quad[i];
+    }
+    vr::Result<std::uint32_t> placed = vbg.map().allocate(blocks, 4);
+    CHECK(placed.ok() && placed.value() == 0);
+    vr::Result<std::vector<vol::BlockIndex>> live =
+        vbg.map().compact_active_blocks();
+    CHECK(live.ok());
+    std::int32_t ptrs[4] = {-1, -1, -1, -1};
+    for (const vol::BlockIndex& blk : live.value()) {
+      for (int i = 0; i < 4; ++i) {
+        if (blk.coord == quad[i]) {
+          ptrs[i] = blk.ptr;
+        }
+      }
+    }
+    for (int i = 0; i < 4; ++i) {
+      CHECK(ptrs[i] >= 0);
+      tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
+    }
+    vr::Result<std::uint32_t> removed = vbg.remove(blocks + 1, 2);
+    CHECK(removed.ok() && removed.value() == 0);
+    CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
+    CHECK(tsdf_grown_data[ptrs[1]] == 0.0f);
+    CHECK(tsdf_grown_data[ptrs[2]] == 0.0f);
+    CHECK(tsdf_grown_data[ptrs[3]] == 1.0f);
+  }
+
   // --- clear() zeroes every attribute, for the same reason: it returns every
   // block to the heap, so every range is about to be re-drawn.
   {

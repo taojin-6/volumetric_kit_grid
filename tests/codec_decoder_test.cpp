@@ -114,7 +114,10 @@ int compare_decoded(const Snapshot& src, const Snapshot& dec, float bound,
 // units of trunc_dist -- a bound on any one voxel, however loose.
 int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
   const Sphere s{vr::Vec3f(0.01f, 0.0f, -0.01f), 0.1f};
-  const std::vector<vr::Vec3i> far = {{30, 30, 30}, {-30, 2, 5}};
+  // Never observed, so the encoder drops both: one sorts after every sphere
+  // block, the other before them all, so dropping it slides the whole
+  // readback down one block.
+  const std::vector<vr::Vec3i> far = {{30, 30, 30}, {-30, 2, -30}};
   vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s, {}, far);
   CHECK(g.ok());
   vol::VoxelBlockGrid src = std::move(g).value();
@@ -198,14 +201,15 @@ int mesh_case(Gpu& gpu, codec::Decoder& dec) {
     CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
     vr::Result<MeshFit> got = fit(gpu, out, s);
     CHECK(got.ok());
+    vr::Result<Snapshot> out_snap = snapshot(out);
+    CHECK(out_snap.ok());
     const double ratio =
         double(got.value().triangles) / double(truth.value().triangles);
     std::printf(
         "%s: %zu bytes (%.1f B/block), %zu triangles (x%.4f), max "
         "%.3g / mean %.3g voxels off\n",
         setting.name, frame.value().size(),
-        double(frame.value().size()) /
-            double(snapshot(out).value().coords.size()),
+        double(frame.value().size()) / double(out_snap.value().coords.size()),
         got.value().triangles, ratio, got.value().max_off / kVoxel,
         got.value().mean_off / kVoxel);
     CHECK(got.value().max_off <= setting.max_off_voxels * kVoxel);
@@ -257,6 +261,39 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   vr::Result<Snapshot> only_b = snapshot(fresh);
   CHECK(only_b.ok());
   CHECK(after_b.value() == only_b.value());
+
+  // Nothing to allocate -- the same frame again, then one holding a subset of
+  // it -- takes the path that reuses the merge's slots instead of compacting
+  // twice, and must land on the same state as a fresh grid.
+  CHECK(dec.decode(fb.value().data(), fb.value().size(), player).ok());
+  vr::Result<Snapshot> again = snapshot(player);
+  CHECK(again.ok() && again.value() == only_b.value());
+  vr::Result<std::vector<vol::BlockIndex>> slots_again = active_sorted(player);
+  CHECK(slots_again.ok());
+  CHECK(std::equal(slots_again.value().begin(), slots_again.value().end(),
+                   slots_b.value().begin(), slots_b.value().end(),
+                   [](const vol::BlockIndex& x, const vol::BlockIndex& y) {
+                     return x.coord == y.coord && x.ptr == y.ptr;
+                   }));
+  std::vector<vol::BlockIndex> dropped(12);
+  for (std::size_t i = 0; i < dropped.size(); ++i) {
+    dropped[i].coord = after_b.value().coords[i * 5];
+  }
+  vr::Result<std::uint32_t> removed = gb.value().remove(
+      dropped.data(), static_cast<std::uint32_t>(dropped.size()));
+  CHECK(removed.ok() && removed.value() == 0);
+  vr::Result<Bytes> fsub = encode_with(gpu, gb.value());
+  CHECK(fsub.ok());
+  CHECK(dec.decode(fsub.value().data(), fsub.value().size(), player).ok());
+  vr::Result<Snapshot> after_sub = snapshot(player);
+  CHECK(after_sub.ok());
+  CHECK(after_sub.value().coords.size() ==
+        after_b.value().coords.size() - dropped.size());
+  vr::Result<vol::VoxelBlockGrid> fs = grid_for(gpu, fsub.value());
+  CHECK(fs.ok());
+  CHECK(dec.decode(fsub.value().data(), fsub.value().size(), fs.value()).ok());
+  vr::Result<Snapshot> only_sub = snapshot(fs.value());
+  CHECK(only_sub.ok() && after_sub.value() == only_sub.value());
 
   // The premise: the grid did keep, drop and gain blocks between the two.
   std::size_t kept = 0;
@@ -341,9 +378,21 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(info.ok() && info.value().block_count > 32);
   const vr::Status s = dec.decode(fb.value().data(), fb.value().size(), small);
   CHECK(!s.ok());
-  CHECK(s.domain() == vr::Status::Code::InvalidArgument);
+  // Too small, not corrupt: the same answer as a table that cannot place the
+  // blocks, so one recovery serves both.
+  CHECK(s.domain() == vr::Status::Code::OutOfMemory);
   vr::Result<Snapshot> small_after = snapshot(small);
   CHECK(small_after.ok() && small_after.value() == small_before.value());
+  std::int32_t buckets = tiny.num_buckets;
+  while (buckets * tiny.bucket_size <
+         std::int32_t(info.value().block_count) * 4) {
+    buckets *= 2;
+  }
+  CHECK(small.resize(buckets).ok());
+  CHECK(dec.decode(fb.value().data(), fb.value().size(), small).ok());
+  vr::Result<Snapshot> recovered = snapshot(small);
+  CHECK(recovered.ok());
+  CHECK(recovered.value().coords.size() == info.value().block_count);
   return 0;
 }
 
@@ -451,6 +500,16 @@ int refusals_case(Gpu& gpu, codec::Decoder& dec) {
   vr::Result<std::vector<vol::BlockIndex>> none =
       gw.value().map().compact_active_blocks();
   CHECK(none.ok() && none.value().empty());
+  // A third attribute, which a kept block would carry over stale.
+  GridShape coloured;
+  coloured.color = true;
+  vr::Result<vol::VoxelBlockGrid> gc = make_grid(gpu, coloured);
+  CHECK(gc.ok());
+  const vr::Status sc =
+      dec.decode(frame.value().data(), frame.value().size(), gc.value());
+  CHECK(!sc.ok() && sc.domain() == vr::Status::Code::InvalidArgument);
+  none = gc.value().map().compact_active_blocks();
+  CHECK(none.ok() && none.value().empty());
   vol::VoxelBlockGrid moved = std::move(g).value();
   vol::VoxelBlockGrid taken = std::move(moved);
   CHECK(!dec.decode(frame.value().data(), frame.value().size(), moved)
@@ -473,12 +532,24 @@ int metrics_case(Gpu& gpu, codec::Decoder& dec) {
   const vr::StageRow* top = find_row(m, "codec decode");
   CHECK(top != nullptr);
   for (const char* sub :
-       {"  ..entropy", "  ..active set", "  ..apply", "  ..transform"}) {
+       {"  ..rans decode", "  ..active set", "  ..apply", "  ..inverse"}) {
     const vr::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
   }
   CHECK(m.total_cpu_ms() == top->cpu_ms);
+  // Encoding into the same metrics adds its own rows beside these rather
+  // than summing into them (the one shared row is the map's compaction).
+  vr::StageMetrics both = m;
+  vr::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  CHECK(enc.ok());
+  CHECK(enc.value().encode(g.value(), &both).ok());
+  for (const char* sub : {"  ..rans decode", "  ..apply", "  ..inverse"}) {
+    CHECK(find_row(both, sub)->cpu_ms == find_row(m, sub)->cpu_ms);
+  }
+  CHECK(find_row(both, "  ..forward") != nullptr);
+  CHECK(find_row(both, "  ..rans encode") != nullptr);
   vr::Result<vr::GpuTimer> probe = vr::GpuTimer::create(gpu.device);
   CHECK(probe.ok());
   if (probe.value().available()) {

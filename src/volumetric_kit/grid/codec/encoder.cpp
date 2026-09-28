@@ -14,11 +14,42 @@
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
 namespace volumetric_kit::recon::codec {
+namespace {
+
+// The public default restates the writer's, which the installed header cannot
+// name; this is what keeps the two one number.
+static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
+              "EncoderConfig's default segment size is the writer's");
+
+// What a moved-from encoder reports: no coefficients and no segments, a
+// configuration that fails validation just as the encoder fails valid().
+EncoderConfig empty_config() {
+  EncoderConfig c;
+  c.params.coefficient_count = 0;
+  c.params.dc_step = 0.0f;
+  c.params.ac_step = 0.0f;
+  c.segment_size = 0;
+  return c;
+}
+
+}  // namespace
 
 Encoder::Encoder() = default;
 Encoder::~Encoder() = default;
-Encoder::Encoder(Encoder&& other) noexcept = default;
-Encoder& Encoder::operator=(Encoder&& other) noexcept = default;
+
+Encoder::Encoder(Encoder&& other) noexcept
+    : config_(std::exchange(other.config_, empty_config())),
+      transform_(std::move(other.transform_)),
+      gpu_timer_(std::move(other.gpu_timer_)) {}
+
+Encoder& Encoder::operator=(Encoder&& other) noexcept {
+  if (this != &other) {
+    config_ = std::exchange(other.config_, empty_config());
+    transform_ = std::move(other.transform_);
+    gpu_timer_ = std::move(other.gpu_timer_);
+  }
+  return *this;
+}
 
 bool Encoder::valid() const noexcept {
   return transform_ != nullptr && transform_->valid();
@@ -58,28 +89,23 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
             grid.map().compact_active_blocks(metrics));
   {
     StageScope sort(metrics, "  ..sort");
-    std::sort(active.begin(), active.end(),
-              [](const volume::BlockIndex& a, const volume::BlockIndex& b) {
-                return detail::coord_less(a.coord, b.coord);
-              });
+    detail::sort_by_coord(active);
   }
 
   // Transform all of them, then keep the blocks with at least one observed
   // voxel. The mask is what says which, and it comes out of the transform, so
-  // the filter runs after it rather than before.
+  // the filter runs after it rather than before -- in place, sliding each kept
+  // block down over the dropped ones, so the readback is never held twice.
   detail::IntraFrame frame;
   frame.voxel_size = grid.grid().voxel_size;
   {
-    StageScope transform(metrics, "  ..transform");
+    StageScope forward(metrics, "  ..forward");
     detail::DctBlocks all;
     VR_TRY(transform_->forward(grid, grid.block_list(active), config_.params,
                                all, &stage));
     const std::size_t k = config_.params.coefficient_count;
-    frame.blocks.params = all.params;
-    frame.blocks.trunc_dist = all.trunc_dist;
     frame.coords.reserve(active.size());
-    frame.blocks.coefficients.reserve(all.coefficients.size());
-    frame.blocks.masks.reserve(all.masks.size());
+    std::size_t kept = 0;
     for (std::size_t i = 0; i < active.size(); ++i) {
       const auto mask = all.masks.begin() +
                         static_cast<std::ptrdiff_t>(i * kMaskWordsPerBlock);
@@ -89,17 +115,25 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
       if (!observed) {
         continue;
       }
+      if (kept != i) {  // kept < i: the destination is a block already read
+        std::copy(mask, mask + kMaskWordsPerBlock,
+                  all.masks.begin() +
+                      static_cast<std::ptrdiff_t>(kept * kMaskWordsPerBlock));
+        const auto coeffs =
+            all.coefficients.begin() + static_cast<std::ptrdiff_t>(i * k);
+        std::copy(
+            coeffs, coeffs + static_cast<std::ptrdiff_t>(k),
+            all.coefficients.begin() + static_cast<std::ptrdiff_t>(kept * k));
+      }
       frame.coords.push_back(active[i].coord);
-      frame.blocks.masks.insert(frame.blocks.masks.end(), mask,
-                                mask + kMaskWordsPerBlock);
-      const auto coeffs =
-          all.coefficients.begin() + static_cast<std::ptrdiff_t>(i * k);
-      frame.blocks.coefficients.insert(frame.blocks.coefficients.end(), coeffs,
-                                       coeffs + static_cast<std::ptrdiff_t>(k));
+      ++kept;
     }
+    all.masks.resize(kept * kMaskWordsPerBlock);
+    all.coefficients.resize(kept * k);
+    frame.blocks = std::move(all);
   }
 
-  StageScope entropy(metrics, "  ..entropy");
+  StageScope entropy(metrics, "  ..rans encode");
   detail::FrameWriteOptions options;
   options.segment_size = config_.segment_size;
   return detail::write_intra_frame(frame, options);
