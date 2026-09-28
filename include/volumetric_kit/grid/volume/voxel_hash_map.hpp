@@ -92,6 +92,20 @@ struct AllocFailures {
   }
 };
 
+/// @brief A compacted active set on the device: @ref count @ref BlockIndex
+///        entries at the start of @ref buffer, bound by their exact range.
+///
+/// Borrowed from the map that compacted it, and stamped so that map can say
+/// whether it still holds: @ref VoxelHashMap::check_device_block_list.
+struct DeviceBlockList {
+  const Buffer* buffer = nullptr;  ///< The map's own list; borrowed.
+  std::uint32_t count = 0;         ///< Entries in it.
+  /// The map's @ref VoxelHashMap::topology_epoch when it was compacted.
+  std::uint64_t epoch = 0;
+  /// Which of the map's compactions wrote it.
+  std::uint64_t serial = 0;
+};
+
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
 ///        pipelines that operate on them, and drives block allocation and
@@ -310,6 +324,26 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The active blocks (order unspecified), or a non-OK @ref Status.
   Result<std::vector<BlockIndex>> compact_active_blocks(
       StageMetrics* metrics = nullptr);
+
+  /// @brief @ref compact_active_blocks, with the list left on the device for a
+  ///        kernel to read in place; only its count reaches the host.
+  /// @param metrics  As @ref compact_active_blocks, under the same row name.
+  /// @return The list, which @ref check_device_block_list accepts until the
+  ///         next compaction, @ref resize, @ref remove, @ref clear or move of
+  ///         this map; or a non-OK @ref Status.
+  Result<DeviceBlockList> compact_active_blocks_on_device(
+      StageMetrics* metrics = nullptr);
+
+  /// @brief Whether @p list still names this map's blocks, for a consumer to
+  ///        ask before it binds the list.
+  /// @param list  From @ref compact_active_blocks_on_device. An empty one is
+  ///              always accepted: it names no block.
+  /// @param who   The caller, for the message.
+  /// @return OK; or @ref Status::Code::InvalidArgument when this map is
+  ///         moved-from, did not compact @p list, has moved since, or has
+  ///         compacted, resized, removed or cleared since.
+  Status check_device_block_list(const DeviceBlockList& list,
+                                 const char* who) const;
 
   /// @brief Compact only the active blocks intersecting @p planes -- the
   ///        per-frame streamed working set for a camera view.
@@ -537,6 +571,12 @@ class VR_VOLUME_API VoxelHashMap {
       const ComputeKernel& kernel, std::uint32_t& last_count,
       GpuStageScope* stage,
       const std::function<Status(CommandBatch&)>& prepare = {});
+  /// The compaction into @ref compacted_ in one submit, returning the count
+  /// and reading the list's first @p head_count entries back into @p head.
+  Result<std::uint32_t> compact_into_device_list(
+      const ComputeKernel& kernel, GpuStageScope* stage,
+      const std::function<Status(CommandBatch&)>& prepare = {},
+      BlockIndex* head = nullptr, std::uint32_t head_count = 0);
 
   /// The row label both compaction entry points report under, carrying
   /// @ref StageMetrics::kBreakdownPrefix or not according to whether @p metrics
@@ -642,6 +682,9 @@ class VR_VOLUME_API VoxelHashMap {
   // how much of the list to read back beside the next count.
   std::uint32_t last_active_count_ = 0;
   std::uint32_t last_frustum_count_ = 0;
+  // Bumped by every write to compacted_ (a compaction) and every swap of it (a
+  // resize), so a DeviceBlockList can be checked against it.
+  std::uint64_t compaction_serial_ = 0;
 
   // The shared descriptor pool the kernels' sets are allocated from. Declared
   // BEFORE the ComputeKernel members so it is destroyed AFTER them (members

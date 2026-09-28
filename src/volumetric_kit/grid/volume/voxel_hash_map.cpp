@@ -521,16 +521,16 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
   VR_TRY(check_storage_buffer_range(
       "VoxelHashMap::allocate_from_depth: the depth buffer", depth_bytes,
       max_storage_buffer_range_));
-  Buffer depth_buf;  // a host array's upload, alive across the dispatch
-  VR_ASSIGN(const VkBuffer depth_handle,
-            depth.buffer(*allocator_, depth_bytes, depth_buf));
-  depth_.set.write_storage_buffer(4, depth_handle, 0, depth_bytes);
-
-  return dispatch_with_retry(depth_, pixels, group_count(pixels), out_failures,
-                             &stage, [&](CommandBatch& batch) {
-                               return batch.upload(camera_params_, 0, &camera,
-                                                   sizeof(DepthCameraParams));
-                             });
+  Buffer depth_buf;  // a host array's device copy, alive across every round
+  return dispatch_with_retry(
+      depth_, pixels, group_count(pixels), out_failures, &stage,
+      [&](CommandBatch& batch) -> Status {
+        VR_ASSIGN(const VkBuffer depth_handle,
+                  depth.buffer(batch, *allocator_, depth_bytes, depth_buf));
+        depth_.set.write_storage_buffer(4, depth_handle, 0, depth_bytes);
+        return batch.upload(camera_params_, 0, &camera,
+                            sizeof(DepthCameraParams));
+      });
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_points(
@@ -614,40 +614,46 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
                           count, delete_, out_failures);
 }
 
-Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
-    const ComputeKernel& kernel, std::uint32_t& last_count,
-    GpuStageScope* stage, const std::function<Status(CommandBatch&)>& prepare) {
+Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
+    const ComputeKernel& kernel, GpuStageScope* stage,
+    const std::function<Status(CommandBatch&)>& prepare, BlockIndex* head,
+    std::uint32_t head_count) {
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   const PushConstants push{grid_, capacity};
+  ++compaction_serial_;  // before the submit, which may have run in part
+  std::uint32_t count = 0;
+  CommandBatch batch(*device_, *allocator_);
+  if (prepare) {
+    VR_TRY(prepare(batch));
+  }
+  VR_TRY(batch.fill(active_count_, 0, sizeof(count), 0u));
+  VR_TRY(batch.dispatch(kernel, &push, sizeof(push),
+                        group_count(total_entries()), max_workgroup_count_x_,
+                        stage));
+  VR_TRY(batch.readback(active_count_, 0, sizeof(count), &count));
+  VR_TRY(batch.readback(compacted_, 0,
+                        VkDeviceSize(head_count) * sizeof(BlockIndex), head));
+  VR_TRY(batch.submit());
+  return std::min(count, capacity);
+}
+
+Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
+    const ComputeKernel& kernel, std::uint32_t& last_count,
+    GpuStageScope* stage, const std::function<Status(CommandBatch&)>& prepare) {
   // The list comes back beside its count, as far as a guess a quarter past
   // this kernel's last count, so a set that has not outgrown it costs one
   // submit rather than two (0.38 ms each on an RTX 5090).
-  // TODO(volume): hand consumers the device list and count instead, so an
-  // integrate or an extract sizes its dispatch on the device and the list
-  // never reaches the host.
+  // TODO(volume): hand the mesh extract the device list too, and size both
+  // tiers' dispatches on the device, so no list or count reaches the host.
   const std::uint32_t guess =
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
-          capacity, std::uint64_t(last_count) + last_count / 4));
+          grid_.num_blocks, std::uint64_t(last_count) + last_count / 4));
   std::vector<BlockIndex> active(guess);
-  std::uint32_t count = 0;
-  {
-    CommandBatch batch(*device_, *allocator_);
-    if (prepare) {
-      VR_TRY(prepare(batch));
-    }
-    VR_TRY(batch.fill(active_count_, 0, sizeof(count), 0u));
-    VR_TRY(batch.dispatch(kernel, &push, sizeof(push),
-                          group_count(total_entries()), max_workgroup_count_x_,
-                          stage));
-    VR_TRY(batch.readback(active_count_, 0, sizeof(count), &count));
-    VR_TRY(batch.readback(compacted_, 0,
-                          VkDeviceSize(guess) * sizeof(BlockIndex),
-                          active.data()));
-    VR_TRY(batch.submit());
-  }
-  count = std::min(count, capacity);
+  VR_ASSIGN(
+      const std::uint32_t count,
+      compact_into_device_list(kernel, stage, prepare, active.data(), guess));
   last_count = count;
   active.resize(count);
   if (count > guess) {
@@ -684,6 +690,40 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
   return collect_compacted(compact_, last_active_count_, &stage);
+}
+
+Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
+    StageMetrics* metrics) {
+  GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
+  if (!valid()) {
+    return Status::invalid_argument(
+        "VoxelHashMap::compact_active_blocks_on_device: moved-from map");
+  }
+  VR_ASSIGN(const std::uint32_t count,
+            compact_into_device_list(compact_, &stage));
+  return DeviceBlockList{&compacted_, count, topology_epoch_,
+                         compaction_serial_};
+}
+
+Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
+                                             const char* who) const {
+  if (list.count == 0) return {};
+  if (!valid()) {
+    return Status::invalid_argument(std::string(who) + ": moved-from map");
+  }
+  if (list.buffer != &compacted_) {
+    return Status::invalid_argument(
+        std::string(who) +
+        ": the device block list is not this map's, or the map has moved "
+        "since it was compacted");
+  }
+  if (list.epoch != topology_epoch_ || list.serial != compaction_serial_) {
+    return Status::invalid_argument(
+        std::string(who) +
+        ": the device block list is stale: the map has compacted, resized, "
+        "removed or cleared since");
+  }
+  return {};
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
@@ -795,6 +835,7 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     bucket_mutex_ = std::move(b.bucket_mutex);
     fail_counts_ = std::move(b.fail_counts);
     compacted_ = std::move(b.compacted);
+    ++compaction_serial_;
     active_count_ = std::move(b.active_count);
     grid_ = g;
     write_persistent_bindings();  // point the sets at the committed buffers
