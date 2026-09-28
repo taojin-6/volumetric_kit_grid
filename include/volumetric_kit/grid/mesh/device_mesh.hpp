@@ -82,8 +82,9 @@ struct DeviceMesh {
   /// vertex -- one writer per vertex -- and texture a shared mesh like any
   /// other.
   bool shares_vertices = false;
-  /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
-  /// plus whatever the producer's consumer asked for. Carried so a consumer can
+  /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`
+  /// and `TRANSFER_SRC | TRANSFER_DST`, plus whatever the producer's consumer
+  /// asked for. Carried so a consumer can
   /// *check* that the binding it is about to make is permitted, rather than
   /// assuming the flags it published reached the producer: Vulkan cannot be
   /// asked what a `VkBuffer` was created with, and binding one that lacks the
@@ -107,13 +108,9 @@ struct DeviceMesh {
   /// Apple, where Metal has no ownership concept, getting it wrong is undefined
   /// in the way that appears to work.
   ///
-  /// @note What is deliberately *not* published is the memory placement: all
-  ///       three buffers are host-visible. That is free on a unified-memory GPU
-  ///       and costs a PCIe fetch per indirect draw on a discrete one -- and,
-  ///       for a consumer binding @ref vertices and @ref indices as geometry, a
-  ///       whole-mesh fetch out of system RAM per drawn frame. A recorded trade
-  ///       rather than a hidden one; see the `TODO(mesh)` on
-  ///       @ref MarchingCubesConfig.
+  /// @note The memory placement is not published because it does not vary:
+  ///       all three buffers are device-local, so a draw fetches them from
+  ///       VRAM on a discrete GPU.
   VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
   /// Which extract on the producing object this view came from. Producers
   /// number their extracts from 1, so the default 0 never matches a real one.

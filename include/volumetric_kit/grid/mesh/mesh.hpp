@@ -85,13 +85,8 @@ struct Vertex {
 // The buffers can also be made *bindable*: a consumer passes the usage it needs
 // through mesh/marching_cubes.hpp's MarchingCubesConfig, which is where the
 // remaining seam-B gaps are enumerated -- being byte-compatible and bindable is
-// still short of being drawable in place.
-// TODO(mesh): they remain *host-visible*, which is right on a unified-memory
-// GPU (Apple silicon reports a host-visible DEVICE_LOCAL heap, so there is
-// nothing to stage) but not on a discrete one, where drawing vertices across
-// PCIe every frame is the slow path. Give them a device-local home with a
-// staging copy when a discrete-GPU consumer of seam B exists to measure it --
-// doing it now would add a copy to the one platform that does not need one.
+// still short of being drawable in place. They are device-local, so a draw
+// fetches them from VRAM.
 static_assert(sizeof(Vertex) == 64, "Vertex must be 64 bytes");
 static_assert(offsetof(Vertex, position) == 0, "Vertex layout drift");
 static_assert(offsetof(Vertex, normal) == 12, "Vertex layout drift");
