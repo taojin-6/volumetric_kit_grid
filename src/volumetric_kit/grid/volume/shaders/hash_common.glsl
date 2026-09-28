@@ -9,8 +9,8 @@
 //
 // Buffer bindings and the SSBO-touching helpers are NOT here: GLSL buffer blocks
 // are global and cannot be passed to functions, so each kernel declares only the
-// buffers it uses, and the lock/heap/allocate helpers live in the allocate
-// kernel that needs them.
+// buffers it uses, and the lock/allocate helpers live in the allocate kernel
+// that needs them; the heap helpers, which delete shares, in hash_heap.glsl.
 //
 // A kernel OUTSIDE the volume tier reaches this through hash_lookup.glsl, which
 // wants the struct layouts, the constants and computeHashPos but has push

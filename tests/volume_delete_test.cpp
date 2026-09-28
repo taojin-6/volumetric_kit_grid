@@ -202,10 +202,10 @@ int main() {
   CHECK(ptrs_after.ok());
   CHECK(ptrs_after.value() == ptrs_before.value());
 
-  // Thousands of blocks freed in one dispatch all go back to the heap. The
-  // append was a compare-and-swap loop that gave up under contention, and
-  // removing 2 048 of 16 384 blocks lost about 960 of them for good; each
-  // cycle below would lose more.
+  // Thousands of blocks freed in one dispatch all go back to the heap, and are
+  // drawn off it again with no pass calling a half-free heap empty. A capped
+  // compare-and-swap loop lost about 960 of 2 048 removed blocks for good, and
+  // made allocation report kFailHeap.
   {
     vol::VoxelGridParams wide = grid;
     wide.bucket_size = 8;
@@ -223,30 +223,37 @@ int main() {
       slab.push_back(block);
       if (i % 2 == 0) half.push_back(block);
     }
-    // Allocation re-drives what lock contention turned away, as a caller does.
+    // Allocation re-drives what lock contention turned away, as a caller does,
+    // but with half the map free no pass may report a capacity limit.
     const auto place = [&](const std::vector<vol::BlockIndex>& blocks) {
       std::uint32_t left = 1;
       for (int pass = 0; pass < 8 && left != 0; ++pass) {
-        vr::Result<std::uint32_t> r =
-            big.allocate(blocks.data(), std::uint32_t(blocks.size()));
-        if (!r) return false;
+        vol::AllocFailures failures{};
+        vr::Result<std::uint32_t> r = big.allocate(
+            blocks.data(), std::uint32_t(blocks.size()), &failures);
+        if (!r || failures.capacity_limited()) return false;
         left = r.value();
       }
       return left == 0;
     };
-    const auto heap_free = [&]() {
-      vr::Result<vol::HashDiagnostics> d = big.diagnostics();
-      return d.ok() ? d.value().heap_free_count : -1;
+    const auto occupancy_is = [&](float want) {
+      vr::Result<float> occupancy = big.load_factor();
+      return occupancy.ok() && occupancy.value() == want;
     };
     CHECK(place(slab));
+    vr::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
+    CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
     for (int cycle = 0; cycle < 3; ++cycle) {
       vol::AllocFailures failures{};
       vr::Result<std::uint32_t> removed =
           big.remove(half.data(), std::uint32_t(half.size()), &failures);
       CHECK(removed.ok() && removed.value() == 0 && failures.terminal == 0);
-      CHECK(heap_free() == wide.num_blocks - 8192);
+      CHECK(occupancy_is(0.25f));
       CHECK(place(half));
-      CHECK(heap_free() == wide.num_blocks - 16384);
+      CHECK(occupancy_is(0.5f));
+      // The heap is LIFO, so the freed blocks come back, each to one coord.
+      vr::Result<std::set<std::int32_t>> ptrs = active_ptrs(big);
+      CHECK(ptrs.ok() && ptrs.value() == slab_ptrs.value());
     }
   }
 

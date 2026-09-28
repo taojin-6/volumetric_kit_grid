@@ -10,8 +10,9 @@
 // declared at binding 4 by each kernel; everything common lives here.
 //
 // #include this AFTER hash_common.glsl: it supplies the struct layouts, the
-// hash-table constants (kFreeEntry/...), the spin/heap retry caps, the coord
+// hash-table constants (kFreeEntry/...), the spin retry cap, the coord
 // transforms (worldToBlock / truncationBlocks), and the push-constant block.
+// The heap comes from hash_heap.glsl, which the delete kernel shares.
 //
 // Concurrency: mutual exclusion is a per-bucket spin lock (atomicCompSwap on
 // bucket_mutex); memoryBarrierBuffer() supplies the acquire/release ordering
@@ -19,11 +20,11 @@
 // memory. Alloc and free run in SEPARATE dispatches (never concurrently), which
 // the heap design relies on.
 
+#include "hash_heap.glsl"
+
 layout(set = 0, binding = 0, scalar) coherent buffer Entries {
   HashEntry entries[];
 };
-layout(set = 0, binding = 1) coherent buffer Heap { uint heap[]; };
-layout(set = 0, binding = 2) coherent buffer HeapCounter { uint heap_counter; };
 layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
 
@@ -32,8 +33,6 @@ layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
 // so the slot layout is shared rather than owned by this header. Every failure
 // an allocate kernel reports is retryable, so none of them touch kFailTerminal.
 
-const uint kHeapEmpty = 0xFFFFFFFFu;
-
 // Sentinel for insert_block's preset pointer: draw a fresh block off the heap
 // (normal allocation). A real block pointer is block_idx * voxels_per_block, so
 // it is always >= 0 and never collides with this. A non-sentinel preset reuses
@@ -41,23 +40,6 @@ const uint kHeapEmpty = 0xFFFFFFFFu;
 // each block's index so its per-voxel attribute data (keyed by the pointer)
 // survives a resize.
 const int kNoPresetPtr = -1;
-
-// Pop a free block index off the heap, or kHeapEmpty when exhausted. One
-// atomicAdd claims the slot, so kHeapEmpty means empty: a capped
-// compare-and-swap loop used to return it for a heap that was merely
-// contended, which a caller reads as a reason to grow the map.
-//
-// A dispatch here only pops, so the counter only falls, and a pop from an
-// empty heap is undone. While it is, the counter reads past num_blocks, which
-// fails any other pop the same way; every one is undone, so it ends at 0.
-uint consume_heap() {
-  uint old = atomicAdd(heap_counter, 0xFFFFFFFFu);
-  if (old == 0u || old > uint(pc.grid.num_blocks)) {
-    atomicAdd(heap_counter, 1u);
-    return kHeapEmpty;
-  }
-  return heap[old - 1u];
-}
 
 bool try_lock_bucket(uint bucket, int max_retries) {
   for (int a = 0; a < max_retries; ++a) {
@@ -179,7 +161,7 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
   // kFailHeap -- one physical state with two names depending on which helper
   // happened to hit it. Guarded to the heap path, so kFailHeap stays provably
   // impossible on the rehash preset, which never consults the heap.
-  if (preset_ptr == kNoPresetPtr && atomicAdd(heap_counter, 0u) == 0u) {
+  if (preset_ptr == kNoPresetPtr && heap_empty(atomicAdd(heap_counter, 0u))) {
     return kFailHeap;
   }
 
