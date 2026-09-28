@@ -17,7 +17,8 @@ set(_vr_codec_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(recon_codec)
 add_library(volumetric_kit::recon_codec ALIAS recon_codec)
 
-target_sources(recon_codec PRIVATE codec_params.cpp dct_transform.cpp)
+target_sources(recon_codec PRIVATE bitstream.cpp codec_params.cpp
+                                   dct_transform.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.
