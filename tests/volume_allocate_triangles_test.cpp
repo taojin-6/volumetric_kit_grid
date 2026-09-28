@@ -24,6 +24,7 @@
 #include <tuple>
 #include <vector>
 
+#include "test_meshes.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
@@ -47,42 +48,9 @@ namespace vol = volumetric_kit::recon::volume;
 
 namespace {
 
-using Coord = std::tuple<int, int, int>;
+using test_meshes::closest_point;
 
-// Closest point on a triangle, written out independently of the GLSL the kernel
-// uses so the two are not the same expression checked against itself.
-// Barycentric projection with a clamp to the triangle's edges, which is a
-// different formulation from the shader's region test and agrees with it.
-vr::Vec3f closest_point(vr::Vec3f p, vr::Vec3f a, vr::Vec3f b, vr::Vec3f c) {
-  const vr::Vec3f ab = b - a;
-  const vr::Vec3f ac = c - a;
-  const vr::Vec3f n = vr::cross(ab, ac);
-  const float nn = vr::dot(n, n);
-  // Project onto the plane, then read off barycentrics as signed sub-areas.
-  const vr::Vec3f q = p - n * (vr::dot(n, p - a) / nn);
-  const float u = vr::dot(n, vr::cross(c - b, q - b)) / nn;
-  const float v = vr::dot(n, vr::cross(a - c, q - c)) / nn;
-  const float w = vr::dot(n, vr::cross(ab, q - a)) / nn;
-  if (u >= 0.0f && v >= 0.0f && w >= 0.0f) {
-    return q;  // inside
-  }
-  // Outside: the nearest point on the nearest edge segment.
-  auto on_segment = [](vr::Vec3f pt, vr::Vec3f s0, vr::Vec3f s1) {
-    const vr::Vec3f d = s1 - s0;
-    const float dd = vr::dot(d, d);
-    float t = (dd > 0.0f) ? vr::dot(pt - s0, d) / dd : 0.0f;
-    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-    return s0 + d * t;
-  };
-  const vr::Vec3f e0 = on_segment(p, a, b);
-  const vr::Vec3f e1 = on_segment(p, b, c);
-  const vr::Vec3f e2 = on_segment(p, c, a);
-  const float d0 = vr::dot(p - e0, p - e0);
-  const float d1 = vr::dot(p - e1, p - e1);
-  const float d2 = vr::dot(p - e2, p - e2);
-  if (d0 <= d1 && d0 <= d2) return e0;
-  return (d1 <= d2) ? e1 : e2;
-}
+using Coord = std::tuple<int, int, int>;
 
 float distance_to_triangle(vr::Vec3f p, vr::Vec3f a, vr::Vec3f b, vr::Vec3f c) {
   const vr::Vec3f q = closest_point(p, a, b, c);
