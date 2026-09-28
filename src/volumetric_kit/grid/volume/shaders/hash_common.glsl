@@ -78,8 +78,8 @@ const int kMaxSpinRetries = 128;
 // in one kernel's header.
 //
 // [0..3] mirror hash_ops.metal and are **retryable**: the host re-dispatches
-// while the total keeps dropping, because the element that failed is still
-// unprocessed and the next round can succeed. [4] is the one that is not, and
+// while any remain, because the element that failed is still unprocessed and
+// the next round can succeed. [4] is the one that is not, and
 // the distinction is load-bearing: a delete whose heap append fails has already
 // cleared the entry, so re-dispatching finds the coord absent and counts
 // nothing -- the convergence heuristic would erase the report instead of

@@ -297,10 +297,12 @@ class VR_VOLUME_API VoxelHashMap {
   ///          that carries attributes.
   /// @return The number of removals that failed (0 = all done), or a non-OK
   ///         @ref Status if a buffer or the dispatch fails. A non-zero count
-  ///         here is **not** capacity pressure: it counts blocks that were
-  ///         removed from the table but whose index could not be returned to
-  ///         the free heap, i.e. leaked capacity (@ref
-  ///         AllocFailures::terminal), plus any coord no attempt could delete.
+  ///         here is **not** capacity pressure. It is the sum of blocks
+  ///         removed from the table whose index the free heap refused, i.e.
+  ///         leaked capacity (@ref AllocFailures::terminal), and coords
+  ///         bucket-lock contention kept through every round
+  ///         (@ref AllocFailures::lock), which are still in the table: call
+  ///         again to remove them.
   /// @param out_failures  Optional: receives the per-reason split (see
   ///                      @ref AllocFailures). Untouched when null.
   Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
@@ -584,9 +586,10 @@ class VR_VOLUME_API VoxelHashMap {
   static const char* active_set_row(const StageMetrics* metrics) noexcept;
 
   /// Dispatch @p kernel (push arg = @p arg) over @p groups groups,
-  /// re-dispatching while the shared `fail_counts_[kFailTotal]` tally keeps
-  /// dropping to converge past transient same-bucket lock contention. Re-zeroes
-  /// the tally each round. The shared tail of every allocate/remove kernel.
+  /// re-dispatching while the shared `fail_counts_[kFailTotal]` tally is
+  /// non-zero, to converge past transient same-bucket lock contention, until a
+  /// capacity limit stops progress or the rounds run out. Re-zeroes the tally
+  /// each round. The shared tail of every allocate/remove kernel.
   /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
   /// added to the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
@@ -622,12 +625,15 @@ class VR_VOLUME_API VoxelHashMap {
   /// @ref remove, @ref allocate_from_points): upload @p count elements of
   /// @p elem_size bytes to the input binding (4) of @p kernel's set, then run
   /// @p kernel over them (one thread per element) via @ref dispatch_with_retry.
-  /// @p op names the caller for diagnostics.
+  /// @p op names the caller for diagnostics. @p done_flags binds a zeroed
+  /// flag per element at binding 6, which @ref remove's kernel sets on each
+  /// coord it finishes so later rounds skip it.
   Result<std::uint32_t> run_input_kernel(const char* op, const void* data,
                                          std::size_t elem_size,
                                          std::uint32_t count,
                                          const ComputeKernel& kernel,
-                                         AllocFailures* out_failures);
+                                         AllocFailures* out_failures,
+                                         bool done_flags = false);
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and

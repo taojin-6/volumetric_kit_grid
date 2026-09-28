@@ -202,7 +202,7 @@ int main() {
   CHECK(ptrs_after.ok());
   CHECK(ptrs_after.value() == ptrs_before.value());
 
-  // Thousands of blocks freed in one dispatch all go back to the heap, and are
+  // Thousands of blocks freed in one call all go back to the heap, and are
   // drawn off it again with no pass calling a half-free heap empty. A capped
   // compare-and-swap loop lost about 960 of 2 048 removed blocks for good, and
   // made allocation report kFailHeap.
@@ -244,10 +244,15 @@ int main() {
     vr::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
     for (int cycle = 0; cycle < 3; ++cycle) {
+      // One call removes them all: a retry round skips what earlier rounds
+      // removed, and contention alone never ends the rounds. Lost blocks
+      // (terminal) and blocks left behind fail on separate lines.
       vol::AllocFailures failures{};
       vr::Result<std::uint32_t> removed =
           big.remove(half.data(), std::uint32_t(half.size()), &failures);
-      CHECK(removed.ok() && removed.value() == 0 && failures.terminal == 0);
+      CHECK(removed.ok());
+      CHECK(failures.terminal == 0);
+      CHECK(removed.value() == 0);
       CHECK(occupancy_is(0.25f));
       CHECK(place(half));
       CHECK(occupancy_is(0.5f));
@@ -255,6 +260,49 @@ int main() {
       vr::Result<std::set<std::int32_t>> ptrs = active_ptrs(big);
       CHECK(ptrs.ok() && ptrs.value() == slab_ptrs.value());
     }
+  }
+
+  // Contention that outlasts every round is reported as lock contention, and
+  // loses nothing. The table is one bucket, so every thread queues on one lock,
+  // which settles fewer than 100 of 1 024 coords over all ten rounds on an RTX
+  // 5090 or an M5 Max. lavapipe, on the CPU, settles them all, and there the
+  // checks hold trivially. The 8 allocated coords lead the list; the rest are
+  // absent, which the kernel still takes the lock to learn.
+  {
+    vol::VoxelGridParams one = grid;
+    one.bucket_size = 8;
+    one.num_buckets = 1;
+    one.num_blocks = 8;
+    vr::Result<vol::VoxelHashMap> made =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), one);
+    CHECK(made.ok());
+    vol::VoxelHashMap tight = std::move(made).value();
+    std::vector<vol::BlockIndex> coords(1024);
+    for (std::size_t i = 0; i < coords.size(); ++i) {
+      coords[i].coord = vr::Vec3i(static_cast<int>(i), 0, 0);
+    }
+    // Re-drives until nothing is left, as a caller does.
+    const auto settle = [&](bool remove) {
+      std::uint32_t left = 1;
+      for (int pass = 0; pass < 8 && left != 0; ++pass) {
+        vr::Result<std::uint32_t> r = remove ? tight.remove(coords.data(), 8)
+                                             : tight.allocate(coords.data(), 8);
+        if (!r) return false;
+        left = r.value();
+      }
+      return left == 0;
+    };
+    CHECK(settle(false));
+    vol::AllocFailures failures{};
+    vr::Result<std::uint32_t> left = tight.remove(
+        coords.data(), static_cast<std::uint32_t>(coords.size()), &failures);
+    CHECK(left.ok());
+    CHECK(failures.lock == left.value());
+    CHECK(failures.terminal == 0);
+    // Nothing was lost: the blocks still allocated remove, and free the heap.
+    CHECK(settle(true));
+    vr::Result<float> occupancy = tight.load_factor();
+    CHECK(occupancy.ok() && occupancy.value() == 0.0f);
   }
 
   std::printf(

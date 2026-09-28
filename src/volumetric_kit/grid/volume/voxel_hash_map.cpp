@@ -168,8 +168,9 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   // storage-buffer binding count matching that shader's set 0. Every kernel
   // pushes the shared PushConstants block. allocate-from-coords and
   // -from-points have the same 6-binding shape but each owns its kernel; depth
-  // adds the camera-params buffer at binding 6 (7 bindings); frustum compaction
-  // adds the planes buffer at binding 3 (4 bindings).
+  // adds the camera-params buffer at binding 6 (7 bindings), delete its done
+  // flags there; frustum compaction adds the planes buffer at binding 3 (4
+  // bindings).
   VkPushConstantRange push{};
   push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   push.offset = 0;
@@ -185,7 +186,7 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
                 vr_hash_compact_comp_spv_size, 3, &push));
   VR_TRY(kb.add(map.delete_, "hash_delete_coords",
                 vr_hash_delete_coords_comp_spv,
-                vr_hash_delete_coords_comp_spv_size, 6, &push));
+                vr_hash_delete_coords_comp_spv_size, 7, &push));
   VR_TRY(kb.add(map.depth_, "hash_allocate_depth",
                 vr_hash_allocate_depth_comp_spv,
                 vr_hash_allocate_depth_comp_spv_size, 7, &push));
@@ -216,7 +217,8 @@ void VoxelHashMap::write_persistent_bindings() {
   // delete / depth / points / triangles) additionally share the fail-counts
   // buffer at binding 5 -- they never run in the same dispatch, and each
   // re-zeroes it before use. Their per-call input (coords / points at binding
-  // 4, depth+camera at 4+6, vertices+indices+offsets at 4+6+7) is
+  // 4, delete's done flags at 6, depth+camera at 4+6, vertices+indices+offsets
+  // at 4+6+7) is
   // written before each dispatch. Compact uses entries + the compaction output
   // + its counter.
   const VkBuffer entries = entries_.handle();
@@ -347,19 +349,21 @@ Status VoxelHashMap::rebuild_heap_excluding(
 }
 
 // Dispatch `kernel` (push arg = `arg`) over `groups` groups, re-dispatching
-// while the reported failure count keeps dropping.
+// while failures remain, up to kMaxRounds.
 // Allocations spuriously fail under heavy same-bucket contention (a GPU
 // spin-lock livelock within a SIMD group) -- worst for depth, whose adjacent
 // pixels hammer the same block. Already-processed elements take the lock-free
-// fast path on the next round (allocate / depth / points) or become a no-op
-// (remove -- the delete kernel skips a coord it no longer finds without
-// counting a failure), so contention falls and the set converges, unless a
-// genuine capacity limit (chain full / heap empty) stalls progress. Mirrors the
-// prior engine's launchWithRetry.
+// fast path on the next round (allocate / depth / points) or are skipped by
+// their done flag (remove), so contention falls and the set converges. Only a
+// genuine capacity limit (chain full / heap empty / table full) that stops
+// progress for kStallLimit rounds ends the loop early; contention alone never
+// does, since another round is what resolves it. Mirrors the prior engine's
+// launchWithRetry.
 //
-// fail_counts_[kFailTotal] is the shared *retryable* tally (allocate / depth /
-// points also split reasons into [1]=lock/[2]=chain/[3]=heap); re-zeroed each
-// round, since re-dispatching is what is supposed to drive it down.
+// fail_counts_[kFailTotal] is the shared *retryable* tally, split by reason
+// into [1]=lock/[2]=chain/[3]=heap/[5]=table (remove reports only lock);
+// re-zeroed each round, since re-dispatching is what is supposed to drive it
+// down.
 //
 // fail_counts_[kFailTerminal] is the failure the loop above cannot resolve, and
 // it is accumulated across rounds rather than read from the last one. Only the
@@ -400,15 +404,13 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     heap_free_ = heap_free;
     failures = slots[kFailTotal];
     terminal += slots[kFailTerminal];
+    // The retryable reasons describe this round; terminal accumulates, since
+    // no later round can restate it.
+    const AllocFailures reported{failures,          slots[kFailLock],
+                                 slots[kFailChain], slots[kFailHeap],
+                                 slots[kFailTable], terminal};
     if (out_failures != nullptr) {
-      // The retryable reasons describe the round that is about to be reported;
-      // terminal accumulates, since no later round can restate it.
-      out_failures->total = failures;
-      out_failures->lock = slots[kFailLock];
-      out_failures->chain = slots[kFailChain];
-      out_failures->heap = slots[kFailHeap];
-      out_failures->table = slots[kFailTable];
-      out_failures->terminal = terminal;
+      *out_failures = reported;
     }
     if (failures == 0) {
       break;
@@ -416,8 +418,8 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     if (failures < prev_failures) {
       prev_failures = failures;
       stall = 0;
-    } else if (++stall >= kStallLimit) {
-      break;  // no progress across kStallLimit rounds -> a real capacity limit
+    } else if (reported.capacity_limited() && ++stall >= kStallLimit) {
+      break;  // a capacity limit stopped progress; another round cannot help
     }
   }
   return failures + terminal;
@@ -437,7 +439,7 @@ Result<Buffer> VoxelHashMap::upload_to_binding(CommandBatch& batch,
 Result<std::uint32_t> VoxelHashMap::run_input_kernel(
     const char* op, const void* data, std::size_t elem_size,
     std::uint32_t count, const ComputeKernel& kernel,
-    AllocFailures* out_failures) {
+    AllocFailures* out_failures, bool done_flags) {
   if (!valid()) {
     return Status::invalid_argument(std::string(op) + ": moved-from map");
   }
@@ -457,11 +459,20 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   VR_TRY(
       check_storage_buffer_range(op, input_bytes, max_storage_buffer_range_));
   Buffer input_buf;  // alive across every round
+  Buffer done_buf;
   return dispatch_with_retry(
       kernel, count, group_count(count), out_failures, nullptr,
       [&](CommandBatch& batch) -> Status {
         VR_ASSIGN(input_buf,
                   upload_to_binding(batch, kernel.set, 4, data, input_bytes));
+        if (done_flags) {
+          const VkDeviceSize bytes =
+              VkDeviceSize(count) * sizeof(std::uint32_t);
+          VR_ASSIGN(done_buf, device_storage_buffer(*allocator_, bytes));
+          VR_TRY(batch.fill(done_buf, 0, bytes, 0u));
+          kernel.set.write_storage_buffer(6, done_buf.handle(), 0,
+                                          VK_WHOLE_SIZE);
+        }
         return {};
       });
 }
@@ -611,7 +622,7 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
   // check placed after it would read the pre-removal value.
   topology_epoch_ = next_topology_epoch();
   return run_input_kernel("VoxelHashMap::remove", coords, sizeof(BlockIndex),
-                          count, delete_, out_failures);
+                          count, delete_, out_failures, true);
 }
 
 Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
