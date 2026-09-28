@@ -2,16 +2,21 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only test for eval/mesh_distance.hpp: the closest point in every region
-// of a triangle, the reach clamp, the summary statistics, accuracy / coverage
-// and the F-score between meshes whose true distance is known -- a plane
-// against a copy of itself shifted by a known amount, and against one with
-// half its triangles gone -- and every refusal. CPU-only.
+// of a triangle and on every degenerate one, the reach clamp, the summary
+// statistics, accuracy / coverage and the F-score between meshes whose true
+// distance is known -- a plane against a copy of itself shifted by a known
+// amount, and against one with half its triangles gone -- what counts as
+// surface, figures independent of the mesh's order, the reusable reference,
+// and every refusal. CPU-only.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -68,6 +73,36 @@ mesh::Mesh plane(int n, float cell, float z, float keep_x = 1e9f) {
   return m;
 }
 
+// `m` with its vertices moved one place down (the first to the end) and its
+// triangles in reverse order: the same surface, as another run's atomics might
+// emit it. A rotation rather than a reversal, which on 41^2 vertices maps
+// every seventh index onto every seventh index.
+mesh::Mesh reordered(const mesh::Mesh& m) {
+  const auto n = static_cast<std::uint32_t>(m.vertices.size());
+  mesh::Mesh r;
+  r.vertices.assign(m.vertices.begin() + 1, m.vertices.end());
+  r.vertices.push_back(m.vertices.front());
+  for (std::size_t t = m.indices.size(); t >= 3; t -= 3) {
+    for (std::size_t k = t - 3; k < t; ++k) {
+      r.indices.push_back((m.indices[k] + n - 1) % n);
+    }
+  }
+  return r;
+}
+
+bool identical(const eval::DistanceStats& a, const eval::DistanceStats& b) {
+  return a.count == b.count && a.beyond_reach == b.beyond_reach &&
+         a.mean == b.mean && a.rms == b.rms && a.p95 == b.p95 && a.max == b.max;
+}
+
+bool identical(const eval::MeshComparison& a, const eval::MeshComparison& b) {
+  return identical(a.accuracy, b.accuracy) &&
+         identical(a.coverage, b.coverage) &&
+         a.fscore.threshold == b.fscore.threshold &&
+         a.fscore.precision == b.fscore.precision &&
+         a.fscore.recall == b.fscore.recall && a.fscore.f == b.fscore.f;
+}
+
 int closest_point_case() {
   const vr::Vec3f a(0, 0, 0), b(1, 0, 0), c(0, 1, 0);
   // Face interior: straight down.
@@ -87,9 +122,24 @@ int closest_point_case() {
   // A point on the triangle is its own closest point.
   CHECK(near(eval::closest_point_on_triangle({0.2f, 0.3f, 0}, a, b, c),
              {0.2f, 0.3f, 0.0f}));
-  // A degenerate triangle collapses to its segment.
-  CHECK(near(eval::closest_point_on_triangle({0.5f, 1, 0}, a, b, b),
-             {0.5f, 0.0f, 0.0f}));
+  // A degenerate triangle collapses to its segment, whichever two corners
+  // coincide: with the first two, Ericson's edge region read 0 / 0.
+  const vr::Vec3f p(0.001f, 0.5f, 0.0f);
+  const vr::Vec3f on_ac(0.0f, 0.5f, 0.0f);
+  for (const auto& [x, y, z] :
+       {std::tuple{a, a, c}, std::tuple{a, c, a}, std::tuple{c, a, a},
+        std::tuple{a, c, c}, std::tuple{c, a, c}, std::tuple{c, c, a}}) {
+    CHECK(near(eval::closest_point_on_triangle(p, x, y, z), on_ac));
+  }
+  // Three distinct corners on one line: the segment they span.
+  const vr::Vec3f mid(0.0f, 0.25f, 0.0f);
+  for (const auto& [x, y, z] :
+       {std::tuple{a, mid, c}, std::tuple{mid, a, c}, std::tuple{c, mid, a}}) {
+    CHECK(near(eval::closest_point_on_triangle({0.001f, 0.75f, 0}, x, y, z),
+               {0.0f, 0.75f, 0.0f}));
+  }
+  // All three one point: that point.
+  CHECK(near(eval::closest_point_on_triangle({1, 1, 1}, c, c, c), c));
   return 0;
 }
 
@@ -111,6 +161,37 @@ int distance_case() {
   vr::Result<eval::MeshDistance> empty =
       eval::MeshDistance::create(mesh::Mesh{}, 0.05f);
   CHECK(empty.ok() && empty.value().distance({0, 0, 0}) == 0.05f);
+
+  // A mesh triangle whose first two corners coincide is the segment to the
+  // third, not a hole.
+  mesh::Mesh sliver;
+  for (const vr::Vec3f& q : {vr::Vec3f(0, 0, 0), vr::Vec3f(0.5f, 0.5f, 0.5f),
+                             vr::Vec3f(0, 0.01f, 0)}) {
+    mesh::Vertex v{};
+    v.position = q;
+    sliver.vertices.push_back(v);
+  }
+  sliver.indices = {0, 0, 2};
+  vr::Result<eval::MeshDistance> s = eval::MeshDistance::create(sliver, 0.02f);
+  CHECK(s.ok());
+  CHECK(near(double(s.value().distance({0.001f, 0.005f, 0.0f})), 0.001, 1e-6));
+
+  // A triangle collapsed to one point is not surface: it is what an
+  // incremental extract retires a triangle to.
+  sliver.indices = {2, 2, 2};
+  vr::Result<eval::MeshDistance> point =
+      eval::MeshDistance::create(sliver, 0.02f);
+  CHECK(point.ok());
+  CHECK(point.value().distance({0.0f, 0.01f, 0.001f}) == 0.02f);
+
+  // A query that is not finite, or past the index's range, has nothing
+  // within reach -- and does not overflow the cell arithmetic getting there.
+  const float inf = std::numeric_limits<float>::infinity();
+  CHECK(d.distance({inf, 0, 0}) == 0.05f);
+  CHECK(d.distance({0, -inf, 0}) == 0.05f);
+  CHECK(d.distance({0, 0, std::numeric_limits<float>::quiet_NaN()}) == 0.05f);
+  CHECK(d.distance({1e30f, 0, 0}) == 0.05f);
+  CHECK(d.distance({0, -3e38f, 0}) == 0.05f);
   return 0;
 }
 
@@ -125,6 +206,15 @@ int summarize_case() {
   CHECK(near(s.p95, 0.4, 1e-6));
   const eval::DistanceStats none = eval::summarize({}, 1.0f);
   CHECK(none.count == 0 && none.mean == 0.0);
+  // The p95 is the nearest rank, ceil(0.95 n): the 19th of 20, not the max.
+  std::vector<float> twenty;
+  for (int i = 1; i <= 20; ++i) {
+    twenty.push_back(float(i));
+  }
+  const eval::DistanceStats t = eval::summarize(twenty, 100.0f);
+  CHECK(t.p95 == 19.0 && t.max == 20.0);
+  // And one sample is its own p95.
+  CHECK(eval::summarize({0.5f}, 1.0f).p95 == 0.5);
   return 0;
 }
 
@@ -164,13 +254,101 @@ int compare_case() {
   CHECK(h.value().coverage.beyond_reach > reference.vertices.size() / 3);
   CHECK(h.value().coverage.beyond_reach < reference.vertices.size() / 2);
 
-  // A stride measures every stride-th vertex.
+  // A stride measures about one vertex in seven...
   opt.stride = 7;
   vr::Result<eval::MeshComparison> sparse =
       eval::compare_meshes(reference, shifted, opt);
   CHECK(sparse.ok());
-  CHECK(sparse.value().accuracy.count == (reference.vertices.size() + 6) / 7);
+  const std::size_t n = reference.vertices.size();
+  CHECK(sparse.value().accuracy.count > n / 10);
+  CHECK(sparse.value().accuracy.count < n / 5);
   CHECK(near(sparse.value().accuracy.mean, 0.003, 1e-6));
+  // ... chosen by position, so the same surfaces stored in another order give
+  // the same figures to the bit, where a stride over the array would not. The
+  // test mesh is bumped so every vertex has a distance of its own; on a flat
+  // grid, many subsets share one distribution.
+  mesh::Mesh bumpy = half;
+  for (std::size_t v = 0; v < bumpy.vertices.size(); ++v) {
+    bumpy.vertices[v].position.z = 1e-4f * float(v % 17);
+  }
+  vr::Result<eval::MeshComparison> again =
+      eval::compare_meshes(reordered(reference), reordered(bumpy), opt);
+  vr::Result<eval::MeshComparison> first =
+      eval::compare_meshes(reference, bumpy, opt);
+  CHECK(again.ok() && first.ok());
+  CHECK(identical(again.value(), first.value()));
+  return 0;
+}
+
+// Only the surface is measured: vertices no triangle uses, and triangles
+// collapsed to a point, are what an incremental extract leaves behind, and
+// neither is surface.
+int surface_case() {
+  const mesh::Mesh reference = plane(20, 0.005f, 0.0f);
+  eval::CompareOptions opt;
+  opt.reach = 0.02f;
+  opt.fscore_threshold = 0.001f;
+  vr::Result<eval::MeshComparison> clean =
+      eval::compare_meshes(reference, reference, opt);
+  CHECK(clean.ok());
+
+  mesh::Mesh stale = reference;
+  mesh::Vertex far{};
+  far.position = vr::Vec3f(0.05f, 0.05f, 0.01f);  // 1 cm off, within reach
+  stale.vertices.push_back(far);                  // referenced by nothing
+  const auto retired = static_cast<std::uint32_t>(stale.vertices.size());
+  for (int k = 0; k < 3; ++k) {  // the default kernel's retired triangle
+    mesh::Vertex o{};
+    o.position = vr::Vec3f(0.05f, 0.05f, -0.01f);
+    stale.vertices.push_back(o);
+  }
+  stale.indices.insert(stale.indices.end(),
+                       {retired, retired + 1, retired + 2});
+  stale.indices.insert(stale.indices.end(), {0, 0, 0});  // the shared one's
+  // A vertex nothing uses may even be garbage.
+  mesh::Vertex nan{};
+  nan.position = vr::Vec3f(std::numeric_limits<float>::quiet_NaN());
+  stale.vertices.push_back(nan);
+
+  const mesh::Mesh* const clean_mesh = &reference;
+  const mesh::Mesh* const stale_mesh = &stale;
+  for (const auto& [ref, test] :
+       {std::pair{clean_mesh, stale_mesh}, std::pair{stale_mesh, clean_mesh}}) {
+    vr::Result<eval::MeshComparison> c = eval::compare_meshes(*ref, *test, opt);
+    CHECK(c.ok());
+    CHECK(identical(c.value(), clean.value()));
+  }
+  return 0;
+}
+
+// A reference indexed once gives what compare_meshes gives, for each mesh
+// judged against it, and outlives the mesh it was built from.
+int reference_case() {
+  eval::CompareOptions opt;
+  opt.reach = 0.02f;
+  opt.stride = 3;
+  opt.fscore_threshold = 0.004f;
+  vr::Result<eval::ReferenceMesh> ref =
+      eval::ReferenceMesh::create(plane(40, 0.005f, 0.0f), opt);
+  CHECK(ref.ok());
+  CHECK(ref.value().options().stride == 3);
+  const mesh::Mesh reference = plane(40, 0.005f, 0.0f);
+  for (const mesh::Mesh& test :
+       {plane(40, 0.005f, 0.003f), plane(40, 0.005f, 0.0f, 0.1f)}) {
+    vr::Result<eval::MeshComparison> once = ref.value().compare(test);
+    vr::Result<eval::MeshComparison> each =
+        eval::compare_meshes(reference, test, opt);
+    CHECK(once.ok() && each.ok());
+    CHECK(identical(once.value(), each.value()));
+  }
+  // It refuses what compare_meshes refuses.
+  mesh::Mesh wild = reference;
+  wild.indices[4] = static_cast<std::uint32_t>(wild.vertices.size());
+  CHECK(!ref.value().compare(wild).ok());
+  CHECK(!eval::ReferenceMesh::create(wild, opt).ok());
+  eval::CompareOptions no_stride = opt;
+  no_stride.stride = 0;
+  CHECK(!eval::ReferenceMesh::create(reference, no_stride).ok());
   return 0;
 }
 
@@ -240,6 +418,37 @@ int refusals_case() {
   // compare_meshes refuses the same meshes, either side.
   CHECK(!eval::compare_meshes(wild, good).ok());
   CHECK(!eval::compare_meshes(good, wild).ok());
+  // A corner that is not finite, or too far out for the cell keys: each once
+  // left the cell loop unbounded.
+  for (float bad : {std::numeric_limits<float>::infinity(),
+                    -std::numeric_limits<float>::infinity(),
+                    std::numeric_limits<float>::quiet_NaN(), 1e30f}) {
+    mesh::Mesh off = good;
+    off.vertices[off.indices[0]].position.z = bad;
+    CHECK(!eval::MeshDistance::create(off, 0.02f).ok());
+    CHECK(!eval::compare_meshes(good, off).ok());
+  }
+  // A reach too small for the triangles, refused before it is paid for: one
+  // 1 cm triangle at a micron once took seconds and gigabytes.
+  mesh::Mesh one;
+  for (const vr::Vec3f& q : {vr::Vec3f(0, 0, 0), vr::Vec3f(0.01f, 0, 0.01f),
+                             vr::Vec3f(0, 0.01f, 0.005f)}) {
+    mesh::Vertex v{};
+    v.position = q;
+    one.vertices.push_back(v);
+  }
+  one.indices = {0, 1, 2};
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(!eval::MeshDistance::create(one, 1e-6f).ok());
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
+  CHECK(eval::MeshDistance::create(one, 0.01f).ok());  // 2 x 2 x 2 cells
+  // A bad reach is named as the reach, not as the threshold left at 0.
+  eval::CompareOptions bad_reach;
+  bad_reach.reach = -0.01f;
+  vr::Result<eval::MeshComparison> r =
+      eval::compare_meshes(good, good, bad_reach);
+  CHECK(!r.ok());
+  CHECK(r.status().message().find("reach must be") != std::string::npos);
   // A stride of 0, and an F-score threshold negative, not finite or past the
   // reach (where every distance reads as the reach).
   eval::CompareOptions opt;
@@ -266,6 +475,8 @@ int main() {
   if (summarize_case() != 0) return 1;
   if (compare_case() != 0) return 1;
   if (fscore_case() != 0) return 1;
+  if (surface_case() != 0) return 1;
+  if (reference_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::printf("eval mesh distance: OK\n");
   return 0;
