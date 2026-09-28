@@ -566,8 +566,8 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   return out;
 }
 
-Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
-                                    std::uint32_t max_blocks) {
+Result<FrameHeader> read_frame_header(const std::uint8_t* data,
+                                      std::size_t size) {
   if (data == nullptr || size < kFrameHeaderBytes) {
     return bad("shorter than a frame header");
   }
@@ -578,16 +578,16 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   const std::uint32_t version = h.u16();
   const std::uint32_t type = h.u8();
   const std::uint32_t reserved = h.u8();
-  IntraFrame frame;
-  frame.voxel_size = h.f32();
-  frame.blocks.trunc_dist = h.f32();
+  FrameHeader header;
+  header.voxel_size = h.f32();
+  header.trunc_dist = h.f32();
   const std::uint32_t block_size = h.u32();
-  frame.blocks.params.coefficient_count = h.u32();
-  frame.blocks.params.dc_step = h.f32();
-  frame.blocks.params.ac_step = h.f32();
-  const std::uint32_t n = h.u32();
-  const std::uint32_t r_size = h.u32();
-  const std::uint32_t section_count = h.u32();
+  header.params.coefficient_count = h.u32();
+  header.params.dc_step = h.f32();
+  header.params.ac_step = h.f32();
+  header.block_count = h.u32();
+  header.segment_size = h.u32();
+  header.section_count = h.u32();
 
   if (version != kFrameVersion) {
     return Status::unsupported("read_intra_frame: frame version " +
@@ -606,16 +606,29 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
         "read_intra_frame: block size " + std::to_string(block_size) +
         " (the codec's is " + std::to_string(kBlockSize) + ")");
   }
-  if (!positive_finite(frame.voxel_size) ||
-      !positive_finite(frame.blocks.trunc_dist)) {
+  if (!positive_finite(header.voxel_size) ||
+      !positive_finite(header.trunc_dist)) {
     return bad("voxel_size and trunc_dist must be finite and positive");
   }
-  if (Status s = frame.blocks.params.validate(); !s.ok()) {
+  if (Status s = header.params.validate(); !s.ok()) {
     return bad("invalid codec params: " + s.message());
   }
-  if (r_size == 0) {
+  if (header.segment_size == 0) {
     return bad("segment size 0");
   }
+  return header;
+}
+
+Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
+                                    std::uint32_t max_blocks) {
+  VR_ASSIGN(const FrameHeader header, read_frame_header(data, size));
+  IntraFrame frame;
+  frame.voxel_size = header.voxel_size;
+  frame.blocks.trunc_dist = header.trunc_dist;
+  frame.blocks.params = header.params;
+  const std::uint32_t n = header.block_count;
+  const std::uint32_t r_size = header.segment_size;
+  const std::uint32_t section_count = header.section_count;
   if (n > max_blocks) {
     return bad("the frame holds " + std::to_string(n) +
                " blocks, more than the caller's " + std::to_string(max_blocks));

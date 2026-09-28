@@ -29,7 +29,8 @@
 
 namespace volumetric_kit::recon {
 class Device;
-}
+class GpuStageScope;
+}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::codec::detail {
 
@@ -119,6 +120,9 @@ class VR_CODEC_API DctTransform {
   /// @param params  The coefficient count and steps.
   /// @param out     Receives the coefficients and masks, and @p params and the
   ///                grid's `trunc_dist` beside them.
+  /// @param stage   Optional scope the caller's stage row is open under; the
+  ///                dispatches record their device spans into it. `nullptr`
+  ///                times nothing.
   /// @return OK, or @ref Status::Code::InvalidArgument for a moved-from
   ///         transform, invalid @p params, a grid that is moved-from, has
   ///         another block size, a non-positive `trunc_dist`, or lacks a float
@@ -130,7 +134,7 @@ class VR_CODEC_API DctTransform {
   ///         On failure @p out is left empty.
   Status forward(const volume::VoxelBlockGrid& grid,
                  const volume::BlockList& blocks, const CodecParams& params,
-                 DctBlocks& out);
+                 DctBlocks& out, GpuStageScope* stage = nullptr);
 
   /// @brief Reconstruct every block in @p blocks from its coefficients and
   ///        mask, overwriting its `tsdf` and `weight`.
@@ -141,6 +145,7 @@ class VR_CODEC_API DctTransform {
   /// @param blocks  The blocks to reconstruct, in the order @p in was produced
   ///                in; each must be live in @p grid.
   /// @param in      A @ref forward output, or one read back from a frame.
+  /// @param stage   As @ref forward.
   /// @return OK, the same refusals as @ref forward, or
   ///         @ref Status::Code::InvalidArgument when @p in carries invalid
   ///         params, another `trunc_dist` than @p grid, or a size that does
@@ -148,7 +153,7 @@ class VR_CODEC_API DctTransform {
   ///         from the device, after every live entry has been written; the
   ///         others refuse before anything is.
   Status inverse(volume::VoxelBlockGrid& grid, const volume::BlockList& blocks,
-                 const DctBlocks& in);
+                 const DctBlocks& in, GpuStageScope* stage = nullptr);
 
   /// @return `true` if this owns both live pipelines (`false` when moved-from).
   bool valid() const noexcept {
@@ -177,7 +182,8 @@ class VR_CODEC_API DctTransform {
   Status run(const char* op, ComputeKernel& kernel,
              const volume::VoxelBlockGrid& grid, const GridViews& views,
              const volume::BlockList& blocks, const CodecParams& params,
-             const Buffer& coefficients, const Buffer& masks);
+             const Buffer& coefficients, const Buffer& masks,
+             GpuStageScope* stage);
 
   // Borrowed (must outlive this).
   Device* device_ = nullptr;

@@ -115,6 +115,22 @@ inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
   return a.x < b.x;
 }
 
+/// @brief A frame's header, parsed and checked without decoding anything.
+struct FrameHeader {
+  float voxel_size = 0.0f;          ///< Metres per voxel edge.
+  float trunc_dist = 0.0f;          ///< Metres; the steps are fractions of it.
+  CodecParams params;               ///< K and the two steps.
+  std::uint32_t block_count = 0;    ///< Blocks the frame holds.
+  std::uint32_t segment_size = 0;   ///< Blocks per segment, at least 1.
+  std::uint32_t section_count = 0;  ///< Entries in the section table.
+};
+
+/// @brief Parse and check a frame's fixed header -- the first
+///        @ref kFrameHeaderBytes -- and nothing after it.
+/// @return The header, or the same header refusals as @ref read_intra_frame.
+VR_CODEC_API Result<FrameHeader> read_frame_header(const std::uint8_t* data,
+                                                   std::size_t size);
+
 /// Writer options.
 struct FrameWriteOptions {
   /// Blocks per segment, at least 1.

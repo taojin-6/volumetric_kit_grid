@@ -20,7 +20,7 @@ add_library(recon_codec)
 add_library(volumetric_kit::recon_codec ALIAS recon_codec)
 
 target_sources(recon_codec PRIVATE bitstream.cpp codec_params.cpp
-                                   dct_transform.cpp)
+                                   dct_transform.cpp decoder.cpp encoder.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.
