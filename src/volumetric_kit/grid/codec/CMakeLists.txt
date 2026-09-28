@@ -3,14 +3,15 @@
 
 # --- recon_codec: the per-frame TSDF geometry codec --------------------------
 # Encodes a grid's active blocks as a self-contained intra frame and decodes it
-# back into a VoxelBlockGrid (the 2026-09-26 decision). So far it carries the
-# public CodecParams and, all private, the DctTransform (the GLSL
-# forward/inverse 8^3 DCT that turns a block list into quantized coefficients
-# plus an observed mask, and back), the host rANS reference coder (rans.hpp,
-# header-only) and the v1 intra frame built on it (bitstream.cpp; the 2026-09-27
-# decision). Links recon_volume ALONE -- it reads a grid's tsdf/weight and
-# re-creates blocks through the map, and needs neither the integrator that
-# produced the field nor the mesher that consumes the decoded one.
+# back into a VoxelBlockGrid (the 2026-09-26 decision). Public: CodecParams, and
+# the Encoder and Decoder built on the private pieces (encoder.cpp, decoder.cpp)
+# -- the DctTransform (the GLSL forward/inverse 8^3 DCT that turns a block list
+# into quantized coefficients plus an observed mask, and back), the host rANS
+# reference coder (rans.hpp, header-only) and the v1 intra frame built on it
+# (bitstream.cpp; the 2026-09-27 decisions). Links recon_volume ALONE -- it
+# reads a grid's tsdf/weight and re-creates blocks through the map, and needs
+# neither the integrator that produced the field nor the mesher that consumes
+# the decoded one.
 include(GenerateExportHeader)
 include(GNUInstallDirs)
 
@@ -20,7 +21,7 @@ add_library(recon_codec)
 add_library(volumetric_kit::recon_codec ALIAS recon_codec)
 
 target_sources(recon_codec PRIVATE bitstream.cpp codec_params.cpp
-                                   dct_transform.cpp)
+                                   dct_transform.cpp decoder.cpp encoder.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.

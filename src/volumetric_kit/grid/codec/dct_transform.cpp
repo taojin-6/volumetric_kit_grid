@@ -183,7 +183,7 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
                          const GridViews& views,
                          const volume::BlockList& blocks,
                          const CodecParams& params, const Buffer& coefficients,
-                         const Buffer& masks) {
+                         const Buffer& masks, GpuStageScope* stage) {
   const VkDeviceSize list_bytes =
       VkDeviceSize(blocks.count) * sizeof(volume::BlockIndex);
   VR_TRY(check_storage_buffer_range("DctTransform: the block list", list_bytes,
@@ -235,7 +235,7 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
     const std::uint32_t groups =
         std::min(blocks_per_dispatch_, blocks.count - base);
     VR_TRY(dispatch(*device_, kernel, &push, sizeof(push), groups,
-                    max_workgroup_count_x_));
+                    max_workgroup_count_x_, stage));
   }
   std::uint32_t rejected = 0;
   std::memcpy(&rejected, rejected_.mapped(), sizeof(rejected));
@@ -251,7 +251,8 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
 
 Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
                              const volume::BlockList& blocks,
-                             const CodecParams& params, DctBlocks& out) {
+                             const CodecParams& params, DctBlocks& out,
+                             GpuStageScope* stage) {
   out.params = CodecParams{};
   out.trunc_dist = 0.0f;
   out.coefficients.clear();
@@ -280,7 +281,7 @@ Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
                              "codec.masks");
 
     VR_TRY(run("forward", forward_kernel_, grid, views, blocks, params,
-               coeff_buf, mask_buf));
+               coeff_buf, mask_buf, stage));
 
     out.coefficients.resize(coeff_count);
     out.masks.resize(mask_count);
@@ -294,7 +295,7 @@ Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
 
 Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                              const volume::BlockList& blocks,
-                             const DctBlocks& in) {
+                             const DctBlocks& in, GpuStageScope* stage) {
   VR_ASSIGN(GridViews views, check_inputs("inverse", grid, blocks, in.params));
   if (in.trunc_dist != grid.grid().trunc_dist) {
     return fail("inverse", "the coefficients were normalized by trunc_dist " +
@@ -340,7 +341,7 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                            "codec.masks");
 
   return run("inverse", inverse_kernel_, grid, views, blocks, in.params,
-             coeff_buf, mask_buf);
+             coeff_buf, mask_buf, stage);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

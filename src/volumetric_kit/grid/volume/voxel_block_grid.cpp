@@ -3,6 +3,7 @@
 
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -278,27 +279,41 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
   // grid actually carries attributes.
   if (!attributes_.empty()) {
     VR_ASSIGN(std::vector<BlockIndex> active, map_.compact_active_blocks());
+    // Sorted once, so each coord is a binary search: a scan of the whole
+    // active set per coord made removing k of n blocks O(k * n), which a
+    // decoder removing thousands of blocks a frame cannot afford.
+    const auto less = [](const Vec3i& a, const Vec3i& b) {
+      if (a.z != b.z) return a.z < b.z;
+      if (a.y != b.y) return a.y < b.y;
+      return a.x < b.x;
+    };
+    std::sort(active.begin(), active.end(),
+              [&](const BlockIndex& a, const BlockIndex& b) {
+                return less(a.coord, b.coord);
+              });
     const auto voxels_per_block =
         static_cast<std::uint64_t>(map_.grid().voxels_per_block);
     for (std::uint32_t i = 0; i < count; ++i) {
-      for (const BlockIndex& block : active) {
-        if (block.coord != coords[i].coord) {
-          continue;
+      const auto block =
+          std::lower_bound(active.begin(), active.end(), coords[i].coord,
+                           [&](const BlockIndex& b, const Vec3i& c) {
+                             return less(b.coord, c);
+                           });
+      if (block == active.end() || block->coord != coords[i].coord) {
+        continue;
+      }
+      // Zero this block's slice of every attribute. The buffers are
+      // host-visible and mapped, and remove() is synchronous, so this is a
+      // plain memset rather than a fill dispatch.
+      const auto first = static_cast<std::uint64_t>(block->ptr);
+      for (Attribute& attr : attributes_) {
+        const std::uint64_t offset = first * attr.element_size;
+        const std::uint64_t bytes = voxels_per_block * attr.element_size;
+        if (offset + bytes > attr.buffer.size()) {
+          continue;  // an out-of-lockstep array; attribute() reports it
         }
-        // Zero this block's slice of every attribute. The buffers are
-        // host-visible and mapped, and remove() is synchronous, so this is a
-        // plain memset rather than a fill dispatch.
-        const auto first = static_cast<std::uint64_t>(block.ptr);
-        for (Attribute& attr : attributes_) {
-          const std::uint64_t offset = first * attr.element_size;
-          const std::uint64_t bytes = voxels_per_block * attr.element_size;
-          if (offset + bytes > attr.buffer.size()) {
-            continue;  // an out-of-lockstep array; attribute() reports it
-          }
-          std::memset(static_cast<std::uint8_t*>(attr.buffer.mapped()) + offset,
-                      0, static_cast<std::size_t>(bytes));
-        }
-        break;
+        std::memset(static_cast<std::uint8_t*>(attr.buffer.mapped()) + offset,
+                    0, static_cast<std::size_t>(bytes));
       }
     }
   }

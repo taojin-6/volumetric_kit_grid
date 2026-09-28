@@ -44,6 +44,7 @@
 /// integer is a *class* -- its bit length -- through a table, plus the bits
 /// below its leading one (and a sign) raw.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -52,6 +53,7 @@
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/volume/hash_types.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
 
@@ -115,6 +117,32 @@ inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
   return a.x < b.x;
 }
 
+/// @brief Sort @p blocks into the order a frame holds them in (@ref
+///        coord_less): the order the encoder writes and the decoder's merge
+///        walks, so the two cannot drift apart.
+inline void sort_by_coord(std::vector<volume::BlockIndex>& blocks) {
+  std::sort(blocks.begin(), blocks.end(),
+            [](const volume::BlockIndex& a, const volume::BlockIndex& b) {
+              return coord_less(a.coord, b.coord);
+            });
+}
+
+/// @brief A frame's header, parsed and checked without decoding anything.
+struct FrameHeader {
+  float voxel_size = 0.0f;          ///< Metres per voxel edge.
+  float trunc_dist = 0.0f;          ///< Metres; the steps are fractions of it.
+  CodecParams params;               ///< K and the two steps.
+  std::uint32_t block_count = 0;    ///< Blocks the frame holds.
+  std::uint32_t segment_size = 0;   ///< Blocks per segment, at least 1.
+  std::uint32_t section_count = 0;  ///< Entries in the section table.
+};
+
+/// @brief Parse and check a frame's fixed header -- the first
+///        @ref kFrameHeaderBytes -- and nothing after it.
+/// @return The header, or the same header refusals as @ref read_intra_frame.
+VR_CODEC_API Result<FrameHeader> read_frame_header(const std::uint8_t* data,
+                                                   std::size_t size);
+
 /// Writer options.
 struct FrameWriteOptions {
   /// Blocks per segment, at least 1.
@@ -146,15 +174,18 @@ VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
 ///                    bytes per block, with K from the header (at most 512),
 ///                    so at most ~2.1 KB -- about half of the 4 KB of
 ///                    `tsdf` + `weight` the grid it decodes into holds per
-///                    block.
+///                    block. Checked once the block count agrees with the
+///                    segment table, so a corrupt count is refused as corrupt
+///                    and only a sound frame is refused for its size.
 /// @return The frame, or: @ref Status::Code::Unsupported for another version,
 ///         frame type, block size, an unknown required section, or a known
 ///         section with a flag v1 does not define;
 ///         @ref Status::Code::InvalidArgument for anything malformed,
 ///         truncated or inconsistent (coordinates out of order across
-///         segments included), and for more than @p max_blocks blocks;
-///         @ref Status::Code::OutOfMemory for a frame whose arrays would not
-///         fit this platform's address space (reachable on a 32-bit build).
+///         segments included); @ref Status::Code::OutOfMemory for a
+///         well-formed frame of more than @p max_blocks blocks, or one whose
+///         arrays would not fit this platform's address space (reachable on a
+///         32-bit build).
 VR_CODEC_API Result<IntraFrame> read_intra_frame(const std::uint8_t* data,
                                                  std::size_t size,
                                                  std::uint32_t max_blocks);

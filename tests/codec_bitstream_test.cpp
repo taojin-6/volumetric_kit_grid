@@ -323,9 +323,15 @@ int header_refusals_case() {
   b = good;
   put_u32(b, 40, 0x40000000u);
   CHECK(refused_as(b, C::InvalidArgument));  // section table past the end
-  // The caller's limit, which the frame's size cannot stand in for.
-  CHECK(refused_as(good, C::InvalidArgument, 99));
+  // The caller's limit, which the frame's size cannot stand in for: a sound
+  // frame past it is too big to hold, not corrupt ...
+  CHECK(refused_as(good, C::OutOfMemory, 99));
   CHECK(read(good, 100).ok());
+  // ... while a count the segment table disagrees with is corrupt, however
+  // far past the limit it claims to be.
+  b = good;
+  put_u32(b, 32, 0x7FFFFFFFu);
+  CHECK(refused_as(b, C::InvalidArgument, 99));
   // Exact length: a trailing byte is refused, as is a null frame.
   b = good;
   b.push_back(0);

@@ -1,0 +1,631 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// GPU test for codec::Decoder, and the codec end to end: a frame decodes to
+// exactly the encoded grid's observed blocks and voxels, within the bound an
+// orthonormal transform guarantees; the decoded grid meshes to the analytic
+// sphere it came from; frame after frame into one grid leaves exactly the
+// last frame; every refusal before the grid is touched leaves it untouched;
+// a grid whose hash table cannot place the frame says so and recovers after a
+// resize; read_frame_info; the stage rows; the moves. Links recon_mesh, which
+// the codec tier itself may not. Exits 0 (skip) with no device.
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <utility>
+#include <vector>
+
+#include "codec_fixture.hpp"
+#include "volumetric_kit/recon/codec/decoder.hpp"
+#include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/gpu_timer.hpp"
+#include "volumetric_kit/recon/core/stage_metrics.hpp"
+#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
+#include "volumetric_kit/recon/mesh/mesh.hpp"
+
+namespace codec = volumetric_kit::recon::codec;
+namespace mesh = volumetric_kit::recon::mesh;
+using namespace codec_fixture;
+
+namespace {
+
+using Bytes = std::vector<std::uint8_t>;
+
+const vr::StageRow* find_row(const vr::StageMetrics& m, const char* name) {
+  for (const vr::StageRow& row : m.rows()) {
+    if (std::strcmp(row.name, name) == 0) {
+      return &row;
+    }
+  }
+  return nullptr;
+}
+
+vr::Result<Bytes> encode_with(Gpu& gpu, vol::VoxelBlockGrid& grid,
+                              const codec::EncoderConfig& config = {}) {
+  VR_ASSIGN(codec::Encoder enc,
+            codec::Encoder::create(gpu.device, gpu.allocator, config));
+  return enc.encode(grid);
+}
+
+// A grid built from a frame's header, as a player builds one.
+vr::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
+                                         std::int32_t num_buckets = 512) {
+  VR_ASSIGN(const codec::FrameInfo info,
+            codec::read_frame_info(frame.data(), frame.size()));
+  GridShape shape;
+  shape.voxel_size = info.voxel_size;
+  shape.trunc_dist = info.trunc_dist;
+  shape.num_buckets = num_buckets;
+  return make_grid(gpu, shape);
+}
+
+codec::EncoderConfig near_lossless() {
+  codec::EncoderConfig c;
+  c.params.coefficient_count = codec::kVoxelsPerBlock;
+  c.params.dc_step = 0.002f;
+  c.params.ac_step = 0.002f;
+  return c;
+}
+
+// The source's observed blocks and voxels, against the decoded grid's: the
+// same blocks exactly, weight 1 exactly where the source observed and 0
+// elsewhere, tsdf 0 where unobserved, and within `bound` metres where
+// observed. Reports the largest error it saw.
+int compare_decoded(const Snapshot& src, const Snapshot& dec, float bound,
+                    float* max_err_out) {
+  std::vector<vr::Vec3i> observed;
+  std::vector<std::size_t> src_index;
+  for (std::size_t i = 0; i < src.coords.size(); ++i) {
+    for (std::uint32_t v = 0; v < kVpb; ++v) {
+      if (src.weight[i * kVpb + v] >= vol::kObservedWeight) {
+        observed.push_back(src.coords[i]);
+        src_index.push_back(i);
+        break;
+      }
+    }
+  }
+  CHECK(dec.coords == observed);
+  float max_err = 0.0f;
+  for (std::size_t d = 0; d < dec.coords.size(); ++d) {
+    const std::size_t s = src_index[d];
+    for (std::uint32_t v = 0; v < kVpb; ++v) {
+      const bool obs = src.weight[s * kVpb + v] >= vol::kObservedWeight;
+      const float w = dec.weight[d * kVpb + v];
+      const float t = dec.tsdf[d * kVpb + v];
+      if (obs) {
+        CHECK(w == 1.0f);
+        max_err = std::max(max_err, std::fabs(t - src.tsdf[s * kVpb + v]));
+      } else {
+        CHECK(w == 0.0f);
+        CHECK(t == 0.0f);
+      }
+    }
+  }
+  CHECK(max_err <= bound);
+  *max_err_out = max_err;
+  return 0;
+}
+
+// Near-lossless (K = 512, steps 0.002): each coefficient is within half a
+// step, so over a block the error's norm is at most sqrt(512) * step / 2 in
+// units of trunc_dist -- a bound on any one voxel, however loose.
+int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
+  const Sphere s{vr::Vec3f(0.01f, 0.0f, -0.01f), 0.1f};
+  // Never observed, so the encoder drops both: one sorts after every sphere
+  // block, the other before them all, so dropping it slides the whole
+  // readback down one block.
+  const std::vector<vr::Vec3i> far = {{30, 30, 30}, {-30, 2, -30}};
+  vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s, {}, far);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid src = std::move(g).value();
+  vr::Result<Snapshot> src_snap = snapshot(src);
+  CHECK(src_snap.ok());
+
+  vr::Result<Bytes> frame = encode_with(gpu, src, near_lossless());
+  CHECK(frame.ok());
+  vr::Result<vol::VoxelBlockGrid> d = grid_for(gpu, frame.value());
+  CHECK(d.ok());
+  vol::VoxelBlockGrid out = std::move(d).value();
+  CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
+  vr::Result<Snapshot> out_snap = snapshot(out);
+  CHECK(out_snap.ok());
+
+  const float bound = std::sqrt(512.0f) * 0.002f / 2.0f * kTrunc + 1e-6f;
+  float max_err = 0.0f;
+  CHECK(compare_decoded(src_snap.value(), out_snap.value(), bound, &max_err) ==
+        0);
+  std::printf(
+      "near-lossless: %zu blocks, %zu bytes, max voxel error %.3g m "
+      "(bound %.3g)\n",
+      out_snap.value().coords.size(), frame.value().size(), double(max_err),
+      double(bound));
+  return 0;
+}
+
+// Mesh a grid, and measure how far its vertices sit from the true sphere.
+struct MeshFit {
+  std::size_t triangles = 0;
+  double max_off = 0.0;   // metres, worst vertex
+  double mean_off = 0.0;  // metres
+};
+
+vr::Result<MeshFit> fit(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sphere& s) {
+  VR_ASSIGN(mesh::MarchingCubes mc,
+            mesh::MarchingCubes::create(gpu.device, gpu.allocator));
+  VR_ASSIGN(const mesh::Mesh m, mc.extract_host(grid));
+  MeshFit f;
+  f.triangles = m.triangle_count();
+  for (const mesh::Vertex& v : m.vertices) {
+    const double off = std::fabs(double(s.sdf(v.position)));
+    f.max_off = std::max(f.max_off, off);
+    f.mean_off += off;
+  }
+  if (!m.vertices.empty()) {
+    f.mean_off /= double(m.vertices.size());
+  }
+  return f;
+}
+
+// The promise the codec is for: the decoded grid meshes to the surface the
+// source did. Judged against the analytic sphere, so a decoded mesh that
+// matched a wrong source mesh would not pass.
+int mesh_case(Gpu& gpu, codec::Decoder& dec) {
+  const Sphere s{vr::Vec3f(0.0f, 0.02f, 0.0f), 0.12f};
+  vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid src = std::move(g).value();
+  vr::Result<MeshFit> truth = fit(gpu, src, s);
+  CHECK(truth.ok());
+  CHECK(truth.value().triangles > 1000);
+
+  struct Setting {
+    const char* name;
+    codec::EncoderConfig config;
+    double max_off_voxels;  // worst vertex, in voxels
+    double tri_ratio;       // allowed triangle-count drift either way
+  };
+  const Setting settings[] = {{"defaults (K = 32)", {}, 0.5, 0.02},
+                              {"near-lossless", near_lossless(), 0.1, 0.005}};
+  std::printf("source mesh: %zu triangles, max %.3g / mean %.3g voxels off\n",
+              truth.value().triangles, truth.value().max_off / kVoxel,
+              truth.value().mean_off / kVoxel);
+  for (const Setting& setting : settings) {
+    vr::Result<Bytes> frame = encode_with(gpu, src, setting.config);
+    CHECK(frame.ok());
+    vr::Result<vol::VoxelBlockGrid> d = grid_for(gpu, frame.value());
+    CHECK(d.ok());
+    vol::VoxelBlockGrid out = std::move(d).value();
+    CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
+    vr::Result<MeshFit> got = fit(gpu, out, s);
+    CHECK(got.ok());
+    vr::Result<Snapshot> out_snap = snapshot(out);
+    CHECK(out_snap.ok());
+    const double ratio =
+        double(got.value().triangles) / double(truth.value().triangles);
+    std::printf(
+        "%s: %zu bytes (%.1f B/block), %zu triangles (x%.4f), max "
+        "%.3g / mean %.3g voxels off\n",
+        setting.name, frame.value().size(),
+        double(frame.value().size()) / double(out_snap.value().coords.size()),
+        got.value().triangles, ratio, got.value().max_off / kVoxel,
+        got.value().mean_off / kVoxel);
+    CHECK(got.value().max_off <= setting.max_off_voxels * kVoxel);
+    CHECK(std::fabs(ratio - 1.0) <= setting.tri_ratio);
+  }
+  return 0;
+}
+
+// Frame after frame into one grid leaves exactly the last frame -- the same
+// state, bit for bit, as decoding that frame into a fresh grid. The two
+// spheres overlap, so the grid keeps some blocks, drops some and gains some.
+int sequence_case(Gpu& gpu, codec::Decoder& dec) {
+  const Sphere a{vr::Vec3f(0.0f), 0.08f};
+  const Sphere b{vr::Vec3f(0.05f, 0.0f, 0.0f), 0.07f};
+  vr::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
+  vr::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
+  CHECK(ga.ok() && gb.ok());
+  vr::Result<Bytes> fa = encode_with(gpu, ga.value());
+  vr::Result<Bytes> fb = encode_with(gpu, gb.value());
+  CHECK(fa.ok() && fb.ok());
+
+  vr::Result<vol::VoxelBlockGrid> g = grid_for(gpu, fa.value());
+  CHECK(g.ok());
+  vol::VoxelBlockGrid player = std::move(g).value();
+  CHECK(dec.decode(fa.value().data(), fa.value().size(), player).ok());
+  vr::Result<Snapshot> after_a = snapshot(player);
+  CHECK(after_a.ok());
+  vr::Result<std::vector<vol::BlockIndex>> slots_a = active_sorted(player);
+  CHECK(slots_a.ok());
+  CHECK(dec.decode(fb.value().data(), fb.value().size(), player).ok());
+  vr::Result<Snapshot> after_b = snapshot(player);
+  CHECK(after_b.ok());
+  vr::Result<std::vector<vol::BlockIndex>> slots_b = active_sorted(player);
+  CHECK(slots_b.ok());
+  // A block in both frames costs no allocation: it keeps its slot, where a
+  // remove-and-reallocate would hand it whatever the LIFO heap had on top.
+  for (const vol::BlockIndex& a_block : slots_a.value()) {
+    for (const vol::BlockIndex& b_block : slots_b.value()) {
+      if (a_block.coord == b_block.coord) {
+        CHECK(a_block.ptr == b_block.ptr);
+      }
+    }
+  }
+
+  vr::Result<vol::VoxelBlockGrid> f = grid_for(gpu, fb.value());
+  CHECK(f.ok());
+  vol::VoxelBlockGrid fresh = std::move(f).value();
+  CHECK(dec.decode(fb.value().data(), fb.value().size(), fresh).ok());
+  vr::Result<Snapshot> only_b = snapshot(fresh);
+  CHECK(only_b.ok());
+  CHECK(after_b.value() == only_b.value());
+
+  // Nothing to allocate -- the same frame again, then one holding a subset of
+  // it -- takes the path that reuses the merge's slots instead of compacting
+  // twice, and must land on the same state as a fresh grid.
+  CHECK(dec.decode(fb.value().data(), fb.value().size(), player).ok());
+  vr::Result<Snapshot> again = snapshot(player);
+  CHECK(again.ok() && again.value() == only_b.value());
+  vr::Result<std::vector<vol::BlockIndex>> slots_again = active_sorted(player);
+  CHECK(slots_again.ok());
+  CHECK(std::equal(slots_again.value().begin(), slots_again.value().end(),
+                   slots_b.value().begin(), slots_b.value().end(),
+                   [](const vol::BlockIndex& x, const vol::BlockIndex& y) {
+                     return x.coord == y.coord && x.ptr == y.ptr;
+                   }));
+  std::vector<vol::BlockIndex> dropped(12);
+  for (std::size_t i = 0; i < dropped.size(); ++i) {
+    dropped[i].coord = after_b.value().coords[i * 5];
+  }
+  vr::Result<std::uint32_t> removed = gb.value().remove(
+      dropped.data(), static_cast<std::uint32_t>(dropped.size()));
+  CHECK(removed.ok() && removed.value() == 0);
+  vr::Result<Bytes> fsub = encode_with(gpu, gb.value());
+  CHECK(fsub.ok());
+  CHECK(dec.decode(fsub.value().data(), fsub.value().size(), player).ok());
+  vr::Result<Snapshot> after_sub = snapshot(player);
+  CHECK(after_sub.ok());
+  CHECK(after_sub.value().coords.size() ==
+        after_b.value().coords.size() - dropped.size());
+  vr::Result<vol::VoxelBlockGrid> fs = grid_for(gpu, fsub.value());
+  CHECK(fs.ok());
+  CHECK(dec.decode(fsub.value().data(), fsub.value().size(), fs.value()).ok());
+  vr::Result<Snapshot> only_sub = snapshot(fs.value());
+  CHECK(only_sub.ok() && after_sub.value() == only_sub.value());
+
+  // The premise: the grid did keep, drop and gain blocks between the two.
+  std::size_t kept = 0;
+  for (const vr::Vec3i& c : after_a.value().coords) {
+    kept += std::binary_search(after_b.value().coords.begin(),
+                               after_b.value().coords.end(), c, coord_less)
+                ? 1
+                : 0;
+  }
+  CHECK(kept > 0);
+  CHECK(kept < after_a.value().coords.size());
+  CHECK(kept < after_b.value().coords.size());
+
+  // And a frame of no blocks empties the grid.
+  vr::Result<vol::VoxelBlockGrid> e = make_grid(gpu);
+  CHECK(e.ok());
+  vr::Result<Bytes> empty = encode_with(gpu, e.value());
+  CHECK(empty.ok());
+  CHECK(dec.decode(empty.value().data(), empty.value().size(), player).ok());
+  vr::Result<Snapshot> none = snapshot(player);
+  CHECK(none.ok() && none.value().coords.empty());
+  return 0;
+}
+
+// Every refusal that comes before the grid changes leaves it exactly as it
+// was: a corrupt frame, one of other geometry, one too big for the heap.
+int untouched_case(Gpu& gpu, codec::Decoder& dec) {
+  const Sphere a{vr::Vec3f(0.0f), 0.06f};
+  const Sphere b{vr::Vec3f(0.03f, 0.0f, 0.0f), 0.09f};
+  vr::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
+  vr::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
+  CHECK(ga.ok() && gb.ok());
+  vr::Result<Bytes> fa = encode_with(gpu, ga.value());
+  vr::Result<Bytes> fb = encode_with(gpu, gb.value());
+  CHECK(fa.ok() && fb.ok());
+  vr::Result<vol::VoxelBlockGrid> g = grid_for(gpu, fa.value());
+  CHECK(g.ok());
+  vol::VoxelBlockGrid player = std::move(g).value();
+  CHECK(dec.decode(fa.value().data(), fa.value().size(), player).ok());
+  vr::Result<Snapshot> before = snapshot(player);
+  CHECK(before.ok());
+  auto unchanged = [&]() {
+    vr::Result<Snapshot> now = snapshot(player);
+    return now.ok() && now.value() == before.value();
+  };
+
+  // Truncated, and one byte flipped in the middle of the payload.
+  CHECK(!dec.decode(fb.value().data(), fb.value().size() - 1, player).ok());
+  CHECK(unchanged());
+  Bytes flipped = fb.value();
+  flipped[flipped.size() / 2] ^= 0xFF;
+  if (!dec.decode(flipped.data(), flipped.size(), player).ok()) {
+    CHECK(unchanged());  // (a flip in raw bits can decode; see codec_rans)
+  } else {
+    CHECK(dec.decode(fa.value().data(), fa.value().size(), player).ok());
+  }
+  CHECK(unchanged());
+
+  // Another geometry: a frame from a grid of 4 mm voxels.
+  GridShape other;
+  other.voxel_size = 0.004f;
+  vr::Result<vol::VoxelBlockGrid> go = sphere_grid(gpu, b, other);
+  CHECK(go.ok());
+  vr::Result<Bytes> fo = encode_with(gpu, go.value());
+  CHECK(fo.ok());
+  CHECK(!dec.decode(fo.value().data(), fo.value().size(), player).ok());
+  CHECK(unchanged());
+
+  // Too many blocks for the heap: a grid of 32 slots, holding a few blocks.
+  GridShape tiny;
+  tiny.num_buckets = 4;
+  vr::Result<vol::VoxelBlockGrid> gt = make_grid(gpu, tiny);
+  CHECK(gt.ok());
+  vol::VoxelBlockGrid small = std::move(gt).value();
+  CHECK(allocate(small, {{0, 0, 0}, {1, 0, 0}}).ok());
+  CHECK(
+      write_sphere(small, Sphere{vr::Vec3f(0.02f, 0.02f, 0.02f), 0.02f}).ok());
+  vr::Result<Snapshot> small_before = snapshot(small);
+  CHECK(small_before.ok());
+  vr::Result<codec::FrameInfo> info =
+      codec::read_frame_info(fb.value().data(), fb.value().size());
+  CHECK(info.ok() && info.value().block_count > 32);
+  const vr::Status s = dec.decode(fb.value().data(), fb.value().size(), small);
+  CHECK(!s.ok());
+  // Too small, not corrupt: the same answer as a table that cannot place the
+  // blocks, so one recovery serves both.
+  CHECK(s.domain() == vr::Status::Code::OutOfMemory);
+  vr::Result<Snapshot> small_after = snapshot(small);
+  CHECK(small_after.ok() && small_after.value() == small_before.value());
+  std::int32_t buckets = tiny.num_buckets;
+  while (buckets * tiny.bucket_size <
+         std::int32_t(info.value().block_count) * 4) {
+    buckets *= 2;
+  }
+  CHECK(small.resize(buckets).ok());
+  CHECK(dec.decode(fb.value().data(), fb.value().size(), small).ok());
+  vr::Result<Snapshot> recovered = snapshot(small);
+  CHECK(recovered.ok());
+  CHECK(recovered.value().coords.size() == info.value().block_count);
+  return 0;
+}
+
+// A hash table that cannot place the frame's blocks -- few buckets, short
+// chains, as many blocks as it has slots -- is OutOfMemory, and a resize
+// followed by the same decode recovers the frame exactly.
+int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
+  // Sixteen blocks, every voxel observed, from a roomy source grid.
+  vr::Result<vol::VoxelBlockGrid> gs = make_grid(gpu);
+  CHECK(gs.ok());
+  vol::VoxelBlockGrid src = std::move(gs).value();
+  std::vector<vr::Vec3i> coords;
+  for (int i = 0; i < 16; ++i) {
+    coords.push_back(vr::Vec3i(i % 4, i / 4, 0));
+  }
+  CHECK(allocate(src, coords).ok());
+  CHECK(write_sphere(src, Sphere{vr::Vec3f(0.08f, 0.08f, 0.02f), 0.05f}).ok());
+  vr::Result<Snapshot> src_snap = snapshot(src);
+  CHECK(src_snap.ok());
+  vr::Result<Bytes> frame = encode_with(gpu, src);
+  CHECK(frame.ok());
+  vr::Result<codec::FrameInfo> info =
+      codec::read_frame_info(frame.value().data(), frame.value().size());
+  CHECK(info.ok());
+  const std::uint32_t n = info.value().block_count;
+  CHECK(n >= 8);
+
+  // Exactly n slots -- so the heap check passes -- in two-slot buckets with
+  // one-link chains, which n blocks hashed at random cannot all fit.
+  GridShape cramped;
+  cramped.bucket_size = 2;
+  cramped.num_buckets = std::int32_t((n + 1) / 2);
+  cramped.max_chain = 1;
+  vr::Result<vol::VoxelBlockGrid> gc = make_grid(gpu, cramped);
+  CHECK(gc.ok());
+  vol::VoxelBlockGrid tight = std::move(gc).value();
+  const vr::Status s =
+      dec.decode(frame.value().data(), frame.value().size(), tight);
+  CHECK(!s.ok());
+  CHECK(s.domain() == vr::Status::Code::OutOfMemory);
+
+  // The documented recovery.
+  CHECK(tight.resize(cramped.num_buckets * 8).ok());
+  CHECK(dec.decode(frame.value().data(), frame.value().size(), tight).ok());
+  vr::Result<Snapshot> out = snapshot(tight);
+  CHECK(out.ok());
+  CHECK(out.value().coords.size() == n);
+  return 0;
+}
+
+int frame_info_case(Gpu& gpu) {
+  const Sphere s{vr::Vec3f(0.0f), 0.05f};
+  vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
+  CHECK(g.ok());
+  codec::EncoderConfig config;
+  config.params.coefficient_count = 20;
+  config.params.dc_step = 0.3f;
+  config.params.ac_step = 0.07f;
+  vr::Result<Bytes> frame = encode_with(gpu, g.value(), config);
+  CHECK(frame.ok());
+  vr::Result<codec::FrameInfo> info =
+      codec::read_frame_info(frame.value().data(), frame.value().size());
+  CHECK(info.ok());
+  CHECK(info.value().voxel_size == kVoxel);
+  CHECK(info.value().trunc_dist == kTrunc);
+  CHECK(info.value().params.coefficient_count == 20);
+  CHECK(info.value().params.dc_step == 0.3f);
+  CHECK(info.value().params.ac_step == 0.07f);
+  CHECK(info.value().block_count > 0);
+  // The header alone is enough; less than it is not.
+  CHECK(codec::read_frame_info(frame.value().data(), 44).ok());
+  CHECK(!codec::read_frame_info(frame.value().data(), 43).ok());
+  CHECK(!codec::read_frame_info(nullptr, 0).ok());
+  Bytes bad = frame.value();
+  bad[0] = 'X';
+  CHECK(!codec::read_frame_info(bad.data(), bad.size()).ok());
+  bad = frame.value();
+  bad[4] = 2;  // version 2
+  vr::Result<codec::FrameInfo> v2 = codec::read_frame_info(bad.data(), 44);
+  CHECK(!v2.ok() && v2.status().domain() == vr::Status::Code::Unsupported);
+  return 0;
+}
+
+int refusals_case(Gpu& gpu, codec::Decoder& dec) {
+  // A frame with blocks in it, so a refusal that came after the grid started
+  // to change would show.
+  vr::Result<vol::VoxelBlockGrid> g =
+      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
+  CHECK(g.ok());
+  vr::Result<Bytes> frame = encode_with(gpu, g.value());
+  CHECK(frame.ok());
+  GridShape four;
+  four.block_size = 4;
+  vr::Result<vol::VoxelBlockGrid> g4 = make_grid(gpu, four);
+  CHECK(g4.ok());
+  CHECK(
+      !dec.decode(frame.value().data(), frame.value().size(), g4.value()).ok());
+  GridShape no_weight;
+  no_weight.weight = false;
+  vr::Result<vol::VoxelBlockGrid> gw = make_grid(gpu, no_weight);
+  CHECK(gw.ok());
+  CHECK(
+      !dec.decode(frame.value().data(), frame.value().size(), gw.value()).ok());
+  // Refused before a block was allocated.
+  vr::Result<std::vector<vol::BlockIndex>> none =
+      gw.value().map().compact_active_blocks();
+  CHECK(none.ok() && none.value().empty());
+  // A third attribute, which a kept block would carry over stale.
+  GridShape coloured;
+  coloured.color = true;
+  vr::Result<vol::VoxelBlockGrid> gc = make_grid(gpu, coloured);
+  CHECK(gc.ok());
+  const vr::Status sc =
+      dec.decode(frame.value().data(), frame.value().size(), gc.value());
+  CHECK(!sc.ok() && sc.domain() == vr::Status::Code::InvalidArgument);
+  none = gc.value().map().compact_active_blocks();
+  CHECK(none.ok() && none.value().empty());
+  vol::VoxelBlockGrid moved = std::move(g).value();
+  vol::VoxelBlockGrid taken = std::move(moved);
+  CHECK(!dec.decode(frame.value().data(), frame.value().size(), moved)
+             .ok());  // NOLINT(bugprone-use-after-move)
+  CHECK(dec.decode(frame.value().data(), frame.value().size(), taken).ok());
+  return 0;
+}
+
+int metrics_case(Gpu& gpu, codec::Decoder& dec) {
+  const Sphere s{vr::Vec3f(0.0f), 0.08f};
+  vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
+  CHECK(g.ok());
+  vr::Result<Bytes> frame = encode_with(gpu, g.value());
+  CHECK(frame.ok());
+  vr::Result<vol::VoxelBlockGrid> d = grid_for(gpu, frame.value());
+  CHECK(d.ok());
+  vr::StageMetrics m;
+  CHECK(dec.decode(frame.value().data(), frame.value().size(), d.value(), &m)
+            .ok());
+  const vr::StageRow* top = find_row(m, "codec decode");
+  CHECK(top != nullptr);
+  for (const char* sub :
+       {"  ..rans decode", "  ..active set", "  ..apply", "  ..inverse"}) {
+    const vr::StageRow* row = find_row(m, sub);
+    CHECK(row != nullptr);
+    CHECK(row->cpu_ms <= top->cpu_ms);
+  }
+  CHECK(m.total_cpu_ms() == top->cpu_ms);
+  // Encoding into the same metrics adds its own rows beside these rather
+  // than summing into them (the one shared row is the map's compaction).
+  vr::StageMetrics both = m;
+  vr::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  CHECK(enc.ok());
+  CHECK(enc.value().encode(g.value(), &both).ok());
+  for (const char* sub : {"  ..rans decode", "  ..apply", "  ..inverse"}) {
+    CHECK(find_row(both, sub)->cpu_ms == find_row(m, sub)->cpu_ms);
+  }
+  CHECK(find_row(both, "  ..forward") != nullptr);
+  CHECK(find_row(both, "  ..rans encode") != nullptr);
+  vr::Result<vr::GpuTimer> probe = vr::GpuTimer::create(gpu.device);
+  CHECK(probe.ok());
+  if (probe.value().available()) {
+    CHECK(top->has_gpu);
+    CHECK(top->gpu_ms > 0.0 && top->gpu_ms < top->cpu_ms);
+  }
+  return 0;
+}
+
+int moves_case(Gpu& gpu) {
+  vr::Result<codec::Decoder> a_r =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(a_r.ok());
+  codec::Decoder a = std::move(a_r).value();
+  CHECK(a.valid());
+  codec::Decoder b(std::move(a));
+  CHECK(b.valid());
+  CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
+  vr::Result<codec::Decoder> c_r =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(c_r.ok());
+  codec::Decoder c = std::move(c_r).value();
+  c = std::move(b);  // over a live decoder
+  CHECK(c.valid());
+  CHECK(!b.valid());  // NOLINT(bugprone-use-after-move)
+  codec::Decoder* alias = &c;
+  c = std::move(*alias);  // self-move, laundered past -Wself-move
+  CHECK(c.valid());
+
+  vr::Result<vol::VoxelBlockGrid> g = make_grid(gpu);
+  CHECK(g.ok());
+  vr::Result<Bytes> frame = encode_with(gpu, g.value());
+  CHECK(frame.ok());
+  CHECK(c.decode(frame.value().data(), frame.value().size(), g.value()).ok());
+  CHECK(!a.decode(frame.value().data(), frame.value().size(), g.value()).ok());
+  return 0;
+}
+
+}  // namespace
+
+int main() {
+  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  if (!instance) {
+    std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
+                 instance.status().message().c_str());
+    return 0;
+  }
+  vr::Result<VkPhysicalDevice> physical =
+      instance.value().select_physical_device();
+  if (!physical) {
+    std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
+                 physical.status().message().c_str());
+    return 0;
+  }
+  vr::Result<vr::Device> device =
+      vr::Device::create(instance.value(), physical.value(), {});
+  CHECK(device.ok());
+  vr::Result<vr::Allocator> allocator =
+      vr::Allocator::create(instance.value().handle(), device.value());
+  CHECK(allocator.ok());
+  Gpu gpu{device.value(), allocator.value()};
+
+  vr::Result<codec::Decoder> d =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(d.ok());
+  codec::Decoder dec = std::move(d).value();
+
+  if (round_trip_case(gpu, dec) != 0) return 1;
+  if (mesh_case(gpu, dec) != 0) return 1;
+  if (sequence_case(gpu, dec) != 0) return 1;
+  if (untouched_case(gpu, dec) != 0) return 1;
+  if (out_of_memory_case(gpu, dec) != 0) return 1;
+  if (frame_info_case(gpu) != 0) return 1;
+  if (refusals_case(gpu, dec) != 0) return 1;
+  if (metrics_case(gpu, dec) != 0) return 1;
+  if (moves_case(gpu) != 0) return 1;
+  std::printf("codec Decoder: OK\n");
+  return 0;
+}
