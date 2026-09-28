@@ -379,28 +379,30 @@ struct MarchingCubesConfig {
   /// published as @ref DeviceMesh::shares_vertices; and
   /// @ref ExtractTimings::emitted_vertices stops being `3 * emitted_triangles`.
   ///
-  /// @note Compatible with `texture::ProjectiveTexturer`, which it was not
-  ///       until that pass moved to a per-*vertex* dispatch. The
+  /// @note Compatible with `texture::ProjectiveTexturer`'s single-camera
+  ///       pass, which it was not until that pass moved to a per-*vertex*
+  ///       dispatch. The
   ///       incompatibility was never really about sharing: the texturer decided
   ///       visibility per *triangle* and wrote @ref Vertex::uv0 per *vertex*,
   ///       so a vertex belonging to several triangles that disagreed was
   ///       written by whichever thread ran last. Every input to that verdict is
   ///       a property of the vertex alone, so the pass now dispatches one
-  ///       thread per vertex -- one writer each, nothing to race -- and refuses
-  ///       nothing. It also got cheaper doing it, since a shared vertex used to
-  ///       be projected once per referencing triangle.
+  ///       thread per vertex -- one writer each, nothing to race -- and
+  ///       textures a shared mesh. It also got cheaper doing it, since a
+  ///       shared vertex used to be projected once per referencing triangle.
   ///
   ///       What it costs is the all-three-vertices gate: a triangle straddling
   ///       the visibility boundary is no longer refused whole, so the textured
   ///       region grows by up to one triangle at an occlusion silhouette. See
   ///       `texture::ProjectiveTexturer` for the encoding that bounds it.
   ///
-  /// @note A packed multi-camera atlas is a different matter and still wants a
-  ///       per-*primitive* camera id: a triangle whose vertices index different
-  ///       sub-rects of a pack cannot be expressed per vertex under any
-  ///       encoding. That is the reason this flag stays published on
-  ///       @ref DeviceMesh -- along with a consumer needing to know whether
-  ///       `v = 3t` when it sizes an arena -- not a residual incompatibility.
+  /// @note The texturer's several-view atlas is a different matter and
+  ///       refuses a mesh built with this: it chooses a view per triangle, and
+  ///       a triangle whose vertices index different tiles of the atlas cannot
+  ///       be expressed per vertex under any encoding. A per-*primitive* tile
+  ///       id would lift that. This is one reason the flag stays published on
+  ///       @ref DeviceMesh, the other being a consumer that needs to know
+  ///       whether `v = 3t` when it sizes an arena.
   ///
   /// @note @ref MarchingCubes::extract_device_incremental runs under this. It
   ///       used to fall back to a full extract, on the grounds that a relocated
