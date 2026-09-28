@@ -229,6 +229,9 @@ class ByteReader {
     std::memcpy(&f, &bits, sizeof(f));
     return f;
   }
+  // Canonical LEB128 only, the one encoding ByteWriter::varint makes: a
+  // final byte of 0 after the first adds nothing, so {0x80, 0x00} is refused
+  // rather than read as a second spelling of 0.
   std::uint32_t varint() {
     std::uint32_t v = 0;
     for (std::uint32_t shift = 0; shift < 35; shift += 7) {
@@ -239,6 +242,10 @@ class ByteReader {
       }
       v |= (b & 0x7Fu) << shift;
       if ((b & 0x80u) == 0) {
+        if (b == 0 && shift != 0) {
+          failed_ = true;  // overlong
+          return 0;
+        }
         return v;
       }
     }
@@ -353,7 +360,9 @@ bool to_coord(std::int64_t v, std::int32_t& out) {
 }
 
 // The mirror of emit_block. Returns false for a coordinate outside int32; the
-// reader's own failure flag carries everything else.
+// reader's own failure flag carries everything else, including a failure
+// partway through the deltas, whose zeros would otherwise decode as a run step
+// and could be misreported as leaving int32.
 bool read_block(RansReader& r, const std::vector<FrequencyTable>& t,
                 const Vec3i* prev, Vec3i& cur, std::uint32_t* mask,
                 std::int32_t* coeffs, std::uint32_t k) {
@@ -373,12 +382,18 @@ bool read_block(RansReader& r, const std::vector<FrequencyTable>& t,
       dy = get_signed(r, t[kDyFree]);
       dx = get_signed(r, t[kDxFree]);
     }
+    if (r.failed()) {
+      return true;  // the caller's finish() reports the corrupt segment
+    }
     if (!to_coord(prev->x + dx, cur.x) || !to_coord(prev->y + dy, cur.y) ||
         !to_coord(prev->z + dz, cur.z)) {
       return false;
     }
   }
 
+  // TODO(codec): refuse a partial mask that decodes all-full or all-empty.
+  // The writer never makes one and it decodes correctly, so it is a second
+  // spelling of one frame rather than a wrong one (the 2026-09-27 entry).
   const std::uint32_t cls = r.get(t[kMaskClass]);
   for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
     if (cls == kMaskPartial) {
@@ -397,6 +412,17 @@ bool read_block(RansReader& r, const std::vector<FrequencyTable>& t,
     coeffs[j] = static_cast<std::int32_t>(get_signed(r, t[kFirstCoef + j]));
   }
   return true;
+}
+
+// Where a known section's body sits in the frame.
+struct SectionBody {
+  const std::uint8_t* data = nullptr;
+  std::uint32_t size = 0;
+};
+
+const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
+                           SectionId id) {
+  return found[static_cast<std::size_t>(id) - 1];
 }
 
 }  // namespace
@@ -419,14 +445,25 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   if (n > std::numeric_limits<std::uint32_t>::max()) {
     return bad_write("more than 2^32 - 1 blocks");
   }
-  if (b.coefficients.size() != n * k) {
-    return bad_write("expected " + std::to_string(n * k) +
+  // Sizes in 64 bits: n * K wraps a 32-bit size_t long before 2^32 blocks.
+  const std::uint64_t coefficient_count = std::uint64_t(n) * k;
+  const std::uint64_t mask_count = std::uint64_t(n) * kMaskWordsPerBlock;
+  if (b.coefficients.size() != coefficient_count) {
+    return bad_write("expected " + std::to_string(coefficient_count) +
                      " coefficients, got " +
                      std::to_string(b.coefficients.size()));
   }
-  if (b.masks.size() != n * kMaskWordsPerBlock) {
-    return bad_write("expected " + std::to_string(n * kMaskWordsPerBlock) +
+  if (b.masks.size() != mask_count) {
+    return bad_write("expected " + std::to_string(mask_count) +
                      " mask words, got " + std::to_string(b.masks.size()));
+  }
+  const std::uint32_t r_size = options.segment_size;
+  const std::uint64_t segments =
+      n == 0 ? 0 : (std::uint64_t(n) - 1) / r_size + 1;
+  if (segments > std::numeric_limits<std::uint32_t>::max() / 4) {
+    return bad_write(
+        "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
+        "u32 length");
   }
   for (std::size_t i = 1; i < n; ++i) {
     if (!coord_less(frame.coords[i - 1], frame.coords[i])) {
@@ -443,7 +480,6 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
     }
   }
 
-  const std::uint32_t r_size = options.segment_size;
   auto prev_of = [&](std::size_t i) -> const Vec3i* {
     return i % r_size == 0 ? nullptr : &frame.coords[i - 1];
   };
@@ -464,30 +500,38 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
     tables.push_back(normalize_counts(c));
   }
 
-  // Pass 2: each segment as its own stream.
+  // Pass 2: each segment as its own stream, appended straight onto the
+  // payload.
   std::vector<std::uint8_t> payload;
-  std::vector<std::uint32_t> lengths;
+  std::vector<std::uint8_t> segments_body;
+  ByteWriter sw(segments_body);
   RansWriter writer;
   WriteSink write_sink{writer, tables};
-  for (std::size_t first = 0; first < n; first += r_size) {
-    const std::size_t end = std::min<std::size_t>(n, first + r_size);
+  for (std::uint64_t s = 0; s < segments; ++s) {
+    const std::size_t first = static_cast<std::size_t>(s * r_size);  // < n
+    const std::size_t end = static_cast<std::size_t>(
+        std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
     for (std::size_t i = first; i < end; ++i) {
       emit_block(write_sink, prev_of(i), frame.coords[i],
                  &b.masks[i * kMaskWordsPerBlock], &b.coefficients[i * k], k);
     }
-    const std::vector<std::uint8_t> stream = writer.finish();
-    lengths.push_back(static_cast<std::uint32_t>(stream.size()));
-    payload.insert(payload.end(), stream.begin(), stream.end());
+    const std::size_t stream_at = payload.size();
+    if (!writer.finish(payload)) {
+      // Pass 1 counted every symbol pass 2 puts, so this is a bug here.
+      return Status::io_error(
+          "write_intra_frame: a table refused a symbol it was counted from");
+    }
+    sw.u32(static_cast<std::uint32_t>(payload.size() - stream_at));
+  }
+  // Every segment's length is at most the payload's, so this bounds both.
+  if (std::uint64_t(payload.size()) >
+      std::numeric_limits<std::uint32_t>::max()) {
+    return bad_write("the payload outgrows its u32 length (4 GiB)");
   }
 
-  std::vector<std::uint8_t> tables_body;
+  std::vector<std::uint8_t> tables_body;  // under 32 KB
   ByteWriter tw(tables_body);
   write_tables(tw, tables);
-  std::vector<std::uint8_t> segments_body;
-  ByteWriter sw(segments_body);
-  for (std::uint32_t len : lengths) {
-    sw.u32(len);
-  }
 
   std::vector<std::uint8_t> out;
   ByteWriter w(out);
@@ -505,15 +549,16 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   w.f32(b.params.ac_step);
   w.u32(static_cast<std::uint32_t>(n));
   w.u32(r_size);
-  const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>, 3>
+  const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>,
+                   kSectionCount>
       sections = {{{SectionId::kTables, &tables_body},
                    {SectionId::kSegments, &segments_body},
                    {SectionId::kPayload, &payload}}};
-  w.u32(static_cast<std::uint32_t>(sections.size()));
+  w.u32(kSectionCount);
   for (const auto& [id, body] : sections) {
     w.u16(static_cast<std::uint32_t>(id));
     w.u16(kSectionRequired);
-    w.u32(static_cast<std::uint32_t>(body->size()));
+    w.u32(static_cast<std::uint32_t>(body->size()));  // each bounded above
   }
   for (const auto& [id, body] : sections) {
     w.bytes(*body);
@@ -587,8 +632,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   const std::uint64_t body_bytes =
       size - kFrameHeaderBytes - section_count * kSectionEntryBytes;
   std::uint64_t offset = 0;
-  const std::uint8_t* found[4] = {nullptr, nullptr, nullptr, nullptr};
-  std::uint32_t found_size[4] = {0, 0, 0, 0};
+  std::array<SectionBody, kSectionCount> found{};  // by id - 1
   for (std::uint32_t i = 0; i < section_count; ++i) {
     const std::uint32_t id = st.u16();
     const std::uint32_t flags = st.u16();
@@ -596,39 +640,48 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
     if (offset + length > body_bytes) {
       return bad("a section runs past the end");
     }
-    const bool known = id >= static_cast<std::uint32_t>(SectionId::kTables) &&
-                       id <= static_cast<std::uint32_t>(SectionId::kPayload);
-    if (known) {
-      if (found[id] != nullptr) {
+    if (id >= 1 && id <= kSectionCount) {
+      if ((flags & ~std::uint32_t(kSectionKnownFlags)) != 0) {
+        return Status::unsupported(
+            "read_intra_frame: section " + std::to_string(id) + " sets flags " +
+            std::to_string(flags) + ", which v1 does not define");
+      }
+      SectionBody& f = found[id - 1];
+      if (f.data != nullptr) {
         return bad("section " + std::to_string(id) + " appears twice");
       }
-      found[id] = body + offset;
-      found_size[id] = length;
+      f = SectionBody{body + offset, length};
     } else if ((flags & kSectionRequired) != 0) {
       return Status::unsupported("read_intra_frame: unknown required section " +
                                  std::to_string(id));
     }
+    // TODO(codec): the optional CRC section of the 2026-09-27 entry, should a
+    // consumer ever keep frames where nothing else checks them. A v1 reader
+    // skips it here, so adding it needs no new version.
     offset += length;
   }
   if (offset != body_bytes) {
     return bad("bytes after the last section");
   }
-  for (std::uint32_t id = 1; id <= 3; ++id) {
-    if (found[id] == nullptr) {
-      return bad("section " + std::to_string(id) + " is missing");
+  for (std::uint32_t i = 0; i < kSectionCount; ++i) {
+    if (found[i].data == nullptr) {
+      return bad("section " + std::to_string(i + 1) + " is missing");
     }
   }
+  const SectionBody& tables_section = section(found, SectionId::kTables);
+  const SectionBody& segments_section = section(found, SectionId::kSegments);
+  const SectionBody& payload_section = section(found, SectionId::kPayload);
 
   const std::uint32_t k = frame.blocks.params.coefficient_count;
   std::vector<FrequencyTable> tables;
-  VR_TRY(read_tables(found[1], found_size[1], k, tables));
+  VR_TRY(read_tables(tables_section.data, tables_section.size, k, tables));
 
   const std::uint64_t segments =
       n == 0 ? 0 : (std::uint64_t(n) - 1) / r_size + 1;
-  if (found_size[2] != segments * 4) {
+  if (segments_section.size != segments * 4) {
     return bad("the SEGMENTS section does not list one length per segment");
   }
-  ByteReader lens(found[2], found_size[2]);
+  ByteReader lens(segments_section.data, segments_section.size);
   std::vector<std::uint32_t> lengths(segments);
   std::uint64_t total = 0;
   for (std::uint64_t s = 0; s < segments; ++s) {
@@ -638,19 +691,30 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
     }
     total += lengths[s];
   }
-  if (total != found_size[3]) {
+  if (total != payload_section.size) {
     return bad("the segment lengths do not add up to the PAYLOAD section");
   }
 
+  // max_blocks bounds these in bytes, but not below what a 32-bit size_t can
+  // count: n * K reaches 2^41. Past this check every index below fits.
+  if (n > frame.coords.max_size() ||
+      std::uint64_t(n) * k > frame.blocks.coefficients.max_size() ||
+      std::uint64_t(n) * kMaskWordsPerBlock > frame.blocks.masks.max_size()) {
+    return Status::out_of_memory(
+        "read_intra_frame: " + std::to_string(n) + " blocks of " +
+        std::to_string(k) +
+        " coefficients exceed this platform's address space");
+  }
   frame.coords.resize(n);
   frame.blocks.coefficients.resize(std::size_t(n) * k);
   frame.blocks.masks.resize(std::size_t(n) * kMaskWordsPerBlock);
-  const std::uint8_t* stream = found[3];
+  const std::uint8_t* stream = payload_section.data;
   for (std::uint64_t s = 0; s < segments; ++s) {
     RansReader r(stream, lengths[s]);
-    const std::uint64_t first = s * r_size;
-    const std::uint64_t end = std::min<std::uint64_t>(n, first + r_size);
-    for (std::uint64_t i = first; i < end && !r.failed(); ++i) {
+    const std::size_t first = static_cast<std::size_t>(s * r_size);  // < n
+    const std::size_t end = static_cast<std::size_t>(
+        std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
+    for (std::size_t i = first; i < end && !r.failed(); ++i) {
       const Vec3i* prev = i == first ? nullptr : &frame.coords[i - 1];
       if (!read_block(r, tables, prev, frame.coords[i],
                       &frame.blocks.masks[i * kMaskWordsPerBlock],
@@ -661,6 +725,14 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
     }
     if (!r.finish()) {
       return bad("segment " + std::to_string(s) + " is corrupt");
+    }
+    // Within a segment the deltas cannot step backwards; its first coordinate
+    // is raw bits, which no end check sees, so the order across segments is
+    // checked here. Without it a flipped bit decodes a duplicate, and the
+    // inverse transform races two workgroups on one block.
+    if (s > 0 && !coord_less(frame.coords[first - 1], frame.coords[first])) {
+      return bad("segment " + std::to_string(s) +
+                 " does not start after the one before ends");
     }
     stream += lengths[s];
   }

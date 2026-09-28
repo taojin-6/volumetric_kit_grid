@@ -3,8 +3,9 @@
 
 // Host-only tests for the codec's rANS reference coder (rans.hpp): table
 // normalization, round trips over symbols and raw bits, the cost of a
-// probability-one symbol, size against the ideal code length, and what a
-// truncated or bit-flipped stream does. CPU-only, so these always run; the
+// probability-one symbol, size against the ideal code length, what a
+// truncated or bit-flipped stream does, and the puts and gets either side
+// refuses. CPU-only, so these always run; the
 // fuzz cases are what the sanitizer job turns into out-of-bounds detectors.
 //
 // Random inputs come from a fixed-seed LCG rather than <random>'s
@@ -157,7 +158,9 @@ std::vector<std::uint8_t> encode(const std::vector<d::FrequencyTable>& t,
       w.put(t[std::size_t(op.table)], op.value);
     }
   }
-  return w.finish();
+  std::vector<std::uint8_t> out;
+  const bool ok = w.finish(out);
+  return ok ? out : std::vector<std::uint8_t>{};
 }
 
 // Decode ops.size() operations; true when every one matched and the stream
@@ -317,7 +320,8 @@ int corrupt_case() {
   // early.
   d::RansWriter one;
   one.put_bits(0xA5, 8);
-  const std::vector<std::uint8_t> short_stream = one.finish();
+  std::vector<std::uint8_t> short_stream;
+  CHECK(one.finish(short_stream));
   CHECK(short_stream.size() == 4);
   {
     d::RansReader early(short_stream.data(), short_stream.size());
@@ -339,6 +343,77 @@ int corrupt_case() {
   return 0;
 }
 
+// What each side refuses rather than encoding or decoding wrong, and that
+// finish() appends -- the frame writes every segment straight onto one
+// payload.
+int refusal_case() {
+  d::FrequencyTable t = d::normalize_counts({3, 0, 5});
+  t.build_decode();
+
+  // A symbol of frequency 0, and one past the alphabet: finish() fails and
+  // appends nothing, whatever surrounds the bad symbol, and the writer is
+  // usable again after it.
+  for (std::uint32_t symbol : {1u, 3u, 999u}) {
+    d::RansWriter w;
+    w.put(t, 0);
+    w.put(t, symbol);
+    w.put(t, 2);
+    std::vector<std::uint8_t> out = {0xAB};
+    CHECK(!w.finish(out));
+    CHECK(out.size() == 1);
+    CHECK(w.size() == 0);
+    w.put(t, 2);
+    CHECK(w.finish(out));
+    CHECK(out.size() == 1 + 4);
+  }
+  // A raw field wider than 32 bits, on either side.
+  {
+    d::RansWriter w;
+    w.put_bits(0, d::kRansMaxFieldBits + 1);
+    std::vector<std::uint8_t> out;
+    CHECK(!w.finish(out) && out.empty());
+
+    // Three whole 12-bit chunks, which a 36-bit read would consume cleanly
+    // if nothing refused it -- so only the width check can fail it.
+    d::RansWriter ok;
+    for (int i = 0; i < 3; ++i) {
+      ok.put_bits(0xFFF, d::kRansMaxRawBits);
+    }
+    std::vector<std::uint8_t> stream;
+    CHECK(ok.finish(stream));
+    d::RansReader r(stream.data(), stream.size());
+    CHECK(r.get_bits(3 * d::kRansMaxRawBits) == 0);
+    CHECK(r.failed());
+    d::RansReader full(stream.data(), stream.size());
+    for (int i = 0; i < 3; ++i) {
+      CHECK(full.get_bits(d::kRansMaxRawBits) == 0xFFF);
+    }
+    CHECK(full.finish());
+  }
+  // finish() appends after what is already there, the same bytes a fresh
+  // vector receives.
+  {
+    Lcg rng{41};
+    const std::vector<d::FrequencyTable> tables = random_tables(rng, 3);
+    const std::vector<Op> ops = random_ops(rng, tables, 300);
+    const std::vector<std::uint8_t> alone = encode(tables, ops);
+    d::RansWriter w;
+    for (const Op& op : ops) {
+      if (op.table < 0) {
+        w.put_bits(op.value, op.bits);
+      } else {
+        w.put(tables[std::size_t(op.table)], op.value);
+      }
+    }
+    std::vector<std::uint8_t> out = {1, 2, 3};
+    CHECK(w.finish(out));
+    CHECK(out.size() == 3 + alone.size());
+    CHECK(out[0] == 1 && out[1] == 2 && out[2] == 3);
+    CHECK(std::vector<std::uint8_t>(out.begin() + 3, out.end()) == alone);
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -347,6 +422,7 @@ int main() {
   if (zero_cost_case() != 0) return 1;
   if (size_case() != 0) return 1;
   if (corrupt_case() != 0) return 1;
+  if (refusal_case() != 0) return 1;
   std::printf("codec rANS: OK\n");
   return 0;
 }

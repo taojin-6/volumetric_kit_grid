@@ -10,9 +10,10 @@
 /// Internal (under src/, never installed), and the **reference** the GPU
 /// kernels of the 2026-09-26 decision's fifth PR must match byte for byte. So
 /// everything here is integer arithmetic on fixed widths, nothing depends on
-/// the host's float behaviour, and nothing needs more than 32-bit arithmetic
-/// on the state (the one 64-bit product, the renormalization bound, exists
-/// only because `freq << 20` reaches 2^32 at a probability of one).
+/// the host's float behaviour, and nothing needs more than 32-bit arithmetic.
+/// The renormalization bound is the one place that takes care: it is tested
+/// as `(x >> 20) >= f`, since the equivalent `x >= f << 20` is 2^32 at a
+/// probability of one and wraps to 0 in 32 bits.
 ///
 /// The scheme is Giesen's word-oriented rANS: the state `x` lives in
 /// `[L, L << 16)` with `L = 2^16`, a symbol of frequency `f` at cumulative
@@ -43,6 +44,13 @@ inline constexpr std::uint32_t kRansLower = 1u << 16;
 /// The widest raw field one coder step carries (@ref RansWriter::put_bits
 /// splits wider ones).
 inline constexpr std::uint32_t kRansMaxRawBits = kRansScaleBits;
+/// The widest raw field @ref RansWriter::put_bits and
+/// @ref RansReader::get_bits take: one `uint32_t`.
+inline constexpr std::uint32_t kRansMaxFieldBits = 32;
+/// The encoder's renormalization shift: a word leaves the state before a
+/// symbol of frequency `f` whenever `x >= f << 20`, which is `(x >> 20) >= f`.
+/// 20 is 32 minus the probability bits, since the state tops out at 2^32.
+inline constexpr std::uint32_t kRansRenormShift = 32 - kRansScaleBits;
 
 /// @brief A normalized frequency table over an alphabet of
 ///        `freq.size()` symbols.
@@ -143,18 +151,31 @@ inline FrequencyTable normalize_counts(
 
 /// @brief Collects symbols in decode order and encodes them, backwards, on
 ///        @ref finish.
+///
+/// A symbol its table cannot encode, or a raw field wider than
+/// @ref kRansMaxFieldBits, is recorded as a coder step of frequency 0, which
+/// @ref finish refuses at the division it would otherwise make. In band
+/// rather than a flag: a failure flag stored in @ref put made a room0-sized
+/// frame's write 47.5 ms against this form's 42.8 (Apple M5 Max, Release).
 class RansWriter {
  public:
-  /// Append one symbol of @p table.
-  /// @pre `table.freq[symbol] > 0`: the table was built from counts that
-  ///      include this symbol.
+  /// Append one symbol of @p table. One the table cannot encode -- past its
+  /// alphabet, or of frequency 0, so the table was built from counts that
+  /// did not include it -- makes @ref finish fail.
   void put(const FrequencyTable& table, std::uint32_t symbol) {
-    ops_.push_back(Op{table.cum[symbol], table.freq[symbol]});
+    ops_.push_back(symbol < table.freq.size()
+                       ? Op{table.cum[symbol], table.freq[symbol]}
+                       : Op{0, 0});
   }
 
   /// Append the low @p bits bits of @p value as uniform raw bits, low chunk
-  /// first, in chunks of at most @ref kRansMaxRawBits.
+  /// first, in chunks of at most @ref kRansMaxRawBits. More than
+  /// @ref kRansMaxFieldBits makes @ref finish fail.
   void put_bits(std::uint32_t value, std::uint32_t bits) {
+    if (bits > kRansMaxFieldBits) {
+      ops_.push_back(Op{0, 0});
+      return;
+    }
     while (bits > 0) {
       const std::uint32_t n = std::min(bits, kRansMaxRawBits);
       const std::uint32_t chunk = value & ((1u << n) - 1u);
@@ -169,38 +190,46 @@ class RansWriter {
   /// @return How many coder steps have been appended.
   std::size_t size() const noexcept { return ops_.size(); }
 
-  /// @brief Encode everything appended and return the stream.
+  /// @brief Encode everything appended onto the end of @p out.
   ///
   /// The stream is the final state as two 16-bit words (high first), then the
   /// renormalization words in the order the decoder reads them; every word is
-  /// little-endian. Leaves the writer empty.
-  /// @return The stream: always at least 4 bytes, always even.
-  std::vector<std::uint8_t> finish() {
+  /// little-endian. Appends, so a frame's segments are written straight into
+  /// the frame. Leaves the writer empty either way.
+  /// @return `true` having appended the stream -- always at least 4 bytes,
+  ///         always even -- or `false`, appending nothing, if anything put
+  ///         could not be encoded (see the class comment).
+  bool finish(std::vector<std::uint8_t>& out) {
     std::uint32_t x = kRansLower;
-    std::vector<std::uint16_t> words;  // in emission order, reversed below
+    words_.clear();  // in emission order, reversed below
     for (std::size_t i = ops_.size(); i-- > 0;) {
       const Op op = ops_[i];
-      const std::uint64_t x_max =
-          (std::uint64_t(kRansLower >> kRansScaleBits) << 16) * op.freq;
-      if (x >= x_max) {
-        words.push_back(static_cast<std::uint16_t>(x & 0xFFFFu));
+      if (op.freq == 0) {
+        ops_.clear();
+        return false;
+      }
+      if ((x >> kRansRenormShift) >= op.freq) {
+        words_.push_back(static_cast<std::uint16_t>(x & 0xFFFFu));
         x >>= 16;
       }
       x = ((x / op.freq) << kRansScaleBits) + (x % op.freq) + op.start;
     }
     ops_.clear();
-    std::vector<std::uint8_t> out;
-    out.reserve(4 + 2 * words.size());
-    auto put_word = [&out](std::uint16_t w) {
-      out.push_back(static_cast<std::uint8_t>(w & 0xFFu));
-      out.push_back(static_cast<std::uint8_t>(w >> 8));
+    // resize, not reserve: reserve takes exactly what it is asked for, so
+    // appending a frame's segments one reserve at a time would copy the frame
+    // once per segment, where resize grows geometrically.
+    std::size_t at = out.size();
+    out.resize(at + 4 + 2 * words_.size());
+    auto put_word = [&out, &at](std::uint16_t w) {
+      out[at++] = static_cast<std::uint8_t>(w & 0xFFu);
+      out[at++] = static_cast<std::uint8_t>(w >> 8);
     };
     put_word(static_cast<std::uint16_t>(x >> 16));
     put_word(static_cast<std::uint16_t>(x & 0xFFFFu));
-    for (std::size_t i = words.size(); i-- > 0;) {
-      put_word(words[i]);
+    for (std::size_t i = words_.size(); i-- > 0;) {
+      put_word(words_[i]);
     }
-    return out;
+    return true;
   }
 
  private:
@@ -209,6 +238,8 @@ class RansWriter {
     std::uint16_t freq;
   };
   std::vector<Op> ops_;
+  // finish()'s scratch, a member so a frame's segments reuse one allocation.
+  std::vector<std::uint16_t> words_;
 };
 
 /// @brief Decodes one stream made by @ref RansWriter::finish.
@@ -249,9 +280,14 @@ class RansReader {
     return failed_ ? 0 : s;
   }
 
-  /// @return The next @p bits raw bits (at most 32), low chunk first, or 0
-  ///         once failed.
+  /// @return The next @p bits raw bits, low chunk first, or 0 once failed.
+  ///         More than @ref kRansMaxFieldBits fails the reader, since no
+  ///         writer can have put them.
   std::uint32_t get_bits(std::uint32_t bits) {
+    if (bits > kRansMaxFieldBits) {
+      failed_ = true;
+      return 0;
+    }
     std::uint32_t value = 0;
     std::uint32_t shift_out = 0;
     while (bits > 0 && !failed_) {

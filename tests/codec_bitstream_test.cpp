@@ -4,9 +4,10 @@
 // Host-only tests for the v1 intra frame (bitstream.hpp): round trips across
 // block counts, coefficient counts and segment sizes; coordinates at the ends
 // of int32; every writer refusal; every reader refusal, each made by editing
-// one field or section of a valid frame; the section rules; truncation and
-// random corruption, which must fail cleanly and never read out of bounds;
-// and what an all-zero frame costs. CPU-only, so these always run.
+// one field or section of a valid frame; the section rules; coordinates out
+// of order across segments; truncation and random corruption, which must fail
+// cleanly and never read out of bounds; and what an all-zero frame costs.
+// CPU-only, so these always run.
 
 #include <algorithm>
 #include <cmath>
@@ -360,6 +361,15 @@ int section_rules_case() {
   CHECK(same_frame(f, with_extra.value()));
   extra.flags = d::kSectionRequired;
   CHECK(refused_as(assemble(good, {s[0], extra, s[1], s[2]}), C::Unsupported));
+  // A flag v1 does not define is refused on a known section, whose body it
+  // may reinterpret, and ignored on an unknown optional one, which is skipped.
+  for (std::size_t known = 0; known < 3; ++known) {
+    std::vector<Section> flagged = s;
+    flagged[known].flags = static_cast<std::uint16_t>(flagged[known].flags | 2);
+    CHECK(refused_as(assemble(good, flagged), C::Unsupported));
+  }
+  extra.flags = 2;
+  CHECK(read(assemble(good, {s[0], extra, s[1], s[2]})).ok());
 
   // SEGMENTS must list one length per segment, each a whole number of words
   // and at least a state, adding up to the PAYLOAD.
@@ -411,44 +421,107 @@ int table_rules_case() {
   CHECK(refused_as(with_tables({0, 0, 0}), C::InvalidArgument));
   CHECK(refused_as(with_tables(std::vector<std::uint8_t>(9, 0)),
                    C::InvalidArgument));
-  // An over-long varint.
+  // A varint of more than 32 bits.
   CHECK(refused_as(
       with_tables({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0, 0, 0, 0, 0, 0, 0}),
       C::InvalidArgument));
+  // An overlong varint: the valid table above with its gap of 0 spelled
+  // {0x80, 0x00}, then with 4096 spelled in three bytes. Each value has one
+  // spelling, so a frame's tables have one too.
+  CHECK(
+      refused_as(with_tables({1, 0x80, 0x00, 0x80, 0x20, 0, 0, 0, 0, 0, 0, 0}),
+                 C::InvalidArgument));
+  CHECK(refused_as(with_tables({1, 0, 0x80, 0xA0, 0x00, 0, 0, 0, 0, 0, 0, 0}),
+                   C::InvalidArgument));
   return 0;
 }
 
+// Rewrite the low 12 bits of the x of the first block of the segment whose
+// stream starts at @p at in PAYLOAD. A segment's first raw chunk is the low 12
+// bits of its stream's initial state word (bytes 2-3), and raw bits leave the
+// state untouched, so this moves that one coordinate and nothing else -- the
+// edit no end check can see, and so how a test reaches what only a flipped
+// raw bit makes.
+void set_first_x_low_bits(std::vector<std::uint8_t>& payload, std::size_t at,
+                          std::uint32_t low12) {
+  payload[at + 2] = static_cast<std::uint8_t>(low12 & 0xFF);
+  payload[at + 3] = static_cast<std::uint8_t>((payload[at + 3] & 0xF0) |
+                                              ((low12 >> 8) & 0x0F));
+}
+
+// Blocks all observed with zero coefficients at @p coords, K = 1.
+d::IntraFrame plain_frame(const std::vector<vr::Vec3i>& coords) {
+  d::IntraFrame f = make_frame(0, 1, 1);
+  f.coords = coords;
+  f.blocks.masks.assign(coords.size() * codec::kMaskWordsPerBlock, ~0u);
+  f.blocks.coefficients.assign(coords.size(), 0);
+  return f;
+}
+
 // A delta that steps a coordinate out of int32 is refused, not wrapped. No
-// writer makes one, so it is made by hand: a segment's first raw chunk -- the
-// low 12 bits of its first block's x -- is the low 12 bits of the stream's
-// initial state word (bytes 2-3), and raw bits leave the state untouched, so
-// patching them moves only that coordinate. x = 0x7FFFF000 becomes INT32_MAX,
+// writer makes one, so it is made by hand: x = 0x7FFFF000 becomes INT32_MAX,
 // and the next block's run step (+1) leaves int32.
 int coord_overflow_case() {
-  d::IntraFrame f = make_frame(0, 1, 1);
-  f.coords = {{0x7FFFF000, 0, 0}, {0x7FFFF001, 0, 0}};
-  f.blocks.masks.assign(2 * codec::kMaskWordsPerBlock, ~0u);
-  f.blocks.coefficients.assign(2, 0);
+  d::IntraFrame f = plain_frame({{0x7FFFF000, 0, 0}, {0x7FFFF001, 0, 0}});
   const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
   CHECK(read(good).ok());
   std::vector<Section> s = sections_of(good);
-  s[2].body[2] = 0xFF;
-  s[2].body[3] = static_cast<std::uint8_t>((s[2].body[3] & 0xF0) | 0x0F);
+  set_first_x_low_bits(s[2].body, 0, 0xFFF);
   vr::Result<d::IntraFrame> r = read(assemble(good, s));
   CHECK(!r.ok());
   CHECK(r.status().message().find("outside int32") != std::string::npos);
   // The same patch one block earlier is merely a different, valid frame:
   // raw bits carry no redundancy (see codec_rans_test).
-  f.coords = {{0x7FFFF000, 0, 0}};
-  f.blocks.masks.resize(codec::kMaskWordsPerBlock);
-  f.blocks.coefficients.resize(1);
+  f = plain_frame({{0x7FFFF000, 0, 0}});
   const std::vector<std::uint8_t> one = d::write_intra_frame(f).value();
   s = sections_of(one);
-  s[2].body[2] = 0xFF;
-  s[2].body[3] = static_cast<std::uint8_t>((s[2].body[3] & 0xF0) | 0x0F);
+  set_first_x_low_bits(s[2].body, 0, 0xFFF);
   vr::Result<d::IntraFrame> moved = read(assemble(one, s));
   CHECK(moved.ok());
   CHECK(moved.value().coords[0].x == kMax32);
+
+  // A stream that fails partway through a block's deltas is reported as
+  // corrupt, not as leaving int32, although its zeros decode as a run step
+  // off INT32_MAX: a one-block frame whose header claims two reaches for the
+  // never-used z-step table.
+  f = plain_frame({{kMax32, 0, 0}});
+  std::vector<std::uint8_t> b = d::write_intra_frame(f).value();
+  put_u32(b, 32, 2);
+  r = read(b);
+  CHECK(!r.ok());
+  CHECK(r.status().message().find("corrupt") != std::string::npos);
+  return 0;
+}
+
+// Coordinates must increase across segments too. Within one the delta code
+// cannot step backwards, but a segment's first coordinate is raw bits, so a
+// flip there decodes cleanly: the reader must check the order itself, or a
+// duplicate reaches the inverse transform as two workgroups on one block.
+int segment_order_case() {
+  const d::IntraFrame f = plain_frame({{4, 0, 0}, {5, 0, 0}});
+  d::FrameWriteOptions one_each;
+  one_each.segment_size = 1;
+  const std::vector<std::uint8_t> good =
+      d::write_intra_frame(f, one_each).value();
+  CHECK(read(good).ok());
+  const std::vector<Section> s = sections_of(good);
+  const std::size_t second = get_u32(s[1].body, 0);  // segment 1's offset
+  auto with_second_x = [&](std::uint32_t x) {
+    std::vector<Section> t = s;
+    set_first_x_low_bits(t[2].body, second, x);
+    return read(assemble(good, t));
+  };
+  // A duplicate, and a step backwards: both refused.
+  for (std::uint32_t x : {4u, 3u}) {
+    vr::Result<d::IntraFrame> r = with_second_x(x);
+    CHECK(!r.ok());
+    CHECK(r.status().message().find("does not start after") !=
+          std::string::npos);
+  }
+  // A step forwards is only a different, valid frame.
+  vr::Result<d::IntraFrame> r = with_second_x(9);
+  CHECK(r.ok());
+  CHECK(r.value().coords[1] == vr::Vec3i(9, 0, 0));
   return 0;
 }
 
@@ -524,6 +597,7 @@ int main() {
   if (section_rules_case() != 0) return 1;
   if (table_rules_case() != 0) return 1;
   if (coord_overflow_case() != 0) return 1;
+  if (segment_order_case() != 0) return 1;
   if (corruption_case() != 0) return 1;
   if (zero_frame_cost_case() != 0) return 1;
   std::printf("codec bitstream: OK\n");

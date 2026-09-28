@@ -33,7 +33,10 @@
 /// stream length, u32), PAYLOAD (the segment streams). A segment is R
 /// consecutive blocks coded as one independent rANS stream (@ref rans.hpp);
 /// the last may be shorter. A decoder refuses an unknown section flagged
-/// @ref kSectionRequired and skips an unknown optional one.
+/// @ref kSectionRequired and skips an unknown optional one. Every other flag
+/// bit is reserved: zero in v1, and a decoder refuses a known section that
+/// sets one, since a later version may define a flag that changes how the
+/// body reads.
 ///
 /// Inside a segment each block is, in order: its coordinate (the segment's
 /// first in full, the rest as deltas from the block before), its mask class
@@ -45,7 +48,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "dct_transform.hpp"
+#include "dct_blocks.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -63,6 +66,9 @@ inline constexpr std::size_t kSectionEntryBytes = 8;
 /// Section flag: a decoder that does not know the section must refuse the
 /// frame rather than skip it.
 inline constexpr std::uint16_t kSectionRequired = 1;
+/// Every section flag v1 defines. A known section with any other bit set is
+/// refused as @ref Status::Code::Unsupported.
+inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// Blocks per segment unless the writer is told otherwise: about 1% of a
 /// default frame in per-segment overhead, and room0's ~107 k blocks in ~1.7 k
 /// independently decodable segments.
@@ -73,12 +79,16 @@ enum class FrameType : std::uint8_t {
   kIntra = 0,  ///< Self-contained: decodes with no reference frame.
 };
 
-/// The sections v1 defines.
+/// The sections v1 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
   kTables = 1,    ///< The frequency tables, one per model.
   kSegments = 2,  ///< Each segment's stream length in bytes, u32.
   kPayload = 3,   ///< The segment streams, back to back.
 };
+/// How many sections v1 defines.
+inline constexpr std::uint32_t kSectionCount = 3;
+static_assert(static_cast<std::uint32_t>(SectionId::kPayload) == kSectionCount,
+              "section ids run 1..kSectionCount");
 
 /// @brief One intra frame's content, as the writer takes it and the reader
 ///        returns it.
@@ -89,7 +99,9 @@ struct IntraFrame {
   /// Block coordinates, **strictly increasing** in (z, y, x) order (see
   /// @ref coord_less). A format rule, not a convention: it is what makes the
   /// deltas small, and it guarantees the decoder hands the inverse transform
-  /// the duplicate-free list it requires.
+  /// the duplicate-free list it requires. Within a segment the delta code
+  /// cannot step backwards; across segments the reader checks it, since a
+  /// segment's first coordinate is raw bits.
   std::vector<Vec3i> coords;
   /// The transform output for `coords`, entry for entry.
   DctBlocks blocks;
@@ -113,8 +125,12 @@ struct FrameWriteOptions {
 /// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, arrays whose sizes disagree with `coords`, coordinates not
-///         strictly increasing, a coefficient outside ±32767, or a
-///         segment size of 0.
+///         strictly increasing, a coefficient outside ±32767, a segment size
+///         of 0, or a frame whose SEGMENTS or PAYLOAD would outgrow its u32
+///         length (more than 2^30 - 1 segments, or 4 GiB of payload).
+///         @ref Status::Code::IoError only if the coder refuses a symbol its
+///         own tables were counted from, which is a bug here, never the
+///         input's.
 VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
     const IntraFrame& frame, const FrameWriteOptions& options = {});
 
@@ -126,11 +142,19 @@ VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
 /// @param max_blocks  The most blocks the caller can hold. A frame's size does
 ///                    not bound its block count -- a block whose every symbol
 ///                    has probability one costs no bits -- so this is what
-///                    bounds what the reader allocates.
+///                    bounds the work and the allocation: `12 + 64 + 4 K`
+///                    bytes per block, with K from the header (at most 512),
+///                    so at most ~2.1 KB -- about half of the 4 KB of
+///                    `tsdf` + `weight` the grid it decodes into holds per
+///                    block.
 /// @return The frame, or: @ref Status::Code::Unsupported for another version,
-///         frame type, block size or an unknown required section;
+///         frame type, block size, an unknown required section, or a known
+///         section with a flag v1 does not define;
 ///         @ref Status::Code::InvalidArgument for anything malformed,
-///         truncated or inconsistent, and for more than @p max_blocks blocks.
+///         truncated or inconsistent (coordinates out of order across
+///         segments included), and for more than @p max_blocks blocks;
+///         @ref Status::Code::OutOfMemory for a frame whose arrays would not
+///         fit this platform's address space (reachable on a 32-bit build).
 VR_CODEC_API Result<IntraFrame> read_intra_frame(const std::uint8_t* data,
                                                  std::size_t size,
                                                  std::uint32_t max_blocks);

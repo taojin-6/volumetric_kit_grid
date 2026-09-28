@@ -3,10 +3,12 @@
 
 # --- recon_codec: the per-frame TSDF geometry codec --------------------------
 # Encodes a grid's active blocks as a self-contained intra frame and decodes it
-# back into a VoxelBlockGrid (the 2026-09-26 decision). This first cut carries
-# the public CodecParams and the private DctTransform: the GLSL forward/inverse
-# 8^3 DCT that turns a block list into quantized coefficients plus an observed
-# mask, and back. Links recon_volume ALONE -- it reads a grid's tsdf/weight and
+# back into a VoxelBlockGrid (the 2026-09-26 decision). So far it carries the
+# public CodecParams and, all private, the DctTransform (the GLSL
+# forward/inverse 8^3 DCT that turns a block list into quantized coefficients
+# plus an observed mask, and back), the host rANS reference coder (rans.hpp,
+# header-only) and the v1 intra frame built on it (bitstream.cpp; the 2026-09-27
+# decision). Links recon_volume ALONE -- it reads a grid's tsdf/weight and
 # re-creates blocks through the map, and needs neither the integrator that
 # produced the field nor the mesher that consumes the decoded one.
 include(GenerateExportHeader)
