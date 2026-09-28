@@ -49,7 +49,8 @@ namespace volumetric_kit::recon::volume {
 /// @param vertex_count    How many @p vertices.
 /// @param indices         `3 * triangle_count` indices into @p vertices.
 /// @param triangle_count  How many triangles.
-/// @param who             Names the caller, for the error message.
+/// @param who             Names the caller, for the error message (null names
+///                        this function instead).
 /// @return `triangle_count + 1` offsets, the last being the total work-item
 ///         count (0 when every triangle was skipped); or
 ///         @ref Status::Code::InvalidArgument for a null @p vertices or

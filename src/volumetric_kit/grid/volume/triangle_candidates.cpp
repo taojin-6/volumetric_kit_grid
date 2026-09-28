@@ -26,13 +26,16 @@ Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
     const VoxelGridParams& grid, const Vec3f* vertices,
     std::uint32_t vertex_count, const std::uint32_t* indices,
     std::uint32_t triangle_count, const char* who) {
+  const std::string name =
+      who != nullptr ? who : "volume::triangle_candidate_offsets";
+  // Refused before the offsets are allocated: a null mesh with a large count
+  // would otherwise spend gigabytes to report an argument error.
+  if (triangle_count != 0 && (vertices == nullptr || indices == nullptr)) {
+    return Status::invalid_argument(name + ": vertices or indices is null");
+  }
   std::vector<std::uint32_t> offsets(std::size_t{triangle_count} + 1, 0u);
   if (triangle_count == 0) {
     return offsets;
-  }
-  if (vertices == nullptr || indices == nullptr) {
-    return Status::invalid_argument(std::string(who) +
-                                    ": vertices or indices is null");
   }
 
   std::uint64_t total = 0;
@@ -44,7 +47,7 @@ Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
     const std::uint32_t i2 = indices[3 * std::size_t{t} + 2];
     if (i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count) {
       return Status::invalid_argument(
-          std::string(who) + ": a triangle index is at or past vertex_count");
+          name + ": a triangle index is at or past vertex_count");
     }
     const Vec3f v0 = vertices[i0];
     const Vec3f v1 = vertices[i1];
@@ -79,7 +82,7 @@ Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
     // saying so beats truncating the count and covering a fraction of it.
     if (total > std::numeric_limits<std::uint32_t>::max()) {
       return Status::invalid_argument(
-          std::string(who) +
+          name +
           ": candidate blocks exceed 2^32 -- is the mesh scaled to the grid's "
           "units (metres)?");
     }
