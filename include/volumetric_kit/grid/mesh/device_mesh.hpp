@@ -82,8 +82,9 @@ struct DeviceMesh {
   /// vertex -- one writer per vertex -- and texture a shared mesh like any
   /// other.
   bool shares_vertices = false;
-  /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
-  /// plus whatever the producer's consumer asked for. Carried so a consumer can
+  /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`
+  /// and `TRANSFER_SRC | TRANSFER_DST`, plus whatever the producer's consumer
+  /// asked for. Carried so a consumer can
   /// *check* that the binding it is about to make is permitted, rather than
   /// assuming the flags it published reached the producer: Vulkan cannot be
   /// asked what a `VkBuffer` was created with, and binding one that lacks the

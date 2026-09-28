@@ -135,6 +135,28 @@ bool fill_sphere(const vr::Device& dev, vr::Allocator& alloc,
          vr_test::write_attribute(dev, alloc, g, "weight", weight.value()).ok();
 }
 
+// The first `count` elements of `src`, a buffer the test holds only as a
+// VkBuffer (a DeviceMesh's), copied into host memory; empty on failure.
+template <typename T>
+std::vector<T> copy_out(const vr::Device& dev, vr::Allocator& alloc,
+                        VkBuffer src, std::size_t count) {
+  const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(T);
+  vr::Result<vr::Buffer> staging = vr::storage_buffer(
+      alloc, bytes, vr::HostAccess::Random, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  if (!staging.ok()) return {};
+  const VkBuffer dst = staging.value().handle();
+  const vr::Status copied =
+      dev.submit_single_time([src, dst, bytes](VkCommandBuffer cb) {
+        VkBufferCopy region{};
+        region.size = bytes;
+        vkCmdCopyBuffer(cb, src, dst, 1, &region);
+      });
+  if (!copied.ok()) return {};
+  std::vector<T> out(count);
+  std::memcpy(out.data(), staging.value().mapped(), bytes);
+  return out;
+}
+
 }  // namespace
 
 int main() {
@@ -227,6 +249,21 @@ int main() {
   CHECK((big_mesh.value().vertex_usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) !=
         0);
   CHECK((big_mesh.value().index_usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) != 0);
+
+  // The grown run holds the identity on the device, which is what a renderer
+  // draws through. download() regenerates it on the host, so only a copy of
+  // the run itself sees whether the grow filled it.
+  {
+    const std::size_t index_count =
+        std::size_t(big_mesh.value().triangle_count) * 3;
+    const std::vector<std::uint32_t> run =
+        copy_out<std::uint32_t>(device.value(), allocator.value(),
+                                big_mesh.value().indices, index_count);
+    CHECK(run.size() == index_count);
+    for (std::size_t i = 0; i < run.size(); ++i) {
+      CHECK(run[i] == static_cast<std::uint32_t>(i));
+    }
+  }
 
   // --- The default is exactly STORAGE_BUFFER and the transfer bits ----------
   // A recon-only consumer pays for nothing it does not use; the transfer bits
@@ -352,13 +389,12 @@ int main() {
   // mesh with every other assertion in this suite still green (verified by
   // mutation: `emitted * kIndicesPerTriangle` -> `emitted` passed everything).
   //
-  // Read back through a copy rather than a map, because the test holds only a
-  // VkBuffer. That makes this a genuine consumer of extra_indirect_usage -- the
-  // TRANSFER_SRC bit below is the config knob under test, so the readback and
-  // the flag prove each other.
+  // Read back through a copy, because the test holds only a VkBuffer. The
+  // extra_indirect_usage bit below is one no buffer here carries otherwise, so
+  // finding it is what shows the knob reached the allocation.
   {
     mesh::MarchingCubesConfig cmd_config;
-    cmd_config.extra_indirect_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    cmd_config.extra_indirect_usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     vr::Result<mesh::MarchingCubes> cmd_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), cmd_config);
     CHECK(cmd_result.ok());
@@ -369,25 +405,13 @@ int main() {
     CHECK(cmd_mesh.ok());
     CHECK(!cmd_mesh.value().empty());
     CHECK((cmd_mesh.value().indirect_usage &
-           VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0);
+           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) != 0);
 
-    vr::Result<vr::Buffer> staging = vr::storage_buffer(
-        allocator.value(), sizeof(VkDrawIndexedIndirectCommand),
-        vr::HostAccess::Random, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    CHECK(staging.ok());
-
-    const VkBuffer src = cmd_mesh.value().indirect;
-    const VkBuffer dst = staging.value().handle();
-    CHECK(device.value()
-              .submit_single_time([src, dst](VkCommandBuffer cb) {
-                VkBufferCopy region{};
-                region.size = sizeof(VkDrawIndexedIndirectCommand);
-                vkCmdCopyBuffer(cb, src, dst, 1, &region);
-              })
-              .ok());
-
-    VkDrawIndexedIndirectCommand cmd{};
-    std::memcpy(&cmd, staging.value().mapped(), sizeof(cmd));
+    const std::vector<VkDrawIndexedIndirectCommand> copied =
+        copy_out<VkDrawIndexedIndirectCommand>(
+            device.value(), allocator.value(), cmd_mesh.value().indirect, 1);
+    CHECK(copied.size() == 1);
+    const VkDrawIndexedIndirectCommand cmd = copied[0];
     // The units: three indices per triangle, which is what makes the kernel's
     // append atomic the command itself.
     CHECK(cmd.indexCount == cmd_mesh.value().triangle_count * 3);
@@ -700,6 +724,33 @@ int main() {
     vr::Result<mesh::Mesh> none_host = ex.download(none.value());
     CHECK(none_host.ok());
     CHECK(none_host.value().vertices.empty());
+  }
+
+  // One slot, so every extract shares one command. An empty extract resets it
+  // only when it is not empty already, and the real extract between the two
+  // must count as not empty, or the second would hand out the real one's count.
+  {
+    vr::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
+        device.value(), allocator.value(), gp, attrs, 2);
+    CHECK(empty_result.ok());
+    vol::VoxelBlockGrid empty_grid = std::move(empty_result).value();
+    vr::Result<mesh::MarchingCubes> one_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value());
+    CHECK(one_result.ok());
+    mesh::MarchingCubes one = std::move(one_result).value();
+    const auto index_count = [&](const mesh::DeviceMesh& m) -> std::uint32_t {
+      const std::vector<VkDrawIndexedIndirectCommand> c =
+          copy_out<VkDrawIndexedIndirectCommand>(
+              device.value(), allocator.value(), m.indirect, 1);
+      return c.empty() ? ~0u : c[0].indexCount;
+    };
+    vr::Result<mesh::DeviceMesh> a = one.extract_device(empty_grid, 0.0f);
+    CHECK(a.ok() && index_count(a.value()) == 0);
+    vr::Result<mesh::DeviceMesh> b = one.extract_device(small, 0.0f);
+    CHECK(b.ok() && index_count(b.value()) == b.value().triangle_count * 3);
+    CHECK(b.value().triangle_count > 0);
+    vr::Result<mesh::DeviceMesh> c = one.extract_device(empty_grid, 0.0f);
+    CHECK(c.ok() && index_count(c.value()) == 0);
   }
 
   std::fprintf(stderr, "marching_cubes_config: OK\n");

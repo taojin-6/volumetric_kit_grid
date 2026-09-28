@@ -244,48 +244,36 @@ static_assert(offsetof(SparsePushConstants, dirty_capacity) == 56,
 static_assert(offsetof(SparsePushConstants, num_block_slots) == 60,
               "SparsePushConstants layout drift");
 
-// The draw command plus two words of recon scratch, starting at byte 20,
-// immediately past the 20-byte VkDrawIndexedIndirectCommand. Keeping them in
-// this buffer costs no second allocation per ring slot and leaves a well-formed
-// command at offset 0, which is all vkCmdDrawIndexedIndirect binds.
-//   * The vertex counter, which the sharing kernel allocates through. It cannot
-//     be derived from indexCount any more -- that held only while every
-//     triangle owned three private vertices.
-//   * The sharing kernel's report that it really did share (see
-//     kMaxSharedCells).
-// Both are written only by marching_cubes_sparse_shared.comp; the default
-// kernel leaves them at the host's reset.
-constexpr VkDeviceSize kVertexCountOffset =
-    sizeof(VkDrawIndexedIndirectCommand);
-constexpr VkDeviceSize kSharingAppliedOffset =
-    kVertexCountOffset + sizeof(std::uint32_t);
-//   * Blocks an incremental dispatch actually re-meshed, which is the number
-//     the whole feature trades against and the one thing about it the host
-//     cannot derive: the dilation from the changed set to the re-mesh set
-//     happens on-device, off shared memory. Bumped once per re-meshed
-//     workgroup by the default kernel and only while pc.incremental is set --
-//     a full pass re-meshes its whole active set, which the host already knows,
-//     and 107k atomics to restate it is not free.
-constexpr VkDeviceSize kRemeshedBlocksOffset =
-    kSharingAppliedOffset + sizeof(std::uint32_t);
-constexpr VkDeviceSize kIndirectBufferBytes =
-    kRemeshedBlocksOffset + sizeof(std::uint32_t);
-
-// The whole command buffer as the host resets it and reads it back, in one
-// transfer each way.
+// The command buffer: the draw command plus three words of recon scratch,
+// immediately past it. Keeping them in this buffer costs no second allocation
+// per ring slot and leaves a well-formed command at offset 0, which is all
+// vkCmdDrawIndexedIndirect binds. The host resets it and reads it back whole,
+// in one transfer each way.
 struct IndirectWords {
   VkDrawIndexedIndirectCommand command;
+  // The vertex counter, which the sharing kernel allocates through. It cannot
+  // be derived from indexCount any more -- that held only while every
+  // triangle owned three private vertices.
   std::uint32_t vertex_count;
+  // The sharing kernel's report that it really did share (see
+  // kMaxSharedCells). This and vertex_count are written only by
+  // marching_cubes_sparse_shared.comp; the default kernel leaves them at the
+  // host's reset.
   std::uint32_t sharing_applied;
+  // Blocks an incremental dispatch actually re-meshed, which is the number
+  // the whole feature trades against and the one thing about it the host
+  // cannot derive: the dilation from the changed set to the re-mesh set
+  // happens on-device, off shared memory. Bumped once per re-meshed
+  // workgroup by the default kernel and only while pc.incremental is set --
+  // a full pass re-meshes its whole active set, which the host already knows,
+  // and 107k atomics to restate it is not free.
   std::uint32_t remeshed_blocks;
 };
-static_assert(sizeof(IndirectWords) == kIndirectBufferBytes &&
-                  offsetof(IndirectWords, vertex_count) == kVertexCountOffset &&
-                  offsetof(IndirectWords, sharing_applied) ==
-                      kSharingAppliedOffset &&
-                  offsetof(IndirectWords, remeshed_blocks) ==
-                      kRemeshedBlocksOffset,
+// Packed, as the kernels' scalar-layout mirror assumes.
+static_assert(sizeof(IndirectWords) == sizeof(VkDrawIndexedIndirectCommand) +
+                                           3 * sizeof(std::uint32_t),
               "IndirectWords must mirror the command buffer's layout");
+constexpr VkDeviceSize kIndirectBufferBytes = sizeof(IndirectWords);
 
 // Bytes a vertex arena needs to hold @p vertex_capacity VERTICES.
 //
@@ -578,6 +566,8 @@ Status MarchingCubes::ensure_indirect_command(CommandBatch& batch,
             config_.queue_family_count));
     name_slot_buffer(indirect(), "mesh.indirect[%u]");
   }
+  // This reset may be seeded, and the dispatch after it counts.
+  slots_[slot_].command_empty = false;
   // The whole command, not just the counter it starts as. indexCount is zeroed
   // for the kernel to accumulate into; the other four fields are what make the
   // result a *drawable* command rather than a number a host has to build one
@@ -887,14 +877,21 @@ Status MarchingCubes::ensure_output_buffers(CommandBatch& batch,
             config_.queue_family_count));
     if (!config_.share_vertices) {
       // The kernel writes vertices at `tri * 3`, so the run IS the identity
-      // 0,1,2,..., staged up once per grow; download() regenerates it rather
+      // 0,1,2,..., uploaded once per grow; download() regenerates it rather
       // than reading it back. With sharing only the kernel knows the mapping,
       // and it writes the run itself.
+      //
+      // Submitted here, before the run is committed below, not recorded into
+      // @p batch: nothing refills a run that has been committed, so a batch
+      // that failed after committing it would leave the draw indexing
+      // uninitialized memory for the extractor's lifetime.
       std::vector<std::uint32_t> identity(
           static_cast<std::size_t>(target_capacity) * kIndicesPerTriangle);
       std::iota(identity.begin(), identity.end(), std::uint32_t{0});
-      VR_TRY(batch.upload(indices_buf, 0, identity.data(),
-                          index_run_bytes_for(target_capacity)));
+      CommandBatch fill(*device_, *allocator_);
+      VR_TRY(fill.upload(indices_buf, 0, identity.data(),
+                         index_run_bytes_for(target_capacity)));
+      VR_TRY(fill.submit());
     }
   }
   // Committed after both allocations, so a failure on the second cannot leave
@@ -1097,9 +1094,10 @@ Result<Mesh> MarchingCubes::extract_host(volume::VoxelBlockGrid& grid,
       const DeviceMesh device_mesh,
       extract_device_impl(grid, iso, nullptr, nullptr, timings, kEntryHost));
   // The host copy is part of this call's readback, so it belongs in the phase
-  // that names it -- the device path stamped readback_ms with the 20-byte
-  // command read alone, which is right for that entry point but would leave the
-  // host path's ~45 MB copy uncounted in ExtractTimings::total_ms.
+  // that names it -- the device path's readback_ms is near zero, its command
+  // read riding the dispatch's submit, which is right for that entry point but
+  // would leave the host path's ~45 MB copy uncounted in
+  // ExtractTimings::total_ms.
   PhaseClock download_clock(timings != nullptr);
   Result<Mesh> mesh = download(device_mesh);
   if (timings != nullptr) timings->readback_ms += download_clock.lap();
@@ -1169,28 +1167,32 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
   mesh.indices.resize(index_count);
   // Copied back through a batch, never read through a mapping: the buffers are
   // device-local, and a host read of VRAM is uncached (6.6 s for this mesh
-  // from BAR memory on an RTX 5090, the 2026-09-28 residency decision).
-  CommandBatch batch(*device_, *allocator_);
+  // from BAR memory on an RTX 5090, the 2026-09-28 residency decision). A
+  // batch per buffer, so no staging buffer is larger than a device buffer that
+  // was already allocated.
   if (vertex_count > 0) {
+    CommandBatch batch(*device_, *allocator_);
     VR_TRY(batch.readback(arena(), 0,
                           VkDeviceSize(vertex_count) * sizeof(Vertex),
                           mesh.vertices.data()));
+    VR_TRY(batch.submit());
   }
   if (index_count > 0) {
     if (config_.share_vertices) {
       // READ BACK. A shared vertex is referenced by several triangles from
       // several cells, so the mapping is a property of the dispatch and only
       // the kernel knows it -- there is no run to regenerate.
+      CommandBatch batch(*device_, *allocator_);
       VR_TRY(batch.readback(index_run(), 0,
                             VkDeviceSize(index_count) * sizeof(std::uint32_t),
                             mesh.indices.data()));
+      VR_TRY(batch.submit());
     } else {
       // Regenerated, not read back: the default kernel writes each triangle's
       // three vertices at `tri * 3`, so the run is the identity 0,1,2,...
       std::iota(mesh.indices.begin(), mesh.indices.end(), std::uint32_t{0});
     }
   }
-  VR_TRY(batch.submit());
   return mesh;
 }
 
@@ -1402,10 +1404,13 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // whichever arena this slot happens to hold. Zeroed, it draws nothing,
     // which is what an empty mesh means -- and zero is what this path passes,
     // rather than what it happens to find, since the seed is a parameter.
-    {
+    // Skipped when the slot already holds it, so a cull that sees nothing
+    // costs no submit per frame.
+    if (!slots_[slot_].command_empty) {
       CommandBatch batch(*device_, *allocator_);
       VR_TRY(ensure_indirect_command(batch, 0, 0));
       VR_TRY(batch.submit());
+      slots_[slot_].command_empty = true;
     }
     // Stamped here and not a line earlier: this is the last fallible statement,
     // so from here the DeviceMesh below is certain to be handed out. A stamp
@@ -1758,9 +1763,15 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     //
     // Only the command and its scratch words come back, in the same batch;
     // the geometry stays where the kernel wrote it.
-    VR_TRY(batch->dispatch(kernel_sparse_, &push, sizeof(push), num_active,
-                           max_workgroup_count_x_));
-    VR_TRY(batch->readback(indirect(), 0, sizeof(words), &words));
+    //
+    // A refused dispatch or readback poisons the batch and submit returns that
+    // refusal, so every failure takes the one exit below. The reset was only
+    // recorded, so each of them has to disarm the command: it still holds the
+    // last extract's count, or attempt 0's over-count, over buffers this call
+    // may have replaced.
+    static_cast<void>(batch->dispatch(kernel_sparse_, &push, sizeof(push),
+                                      num_active, max_workgroup_count_x_));
+    static_cast<void>(batch->readback(indirect(), 0, sizeof(words), &words));
     if (Status ran = batch->submit(); !ran.ok()) {
       disarm_indirect_command();
       return ran;
