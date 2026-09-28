@@ -27,7 +27,8 @@
 
 namespace volumetric_kit::recon {
 class Device;
-}
+class StorageInput;
+}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::volume {
 
@@ -551,16 +552,16 @@ class VR_VOLUME_API VoxelHashMap {
                                             AllocFailures* out_failures,
                                             GpuStageScope* stage = nullptr);
 
-  /// Create a transient host-visible buffer holding @p bytes of @p data and
-  /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
-  /// alive across the (synchronous) dispatch that reads it.
-  // Both allocate_from_depth overloads: exactly one of the two depths is set.
-  Result<std::uint32_t> allocate_from_depth(const float* host_depth,
-                                            const Buffer* device_depth,
+  /// Both @ref allocate_from_depth overloads: @p depth is the host array or
+  /// the device buffer the caller passed.
+  Result<std::uint32_t> allocate_from_depth(const StorageInput& depth,
                                             const DepthCameraParams& camera,
                                             AllocFailures* out_failures,
                                             StageMetrics* metrics);
 
+  /// Create a transient host-visible buffer holding @p bytes of @p data and
+  /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
+  /// alive across the (synchronous) dispatch that reads it.
   Result<Buffer> upload_to_binding(const DescriptorSet& set,
                                    std::uint32_t binding, const void* data,
                                    VkDeviceSize bytes);
