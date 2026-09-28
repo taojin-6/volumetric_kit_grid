@@ -12,11 +12,15 @@
 namespace volumetric_kit::recon::eval {
 namespace {
 
+// Cells per reach: a cell is half the reach on a side, so anything within
+// reach of a query lies at most kRings cells from its own.
+constexpr int kRings = 2;
+
 // Cells are keyed 21 bits per axis, offset to unsigned: [-2^20, 2^20) on each.
 // A triangle is filed at most kMaxCell cells from the origin, so a query that
-// can see one probes neighbours at most kMaxCell + 2 out, still inside the
-// keys' range, and no two cells share a key.
-constexpr float kMaxCell = float((1 << 20) - 3);
+// can see one probes neighbours at most kMaxCell + 2 * kRings out, still
+// inside the keys' range, and no two cells share a key.
+constexpr float kMaxCell = float((1 << 20) - 1 - 2 * kRings);
 
 std::uint64_t key(Vec3i c) {
   const auto bits = [](int v) {
@@ -49,8 +53,8 @@ Vec3f closest_point_on_segment(Vec3f p, Vec3f a, Vec3f b) {
   return a + ab * std::clamp(dot(p - a, ab) / len2, 0.0f, 1.0f);
 }
 
-// A zero-area triangle's nearest point: the nearest of its three edges, any of
-// which may itself be a point.
+// The nearest point of a triangle's three edges, any of which may itself be a
+// point.
 Vec3f closest_point_on_edges(Vec3f p, Vec3f a, Vec3f b, Vec3f c) {
   Vec3f best = closest_point_on_segment(p, a, b);
   for (const Vec3f q :
@@ -69,6 +73,7 @@ Status check_surface(const mesh::Mesh& mesh, float reach) {
     return Status::invalid_argument(
         "MeshDistance: reach must be finite and positive");
   }
+  const float cell = reach / float(kRings);
   if (mesh.indices.size() % 3 != 0) {
     return Status::invalid_argument(
         "MeshDistance: the index count is not a multiple of 3");
@@ -95,18 +100,18 @@ Status check_surface(const mesh::Mesh& mesh, float reach) {
         return Status::invalid_argument(
             "MeshDistance: a triangle corner is not finite");
       }
-      if (!within(cell_of(p, reach), kMaxCell)) {
+      if (!within(cell_of(p, cell), kMaxCell)) {
         return Status::invalid_argument(
             "MeshDistance: a triangle corner is more than " +
-            std::to_string(std::int64_t(kMaxCell)) +
+            std::to_string(std::int64_t(kMaxCell) / kRings) +
             " reaches from the origin");
       }
     }
     if (is_point(a, b, c)) {
       continue;
     }
-    const Vec3i span = Vec3i(cell_of(glm::max(a, glm::max(b, c)), reach)) -
-                       Vec3i(cell_of(glm::min(a, glm::min(b, c)), reach)) +
+    const Vec3i span = Vec3i(cell_of(glm::max(a, glm::max(b, c)), cell)) -
+                       Vec3i(cell_of(glm::min(a, glm::min(b, c)), cell)) +
                        Vec3i(1);
     cells +=
         std::uint64_t(span.x) * std::uint64_t(span.y) * std::uint64_t(span.z);
@@ -180,7 +185,7 @@ std::vector<Vec3f> sample_points(const mesh::Mesh& mesh, std::size_t stride) {
   return points;
 }
 
-// TODO(eval): thread this -- room0 at 1 cm takes ~9 s at stride 4 on one core.
+// TODO(eval): thread this -- room0 at 1 cm takes ~2 s at stride 4 on one core.
 std::vector<float> distances_to(const std::vector<Vec3f>& points,
                                 const MeshDistance& surface) {
   std::vector<float> out;
@@ -216,54 +221,33 @@ MeshComparison combine(std::vector<float> acc, std::vector<float> cov,
 }  // namespace
 
 Vec3f closest_point_on_triangle(Vec3f p, Vec3f a, Vec3f b, Vec3f c) {
+  // The projection onto the face when it lands inside, else the nearest edge
+  // -- not Ericson's region test, whose divisions now and then lose the
+  // answer on a thin triangle: about one query in 300 000 on 1 cm slivers at
+  // room coordinates, by up to 90 um. The face is trusted only while the sine
+  // of the angle at `a` is above 1e-4, a thousand times the float rounding in
+  // the cross product -- a margin, not a measured need; a thinner triangle is
+  // measured by its edges, which lie within its height of its face.
   const Vec3f ab = b - a;
-  const Vec3f ac = c - a;
-  // Ericson's regions assume an area. Without one they misfire: with a == b
-  // every point falls in edge ab's region, whose parameter is then 0 / 0. So
-  // a triangle whose angle at `a` has a sine under 1e-5 -- two corners
-  // coinciding, or all three on a line -- is taken as its edges. That moves
-  // the answer by at most 1e-5 of the triangle's size.
-  const Vec3f n = cross(ab, ac);
-  if (dot(n, n) <= 1e-10f * dot(ab, ab) * dot(ac, ac)) {
-    return closest_point_on_edges(p, a, b, c);
+  const Vec3f bc = c - b;
+  const Vec3f ca = a - c;
+  const Vec3f n = cross(ab, c - a);
+  const float n2 = dot(n, n);
+  if (n2 > 1e-8f * dot(ab, ab) * dot(ca, ca)) {
+    const Vec3f q = p - n * (dot(p - a, n) / n2);
+    if (dot(cross(ab, q - a), n) >= 0.0f && dot(cross(bc, q - b), n) >= 0.0f &&
+        dot(cross(ca, q - c), n) >= 0.0f) {
+      return q;
+    }
   }
-  const Vec3f ap = p - a;
-  const float d1 = dot(ab, ap);
-  const float d2 = dot(ac, ap);
-  if (d1 <= 0.0f && d2 <= 0.0f) return a;
-  const Vec3f bp = p - b;
-  const float d3 = dot(ab, bp);
-  const float d4 = dot(ac, bp);
-  if (d3 >= 0.0f && d4 <= d3) return b;
-  const float vc = d1 * d4 - d3 * d2;
-  if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-    return a + ab * (d1 / (d1 - d3));
-  }
-  const Vec3f cp = p - c;
-  const float d5 = dot(ab, cp);
-  const float d6 = dot(ac, cp);
-  if (d6 >= 0.0f && d5 <= d6) return c;
-  const float vb = d5 * d2 - d1 * d6;
-  if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-    return a + ac * (d2 / (d2 - d6));
-  }
-  const float va = d3 * d6 - d5 * d4;
-  if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-    return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
-  }
-  // Inside the face. The sum is the squared area, positive past the check
-  // above; if rounding says otherwise, the edges are still right.
-  const float sum = va + vb + vc;
-  if (!(sum > 0.0f)) {
-    return closest_point_on_edges(p, a, b, c);
-  }
-  return a + ab * (vb / sum) + ac * (vc / sum);
+  return closest_point_on_edges(p, a, b, c);
 }
 
 Result<MeshDistance> MeshDistance::create(const mesh::Mesh& mesh, float reach) {
   VR_TRY(check_surface(mesh, reach));
   MeshDistance d;
   d.reach_ = reach;
+  d.cell_ = reach / float(kRings);
   d.corners_.reserve(mesh.indices.size());
   for (std::size_t i = 0; i < mesh.indices.size(); i += 3) {
     const Vec3f& a = mesh.vertices[mesh.indices[i]].position;
@@ -274,8 +258,8 @@ Result<MeshDistance> MeshDistance::create(const mesh::Mesh& mesh, float reach) {
     }
     const auto t = static_cast<std::uint32_t>(d.corners_.size());
     d.corners_.insert(d.corners_.end(), {a, b, c});
-    const Vec3i lo(cell_of(glm::min(a, glm::min(b, c)), reach));
-    const Vec3i hi(cell_of(glm::max(a, glm::max(b, c)), reach));
+    const Vec3i lo(cell_of(glm::min(a, glm::min(b, c)), d.cell_));
+    const Vec3i hi(cell_of(glm::max(a, glm::max(b, c)), d.cell_));
     for (int z = lo.z; z <= hi.z; ++z) {
       for (int y = lo.y; y <= hi.y; ++y) {
         for (int x = lo.x; x <= hi.x; ++x) {
@@ -288,30 +272,59 @@ Result<MeshDistance> MeshDistance::create(const mesh::Mesh& mesh, float reach) {
 }
 
 float MeshDistance::distance(Vec3f p) const {
-  // No triangle is filed past kMaxCell, so a point more than a cell beyond it,
-  // or one that is not finite, has nothing within reach.
-  const Vec3f cell = cell_of(p, reach_);
-  if (!within(cell, kMaxCell + 1.0f)) {
+  // No triangle is filed past kMaxCell, and nothing within reach is more than
+  // kRings cells from the query's own, so a point further out than both, or
+  // one that is not finite, has nothing within reach.
+  const Vec3f cell = cell_of(p, cell_);
+  if (!within(cell, kMaxCell + float(kRings))) {
     return reach_;
   }
-  float best = reach_;
   const Vec3i centre(cell);
-  for (int dz = -1; dz <= 1; ++dz) {
-    for (int dy = -1; dy <= 1; ++dy) {
-      for (int dx = -1; dx <= 1; ++dx) {
-        const auto it = cells_.find(key(centre + Vec3i(dx, dy, dz)));
-        if (it == cells_.end()) {
+  // Lower best2 to the nearest triangle filed under cell c, if nearer.
+  const auto scan = [this, p](Vec3i c, float& best2) {
+    const auto it = cells_.find(key(c));
+    if (it == cells_.end()) {
+      return;
+    }
+    for (std::uint32_t t : it->second) {
+      const Vec3f d = p - closest_point_on_triangle(
+                              p, corners_[t], corners_[t + 1], corners_[t + 2]);
+      best2 = std::min(best2, dot(d, d));
+    }
+  };
+  // The squared distance along one axis from coordinate v to cell i's slab.
+  const auto gap2 = [this](float v, int i) {
+    const float lo = float(i) * cell_;
+    const float g = v < lo ? lo - v : v - (lo + cell_);
+    return g > 0.0f ? g * g : 0.0f;
+  };
+  // A triangle is filed under every cell its bounding box touches, so its
+  // nearest point to p lies in one of them. The query's own cell goes first,
+  // so the best found so far -- under a millimetre on a surface -- prunes
+  // every neighbour whose box is farther than it.
+  const float reach2 = reach_ * reach_;
+  float best2 = reach2;
+  scan(centre, best2);
+  for (int dz = -kRings; dz <= kRings; ++dz) {
+    const float gz = gap2(p.z, centre.z + dz);
+    if (gz >= best2) {
+      continue;
+    }
+    for (int dy = -kRings; dy <= kRings; ++dy) {
+      const float gy = gz + gap2(p.y, centre.y + dy);
+      if (gy >= best2) {
+        continue;
+      }
+      for (int dx = -kRings; dx <= kRings; ++dx) {
+        if ((dx == 0 && dy == 0 && dz == 0) ||
+            gy + gap2(p.x, centre.x + dx) >= best2) {
           continue;
         }
-        for (std::uint32_t t : it->second) {
-          best = std::min(best, length(p - closest_point_on_triangle(
-                                               p, corners_[t], corners_[t + 1],
-                                               corners_[t + 2])));
-        }
+        scan(centre + Vec3i(dx, dy, dz), best2);
       }
     }
   }
-  return best;
+  return best2 < reach2 ? std::sqrt(best2) : reach_;
 }
 
 DistanceStats summarize(std::vector<float> distances, float reach) {

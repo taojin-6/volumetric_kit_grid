@@ -2,12 +2,13 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only test for eval/mesh_distance.hpp: the closest point in every region
-// of a triangle and on every degenerate one, the reach clamp, the summary
-// statistics, accuracy / coverage and the F-score between meshes whose true
-// distance is known -- a plane against a copy of itself shifted by a known
-// amount, and against one with half its triangles gone -- what counts as
-// surface, figures independent of the mesh's order, the reusable reference,
-// and every refusal. CPU-only.
+// of a triangle, on every degenerate one and on thin ones against a
+// double-precision answer, the pruned cell search against a scan of every
+// triangle, the reach clamp, the summary statistics, accuracy / coverage and
+// the F-score between meshes whose true distance is known -- a plane against a
+// copy of itself shifted by a known amount, and against one with half its
+// triangles gone -- what counts as surface, figures independent of the mesh's
+// order, the reusable reference, and every refusal. CPU-only.
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <glm/glm.hpp>
 
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
@@ -90,6 +93,42 @@ mesh::Mesh reordered(const mesh::Mesh& m) {
   return r;
 }
 
+// A deterministic stream of floats in [lo, hi): a fixed LCG, so every
+// standard library draws the same points.
+struct Lcg {
+  std::uint32_t state = 12345u;
+  float operator()(float lo, float hi) {
+    state = state * 1664525u + 1013904223u;
+    return lo + (hi - lo) * float(state >> 8) / float(1u << 24);
+  }
+};
+
+// The distance from p to triangle abc in double, where a thin triangle at room
+// coordinates is still well conditioned: to the face when p projects inside
+// it, else to the nearest edge.
+double triangle_distance(const vr::Vec3f& pf, const vr::Vec3f& af,
+                         const vr::Vec3f& bf, const vr::Vec3f& cf) {
+  const glm::dvec3 p(pf), a(af), b(bf), c(cf);
+  const auto segment = [&p](const glm::dvec3& u, const glm::dvec3& v) {
+    const glm::dvec3 uv = v - u;
+    const double len2 = glm::dot(uv, uv);
+    const double t =
+        len2 > 0.0 ? std::clamp(glm::dot(p - u, uv) / len2, 0.0, 1.0) : 0.0;
+    return glm::length(p - (u + uv * t));
+  };
+  const glm::dvec3 n = glm::cross(b - a, c - a);
+  const double n2 = glm::dot(n, n);
+  if (n2 > 0.0) {
+    const glm::dvec3 q = p - n * (glm::dot(p - a, n) / n2);
+    if (glm::dot(glm::cross(b - a, q - a), n) >= 0.0 &&
+        glm::dot(glm::cross(c - b, q - b), n) >= 0.0 &&
+        glm::dot(glm::cross(a - c, q - c), n) >= 0.0) {
+      return glm::length(p - q);
+    }
+  }
+  return std::min({segment(a, b), segment(b, c), segment(c, a)});
+}
+
 bool identical(const eval::DistanceStats& a, const eval::DistanceStats& b) {
   return a.count == b.count && a.beyond_reach == b.beyond_reach &&
          a.mean == b.mean && a.rms == b.rms && a.p95 == b.p95 && a.max == b.max;
@@ -140,6 +179,77 @@ int closest_point_case() {
   }
   // All three one point: that point.
   CHECK(near(eval::closest_point_on_triangle({1, 1, 1}, c, c, c), c));
+  return 0;
+}
+
+// Thin triangles at room coordinates, 1 cm across: slivers whose third corner
+// sits a sine of 1e-6 to 1e-2 off the opposite edge, each corner in turn
+// first, and needles with a 1 um edge. Marching cubes emits both. Ericson's
+// region test was off on about one in 300 000 of these, by up to 90 um, so
+// the sample is large enough to meet a few. The answer must be the
+// double-precision one to within float rounding at 3 m (0.24 um).
+int thin_triangle_case() {
+  Lcg rng;
+  const vr::Vec3f base(3.2f, 1.7f, 2.9f);
+  const auto around = [&rng](float r) {
+    return vr::Vec3f(rng(-r, r), rng(-r, r), rng(-r, r));
+  };
+  const auto matches = [](vr::Vec3f p, vr::Vec3f a, vr::Vec3f b, vr::Vec3f c) {
+    const vr::Vec3f q = eval::closest_point_on_triangle(p, a, b, c);
+    return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) &&
+           std::fabs(double(vr::length(p - q)) -
+                     triangle_distance(p, a, b, c)) <= 0.5e-6;
+  };
+  for (int i = 0; i < 50000; ++i) {
+    const vr::Vec3f a = base + around(0.01f);
+    const vr::Vec3f b = a + around(0.01f);
+    const vr::Vec3f p = base + around(0.04f);
+    for (float sine : {1e-6f, 1e-5f, 3e-5f, 1e-4f, 1e-3f, 1e-2f}) {
+      const vr::Vec3f ab = b - a;
+      const vr::Vec3f off = glm::normalize(vr::cross(ab, around(1.0f)));
+      const vr::Vec3f c = a + ab * rng(0.2f, 0.8f) +
+                          off * (sine * vr::length(ab) * rng(0.5f, 1.5f));
+      CHECK(matches(p, a, b, c));
+      CHECK(matches(p, c, a, b));
+      CHECK(matches(p, b, c, a));
+    }
+    CHECK(matches(p, a, a + around(1e-6f), b));
+  }
+  return 0;
+}
+
+// The search prunes neighbouring cells by distance; it must find what a scan
+// of every triangle finds. A bumpy sheet of 1 cm triangles, some collapsed to
+// a segment, against points scattered within and beyond the reach.
+int search_case() {
+  Lcg rng;
+  mesh::Mesh m = plane(30, 0.01f, 0.0f);
+  for (mesh::Vertex& v : m.vertices) {
+    v.position += vr::Vec3f(rng(-0.004f, 0.004f), rng(-0.004f, 0.004f),
+                            rng(-0.006f, 0.006f));
+  }
+  for (std::size_t t = 0; t < m.indices.size(); t += 3 * 17) {
+    m.indices[t + 1] = m.indices[t];  // a segment, still surface
+  }
+  const float reach = 0.04f;
+  vr::Result<eval::MeshDistance> d = eval::MeshDistance::create(m, reach);
+  CHECK(d.ok());
+  int within = 0;
+  for (int i = 0; i < 3000; ++i) {
+    const vr::Vec3f p(rng(-0.05f, 0.35f), rng(-0.05f, 0.35f),
+                      rng(-0.05f, 0.05f));
+    float best = reach;
+    for (std::size_t t = 0; t < m.indices.size(); t += 3) {
+      best = std::min(
+          best, vr::length(p - eval::closest_point_on_triangle(
+                                   p, m.vertices[m.indices[t]].position,
+                                   m.vertices[m.indices[t + 1]].position,
+                                   m.vertices[m.indices[t + 2]].position)));
+    }
+    CHECK(near(double(d.value().distance(p)), double(best), 1e-7));
+    within += best < reach ? 1 : 0;
+  }
+  CHECK(within > 1000 && within < 3000);  // both sides of the reach
   return 0;
 }
 
@@ -441,7 +551,7 @@ int refusals_case() {
   const auto t0 = std::chrono::steady_clock::now();
   CHECK(!eval::MeshDistance::create(one, 1e-6f).ok());
   CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
-  CHECK(eval::MeshDistance::create(one, 0.01f).ok());  // 2 x 2 x 2 cells
+  CHECK(eval::MeshDistance::create(one, 0.01f).ok());  // 3 x 3 x 2 cells
   // A bad reach is named as the reach, not as the threshold left at 0.
   eval::CompareOptions bad_reach;
   bad_reach.reach = -0.01f;
@@ -471,6 +581,8 @@ int refusals_case() {
 
 int main() {
   if (closest_point_case() != 0) return 1;
+  if (thin_triangle_case() != 0) return 1;
+  if (search_case() != 0) return 1;
   if (distance_case() != 0) return 1;
   if (summarize_case() != 0) return 1;
   if (compare_case() != 0) return 1;

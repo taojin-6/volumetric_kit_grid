@@ -49,30 +49,39 @@ namespace volumetric_kit::recon::eval {
 // TODO(eval): the codec's ground-truth test (#94) carries its own copy of this
 // closest-point code; move it onto eval, and drop the copy, once both land.
 
-/// @brief The point of triangle `abc` nearest to @p p (Ericson, "Real-Time
-///        Collision Detection", 5.1.5): a corner, a point on an edge, or one
-///        inside the face.
+/// @brief The point of triangle `abc` nearest to @p p: its projection onto
+///        the face when that lands inside, and otherwise the nearest point of
+///        the three edges.
+///
+/// Within float rounding of a double-precision answer on any triangle, a thin
+/// one included -- marching cubes emits slivers wherever a crossing lands
+/// near a voxel corner. Ericson's region test ("Real-Time Collision
+/// Detection", 5.1.5) was off on about one query in 300 000 on 1 cm slivers
+/// at room coordinates, by up to 90 um.
 /// @param p  The query point.
 /// @param a  The triangle's first corner.
 /// @param b  Its second corner.
 /// @param c  Its third corner.
-/// @return The nearest point. A degenerate (zero-area) triangle -- two corners
-///         coinciding, whichever two, or all three on one line -- is handled as
-///         the segment or point it collapses to.
+/// @return The nearest point. A triangle whose angle at @p a has a sine under
+///         1e-4 -- two corners coinciding, whichever two, or all three on one
+///         line -- is measured by its edges, which lie within its height of
+///         its face.
 VR_EVAL_API Vec3f closest_point_on_triangle(Vec3f p, Vec3f a, Vec3f b, Vec3f c);
 
 /// @brief Distance from points to one triangle mesh's surface, up to a reach.
 ///
 /// Built once over a mesh and queried many times. Each triangle is filed
-/// under every `reach`-sized cell its bounding box touches, so a query needs
-/// only the 27 cells around its own to see every triangle within `reach`. The
-/// triangles are **copied** at @ref create, so the source mesh need not
-/// outlive this.
+/// under every cell its bounding box touches, the cells half the reach on a
+/// side. A query scans its own cell first, and then only the neighbours
+/// within two cells whose box is nearer than the best found so far -- on a
+/// surface, few of them. The triangles are **copied** at @ref create, so the
+/// source mesh need not outlive this.
 class VR_EVAL_API MeshDistance {
  public:
   /// The most cells a triangle may be filed under, on average over the mesh.
-  /// A triangle no larger than the reach touches at most 8. Past this the
-  /// reach is too small for the triangles, and the index would grow as
+  /// A triangle no larger than half the reach touches at most 8 cells, and
+  /// one no larger than the reach at most 27. Past this the reach is too
+  /// small for the triangles, and the index would grow as
   /// `(triangle size / reach)^3`.
   static constexpr std::size_t kMaxCellsPerTriangle = 64;
 
@@ -84,8 +93,8 @@ class VR_EVAL_API MeshDistance {
   ///         - a `reach` that is not finite and positive;
   ///         - an index count that is not a multiple of 3, or an index past
   ///           the vertices;
-  ///         - a triangle corner that is not finite, or more than about a
-  ///           million reaches from the origin, past the cell keys' range;
+  ///         - a triangle corner that is not finite, or more than about half
+  ///           a million reaches from the origin, past the cell keys' range;
   ///         - triangles that would be filed under more than
   ///           @ref kMaxCellsPerTriangle cells each on average.
   static Result<MeshDistance> create(const mesh::Mesh& mesh, float reach);
@@ -104,6 +113,7 @@ class VR_EVAL_API MeshDistance {
   MeshDistance() = default;
 
   float reach_ = 0.0f;
+  float cell_ = 0.0f;           // the cell edge, half the reach
   std::vector<Vec3f> corners_;  // three per triangle
   std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> cells_;
 };
