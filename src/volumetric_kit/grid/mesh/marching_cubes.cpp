@@ -2062,14 +2062,14 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   device_mesh.vertex_count = std::min(
       config_.share_vertices ? produced_verts : emitted * kIndicesPerTriangle,
       arena_vertex_capacity());
-  // Published so a consumer can *ask* rather than be told. It no longer names
-  // an incompatibility -- texture::ProjectiveTexturer decides visibility per
-  // vertex now and textures a shared mesh like any other -- but it still names
-  // the thing a consumer cannot derive from the buffers: whether vertex_count
-  // is `3 * triangle_count` or roughly a quarter of it. That is a sizing
-  // answer, and the multi-camera atlas will want it again as a real constraint,
-  // since a triangle whose vertices index different sub-rects of a pack needs a
-  // per-PRIMITIVE camera id however uv0 is encoded.
+  // Published so a consumer can *ask* rather than be told. It names the thing
+  // a consumer cannot derive from the buffers: whether vertex_count is
+  // `3 * triangle_count` or roughly a quarter of it. That is a sizing answer,
+  // and one constraint: texture::ProjectiveTexturer's single-camera pass
+  // decides per vertex and textures a shared mesh like any other, but its
+  // several-view atlas chooses per triangle and refuses one, since a triangle
+  // whose vertices index different tiles needs a per-PRIMITIVE tile id however
+  // uv0 is encoded.
   device_mesh.shares_vertices = config_.share_vertices;
   device_mesh.generation = generation_;
   device_mesh.live_generation = &generation_;

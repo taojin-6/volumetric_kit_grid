@@ -73,14 +73,14 @@ struct DeviceMesh {
   /// obligation stated in prose is not a contract. Same reason
   /// @ref vertex_usage and @ref sharing_mode are here.
   ///
-  /// What acts on it today is **sizing**, not compatibility -- a consumer
-  /// budgeting a vertex arena needs to know whether `v = 3t` still holds.
-  /// `texture::ProjectiveTexturer` used to refuse a mesh carrying this, because
-  /// it decided visibility per triangle while writing `Vertex::uv0` per vertex;
-  /// it dispatches per vertex now, so there is one writer per vertex and it
-  /// refuses nothing. A packed multi-camera atlas will need a per-*primitive*
-  /// camera id and will care again, for a reason no encoding of `uv0` can
-  /// address.
+  /// Two things act on it. **Sizing**: a consumer budgeting a vertex arena
+  /// needs to know whether `v = 3t` still holds. And one **refusal**:
+  /// `texture::ProjectiveTexturer`'s several-view overloads choose a view per
+  /// triangle, and a triangle whose vertices index different tiles of the
+  /// atlas cannot be expressed per vertex under any encoding of `uv0`, so they
+  /// refuse a mesh carrying this. Its single-camera overloads dispatch per
+  /// vertex -- one writer per vertex -- and texture a shared mesh like any
+  /// other.
   bool shares_vertices = false;
   /// Usage flags @ref vertices was created with -- always `STORAGE_BUFFER`,
   /// plus whatever the producer's consumer asked for. Carried so a consumer can
