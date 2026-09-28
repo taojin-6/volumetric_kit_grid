@@ -10,8 +10,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <optional>
-#include <utility>
 #include <vector>
 
 #include "codec_stream.hpp"
@@ -32,7 +30,7 @@ struct SweepConfig {
   float ac;
 };
 
-/// @brief The sweep's configurations, in four families:
+/// @brief The sweep's configurations, in three families:
 ///  - "split": the prior engine's DC 5x AC, across K and across step scale;
 ///  - "uniform": DC = AC, across step at K from 32 to all 512;
 ///  - "ref": K = 512 at a fine step, near-lossless -- whatever error it still
@@ -71,20 +69,30 @@ inline std::vector<SweepConfig> sweep_configs() {
 /// dispatches pay one-off pipeline costs that would otherwise be read as the
 /// configuration's. The timed decode is of a frame the player already holds,
 /// a static scene's steady state.
+///
+/// Accuracy's RMS, p95 and max are over the decoded vertices within `reach`
+/// of the source, so the max is under `reach` by construction; `acc>r`
+/// counts the vertices past it -- floaters -- and `cov>r` the source
+/// vertices with no decoded surface within it -- holes.
+///
+/// @param player  The grid to decode into: a stream's player, already built
+///                for this geometry (it grows if a frame needs it).
 inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
                                   vr::volume::VoxelBlockGrid& source,
                                   const vr::mesh::Mesh& reference,
                                   vr::mesh::MarchingCubes& extractor,
+                                  vr::volume::VoxelBlockGrid& player,
                                   float reach, std::size_t stride) {
   VR_ASSIGN(vr::codec::Decoder dec,
             vr::codec::Decoder::create(device, allocator));
-  std::optional<vr::volume::VoxelBlockGrid> player;
+  const MeshDistance to_reference(reference, reach);  // hashed once
   int grows = 0;
   std::printf(
       "sweep (steps are fractions of trunc_dist; distances in mm):\n"
-      "  %-8s %4s %6s %6s | %8s %7s %6s | %7s %7s %7s | %7s %7s | %7s %7s\n",
+      "  %-8s %4s %6s %6s | %8s %7s %6s | %7s %7s %7s %6s | %7s %6s | %7s "
+      "%7s\n",
       "family", "K", "dc", "ac", "bytes", "B/block", "ratio", "acc rms",
-      "acc p95", "acc max", "cov rms", "cov>r", "enc ms", "dec ms");
+      "acc p95", "acc max", "acc>r", "cov rms", "cov>r", "enc ms", "dec ms");
   for (const SweepConfig& cfg : sweep_configs()) {
     vr::codec::EncoderConfig ec;
     ec.params.coefficient_count = cfg.k;
@@ -93,31 +101,25 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
     VR_ASSIGN(vr::codec::Encoder enc,
               vr::codec::Encoder::create(device, allocator, ec));
     VR_ASSIGN(const Bytes warm, enc.encode(source));
-    if (!player) {
-      VR_ASSIGN(
-          vr::volume::VoxelBlockGrid g,
-          player_grid(device, allocator, warm, source.grid().num_buckets));
-      player.emplace(std::move(g));
-    }
-    VR_TRY(decode_growing(dec, warm, *player, nullptr, &grows));
+    VR_TRY(decode_growing(dec, warm, player, nullptr, &grows));
 
     vr::StageMetrics enc_rows;
     vr::StageMetrics dec_rows;
     VR_ASSIGN(const Bytes frame, enc.encode(source, &enc_rows));
-    VR_TRY(decode_growing(dec, frame, *player, &dec_rows, &grows));
+    VR_TRY(decode_growing(dec, frame, player, &dec_rows, &grows));
     VR_ASSIGN(const vr::codec::FrameInfo info,
               vr::codec::read_frame_info(frame.data(), frame.size()));
-    VR_ASSIGN(const vr::mesh::Mesh decoded, extractor.extract_host(*player));
-    const MeshComparison c = compare_meshes(reference, decoded, reach, stride);
+    VR_ASSIGN(const vr::mesh::Mesh decoded, extractor.extract_host(player));
+    const MeshComparison c = compare_meshes(to_reference, decoded, stride);
     const double per_block =
         info.block_count > 0 ? double(frame.size()) / info.block_count : 0.0;
     std::printf(
-        "  %-8s %4u %6.3f %6.3f | %8zu %7.1f %5.0fx | %7.3f %7.3f %7.3f | "
-        "%7.3f %7zu | %7.2f %7.2f\n",
+        "  %-8s %4u %6.3f %6.3f | %8zu %7.1f %5.0fx | %7.3f %7.3f %7.3f %6zu | "
+        "%7.3f %6zu | %7.2f %7.2f\n",
         cfg.family, cfg.k, double(cfg.dc), double(cfg.ac), frame.size(),
         per_block, per_block > 0 ? kRawBytesPerBlock / per_block : 0.0,
         c.accuracy.rms * 1e3, c.accuracy.p95 * 1e3, c.accuracy.max * 1e3,
-        c.coverage.rms * 1e3, c.coverage.beyond_reach,
+        c.accuracy.beyond_reach, c.coverage.rms * 1e3, c.coverage.beyond_reach,
         row_ms(enc_rows, "codec encode"), row_ms(dec_rows, "codec decode"));
   }
   return {};

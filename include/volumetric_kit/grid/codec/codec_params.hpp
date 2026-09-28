@@ -62,10 +62,14 @@ inline const float kMinStep = static_cast<float>(
 /// The defaults -- K = 64, one step of 0.2 for DC and AC alike -- are
 /// room0's (the 2026-09-27 measurement), and **provisional** until the
 /// per-band quantization study. Against the prior engine's K = 32 with a DC
-/// step five times its AC step, which they replaced, they are 8% smaller and
+/// step five times its AC step, which they replaced, they are 7% smaller and
 /// 28% more accurate at 1 cm, and fit a frame interval on the host. A DC step
 /// coarser than the AC one bought nothing: the transform is orthonormal, so a
 /// unit of error costs the same in any coefficient.
+///
+/// TODO(codec): re-choose the defaults with the per-band quantization study
+/// -- a step per `x + y + z` band, judged on room0 and on the decoder test's
+/// sphere, where these lose (the 2026-09-27 decision).
 struct VR_CODEC_API CodecParams {
   /// Coefficients kept per block, taken in 3-D zigzag order (lowest `x+y+z`
   /// first). In [1, @ref kVoxelsPerBlock]; @ref kVoxelsPerBlock keeps the

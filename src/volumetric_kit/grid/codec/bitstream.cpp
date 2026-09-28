@@ -502,6 +502,9 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
 
   // Pass 2: each segment as its own stream, appended straight onto the
   // payload.
+  // TODO(codec): code the segments on several host threads, which they allow
+  // by construction, if a finer voxel or K = 128 is wanted in real time (the
+  // 2026-09-27 defaults decision); here and in the reader's loop.
   std::vector<std::uint8_t> payload;
   std::vector<std::uint8_t> segments_body;
   ByteWriter sw(segments_body);
