@@ -622,6 +622,7 @@ Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   const PushConstants push{grid_, capacity};
+  ++compaction_serial_;  // before the submit, which may have run in part
   std::uint32_t count = 0;
   CommandBatch batch(*device_, *allocator_);
   if (prepare) {
@@ -650,9 +651,9 @@ Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
           grid_.num_blocks, std::uint64_t(last_count) + last_count / 4));
   std::vector<BlockIndex> active(guess);
-  VR_ASSIGN(const std::uint32_t count,
-            compact_into_device_list(kernel, stage, prepare, active.data(),
-                                     guess));
+  VR_ASSIGN(
+      const std::uint32_t count,
+      compact_into_device_list(kernel, stage, prepare, active.data(), guess));
   last_count = count;
   active.resize(count);
   if (count > guess) {
@@ -700,7 +701,29 @@ Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
   }
   VR_ASSIGN(const std::uint32_t count,
             compact_into_device_list(compact_, &stage));
-  return DeviceBlockList{compacted_.handle(), count};
+  return DeviceBlockList{&compacted_, count, topology_epoch_,
+                         compaction_serial_};
+}
+
+Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
+                                             const char* who) const {
+  if (list.count == 0) return {};
+  if (!valid()) {
+    return Status::invalid_argument(std::string(who) + ": moved-from map");
+  }
+  if (list.buffer != &compacted_) {
+    return Status::invalid_argument(
+        std::string(who) +
+        ": the device block list is not this map's, or the map has moved "
+        "since it was compacted");
+  }
+  if (list.epoch != topology_epoch_ || list.serial != compaction_serial_) {
+    return Status::invalid_argument(
+        std::string(who) +
+        ": the device block list is stale: the map has compacted, resized, "
+        "removed or cleared since");
+  }
+  return {};
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
@@ -812,6 +835,7 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     bucket_mutex_ = std::move(b.bucket_mutex);
     fail_counts_ = std::move(b.fail_counts);
     compacted_ = std::move(b.compacted);
+    ++compaction_serial_;
     active_count_ = std::move(b.active_count);
     grid_ = g;
     write_persistent_bindings();  // point the sets at the committed buffers

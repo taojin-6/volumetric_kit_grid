@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "buffer_readback.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
@@ -165,6 +166,32 @@ int main() {
   CHECK(got == want);
   CHECK(ptrs.size() == want.size());
 
+  // The same set left on the device: the host list's entries, and refused
+  // once another compaction has rewritten it.
+  const auto n = static_cast<std::uint32_t>(coords.size());
+  vr::Result<vol::DeviceBlockList> on_device =
+      map.compact_active_blocks_on_device();
+  CHECK(on_device.ok() && on_device.value().count == want.size());
+  CHECK(map.check_device_block_list(on_device.value(), "test").ok());
+  {
+    vr::Result<std::vector<vol::BlockIndex>> listed =
+        vr_test::read_back<vol::BlockIndex>(device.value(), allocator.value(),
+                                            *on_device.value().buffer,
+                                            on_device.value().count);
+    CHECK(listed.ok());
+    std::set<std::pair<Coord, int>> host_set;
+    std::set<std::pair<Coord, int>> device_set;
+    for (const vol::BlockIndex& b : active.value()) {
+      host_set.insert({{b.coord.x, b.coord.y, b.coord.z}, b.ptr});
+    }
+    for (const vol::BlockIndex& b : listed.value()) {
+      device_set.insert({{b.coord.x, b.coord.y, b.coord.z}, b.ptr});
+    }
+    CHECK(device_set == host_set);
+  }
+  CHECK(map.compact_active_blocks().ok());
+  CHECK(!map.check_device_block_list(on_device.value(), "test").ok());
+
   // Scalar-ABI round-trip: read the raw HashEntry slots. Exactly 27 are
   // occupied, each pos is one of the inputs (proving `pos` lands at the host
   // offset the shader wrote), and each ptr is a whole block (a multiple of
@@ -187,6 +214,35 @@ int main() {
       map.compact_active_blocks();
   CHECK(after_clear.ok());
   CHECK(after_clear.value().empty());
+
+  // An empty device list names nothing, so it is accepted; a remove or a
+  // resize since a compaction makes its list stale, and another map refuses
+  // it.
+  vr::Result<vol::DeviceBlockList> none = map.compact_active_blocks_on_device();
+  CHECK(none.ok() && none.value().count == 0);
+  CHECK(map.check_device_block_list(none.value(), "test").ok());
+  {
+    vr::Result<vol::VoxelHashMap> lmap_result =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+    CHECK(lmap_result.ok());
+    vol::VoxelHashMap lmap = std::move(lmap_result).value();
+    CHECK(lmap.allocate(coords.data(), n).value() == 0);
+    vr::Result<vol::DeviceBlockList> before_remove =
+        lmap.compact_active_blocks_on_device();
+    CHECK(before_remove.ok() && before_remove.value().count == want.size());
+    CHECK(lmap.remove(coords.data(), 1).ok());
+    CHECK(!lmap.check_device_block_list(before_remove.value(), "test").ok());
+    vr::Result<vol::DeviceBlockList> before_resize =
+        lmap.compact_active_blocks_on_device();
+    CHECK(before_resize.ok());
+    CHECK(lmap.check_device_block_list(before_resize.value(), "test").ok());
+    CHECK(lmap.resize(grid.num_buckets * 2).ok());
+    CHECK(!lmap.check_device_block_list(before_resize.value(), "test").ok());
+    vr::Result<vol::DeviceBlockList> fresh =
+        lmap.compact_active_blocks_on_device();
+    CHECK(fresh.ok() && fresh.value().count == want.size() - 1);
+    CHECK(!map.check_device_block_list(fresh.value(), "test").ok());
+  }
 
   // --- Overflow / collision-chain coverage ----------------------------------
   // The 3x3x3 cube above scatters across 1024 buckets and never fills one, so
@@ -426,10 +482,18 @@ int main() {
   }
 
   // --- Move-only ------------------------------------------------------------
-  // Move-construct: the source empties, the destination lives.
+  // Move-construct: the source empties, the destination lives. A device list
+  // compacted before the move is refused by the map it moved into, and the
+  // moved-from map compacts nothing.
+  CHECK(map.allocate(coords.data(), n).value() == 0);
+  vr::Result<vol::DeviceBlockList> before_move =
+      map.compact_active_blocks_on_device();
+  CHECK(before_move.ok() && before_move.value().count == want.size());
   vol::VoxelHashMap moved = std::move(map);
   CHECK(!map.valid());
   CHECK(moved.valid());
+  CHECK(!moved.check_device_block_list(before_move.value(), "test").ok());
+  CHECK(!map.compact_active_blocks_on_device().ok());
 
   // Both entries accessors must agree with valid(). grid_ is a POD the
   // defaulted move COPIES, so the size accessor can still see the table shape
