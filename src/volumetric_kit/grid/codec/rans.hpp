@@ -215,14 +215,15 @@ class RansWriter {
       x = ((x / op.freq) << kRansScaleBits) + (x % op.freq) + op.start;
     }
     ops_.clear();
-    // resize, not reserve: reserve takes exactly what it is asked for, so
-    // appending a frame's segments one reserve at a time would copy the frame
-    // once per segment, where resize grows geometrically.
-    std::size_t at = out.size();
-    out.resize(at + 4 + 2 * words_.size());
-    auto put_word = [&out, &at](std::uint16_t w) {
-      out[at++] = static_cast<std::uint8_t>(w & 0xFFu);
-      out[at++] = static_cast<std::uint8_t>(w >> 8);
+    // push_back, which grows geometrically. Not reserve: that takes exactly
+    // what it is asked for, so a reserve per appended segment copied the
+    // frame once per segment. And not resize-then-index: GCC 13 at -O3
+    // cannot see that resize grew the caller's vector and fails the build
+    // with -Wstringop-overflow. All three forms that avoid both time the
+    // same.
+    auto put_word = [&out](std::uint16_t w) {
+      out.push_back(static_cast<std::uint8_t>(w & 0xFFu));
+      out.push_back(static_cast<std::uint8_t>(w >> 8));
     };
     put_word(static_cast<std::uint16_t>(x >> 16));
     put_word(static_cast<std::uint16_t>(x & 0xFFFFu));
