@@ -4,11 +4,10 @@
 #pragma once
 
 // Host-side triangle meshes for the GPU tests that take one in (volume's
-// triangle allocation, tsdf's mesh integration, the codec's ground-truth round
-// trip): the index-buffer mesh they share, the fixtures more than one of them
-// uses, and the closest point on a triangle -- written out independently of the
-// GLSL the kernels use, so the two are not the same expression checked against
-// itself.
+// triangle allocation and tsdf's mesh integration): the index-buffer mesh they
+// share, their fixtures, and the closest point on a triangle -- written out
+// independently of the GLSL the kernels use, so the two are not the same
+// expression checked against itself.
 
 #include <cstddef>
 #include <cstdint>
