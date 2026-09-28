@@ -15,12 +15,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <utility>
 #include <vector>
 
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
+#include "grid_readback.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -105,26 +107,42 @@ vr::Result<std::vector<vol::BlockIndex>> allocate_row(vol::VoxelBlockGrid& grid,
   return active;
 }
 
-float* attr(vol::VoxelBlockGrid& grid, const char* name) {
-  return static_cast<float*>(grid.attribute(name).value().buffer->mapped());
+// A copy of an attribute, and back; the arrays are device-local, and both
+// abort on a device error.
+std::vector<float> attr(const vr_test::Gpu& ctx,
+                        const vol::VoxelBlockGrid& grid, const char* name) {
+  return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
+      .value();
+}
+
+void put(const vr_test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
+         const char* name, const std::vector<float>& data) {
+  if (!vr_test::write_attribute(ctx.device, ctx.allocator, grid, name, data)
+           .ok()) {
+    std::abort();
+  }
 }
 
 // Write a block's content: tsdf = s * trunc, weight = w (per voxel).
-void write_block(vol::VoxelBlockGrid& grid, const vol::BlockIndex& b,
-                 const Cube& s, const std::function<float(std::uint32_t)>& w) {
-  float* tsdf = attr(grid, "tsdf");
-  float* weight = attr(grid, "weight");
+void write_block(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+                 const vol::BlockIndex& b, const Cube& s,
+                 const std::function<float(std::uint32_t)>& w) {
+  std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  std::vector<float> weight = attr(ctx, grid, "weight");
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     tsdf[std::uint32_t(b.ptr) + v] = static_cast<float>(s[v]) * kTrunc;
     weight[std::uint32_t(b.ptr) + v] = w(v);
   }
+  put(ctx, grid, "tsdf", tsdf);
+  put(ctx, grid, "weight", weight);
 }
 
 float observed(std::uint32_t) { return 2.0f; }
 
 // Read a block back in normalized units.
-Cube read_block(vol::VoxelBlockGrid& grid, const vol::BlockIndex& b) {
-  const float* tsdf = attr(grid, "tsdf");
+Cube read_block(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+                const vol::BlockIndex& b) {
+  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
   Cube s{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     s[v] = double(tsdf[std::uint32_t(b.ptr) + v]) / double(kTrunc);
@@ -307,6 +325,7 @@ int check_against_reference(const DctBlocks& out, const Cube* content,
 // check_against_reference), over content from white noise to a constant.
 int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
                                    DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -316,7 +335,7 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
   const Cube content[4] = {random_cube(1), plane_cube(), sphere_cube(),
                            constant_cube(0.3)};
   for (int i = 0; i < 4; ++i) {
-    write_block(grid, blocks[std::size_t(i)], content[i], observed);
+    write_block(ctx, grid, blocks[std::size_t(i)], content[i], observed);
   }
 
   codec::CodecParams params;
@@ -349,6 +368,7 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
 // a block's RMS error is at most sqrt(((dc/2)^2 + 511 (ac/2)^2) / 512).
 int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
                           DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -358,7 +378,7 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
   Cube content[4];
   for (int i = 0; i < 4; ++i) {
     content[i] = random_cube(100u + std::uint32_t(i));
-    write_block(grid, blocks[std::size_t(i)], content[i], observed);
+    write_block(ctx, grid, blocks[std::size_t(i)], content[i], observed);
   }
 
   codec::CodecParams params;
@@ -373,10 +393,10 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
   const double dc = params.dc_step, ac = params.ac_step;
   const double bound =
       std::sqrt((dc * dc / 4.0 + (kVpb - 1) * ac * ac / 4.0) / kVpb) + 1e-5;
-  const float* weight = attr(grid, "weight");
+  const std::vector<float> weight = attr(ctx, grid, "weight");
   for (int i = 0; i < 4; ++i) {
     const double err =
-        rms_diff(read_block(grid, blocks[std::size_t(i)]), content[i]);
+        rms_diff(read_block(ctx, grid, blocks[std::size_t(i)]), content[i]);
     CHECK(err <= bound);
     CHECK(err > 0.0);  // it did quantize
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -394,6 +414,7 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
 int truncation_matches_reference_case(vr::Device& device,
                                       vr::Allocator& allocator,
                                       DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -408,7 +429,7 @@ int truncation_matches_reference_case(vr::Device& device,
   const std::uint32_t ks[] = {1, 4, 10, 20, 35, 84, kVpb};
   double last = 1e9;
   for (std::uint32_t k : ks) {
-    write_block(grid, block, content, observed);
+    write_block(ctx, grid, block, content, observed);
     codec::CodecParams params;
     params.coefficient_count = k;
     params.dc_step = codec::kMinStep;
@@ -424,7 +445,7 @@ int truncation_matches_reference_case(vr::Device& device,
       dropped += ref[zigzag[j]] * ref[zigzag[j]];
     }
     const double predicted = std::sqrt(dropped / kVpb);
-    const double err = rms_diff(read_block(grid, block), content);
+    const double err = rms_diff(read_block(ctx, grid, block), content);
     CHECK(std::fabs(err - predicted) <= 1e-3);
     CHECK(err <= last + 1e-4);  // more coefficients never hurt
     last = err;
@@ -438,6 +459,7 @@ int truncation_matches_reference_case(vr::Device& device,
 // voxel -- and the inverse writes an observed voxel as decoded and an
 // unobserved one as a fresh block holds it.
 int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -447,9 +469,9 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   // Block 0 cycles through: none, below the threshold, at it, well above.
   // Block 1 is entirely unobserved -- a mask of all zeros.
   const float cycle[4] = {0.0f, 5e-7f, vol::kObservedWeight, 3.0f};
-  write_block(grid, blocks[0], sphere_cube(),
+  write_block(ctx, grid, blocks[0], sphere_cube(),
               [&](std::uint32_t v) { return cycle[v % 4]; });
-  write_block(grid, blocks[1], random_cube(7),
+  write_block(ctx, grid, blocks[1], random_cube(7),
               [](std::uint32_t) { return 0.0f; });
 
   codec::CodecParams params;
@@ -479,15 +501,19 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   }
 
   // Poison both attributes so the inverse must write every voxel.
-  float* tsdf = attr(grid, "tsdf");
-  float* weight = attr(grid, "weight");
+  std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  std::vector<float> weight = attr(ctx, grid, "weight");
   for (const vol::BlockIndex& b : blocks) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       tsdf[std::uint32_t(b.ptr) + v] = 123.0f;
       weight[std::uint32_t(b.ptr) + v] = 123.0f;
     }
   }
+  put(ctx, grid, "tsdf", tsdf);
+  put(ctx, grid, "weight", weight);
   CHECK(t.inverse(grid, list, out).ok());
+  tsdf = attr(ctx, grid, "tsdf");
+  weight = attr(ctx, grid, "weight");
   for (std::size_t i = 0; i < 2; ++i) {
     const std::uint32_t base = std::uint32_t(blocks[i].ptr);
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -508,14 +534,15 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
 // lands on the clamp's edge without being clamped from further out.
 int constant_case(vr::Device& device, vr::Allocator& allocator,
                   DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
   vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
-  write_block(grid, blocks[0], constant_cube(0.3), observed);
-  write_block(grid, blocks[1], constant_cube(1.0), observed);
+  write_block(ctx, grid, blocks[0], constant_cube(0.3), observed);
+  write_block(ctx, grid, blocks[1], constant_cube(1.0), observed);
   const vol::BlockList list = grid.block_list(blocks);
 
   codec::CodecParams full;
@@ -541,7 +568,7 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(t.forward(grid, list, dc_only, out).ok());
   CHECK(out.coefficients.size() == 2);
   CHECK(t.inverse(grid, list, out).ok());
-  const Cube back = read_block(grid, blocks[0]);
+  const Cube back = read_block(ctx, grid, blocks[0]);
   const double tol = 0.01 / (2.0 * std::sqrt(double(kVpb))) + 1e-6;
   for (double s : back) {
     CHECK(std::fabs(s - 0.3) <= tol);
@@ -554,6 +581,7 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
 // at K = 4 peaks near 1.26), and a decoded grid must not hand a later fuse or
 // a consumer SDF outside the band.
 int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -564,7 +592,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     edge[v] = vz(v) < kEdge / 2 ? 1.0 : -1.0;
   }
-  write_block(grid, block, edge, observed);
+  write_block(ctx, grid, block, edge, observed);
 
   codec::CodecParams params;
   params.coefficient_count = 4;
@@ -584,7 +612,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   CHECK(*std::max_element(unclamped.begin(), unclamped.end()) > 1.2);
 
   CHECK(t.inverse(grid, list, out).ok());
-  const float* tsdf = attr(grid, "tsdf");
+  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
   bool saturated = false;
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     const float sdf = tsdf[std::uint32_t(block.ptr) + v];
@@ -605,6 +633,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
 // for, rather than to the defaults, which room0 moved.
 int partial_block_case(vr::Device& device, vr::Allocator& allocator,
                        DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -625,7 +654,7 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     if (!obs[v]) fused[v] = 0.0;
   }
-  write_block(grid, block, fused, weight_of);
+  write_block(ctx, grid, block, fused, weight_of);
 
   codec::CodecParams params;
   params.coefficient_count = 32;
@@ -644,14 +673,14 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     if (!obs[v]) junk[v] = 0.7;
   }
-  write_block(grid, block, junk, weight_of);
+  write_block(ctx, grid, block, junk, weight_of);
   DctBlocks again;
   CHECK(t.forward(grid, list, params, again).ok());
   CHECK(again.coefficients == out.coefficients);
   CHECK(again.masks == out.masks);
 
   CHECK(t.inverse(grid, list, out).ok());
-  const double err = rms_observed(read_block(grid, block), truth, obs);
+  const double err = rms_observed(read_block(ctx, grid, block), truth, obs);
   const double filled_err =
       rms_observed(reference_round_trip(filled, params), truth, obs);
   const double zero_err =
@@ -664,6 +693,7 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
 // Output follows the list, not the ptrs: permuting the list permutes the rows.
 int order_follows_list_case(vr::Device& device, vr::Allocator& allocator,
                             DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -671,7 +701,8 @@ int order_follows_list_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(active.ok());
   std::vector<vol::BlockIndex> blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {
-    write_block(grid, blocks[i], random_cube(40u + std::uint32_t(i)), observed);
+    write_block(ctx, grid, blocks[i], random_cube(40u + std::uint32_t(i)),
+                observed);
   }
   codec::CodecParams params;
   DctBlocks a;
@@ -694,6 +725,7 @@ int order_follows_list_case(vr::Device& device, vr::Allocator& allocator,
 // result -- the path a list past maxComputeWorkGroupCount[0] takes.
 int batching_case(vr::Device& device, vr::Allocator& allocator,
                   DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   DctTransformConfig small;
   small.max_blocks_per_dispatch = 3;
   vr::Result<DctTransform> batched_r =
@@ -710,7 +742,7 @@ int batching_case(vr::Device& device, vr::Allocator& allocator,
   std::vector<Cube> content;
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     content.push_back(random_cube(200u + std::uint32_t(i)));
-    write_block(grid, blocks[i], content.back(), observed);
+    write_block(ctx, grid, blocks[i], content.back(), observed);
   }
   const vol::BlockList list = grid.block_list(blocks);
   codec::CodecParams params;
@@ -736,17 +768,18 @@ int batching_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(t.inverse(grid, list, one).ok());
   std::vector<Cube> single;
   for (const vol::BlockIndex& b : blocks) {
-    single.push_back(read_block(grid, b));
+    single.push_back(read_block(ctx, grid, b));
   }
-  float* tsdf = attr(grid, "tsdf");
+  std::vector<float> tsdf = attr(ctx, grid, "tsdf");
   for (const vol::BlockIndex& b : blocks) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
     }
   }
+  put(ctx, grid, "tsdf", tsdf);
   CHECK(batched.inverse(grid, list, many).ok());
   for (std::size_t i = 0; i < blocks.size(); ++i) {
-    CHECK(read_block(grid, blocks[i]) == single[i]);
+    CHECK(read_block(ctx, grid, blocks[i]) == single[i]);
   }
   return 0;
 }
@@ -769,6 +802,7 @@ std::int32_t free_ptr(const vol::VoxelBlockGrid& grid,
 // each entry's liveness on the device.
 int refusals_case(vr::Device& device, vr::Allocator& allocator,
                   DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -776,7 +810,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(active.ok());
   const std::vector<vol::BlockIndex> blocks = active.value();
   for (const vol::BlockIndex& b : blocks) {
-    write_block(grid, b, random_cube(300u), observed);
+    write_block(ctx, grid, b, random_cube(300u), observed);
   }
   const codec::CodecParams params;
   DctBlocks out;
@@ -822,14 +856,16 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = unused;
-    float* tsdf = attr(grid, "tsdf");
-    float* weight = attr(grid, "weight");
+    std::vector<float> tsdf = attr(ctx, grid, "tsdf");
     for (const vol::BlockIndex& b : blocks) {
       for (std::uint32_t v = 0; v < kVpb; ++v) {
         tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
       }
     }
+    put(ctx, grid, "tsdf", tsdf);
     CHECK(!t.inverse(grid, grid.block_list(forged), out).ok());
+    tsdf = attr(ctx, grid, "tsdf");
+    const std::vector<float> weight = attr(ctx, grid, "weight");
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       CHECK(weight[std::uint32_t(unused) + v] == 0.0f);
       CHECK(tsdf[std::uint32_t(unused) + v] == 0.0f);

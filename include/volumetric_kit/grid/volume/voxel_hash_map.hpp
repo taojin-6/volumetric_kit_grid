@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
@@ -26,6 +27,7 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
 namespace volumetric_kit::recon {
+class CommandBatch;
 class Device;
 class StorageInput;
 }  // namespace volumetric_kit::recon
@@ -419,7 +421,8 @@ class VR_VOLUME_API VoxelHashMap {
   ///        constant-time read, safe to call every frame.
   ///
   /// The complement of the free-block heap, `1 - heap_free / num_blocks`, taken
-  /// from the host-mapped heap counter with a 4-byte copy and no dispatch. It
+  /// from the host's copy of the heap counter, which every call that moves the
+  /// counter reads back in its own submit -- so this costs no dispatch. It
   /// is also the fraction of hash slots in use -- the same quantity
   /// @ref HashDiagnostics::load_factor reports, derived from the heap counter
   /// instead of a slot scan -- because @ref VoxelGridParams::validate forces
@@ -455,9 +458,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief Compute occupancy + health statistics (active / overflow / chain
   ///        length + heap utilization).
   ///
-  /// A host-side scan of the entries plus the heap counter -- O(total slots),
-  /// so call it for inspection/logging, not per frame. A GPU-side scan is a
-  /// perf follow-up for very large tables.
+  /// A host-side scan of the entries, read back whole, plus the device's heap
+  /// counter -- O(total slots), so call it for inspection/logging, not per
+  /// frame. A GPU-side scan is a perf follow-up for very large tables.
   /// @return The statistics, or a non-OK @ref Status (e.g. moved-from map).
   Result<HashDiagnostics> diagnostics();
 
@@ -515,9 +518,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// active does *not* occupy, in ascending order, with @ref heap_counter_ set
   /// to that free count. Called by @ref resize after @ref init_table (which
   /// fills the heap with every index) and the rehash (which re-inserts @p
-  /// active with their preserved pointers): a plain host write of @ref heap_ +
-  /// @ref heap_counter_, since resize runs single-threaded between dispatches.
-  void rebuild_heap_excluding(const std::vector<BlockIndex>& active);
+  /// active with their preserved pointers): computed on the host and uploaded
+  /// in one batch, since resize runs single-threaded between dispatches.
+  Status rebuild_heap_excluding(const std::vector<BlockIndex>& active);
 
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
@@ -525,10 +528,15 @@ class VR_VOLUME_API VoxelHashMap {
   /// Shared body of the compaction kernels: zero the counter, run @p kernel
   /// over every hash slot, then read back the appended @ref BlockIndex list.
   /// Used by @ref compact_active_blocks (plain) and
-  /// @ref compact_active_blocks_in_frustum (whose set also carries the planes).
-  /// @p stage, when non-null, collects the dispatch's device span.
-  Result<std::vector<BlockIndex>> collect_compacted(const ComputeKernel& kernel,
-                                                    GpuStageScope* stage);
+  /// @ref compact_active_blocks_in_frustum (whose set also carries the planes,
+  /// which @p prepare uploads in the dispatch's batch). @p last_count is that
+  /// kernel's previous count, which sizes the list read back in the same
+  /// batch, and is updated. @p stage, when non-null, collects the dispatch's
+  /// device span.
+  Result<std::vector<BlockIndex>> collect_compacted(
+      const ComputeKernel& kernel, std::uint32_t& last_count,
+      GpuStageScope* stage,
+      const std::function<Status(CommandBatch&)>& prepare = {});
 
   /// The row label both compaction entry points report under, carrying
   /// @ref StageMetrics::kBreakdownPrefix or not according to whether @p metrics
@@ -546,11 +554,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// under its one label, which is the honest total for a frame that genuinely
   /// dispatched several times. A round that fails leaves the rounds before it
   /// recorded, and the scope publishes them on the way out -- they ran.
-  Result<std::uint32_t> dispatch_with_retry(const ComputeKernel& kernel,
-                                            std::uint32_t arg,
-                                            std::uint32_t groups,
-                                            AllocFailures* out_failures,
-                                            GpuStageScope* stage = nullptr);
+  /// @p prepare, when set, records the call's parameter uploads into the first
+  /// round's batch. Each round is one submit, and reads back the heap counter
+  /// into @ref heap_free_ beside the tally.
+  Result<std::uint32_t> dispatch_with_retry(
+      const ComputeKernel& kernel, std::uint32_t arg, std::uint32_t groups,
+      AllocFailures* out_failures, GpuStageScope* stage = nullptr,
+      const std::function<Status(CommandBatch&)>& prepare = {});
 
   /// Both @ref allocate_from_depth overloads: @p depth is the host array or
   /// the device buffer the caller passed.
@@ -559,10 +569,12 @@ class VR_VOLUME_API VoxelHashMap {
                                             AllocFailures* out_failures,
                                             StageMetrics* metrics);
 
-  /// Create a transient host-visible buffer holding @p bytes of @p data and
-  /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
-  /// alive across the (synchronous) dispatch that reads it.
-  Result<Buffer> upload_to_binding(const DescriptorSet& set,
+  /// Create a transient device-local buffer that @p batch fills with @p bytes
+  /// of @p data, and bind it at @p binding of @p set. The caller keeps the
+  /// returned @ref Buffer alive until the batch, and any round after it that
+  /// reads the binding, has run.
+  Result<Buffer> upload_to_binding(CommandBatch& batch,
+                                   const DescriptorSet& set,
                                    std::uint32_t binding, const void* data,
                                    VkDeviceSize bytes);
 
@@ -601,11 +613,8 @@ class VR_VOLUME_API VoxelHashMap {
   // whole, so an over-large one is invalid usage rather than a slow path.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // Persistent device buffers. TODO(volume): all but the bucket locks are
-  // host-visible for this slice; a device-local + staging path is a follow-up
-  // perf pass. The locks are device-local already, since only the kernels
-  // touch them and their spin is what a discrete GPU pays for most (the
-  // 2026-09-28 measured lesson).
+  // Persistent device buffers, all device-local; the host reaches them
+  // through a CommandBatch (the 2026-09-28 residency decision).
   Buffer entries_;
   Buffer heap_;
   Buffer heap_counter_;
@@ -617,11 +626,22 @@ class VR_VOLUME_API VoxelHashMap {
   Buffer compacted_;
   Buffer active_count_;
   // Persistent camera params for allocate_from_depth (bound at binding 6 of
-  // depth_.set, rewritten per call); grid-independent, so not in the bundle.
+  // depth_.set, rewritten inline per call); grid-independent, so not in the
+  // bundle.
   Buffer camera_params_;
   // Persistent frustum planes for compact_active_blocks_in_frustum (bound at
-  // binding 3 of compact_frustum_.set, rewritten per call); grid-independent.
+  // binding 3 of compact_frustum_.set, rewritten inline per call);
+  // grid-independent.
   Buffer frustum_planes_;
+  // The host's copy of heap_counter_, which load_factor() reads: set by
+  // init_table and the heap rebuild, and read back by every retry round, the
+  // only dispatches that move the counter. Copied by the defaulted move, and
+  // harmlessly left on a moved-from map, whose load_factor() is refused.
+  std::uint32_t heap_free_ = 0;
+  // Each compaction kernel's last count, from which collect_compacted guesses
+  // how much of the list to read back beside the next count.
+  std::uint32_t last_active_count_ = 0;
+  std::uint32_t last_frustum_count_ = 0;
 
   // The shared descriptor pool the kernels' sets are allocated from. Declared
   // BEFORE the ComputeKernel members so it is destroyed AFTER them (members

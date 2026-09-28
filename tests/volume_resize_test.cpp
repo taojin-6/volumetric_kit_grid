@@ -23,6 +23,7 @@
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
+#include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
@@ -243,6 +244,44 @@ int main() {
         vr::Status::Code::InvalidArgument);
   CHECK(map.grid().num_buckets ==
         1024);  // rejected grow left the map untouched
+
+  // A grow whose rehash cannot place the blocks rolls back. Five blocks in
+  // five buckets of 8 all land in one bucket of 9, where two slots and a chain
+  // of two hold four. The map is as it was, and so is the heap counter,
+  // including the host copy load_factor() reads.
+  {
+    vol::VoxelGridParams tight = map.grid();
+    tight.bucket_size = 2;
+    tight.num_buckets = 8;
+    tight.num_blocks = 16;
+    tight.max_chain = 2;
+    vr::Result<vol::VoxelHashMap> made =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), tight);
+    CHECK(made.ok());
+    vol::VoxelHashMap small = std::move(made).value();
+    std::vector<vol::BlockIndex> clash;
+    std::set<std::uint32_t> old_buckets;
+    for (int i = 0; i < 4096 && clash.size() < 5; ++i) {
+      const vr::Vec3i c(i % 64, i / 64, 0);
+      if (vol::hash_bucket(c, 9) == 0 &&
+          old_buckets.insert(vol::hash_bucket(c, 8)).second) {
+        vol::BlockIndex block{};
+        block.coord = c;
+        clash.push_back(block);
+      }
+    }
+    CHECK(clash.size() == 5);
+    vr::Result<std::uint32_t> placed = small.allocate(clash.data(), 5);
+    CHECK(placed.ok() && placed.value() == 0);
+    const vr::Status grow = small.resize(9);
+    CHECK(grow.domain() == vr::Status::Code::OutOfMemory);
+    CHECK(small.grid().num_buckets == 8);
+    vr::Result<std::set<Coord>> kept = active_set(small);
+    CHECK(kept.ok() && kept.value().size() == 5);
+    vr::Result<vol::HashDiagnostics> d = small.diagnostics();
+    CHECK(d.ok() && d.value().heap_free_count == 16 - 5);
+    CHECK(small.load_factor().value() == 5.0f / 16.0f);
+  }
 
   std::printf(
       "recon volume resize test passed: grew 256 -> 1024 buckets, %zu blocks "

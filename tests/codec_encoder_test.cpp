@@ -61,7 +61,7 @@ int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
   CHECK(ga.ok());
   vol::VoxelBlockGrid a = std::move(ga).value();
   CHECK(allocate(a, coords).ok());
-  CHECK(write_sphere(a, s).ok());
+  CHECK(write_sphere(gpu, a, s).ok());
 
   GridShape bigger;
   bigger.num_buckets = 2048;
@@ -70,7 +70,7 @@ int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
   vol::VoxelBlockGrid b = std::move(gb).value();
   std::vector<vr::Vec3i> reversed(coords.rbegin(), coords.rend());
   CHECK(allocate(b, reversed).ok());
-  CHECK(write_sphere(b, s).ok());
+  CHECK(write_sphere(gpu, b, s).ok());
 
   vr::Result<std::vector<vol::BlockIndex>> pa = a.map().compact_active_blocks();
   vr::Result<std::vector<vol::BlockIndex>> pb = b.map().compact_active_blocks();
@@ -103,7 +103,7 @@ int unobserved_dropped_case(Gpu& gpu, codec::Encoder& enc) {
   vol::VoxelBlockGrid grid = std::move(g).value();
 
   // Which blocks have an observed voxel, counted on the host.
-  vr::Result<Snapshot> snap = snapshot(grid);
+  vr::Result<Snapshot> snap = snapshot(gpu, grid);
   CHECK(snap.ok());
   std::uint32_t observed_blocks = 0;
   for (std::size_t i = 0; i < snap.value().coords.size(); ++i) {

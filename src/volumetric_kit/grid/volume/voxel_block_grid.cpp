@@ -4,12 +4,12 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
@@ -23,29 +23,6 @@ namespace {
 std::uint64_t voxel_count(const VoxelGridParams& grid) {
   return static_cast<std::uint64_t>(grid.num_blocks) *
          static_cast<std::uint64_t>(grid.voxels_per_block);
-}
-
-// A host-visible, host-mapped storage buffer of the given byte size,
-// uninitialised (the caller fills or zeroes it). resize() copies old attribute
-// contents into the head and zeroes only the grown tail through this, avoiding
-// a redundant full-buffer zero-then-overwrite.
-// TODO(volume): host-visible for this slice; a device-local + staging path is a
-// follow-up perf pass, matching the hash-map buffers.
-Result<Buffer> raw_attribute_buffer(Allocator& allocator, VkDeviceSize bytes) {
-  BufferDesc desc;
-  desc.size = bytes;
-  desc.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  desc.memory = MemoryUsage::HostVisible;
-  desc.mapped = true;
-  desc.host_access = HostAccess::Random;
-  return allocator.create_buffer(desc);
-}
-
-// The same, fully zeroed so a freshly-created attribute reads as all-zero.
-Result<Buffer> attribute_buffer(Allocator& allocator, VkDeviceSize bytes) {
-  VR_ASSIGN(Buffer buffer, raw_attribute_buffer(allocator, bytes));
-  std::memset(buffer.mapped(), 0, static_cast<std::size_t>(bytes));
-  return buffer;
 }
 
 }  // namespace
@@ -101,15 +78,20 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
   VR_ASSIGN(VoxelHashMap map, VoxelHashMap::create(device, allocator, grid));
   VoxelBlockGrid vbg(std::move(map), &device, &allocator, max_range);
 
+  // Device-local, and zeroed on the device, so a fresh attribute reads as
+  // all-zero without the host ever touching it.
   vbg.attributes_.reserve(attr_count);
+  CommandBatch zero(device, allocator);
   for (std::size_t i = 0; i < attr_count; ++i) {
     const AttributeSpec& spec = attrs[i];
     const auto bytes = static_cast<VkDeviceSize>(elements) *
                        static_cast<VkDeviceSize>(spec.element_size);
-    VR_ASSIGN(Buffer buffer, attribute_buffer(allocator, bytes));
+    VR_ASSIGN(Buffer buffer, device_storage_buffer(allocator, bytes));
+    VR_TRY(zero.zero(buffer, 0, bytes));
     vbg.attributes_.push_back(Attribute{std::string(spec.name),
                                         spec.element_size, std::move(buffer)});
   }
+  VR_TRY(zero.submit());
   vbg.name_attribute_buffers();
   return vbg;
 }
@@ -234,19 +216,21 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
         max_storage_buffer_range_));
   }
 
+  // One batch for every attribute: each old array copied into its grown one
+  // on the device, the tail zeroed there too.
   std::vector<Buffer> grown;
   grown.reserve(attributes_.size());
+  CommandBatch batch(*device_, *allocator_);
   for (const Attribute& attr : attributes_) {
     const auto new_bytes = static_cast<VkDeviceSize>(new_elements) *
                            static_cast<VkDeviceSize>(attr.element_size);
-    VR_ASSIGN(Buffer buffer, raw_attribute_buffer(*allocator_, new_bytes));
-    const auto old_bytes = static_cast<std::size_t>(attr.buffer.size());
-    auto* dst = static_cast<std::uint8_t*>(buffer.mapped());
-    std::memcpy(dst, attr.buffer.mapped(), old_bytes);
-    std::memset(dst + old_bytes, 0,
-                static_cast<std::size_t>(new_bytes) - old_bytes);
+    VR_ASSIGN(Buffer buffer, device_storage_buffer(*allocator_, new_bytes));
+    const VkDeviceSize old_bytes = attr.buffer.size();
+    VR_TRY(batch.copy(attr.buffer, 0, buffer, 0, old_bytes));
+    VR_TRY(batch.zero(buffer, old_bytes, new_bytes - old_bytes));
     grown.push_back(std::move(buffer));
   }
+  VR_TRY(batch.submit());
 
   VR_TRY(map_.resize(new_num_buckets));
   for (std::size_t i = 0; i < attributes_.size(); ++i) {
@@ -293,6 +277,7 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
               });
     const auto voxels_per_block =
         static_cast<std::uint64_t>(map_.grid().voxels_per_block);
+    std::vector<std::uint64_t> firsts;  // each found block's first voxel
     for (std::uint32_t i = 0; i < count; ++i) {
       const auto block =
           std::lower_bound(active.begin(), active.end(), coords[i].coord,
@@ -302,20 +287,33 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
       if (block == active.end() || block->coord != coords[i].coord) {
         continue;
       }
-      // Zero this block's slice of every attribute. The buffers are
-      // host-visible and mapped, and remove() is synchronous, so this is a
-      // plain memset rather than a fill dispatch.
-      const auto first = static_cast<std::uint64_t>(block->ptr);
-      for (Attribute& attr : attributes_) {
-        const std::uint64_t offset = first * attr.element_size;
-        const std::uint64_t bytes = voxels_per_block * attr.element_size;
+      firsts.push_back(static_cast<std::uint64_t>(block->ptr));
+    }
+    // Zero each block's slice of every attribute on the device, in one batch.
+    // Sorted and merged, so blocks the LIFO heap handed out side by side cost
+    // one fill, not one each; and attribute by attribute, so each array's
+    // fills rise through it and share one barrier (see CommandBatch).
+    std::sort(firsts.begin(), firsts.end());
+    firsts.erase(std::unique(firsts.begin(), firsts.end()), firsts.end());
+    CommandBatch batch(*device_, *allocator_);
+    for (const Attribute& attr : attributes_) {
+      for (std::size_t i = 0; i < firsts.size();) {
+        std::size_t j = i + 1;
+        while (j < firsts.size() &&
+               firsts[j] == firsts[j - 1] + voxels_per_block) {
+          ++j;
+        }
+        const std::uint64_t offset = firsts[i] * attr.element_size;
+        const std::uint64_t bytes =
+            (j - i) * voxels_per_block * attr.element_size;
+        i = j;
         if (offset + bytes > attr.buffer.size()) {
           continue;  // an out-of-lockstep array; attribute() reports it
         }
-        std::memset(static_cast<std::uint8_t*>(attr.buffer.mapped()) + offset,
-                    0, static_cast<std::size_t>(bytes));
+        VR_TRY(batch.zero(attr.buffer, offset, bytes));
       }
     }
+    VR_TRY(batch.submit());
   }
 
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
@@ -328,16 +326,16 @@ Status VoxelBlockGrid::clear() {
   if (!valid()) {
     return Status::invalid_argument("VoxelBlockGrid::clear: moved-from grid");
   }
-  // Order matters only in that both must happen; the map clear is the one that
-  // can fail, so run it first and leave the attributes untouched if it does --
-  // zeroed attributes under a still-populated table would read as fused blocks
-  // that lost their data.
-  VR_TRY(map_.clear());  // moves the topology epoch; see topology_epoch()
-  for (Attribute& attr : attributes_) {
-    std::memset(attr.buffer.mapped(), 0,
-                static_cast<std::size_t>(attr.buffer.size()));
+  // Zero first, then free: a failure between the two leaves every block
+  // still owning its index, at worst reading as unobserved. Freeing first
+  // would hand the indices back over the old surface if the zeroing then
+  // failed, and the LIFO heap would re-draw them onto it at full weight.
+  CommandBatch batch(*device_, *allocator_);
+  for (const Attribute& attr : attributes_) {
+    VR_TRY(batch.zero(attr.buffer, 0, attr.buffer.size()));
   }
-  return {};
+  VR_TRY(batch.submit());
+  return map_.clear();  // moves the topology epoch; see topology_epoch()
 }
 
 Status VoxelBlockGrid::check_block_list(const BlockList& blocks,

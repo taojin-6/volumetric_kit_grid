@@ -49,6 +49,8 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+#include "grid_readback.hpp"
+
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
 namespace mesh = volumetric_kit::recon::mesh;
@@ -99,6 +101,7 @@ std::uint32_t pack_rgb(vr::Vec3f c) {
          (0xFFu << 24);
 }
 
+// The device the grids live on, for the helpers that write their attributes.
 vol::VoxelGridParams sphere_grid_params() {
   vol::VoxelGridParams grid{};
   grid.voxel_size = kH;
@@ -112,14 +115,26 @@ vol::VoxelGridParams sphere_grid_params() {
   return grid;
 }
 
+// Write the tsdf and weight a helper filled back to the grid.
+bool write_attributes(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+                      const std::vector<float>& tsdf,
+                      const std::vector<float>& weight) {
+  return vr_test::write_attribute(ctx.device, ctx.allocator, g, "tsdf", tsdf)
+             .ok() &&
+         vr_test::write_attribute(ctx.device, ctx.allocator, g, "weight",
+                                  weight)
+             .ok();
+}
+
 // Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (at the
 // given @p weight) and, when requested, the gradient colour into every voxel of
 // every allocated block, addressed by the compacted BlockIndex::ptr + local. A
 // colour attribute left unwritten (with_color = false on a grid that carries
 // one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
 // false on any device error.
-bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
-                      float weight_value = 1.0f, float radius = kRadius) {
+bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+                      bool with_color, float weight_value = 1.0f,
+                      float radius = kRadius) {
   std::vector<vol::BlockIndex> blocks;
   for (int cz = 0; cz < kBlocks; ++cz) {
     for (int cy = 0; cy < kBlocks; ++cy) {
@@ -141,20 +156,24 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
     return false;
   }
 
-  vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight = g.attribute("weight");
+  auto tsdf =
+      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "tsdf");
+  auto weight =
+      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "weight");
   if (!tsdf || !weight) {
     return false;
   }
-  auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
-  auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
+  float* tptr = tsdf.value().data();
+  float* wptr = weight.value().data();
+  vr::Result<std::vector<std::uint32_t>> color = std::vector<std::uint32_t>{};
   std::uint32_t* cptr = nullptr;
   if (with_color) {
-    vr::Result<vol::AttributeView> color = g.attribute("color");
+    color = vr_test::read_attribute<std::uint32_t>(ctx.device, ctx.allocator, g,
+                                                   "color");
     if (!color) {
       return false;
     }
-    cptr = static_cast<std::uint32_t*>(color.value().buffer->mapped());
+    cptr = color.value().data();
   }
 
   for (const vol::BlockIndex& b : active.value()) {
@@ -174,7 +193,10 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
       }
     }
   }
-  return true;
+  return write_attributes(ctx, g, tsdf.value(), weight.value()) &&
+         (!with_color || vr_test::write_attribute(ctx.device, ctx.allocator, g,
+                                                  "color", color.value())
+                             .ok());
 }
 
 // Allocate a @p span cubed run of blocks and fill every voxel with a
@@ -194,7 +216,8 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
 //
 // Reads the block size from the grid rather than assuming kBlock, for that
 // second use.
-bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
+bool fill_dense_blocks(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+                       int span) {
   const int bs = g.grid().block_size;
   const float h = g.grid().voxel_size;
   std::vector<vol::BlockIndex> blocks;
@@ -217,13 +240,15 @@ bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
   if (!active || active.value().size() != blocks.size()) {
     return false;
   }
-  vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight = g.attribute("weight");
+  auto tsdf =
+      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "tsdf");
+  auto weight =
+      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "weight");
   if (!tsdf || !weight) {
     return false;
   }
-  auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
-  auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
+  float* tptr = tsdf.value().data();
+  float* wptr = weight.value().data();
   for (const vol::BlockIndex& blk : active.value()) {
     for (int lz = 0; lz < bs; ++lz) {
       for (int ly = 0; ly < bs; ++ly) {
@@ -238,7 +263,7 @@ bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
       }
     }
   }
-  return true;
+  return write_attributes(ctx, g, tsdf.value(), weight.value());
 }
 
 // How a mesh's triangles are laid out in the arena relative to the blocks that
@@ -540,6 +565,7 @@ int main() {
                  allocator.status().message().c_str());
     return 1;
   }
+  const vr_test::Gpu ctx{device.value(), allocator.value()};
 
   // The main extractor asks for the span table; most of the fixtures below do
   // not, which is the point -- track_block_spans is off by default and the
@@ -564,7 +590,7 @@ int main() {
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(grid_result.ok());
   vol::VoxelBlockGrid grid = std::move(grid_result).value();
-  CHECK(fill_sphere_grid(grid, /*with_color=*/false));
+  CHECK(fill_sphere_grid(ctx, grid, /*with_color=*/false));
 
   vr::Result<mesh::Mesh> sparse_result = extractor.extract_host(grid, 0.0f);
   CHECK(sparse_result.ok());
@@ -807,7 +833,7 @@ int main() {
       device.value(), allocator.value(), chained_gp, attrs, 2);
   CHECK(chained_result.ok());
   vol::VoxelBlockGrid chained_grid = std::move(chained_result).value();
-  CHECK(fill_sphere_grid(chained_grid, /*with_color=*/false));
+  CHECK(fill_sphere_grid(ctx, chained_grid, /*with_color=*/false));
 
   // The fixture only tests what it exercises, so assert that it spills before
   // trusting what it proves -- otherwise a later change to the hash or to these
@@ -838,7 +864,7 @@ int main() {
       device.value(), allocator.value(), gp, cattrs, 3);
   CHECK(cgrid_result.ok());
   vol::VoxelBlockGrid cgrid = std::move(cgrid_result).value();
-  CHECK(fill_sphere_grid(cgrid, /*with_color=*/true));
+  CHECK(fill_sphere_grid(ctx, cgrid, /*with_color=*/true));
 
   vr::Result<mesh::Mesh> colored_result = extractor.extract_host(cgrid, 0.0f);
   CHECK(colored_result.ok());
@@ -877,7 +903,7 @@ int main() {
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(zw_result.ok());
   vol::VoxelBlockGrid zw_grid = std::move(zw_result).value();
-  CHECK(fill_sphere_grid(zw_grid, /*with_color=*/false, /*weight=*/0.0f));
+  CHECK(fill_sphere_grid(ctx, zw_grid, /*with_color=*/false, /*weight=*/0.0f));
   vr::Result<mesh::Mesh> zw_mesh = extractor.extract_host(zw_grid, 0.0f);
   CHECK(zw_mesh.ok());
   CHECK(std::move(zw_mesh).value().empty());
@@ -894,7 +920,8 @@ int main() {
       device.value(), allocator.value(), gp, cattrs, 3);
   CHECK(sgrid_result.ok());
   vol::VoxelBlockGrid sgrid = std::move(sgrid_result).value();
-  CHECK(fill_sphere_grid(sgrid, /*with_color=*/false));  // colour left at 0
+  CHECK(
+      fill_sphere_grid(ctx, sgrid, /*with_color=*/false));  // colour left at 0
   vr::Result<mesh::Mesh> sentinel_result = extractor.extract_host(sgrid, 0.0f);
   CHECK(sentinel_result.ok());
   const mesh::Mesh sentinel = std::move(sentinel_result).value();
@@ -994,7 +1021,7 @@ int main() {
                                     attrs, 2);
     CHECK(grow_grid_result.ok());
     vol::VoxelBlockGrid grow_grid = std::move(grow_grid_result).value();
-    CHECK(fill_sphere_grid(grow_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(ctx, grow_grid, /*with_color=*/false));
 
     mesh::MarchingCubesConfig grow_config;
     grow_config.track_block_spans = true;
@@ -1134,7 +1161,7 @@ int main() {
                                   2);
   CHECK(dense_block_result.ok());
   vol::VoxelBlockGrid dense_block = std::move(dense_block_result).value();
-  CHECK(fill_dense_blocks(dense_block, 1));
+  CHECK(fill_dense_blocks(ctx, dense_block, 1));
 
   mesh::ExtractTimings refit_timings;
   vr::Result<mesh::Mesh> refit_mesh_result =
@@ -1181,7 +1208,7 @@ int main() {
                                   2);
   CHECK(dense_run_result.ok());
   vol::VoxelBlockGrid dense_run = std::move(dense_run_result).value();
-  CHECK(fill_dense_blocks(dense_run, 3));
+  CHECK(fill_dense_blocks(ctx, dense_run, 3));
 
   vr::Result<mesh::MarchingCubes> run_result =
       mesh::MarchingCubes::create(device.value(), allocator.value());
@@ -1493,7 +1520,7 @@ int main() {
                                     attrs, 2);
     CHECK(grow_grid_result.ok());
     vol::VoxelBlockGrid grow_grid = std::move(grow_grid_result).value();
-    CHECK(fill_dense_blocks(grow_grid, 2));
+    CHECK(fill_dense_blocks(ctx, grow_grid, 2));
 
     mesh::ExtractTimings after_grow;
     vr::Result<mesh::Mesh> grown_result =
@@ -1533,7 +1560,7 @@ int main() {
   // slots the kernel's per-cell cache holds and take the second full gather
   // instead of the cheap register rejection, and only then is the uncached
   // branch exercised at all.
-  CHECK(fill_dense_blocks(big_block_grid, 1));
+  CHECK(fill_dense_blocks(ctx, big_block_grid, 1));
   CHECK(!share_mc.extract_host(big_block_grid, 0.0f).ok());
   // The same grid is fine without sharing -- the refusal is the kernel's table,
   // not the block size.
@@ -1561,7 +1588,8 @@ int main() {
       device.value(), allocator.value(), split_gp, attrs, 2);
   CHECK(split_result.ok());
   vol::VoxelBlockGrid split_grid = std::move(split_result).value();
-  CHECK(fill_dense_blocks(split_grid, 2));  // 2x2x2 blocks of 8 = the same 16^3
+  CHECK(fill_dense_blocks(ctx, split_grid,
+                          2));  // 2x2x2 blocks of 8 = the same 16^3
   mesh::ExtractTimings split_timings;
   vr::Result<mesh::Mesh> split_mesh_result =
       arena_mc.extract_host(split_grid, 0.0f, &split_timings);
@@ -1634,7 +1662,7 @@ int main() {
                                     attrs, 2);
     CHECK(anchor_grid_result.ok());
     vol::VoxelBlockGrid anchor_grid = std::move(anchor_grid_result).value();
-    CHECK(fill_sphere_grid(anchor_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(ctx, anchor_grid, /*with_color=*/false));
 
     mesh::MarchingCubesConfig anchor_config;
     anchor_config.track_block_spans = true;
@@ -1700,7 +1728,7 @@ int main() {
         device.value(), allocator.value(), gp, attrs, 2);
     CHECK(other_result.ok());
     vol::VoxelBlockGrid other_grid = std::move(other_result).value();
-    CHECK(fill_sphere_grid(other_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(ctx, other_grid, /*with_color=*/false));
     // Two fresh grids never share a token, even at the same topology and even
     // if one is built in storage the other has vacated -- it is drawn from a
     // process-wide counter, which is what closes the ABA a grid pointer cannot
@@ -1758,7 +1786,7 @@ int main() {
                                     attrs, 2);
     CHECK(inc_grid_result.ok());
     vol::VoxelBlockGrid inc_grid = std::move(inc_grid_result).value();
-    CHECK(fill_sphere_grid(inc_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false));
 
     mesh::MarchingCubesConfig inc_config;
     inc_config.track_block_spans =
@@ -1796,7 +1824,7 @@ int main() {
 
     // A visibly different sphere, written straight into the same blocks.
     const float kGrown = kRadius * 1.15f;
-    CHECK(fill_sphere_grid(inc_grid, /*with_color=*/false, 1.0f, kGrown));
+    CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false, 1.0f, kGrown));
 
     // What a full extract of the NEW field gives, taken now so the mixed pass
     // below can be checked against both surfaces. A separate extractor, so
@@ -1960,7 +1988,7 @@ int main() {
     //
     // The field is changed once more, back toward the original radius, so a
     // pass that wrongly skipped would return the grown sphere and be caught.
-    CHECK(fill_sphere_grid(inc_grid, /*with_color=*/false, 1.0f, kRadius));
+    CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false, 1.0f, kRadius));
     std::vector<std::array<float, 9>> shrunk_surface;
     {
       vr::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
@@ -2080,7 +2108,7 @@ int main() {
                                     attrs, 2);
     CHECK(cull_grid_result.ok());
     vol::VoxelBlockGrid cull_grid = std::move(cull_grid_result).value();
-    CHECK(fill_sphere_grid(cull_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(ctx, cull_grid, /*with_color=*/false));
 
     vr::Result<mesh::MarchingCubes> cull_result =
         mesh::MarchingCubes::create(device.value(), allocator.value(), {});
