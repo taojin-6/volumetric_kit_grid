@@ -49,6 +49,8 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+#include "grid_readback.hpp"
+
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
 namespace mesh = volumetric_kit::recon::mesh;
@@ -99,6 +101,10 @@ std::uint32_t pack_rgb(vr::Vec3f c) {
          (0xFFu << 24);
 }
 
+// The device the grids live on, for the helpers that write their attributes.
+const vr::Device* g_device = nullptr;
+vr::Allocator* g_allocator = nullptr;
+
 vol::VoxelGridParams sphere_grid_params() {
   vol::VoxelGridParams grid{};
   grid.voxel_size = kH;
@@ -110,6 +116,15 @@ vol::VoxelGridParams sphere_grid_params() {
   grid.num_blocks = 1024;  // = bucket_size * num_buckets; >> 216 active blocks
   grid.max_chain = 128;
   return grid;
+}
+
+// Write the tsdf and weight a helper filled back to the grid.
+bool write_attributes(vol::VoxelBlockGrid& g, const std::vector<float>& tsdf,
+                      const std::vector<float>& weight) {
+  return vr_test::write_attribute(*g_device, *g_allocator, g, "tsdf", tsdf)
+             .ok() &&
+         vr_test::write_attribute(*g_device, *g_allocator, g, "weight", weight)
+             .ok();
 }
 
 // Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (at the
@@ -141,20 +156,24 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
     return false;
   }
 
-  vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight = g.attribute("weight");
+  auto tsdf =
+      vr_test::read_attribute<float>(*g_device, *g_allocator, g, "tsdf");
+  auto weight =
+      vr_test::read_attribute<float>(*g_device, *g_allocator, g, "weight");
   if (!tsdf || !weight) {
     return false;
   }
-  auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
-  auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
+  float* tptr = tsdf.value().data();
+  float* wptr = weight.value().data();
+  vr::Result<std::vector<std::uint32_t>> color = std::vector<std::uint32_t>{};
   std::uint32_t* cptr = nullptr;
   if (with_color) {
-    vr::Result<vol::AttributeView> color = g.attribute("color");
+    color = vr_test::read_attribute<std::uint32_t>(*g_device, *g_allocator, g,
+                                                   "color");
     if (!color) {
       return false;
     }
-    cptr = static_cast<std::uint32_t*>(color.value().buffer->mapped());
+    cptr = color.value().data();
   }
 
   for (const vol::BlockIndex& b : active.value()) {
@@ -174,7 +193,10 @@ bool fill_sphere_grid(vol::VoxelBlockGrid& g, bool with_color,
       }
     }
   }
-  return true;
+  return write_attributes(g, tsdf.value(), weight.value()) &&
+         (!with_color || vr_test::write_attribute(*g_device, *g_allocator, g,
+                                                  "color", color.value())
+                             .ok());
 }
 
 // Allocate a @p span cubed run of blocks and fill every voxel with a
@@ -217,13 +239,15 @@ bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
   if (!active || active.value().size() != blocks.size()) {
     return false;
   }
-  vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight = g.attribute("weight");
+  auto tsdf =
+      vr_test::read_attribute<float>(*g_device, *g_allocator, g, "tsdf");
+  auto weight =
+      vr_test::read_attribute<float>(*g_device, *g_allocator, g, "weight");
   if (!tsdf || !weight) {
     return false;
   }
-  auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
-  auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
+  float* tptr = tsdf.value().data();
+  float* wptr = weight.value().data();
   for (const vol::BlockIndex& blk : active.value()) {
     for (int lz = 0; lz < bs; ++lz) {
       for (int ly = 0; ly < bs; ++ly) {
@@ -238,7 +262,7 @@ bool fill_dense_blocks(vol::VoxelBlockGrid& g, int span) {
       }
     }
   }
-  return true;
+  return write_attributes(g, tsdf.value(), weight.value());
 }
 
 // How a mesh's triangles are laid out in the arena relative to the blocks that
@@ -540,6 +564,8 @@ int main() {
                  allocator.status().message().c_str());
     return 1;
   }
+  g_device = &device.value();
+  g_allocator = &allocator.value();
 
   // The main extractor asks for the span table; most of the fixtures below do
   // not, which is the point -- track_block_spans is off by default and the

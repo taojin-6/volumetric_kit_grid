@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 
+#include "grid_readback.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
@@ -155,12 +157,15 @@ inline std::vector<vr::Vec3i> band_blocks(const Sphere& s, float voxel = kVoxel,
 // observed (weight 2) with its true SDF clamped to +-trunc; one outside it is
 // unobserved (weight 0, tsdf 0) -- the shape a fused grid has, partially
 // observed blocks included.
-inline vr::Status write_sphere(vol::VoxelBlockGrid& grid, const Sphere& s) {
+inline vr::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
+                               const Sphere& s) {
   VR_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VR_ASSIGN(const vol::AttributeView tsdf_view, grid.attribute("tsdf"));
-  VR_ASSIGN(const vol::AttributeView weight_view, grid.attribute("weight"));
-  float* tsdf = static_cast<float*>(tsdf_view.buffer->mapped());
-  float* weight = static_cast<float*>(weight_view.buffer->mapped());
+  VR_ASSIGN(
+      std::vector<float> tsdf,
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VR_ASSIGN(std::vector<float> weight,
+            vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                           "weight"));
   const float voxel = grid.grid().voxel_size;
   const float trunc = grid.grid().trunc_dist;
   for (const vol::BlockIndex& b : active) {
@@ -174,7 +179,10 @@ inline vr::Status write_sphere(vol::VoxelBlockGrid& grid, const Sphere& s) {
       weight[std::uint32_t(b.ptr) + v] = obs ? 2.0f : 0.0f;
     }
   }
-  return {};
+  VR_TRY(
+      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
+  return vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
+                                  weight);
 }
 
 // A grid holding the sphere: its band blocks allocated and written, plus
@@ -187,7 +195,7 @@ inline vr::Result<vol::VoxelBlockGrid> sphere_grid(
       band_blocks(s, shape.voxel_size, shape.trunc_dist);
   coords.insert(coords.end(), extra.begin(), extra.end());
   VR_TRY(allocate(grid, coords));
-  VR_TRY(write_sphere(grid, s));
+  VR_TRY(write_sphere(gpu, grid, s));
   return grid;
 }
 
@@ -202,17 +210,22 @@ struct Snapshot {
   }
 };
 
-inline vr::Result<Snapshot> snapshot(vol::VoxelBlockGrid& grid) {
+inline vr::Result<Snapshot> snapshot(Gpu& gpu, vol::VoxelBlockGrid& grid) {
   VR_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VR_ASSIGN(const vol::AttributeView tsdf_view, grid.attribute("tsdf"));
-  VR_ASSIGN(const vol::AttributeView weight_view, grid.attribute("weight"));
-  const float* tsdf = static_cast<const float*>(tsdf_view.buffer->mapped());
-  const float* weight = static_cast<const float*>(weight_view.buffer->mapped());
+  VR_ASSIGN(
+      const std::vector<float> tsdf,
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VR_ASSIGN(const std::vector<float> weight,
+            vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                           "weight"));
   Snapshot out;
   for (const vol::BlockIndex& b : active) {
+    const auto at = [&](const std::vector<float>& a) {
+      return a.begin() + std::ptrdiff_t(b.ptr);
+    };
     out.coords.push_back(b.coord);
-    out.tsdf.insert(out.tsdf.end(), tsdf + b.ptr, tsdf + b.ptr + kVpb);
-    out.weight.insert(out.weight.end(), weight + b.ptr, weight + b.ptr + kVpb);
+    out.tsdf.insert(out.tsdf.end(), at(tsdf), at(tsdf) + kVpb);
+    out.weight.insert(out.weight.end(), at(weight), at(weight) + kVpb);
   }
   return out;
 }

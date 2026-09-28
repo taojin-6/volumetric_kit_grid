@@ -21,6 +21,8 @@
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
+
+#include "grid_readback.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
@@ -115,14 +117,24 @@ int main() {
   CHECK(tsdf.value().buffer->valid());
   CHECK(tsdf.value().buffer->size() == voxels * sizeof(float));
 
-  // SoA independence: writing one attribute leaves the other untouched. The
-  // buffers are host-visible + zero-initialised, so a plain host round-trip
-  // exercises the mapping (no device work needed for the storage itself).
-  auto* tsdf_data = static_cast<float*>(tsdf.value().buffer->mapped());
-  auto* weight_data = static_cast<float*>(weight.value().buffer->mapped());
-  CHECK(tsdf_data != nullptr && weight_data != nullptr);
+  // The arrays are device-local, so the test works on host copies: read
+  // after the grid changes them, written back before the grid reads them.
+  CHECK(tsdf.value().buffer->mapped() == nullptr);
+  const auto get = [&](const char* name) {
+    return vr_test::read_attribute<float>(device.value(), allocator.value(),
+                                          vbg, name)
+        .value();
+  };
+  const auto put = [&](const char* name, const std::vector<float>& data) {
+    return vr_test::write_attribute(device.value(), allocator.value(), vbg,
+                                    name, data)
+        .ok();
+  };
+  std::vector<float> tsdf_data = get("tsdf");
+  std::vector<float> weight_data = get("weight");
   const std::uint64_t last = voxels - 1;
   CHECK(tsdf_data[0] == 0.0f && weight_data[0] == 0.0f);  // zero-initialised
+  CHECK(tsdf_data[last] == 0.0f && weight_data[last] == 0.0f);
   tsdf_data[0] = 1.5f;
   tsdf_data[last] = 2.5f;
   weight_data[0] = 10.0f;
@@ -184,6 +196,7 @@ int main() {
   const std::size_t before_count = before.value().size();
 
   const std::int32_t new_buckets = grid.num_buckets * 4;
+  CHECK(put("tsdf", tsdf_data) && put("weight", weight_data));
   CHECK(vbg.resize(new_buckets).ok());
   CHECK(vbg.map().grid().num_buckets == new_buckets);  // the map grew
   const std::uint64_t new_voxels =
@@ -202,10 +215,8 @@ int main() {
 
   // The data written before the grow survives at the same pointers (indices
   // preserved): block A's filled tsdf range, block B's base, block A's weight.
-  auto* tsdf_grown_data =
-      static_cast<float*>(tsdf_grown.value().buffer->mapped());
-  auto* weight_grown_data =
-      static_cast<float*>(weight_grown.value().buffer->mapped());
+  std::vector<float> tsdf_grown_data = get("tsdf");
+  std::vector<float> weight_grown_data = get("weight");
   CHECK(tsdf_grown_data[ptr_a] == -0.02f);
   CHECK(tsdf_grown_data[ptr_a + vpb - 1] == -0.02f);  // whole range survived
   CHECK(tsdf_grown_data[ptr_b] == 0.75f);
@@ -229,6 +240,7 @@ int main() {
   }
   CHECK(fresh_ptr >= 0);
   CHECK(static_cast<std::uint64_t>(fresh_ptr) + vpb <= new_voxels);  // in pool
+  tsdf_grown_data = get("tsdf");
   CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);  // fresh block: zeroed attribute
 
   // --- remove() clears the per-voxel data before the index goes back.
@@ -244,9 +256,12 @@ int main() {
     tsdf_grown_data[fresh_ptr] = -0.5f;
     tsdf_grown_data[fresh_ptr + vpb - 1] = -0.5f;
     weight_grown_data[fresh_ptr] = 5.0f;
+    CHECK(put("tsdf", tsdf_grown_data) && put("weight", weight_grown_data));
 
     vr::Result<std::uint32_t> removed = vbg.remove(&fresh, 1);
     CHECK(removed.ok() && removed.value() == 0);
+    tsdf_grown_data = get("tsdf");
+    weight_grown_data = get("weight");
     // Cleared at the removed block's own range, both attributes, whole block.
     CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);
     CHECK(tsdf_grown_data[fresh_ptr + vpb - 1] == 0.0f);
@@ -268,7 +283,8 @@ int main() {
         reused_ptr = blk.ptr;
       }
     }
-    CHECK(reused_ptr == fresh_ptr);              // LIFO: the same index back
+    CHECK(reused_ptr == fresh_ptr);  // LIFO: the same index back
+    tsdf_grown_data = get("tsdf");
     CHECK(tsdf_grown_data[reused_ptr] == 0.0f);  // and it is clean
   }
 
@@ -299,8 +315,10 @@ int main() {
       CHECK(ptrs[i] >= 0);
       tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
     }
+    CHECK(put("tsdf", tsdf_grown_data));
     vr::Result<std::uint32_t> removed = vbg.remove(blocks + 1, 2);
     CHECK(removed.ok() && removed.value() == 0);
+    tsdf_grown_data = get("tsdf");
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
     CHECK(tsdf_grown_data[ptrs[1]] == 0.0f);
     CHECK(tsdf_grown_data[ptrs[2]] == 0.0f);
@@ -311,7 +329,10 @@ int main() {
   // block to the heap, so every range is about to be re-drawn.
   {
     tsdf_grown_data[ptr_a] = -0.02f;
+    CHECK(put("tsdf", tsdf_grown_data));
     CHECK(vbg.clear().ok());
+    tsdf_grown_data = get("tsdf");
+    weight_grown_data = get("weight");
     CHECK(tsdf_grown_data[ptr_a] == 0.0f);
     CHECK(weight_grown_data[ptr_a] == 0.0f);
     vr::Result<std::vector<vol::BlockIndex>> empty =

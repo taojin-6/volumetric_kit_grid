@@ -43,8 +43,8 @@ struct AttributeSpec {
 
 /// @brief Non-owning view of one attribute's backing store.
 ///
-/// @ref buffer is the device buffer to bind to a compute kernel (or read/write
-/// through @ref Buffer::mapped for this host-visible slice); it holds
+/// @ref buffer is the device-local buffer to bind to a compute kernel (the
+/// host reaches it through a @ref CommandBatch); it holds
 /// @ref element_count voxels of @ref element_size bytes each. Re-fetch the view
 /// (do not cache @ref buffer or its handle) across a move **or a
 /// @ref VoxelBlockGrid::resize** of the owning grid -- resize replaces every

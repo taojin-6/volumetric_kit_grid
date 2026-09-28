@@ -40,6 +40,8 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+#include "grid_readback.hpp"
+
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
 namespace mesh = volumetric_kit::recon::mesh;
@@ -74,7 +76,8 @@ vol::VoxelGridParams grid_params() {
 // surface crosses the volume and marching cubes emits a triangle count that
 // scales with the block count -- which is what lets the second extract outgrow
 // the arena the first one sized.
-bool fill_sphere(vol::VoxelBlockGrid& g, int blocks) {
+bool fill_sphere(const vr::Device& dev, vr::Allocator& alloc,
+                 vol::VoxelBlockGrid& g, int blocks) {
   const int n = kBlock * blocks;
   const float centre = static_cast<float>(n - 1) * 0.5f * kH;
   const float radius = static_cast<float>(n - 1) * 0.35f * kH;
@@ -100,13 +103,15 @@ bool fill_sphere(vol::VoxelBlockGrid& g, int blocks) {
     return false;
   }
 
-  vr::Result<vol::AttributeView> tsdf = g.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight = g.attribute("weight");
+  vr::Result<std::vector<float>> tsdf =
+      vr_test::read_attribute<float>(dev, alloc, g, "tsdf");
+  vr::Result<std::vector<float>> weight =
+      vr_test::read_attribute<float>(dev, alloc, g, "weight");
   if (!tsdf || !weight) {
     return false;
   }
-  auto* tptr = static_cast<float*>(tsdf.value().buffer->mapped());
-  auto* wptr = static_cast<float*>(weight.value().buffer->mapped());
+  float* tptr = tsdf.value().data();
+  float* wptr = weight.value().data();
 
   for (const vol::BlockIndex& b : active.value()) {
     for (int lz = 0; lz < kBlock; ++lz) {
@@ -126,7 +131,8 @@ bool fill_sphere(vol::VoxelBlockGrid& g, int blocks) {
       }
     }
   }
-  return true;
+  return vr_test::write_attribute(dev, alloc, g, "tsdf", tsdf.value()).ok() &&
+         vr_test::write_attribute(dev, alloc, g, "weight", weight.value()).ok();
 }
 
 }  // namespace
@@ -177,7 +183,7 @@ int main() {
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(small_result.ok());
   vol::VoxelBlockGrid small = std::move(small_result).value();
-  CHECK(fill_sphere(small, 2));
+  CHECK(fill_sphere(device.value(), allocator.value(), small, 2));
 
   mesh::ExtractTimings first{};
   vr::Result<mesh::DeviceMesh> small_mesh =
@@ -209,7 +215,7 @@ int main() {
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(big_result.ok());
   vol::VoxelBlockGrid big = std::move(big_result).value();
-  CHECK(fill_sphere(big, 6));
+  CHECK(fill_sphere(device.value(), allocator.value(), big, 6));
 
   mesh::ExtractTimings second{};
   vr::Result<mesh::DeviceMesh> big_mesh =

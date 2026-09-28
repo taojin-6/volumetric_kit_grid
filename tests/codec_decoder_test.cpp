@@ -121,7 +121,7 @@ int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
   vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s, {}, far);
   CHECK(g.ok());
   vol::VoxelBlockGrid src = std::move(g).value();
-  vr::Result<Snapshot> src_snap = snapshot(src);
+  vr::Result<Snapshot> src_snap = snapshot(gpu, src);
   CHECK(src_snap.ok());
 
   vr::Result<Bytes> frame = encode_with(gpu, src, near_lossless());
@@ -130,7 +130,7 @@ int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(d.ok());
   vol::VoxelBlockGrid out = std::move(d).value();
   CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
-  vr::Result<Snapshot> out_snap = snapshot(out);
+  vr::Result<Snapshot> out_snap = snapshot(gpu, out);
   CHECK(out_snap.ok());
 
   const float bound = std::sqrt(512.0f) * 0.002f / 2.0f * kTrunc + 1e-6f;
@@ -211,7 +211,7 @@ int mesh_case(Gpu& gpu, codec::Decoder& dec) {
     CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
     vr::Result<MeshFit> got = fit(gpu, out, s);
     CHECK(got.ok());
-    vr::Result<Snapshot> out_snap = snapshot(out);
+    vr::Result<Snapshot> out_snap = snapshot(gpu, out);
     CHECK(out_snap.ok());
     const double ratio =
         double(got.value().triangles) / double(truth.value().triangles);
@@ -246,12 +246,12 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(g.ok());
   vol::VoxelBlockGrid player = std::move(g).value();
   CHECK(dec.decode(fa.value().data(), fa.value().size(), player).ok());
-  vr::Result<Snapshot> after_a = snapshot(player);
+  vr::Result<Snapshot> after_a = snapshot(gpu, player);
   CHECK(after_a.ok());
   vr::Result<std::vector<vol::BlockIndex>> slots_a = active_sorted(player);
   CHECK(slots_a.ok());
   CHECK(dec.decode(fb.value().data(), fb.value().size(), player).ok());
-  vr::Result<Snapshot> after_b = snapshot(player);
+  vr::Result<Snapshot> after_b = snapshot(gpu, player);
   CHECK(after_b.ok());
   vr::Result<std::vector<vol::BlockIndex>> slots_b = active_sorted(player);
   CHECK(slots_b.ok());
@@ -269,7 +269,7 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(f.ok());
   vol::VoxelBlockGrid fresh = std::move(f).value();
   CHECK(dec.decode(fb.value().data(), fb.value().size(), fresh).ok());
-  vr::Result<Snapshot> only_b = snapshot(fresh);
+  vr::Result<Snapshot> only_b = snapshot(gpu, fresh);
   CHECK(only_b.ok());
   CHECK(after_b.value() == only_b.value());
 
@@ -277,7 +277,7 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   // it -- takes the path that reuses the merge's slots instead of compacting
   // twice, and must land on the same state as a fresh grid.
   CHECK(dec.decode(fb.value().data(), fb.value().size(), player).ok());
-  vr::Result<Snapshot> again = snapshot(player);
+  vr::Result<Snapshot> again = snapshot(gpu, player);
   CHECK(again.ok() && again.value() == only_b.value());
   vr::Result<std::vector<vol::BlockIndex>> slots_again = active_sorted(player);
   CHECK(slots_again.ok());
@@ -296,14 +296,14 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   vr::Result<Bytes> fsub = encode_with(gpu, gb.value());
   CHECK(fsub.ok());
   CHECK(dec.decode(fsub.value().data(), fsub.value().size(), player).ok());
-  vr::Result<Snapshot> after_sub = snapshot(player);
+  vr::Result<Snapshot> after_sub = snapshot(gpu, player);
   CHECK(after_sub.ok());
   CHECK(after_sub.value().coords.size() ==
         after_b.value().coords.size() - dropped.size());
   vr::Result<vol::VoxelBlockGrid> fs = grid_for(gpu, fsub.value());
   CHECK(fs.ok());
   CHECK(dec.decode(fsub.value().data(), fsub.value().size(), fs.value()).ok());
-  vr::Result<Snapshot> only_sub = snapshot(fs.value());
+  vr::Result<Snapshot> only_sub = snapshot(gpu, fs.value());
   CHECK(only_sub.ok() && after_sub.value() == only_sub.value());
 
   // The premise: the grid did keep, drop and gain blocks between the two.
@@ -324,7 +324,7 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   vr::Result<Bytes> empty = encode_with(gpu, e.value());
   CHECK(empty.ok());
   CHECK(dec.decode(empty.value().data(), empty.value().size(), player).ok());
-  vr::Result<Snapshot> none = snapshot(player);
+  vr::Result<Snapshot> none = snapshot(gpu, player);
   CHECK(none.ok() && none.value().coords.empty());
   return 0;
 }
@@ -344,10 +344,10 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(g.ok());
   vol::VoxelBlockGrid player = std::move(g).value();
   CHECK(dec.decode(fa.value().data(), fa.value().size(), player).ok());
-  vr::Result<Snapshot> before = snapshot(player);
+  vr::Result<Snapshot> before = snapshot(gpu, player);
   CHECK(before.ok());
   auto unchanged = [&]() {
-    vr::Result<Snapshot> now = snapshot(player);
+    vr::Result<Snapshot> now = snapshot(gpu, player);
     return now.ok() && now.value() == before.value();
   };
 
@@ -380,9 +380,9 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(gt.ok());
   vol::VoxelBlockGrid small = std::move(gt).value();
   CHECK(allocate(small, {{0, 0, 0}, {1, 0, 0}}).ok());
-  CHECK(
-      write_sphere(small, Sphere{vr::Vec3f(0.02f, 0.02f, 0.02f), 0.02f}).ok());
-  vr::Result<Snapshot> small_before = snapshot(small);
+  CHECK(write_sphere(gpu, small, Sphere{vr::Vec3f(0.02f, 0.02f, 0.02f), 0.02f})
+            .ok());
+  vr::Result<Snapshot> small_before = snapshot(gpu, small);
   CHECK(small_before.ok());
   vr::Result<codec::FrameInfo> info =
       codec::read_frame_info(fb.value().data(), fb.value().size());
@@ -392,7 +392,7 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   // Too small, not corrupt: the same answer as a table that cannot place the
   // blocks, so one recovery serves both.
   CHECK(s.domain() == vr::Status::Code::OutOfMemory);
-  vr::Result<Snapshot> small_after = snapshot(small);
+  vr::Result<Snapshot> small_after = snapshot(gpu, small);
   CHECK(small_after.ok() && small_after.value() == small_before.value());
   std::int32_t buckets = tiny.num_buckets;
   while (buckets * tiny.bucket_size <
@@ -401,7 +401,7 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   }
   CHECK(small.resize(buckets).ok());
   CHECK(dec.decode(fb.value().data(), fb.value().size(), small).ok());
-  vr::Result<Snapshot> recovered = snapshot(small);
+  vr::Result<Snapshot> recovered = snapshot(gpu, small);
   CHECK(recovered.ok());
   CHECK(recovered.value().coords.size() == info.value().block_count);
   return 0;
@@ -420,8 +420,9 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
     coords.push_back(vr::Vec3i(i % 4, i / 4, 0));
   }
   CHECK(allocate(src, coords).ok());
-  CHECK(write_sphere(src, Sphere{vr::Vec3f(0.08f, 0.08f, 0.02f), 0.05f}).ok());
-  vr::Result<Snapshot> src_snap = snapshot(src);
+  CHECK(write_sphere(gpu, src, Sphere{vr::Vec3f(0.08f, 0.08f, 0.02f), 0.05f})
+            .ok());
+  vr::Result<Snapshot> src_snap = snapshot(gpu, src);
   CHECK(src_snap.ok());
   vr::Result<Bytes> frame = encode_with(gpu, src);
   CHECK(frame.ok());
@@ -448,7 +449,7 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
   // The documented recovery.
   CHECK(tight.resize(cramped.num_buckets * 8).ok());
   CHECK(dec.decode(frame.value().data(), frame.value().size(), tight).ok());
-  vr::Result<Snapshot> out = snapshot(tight);
+  vr::Result<Snapshot> out = snapshot(gpu, tight);
   CHECK(out.ok());
   CHECK(out.value().coords.size() == n);
   return 0;

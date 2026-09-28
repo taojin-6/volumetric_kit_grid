@@ -15,12 +15,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <utility>
 #include <vector>
 
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
+#include "grid_readback.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -105,26 +107,42 @@ vr::Result<std::vector<vol::BlockIndex>> allocate_row(vol::VoxelBlockGrid& grid,
   return active;
 }
 
-float* attr(vol::VoxelBlockGrid& grid, const char* name) {
-  return static_cast<float*>(grid.attribute(name).value().buffer->mapped());
+const vr::Device* g_device = nullptr;
+vr::Allocator* g_allocator = nullptr;
+
+// A copy of an attribute, and back; the arrays are device-local, and both
+// abort on a device error.
+std::vector<float> attr(const vol::VoxelBlockGrid& grid, const char* name) {
+  return vr_test::read_attribute<float>(*g_device, *g_allocator, grid, name)
+      .value();
+}
+
+void put(const vol::VoxelBlockGrid& grid, const char* name,
+         const std::vector<float>& data) {
+  if (!vr_test::write_attribute(*g_device, *g_allocator, grid, name, data)
+           .ok()) {
+    std::abort();
+  }
 }
 
 // Write a block's content: tsdf = s * trunc, weight = w (per voxel).
 void write_block(vol::VoxelBlockGrid& grid, const vol::BlockIndex& b,
                  const Cube& s, const std::function<float(std::uint32_t)>& w) {
-  float* tsdf = attr(grid, "tsdf");
-  float* weight = attr(grid, "weight");
+  std::vector<float> tsdf = attr(grid, "tsdf");
+  std::vector<float> weight = attr(grid, "weight");
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     tsdf[std::uint32_t(b.ptr) + v] = static_cast<float>(s[v]) * kTrunc;
     weight[std::uint32_t(b.ptr) + v] = w(v);
   }
+  put(grid, "tsdf", tsdf);
+  put(grid, "weight", weight);
 }
 
 float observed(std::uint32_t) { return 2.0f; }
 
 // Read a block back in normalized units.
 Cube read_block(vol::VoxelBlockGrid& grid, const vol::BlockIndex& b) {
-  const float* tsdf = attr(grid, "tsdf");
+  const std::vector<float> tsdf = attr(grid, "tsdf");
   Cube s{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     s[v] = double(tsdf[std::uint32_t(b.ptr) + v]) / double(kTrunc);
@@ -373,7 +391,7 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
   const double dc = params.dc_step, ac = params.ac_step;
   const double bound =
       std::sqrt((dc * dc / 4.0 + (kVpb - 1) * ac * ac / 4.0) / kVpb) + 1e-5;
-  const float* weight = attr(grid, "weight");
+  const std::vector<float> weight = attr(grid, "weight");
   for (int i = 0; i < 4; ++i) {
     const double err =
         rms_diff(read_block(grid, blocks[std::size_t(i)]), content[i]);
@@ -479,15 +497,19 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   }
 
   // Poison both attributes so the inverse must write every voxel.
-  float* tsdf = attr(grid, "tsdf");
-  float* weight = attr(grid, "weight");
+  std::vector<float> tsdf = attr(grid, "tsdf");
+  std::vector<float> weight = attr(grid, "weight");
   for (const vol::BlockIndex& b : blocks) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       tsdf[std::uint32_t(b.ptr) + v] = 123.0f;
       weight[std::uint32_t(b.ptr) + v] = 123.0f;
     }
   }
+  put(grid, "tsdf", tsdf);
+  put(grid, "weight", weight);
   CHECK(t.inverse(grid, list, out).ok());
+  tsdf = attr(grid, "tsdf");
+  weight = attr(grid, "weight");
   for (std::size_t i = 0; i < 2; ++i) {
     const std::uint32_t base = std::uint32_t(blocks[i].ptr);
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -584,7 +606,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
   CHECK(*std::max_element(unclamped.begin(), unclamped.end()) > 1.2);
 
   CHECK(t.inverse(grid, list, out).ok());
-  const float* tsdf = attr(grid, "tsdf");
+  const std::vector<float> tsdf = attr(grid, "tsdf");
   bool saturated = false;
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     const float sdf = tsdf[std::uint32_t(block.ptr) + v];
@@ -738,12 +760,13 @@ int batching_case(vr::Device& device, vr::Allocator& allocator,
   for (const vol::BlockIndex& b : blocks) {
     single.push_back(read_block(grid, b));
   }
-  float* tsdf = attr(grid, "tsdf");
+  std::vector<float> tsdf = attr(grid, "tsdf");
   for (const vol::BlockIndex& b : blocks) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
     }
   }
+  put(grid, "tsdf", tsdf);
   CHECK(batched.inverse(grid, list, many).ok());
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     CHECK(read_block(grid, blocks[i]) == single[i]);
@@ -822,14 +845,16 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = unused;
-    float* tsdf = attr(grid, "tsdf");
-    float* weight = attr(grid, "weight");
+    std::vector<float> tsdf = attr(grid, "tsdf");
     for (const vol::BlockIndex& b : blocks) {
       for (std::uint32_t v = 0; v < kVpb; ++v) {
         tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
       }
     }
+    put(grid, "tsdf", tsdf);
     CHECK(!t.inverse(grid, grid.block_list(forged), out).ok());
+    tsdf = attr(grid, "tsdf");
+    const std::vector<float> weight = attr(grid, "weight");
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       CHECK(weight[std::uint32_t(unused) + v] == 0.0f);
       CHECK(tsdf[std::uint32_t(unused) + v] == 0.0f);
@@ -963,6 +988,8 @@ int main() {
   }
   vr::Device& dev = device.value();
   vr::Allocator& alloc = allocator.value();
+  g_device = &dev;
+  g_allocator = &alloc;
 
   vr::Result<DctTransform> t_r = DctTransform::create(dev, alloc);
   if (!t_r) {
