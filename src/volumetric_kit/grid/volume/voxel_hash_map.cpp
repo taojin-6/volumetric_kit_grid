@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstring>
 #include <functional>
 #include <limits>
 #include <string>
@@ -424,15 +423,15 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
   return failures + terminal;
 }
 
-Result<Buffer> VoxelHashMap::upload_to_binding(const DescriptorSet& set,
+Result<Buffer> VoxelHashMap::upload_to_binding(CommandBatch& batch,
+                                               const DescriptorSet& set,
                                                std::uint32_t binding,
                                                const void* data,
                                                VkDeviceSize bytes) {
-  VR_ASSIGN(Buffer buf,
-            storage_buffer(*allocator_, bytes, HostAccess::SequentialWrite));
-  std::memcpy(buf.mapped(), data, static_cast<std::size_t>(bytes));
+  VR_ASSIGN(Buffer buf, device_storage_buffer(*allocator_, bytes));
+  VR_TRY(batch.upload(buf, 0, data, bytes));
   set.write_storage_buffer(binding, buf.handle(), 0, VK_WHOLE_SIZE);
-  return buf;  // caller keeps it alive across the (synchronous) dispatch
+  return buf;  // caller keeps it alive until the batch has run
 }
 
 Result<std::uint32_t> VoxelHashMap::run_input_kernel(
@@ -457,9 +456,14 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   const VkDeviceSize input_bytes = VkDeviceSize(count) * elem_size;
   VR_TRY(
       check_storage_buffer_range(op, input_bytes, max_storage_buffer_range_));
-  VR_ASSIGN(Buffer input_buf,
-            upload_to_binding(kernel.set, 4, data, input_bytes));
-  return dispatch_with_retry(kernel, count, group_count(count), out_failures);
+  Buffer input_buf;  // alive across every round
+  return dispatch_with_retry(
+      kernel, count, group_count(count), out_failures, nullptr,
+      [&](CommandBatch& batch) -> Status {
+        VR_ASSIGN(input_buf,
+                  upload_to_binding(batch, kernel.set, 4, data, input_bytes));
+        return {};
+      });
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
@@ -580,17 +584,21 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
   VR_TRY(check_storage_buffer_range(
       "VoxelHashMap::allocate_from_triangles: the offset buffer", offset_bytes,
       max_storage_buffer_range_));
-  VR_ASSIGN(Buffer vertex_buf,
-            upload_to_binding(triangles_.set, 4, vertices, vertex_bytes));
-  VR_ASSIGN(Buffer index_buf,
-            upload_to_binding(triangles_.set, 6, indices, index_bytes));
-  VR_ASSIGN(Buffer offset_buf,
-            upload_to_binding(triangles_.set, 7, offsets.data(), offset_bytes));
+  Buffer vertex_buf, index_buf, offset_buf;  // alive across every round
 
   // pc.arg is the TRIANGLE count (the kernel's binary-search bound), not the
   // dispatch width -- the kernel reads that from offsets[pc.arg].
-  return dispatch_with_retry(triangles_, triangle_count, group_count(total),
-                             out_failures, &stage);
+  return dispatch_with_retry(
+      triangles_, triangle_count, group_count(total), out_failures, &stage,
+      [&](CommandBatch& batch) -> Status {
+        VR_ASSIGN(vertex_buf, upload_to_binding(batch, triangles_.set, 4,
+                                                vertices, vertex_bytes));
+        VR_ASSIGN(index_buf, upload_to_binding(batch, triangles_.set, 6,
+                                               indices, index_bytes));
+        VR_ASSIGN(offset_buf, upload_to_binding(batch, triangles_.set, 7,
+                                                offsets.data(), offset_bytes));
+        return {};
+      });
 }
 
 Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
@@ -607,12 +615,22 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
-    const ComputeKernel& kernel, GpuStageScope* stage,
-    const std::function<Status(CommandBatch&)>& prepare) {
+    const ComputeKernel& kernel, std::uint32_t& last_count,
+    GpuStageScope* stage, const std::function<Status(CommandBatch&)>& prepare) {
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   const PushConstants push{grid_, capacity};
+  // The list comes back beside its count, as far as a guess a quarter past
+  // this kernel's last count, so a set that has not outgrown it costs one
+  // submit rather than two (0.38 ms each on an RTX 5090).
+  // TODO(volume): hand consumers the device list and count instead, so an
+  // integrate or an extract sizes its dispatch on the device and the list
+  // never reaches the host.
+  const std::uint32_t guess =
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          capacity, std::uint64_t(last_count) + last_count / 4));
+  std::vector<BlockIndex> active(guess);
   std::uint32_t count = 0;
   {
     CommandBatch batch(*device_, *allocator_);
@@ -624,19 +642,20 @@ Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
                           group_count(total_entries()), max_workgroup_count_x_,
                           stage));
     VR_TRY(batch.readback(active_count_, 0, sizeof(count), &count));
+    VR_TRY(batch.readback(compacted_, 0,
+                          VkDeviceSize(guess) * sizeof(BlockIndex),
+                          active.data()));
     VR_TRY(batch.submit());
   }
   count = std::min(count, capacity);
-  std::vector<BlockIndex> active(count);
-  if (count > 0) {
-    // The list itself, sized by the count the batch above read back.
-    // TODO(volume): hand consumers the device list and count instead, so an
-    // integrate or an extract sizes its dispatch on the device and the list
-    // never reaches the host.
+  last_count = count;
+  active.resize(count);
+  if (count > guess) {
+    // It outgrew the guess: the rest in a second submit.
     CommandBatch batch(*device_, *allocator_);
-    VR_TRY(batch.readback(compacted_, 0,
-                          VkDeviceSize(count) * sizeof(BlockIndex),
-                          active.data()));
+    VR_TRY(batch.readback(compacted_, VkDeviceSize(guess) * sizeof(BlockIndex),
+                          VkDeviceSize(count - guess) * sizeof(BlockIndex),
+                          active.data() + guess));
     VR_TRY(batch.submit());
   }
   return active;
@@ -664,7 +683,7 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
     return Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
-  return collect_compacted(compact_, &stage);
+  return collect_compacted(compact_, last_active_count_, &stage);
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
@@ -676,10 +695,11 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
   }
   // The six planes are per-call; they go inline into the persistent buffer
   // bound once at binding 3 of the frustum set (like camera_params_).
-  return collect_compacted(compact_frustum_, &stage, [&](CommandBatch& batch) {
-    return batch.upload(frustum_planes_, 0, planes.data(),
-                        sizeof(FrustumPlanes));
-  });
+  return collect_compacted(
+      compact_frustum_, last_frustum_count_, &stage, [&](CommandBatch& batch) {
+        return batch.upload(frustum_planes_, 0, planes.data(),
+                            sizeof(FrustumPlanes));
+      });
 }
 
 Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks_in_frustum(
@@ -795,9 +815,14 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     // insert_block is idempotent, so re-driving the dispatch absorbs transient
     // bucket-lock contention. A residual failure is a genuine chain overflow.
     const auto count = static_cast<std::uint32_t>(active.size());
-    VR_ASSIGN(Buffer snapshot,
-              upload_to_binding(rehash_.set, 4, active.data(),
-                                VkDeviceSize(count) * sizeof(BlockIndex)));
+    Buffer snapshot;
+    const auto upload_snapshot = [&](CommandBatch& batch) -> Status {
+      if (snapshot.valid()) return {};  // the first pass uploaded it
+      VR_ASSIGN(snapshot,
+                upload_to_binding(batch, rehash_.set, 4, active.data(),
+                                  VkDeviceSize(count) * sizeof(BlockIndex)));
+      return {};
+    };
     // Keep the per-reason split rather than passing nullptr: this is the one
     // failure a caller cannot answer by growing (it *is* the grow), so the
     // reason is the only thing that makes it diagnosable -- chain overflow in
@@ -806,7 +831,8 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     AllocFailures rehash_failures{};
     for (int pass = 0; pass < kReinsertPasses; ++pass) {
       VR_ASSIGN(failed, dispatch_with_retry(rehash_, count, group_count(count),
-                                            &rehash_failures));
+                                            &rehash_failures, nullptr,
+                                            upload_snapshot));
       if (failed == 0) {
         break;
       }
@@ -862,8 +888,16 @@ Result<HashDiagnostics> VoxelHashMap::diagnostics() {
     return Status::invalid_argument(
         "VoxelHashMap::diagnostics: moved-from map");
   }
-  VR_ASSIGN(std::vector<HashEntry> entries, read_entries());
-  const std::uint32_t heap_free = heap_free_;
+  // The table and the device's own heap counter in one batch -- not the
+  // host copy load_factor() reads, so this is what can catch that copy stale.
+  std::vector<HashEntry> entries(total_entries());
+  std::uint32_t heap_free = 0;
+  CommandBatch batch(*device_, *allocator_);
+  VR_TRY(batch.readback(entries_, 0,
+                        VkDeviceSize(entries.size()) * sizeof(HashEntry),
+                        entries.data()));
+  VR_TRY(batch.readback(heap_counter_, 0, sizeof(heap_free), &heap_free));
+  VR_TRY(batch.submit());
 
   const int num_buckets = grid_.num_buckets;
   const int bucket_size = grid_.bucket_size;

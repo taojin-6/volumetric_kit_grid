@@ -458,9 +458,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief Compute occupancy + health statistics (active / overflow / chain
   ///        length + heap utilization).
   ///
-  /// A host-side scan of the entries, read back whole, plus the heap counter --
-  /// O(total slots), so call it for inspection/logging, not per frame. A
-  /// GPU-side scan is a perf follow-up for very large tables.
+  /// A host-side scan of the entries, read back whole, plus the device's heap
+  /// counter -- O(total slots), so call it for inspection/logging, not per
+  /// frame. A GPU-side scan is a perf follow-up for very large tables.
   /// @return The statistics, or a non-OK @ref Status (e.g. moved-from map).
   Result<HashDiagnostics> diagnostics();
 
@@ -529,10 +529,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// over every hash slot, then read back the appended @ref BlockIndex list.
   /// Used by @ref compact_active_blocks (plain) and
   /// @ref compact_active_blocks_in_frustum (whose set also carries the planes,
-  /// which @p prepare uploads in the dispatch's batch).
-  /// @p stage, when non-null, collects the dispatch's device span.
+  /// which @p prepare uploads in the dispatch's batch). @p last_count is that
+  /// kernel's previous count, which sizes the list read back in the same
+  /// batch, and is updated. @p stage, when non-null, collects the dispatch's
+  /// device span.
   Result<std::vector<BlockIndex>> collect_compacted(
-      const ComputeKernel& kernel, GpuStageScope* stage,
+      const ComputeKernel& kernel, std::uint32_t& last_count,
+      GpuStageScope* stage,
       const std::function<Status(CommandBatch&)>& prepare = {});
 
   /// The row label both compaction entry points report under, carrying
@@ -566,10 +569,12 @@ class VR_VOLUME_API VoxelHashMap {
                                             AllocFailures* out_failures,
                                             StageMetrics* metrics);
 
-  /// Create a transient host-visible buffer holding @p bytes of @p data and
-  /// bind it at @p binding of @p set. The caller keeps the returned @ref Buffer
-  /// alive across the (synchronous) dispatch that reads it.
-  Result<Buffer> upload_to_binding(const DescriptorSet& set,
+  /// Create a transient device-local buffer that @p batch fills with @p bytes
+  /// of @p data, and bind it at @p binding of @p set. The caller keeps the
+  /// returned @ref Buffer alive until the batch, and any round after it that
+  /// reads the binding, has run.
+  Result<Buffer> upload_to_binding(CommandBatch& batch,
+                                   const DescriptorSet& set,
                                    std::uint32_t binding, const void* data,
                                    VkDeviceSize bytes);
 
@@ -633,6 +638,10 @@ class VR_VOLUME_API VoxelHashMap {
   // only dispatches that move the counter. Copied by the defaulted move, and
   // harmlessly left on a moved-from map, whose load_factor() is refused.
   std::uint32_t heap_free_ = 0;
+  // Each compaction kernel's last count, from which collect_compacted guesses
+  // how much of the list to read back beside the next count.
+  std::uint32_t last_active_count_ = 0;
+  std::uint32_t last_frustum_count_ = 0;
 
   // The shared descriptor pool the kernels' sets are allocated from. Declared
   // BEFORE the ComputeKernel members so it is destroyed AFTER them (members

@@ -41,13 +41,9 @@ constexpr float kVoxel = 0.005f;
 constexpr float kTrunc = 0.04f;
 constexpr std::uint32_t kVpb = 512;
 
-// The device and allocator every case runs on. Held by reference, never moved:
-// the allocator and every tier keep references to the device, so a test's
-// main keeps all three where it created them.
-struct Gpu {
-  vr::Device& device;
-  vr::Allocator& allocator;
-};
+// The device and allocator every case runs on, never moved: the allocator
+// and every tier keep references to the device.
+using Gpu = vr_test::Gpu;
 
 struct GridShape {
   float voxel_size = kVoxel;

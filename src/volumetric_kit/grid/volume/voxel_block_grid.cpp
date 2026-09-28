@@ -4,7 +4,6 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -24,22 +23,6 @@ namespace {
 std::uint64_t voxel_count(const VoxelGridParams& grid) {
   return static_cast<std::uint64_t>(grid.num_blocks) *
          static_cast<std::uint64_t>(grid.voxels_per_block);
-}
-
-// Zero `bytes` of `buffer` at `offset` in `batch`. The 4-byte-aligned middle is
-// one fill; an unaligned edge -- an attribute of 3-byte elements in a block of
-// odd size -- is a few zero bytes uploaded, since vkCmdFillBuffer writes whole
-// words only.
-Status zero_range(CommandBatch& batch, const Buffer& buffer,
-                  VkDeviceSize offset, VkDeviceSize bytes) {
-  static constexpr unsigned char kZeros[4] = {};
-  const VkDeviceSize end = offset + bytes;
-  const VkDeviceSize first_word =
-      std::min((offset + 3) & ~VkDeviceSize{3}, end);
-  const VkDeviceSize last_word = std::max(end & ~VkDeviceSize{3}, first_word);
-  VR_TRY(batch.upload(buffer, offset, kZeros, first_word - offset));
-  VR_TRY(batch.fill(buffer, first_word, last_word - first_word, 0u));
-  return batch.upload(buffer, last_word, kZeros, end - last_word);
 }
 
 }  // namespace
@@ -104,7 +87,7 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
     const auto bytes = static_cast<VkDeviceSize>(elements) *
                        static_cast<VkDeviceSize>(spec.element_size);
     VR_ASSIGN(Buffer buffer, device_storage_buffer(allocator, bytes));
-    VR_TRY(zero_range(zero, buffer, 0, bytes));
+    VR_TRY(zero.zero(buffer, 0, bytes));
     vbg.attributes_.push_back(Attribute{std::string(spec.name),
                                         spec.element_size, std::move(buffer)});
   }
@@ -244,7 +227,7 @@ Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
     VR_ASSIGN(Buffer buffer, device_storage_buffer(*allocator_, new_bytes));
     const VkDeviceSize old_bytes = attr.buffer.size();
     VR_TRY(batch.copy(attr.buffer, 0, buffer, 0, old_bytes));
-    VR_TRY(zero_range(batch, buffer, old_bytes, new_bytes - old_bytes));
+    VR_TRY(batch.zero(buffer, old_bytes, new_bytes - old_bytes));
     grown.push_back(std::move(buffer));
   }
   VR_TRY(batch.submit());
@@ -308,26 +291,27 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
     }
     // Zero each block's slice of every attribute on the device, in one batch.
     // Sorted and merged, so blocks the LIFO heap handed out side by side cost
-    // one fill, not one each.
+    // one fill, not one each; and attribute by attribute, so each array's
+    // fills rise through it and share one barrier (see CommandBatch).
     std::sort(firsts.begin(), firsts.end());
     firsts.erase(std::unique(firsts.begin(), firsts.end()), firsts.end());
     CommandBatch batch(*device_, *allocator_);
-    for (std::size_t i = 0; i < firsts.size();) {
-      std::size_t j = i + 1;
-      while (j < firsts.size() &&
-             firsts[j] == firsts[j - 1] + voxels_per_block) {
-        ++j;
-      }
-      const std::uint64_t voxels = (j - i) * voxels_per_block;
-      for (const Attribute& attr : attributes_) {
+    for (const Attribute& attr : attributes_) {
+      for (std::size_t i = 0; i < firsts.size();) {
+        std::size_t j = i + 1;
+        while (j < firsts.size() &&
+               firsts[j] == firsts[j - 1] + voxels_per_block) {
+          ++j;
+        }
         const std::uint64_t offset = firsts[i] * attr.element_size;
-        const std::uint64_t bytes = voxels * attr.element_size;
+        const std::uint64_t bytes =
+            (j - i) * voxels_per_block * attr.element_size;
+        i = j;
         if (offset + bytes > attr.buffer.size()) {
           continue;  // an out-of-lockstep array; attribute() reports it
         }
-        VR_TRY(zero_range(batch, attr.buffer, offset, bytes));
+        VR_TRY(batch.zero(attr.buffer, offset, bytes));
       }
-      i = j;
     }
     VR_TRY(batch.submit());
   }
@@ -342,16 +326,16 @@ Status VoxelBlockGrid::clear() {
   if (!valid()) {
     return Status::invalid_argument("VoxelBlockGrid::clear: moved-from grid");
   }
-  // Order matters only in that both must happen; the map clear is the one that
-  // can fail, so run it first and leave the attributes untouched if it does --
-  // zeroed attributes under a still-populated table would read as fused blocks
-  // that lost their data.
-  VR_TRY(map_.clear());  // moves the topology epoch; see topology_epoch()
+  // Zero first, then free: a failure between the two leaves every block
+  // still owning its index, at worst reading as unobserved. Freeing first
+  // would hand the indices back over the old surface if the zeroing then
+  // failed, and the LIFO heap would re-draw them onto it at full weight.
   CommandBatch batch(*device_, *allocator_);
   for (const Attribute& attr : attributes_) {
-    VR_TRY(zero_range(batch, attr.buffer, 0, attr.buffer.size()));
+    VR_TRY(batch.zero(attr.buffer, 0, attr.buffer.size()));
   }
-  return batch.submit();
+  VR_TRY(batch.submit());
+  return map_.clear();  // moves the topology epoch; see topology_epoch()
 }
 
 Status VoxelBlockGrid::check_block_list(const BlockList& blocks,

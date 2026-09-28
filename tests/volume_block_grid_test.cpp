@@ -130,15 +130,29 @@ int main() {
                                     name, data)
         .ok();
   };
+  // load_factor() reads a host copy of the heap counter, and diagnostics()
+  // the device's own: the two agree after every call that moves it.
+  const auto heap_agrees = [&]() {
+    vr::Result<float> lf = vbg.map().load_factor();
+    vr::Result<vol::HashDiagnostics> d = vbg.map().diagnostics();
+    return lf.ok() && d.ok() &&
+           lf.value() == 1.0f - static_cast<float>(d.value().heap_free_count) /
+                                    static_cast<float>(d.value().total_blocks);
+  };
   std::vector<float> tsdf_data = get("tsdf");
   std::vector<float> weight_data = get("weight");
+  for (std::uint64_t i = 0; i < voxels; ++i) {  // zeroed on the device
+    CHECK(tsdf_data[i] == 0.0f && weight_data[i] == 0.0f);
+  }
+  // Both ends of both arrays round-trip through the device.
   const std::uint64_t last = voxels - 1;
-  CHECK(tsdf_data[0] == 0.0f && weight_data[0] == 0.0f);  // zero-initialised
-  CHECK(tsdf_data[last] == 0.0f && weight_data[last] == 0.0f);
   tsdf_data[0] = 1.5f;
   tsdf_data[last] = 2.5f;
   weight_data[0] = 10.0f;
   weight_data[last] = 20.0f;
+  CHECK(put("tsdf", tsdf_data) && put("weight", weight_data));
+  tsdf_data = get("tsdf");
+  weight_data = get("weight");
   CHECK(tsdf_data[0] == 1.5f && tsdf_data[last] == 2.5f);
   CHECK(weight_data[0] == 10.0f && weight_data[last] == 20.0f);
 
@@ -159,6 +173,7 @@ int main() {
   vr::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
   CHECK(active.ok() && active.value().size() == cube.size());
+  CHECK(heap_agrees());
 
   // A block's ptr keys into the attribute arrays at [ptr, ptr +
   // voxels_per_block): ptr is voxel-granular (block_idx * voxels_per_block), so
@@ -175,15 +190,18 @@ int main() {
   CHECK(ptr_b >= 0 && static_cast<std::uint64_t>(ptr_b) + vpb <= voxels);
   // Fill block A's whole tsdf range, then set only block B's base: disjoint
   // ranges mean B never reaches A's last voxel and A's fill never reaches B.
+  // Block A's weight goes in too, written after its tsdf: the two arrays are
+  // independent buffers, so the weight must leave the tsdf as it was.
   for (std::int32_t i = 0; i < vpb; ++i) {
     tsdf_data[ptr_a + i] = -0.02f;
   }
   tsdf_data[ptr_b] = 0.75f;
+  weight_data[ptr_a] = 30.0f;
+  CHECK(put("tsdf", tsdf_data) && put("weight", weight_data));
+  tsdf_data = get("tsdf");
+  weight_data = get("weight");
   CHECK(tsdf_data[ptr_a + vpb - 1] == -0.02f);  // B did not overwrite A
   CHECK(tsdf_data[ptr_b] == 0.75f);             // A did not overwrite B
-  // SoA independence at a live block: writing block A's weight leaves its tsdf
-  // untouched (independent buffers, not interleaved AoS).
-  weight_data[ptr_a] = 30.0f;
   CHECK(weight_data[ptr_a] == 30.0f && tsdf_data[ptr_a] == -0.02f);
 
   // Resize with attribute preservation: VoxelBlockGrid::resize grows every
@@ -196,8 +214,8 @@ int main() {
   const std::size_t before_count = before.value().size();
 
   const std::int32_t new_buckets = grid.num_buckets * 4;
-  CHECK(put("tsdf", tsdf_data) && put("weight", weight_data));
   CHECK(vbg.resize(new_buckets).ok());
+  CHECK(heap_agrees());
   CHECK(vbg.map().grid().num_buckets == new_buckets);  // the map grew
   const std::uint64_t new_voxels =
       static_cast<std::uint64_t>(grid.bucket_size) *
@@ -260,6 +278,7 @@ int main() {
 
     vr::Result<std::uint32_t> removed = vbg.remove(&fresh, 1);
     CHECK(removed.ok() && removed.value() == 0);
+    CHECK(heap_agrees());
     tsdf_grown_data = get("tsdf");
     weight_grown_data = get("weight");
     // Cleared at the removed block's own range, both attributes, whole block.
@@ -318,6 +337,7 @@ int main() {
     CHECK(put("tsdf", tsdf_grown_data));
     vr::Result<std::uint32_t> removed = vbg.remove(blocks + 1, 2);
     CHECK(removed.ok() && removed.value() == 0);
+    CHECK(heap_agrees());
     tsdf_grown_data = get("tsdf");
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
     CHECK(tsdf_grown_data[ptrs[1]] == 0.0f);
@@ -331,6 +351,7 @@ int main() {
     tsdf_grown_data[ptr_a] = -0.02f;
     CHECK(put("tsdf", tsdf_grown_data));
     CHECK(vbg.clear().ok());
+    CHECK(heap_agrees() && vbg.map().load_factor().value() == 0.0f);
     tsdf_grown_data = get("tsdf");
     weight_grown_data = get("weight");
     CHECK(tsdf_grown_data[ptr_a] == 0.0f);

@@ -254,7 +254,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @param count   How many.
   /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
   /// @return What @ref VoxelHashMap::remove returns, or a non-OK @ref Status if
-  ///         the grid is moved-from, @p coords is null, or the snapshot fails.
+  ///         the grid is moved-from, @p coords is null, or the snapshot or the
+  ///         zeroing fails. Either failure comes before any index is freed.
   Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
                                AllocFailures* out_failures = nullptr);
 
@@ -263,9 +264,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @ref VoxelHashMap::clear returns every block to the heap, so every
   /// attribute range is about to be re-drawn; zeroing them here is what keeps
   /// "a freshly allocated block reads as zero" true after a clear, exactly as
-  /// it is after @ref create.
-  /// @return OK, or a non-OK @ref Status if the grid is moved-from or the
-  ///         underlying @ref VoxelHashMap::clear fails.
+  /// it is after @ref create. The zeroing runs first, so a failure never frees
+  /// an index over stale data.
+  /// @return OK, or a non-OK @ref Status if the grid is moved-from, the
+  ///         zeroing fails, or the underlying @ref VoxelHashMap::clear fails.
   Status clear();
 
   /// @return `true` if an attribute of @p name was declared.
