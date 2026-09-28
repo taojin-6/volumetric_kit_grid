@@ -15,7 +15,10 @@
 // delete acts on presence, and a concurrent delete of a neighbouring chain node
 // can transiently make a still-present coord read absent, so trusting a
 // lock-free "absent" read would silently drop the delete. Every search here is
-// therefore authoritative under the bucket lock.
+// therefore authoritative under the bucket lock. A later round skips what an
+// earlier one settled instead: a coord the lock proved removed or absent is
+// flagged done, so a retry round contends only over the coords still
+// unresolved.
 //
 // Voxel-data clearing (the Metal path zeroed SDF/color on free) is NOT done
 // here, and deliberately so: this kernel belongs to the block index, which
@@ -46,6 +49,8 @@ layout(set = 0, binding = 4, scalar) readonly buffer Coords {
   BlockIndex coords[];
 };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
+// One flag per coord, zeroed by the host before the first round.
+layout(set = 0, binding = 6) buffer Done { uint done[]; };
 
 // --- helpers (the allocate kernel has its own lock copies) ---
 
@@ -142,7 +147,7 @@ bool delete_linked_list(uint target_idx, uint prev_idx, uint hash_bucket) {
 
 void main() {
   uint gid = gl_GlobalInvocationID.x;
-  if (gid >= pc.arg) {
+  if (gid >= pc.arg || done[gid] != 0u) {
     return;
   }
   ivec3 coord = coords[gid].coord;
@@ -205,6 +210,7 @@ void main() {
     // primary or chain) retries; if every attempt loses it is counted below, so
     // the host learns rather than the block silently staying resident.
     if (success || !found) {
+      done[gid] = 1u;
       return;
     }
   }

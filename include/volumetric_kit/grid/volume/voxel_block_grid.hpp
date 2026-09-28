@@ -249,7 +249,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// range first, matching the state @ref create leaves a fresh array in.
   ///
   /// The ranges are resolved from a snapshot of the active set, so a coord that
-  /// is not currently allocated costs nothing and clears nothing.
+  /// is not currently allocated costs nothing and clears nothing. They are
+  /// zeroed before the map's remove runs, so a block that call leaves in the
+  /// table (@ref AllocFailures::lock) is left zeroed, reading as a freshly
+  /// allocated block until a later call removes it.
   /// @param coords  The block coordinates to remove (only `coord` is read).
   /// @param count   How many.
   /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
