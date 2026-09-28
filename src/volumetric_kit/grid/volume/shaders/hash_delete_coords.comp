@@ -34,21 +34,20 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
+#include "hash_heap.glsl"
 
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0, scalar) coherent buffer Entries {
   HashEntry entries[];
 };
-layout(set = 0, binding = 1) coherent buffer Heap { uint heap[]; };
-layout(set = 0, binding = 2) coherent buffer HeapCounter { uint heap_counter; };
 layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
 layout(set = 0, binding = 4, scalar) readonly buffer Coords {
   BlockIndex coords[];
 };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
 
-// --- helpers (self-contained; the allocate kernel has its own copies) ---
+// --- helpers (the allocate kernel has its own lock copies) ---
 
 bool try_lock_bucket(uint bucket, int max_retries) {
   for (int a = 0; a < max_retries; ++a) {
@@ -66,34 +65,15 @@ void unlock_bucket(uint bucket) {
   atomicExchange(bucket_mutex[bucket], kFreeEntry);
 }
 
-// Return a freed block index to the heap. A block that cannot be returned is a
-// capacity leak, so both exits without an append report rather than dropping the
-// block silently.
-//
-// They report through kFailTerminal, NOT kFailTotal, because this failure is
-// not retryable: the entry was cleared from the table before we got here, so a
-// re-dispatch of the same coord list finds it absent and returns without
-// counting anything. Counted as a retryable failure it would read as zero
-// failures on the next round and the host would report a clean delete over a
-// permanently unreachable block index. The host accumulates this slot across
-// rounds instead (see VoxelHashMap::dispatch_with_retry).
-void append_heap(uint block_idx) {
-  uint old = atomicAdd(heap_counter, 0u);  // atomic load
-  for (int a = 0; a < kMaxHeapRetries; ++a) {
-    if (old >= uint(pc.grid.num_blocks)) {
-      // heap full: we only free what we allocated
-      atomicAdd(fail_count[kFailTerminal], 1u);
-      return;
-    }
-    uint prev = atomicCompSwap(heap_counter, old, old + 1u);
-    if (prev == old) {
-      heap[old] = block_idx;
-      return;
-    }
-    old = prev;
+// Return a freed block index to the heap. A full heap is reported through
+// kFailTerminal, NOT kFailTotal, because it is not retryable: the entry was
+// cleared from the table before we got here, so a re-dispatch of the same
+// coord list finds it absent and counts nothing. The host accumulates this
+// slot across rounds instead (see VoxelHashMap::dispatch_with_retry).
+void free_block(uint block_idx) {
+  if (!append_heap(block_idx)) {
+    atomicAdd(fail_count[kFailTerminal], 1u);
   }
-  // counter CAS starved under contention
-  atomicAdd(fail_count[kFailTerminal], 1u);
 }
 
 uint block_of(int ptr) { return uint(ptr) / uint(pc.grid.voxels_per_block); }
@@ -122,7 +102,7 @@ bool delete_primary(uint target_slot, uint hash_bucket) {
     entries[next_idx].offset = kNoOffset;
     memoryBarrierBuffer();
     atomicExchange(entries[next_idx].ptr, kFreeEntry);
-    append_heap(block_of(old_ptr));
+    free_block(block_of(old_ptr));
     if (different) {
       unlock_bucket(next_bucket);
     }
@@ -132,7 +112,7 @@ bool delete_primary(uint target_slot, uint hash_bucket) {
     entries[target_slot].offset = kNoOffset;
     memoryBarrierBuffer();
     atomicExchange(entries[target_slot].ptr, kFreeEntry);
-    append_heap(block_of(saved_ptr));
+    free_block(block_of(saved_ptr));
   }
   return true;
 }
@@ -152,7 +132,7 @@ bool delete_linked_list(uint target_idx, uint prev_idx, uint hash_bucket) {
   entries[target_idx].offset = kNoOffset;
   memoryBarrierBuffer();
   atomicExchange(entries[target_idx].ptr, kFreeEntry);
-  append_heap(block_of(saved_ptr));
+  free_block(block_of(saved_ptr));
   entries[prev_idx].offset = curr_offset;  // splice out
   if (different) {
     unlock_bucket(target_bucket);
