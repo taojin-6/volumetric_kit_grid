@@ -562,8 +562,7 @@ Status MarchingCubes::ensure_indirect_command(CommandBatch& batch,
         device_storage_buffer(
             *allocator_, kIndirectBufferBytes,
             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | config_.extra_indirect_usage,
-            config_.queue_family_count > 0 ? config_.queue_families : nullptr,
-            config_.queue_family_count));
+            config_.queue_families, config_.queue_family_count));
     name_slot_buffer(indirect(), "mesh.indirect[%u]");
   }
   // This reset may be seeded, and the dispatch after it counts.
@@ -861,8 +860,7 @@ Status MarchingCubes::ensure_output_buffers(CommandBatch& batch,
         device_storage_buffer(
             *allocator_,
             static_cast<VkDeviceSize>(arena_bytes_for(target_vertex_capacity)),
-            config_.extra_vertex_usage,
-            config_.queue_family_count > 0 ? config_.queue_families : nullptr,
+            config_.extra_vertex_usage, config_.queue_families,
             config_.queue_family_count));
   }
   if (grow_index_run) {
@@ -872,8 +870,7 @@ Status MarchingCubes::ensure_output_buffers(CommandBatch& batch,
         device_storage_buffer(
             *allocator_,
             static_cast<VkDeviceSize>(index_run_bytes_for(target_capacity)),
-            config_.extra_index_usage,
-            config_.queue_family_count > 0 ? config_.queue_families : nullptr,
+            config_.extra_index_usage, config_.queue_families,
             config_.queue_family_count));
     if (!config_.share_vertices) {
       // The kernel writes vertices at `tri * 3`, so the run IS the identity
@@ -950,16 +947,9 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   }
 
   // Caught here rather than at the first arena grow, where it would surface as
-  // a buffer-creation failure several frames into a scan. Allocator applies the
-  // same limit to *distinct* families; this bounds what the config can carry at
-  // all, since the array is fixed-size and a count past it would read past the
-  // end.
-  if (config.queue_family_count > BufferDesc::kMaxQueueFamilies) {
-    return Status::invalid_argument(
-        "MarchingCubes::create: queue_family_count must be 0.." +
-        std::to_string(BufferDesc::kMaxQueueFamilies) + " (got " +
-        std::to_string(config.queue_family_count) + ")");
-  }
+  // a buffer-creation failure several frames into a scan.
+  VR_TRY(check_queue_family_count(config.queue_family_count,
+                                  "MarchingCubes::create"));
 
   if (config.slot_count == 0 || config.slot_count > kMaxSlots) {
     return Status::invalid_argument(
