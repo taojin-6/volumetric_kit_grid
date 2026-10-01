@@ -3,11 +3,12 @@
 
 // The block stamps and the GC over them. Every allocation path stamps the
 // blocks it asks for -- inserted or already there -- with the map's tick
-// (`requested`); the grid's block pass stamps the blocks holding weight
-// (`weighted`); and free_stale_blocks frees exactly the blocks that have been
-// neither for max_age ticks. A freed slot's record is zeroed, resize keeps
-// every record in its slot (the rehash does not restamp), and clear zeroes
-// them all. Exits 0 (skip) where no device is present.
+// (`requested`); the grid's block pass stamps the blocks holding an observed
+// voxel (`weighted`); and free_stale_blocks frees exactly the blocks that have
+// been neither for max_age ticks, zeroing their voxels. A freed slot's record
+// is zeroed, resize keeps every record in its slot (the rehash does not
+// restamp), and clear zeroes them all. Exits 0 (skip) where no device is
+// present.
 
 #include <cstdint>
 #include <cstdio>
@@ -132,13 +133,22 @@ int main() {
     CHECK(st.value()[s].requested == 1 && st.value()[s].weighted == 0);
   }
 
-  // The first block holds weight; at tick 3 the pass stamps it, and asking
-  // for the third again restamps that one.
+  // The first block holds weight. The second holds a tsdf and a weight under
+  // kObservedWeight, which the mesher and the codec read as none, and so does
+  // the pass. At tick 3 the pass stamps the first, and asking for the third
+  // again restamps that one.
   {
     auto w = vr_test::read_attribute<float>(dev, alloc, grid, "weight");
-    CHECK(w.ok());
+    auto t = vr_test::read_attribute<float>(dev, alloc, grid, "tsdf");
+    CHECK(w.ok() && t.ok());
     w.value()[std::size_t{a} * 512 + 7] = 1.0f;
+    w.value()[std::size_t{b} * 512 + 7] = 0.5f * vol::kObservedWeight;
+    t.value()[std::size_t{a} * 512 + 7] = 0.25f;
+    for (std::size_t k = 0; k < 512; ++k) {
+      t.value()[std::size_t{b} * 512 + k] = 0.5f;
+    }
     CHECK(vr_test::write_attribute(dev, alloc, grid, "weight", w.value()).ok());
+    CHECK(vr_test::write_attribute(dev, alloc, grid, "tsdf", t.value()).ok());
   }
   map.advance_tick();
   map.advance_tick();
@@ -166,6 +176,42 @@ int main() {
   CHECK(st.ok());
   CHECK(st.value()[b].requested == 0 && st.value()[b].weighted == 0);
   CHECK(st.value()[a].weighted == 4);
+  // Its voxels are zeroed, every attribute, and the kept block's stay.
+  {
+    auto w = vr_test::read_attribute<float>(dev, alloc, grid, "weight");
+    auto t = vr_test::read_attribute<float>(dev, alloc, grid, "tsdf");
+    CHECK(w.ok() && t.ok());
+    for (std::size_t k = 0; k < 512; ++k) {
+      CHECK(w.value()[std::size_t{b} * 512 + k] == 0.0f &&
+            t.value()[std::size_t{b} * 512 + k] == 0.0f);
+    }
+    CHECK(w.value()[std::size_t{a} * 512 + 7] == 1.0f &&
+          t.value()[std::size_t{a} * 512 + 7] == 0.25f);
+  }
+
+  // Move-assigning carries the block pass along: into a moved-from grid, and
+  // over one that has run its own over fewer attributes.
+  {
+    vol::VoxelBlockGrid other = std::move(grid);
+    CHECK(other.stamp_blocks().ok());
+    grid = std::move(other);
+    CHECK(grid.stamp_blocks().ok());
+    // NOLINTNEXTLINE(bugprone-use-after-move) -- asserting it is empty
+    CHECK(other.stamp_blocks().domain() == vr::Status::Code::InvalidArgument);
+
+    const vol::AttributeSpec wider[] = {{"tsdf", sizeof(float)},
+                                        {"weight", sizeof(float)},
+                                        {"color", sizeof(std::uint32_t)}};
+    auto wide = vol::VoxelBlockGrid::create(dev, alloc, params(), wider, 3);
+    auto narrow = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
+    CHECK(wide.ok() && narrow.ok());
+    CHECK(wide->map().allocate(three, 1).ok());
+    CHECK(narrow->stamp_blocks().ok());
+    narrow.value() = std::move(wide).value();
+    narrow->map().advance_tick();
+    auto gone = narrow->free_stale_blocks(1);
+    CHECK(gone.ok() && gone.value() == 1);
+  }
 
   // Every allocation path stamps what it asks for, through a binding of its
   // own: coords (above), points, triangles and depth.

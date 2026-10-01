@@ -128,6 +128,14 @@ class VR_VOLUME_API VoxelBlockGrid {
     if (this != &other) {
       map_ = std::move(other.map_);
       attributes_ = std::move(other.attributes_);
+      block_pool_ = std::move(other.block_pool_);
+      stamp_kernel_ = std::move(other.stamp_kernel_);
+      zero_kernel_ = std::move(other.zero_kernel_);
+      zero_sets_ = std::move(other.zero_sets_);
+      gpu_timer_ = std::move(other.gpu_timer_);
+      stale_list_ = std::move(other.stale_list_);
+      stale_count_ = std::move(other.stale_count_);
+      max_workgroup_count_x_ = other.max_workgroup_count_x_;
       max_storage_buffer_range_ = other.max_storage_buffer_range_;
       device_ = other.device_;
       allocator_ = other.allocator_;
@@ -308,11 +316,13 @@ class VR_VOLUME_API VoxelBlockGrid {
   bool valid() const noexcept { return map_.valid(); }
 
   /// @brief The block pass: stamp `weighted` with the map's tick
-  ///        (@ref VoxelHashMap::tick) on every active block any of whose
-  ///        voxels holds weight.
+  ///        (@ref VoxelHashMap::tick) on every active block holding an
+  ///        observed voxel (`weight >= kObservedWeight`, as the mesher and
+  ///        the codec read it).
   ///
   /// One workgroup per active block, reading its `weight` attribute, so it is
-  /// meant for every few ticks rather than every fuse.
+  /// meant for every few ticks rather than every fuse. Its kernels are built
+  /// on the first call.
   /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
   ///                 over the compaction's `"  ..active set"`.
   /// @return OK; @ref Status::Code::InvalidArgument for a moved-from grid or
@@ -326,11 +336,14 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// So a block the allocator still asks for stays, holding weight or not --
   /// the band around the surface the cameras see -- and so does one still
   /// holding weight, seen or not; what goes is space a surface has left.
-  /// Freeing moves the map's topology epoch, as any @ref remove does.
+  /// Freeing moves the map's topology epoch, as any @ref remove does. Ages
+  /// are differences of ticks, so they hold across the clock's wrap.
   /// @param max_age  Ticks a block may be neither and stay; at least 1.
   /// @param metrics  As @ref stamp_blocks, the row spanning the frees too.
   /// @return The blocks freed; @ref Status::Code::InvalidArgument for a
-  ///         @p max_age of 0, or what @ref stamp_blocks and @ref remove refuse.
+  ///         @p max_age of 0 or an attribute whose block is not whole 4-byte
+  ///         words (an odd block size with an element under 4 bytes), or what
+  ///         @ref stamp_blocks and @ref VoxelHashMap::remove refuse.
   Result<std::uint32_t> free_stale_blocks(std::uint32_t max_age,
                                           StageMetrics* metrics = nullptr);
 
@@ -362,21 +375,27 @@ class VR_VOLUME_API VoxelBlockGrid {
     Buffer buffer;
   };
 
-  // The block pass: stamps, and with a max_age the stale blocks' list.
-  Result<std::vector<BlockIndex>> block_pass(std::uint32_t max_age,
-                                             GpuStageScope& stage,
-                                             StageMetrics* metrics);
+  // Build the block pass's kernels, timer and count on its first call, so a
+  // grid that never runs one never pays for them.
+  Status prepare_block_pass();
+  // The block pass: stamps, and with a max_age the stale blocks listed in
+  // stale_list_. Returns how many.
+  Result<std::uint32_t> block_pass(std::uint32_t max_age, GpuStageScope& stage,
+                                   StageMetrics* metrics);
   // Zero every attribute of the blocks whose first voxels these are, in one
   // batch: sorted and merged runs, attribute by attribute.
   Status zero_blocks(std::vector<std::uint64_t> firsts);
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
-  // The block pass's kernel (its pool first, so it outlives the set), its
-  // device timer, and its stale list and count; the list grows to the most
-  // active blocks a pass has seen.
-  DescriptorPool stamp_pool_;
+  // The block pass's kernels (their pool first, so it outlives the sets): the
+  // stamp pass, and the zeroing of the stale blocks, a set an attribute. Then
+  // its device timer, and its stale list and count; the list grows to the
+  // most active blocks a pass has seen.
+  DescriptorPool block_pool_;
   ComputeKernel stamp_kernel_;
+  ComputeKernel zero_kernel_;
+  KernelSets zero_sets_;
   GpuTimer gpu_timer_;
   Buffer stale_list_;
   Buffer stale_count_;

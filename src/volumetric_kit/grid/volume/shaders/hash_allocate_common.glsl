@@ -364,9 +364,10 @@ int allocate_block(ivec3 coord) {
 #ifdef VR_STAMPS_BINDING
   if (fail < 0) {
     // Atomic only because a band's blocks are asked for by many lanes at
-    // once; they all write the same tick.
-    atomicMax(stamps[uint(ptr) / uint(pc.grid.voxels_per_block)].requested,
-              pc.tick);
+    // once; they all write the same tick. An exchange, not a max, so the
+    // stamp follows the clock across its wrap.
+    uint slot = uint(ptr) / uint(pc.grid.voxels_per_block);
+    atomicExchange(stamps[slot].requested, pc.tick);
   }
 #endif
   return fail;
