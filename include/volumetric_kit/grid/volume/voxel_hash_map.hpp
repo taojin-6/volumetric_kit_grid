@@ -16,6 +16,7 @@
 #include "volumetric_kit/recon/core/buffer.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -29,7 +30,6 @@
 namespace volumetric_kit::recon {
 class CommandBatch;
 class Device;
-class StorageInput;
 }  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::volume {
@@ -90,6 +90,16 @@ struct AllocFailures {
   bool capacity_limited() const noexcept {
     return chain > 0 || heap > 0 || table > 0;
   }
+};
+
+/// @brief One camera's depth frame, for @ref VoxelHashMap::allocate_from_depth
+///        over several cameras at once.
+struct DepthInput {
+  /// Row-major depth in **metres**, `camera.width * camera.height` samples:
+  /// a host array, staged in the call's first round, or a storage buffer,
+  /// bound in place.
+  StorageInput depth;
+  DepthCameraParams camera;  ///< Intrinsics, depth range, size and pose.
 };
 
 /// @brief A compacted active set on the device: @ref count @ref BlockIndex
@@ -218,6 +228,25 @@ class VR_VOLUME_API VoxelHashMap {
   ///         the image.
   Result<std::uint32_t> allocate_from_depth(
       const Buffer& depth, const DepthCameraParams& camera,
+      AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
+
+  /// @brief @ref allocate_from_depth for several cameras' frames at once: one
+  ///        submit a round rather than one a frame.
+  ///
+  /// Each round dispatches every frame, in order, in one batch, and reads the
+  /// tally back once. A retry round dispatches them all again, the blocks
+  /// already present taking the lookup's lock-free path. The blocks allocated
+  /// are those allocating the frames one after another gives; only the slot
+  /// each lands in can differ, as it can between two runs of one frame.
+  /// @param frames        The frames. Every one is checked, as the
+  ///                      one-frame overloads check theirs, before any work;
+  ///                      none allocates nothing.
+  /// @param out_failures  As @ref allocate_from_depth, over every frame.
+  /// @param metrics       As @ref allocate_from_depth: one `"allocate"` row,
+  ///                      a device span per frame per round.
+  /// @return As @ref allocate_from_depth, the failures summed over the frames.
+  Result<std::uint32_t> allocate_from_depth(
+      const std::vector<DepthInput>& frames,
       AllocFailures* out_failures = nullptr, StageMetrics* metrics = nullptr);
 
   /// @brief Allocate voxel blocks from a world-space point cloud.
@@ -585,32 +614,31 @@ class VR_VOLUME_API VoxelHashMap {
   /// already has a stage open.
   static const char* active_set_row(const StageMetrics* metrics) noexcept;
 
-  /// Dispatch @p kernel (push arg = @p arg) over @p groups groups,
-  /// re-dispatching while the shared `fail_counts_[kFailTotal]` tally is
+  /// Record what @p dispatches records each round, re-dispatching while the
+  /// shared `fail_counts_[kFailTotal]` tally is
   /// non-zero, to converge past transient same-bucket lock contention, until a
   /// capacity limit stops progress or the rounds run out. Re-zeroes the tally
   /// each round. The shared tail of every allocate/remove kernel.
   /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
   /// added to the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
-  /// @p stage, when non-null, collects one span per round; they accumulate
+  /// A dispatch given a stage collects one span per round; they accumulate
   /// under its one label, which is the honest total for a frame that genuinely
   /// dispatched several times. A round that fails leaves the rounds before it
   /// recorded, and the scope publishes them on the way out -- they ran.
   /// @p prepare, when set, records the call's parameter uploads into the first
-  /// round's batch. Each round is one submit, and reads back the heap counter
-  /// into @ref heap_free_ beside the tally.
+  /// round's batch, ahead of the dispatches. Each round is one submit, and
+  /// reads back the heap counter into @ref heap_free_ beside the tally.
   Result<std::uint32_t> dispatch_with_retry(
-      const ComputeKernel& kernel, std::uint32_t arg, std::uint32_t groups,
-      AllocFailures* out_failures, GpuStageScope* stage = nullptr,
+      const std::function<Status(CommandBatch&)>& dispatches,
+      AllocFailures* out_failures,
       const std::function<Status(CommandBatch&)>& prepare = {});
 
-  /// Both @ref allocate_from_depth overloads: @p depth is the host array or
-  /// the device buffer the caller passed.
-  Result<std::uint32_t> allocate_from_depth(const StorageInput& depth,
-                                            const DepthCameraParams& camera,
-                                            AllocFailures* out_failures,
-                                            StageMetrics* metrics);
+  /// The set the depth kernel binds for a call's @p i-th frame: its own for
+  /// the first, one of @ref depth_sets_ for each after it.
+  const DescriptorSet& depth_set(std::size_t i) const noexcept {
+    return i == 0 ? depth_.set : depth_sets_.sets[i - 1];
+  }
 
   /// Create a transient device-local buffer that @p batch fills with @p bytes
   /// of @p data, and bind it at @p binding of @p set. The caller keeps the
@@ -725,6 +753,10 @@ class VR_VOLUME_API VoxelHashMap {
   // draw), so per-voxel data survives a resize. Same 6-binding shape as
   // allocate_ (its input at binding 4 is BlockIndex{coord, ptr}, ptr read).
   ComputeKernel rehash_;
+  // The depth kernel's sets for every frame of a call after the first, so a
+  // round dispatches several cameras in one batch. Grown to the most frames a
+  // call has had; written whole each call, so a resize leaves none stale.
+  KernelSets depth_sets_;
 };
 
 }  // namespace volumetric_kit::recon::volume

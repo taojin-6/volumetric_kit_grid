@@ -374,10 +374,9 @@ Status VoxelHashMap::rebuild_heap_excluding(
 // heuristic erasing the report instead of resolving it -- so the two are summed
 // and the caller sees a non-zero count exactly when something did not complete.
 Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
-    const ComputeKernel& kernel, std::uint32_t arg, std::uint32_t groups,
-    AllocFailures* out_failures, GpuStageScope* stage,
+    const std::function<Status(CommandBatch&)>& dispatches,
+    AllocFailures* out_failures,
     const std::function<Status(CommandBatch&)>& prepare) {
-  const PushConstants push{grid_, arg};
   constexpr int kMaxRounds = 10;
   constexpr int kStallLimit = 2;  // consecutive no-progress rounds -> give up
   std::uint32_t failures = 0;
@@ -396,8 +395,7 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
       VR_TRY(prepare(batch));
     }
     VR_TRY(batch.fill(fail_counts_, 0, sizeof(slots), 0u));
-    VR_TRY(batch.dispatch(kernel, &push, sizeof(push), groups,
-                          max_workgroup_count_x_, stage));
+    VR_TRY(dispatches(batch));
     VR_TRY(batch.readback(fail_counts_, 0, sizeof(slots), slots));
     VR_TRY(batch.readback(heap_counter_, 0, sizeof(heap_free), &heap_free));
     VR_TRY(batch.submit());
@@ -460,8 +458,13 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
       check_storage_buffer_range(op, input_bytes, max_storage_buffer_range_));
   Buffer input_buf;  // alive across every round
   Buffer done_buf;
+  const PushConstants push{grid_, count};
   return dispatch_with_retry(
-      kernel, count, group_count(count), out_failures, nullptr,
+      [&](CommandBatch& batch) {
+        return batch.dispatch(kernel, &push, sizeof(push), group_count(count),
+                              max_workgroup_count_x_);
+      },
+      out_failures,
       [&](CommandBatch& batch) -> Status {
         VR_ASSIGN(input_buf,
                   upload_to_binding(batch, kernel.set, 4, data, input_bytes));
@@ -487,20 +490,20 @@ Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const float* depth, const DepthCameraParams& camera,
     AllocFailures* out_failures, StageMetrics* metrics) {
-  return allocate_from_depth(StorageInput(depth), camera, out_failures,
-                             metrics);
+  return allocate_from_depth({DepthInput{StorageInput(depth), camera}},
+                             out_failures, metrics);
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const Buffer& depth, const DepthCameraParams& camera,
     AllocFailures* out_failures, StageMetrics* metrics) {
-  return allocate_from_depth(StorageInput(depth), camera, out_failures,
-                             metrics);
+  return allocate_from_depth({DepthInput{StorageInput(depth), camera}},
+                             out_failures, metrics);
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
-    const StorageInput& depth, const DepthCameraParams& camera,
-    AllocFailures* out_failures, StageMetrics* metrics) {
+    const std::vector<DepthInput>& frames, AllocFailures* out_failures,
+    StageMetrics* metrics) {
   // Before the validity check, so a refused call still costs its row -- a stage
   // silent on failure reads as one that did not run. Inert when null, and it
   // publishes both halves on every return below, including the failing ones.
@@ -509,38 +512,79 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: moved-from map");
   }
-  const std::uint64_t pixel_count =
-      static_cast<std::uint64_t>(camera.width) * camera.height;
-  // One dispatch thread per pixel. width*height feeds the 32-bit group count
-  // (the depth shader derives its own bound from cam.width*cam.height); reject
-  // a pathological image dimension here rather than let the uint64 product
-  // truncate. dispatch() separately caps groupCountX at the device limit.
-  if (pixel_count > std::numeric_limits<std::uint32_t>::max()) {
-    return Status::invalid_argument(
-        "VoxelHashMap::allocate_from_depth: width*height exceeds 2^32");
+  // Every frame checked before any work. One dispatch thread per pixel, and
+  // width*height feeds the 32-bit group count (the depth shader derives its
+  // own bound from cam.width*cam.height), so a pathological image dimension is
+  // refused here rather than truncated. A frame with no pixels dispatches
+  // nothing.
+  std::vector<std::size_t> live;  // the frames that dispatch, in order
+  std::vector<std::uint32_t> pixels(frames.size(), 0);
+  for (std::size_t i = 0; i < frames.size(); ++i) {
+    const DepthCameraParams& camera = frames[i].camera;
+    const std::uint64_t count =
+        static_cast<std::uint64_t>(camera.width) * camera.height;
+    if (count > std::numeric_limits<std::uint32_t>::max()) {
+      return Status::invalid_argument(
+          "VoxelHashMap::allocate_from_depth: width*height exceeds 2^32");
+    }
+    const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(float);
+    VR_TRY(frames[i].depth.check("VoxelHashMap::allocate_from_depth: depth",
+                                 bytes));
+    if (count == 0) continue;
+    VR_TRY(check_storage_buffer_range(
+        "VoxelHashMap::allocate_from_depth: the depth buffer", bytes,
+        max_storage_buffer_range_));
+    pixels[i] = static_cast<std::uint32_t>(count);
+    live.push_back(i);
   }
-  const auto pixels = static_cast<std::uint32_t>(pixel_count);
-
-  // Depth samples are per-call/variable (transient, binding 4); the camera
-  // params ride the persistent camera_params_ buffer (binding 6, bound once at
-  // create), rewritten in place here.
-  const VkDeviceSize depth_bytes = VkDeviceSize(pixels) * sizeof(float);
-  VR_TRY(depth.check("VoxelHashMap::allocate_from_depth: depth", depth_bytes));
-  if (pixels == 0) {
+  if (live.empty()) {
     return std::uint32_t{0};
   }
-  VR_TRY(check_storage_buffer_range(
-      "VoxelHashMap::allocate_from_depth: the depth buffer", depth_bytes,
-      max_storage_buffer_range_));
-  Buffer depth_buf;  // a host array's device copy, alive across every round
+  if (live.size() - 1 > depth_sets_.sets.size()) {
+    VR_ASSIGN(depth_sets_, allocate_kernel_sets(
+                               *device_, depth_, 7,
+                               static_cast<std::uint32_t>(live.size() - 1)));
+  }
+
+  // Each frame's depth is per-call (binding 4: a host array's device copy, or
+  // the caller's buffer), and the camera rides the one persistent
+  // camera_params_ (binding 6), rewritten inline ahead of each dispatch: the
+  // batch's barrier around every dispatch orders the rewrite after the read.
+  std::vector<Buffer> uploads(frames.size());  // alive across every round
   return dispatch_with_retry(
-      depth_, pixels, group_count(pixels), out_failures, &stage,
       [&](CommandBatch& batch) -> Status {
-        VR_ASSIGN(const VkBuffer depth_handle,
-                  depth.buffer(batch, *allocator_, depth_bytes, depth_buf));
-        depth_.set.write_storage_buffer(4, depth_handle, 0, depth_bytes);
-        return batch.upload(camera_params_, 0, &camera,
-                            sizeof(DepthCameraParams));
+        for (std::size_t k = 0; k < live.size(); ++k) {
+          const std::size_t i = live[k];
+          VR_TRY(batch.upload(camera_params_, 0, &frames[i].camera,
+                              sizeof(DepthCameraParams)));
+          const PushConstants push{grid_, pixels[i]};
+          VR_TRY(batch.dispatch(depth_, depth_set(k), &push, sizeof(push),
+                                group_count(pixels[i]), max_workgroup_count_x_,
+                                &stage));
+        }
+        return {};
+      },
+      out_failures,
+      [&](CommandBatch& batch) -> Status {
+        // Every binding of every set, so a set another call wrote, or one a
+        // resize left naming freed buffers, is whole again.
+        for (std::size_t k = 0; k < live.size(); ++k) {
+          const std::size_t i = live[k];
+          const VkDeviceSize bytes = VkDeviceSize(pixels[i]) * sizeof(float);
+          VR_ASSIGN(
+              const VkBuffer depth,
+              frames[i].depth.buffer(batch, *allocator_, bytes, uploads[i]));
+          const DescriptorSet& set = depth_set(k);
+          set.write_storage_buffer(0, entries_.handle(), 0, VK_WHOLE_SIZE);
+          set.write_storage_buffer(1, heap_.handle(), 0, VK_WHOLE_SIZE);
+          set.write_storage_buffer(2, heap_counter_.handle(), 0, VK_WHOLE_SIZE);
+          set.write_storage_buffer(3, bucket_mutex_.handle(), 0, VK_WHOLE_SIZE);
+          set.write_storage_buffer(4, depth, 0, bytes);
+          set.write_storage_buffer(5, fail_counts_.handle(), 0, VK_WHOLE_SIZE);
+          set.write_storage_buffer(6, camera_params_.handle(), 0,
+                                   VK_WHOLE_SIZE);
+        }
+        return {};
       });
 }
 
@@ -599,8 +643,14 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
 
   // pc.arg is the TRIANGLE count (the kernel's binary-search bound), not the
   // dispatch width -- the kernel reads that from offsets[pc.arg].
+  const PushConstants push{grid_, triangle_count};
   return dispatch_with_retry(
-      triangles_, triangle_count, group_count(total), out_failures, &stage,
+      [&](CommandBatch& batch) {
+        return batch.dispatch(triangles_, &push, sizeof(push),
+                              group_count(total), max_workgroup_count_x_,
+                              &stage);
+      },
+      out_failures,
       [&](CommandBatch& batch) -> Status {
         VR_ASSIGN(vertex_buf, upload_to_binding(batch, triangles_.set, 4,
                                                 vertices, vertex_bytes));
@@ -881,10 +931,14 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     // the new table reads very differently from residual lock contention.
     std::uint32_t failed = 0;
     AllocFailures rehash_failures{};
+    const PushConstants push{grid_, count};
+    const auto rehash = [&](CommandBatch& batch) {
+      return batch.dispatch(rehash_, &push, sizeof(push), group_count(count),
+                            max_workgroup_count_x_);
+    };
     for (int pass = 0; pass < kReinsertPasses; ++pass) {
-      VR_ASSIGN(failed, dispatch_with_retry(rehash_, count, group_count(count),
-                                            &rehash_failures, nullptr,
-                                            upload_snapshot));
+      VR_ASSIGN(failed,
+                dispatch_with_retry(rehash, &rehash_failures, upload_snapshot));
       if (failed == 0) {
         break;
       }
