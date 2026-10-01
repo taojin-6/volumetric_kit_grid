@@ -242,6 +242,19 @@ int main() {
         lmap.compact_active_blocks_on_device();
     CHECK(fresh.ok() && fresh.value().count == want.size() - 1);
     CHECK(!map.check_device_block_list(fresh.value(), "test").ok());
+    // Nothing has changed since, so the same list comes back undispatched. An
+    // allocation that takes a block makes it stale; one that takes none, of
+    // blocks already there, does not.
+    vr::Result<vol::DeviceBlockList> again =
+        lmap.compact_active_blocks_on_device();
+    CHECK(again.ok() && again.value().serial == fresh.value().serial);
+    CHECK(lmap.allocate(coords.data(), n).value() == 0);
+    CHECK(!lmap.check_device_block_list(fresh.value(), "test").ok());
+    vr::Result<vol::DeviceBlockList> regrown =
+        lmap.compact_active_blocks_on_device();
+    CHECK(regrown.ok() && regrown.value().count == want.size());
+    CHECK(lmap.allocate(coords.data(), n).value() == 0);
+    CHECK(lmap.check_device_block_list(regrown.value(), "test").ok());
   }
 
   // --- Overflow / collision-chain coverage ----------------------------------

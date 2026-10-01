@@ -69,10 +69,13 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 /// had to refit and re-run, and @ref arena_bytes is what the extractor is
 /// holding across the whole ring.
 struct ExtractTimings {
-  /// Compacting the hash map's active block list (a dispatch + readback).
+  /// Compacting the hash map's active block list (a dispatch + readback), near
+  /// zero when the map's last device list still holds (spans off).
   double compact_ms = 0.0;
-  /// Allocating the active-block input buffer and staging the list. Its copy
-  /// to the device runs in @ref dispatch_ms's submit.
+  /// With a host list (the spans on, or a caller's subset), allocating the
+  /// active-block input buffer and staging the list, whose copy runs in
+  /// @ref dispatch_ms's submit. Near zero otherwise: the device list is bound
+  /// in place.
   double input_upload_ms = 0.0;
   /// Sizing the vertex arena + recording the draw command's reset, which runs
   /// in @ref dispatch_ms's submit, including a refit after an undersized guess
@@ -91,7 +94,7 @@ struct ExtractTimings {
   double arena_alloc_ms = 0.0;
   /// Writing the kernel's descriptor bindings.
   double descriptor_ms = 0.0;
-  /// Each attempt's submit, including the blocking fence wait: the active
+  /// Each attempt's submit, including the blocking fence wait: a host active
   /// list's copy and the command reset, the marching-cubes dispatch, and the
   /// command's readback -- summed over both when a refit forced a second one
   /// (@ref dispatches).
@@ -1397,8 +1400,9 @@ class VR_MESH_API MarchingCubes {
   // integrator that owned it was destroyed. As a parameter that state cannot be
   // represented.
   //
-  // @p blocks is null when this call compacts the whole active set itself, and
-  // points at the caller's subset otherwise -- borrowed for this call alone,
+  // @p blocks is null when this call compacts the whole active set itself (onto
+  // the device with the spans off, else to the host), and points at the
+  // caller's subset otherwise -- borrowed for this call alone,
   // and a parameter for the same reason @p dirty is, only more so: it is a bare
   // host pointer into a std::vector the caller owns, so latching it on the
   // extractor would leave a dangling read for the NEXT extract rather than a

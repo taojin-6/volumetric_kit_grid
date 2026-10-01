@@ -1314,29 +1314,35 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // strand it.
   arena_state_ = ArenaState{};
 
-  // The active set drives the dispatch (one workgroup per block). Either the
-  // caller handed one over -- its own subset of the map, typically what a
-  // camera can see -- or this call compacts the whole map itself. Nothing below
-  // reads which: both arrive as one BlockList, and every use of it is written
-  // against a pointer and a count rather than a container.
+  // The active set drives the dispatch (one workgroup per block): the caller's
+  // subset of the map, typically what a camera can see, or the whole map
+  // compacted here. With the spans off and no subset, nothing on the host reads
+  // the list, so it stays on the device (`on_device`) and `active.blocks` is
+  // null; the host list's uses are all behind the spans. `num_active` counts
+  // the blocks either way.
   //
-  // `compacted` owns the storage in the second case and must outlive every use
-  // of `active`, which borrows it. It is declared here, in the scope the whole
+  // `compacted` owns a host list compacted here and must outlive every use of
+  // `active`, which borrows it. It is declared here, in the scope the whole
   // dispatch runs in, for exactly that reason.
   PhaseClock phase_clock(timings != nullptr);
   std::vector<volume::BlockIndex> compacted;
   volume::BlockList active{};
+  volume::DeviceBlockList on_device{};
+  std::uint32_t num_active = 0;
   if (blocks != nullptr) {
     active = *blocks;
+    num_active = active.count;
   } else {
-    VR_ASSIGN(compacted, grid.map().compact_active_blocks());
-    active.blocks = compacted.data();
-    active.count = static_cast<std::uint32_t>(compacted.size());
-    // Checked against this same grid a moment ago on the other path, so the two
-    // arrive equally anchored. Read after the compaction rather than before:
-    // nothing between them can move it, and taking it from the map that just
-    // produced the list is what makes the two agree by construction.
-    active.epoch = grid.topology_epoch();
+    if (config_.track_block_spans) {
+      VR_ASSIGN(compacted, grid.map().compact_active_blocks());
+      active.blocks = compacted.data();
+      active.count = static_cast<std::uint32_t>(compacted.size());
+      num_active = active.count;
+    } else {
+      // The fuse's own list when nothing has changed since it compacted.
+      VR_ASSIGN(on_device, grid.map().compact_active_blocks_on_device());
+      num_active = on_device.count;
+    }
     // Only this path writes the row. A caller-supplied set did no compaction
     // here, and charging it for the one the CALLER made -- on its own thread,
     // possibly for several consumers -- would be reporting work this call did
@@ -1371,7 +1377,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
         std::to_string(vpb) + ")");
   }
 
-  if (active.count == 0) {
+  if (num_active == 0) {
     // Nothing to mesh -- but this path stamps the slot it claimed above exactly
     // like a real extract, so "every generation handed out lives in exactly one
     // slot" is total.
@@ -1433,8 +1439,6 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     }
     return device_mesh;
   }
-
-  const std::uint32_t num_active = active.count;
 
   // One invocation per voxel of each active block; worst-case 5 triangles each.
   // Both the thread index and the triangle capacity flow through 32-bit shader
@@ -1498,13 +1502,10 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       (std::string(entry) + ": hash entries").c_str(), entries_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
 
-  // Per-extract inputs: the active blocks, staged in the first attempt's batch
-  // with the command reset, and the vertex arena + atomic counter out. The hash
-  // entries and attribute buffers bind straight from the grid (no copy).
-  //
-  // TODO(mesh): without track_block_spans the host never reads the list, so
-  // it could stay on the device (VoxelHashMap::compact_active_blocks_on_device,
-  // as tsdf does) and skip its round trip.
+  // Per-extract inputs: the active blocks -- the device list, or a host list
+  // staged in the first attempt's batch with the command reset -- and the
+  // vertex arena + atomic counter out. The hash entries and attribute buffers
+  // bind straight from the grid (no copy).
   phase_clock.restart();
   const VkDeviceSize active_bytes =
       static_cast<VkDeviceSize>(num_active) * sizeof(volume::BlockIndex);
@@ -1520,9 +1521,15 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   CommandBatch first(*device_, *allocator_);
   std::optional<CommandBatch> retry;
   CommandBatch* batch = &first;
-  VR_ASSIGN(Buffer active_buf,
-            device_storage_buffer(*allocator_, active_bytes));
-  VR_TRY(first.upload(active_buf, 0, active.blocks, active_bytes));
+  Buffer active_buf;
+  VkBuffer active_handle = VK_NULL_HANDLE;
+  if (on_device.buffer != nullptr) {
+    active_handle = on_device.buffer->handle();
+  } else {
+    VR_ASSIGN(active_buf, device_storage_buffer(*allocator_, active_bytes));
+    VR_TRY(first.upload(active_buf, 0, active.blocks, active_bytes));
+    active_handle = active_buf.handle();
+  }
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
   // Both output allocations inside the SAME lap. The span table used to be
@@ -1634,8 +1641,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // Bound to the range the push constant claims rather than VK_WHOLE_SIZE, the
   // way the hash entries and the dirty flags are: the kernel indexes it by
   // `num_active_blocks`, so the two must name the same bytes.
-  kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
-                                          active_bytes);
+  kernel_sparse_.set.write_storage_buffer(1, active_handle, 0, active_bytes);
   kernel_sparse_.set.write_storage_buffer(2, grid.map().entries_buffer(), 0,
                                           entries_bytes);
   kernel_sparse_.set.write_storage_buffer(3, tsdf_view.buffer->handle(), 0,
