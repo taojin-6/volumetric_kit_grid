@@ -114,6 +114,8 @@ struct DeviceBlockList {
   std::uint64_t epoch = 0;
   /// Which of the map's compactions wrote it.
   std::uint64_t serial = 0;
+  /// The map's free blocks then, which an allocation since moves.
+  std::uint32_t heap_free = 0;
 };
 
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
@@ -362,10 +364,14 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// @brief @ref compact_active_blocks, with the list left on the device for a
   ///        kernel to read in place; only its count reaches the host.
+  ///
+  /// While the last call's list still holds, this returns it, dispatching and
+  /// reporting nothing, so a mesh extract after a fuse reuses the fuse's
+  /// compaction.
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
-  /// @return The list, which @ref check_device_block_list accepts until the
-  ///         next compaction, @ref resize, @ref remove, @ref clear or move of
-  ///         this map; or a non-OK @ref Status.
+  /// @return The list, which @ref check_device_block_list accepts until this
+  ///         map compacts another, allocates a block, resizes, removes,
+  ///         clears or moves; or a non-OK @ref Status.
   Result<DeviceBlockList> compact_active_blocks_on_device(
       StageMetrics* metrics = nullptr);
 
@@ -376,7 +382,8 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param who   The caller, for the message.
   /// @return OK; or @ref Status::Code::InvalidArgument when this map is
   ///         moved-from, did not compact @p list, has moved since, or has
-  ///         compacted, resized, removed or cleared since.
+  ///         compacted another list, allocated, resized, removed or cleared
+  ///         since.
   Status check_device_block_list(const DeviceBlockList& list,
                                  const char* who) const;
 
@@ -618,6 +625,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// already has a stage open.
   static const char* active_set_row(const StageMetrics* metrics) noexcept;
 
+  /// Whether @p list is still this map's active set: compacted here, and
+  /// nothing since has rewritten the list, freed a block or allocated one.
+  bool holds(const DeviceBlockList& list) const noexcept;
+
   /// Record what @p dispatches records each round, re-dispatching while the
   /// shared `fail_counts_[kFailTotal]` tally is
   /// non-zero, to converge past transient same-bucket lock contention, until a
@@ -717,6 +728,9 @@ class VR_VOLUME_API VoxelHashMap {
   // Bumped by every write to compacted_ (a compaction) and every swap of it (a
   // resize), so a DeviceBlockList can be checked against it.
   std::uint64_t compaction_serial_ = 0;
+  // The last compact_active_blocks_on_device list, returned again while
+  // holds() says it is still the active set.
+  DeviceBlockList last_device_list_{};
 
   // The shared descriptor pool the kernels' sets are allocated from. Declared
   // BEFORE the ComputeKernel members so it is destroyed AFTER them (members

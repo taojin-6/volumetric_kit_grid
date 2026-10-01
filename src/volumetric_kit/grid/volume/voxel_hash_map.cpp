@@ -726,8 +726,8 @@ Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
   // The list comes back beside its count, as far as a guess a quarter past
   // this kernel's last count, so a set that has not outgrown it costs one
   // submit rather than two (0.38 ms each on an RTX 5090).
-  // TODO(volume): hand the mesh extract the device list too, and size both
-  // tiers' dispatches on the device, so no list or count reaches the host.
+  // TODO(volume): size the fuse's and the extract's dispatches on the device,
+  // so no count reaches the host either.
   const std::uint32_t guess =
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
           grid_.num_blocks, std::uint64_t(last_count) + last_count / 4));
@@ -775,6 +775,9 @@ Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
 
 Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
     StageMetrics* metrics) {
+  // Above the row: a list that still holds is no compaction, so none is
+  // reported.
+  if (valid() && holds(last_device_list_)) return last_device_list_;
   GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
   if (!valid()) {
     return Status::invalid_argument(
@@ -782,8 +785,17 @@ Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
   }
   VR_ASSIGN(const std::uint32_t count,
             compact_into_device_list(compact_, &stage));
-  return DeviceBlockList{&compacted_, count, topology_epoch_,
-                         compaction_serial_};
+  last_device_list_ = DeviceBlockList{&compacted_, count, topology_epoch_,
+                                      compaction_serial_, heap_free_};
+  return last_device_list_;
+}
+
+// The epoch moves on a remove or clear, the serial on any compaction or
+// resize, and the heap's free count on an allocation: within one epoch it only
+// falls.
+bool VoxelHashMap::holds(const DeviceBlockList& list) const noexcept {
+  return list.buffer == &compacted_ && list.epoch == topology_epoch_ &&
+         list.serial == compaction_serial_ && list.heap_free == heap_free_;
 }
 
 Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
@@ -798,11 +810,11 @@ Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
         ": the device block list is not this map's, or the map has moved "
         "since it was compacted");
   }
-  if (list.epoch != topology_epoch_ || list.serial != compaction_serial_) {
+  if (!holds(list)) {
     return Status::invalid_argument(
         std::string(who) +
-        ": the device block list is stale: the map has compacted, resized, "
-        "removed or cleared since");
+        ": the device block list is stale: the map has compacted, allocated, "
+        "resized, removed or cleared since");
   }
   return {};
 }

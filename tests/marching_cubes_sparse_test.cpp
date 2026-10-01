@@ -2290,10 +2290,10 @@ int main() {
     }
   }
 
-  // extract_device over the active set a compaction left on the device, as a
-  // fuse hands it on: the same triangles as compacting here, nothing compacted
-  // by the call, and refused before anything is claimed once the map has
-  // compacted again, or with the spans on.
+  // With the spans off the extract binds the map's device list, reusing the
+  // compaction a fuse just made: the same triangles as a host list, and the
+  // fuse's list still current after. An allocation since makes it compact
+  // again rather than mesh the old list.
   {
     vr::Result<vol::VoxelBlockGrid> list_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
@@ -2301,52 +2301,39 @@ int main() {
     CHECK(list_grid_result.ok());
     vol::VoxelBlockGrid list_grid = std::move(list_grid_result).value();
     CHECK(fill_sphere_grid(ctx, list_grid, /*with_color=*/false));
-    vr::Result<mesh::MarchingCubes> list_mc_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
-    CHECK(list_mc_result.ok());
-    mesh::MarchingCubes list_mc = std::move(list_mc_result).value();
-
-    vr::Result<mesh::Mesh> full = list_mc.extract_host(list_grid, 0.0f);
+    mesh::MarchingCubesConfig spans_config;
+    spans_config.track_block_spans = true;  // the host list
+    vr::Result<mesh::MarchingCubes> host_mc = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), spans_config);
+    CHECK(host_mc.ok());
+    vr::Result<mesh::Mesh> full = host_mc.value().extract_host(list_grid, 0.0f);
     CHECK(full.ok());
     const std::vector<std::array<float, 9>> full_tris =
         canonical_triangles(full.value());
     CHECK(!full_tris.empty());
 
-    vr::Result<vol::DeviceBlockList> listed =
+    vr::Result<mesh::MarchingCubes> list_mc =
+        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
+    CHECK(list_mc.ok());
+    vr::Result<vol::DeviceBlockList> fused =
         list_grid.map().compact_active_blocks_on_device();
-    CHECK(listed.ok() && listed.value().count > 0);
-    mesh::ExtractTimings listed_t{};
-    vr::Result<mesh::DeviceMesh> listed_dm =
-        list_mc.extract_device(list_grid, 0.0f, listed.value(), &listed_t);
-    CHECK(listed_dm.ok());
-    vr::Result<mesh::Mesh> listed_mesh = list_mc.download(listed_dm.value());
-    CHECK(listed_mesh.ok());
-    CHECK(canonical_triangles(listed_mesh.value()) == full_tris);
-    CHECK(listed_t.active_blocks == listed.value().count);
-    CHECK(listed_t.compact_ms == 0.0);
+    CHECK(fused.ok() && fused.value().count > 0);
+    mesh::ExtractTimings t{};
+    vr::Result<mesh::DeviceMesh> dm =
+        list_mc.value().extract_device(list_grid, 0.0f, &t);
+    CHECK(dm.ok());
+    vr::Result<mesh::Mesh> listed = list_mc.value().download(dm.value());
+    CHECK(listed.ok());
+    CHECK(canonical_triangles(listed.value()) == full_tris);
+    CHECK(t.active_blocks == fused.value().count);
+    CHECK(list_grid.map().check_device_block_list(fused.value(), "test").ok());
 
-    // Another compaction makes the list stale: refused, and the mesh taken
-    // from it survives the refusal.
-    CHECK(list_grid.map().compact_active_blocks_on_device().ok());
-    CHECK(list_mc.extract_device(list_grid, 0.0f, listed.value())
-              .status()
-              .domain() == vr::Status::Code::InvalidArgument);
-    CHECK(listed_dm.value().is_current());
-    CHECK(list_mc.download(listed_dm.value()).ok());
-
-    // The spans are summed off a host list, so a device one is refused.
-    mesh::MarchingCubesConfig spans_config;
-    spans_config.track_block_spans = true;
-    vr::Result<mesh::MarchingCubes> spans_mc = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), spans_config);
-    CHECK(spans_mc.ok());
-    vr::Result<vol::DeviceBlockList> fresh =
-        list_grid.map().compact_active_blocks_on_device();
-    CHECK(fresh.ok());
-    CHECK(spans_mc.value()
-              .extract_device(list_grid, 0.0f, fresh.value())
-              .status()
-              .domain() == vr::Status::Code::InvalidArgument);
+    // One block past the cube, never observed, so it adds no surface.
+    vol::BlockIndex extra{};
+    extra.coord = vr::Vec3i(kBlocks, 0, 0);
+    CHECK(list_grid.map().allocate(&extra, 1).value() == 0);
+    CHECK(list_mc.value().extract_device(list_grid, 0.0f, &t).ok());
+    CHECK(t.active_blocks == fused.value().count + 1);
   }
 
   std::printf(

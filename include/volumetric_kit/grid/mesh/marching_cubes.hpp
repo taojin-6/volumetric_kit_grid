@@ -69,10 +69,13 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 /// had to refit and re-run, and @ref arena_bytes is what the extractor is
 /// holding across the whole ring.
 struct ExtractTimings {
-  /// Compacting the hash map's active block list (a dispatch + readback).
+  /// Compacting the hash map's active block list (a dispatch + readback), near
+  /// zero when the map's last device list still holds (spans off).
   double compact_ms = 0.0;
-  /// Allocating the active-block input buffer and staging the list. Its copy
-  /// to the device runs in @ref dispatch_ms's submit.
+  /// With a host list (the spans on, or a caller's subset), allocating the
+  /// active-block input buffer and staging the list, whose copy runs in
+  /// @ref dispatch_ms's submit. Near zero otherwise: the device list is bound
+  /// in place.
   double input_upload_ms = 0.0;
   /// Sizing the vertex arena + recording the draw command's reset, which runs
   /// in @ref dispatch_ms's submit, including a refit after an undersized guess
@@ -91,7 +94,7 @@ struct ExtractTimings {
   double arena_alloc_ms = 0.0;
   /// Writing the kernel's descriptor bindings.
   double descriptor_ms = 0.0;
-  /// Each attempt's submit, including the blocking fence wait: the active
+  /// Each attempt's submit, including the blocking fence wait: a host active
   /// list's copy and the command reset, the marching-cubes dispatch, and the
   /// command's readback -- summed over both when a refit forced a second one
   /// (@ref dispatches).
@@ -1041,30 +1044,6 @@ class VR_MESH_API MarchingCubes {
                                     const volume::BlockList& blocks,
                                     ExtractTimings* timings = nullptr);
 
-  /// @brief @ref extract_device over the active set a caller's compaction left
-  ///        on the device, so this call compacts nothing and no list reaches
-  ///        the host.
-  ///
-  /// What a fuse that has just compacted hands on: `tsdf::TsdfIntegrator::
-  /// integrate` reports the list it fused over. It is the whole active set, so
-  /// this is @ref extract_device in every other respect, the density it
-  /// measures included; @ref ExtractTimings::compact_ms reads 0. Needs
-  /// @ref MarchingCubesConfig::track_block_spans off, since the spans are
-  /// summed off a host list.
-  /// @param grid     As @ref extract_device.
-  /// @param iso      As @ref extract_device.
-  /// @param active   @p grid's active set, from
-  ///                 @ref volume::VoxelHashMap::compact_active_blocks_on_device
-  ///                 and current: no compaction, resize, remove or clear since.
-  /// @param timings  As @ref extract_device.
-  /// @return As @ref extract_device, or @ref Status::Code::InvalidArgument for
-  ///         a stale or foreign @p active, or with the spans on -- refused
-  ///         before anything is claimed, as @ref extract_device's subset
-  ///         overload refuses.
-  Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid, float iso,
-                                    const volume::DeviceBlockList& active,
-                                    ExtractTimings* timings = nullptr);
-
   /// @brief Copy a @ref DeviceMesh's live vertices + indices into a host
   ///        @ref Mesh.
   /// @param device_mesh  A mesh from @ref extract_device on *this* extractor,
@@ -1421,8 +1400,9 @@ class VR_MESH_API MarchingCubes {
   // integrator that owned it was destroyed. As a parameter that state cannot be
   // represented.
   //
-  // @p blocks is null when this call compacts the whole active set itself, and
-  // points at the caller's subset otherwise -- borrowed for this call alone,
+  // @p blocks is null when this call compacts the whole active set itself (onto
+  // the device with the spans off, else to the host), and points at the
+  // caller's subset otherwise -- borrowed for this call alone,
   // and a parameter for the same reason @p dirty is, only more so: it is a bare
   // host pointer into a std::vector the caller owns, so latching it on the
   // extractor would leave a dangling read for the NEXT extract rather than a
@@ -1435,11 +1415,11 @@ class VR_MESH_API MarchingCubes {
   // about the caller this function keeps, and it keeps it because a diagnostic
   // that names a method the header does not declare leaves a user with nothing
   // to grep. See kEntryHost in the .cpp.
-  Result<DeviceMesh> extract_device_impl(
-      volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
-      const volume::BlockList* blocks,
-      const volume::DeviceBlockList* device_list, ExtractTimings* timings,
-      const char* entry);
+  Result<DeviceMesh> extract_device_impl(volume::VoxelBlockGrid& grid,
+                                         float iso, const DirtyBlocks* dirty,
+                                         const volume::BlockList* blocks,
+                                         ExtractTimings* timings,
+                                         const char* entry);
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
   // theoretical ceiling is @p worst_case triangles: the last extract's
