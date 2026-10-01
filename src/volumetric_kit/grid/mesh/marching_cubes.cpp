@@ -1080,9 +1080,9 @@ Result<Mesh> MarchingCubes::extract_host(volume::VoxelBlockGrid& grid,
   // name alone: everything below the entry points reports under whichever one
   // the caller actually called, and borrowing extract_device's would tell a
   // host-only caller to release a slot it never saw.
-  VR_ASSIGN(
-      const DeviceMesh device_mesh,
-      extract_device_impl(grid, iso, nullptr, nullptr, timings, kEntryHost));
+  VR_ASSIGN(const DeviceMesh device_mesh,
+            extract_device_impl(grid, iso, nullptr, nullptr, nullptr, timings,
+                                kEntryHost));
   // The host copy is part of this call's readback, so it belongs in the phase
   // that names it -- the device path's readback_ms is near zero, its command
   // read riding the dispatch's submit, which is right for that entry point but
@@ -1194,28 +1194,35 @@ Result<DeviceMesh> MarchingCubes::extract_device_incremental(
   // watermark, flags the integrator vouches for, one slot, an arena that
   // survives -- and falls back to a full extract when it is not, which is why
   // this is one line and not a second copy of that function.
-  return extract_device_impl(grid, iso, &dirty, nullptr, timings,
+  return extract_device_impl(grid, iso, &dirty, nullptr, nullptr, timings,
                              kEntryIncremental);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, nullptr, timings,
+  return extract_device_impl(grid, iso, nullptr, nullptr, nullptr, timings,
                              kEntryDevice);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(
     volume::VoxelBlockGrid& grid, float iso, const volume::BlockList& blocks,
     ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, &blocks, timings,
+  return extract_device_impl(grid, iso, nullptr, &blocks, nullptr, timings,
+                             kEntryDevice);
+}
+
+Result<DeviceMesh> MarchingCubes::extract_device(
+    volume::VoxelBlockGrid& grid, float iso,
+    const volume::DeviceBlockList& active, ExtractTimings* timings) {
+  return extract_device_impl(grid, iso, nullptr, nullptr, &active, timings,
                              kEntryDevice);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device_impl(
     volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
-    const volume::BlockList* blocks, ExtractTimings* timings,
-    const char* entry) {
+    const volume::BlockList* blocks, const volume::DeviceBlockList* device_list,
+    ExtractTimings* timings, const char* entry) {
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
   // failed call then reports zeros rather than a previous call's numbers.
@@ -1252,6 +1259,18 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // default-constructed BlockList stays the spelling of "nothing is visible".
   if (blocks != nullptr) {
     VR_TRY(grid.check_block_list(*blocks, entry));
+  }
+  // A caller's device list is the whole active set as a compaction left it,
+  // checked against the map that made it. Only with the spans off: they are
+  // summed off a host list.
+  if (device_list != nullptr) {
+    if (config_.track_block_spans) {
+      return Status::invalid_argument(
+          std::string(entry) +
+          ": a device block list needs track_block_spans off, since the spans "
+          "are summed off the host list");
+    }
+    VR_TRY(grid.map().check_device_block_list(*device_list, entry));
   }
   // The grid must carry the float tsdf + weight the sparse kernel samples; the
   // uint32 color attribute is optional (its absence -> opaque-white vertices).
@@ -1326,8 +1345,23 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   PhaseClock phase_clock(timings != nullptr);
   std::vector<volume::BlockIndex> compacted;
   volume::BlockList active{};
+  // With the spans off the host never reads the list, so the whole active set
+  // stays on the device and is bound where the compaction left it: the
+  // caller's, or one compacted here.
+  volume::DeviceBlockList on_device{};
+  const bool list_on_device = blocks == nullptr && !config_.track_block_spans;
   if (blocks != nullptr) {
     active = *blocks;
+  } else if (list_on_device) {
+    if (device_list != nullptr) {
+      on_device = *device_list;
+    } else {
+      VR_ASSIGN(on_device, grid.map().compact_active_blocks_on_device());
+      // Only a compaction this call made writes the row, as below.
+      if (timings != nullptr) timings->compact_ms = phase_clock.lap();
+    }
+    active.count = on_device.count;
+    active.epoch = grid.topology_epoch();
   } else {
     VR_ASSIGN(compacted, grid.map().compact_active_blocks());
     active.blocks = compacted.data();
@@ -1498,13 +1532,10 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       (std::string(entry) + ": hash entries").c_str(), entries_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
 
-  // Per-extract inputs: the active blocks, staged in the first attempt's batch
-  // with the command reset, and the vertex arena + atomic counter out. The hash
-  // entries and attribute buffers bind straight from the grid (no copy).
-  //
-  // TODO(mesh): without track_block_spans the host never reads the list, so
-  // it could stay on the device (VoxelHashMap::compact_active_blocks_on_device,
-  // as tsdf does) and skip its round trip.
+  // Per-extract inputs: the active blocks -- the device list, or a host list
+  // staged in the first attempt's batch with the command reset -- and the
+  // vertex arena + atomic counter out. The hash entries and attribute buffers
+  // bind straight from the grid (no copy).
   phase_clock.restart();
   const VkDeviceSize active_bytes =
       static_cast<VkDeviceSize>(num_active) * sizeof(volume::BlockIndex);
@@ -1520,9 +1551,15 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   CommandBatch first(*device_, *allocator_);
   std::optional<CommandBatch> retry;
   CommandBatch* batch = &first;
-  VR_ASSIGN(Buffer active_buf,
-            device_storage_buffer(*allocator_, active_bytes));
-  VR_TRY(first.upload(active_buf, 0, active.blocks, active_bytes));
+  Buffer active_buf;
+  VkBuffer active_handle = VK_NULL_HANDLE;
+  if (list_on_device) {
+    active_handle = on_device.buffer->handle();
+  } else {
+    VR_ASSIGN(active_buf, device_storage_buffer(*allocator_, active_bytes));
+    VR_TRY(first.upload(active_buf, 0, active.blocks, active_bytes));
+    active_handle = active_buf.handle();
+  }
 
   if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
   // Both output allocations inside the SAME lap. The span table used to be
@@ -1634,8 +1671,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // Bound to the range the push constant claims rather than VK_WHOLE_SIZE, the
   // way the hash entries and the dirty flags are: the kernel indexes it by
   // `num_active_blocks`, so the two must name the same bytes.
-  kernel_sparse_.set.write_storage_buffer(1, active_buf.handle(), 0,
-                                          active_bytes);
+  kernel_sparse_.set.write_storage_buffer(1, active_handle, 0, active_bytes);
   kernel_sparse_.set.write_storage_buffer(2, grid.map().entries_buffer(), 0,
                                           entries_bytes);
   kernel_sparse_.set.write_storage_buffer(3, tsdf_view.buffer->handle(), 0,

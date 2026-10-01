@@ -2290,6 +2290,65 @@ int main() {
     }
   }
 
+  // extract_device over the active set a compaction left on the device, as a
+  // fuse hands it on: the same triangles as compacting here, nothing compacted
+  // by the call, and refused before anything is claimed once the map has
+  // compacted again, or with the spans on.
+  {
+    vr::Result<vol::VoxelBlockGrid> list_grid_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
+                                    attrs, 2);
+    CHECK(list_grid_result.ok());
+    vol::VoxelBlockGrid list_grid = std::move(list_grid_result).value();
+    CHECK(fill_sphere_grid(ctx, list_grid, /*with_color=*/false));
+    vr::Result<mesh::MarchingCubes> list_mc_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
+    CHECK(list_mc_result.ok());
+    mesh::MarchingCubes list_mc = std::move(list_mc_result).value();
+
+    vr::Result<mesh::Mesh> full = list_mc.extract_host(list_grid, 0.0f);
+    CHECK(full.ok());
+    const std::vector<std::array<float, 9>> full_tris =
+        canonical_triangles(full.value());
+    CHECK(!full_tris.empty());
+
+    vr::Result<vol::DeviceBlockList> listed =
+        list_grid.map().compact_active_blocks_on_device();
+    CHECK(listed.ok() && listed.value().count > 0);
+    mesh::ExtractTimings listed_t{};
+    vr::Result<mesh::DeviceMesh> listed_dm =
+        list_mc.extract_device(list_grid, 0.0f, listed.value(), &listed_t);
+    CHECK(listed_dm.ok());
+    vr::Result<mesh::Mesh> listed_mesh = list_mc.download(listed_dm.value());
+    CHECK(listed_mesh.ok());
+    CHECK(canonical_triangles(listed_mesh.value()) == full_tris);
+    CHECK(listed_t.active_blocks == listed.value().count);
+    CHECK(listed_t.compact_ms == 0.0);
+
+    // Another compaction makes the list stale: refused, and the mesh taken
+    // from it survives the refusal.
+    CHECK(list_grid.map().compact_active_blocks_on_device().ok());
+    CHECK(list_mc.extract_device(list_grid, 0.0f, listed.value())
+              .status()
+              .domain() == vr::Status::Code::InvalidArgument);
+    CHECK(listed_dm.value().is_current());
+    CHECK(list_mc.download(listed_dm.value()).ok());
+
+    // The spans are summed off a host list, so a device one is refused.
+    mesh::MarchingCubesConfig spans_config;
+    spans_config.track_block_spans = true;
+    vr::Result<mesh::MarchingCubes> spans_mc = mesh::MarchingCubes::create(
+        device.value(), allocator.value(), spans_config);
+    CHECK(spans_mc.ok());
+    vr::Result<vol::DeviceBlockList> fresh =
+        list_grid.map().compact_active_blocks_on_device();
+    CHECK(fresh.ok());
+    CHECK(spans_mc.value()
+              .extract_device(list_grid, 0.0f, fresh.value())
+              .status()
+              .domain() == vr::Status::Code::InvalidArgument);
+  }
+
   std::printf(
       "recon mesh sparse marching-cubes test passed: meshed a sphere across "
       "%d^3 blocks (%zu triangles), matched the same field at block_size 16 "

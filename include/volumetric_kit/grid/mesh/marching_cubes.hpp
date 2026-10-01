@@ -1041,6 +1041,30 @@ class VR_MESH_API MarchingCubes {
                                     const volume::BlockList& blocks,
                                     ExtractTimings* timings = nullptr);
 
+  /// @brief @ref extract_device over the active set a caller's compaction left
+  ///        on the device, so this call compacts nothing and no list reaches
+  ///        the host.
+  ///
+  /// What a fuse that has just compacted hands on: `tsdf::TsdfIntegrator::
+  /// integrate` reports the list it fused over. It is the whole active set, so
+  /// this is @ref extract_device in every other respect, the density it
+  /// measures included; @ref ExtractTimings::compact_ms reads 0. Needs
+  /// @ref MarchingCubesConfig::track_block_spans off, since the spans are
+  /// summed off a host list.
+  /// @param grid     As @ref extract_device.
+  /// @param iso      As @ref extract_device.
+  /// @param active   @p grid's active set, from
+  ///                 @ref volume::VoxelHashMap::compact_active_blocks_on_device
+  ///                 and current: no compaction, resize, remove or clear since.
+  /// @param timings  As @ref extract_device.
+  /// @return As @ref extract_device, or @ref Status::Code::InvalidArgument for
+  ///         a stale or foreign @p active, or with the spans on -- refused
+  ///         before anything is claimed, as @ref extract_device's subset
+  ///         overload refuses.
+  Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid, float iso,
+                                    const volume::DeviceBlockList& active,
+                                    ExtractTimings* timings = nullptr);
+
   /// @brief Copy a @ref DeviceMesh's live vertices + indices into a host
   ///        @ref Mesh.
   /// @param device_mesh  A mesh from @ref extract_device on *this* extractor,
@@ -1411,11 +1435,11 @@ class VR_MESH_API MarchingCubes {
   // about the caller this function keeps, and it keeps it because a diagnostic
   // that names a method the header does not declare leaves a user with nothing
   // to grep. See kEntryHost in the .cpp.
-  Result<DeviceMesh> extract_device_impl(volume::VoxelBlockGrid& grid,
-                                         float iso, const DirtyBlocks* dirty,
-                                         const volume::BlockList* blocks,
-                                         ExtractTimings* timings,
-                                         const char* entry);
+  Result<DeviceMesh> extract_device_impl(
+      volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
+      const volume::BlockList* blocks,
+      const volume::DeviceBlockList* device_list, ExtractTimings* timings,
+      const char* entry);
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
   // theoretical ceiling is @p worst_case triangles: the last extract's
