@@ -52,6 +52,12 @@ struct BlockIndex {
   int ptr;
 };
 
+// One block slot's stamps, ticks of the map's clock (mirrors volume::BlockStamp).
+struct BlockStamp {
+  uint requested;
+  uint weighted;
+};
+
 // --- Hash-table constants (mirror volume/hash.hpp). ---
 const int kFreeEntry = -1;
 const int kLockEntry = -2;
@@ -106,6 +112,7 @@ layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;
   uint arg;  // allocate: input coord count; compact: output capacity;
              // depth: the frame's tile count along x.
+  uint tick;  // the map's clock, which allocation stamps a block with
 } pc;
 #endif
 

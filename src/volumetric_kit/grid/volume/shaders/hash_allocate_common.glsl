@@ -14,6 +14,11 @@
 // transforms (worldToBlock / truncationBlocks), and the push-constant block.
 // The heap comes from hash_heap.glsl, which the delete kernel shares.
 //
+// A kernel that defines VR_STAMPS_BINDING before including this has
+// allocate_block stamp every block it asks for -- inserted or already there --
+// with the map's tick (BlockStamp::requested). Rehash does not, since a grow
+// keeps every record where it was.
+//
 // Concurrency: mutual exclusion is a per-bucket spin lock (atomicCompSwap on
 // bucket_mutex); memoryBarrierBuffer() supplies the acquire/release ordering
 // across vendors that hash_ops.metal got for free from Apple's coherent unified
@@ -27,6 +32,11 @@ layout(set = 0, binding = 0, scalar) coherent buffer Entries {
 };
 layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
+#ifdef VR_STAMPS_BINDING
+layout(set = 0, binding = VR_STAMPS_BINDING, scalar) buffer Stamps {
+  BlockStamp stamps[];
+};
+#endif
 
 // The fail-reason slots (kFailTotal / kFailLock / kFailChain / kFailHeap) come
 // from hash_common.glsl -- the delete kernel reports through the same buffer,
@@ -64,7 +74,8 @@ void unlock_bucket(uint bucket) {
 // (memoryBarrierBuffer) that pairs with the insert's release barrier, so a
 // just-published ptr is never observed alongside a stale pos (which, being the
 // init sentinel, would false-match coord (0,0,0)).
-bool block_exists(ivec3 coord) {
+// Returns the block's ptr, or kFreeEntry when absent.
+int find_block(ivec3 coord) {
   uint bucket_size = uint(pc.grid.bucket_size);
   uint total_entries = uint(pc.grid.num_buckets) * bucket_size;
   uint bucket = computeHashPos(coord, pc.grid.num_buckets);
@@ -75,7 +86,7 @@ bool block_exists(ivec3 coord) {
     if (entries[slot].ptr != kFreeEntry) {
       memoryBarrierBuffer();  // acquire: pos is current w.r.t. the ptr we saw
       if (entries[slot].pos == coord) {
-        return true;
+        return entries[slot].ptr;
       }
     }
   }
@@ -85,7 +96,7 @@ bool block_exists(ivec3 coord) {
     if (entries[idx].ptr != kFreeEntry) {
       memoryBarrierBuffer();  // acquire (see above)
       if (entries[idx].pos == coord) {
-        return true;
+        return entries[idx].ptr;
       }
     }
     int off = entries[idx].offset;
@@ -94,7 +105,7 @@ bool block_exists(ivec3 coord) {
     }
     idx = (idx_last + uint(off)) % total_entries;
   }
-  return false;
+  return kFreeEntry;
 }
 
 // Returns -1 on success, else the fail reason. Reporting the *reason* rather
@@ -103,7 +114,8 @@ bool block_exists(ivec3 coord) {
 // free non-anchor entry, or bucket-lock contention -- and those are different
 // answers to "should the caller grow the map", which the caller now acts on
 // (AllocFailures::capacity_limited).
-int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
+int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr,
+                        out int ptr) {
   int voxel_block_ptr = preset_ptr;
   if (preset_ptr == kNoPresetPtr) {
     uint block_idx = consume_heap();
@@ -117,6 +129,7 @@ int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
   entries[first_empty].offset = kNoOffset;
   memoryBarrierBuffer();  // pos/offset visible before ptr becomes non-free
   atomicExchange(entries[first_empty].ptr, voxel_block_ptr);
+  ptr = voxel_block_ptr;
   return -1;
 }
 
@@ -139,11 +152,11 @@ int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr) {
 // free run in SEPARATE dispatches, so within one dispatch a slot moves only free
 // -> occupied. A stale "free" therefore costs one wasted lock and is caught by
 // the authoritative re-test under it, and a stale "occupied" cannot happen at
-// all -- so the filter never skips a slot that is genuinely free. (block_exists
+// all -- so the filter never skips a slot that is genuinely free. (find_block
 // reads unlocked for the same reason but needs an acquire barrier before
 // comparing `pos`; this filter reads no second field, so it needs none.)
 int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
-                         int preset_ptr) {
+                         int preset_ptr, out int ptr) {
   uint bucket_size = uint(pc.grid.bucket_size);
   uint total_entries = uint(pc.grid.num_buckets) * bucket_size;
   uint idx_last = (hash_bucket + 1u) * bucket_size - 1u;
@@ -216,6 +229,7 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
       if (target_bucket != hash_bucket) {
         unlock_bucket(target_bucket);
       }
+      ptr = voxel_block_ptr;
       return -1;
     }
 
@@ -236,13 +250,15 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
 
 // Insert `coord` if absent, giving its block `preset_ptr` (or kNoPresetPtr to
 // draw a fresh block off the heap). Returns -1 on success (or already present),
-// else the fail reason (kFailLock / kFailChain / kFailHeap / kFailTable). Shared
-// by normal allocation (fresh heap pointer) and rehash (each block's pointer
-// preserved).
-int insert_block(ivec3 coord, int preset_ptr) {
+// with the block's pointer in `ptr`, else the fail reason (kFailLock /
+// kFailChain / kFailHeap / kFailTable). Shared by normal allocation (fresh heap
+// pointer) and rehash (each block's pointer preserved).
+int insert_block(ivec3 coord, int preset_ptr, out int ptr) {
   int last_fail = kFailLock;
+  ptr = kFreeEntry;
   for (int attempt = 0; attempt < 5; ++attempt) {
-    if (block_exists(coord)) {
+    ptr = find_block(coord);
+    if (ptr != kFreeEntry) {
       return -1;
     }
 
@@ -264,6 +280,7 @@ int insert_block(ivec3 coord, int preset_ptr) {
       if (entries[slot].ptr != kFreeEntry) {
         if (entries[slot].pos == coord) {
           found = true;
+          ptr = entries[slot].ptr;
           break;
         }
       } else if (first_empty == -1) {
@@ -282,6 +299,7 @@ int insert_block(ivec3 coord, int preset_ptr) {
     for (int it = 0; it < pc.grid.max_chain; ++it) {
       if (entries[curr].ptr != kFreeEntry && entries[curr].pos == coord) {
         found = true;
+        ptr = entries[curr].ptr;
         break;
       }
       int off = entries[curr].offset;
@@ -299,14 +317,15 @@ int insert_block(ivec3 coord, int preset_ptr) {
     bool chain_at_limit = (chain_hops >= pc.grid.max_chain - 1);
     bool success = false;
     if (first_empty != -1) {
-      int reason = allocate_in_primary(uint(first_empty), coord, preset_ptr);
+      int reason =
+          allocate_in_primary(uint(first_empty), coord, preset_ptr, ptr);
       success = (reason < 0);
       if (!success) {
         last_fail = reason;
       }
     } else if (!chain_at_limit) {
-      int reason =
-          allocate_in_overflow(hash_bucket, bucket_start, coord, preset_ptr);
+      int reason = allocate_in_overflow(hash_bucket, bucket_start, coord,
+                                        preset_ptr, ptr);
       success = (reason < 0);
       if (!success) {
         last_fail = reason;
@@ -324,7 +343,7 @@ int insert_block(ivec3 coord, int preset_ptr) {
     // occupied -> free: kFailHeap, kFailTable and kFailChain are all monotone.
     // Nor can another thread resolve one by inserting this coord itself -- it
     // would need the same block, slot or chain room this thread just found
-    // missing -- so block_exists cannot start returning true either. Re-running
+    // missing -- so find_block cannot start finding it either. Re-running
     // the chain walk and a full-table scan four more times changes nothing, and
     // that wasted work lands exactly when the device is closest to being lost.
     if (last_fail != kFailLock) {
@@ -335,11 +354,22 @@ int insert_block(ivec3 coord, int preset_ptr) {
 }
 
 // Allocate `coord` if absent, drawing a fresh block off the heap -- the name the
-// allocate-from-coords / -depth / -points kernels call. A thin wrapper over
-// insert_block's heap path (kNoPresetPtr); rehash calls insert_block directly
-// with each block's preserved pointer.
+// allocate-from-coords / -depth / -points / -triangles kernels call. A thin
+// wrapper over insert_block's heap path (kNoPresetPtr) that stamps the block as
+// requested; rehash calls insert_block directly with each block's preserved
+// pointer.
 int allocate_block(ivec3 coord) {
-  return insert_block(coord, kNoPresetPtr);
+  int ptr;
+  int fail = insert_block(coord, kNoPresetPtr, ptr);
+#ifdef VR_STAMPS_BINDING
+  if (fail < 0) {
+    // Atomic only because a band's blocks are asked for by many lanes at
+    // once; they all write the same tick.
+    atomicMax(stamps[uint(ptr) / uint(pc.grid.voxels_per_block)].requested,
+              pc.tick);
+  }
+#endif
+  return fail;
 }
 
 // Record a per-block allocation outcome by reason: a no-op on success

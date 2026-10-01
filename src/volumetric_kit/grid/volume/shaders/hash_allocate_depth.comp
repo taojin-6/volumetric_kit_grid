@@ -20,6 +20,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
+#define VR_STAMPS_BINDING 7
 #include "hash_allocate_common.glsl"
 
 // The tile's side; mirrors the host's kDepthTile, which sizes the dispatch.

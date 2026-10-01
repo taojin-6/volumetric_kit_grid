@@ -55,6 +55,24 @@ static_assert(sizeof(BlockIndex) == 16, "BlockIndex must be 16 bytes");
 static_assert(offsetof(BlockIndex, coord) == 0, "BlockIndex layout drift");
 static_assert(offsetof(BlockIndex, ptr) == 12, "BlockIndex layout drift");
 
+/// @brief One block slot's stamps: ticks of the map's clock
+///        (@ref VoxelHashMap::tick), each written by the pass that knows its
+///        fact, so a consumer reads a block's age against a tick of its own
+///        rather than a flag someone must reset.
+///
+/// Indexed by block slot, `BlockIndex::ptr / voxels_per_block`. A slot's
+/// record is zeroed when its block is freed, and 0 is no tick.
+struct BlockStamp {
+  /// The last tick an allocation asked for the block, whether it inserted the
+  /// block or found it there.
+  std::uint32_t requested = 0;
+  /// The last tick a @ref VoxelBlockGrid::stamp_blocks pass found any of the
+  /// block's voxels holding weight; 0 until one does.
+  std::uint32_t weighted = 0;
+};
+static_assert(sizeof(BlockStamp) == 8, "BlockStamp must be 8 bytes");
+static_assert(offsetof(BlockStamp, weighted) == 4, "BlockStamp layout drift");
+
 /// @brief A compacted list of active blocks -- the subset of a grid the next
 ///        pass should run over -- borrowed from whoever compacted it.
 ///

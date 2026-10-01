@@ -14,6 +14,8 @@
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/vulkan.hpp"
 
+#include "block_stamp_comp.spv.hpp"
+
 namespace volumetric_kit::recon::volume {
 namespace {
 
@@ -92,6 +94,19 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
                                         spec.element_size, std::move(buffer)});
   }
   VR_TRY(zero.submit());
+  VR_ASSIGN(vbg.stale_count_,
+            device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  VkPushConstantRange push{};
+  push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push.size = 4 * sizeof(std::uint32_t);
+  KernelSetBuilder kb(device);
+  VR_TRY(kb.add(vbg.stamp_kernel_, "block_stamp", vr_block_stamp_comp_spv,
+                vr_block_stamp_comp_spv_size, 5, &push));
+  VR_ASSIGN(vbg.stamp_pool_, kb.build());
+  VR_ASSIGN(vbg.gpu_timer_, GpuTimer::create(device));
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(device.physical_device(), &props);
+  vbg.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   vbg.name_attribute_buffers();
   return vbg;
 }
@@ -275,8 +290,6 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
               [&](const BlockIndex& a, const BlockIndex& b) {
                 return less(a.coord, b.coord);
               });
-    const auto voxels_per_block =
-        static_cast<std::uint64_t>(map_.grid().voxels_per_block);
     std::vector<std::uint64_t> firsts;  // each found block's first voxel
     for (std::uint32_t i = 0; i < count; ++i) {
       const auto block =
@@ -289,31 +302,7 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
       }
       firsts.push_back(static_cast<std::uint64_t>(block->ptr));
     }
-    // Zero each block's slice of every attribute on the device, in one batch.
-    // Sorted and merged, so blocks the LIFO heap handed out side by side cost
-    // one fill, not one each; and attribute by attribute, so each array's
-    // fills rise through it and share one barrier (see CommandBatch).
-    std::sort(firsts.begin(), firsts.end());
-    firsts.erase(std::unique(firsts.begin(), firsts.end()), firsts.end());
-    CommandBatch batch(*device_, *allocator_);
-    for (const Attribute& attr : attributes_) {
-      for (std::size_t i = 0; i < firsts.size();) {
-        std::size_t j = i + 1;
-        while (j < firsts.size() &&
-               firsts[j] == firsts[j - 1] + voxels_per_block) {
-          ++j;
-        }
-        const std::uint64_t offset = firsts[i] * attr.element_size;
-        const std::uint64_t bytes =
-            (j - i) * voxels_per_block * attr.element_size;
-        i = j;
-        if (offset + bytes > attr.buffer.size()) {
-          continue;  // an out-of-lockstep array; attribute() reports it
-        }
-        VR_TRY(batch.zero(attr.buffer, offset, bytes));
-      }
-    }
-    VR_TRY(batch.submit());
+    VR_TRY(zero_blocks(std::move(firsts)));
   }
 
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
@@ -336,6 +325,112 @@ Status VoxelBlockGrid::clear() {
   }
   VR_TRY(batch.submit());
   return map_.clear();  // moves the topology epoch; see topology_epoch()
+}
+
+Result<std::vector<BlockIndex>> VoxelBlockGrid::block_pass(
+    std::uint32_t max_age, GpuStageScope& stage, StageMetrics* metrics) {
+  if (!valid()) {
+    return Status::invalid_argument("VoxelBlockGrid: moved-from grid");
+  }
+  VR_ASSIGN(const AttributeView weight, attribute("weight"));
+  if (weight.element_size != sizeof(float)) {
+    return Status::invalid_argument(
+        "VoxelBlockGrid: the block pass needs a float weight attribute");
+  }
+  VR_ASSIGN(const DeviceBlockList active,
+            map_.compact_active_blocks_on_device(metrics));
+  if (active.count == 0) return std::vector<BlockIndex>{};
+  const VkDeviceSize list_bytes =
+      VkDeviceSize(active.count) * sizeof(BlockIndex);
+  if (stale_list_.size() < list_bytes) {
+    VR_ASSIGN(stale_list_, device_storage_buffer(*allocator_, list_bytes));
+  }
+  const DescriptorSet& set = stamp_kernel_.set;
+  set.write_storage_buffer(0, weight.buffer->handle(), 0, VK_WHOLE_SIZE);
+  set.write_storage_buffer(1, active.buffer->handle(), 0, list_bytes);
+  set.write_storage_buffer(2, map_.stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
+  set.write_storage_buffer(3, stale_list_.handle(), 0, VK_WHOLE_SIZE);
+  set.write_storage_buffer(4, stale_count_.handle(), 0, VK_WHOLE_SIZE);
+  const std::uint32_t push[4] = {
+      active.count, static_cast<std::uint32_t>(map_.grid().voxels_per_block),
+      map_.tick(), max_age};
+  std::uint32_t stale = 0;
+  CommandBatch batch(*device_, *allocator_);
+  VR_TRY(batch.fill(stale_count_, 0, sizeof(stale), 0u));
+  VR_TRY(batch.dispatch(stamp_kernel_, push, sizeof(push), active.count,
+                        max_workgroup_count_x_, &stage));
+  VR_TRY(batch.readback(stale_count_, 0, sizeof(stale), &stale));
+  VR_TRY(batch.submit());
+  std::vector<BlockIndex> out(std::min(stale, active.count));
+  if (!out.empty()) {
+    CommandBatch read(*device_, *allocator_);
+    VR_TRY(read.readback(stale_list_, 0, out.size() * sizeof(BlockIndex),
+                         out.data()));
+    VR_TRY(read.submit());
+  }
+  return out;
+}
+
+Status VoxelBlockGrid::stamp_blocks(StageMetrics* metrics) {
+  GpuStageScope stage(metrics, gpu_timer_, "block stamps");
+  return block_pass(0, stage, metrics).status();
+}
+
+Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(std::uint32_t max_age,
+                                                        StageMetrics* metrics) {
+  if (max_age == 0) {
+    return Status::invalid_argument(
+        "VoxelBlockGrid::free_stale_blocks: max_age must be at least 1");
+  }
+  GpuStageScope stage(metrics, gpu_timer_, "block stamps");
+  VR_ASSIGN(const std::vector<BlockIndex> stale,
+            block_pass(max_age, stage, metrics));
+  if (stale.empty()) return std::uint32_t{0};
+  // The pass read each block's ptr off the active list, so remove's own
+  // resolve -- the whole list read back and sorted -- is skipped.
+  std::vector<std::uint64_t> firsts;
+  firsts.reserve(stale.size());
+  for (const BlockIndex& b : stale) {
+    firsts.push_back(static_cast<std::uint64_t>(b.ptr));
+  }
+  VR_TRY(zero_blocks(std::move(firsts)));
+  const auto count = static_cast<std::uint32_t>(stale.size());
+  VR_ASSIGN(const std::uint32_t failed, map_.remove(stale.data(), count));
+  return count - std::min(failed, count);
+}
+
+Status VoxelBlockGrid::zero_blocks(std::vector<std::uint64_t> firsts) {
+  // Zero each block's slice of every attribute on the device, in one batch.
+  // Sorted and merged, so blocks the LIFO heap handed out side by side cost
+  // one fill, not one each; and attribute by attribute, so each array's
+  // fills rise through it and share one barrier (see CommandBatch).
+  // TODO(volume): a kernel zeroing a list of blocks, one dispatch an array,
+  // if frees of thousands of scattered blocks become common: MoltenVK runs
+  // each fill as a dispatch of its own, and 1 500 of them cost a block pass
+  // about 5 ms on the M5 Max (2026-10-01).
+  const auto voxels_per_block =
+      static_cast<std::uint64_t>(map_.grid().voxels_per_block);
+  std::sort(firsts.begin(), firsts.end());
+  firsts.erase(std::unique(firsts.begin(), firsts.end()), firsts.end());
+  CommandBatch batch(*device_, *allocator_);
+  for (const Attribute& attr : attributes_) {
+    for (std::size_t i = 0; i < firsts.size();) {
+      std::size_t j = i + 1;
+      while (j < firsts.size() &&
+             firsts[j] == firsts[j - 1] + voxels_per_block) {
+        ++j;
+      }
+      const std::uint64_t offset = firsts[i] * attr.element_size;
+      const std::uint64_t bytes =
+          (j - i) * voxels_per_block * attr.element_size;
+      i = j;
+      if (offset + bytes > attr.buffer.size()) {
+        continue;  // an out-of-lockstep array; attribute() reports it
+      }
+      VR_TRY(batch.zero(attr.buffer, offset, bytes));
+    }
+  }
+  return batch.submit();
 }
 
 Status VoxelBlockGrid::check_block_list(const BlockList& blocks,

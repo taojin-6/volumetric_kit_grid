@@ -63,6 +63,7 @@ include(vr_embed)
 vr_embed_shaders(
   recon_volume
   SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/block_stamp.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_init.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_coords.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_allocate_depth.comp"
