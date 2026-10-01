@@ -3,7 +3,7 @@
 // The block pass behind VoxelBlockGrid::stamp_blocks: one workgroup per active
 // block. It reduces "is any voxel observed" over the block and stamps the
 // slot's `weighted` with the map's tick; with a max_age, it also lists the
-// blocks neither an allocation nor weight has stamped in that many ticks.
+// blocks neither an allocation nor weight has stamped in more ticks than that.
 
 #extension GL_GOOGLE_include_directive : require
 #define VR_HASH_COMMON_NO_PUSH_CONSTANTS
@@ -56,13 +56,15 @@ void main() {
     stamps[slot].weighted = pc.tick;
   }
   // Ages are differences, so they hold across the clock's wrap; 0 is no
-  // tick, and every active block has been requested.
+  // tick, and every active block has been requested. Older than max_age, not
+  // as old: the writer after an allocation advances the clock, so the band a
+  // set asks for is a tick old by the time its fuse is done.
   BlockStamp st = stamps[slot];
   uint age = pc.tick - st.requested;
   if (st.weighted != 0u) {
     age = min(age, pc.tick - st.weighted);
   }
-  if (pc.max_age != 0u && age >= pc.max_age) {
+  if (pc.max_age != 0u && age > pc.max_age) {
     stale[atomicAdd(stale_count, 1u)] = block;
   }
 }

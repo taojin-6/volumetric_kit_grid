@@ -48,6 +48,7 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 #define VR_DCT_BINDING_MASKS 5
 #define VR_DCT_BINDING_ENTRIES 6
 #define VR_DCT_BINDING_REJECTED 7
+#define VR_DCT_BINDING_STAMPS 8
 
 // BlockIndex and the read-only hash lookup from the volume tier (one
 // definition, not a mirror -- see hash_lookup.glsl), which brings hash_common
@@ -56,7 +57,7 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 #include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
-// layout places each at its host offset (48 bytes).
+// layout places each at its host offset (52 bytes).
 layout(push_constant, scalar) uniform PushConstants {
   uint block_base;         // first list entry this dispatch covers
   uint num_blocks;         // entries in the whole list
@@ -71,6 +72,7 @@ layout(push_constant, scalar) uniform PushConstants {
   int bucket_size;
   int max_chain;
   int max_quantized;       // the clamp on a quantized coefficient
+  uint tick;               // the map's tick, which the inverse stamps with
 }
 pc;
 

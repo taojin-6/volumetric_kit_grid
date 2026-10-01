@@ -5,10 +5,10 @@
 // blocks it asks for -- inserted or already there -- with the map's tick
 // (`requested`); the grid's block pass stamps the blocks holding an observed
 // voxel (`weighted`); and free_stale_blocks frees exactly the blocks that have
-// been neither for max_age ticks, zeroing their voxels. A freed slot's record
-// is zeroed, resize keeps every record in its slot (the rehash does not
-// restamp), and clear zeroes them all. Exits 0 (skip) where no device is
-// present.
+// been neither for more than max_age ticks, zeroing their voxels. A freed
+// slot's record is zeroed, resize keeps every record in its slot (the rehash
+// does not restamp), and clear zeroes them all. Exits 0 (skip) where no device
+// is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +19,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -160,21 +161,35 @@ int main() {
   CHECK(st.value()[b].requested == 1 && st.value()[b].weighted == 0);
   CHECK(st.value()[c].requested == 3 && st.value()[c].weighted == 0);
 
-  // Tick 3, max_age 3: the second block is two ticks old, so nothing goes.
-  auto freed = grid.free_stale_blocks(3);
+  // Tick 3, max_age 2: the second block is two ticks old, no more, so nothing
+  // goes.
+  auto freed = grid.free_stale_blocks(2);
   CHECK(freed.ok() && freed.value() == 0);
 
-  // Tick 4: the second block is three ticks old and goes, its record zeroed;
-  // the weighted one and the one asked for at tick 3 stay.
+  // Tick 4: the second block is three ticks old and goes, its record zeroed --
+  // `changed` too, set here as a writer would so the zero has something to
+  // clear; the weighted one and the one asked for at tick 3 stay.
+  {
+    auto all = map.read_block_stamps();
+    CHECK(all.ok());
+    all.value()[b].changed = 3;
+    vr::CommandBatch batch(dev, alloc);
+    CHECK(batch
+              .upload(map.stamps_buffer(), 0, all.value().data(),
+                      all.value().size() * sizeof(vol::BlockStamp))
+              .ok());
+    CHECK(batch.submit().ok());
+  }
   map.advance_tick();
-  freed = grid.free_stale_blocks(3);
+  freed = grid.free_stale_blocks(2);
   CHECK(freed.ok() && freed.value() == 1);
   slot = slots(grid);
   CHECK(slot.ok() && slot.value().size() == 2 &&
         slot.value().count(Coord{1, 0, 0}) == 0);
   st = map.read_block_stamps();
   CHECK(st.ok());
-  CHECK(st.value()[b].requested == 0 && st.value()[b].weighted == 0);
+  CHECK(st.value()[b].requested == 0 && st.value()[b].weighted == 0 &&
+        st.value()[b].changed == 0);
   CHECK(st.value()[a].weighted == 4);
   // Its voxels are zeroed, every attribute, and the kept block's stay.
   {
@@ -208,8 +223,13 @@ int main() {
     CHECK(wide->map().allocate(three, 1).ok());
     CHECK(narrow->stamp_blocks().ok());
     narrow.value() = std::move(wide).value();
+    // A block asked for before the writer that advances the clock is a tick
+    // old, and stays at max_age 1; a tick later it goes.
     narrow->map().advance_tick();
     auto gone = narrow->free_stale_blocks(1);
+    CHECK(gone.ok() && gone.value() == 0);
+    narrow->map().advance_tick();
+    gone = narrow->free_stale_blocks(1);
     CHECK(gone.ok() && gone.value() == 1);
   }
 
@@ -259,7 +279,8 @@ int main() {
   CHECK(grown.ok() && grown.value().size() == 2 * st.value().size());
   for (std::size_t i = 0; i < st.value().size(); ++i) {
     CHECK(grown.value()[i].requested == st.value()[i].requested &&
-          grown.value()[i].weighted == st.value()[i].weighted);
+          grown.value()[i].weighted == st.value()[i].weighted &&
+          grown.value()[i].changed == st.value()[i].changed);
   }
   CHECK(grown.value().back().requested == 0);
 
@@ -268,7 +289,7 @@ int main() {
   auto cleared = map.read_block_stamps();
   CHECK(cleared.ok());
   for (const vol::BlockStamp& s : cleared.value()) {
-    CHECK(s.requested == 0 && s.weighted == 0);
+    CHECK(s.requested == 0 && s.weighted == 0 && s.changed == 0);
   }
 
   // Refusals: a max_age of 0, and a grid with no weight.

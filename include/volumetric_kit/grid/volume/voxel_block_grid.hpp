@@ -242,6 +242,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @ref VoxelHashMap::resize through @ref map() leaves behind -- is refused,
   /// so the mismatch becomes a clean @ref Status at the binding site rather
   /// than a kernel indexing past the end of a buffer bound `VK_WHOLE_SIZE`.
+  ///
+  /// A write through the view stamps no block `changed` (@ref BlockStamp),
+  /// as the library's own writers do, so an incremental mesh extract after it
+  /// keeps the old triangles: mesh such a grid in full next.
   /// @param name  The attribute name (as declared at @ref create).
   /// @return A view of the attribute, or @ref Status::Code::InvalidArgument if
   ///         no attribute of that name was declared (or the grid is
@@ -331,13 +335,17 @@ class VR_VOLUME_API VoxelBlockGrid {
 
   /// @brief @ref stamp_blocks, then free every active block that has been
   ///        neither asked for by an allocation nor found holding weight for
-  ///        @p max_age ticks (@ref remove).
+  ///        more than @p max_age ticks (@ref remove).
   ///
   /// So a block the allocator still asks for stays, holding weight or not --
   /// the band around the surface the cameras see -- and so does one still
   /// holding weight, seen or not; what goes is space a surface has left.
-  /// Freeing moves the map's topology epoch, as any @ref remove does. Ages
-  /// are differences of ticks, so they hold across the clock's wrap.
+  /// *More* than: the fuse after an allocation advances the clock, so a block
+  /// the last set asked for is a tick old once that set is fused. A rig that
+  /// fuses a set a tick therefore frees a block @p max_age sets after it was
+  /// last asked for. Freeing moves the map's topology epoch, as any
+  /// @ref remove does.
+  /// Ages are differences of ticks, so they hold across the clock's wrap.
   /// @param max_age  Ticks a block may be neither and stay; at least 1.
   /// @param metrics  As @ref stamp_blocks, the row spanning the frees too.
   /// @return The blocks freed; @ref Status::Code::InvalidArgument for a

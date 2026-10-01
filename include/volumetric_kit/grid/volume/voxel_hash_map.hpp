@@ -548,8 +548,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// whether that cache still describes this table, which it otherwise cannot:
   /// a removed block's index goes back to a LIFO heap and is re-drawn by the
   /// next allocation, so the same slot silently comes to mean a different block
-  /// at a different coordinate. `tsdf::TsdfIntegrator`'s dirty-block flags and
-  /// `mesh::MarchingCubes`' span table are the two such caches.
+  /// at a different coordinate. `mesh::MarchingCubes`' span table is such a
+  /// cache. The block stamps are not, since the map zeroes a slot's record as
+  /// it frees the block.
   ///
   /// It lives *here*, on the table that hands block indices out and takes them
   /// back, rather than on @ref VoxelBlockGrid -- which is what makes it
@@ -575,14 +576,22 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// @brief The map's clock, which every @ref BlockStamp is a reading of.
   ///        Starts at 1; 0 is no tick.
+  ///
+  /// It counts the passes that write voxels -- each `tsdf::TsdfIntegrator`
+  /// integrate call (one per set, for a rig), `tsdf::MeshIntegrator` call and
+  /// codec decode -- since each advances it before it stamps `changed`. So a
+  /// reader that records the tick it read at sees every later change as
+  /// newer, however its calls interleave with the writers'. Ticks compare
+  /// modulo 2^32, so an age is right up to 2^31 of them.
   std::uint32_t tick() const noexcept { return tick_; }
-  /// @brief Advance @ref tick by one: once per set of frames fused, say, so
-  ///        an age in ticks is an age in sets. Skips 0 when it wraps.
+  /// @brief Advance @ref tick by one, as a pass that writes voxels does before
+  ///        it stamps. Skips 0 when it wraps.
   void advance_tick() noexcept { tick_ = tick_ + 1 == 0 ? 1 : tick_ + 1; }
   /// @brief The device buffer of one @ref BlockStamp per block slot, for a
   ///        kernel that reads or writes a stamp. Every allocation stamps
-  ///        `requested`; @ref remove, @ref clear and @ref create zero a slot's
-  ///        record, and @ref resize keeps each where it is.
+  ///        `requested`, and every pass that writes voxels `changed`;
+  ///        @ref remove, @ref clear and @ref create zero a slot's record, and
+  ///        @ref resize keeps each where it is.
   const Buffer& stamps_buffer() const noexcept { return stamps_; }
   /// @brief Every block slot's record, read back: for tests and diagnostics.
   Result<std::vector<BlockStamp>> read_block_stamps() const;

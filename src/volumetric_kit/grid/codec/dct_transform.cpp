@@ -38,8 +38,9 @@ struct PushConstants {
   std::int32_t bucket_size;
   std::int32_t max_chain;
   std::int32_t max_quantized;
+  std::uint32_t tick;  // the map's tick, which the inverse stamps blocks with
 };
-static_assert(sizeof(PushConstants) == 48, "PushConstants must be 48 bytes");
+static_assert(sizeof(PushConstants) == 52, "PushConstants must be 52 bytes");
 static_assert(offsetof(PushConstants, block_base) == 0, "layout drift");
 static_assert(offsetof(PushConstants, num_blocks) == 4, "layout drift");
 static_assert(offsetof(PushConstants, coefficient_count) == 8, "layout drift");
@@ -52,6 +53,7 @@ static_assert(offsetof(PushConstants, num_buckets) == 32, "layout drift");
 static_assert(offsetof(PushConstants, bucket_size) == 36, "layout drift");
 static_assert(offsetof(PushConstants, max_chain) == 40, "layout drift");
 static_assert(offsetof(PushConstants, max_quantized) == 44, "layout drift");
+static_assert(offsetof(PushConstants, tick) == 48, "layout drift");
 
 // The kernels' lane-to-line mapping is written for this edge (kEdge in
 // dct_common.glsl), which is why a grid with another block size is refused.
@@ -77,7 +79,8 @@ enum Binding : std::uint32_t {
   kBindingMasks = 5,
   kBindingEntries = 6,
   kBindingRejected = 7,
-  kBindingCount = 8,
+  kBindingStamps = 8,
+  kBindingCount = 9,
 };
 
 Status fail(const char* op, const std::string& why) {
@@ -211,6 +214,8 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
                                   VK_WHOLE_SIZE);
   kernel.set.write_storage_buffer(kBindingEntries, grid.map().entries_buffer(),
                                   0, entries_bytes);
+  kernel.set.write_storage_buffer(
+      kBindingStamps, grid.map().stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
 
   const volume::VoxelGridParams& gp = grid.grid();
   PushConstants push{};
@@ -225,6 +230,7 @@ Status DctTransform::run(const char* op, ComputeKernel& kernel,
   push.bucket_size = gp.bucket_size;
   push.max_chain = gp.max_chain;
   push.max_quantized = kMaxQuantizedMagnitude;
+  push.tick = grid.map().tick();
   std::memset(rejected_.mapped(), 0, sizeof(std::uint32_t));
   // Each dispatch is its own fence-waited submission whose barrier makes its
   // writes visible to the next and to the host, so the batches need no
@@ -340,6 +346,8 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                            debug_object_handle(mask_buf.handle()),
                            "codec.masks");
 
+  // The call is one tick, which every block it writes is stamped changed with.
+  grid.map().advance_tick();
   return run("inverse", inverse_kernel_, grid, views, blocks, in.params,
              coeff_buf, mask_buf, stage);
 }

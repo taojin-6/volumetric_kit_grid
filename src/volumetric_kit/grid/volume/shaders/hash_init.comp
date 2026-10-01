@@ -34,7 +34,7 @@ void main() {
   }
   if (gid < num_blocks) {
     heap[gid] = gid;
-    stamps[gid] = BlockStamp(0u, 0u);
+    stamps[gid] = BlockStamp(0u, 0u, 0u);
   }
   if (gid == 0u) {
     heap_counter = num_blocks;

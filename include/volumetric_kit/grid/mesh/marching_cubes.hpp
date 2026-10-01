@@ -116,7 +116,7 @@ struct ExtractTimings {
   /// the trade soundly -- the first extract against a grid, a topology change,
   /// a preceding culled extract, a
   /// @ref MarchingCubesConfig::slot_count above one, an arena that had to
-  /// grow, or flags the integrator will not vouch for. Each of those is
+  /// grow, or an iso other than the last extract's. Each of those is
   /// invisible to the caller and each turns the feature off *permanently*
   /// (a config flag) or *silently* (a fallback), so the answer is reported
   /// rather than left to be inferred: @ref dispatches counts refit rounds and
@@ -418,9 +418,7 @@ struct MarchingCubesConfig {
   /// actually costs rather than the visible half of it. With this off the
   /// kernel is told not to write the table, nothing is allocated, and the
   /// per-block stamping loop does not run, so a caller who did not ask measures
-  /// nothing -- the same bargain
-  /// `tsdf::TsdfIntegratorConfig::track_dirty_blocks` strikes for the flags it
-  /// gates, and for the same reason.
+  /// nothing.
   ///
   bool track_block_spans = false;
 };
@@ -455,39 +453,6 @@ static_assert(std::is_standard_layout_v<BlockSpan>,
               "BlockSpan must be standard layout");
 static_assert(std::is_trivially_copyable_v<BlockSpan>,
               "BlockSpan must be trivially copyable");
-
-/// @brief The blocks a fuse changed, as the device buffer holding them.
-///
-/// Deliberately opaque: `tsdf` produces this and `mesh` only reads it, so
-/// passing the handle rather than the integrator keeps `mesh` off `tsdf`
-/// entirely -- the tier order forbids the include, and this is what replaces
-/// it. Fill all three fields from the integrator that wrote the flags; each
-/// has an accessor, and each answers the same question about the same fuse.
-///
-/// One `uint32_t` per **block slot** (`BlockIndex::ptr / voxels_per_block`),
-/// non-zero where that block's voxels changed. This is the *changed* set; the
-/// extractor dilates it into the re-mesh set on-device, since a cell reads
-/// corners at `base + {0,1}^3`.
-struct DirtyBlocks {
-  /// The flag buffer, from `TsdfIntegrator::dirty_flags_buffer()`. Null when
-  /// the integrator has nothing usable to offer, which makes the extract fall
-  /// back to a full one rather than fail.
-  VkBuffer flags = VK_NULL_HANDLE;
-  /// Block slots @p flags addresses, from
-  /// `TsdfIntegrator::dirty_flags_capacity()`. The kernel's only bound on the
-  /// buffer, and what its descriptor range is written from -- so it must be
-  /// the capacity of *this* @p flags buffer, not one cached from before the
-  /// integrator grew it. A slot past it is treated as changed, the
-  /// conservative direction.
-  std::uint32_t capacity = 0;
-  /// The `volume::VoxelBlockGrid::topology_epoch` the flags were accumulated
-  /// against, from `TsdfIntegrator::dirty_epoch()`. Checked against the grid
-  /// being meshed, because a flag is keyed by block *slot* and a slot means
-  /// nothing across a `remove()`/`clear()` (which hands the index to a
-  /// different block) or across grids. The token is globally unique, so this
-  /// one comparison answers both -- exactly as it does for the span table.
-  std::uint64_t epoch = 0;
-};
 
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
 ///        straight off a sparse @ref volume::VoxelBlockGrid -- into a host
@@ -819,7 +784,16 @@ class VR_MESH_API MarchingCubes {
   Result<Mesh> extract_host(volume::VoxelBlockGrid& grid, float iso = 0.0f,
                             ExtractTimings* timings = nullptr);
 
-  /// @brief Extract, re-meshing only the blocks @p dirty says a fuse changed.
+  /// @brief Extract, re-meshing only the blocks changed since this
+  ///        extractor's last extract.
+  ///
+  /// "Changed" is the block's `changed` stamp (@ref volume::BlockStamp), which
+  /// every pass that writes voxels stamps with the map's tick after advancing
+  /// it. This extractor keeps the tick its last publishing extract ran at, so
+  /// it re-meshes exactly what was written since, however many fuses ran
+  /// between, and nothing has to be reset. A caller writing voxels any other
+  /// way, through @ref volume::VoxelBlockGrid::attribute, stamps nothing, so
+  /// its next extract after such a write must be a full @ref extract_device.
   ///
   /// The blocks whose `+{0,1}^3` neighbourhood carries no change keep the
   /// triangles they already have, at the offsets @ref block_spans already
@@ -836,11 +810,11 @@ class VR_MESH_API MarchingCubes {
   ///
   /// - the first extract against a grid, which is what *establishes* the
   ///   arena and spans an incremental pass reads;
+  /// - an @p iso other than the last extract's, whose surface every kept
+  ///   block's triangles lie on;
   /// - a `remove()`/`clear()` since then, which hands a block slot to a
-  ///   different block, so neither @ref DirtyBlocks::epoch nor the span
-  ///   table's own anchor still matches the grid;
-  /// - flags the integrator will not vouch for (a null
-  ///   @ref DirtyBlocks::flags, or an epoch that has moved);
+  ///   different block, so the span table's anchor no longer matches the
+  ///   grid;
   /// - an arena that has to grow for this call, since a grow reallocates and
   ///   nothing copies the clean blocks' triangles forward;
   /// - an overflow refit, whose retry has already lost the pre-call spans;
@@ -885,9 +859,6 @@ class VR_MESH_API MarchingCubes {
   /// @param grid     The sparse volume to mesh, as @ref extract_device takes
   ///                 it.
   /// @param iso      The iso-value to extract at (0 for a TSDF surface).
-  /// @param dirty    The blocks the fuse changed; see @ref DirtyBlocks for
-  ///                 where each field comes from. Read for the duration of
-  ///                 this call and not retained.
   /// @param timings  Optional; filled as @ref extract_device fills it, plus
   ///                 @ref ExtractTimings::incremental and
   ///                 @ref ExtractTimings::remeshed_blocks.
@@ -895,7 +866,7 @@ class VR_MESH_API MarchingCubes {
   ///         @ref extract_device's is, or that overload's @ref Status on any
   ///         of the failures it can report.
   Result<DeviceMesh> extract_device_incremental(
-      volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks& dirty,
+      volume::VoxelBlockGrid& grid, float iso = 0.0f,
       ExtractTimings* timings = nullptr);
 
   /// @brief Extract as @ref extract_host does, but leave the result in this
@@ -1194,6 +1165,11 @@ class VR_MESH_API MarchingCubes {
     // kernel writes each triangle's three vertices at `tri * 3` and never
     // touches the counter.
     std::uint32_t vertex_watermark = 0;
+    // The map's tick when the extract that wrote all this ran, so the next
+    // incremental pass re-meshes the blocks stamped changed after it.
+    std::uint32_t tick = 0;
+    // The iso it meshed at, which every triangle a block keeps lies on.
+    float iso = 0.0f;
   };
   ArenaState arena_state_{};
 
@@ -1388,25 +1364,20 @@ class VR_MESH_API MarchingCubes {
   }
 
   // The one sparse extract, with the three public entry points differing only
-  // in what they have to offer it: dirty flags, an active set, or neither.
+  // in what they ask of it: an incremental pass, a caller's active set, or
+  // neither.
   //
-  // @p dirty is null for extract_device and points at the caller's struct for
-  // extract_device_incremental, which is borrowed for this call alone. A
-  // PARAMETER rather than a member the wrapper arms and disarms around a
-  // delegated call: as a member, any exception unwinding out of here -- and
-  // this function allocates a vector, a 12 MB stamp array and several
-  // std::strings -- left a caller-owned VkBuffer latched on the extractor, so
-  // the *plain* extract_device would then bind it, possibly after the
-  // integrator that owned it was destroyed. As a parameter that state cannot be
-  // represented.
+  // @p incremental asks for an incremental pass, which
+  // extract_device_incremental alone does; a parameter rather than a member the
+  // wrapper arms and disarms, so no exception unwinding out of here can leave
+  // the plain extract_device asking for one.
   //
   // @p blocks is null when this call compacts the whole active set itself (onto
   // the device with the spans off, else to the host), and points at the
-  // caller's subset otherwise -- borrowed for this call alone,
-  // and a parameter for the same reason @p dirty is, only more so: it is a bare
-  // host pointer into a std::vector the caller owns, so latching it on the
-  // extractor would leave a dangling read for the NEXT extract rather than a
-  // stale one for this.
+  // caller's subset otherwise -- borrowed for this call alone, and a parameter
+  // for the same reason: it is a bare host pointer into a std::vector the
+  // caller owns, so latching it on the extractor would leave a dangling read
+  // for the NEXT extract rather than a stale one for this.
   //
   // Whether the pass is actually incremental is decided HERE, not by which
   // entry point was called: every clause is something the caller cannot see.
@@ -1416,7 +1387,7 @@ class VR_MESH_API MarchingCubes {
   // that names a method the header does not declare leaves a user with nothing
   // to grep. See kEntryHost in the .cpp.
   Result<DeviceMesh> extract_device_impl(volume::VoxelBlockGrid& grid,
-                                         float iso, const DirtyBlocks* dirty,
+                                         float iso, bool incremental,
                                          const volume::BlockList* blocks,
                                          ExtractTimings* timings,
                                          const char* entry);

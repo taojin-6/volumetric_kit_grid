@@ -132,6 +132,18 @@ int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
   vr::Result<Snapshot> out_snap = snapshot(gpu, out);
   CHECK(out_snap.ok());
+  // Every block decoded is stamped changed, at a tick of the decode's own.
+  {
+    CHECK(out.map().tick() > 1);
+    vr::Result<std::vector<vol::BlockIndex>> active =
+        out.map().compact_active_blocks();
+    vr::Result<std::vector<vol::BlockStamp>> st = out.map().read_block_stamps();
+    CHECK(active.ok() && st.ok() && !active.value().empty());
+    for (const vol::BlockIndex& b : active.value()) {
+      CHECK(st.value()[static_cast<std::uint32_t>(b.ptr) / 512u].changed ==
+            out.map().tick());
+    }
+  }
 
   const float bound = std::sqrt(512.0f) * 0.002f / 2.0f * kTrunc + 1e-6f;
   float max_err = 0.0f;

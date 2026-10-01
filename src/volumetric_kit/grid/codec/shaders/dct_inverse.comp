@@ -10,8 +10,9 @@
 // keeps, which ringing from the dropped coefficients can overshoot -- and the
 // decoded weight. An unobserved voxel gets zero tsdf and zero weight, exactly
 // what a freshly allocated block holds, so the mesher skips it as it skipped
-// the original. An entry that is not a live block of the grid (see
-// block_is_live) is written nothing.
+// the original. Each block written is stamped changed with the map's tick. An
+// entry that is not a live block of the grid (see block_is_live) is written
+// nothing.
 //
 // Re-implements the prior engine's computeIDCTKernel (compute_dct.cu), which
 // wrote every voxel's SDF and left weights alone; the mask is what replaces the
@@ -19,6 +20,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "dct_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/block_stamp.glsl"
 
 layout(local_size_x = kLanes) in;
 
@@ -37,6 +39,9 @@ layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) readonly buffer
     Masks {
   uint masks[];
 };
+layout(set = 0, binding = VR_DCT_BINDING_STAMPS, scalar) buffer Stamps {
+  BlockStamp stamps[];
+};
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
@@ -46,6 +51,9 @@ void main() {
     return;
   }
   uint voxel_base = uint(blocks[entry].ptr);
+  if (lane == 0u) {
+    stamps[voxel_base / kBlockVoxels].changed = pc.tick;
+  }
 
   s_basis[lane] = basis[lane];
   for (uint x = 0u; x < kEdge; ++x) {

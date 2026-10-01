@@ -193,17 +193,17 @@ struct SparsePushConstants {
   // Re-mesh only blocks whose +{0,1}^3 neighbourhood a fuse changed, reusing
   // each block's existing range where the new count fits it.
   std::uint32_t incremental = 0;
-  // Slots the bound dirty-flag buffer addresses. A block past it is treated as
-  // changed, so a table that is somehow short re-meshes rather than goes stale.
-  std::uint32_t dirty_capacity = 0;
+  // The map's tick at the extract this one updates: a block re-meshes when a
+  // block of its neighbourhood was stamped changed after it.
+  std::uint32_t since = 0;
   // Block slots this grid's heap holds (VoxelGridParams::num_blocks), so the
   // kernel can bound a BlockIndex::ptr it did not produce. The host bounds the
   // caller's COUNT in O(1), but bounding every ptr is O(count) of host work per
   // frame, which the extract deliberately does not spend -- and an unbounded
   // ptr is an out-of-bounds STORE into block_spans, not merely a read of the
-  // wrong voxels. One comparison per workgroup buys the other half. Appended at
-  // the END for the reason dirty_capacity was: this block is one ABI shared
-  // with both sparse kernels.
+  // wrong voxels. One comparison per workgroup buys the other half. It is the
+  // stamps' length too. Appended at the END for the reason `since` was: this
+  // block is one ABI shared with both sparse kernels.
   std::uint32_t num_block_slots = 0;
 };
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
@@ -239,7 +239,7 @@ static_assert(offsetof(SparsePushConstants, write_spans) == 48,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, incremental) == 52,
               "SparsePushConstants layout drift");
-static_assert(offsetof(SparsePushConstants, dirty_capacity) == 56,
+static_assert(offsetof(SparsePushConstants, since) == 56,
               "SparsePushConstants layout drift");
 static_assert(offsetof(SparsePushConstants, num_block_slots) == 60,
               "SparsePushConstants layout drift");
@@ -687,9 +687,9 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   VR_ASSIGN(Buffer grown,
             storage_buffer(*allocator_, bytes, HostAccess::Random));
 
-  // Carry the existing spans forward and zero only the new tail, mirroring
-  // TsdfIntegrator::prepare_dirty_flags -- the sibling slot-keyed table, grown
-  // by the same event for the same reason. The grow is driven by
+  // Carry the existing spans forward and zero only the new tail, as the map
+  // does its block stamps -- the sibling slot-keyed table, grown by the same
+  // event for the same reason. The grow is driven by
   // VoxelHashMap::resize, which PRESERVES each block's index, and
   // VoxelBlockGrid::topology_epoch deliberately does not move across it
   // precisely so a slot-keyed cache stays correct; replacing the table
@@ -983,13 +983,13 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
   // vertices / command. After that they diverge, in the count as well as in
   // the assignment:
   //
-  //   default   8 = block spans, 9 = the dirty-block flags it dilates  (TEN)
+  //   default   8 = block spans, 9 = the map's block stamps it dilates (TEN)
   //   sharing   8 = the index run it writes itself, 9 = block spans,
-  //             10 = the dirty-block flags                          (ELEVEN)
+  //             10 = the map's block stamps                         (ELEVEN)
   //
-  // Both dilate the dirty set -- incremental extraction runs under
+  // Both dilate the changed set -- incremental extraction runs under
   // share_vertices since the 2026-08-11 decision -- so the sharing variant's
-  // dirty binding is one slot later rather than absent. The default variant
+  // stamp binding is one slot later rather than absent. The default variant
   // has no index-run binding because its run is the identity the host filled
   // on the last grow. The count below and the two shaders' `binding =`
   // literals are the only statement of any of this, so they are maintained
@@ -1082,7 +1082,7 @@ Result<Mesh> MarchingCubes::extract_host(volume::VoxelBlockGrid& grid,
   // host-only caller to release a slot it never saw.
   VR_ASSIGN(
       const DeviceMesh device_mesh,
-      extract_device_impl(grid, iso, nullptr, nullptr, timings, kEntryHost));
+      extract_device_impl(grid, iso, false, nullptr, timings, kEntryHost));
   // The host copy is part of this call's readback, so it belongs in the phase
   // that names it -- the device path's readback_ms is near zero, its command
   // read riding the dispatch's submit, which is right for that entry point but
@@ -1187,33 +1187,30 @@ Result<Mesh> MarchingCubes::download(const DeviceMesh& device_mesh) const {
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device_incremental(
-    volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks& dirty,
-    ExtractTimings* timings) {
+    volume::VoxelBlockGrid& grid, float iso, ExtractTimings* timings) {
   // The request, not the decision. extract_device_impl decides whether an
   // incremental pass is actually SOUND -- spans anchored to this grid, a live
-  // watermark, flags the integrator vouches for, one slot, an arena that
-  // survives -- and falls back to a full extract when it is not, which is why
-  // this is one line and not a second copy of that function.
-  return extract_device_impl(grid, iso, &dirty, nullptr, timings,
+  // watermark, one slot, an arena that survives -- and falls back to a full
+  // extract when it is not, which is why this is one line and not a second
+  // copy of that function.
+  return extract_device_impl(grid, iso, true, nullptr, timings,
                              kEntryIncremental);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(volume::VoxelBlockGrid& grid,
                                                  float iso,
                                                  ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, nullptr, timings,
-                             kEntryDevice);
+  return extract_device_impl(grid, iso, false, nullptr, timings, kEntryDevice);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device(
     volume::VoxelBlockGrid& grid, float iso, const volume::BlockList& blocks,
     ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, &blocks, timings,
-                             kEntryDevice);
+  return extract_device_impl(grid, iso, false, &blocks, timings, kEntryDevice);
 }
 
 Result<DeviceMesh> MarchingCubes::extract_device_impl(
-    volume::VoxelBlockGrid& grid, float iso, const DirtyBlocks* dirty,
+    volume::VoxelBlockGrid& grid, float iso, bool incremental_request,
     const volume::BlockList* blocks, ExtractTimings* timings,
     const char* entry) {
   // Fully overwrite the caller's struct up front, so the accumulating spans
@@ -1237,8 +1234,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // clear() between the caller's compaction and this call has handed those
   // pointers to DIFFERENT blocks: every one of them is still in range, so the
   // extract would mesh whatever voxels now live there and report Status::ok.
-  // That is exactly the staleness the span table and the dirty flags are
-  // anchored against, and it is answered here with the same token.
+  // That is exactly the staleness the span table is anchored against, and it
+  // is answered here with the same token.
   //
   // Not checked HERE: that each ptr is one this grid actually handed out. It is
   // O(count) of host work per frame -- ~107k entries on room0 -- to catch a
@@ -1510,7 +1507,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   const VkDeviceSize active_bytes =
       static_cast<VkDeviceSize>(num_active) * sizeof(volume::BlockIndex);
   // Range-checked like the two other bindings in this function whose size a
-  // caller supplies (the hash entries above, the dirty flags below). This one
+  // caller supplies (the hash entries above). This one
   // used to be exempt because its size came from a compaction this call made;
   // a caller-supplied set makes num_active an input, so it gets the same guard.
   VR_TRY(check_storage_buffer_range(
@@ -1582,42 +1579,24 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // ExtractTimings::incremental, since none of this is visible from outside.
   const std::uint32_t planned_verts = plan_vertex_capacity(capacity);
   bool incremental =
-      // No public entry point offers both a caller-supplied set and dirty
-      // flags, and this is what keeps that true where it MATTERS rather than
-      // where it happens to hold. An incremental pass keeps the triangles of
-      // every block it does not re-mesh, and a block outside a culled set is
-      // simply not dispatched -- so it would keep its geometry below the
-      // watermark and go on being drawn, giving back the arena and draw savings
-      // the cull exists for and leaving only the dispatch one. Stated as a
-      // clause here, a future entry point that offers both gets this tier's
-      // documented answer to a combination it cannot serve -- a full extract
-      // over the caller's set, reported as ExtractTimings::incremental == false
+      // No public entry point asks for both a caller-supplied set and an
+      // incremental pass, and this is what keeps that true where it MATTERS
+      // rather than where it happens to hold. An incremental pass keeps the
+      // triangles of every block it does not re-mesh, and a block outside a
+      // culled set is simply not dispatched -- so it would keep its geometry
+      // below the watermark and go on being drawn, giving back the arena and
+      // draw savings the cull exists for and leaving only the dispatch one.
+      // Stated as a clause here, a future entry point that offers both gets
+      // this tier's documented answer to a combination it cannot serve -- a
+      // full extract over the caller's set, reported as
+      // ExtractTimings::incremental == false
       // -- rather than a surprise.
-      blocks == nullptr && dirty != nullptr && dirty->flags != VK_NULL_HANDLE &&
-      dirty->capacity != 0 && dirty->epoch == grid.topology_epoch() &&
-      config_.track_block_spans && slot_count_ == 1 &&
-      prev_arena.watermark != 0 && prev_arena.epoch == grid.topology_epoch() &&
-      prev_arena.serial == span_serial_ && arena().valid() &&
-      planned_verts <= arena_vertex_capacity() && capacity <= arena_capacity();
-
-  // The flags are the second binding in this extract whose buffer ANOTHER tier
-  // sized, and they get the same treatment the hash entries above do: bound
-  // with the range the push constant claims rather than VK_WHOLE_SIZE, and
-  // checked against the device limit first. The kernel reads every slot below
-  // `dirty_capacity`, so binding the whole buffer would leave a caller's
-  // over-stated capacity as an out-of-bounds device read -- robustBufferAccess
-  // is enabled nowhere in this repo. Bound to the stated range instead, an
-  // over-statement is a descriptor whose range exceeds its buffer, which the
-  // validation layers name at the binding site.
-  const VkDeviceSize dirty_bytes =
-      incremental
-          ? static_cast<VkDeviceSize>(dirty->capacity) * sizeof(std::uint32_t)
-          : 0;
-  if (incremental) {
-    VR_TRY(check_storage_buffer_range(
-        (std::string(entry) + ": dirty block flags").c_str(), dirty_bytes,
-        static_cast<VkDeviceSize>(max_storage_buffer_range_)));
-  }
+      blocks == nullptr && incremental_request && config_.track_block_spans &&
+      slot_count_ == 1 && prev_arena.watermark != 0 &&
+      prev_arena.epoch == grid.topology_epoch() &&
+      prev_arena.serial == span_serial_ && prev_arena.iso == iso &&
+      arena().valid() && planned_verts <= arena_vertex_capacity() &&
+      capacity <= arena_capacity();
 
   VR_TRY(ensure_block_spans(grid));
   // The reset is only recorded, so a failure here disarms what the last
@@ -1639,7 +1618,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
   if (timings != nullptr) timings->arena_alloc_ms = phase_clock.lap();
 
   // Bound to the range the push constant claims rather than VK_WHOLE_SIZE, the
-  // way the hash entries and the dirty flags are: the kernel indexes it by
+  // way the hash entries are: the kernel indexes it by
   // `num_active_blocks`, so the two must name the same bytes.
   kernel_sparse_.set.write_storage_buffer(1, active_handle, 0, active_bytes);
   kernel_sparse_.set.write_storage_buffer(2, grid.map().entries_buffer(), 0,
@@ -1670,20 +1649,14 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
                                             VK_WHOLE_SIZE);
   }
 
-  // The changed-block flags the kernel dilates on-device, or the same
-  // 1-element dummy the colour slot uses when this pass is full: a descriptor
-  // must be bound either way, and a full pass never reads it. Binding 9
-  // without sharing, 10 with -- that kernel spends 8 on the index run it
-  // writes itself and 9 on the spans.
-  //
-  // Bound to `dirty_bytes` rather than VK_WHOLE_SIZE for the incremental case,
-  // as the hash entries above are: the kernel reads every slot below
-  // `dirty_capacity`, so a caller's over-stated capacity would otherwise be an
-  // out-of-bounds device read.
-  kernel_sparse_.set.write_storage_buffer(
-      config_.share_vertices ? 10 : 9,
-      incremental ? dirty->flags : color_dummy_.handle(), 0,
-      incremental ? dirty_bytes : VK_WHOLE_SIZE);
+  // The map's block stamps the kernel dilates on-device, read only when this
+  // pass is incremental. Binding 9 without sharing, 10 with -- that kernel
+  // spends 8 on the index run it writes itself and 9 on the spans. The map
+  // sized the buffer to the heap, which `num_block_slots` bounds the kernel's
+  // reads by.
+  kernel_sparse_.set.write_storage_buffer(config_.share_vertices ? 10 : 9,
+                                          grid.map().stamps_buffer().handle(),
+                                          0, VK_WHOLE_SIZE);
 
   if (config_.share_vertices) {
     // The sharing kernel's ninth binding. It writes the indices itself, because
@@ -1738,7 +1711,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // Read from the loop variable, not from the decision above it: the refit
     // below turns the retry into a full pass, and this is what carries that.
     push.incremental = incremental ? 1u : 0u;
-    push.dirty_capacity = incremental ? dirty->capacity : 0u;
+    push.since = incremental ? prev_arena.tick : 0u;
     push.num_block_slots = static_cast<std::uint32_t>(gp.num_blocks);
 
     // One workgroup per block, not one thread per voxel: the kernel resolves
@@ -2070,6 +2043,8 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     arena_state_.watermark = emitted;
     arena_state_.epoch = grid.topology_epoch();
     arena_state_.serial = span_serial_;
+    arena_state_.tick = grid.map().tick();
+    arena_state_.iso = iso;
     // The vertex counterpart, and the number the sharing kernel's atomic
     // appends past. Recorded on both paths so a later `share_vertices` reader
     // never sees a watermark pair only half established.
