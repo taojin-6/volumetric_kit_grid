@@ -55,8 +55,8 @@ struct HashDiagnostics {
 /// needs it.
 ///
 /// The choice it exists for is **grow or retry**. @ref lock is transient
-/// same-bucket contention (a GPU spin-lock livelock within a SIMD group, worst
-/// for depth, whose adjacent pixels hammer the same block) and says nothing
+/// same-bucket contention (a GPU spin-lock livelock within a SIMD group, as
+/// when many new blocks land in a few buckets at once) and says nothing
 /// about capacity: the table may be nearly empty. @ref chain and @ref heap are
 /// genuine capacity limits and are what @ref VoxelHashMap::resize answers.
 /// Reading the aggregate as capacity pressure grows the volume -- doubling
@@ -175,10 +175,11 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// @brief Allocate voxel blocks from a posed depth frame.
   ///
-  /// One thread per pixel unprojects its depth sample (via @p camera's pinhole
-  /// intrinsics + pose) to a world point, finds the block containing it, and
-  /// dilates that into the surrounding `(2*tb+1)^3` truncation band the TSDF
-  /// integrates (`tb` = @ref truncation_blocks). Out-of-range
+  /// Each pixel's depth sample is unprojected (via @p camera's pinhole
+  /// intrinsics + pose) to a world point and the block containing it, and
+  /// each distinct block of a 16 x 16 pixel tile is dilated once into the
+  /// surrounding `(2*tb+1)^3` truncation band the TSDF integrates
+  /// (`tb` = @ref truncation_blocks). Out-of-range
   /// (`< min_depth` / `> max_depth`) and non-finite samples are skipped;
   /// already-present blocks are left untouched, so overlapping bands merge and
   /// re-running the same frame allocates nothing new.
@@ -187,10 +188,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param camera  Intrinsics, valid-depth range, dimensions, and pose.
   /// @param out_failures  Optional: receives the per-reason split. **Consult it
   ///                      before growing the map.** A non-zero count does *not*
-  ///                      by itself mean bucket/heap pressure -- this is the
-  ///                      most contended entry point (adjacent pixels dilate
-  ///                      into the same block), so a residue of pure
-  ///                      @ref AllocFailures::lock failures is expected on a
+  ///                      by itself mean bucket/heap pressure -- a frame of
+  ///                      mostly new blocks (the first, or a fast pan) makes
+  ///                      many of them at once, so a residue of pure
+  ///                      @ref AllocFailures::lock failures is possible on a
   ///                      table with ample room. @ref
   ///                      AllocFailures::capacity_limited is the test @ref
   ///                      resize answers.
@@ -254,8 +255,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief Allocate voxel blocks from a world-space point cloud.
   ///
   /// One thread per point finds the block containing it and dilates that into
-  /// the `(2*tb+1)^3` truncation band, exactly as @ref allocate_from_depth
-  /// does per unprojected pixel. Points are in world space (no unprojection);
+  /// the `(2*tb+1)^3` truncation band, the band @ref allocate_from_depth
+  /// allocates around each block it finds. Points are in world space (no
+  /// unprojection);
   /// non-finite points are skipped and already-present blocks are untouched.
   /// @param points  World-space points, metres.
   /// @param count   How many.
@@ -696,8 +698,8 @@ class VR_VOLUME_API VoxelHashMap {
   Buffer compacted_;
   Buffer active_count_;
   // Persistent camera params for allocate_from_depth (bound at binding 6 of
-  // depth_.set, rewritten inline per call); grid-independent, so not in the
-  // bundle.
+  // every depth set, rewritten inline ahead of each frame's dispatch);
+  // grid-independent, so not in the bundle.
   Buffer camera_params_;
   // Persistent frustum planes for compact_active_blocks_in_frustum (bound at
   // binding 3 of compact_frustum_.set, rewritten inline per call);

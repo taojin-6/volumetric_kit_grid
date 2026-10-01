@@ -9,10 +9,10 @@
 // are derived by unprojecting each pixel on the HOST (unproject_to_block, the
 // glm/C++ mirror of the shader) and dilating with the host coord math, so the
 // shader's unprojection + band dilation are genuinely under test -- a wrong
-// intrinsic or a transposed pose would diverge. Also covers many overlapping
-// pixels (lock contention + retry), negative-bias blocks, idempotent re-run,
-// clear(), and null/zero-count guards. Exits 0 (skip) where no device is
-// present.
+// intrinsic or a transposed pose would diverge. Also covers a frame of several
+// ragged tiles at two band widths, lock contention + retry on a one-bucket
+// table, negative-bias blocks, idempotent re-run, clear(), and null/zero-count
+// guards. Exits 0 (skip) where no device is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -147,10 +147,7 @@ int main() {
   // pose and an off-centre principal point -- so the unprojection is
   // non-degenerate (a wrong fx/fy/cx/cy or a transposed cam_to_world changes
   // the world point, unlike a principal-point pixel under identity where it
-  // cancels to (0,0,depth)). The 16 adjacent pixels also land in overlapping
-  // bands that hammer the same buckets -- the multi-thread lock contention the
-  // depth kernel
-  // + retry exist for -- and the pose lands the blocks at a negative Y,
+  // cancels to (0,0,depth)). The pose lands the blocks at a negative Y,
   // exercising the negative-bias voxel->block floor.
   vr::DepthCameraParams cam{};
   cam.fx = 100.0f;
@@ -205,17 +202,51 @@ int main() {
   if (collect_active(map, depth_got2) != 0) return 1;
   CHECK(depth_got2 == depth_want);
 
+  // --- lock contention + retry on one bucket --------------------------------
+  // Every block lands in the one bucket, so every lane making one queues on
+  // one spin lock and a round can lose races that the next round, or another
+  // call, settles. Whether any are lost is the driver's (lavapipe serves the
+  // lock fast enough to lose none), so the checks are the ones that hold
+  // either way: every failure is a lock failure, and re-driving the frame ends
+  // at exactly its band.
+  {
+    vol::VoxelGridParams one = grid;
+    one.num_buckets = 1;
+    one.bucket_size = 64;
+    one.num_blocks = 64;
+    vr::Result<vol::VoxelHashMap> made =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), one);
+    CHECK(made.ok());
+    std::uint32_t left = 1;
+    int passes = 0;
+    for (; passes < 8 && left != 0; ++passes) {
+      vol::AllocFailures failures{};
+      vr::Result<std::uint32_t> r =
+          made.value().allocate_from_depth(depth.data(), cam, &failures);
+      CHECK(r.ok());
+      CHECK(failures.lock == r.value() && failures.terminal == 0);
+      left = r.value();
+    }
+    CHECK(left == 0);
+    std::printf("  one bucket: settled in %d call(s)\n", passes);
+    std::set<Coord> one_got;
+    if (collect_active(made.value(), one_got) != 0) return 1;
+    CHECK(one_got == depth_want);
+  }
+
   // --- allocate-from-depth over several tiles -------------------------------
   // The kernel works a 16 x 16 tile a workgroup and dilates each distinct
   // block once, so a frame several tiles wide and ragged at both edges, with
   // holes, a smooth half (many pixels a block) and a jagged half (many blocks
-  // a tile), must still allocate exactly the union of every pixel's band.
+  // a tile), must still allocate exactly the union of every pixel's band --
+  // at tb = 1, and at tb = 2, whose 125-block band outnumbers the lanes.
   // Every value is dyadic -- focal length 128, voxel 1/128 m, depths in 32nds,
   // a power-of-two pose -- so the host's unprojection is the shader's exactly
   // and no sample can round across a block boundary differently.
-  {
+  for (const float trunc : {0.04f, 0.1f}) {
     vol::VoxelGridParams tiled = grid;
-    tiled.voxel_size = 1.0f / 128.0f;  // a block is 1/16 m; tb stays 1
+    tiled.voxel_size = 1.0f / 128.0f;  // a block is 1/16 m
+    tiled.trunc_dist = trunc;
     vr::Result<vol::VoxelHashMap> tiled_map =
         vol::VoxelHashMap::create(device.value(), allocator.value(), tiled);
     CHECK(tiled_map.ok());
@@ -250,7 +281,8 @@ int main() {
     CHECK(tiled_fail.ok() && tiled_fail.value() == 0);
     std::set<Coord> tiled_got;
     if (collect_active(tiled_map.value(), tiled_got) != 0) return 1;
-    std::printf("  tiled depth: %zu blocks\n", tiled_got.size());
+    std::printf("  tiled depth, tb %d: %zu blocks\n",
+                vol::truncation_blocks(tiled), tiled_got.size());
     CHECK(tiled_got == tiled_want);
   }
 

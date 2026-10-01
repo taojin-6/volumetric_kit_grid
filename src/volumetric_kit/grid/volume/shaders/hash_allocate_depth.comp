@@ -22,11 +22,13 @@
 #include "hash_common.glsl"
 #include "hash_allocate_common.glsl"
 
-layout(local_size_x = 256) in;
-
-// The tile's side, so a workgroup is kTile * kTile = 256 pixels. The host's
-// kDepthTile, which sizes the dispatch.
+// The tile's side; mirrors the host's kDepthTile, which sizes the dispatch.
+// pc.arg is the frame's tile count along x, computed with the dispatch's, so
+// the host places the tiles and this kernel only a tile's pixels.
 const uint kTile = 16u;
+const uint kLanes = kTile * kTile;
+
+layout(local_size_x = kLanes) in;
 
 // binding 4: the depth image, row-major float metres (width*height samples).
 layout(set = 0, binding = 4, scalar) readonly buffer Depth {
@@ -56,17 +58,16 @@ layout(set = 0, binding = 6, scalar) readonly buffer Camera {
 
 // Each lane's centre block, and whether it has one; then the tile's distinct
 // centres.
-shared ivec3 s_block[256];
-shared uint s_valid[256];
-shared ivec3 s_centre[256];
+shared ivec3 s_block[kLanes];
+shared uint s_valid[kLanes];
+shared ivec3 s_centre[kLanes];
 shared uint s_centres;
 
 void main() {
   // No lane returns early: every one reaches both barriers.
   uint lid = gl_LocalInvocationID.x;
-  uint tiles_x = (cam.width + kTile - 1u) / kTile;
-  uint u = (gl_WorkGroupID.x % tiles_x) * kTile + lid % kTile;
-  uint v = (gl_WorkGroupID.x / tiles_x) * kTile + lid / kTile;
+  uint u = (gl_WorkGroupID.x % pc.arg) * kTile + lid % kTile;
+  uint v = (gl_WorkGroupID.x / pc.arg) * kTile + lid / kTile;
   bool valid = u < cam.width && v < cam.height;
   ivec3 block = ivec3(0);
   if (valid) {
@@ -90,22 +91,14 @@ void main() {
   }
   barrier();
 
-  // A lane keeps its block when no earlier lane of the tile has it. Its left or
-  // upper neighbour settles almost every lane; only the first of each block in
-  // the tile scans the lanes before it.
+  // A lane keeps its block when no earlier lane of the tile has it. The scan
+  // walks back from the lane before, so the left neighbour settles most lanes
+  // at once and the nearest match ends it; only the first of each block in
+  // the tile reads every lane before it.
   if (valid) {
-    uint col = lid % kTile;
-    bool first;
-    if (col > 0u && s_valid[lid - 1u] != 0u && s_block[lid - 1u] == block) {
-      first = false;
-    } else if (lid >= kTile && s_valid[lid - kTile] != 0u &&
-               s_block[lid - kTile] == block) {
-      first = false;
-    } else {
-      first = true;
-      for (uint j = 0u; j < lid && first; ++j) {
-        first = !(s_valid[j] != 0u && s_block[j] == block);
-      }
+    bool first = true;
+    for (uint j = lid; j > 0u && first; --j) {
+      first = !(s_valid[j - 1u] != 0u && s_block[j - 1u] == block);
     }
     if (first) {
       s_centre[atomicAdd(s_centres, 1u)] = block;
@@ -114,15 +107,18 @@ void main() {
   barrier();
 
   // Every distinct centre's band, its blocks shared out over the lanes rather
-  // than walked by the one lane that found it.
+  // than walked by the one lane that found it: offset by offset, each across
+  // every centre.
+  // TODO(volume): skip the blocks neighbouring centres' bands share (18 of 27
+  // between adjacent centres), if allocate's device time matters again.
   int tb = truncationBlocks(pc.grid);
   uint side = uint(2 * tb + 1);
   uint cube = side * side * side;
   uint items = s_centres * cube;
   for (uint item = lid; item < items; item += gl_WorkGroupSize.x) {
-    uint o = item % cube;
+    uint o = item / s_centres;
     ivec3 d = ivec3(int(o % side), int((o / side) % side),
                     int(o / (side * side))) - ivec3(tb);
-    report_alloc_fail(allocate_block(s_centre[item / cube] + d));
+    report_alloc_fail(allocate_block(s_centre[item % s_centres] + d));
   }
 }
