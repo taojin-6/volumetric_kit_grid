@@ -58,6 +58,28 @@ std::uint32_t group_count(std::uint32_t items) {
   return volumetric_kit::recon::group_count(items, kLocalSize);
 }
 
+// The depth kernel's tile side: a workgroup is a kDepthTile x kDepthTile tile
+// of pixels (mirrored by hash_allocate_depth.comp's kTile), so it dispatches a
+// group a tile.
+constexpr std::uint32_t kDepthTile = 16;
+static_assert(kDepthTile * kDepthTile == kLocalSize,
+              "a depth tile is one workgroup");
+
+// A frame's tiles along x, which the kernel reads to place each group, and in
+// all. Rounded up in 64 bits, since a width near 2^32 would wrap; the total
+// fits 32, as allocate_from_depth refuses a frame past 2^32 pixels.
+struct DepthTiles {
+  std::uint32_t x;
+  std::uint32_t total;
+};
+DepthTiles depth_tiles(const DepthCameraParams& camera) {
+  const std::uint64_t x =
+      (std::uint64_t{camera.width} + kDepthTile - 1) / kDepthTile;
+  const std::uint64_t y =
+      (std::uint64_t{camera.height} + kDepthTile - 1) / kDepthTile;
+  return {static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(x * y)};
+}
+
 // All the persistent device buffers, sized for one grid. Returned as a bundle
 // so a caller commits them only once every allocation has succeeded: create()
 // into a fresh map, resize() as an all-or-nothing swap over the live one (a
@@ -350,14 +372,14 @@ Status VoxelHashMap::rebuild_heap_excluding(
 // Record what `dispatches` records each round, re-dispatching while failures
 // remain, up to kMaxRounds.
 // Allocations spuriously fail under heavy same-bucket contention (a GPU
-// spin-lock livelock within a SIMD group) -- worst for depth, whose adjacent
-// pixels hammer the same block. Already-processed elements take the lock-free
-// fast path on the next round (allocate / depth / points) or are skipped by
-// their done flag (remove), so contention falls and the set converges. Only a
-// genuine capacity limit (chain full / heap empty / table full) that stops
-// progress for kStallLimit rounds ends the loop early; contention alone never
-// does, since another round is what resolves it. Mirrors the prior engine's
-// launchWithRetry.
+// spin-lock livelock within a SIMD group) -- worst where one dispatch makes
+// many new blocks, as depth's first frame does. Already-processed elements
+// take the lock-free fast path on the next round (allocate / depth / points)
+// or are skipped by their done flag (remove), so contention falls and the set
+// converges. Only a genuine capacity limit (chain full / heap empty / table
+// full) that stops progress for kStallLimit rounds ends the loop early;
+// contention alone never does, since another round is what resolves it.
+// Mirrors the prior engine's launchWithRetry.
 //
 // fail_counts_[kFailTotal] is the shared *retryable* tally, split by reason
 // into [1]=lock/[2]=chain/[3]=heap/[5]=table (remove reports only lock);
@@ -510,11 +532,9 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     return Status::invalid_argument(
         "VoxelHashMap::allocate_from_depth: moved-from map");
   }
-  // Every frame checked before any work. One dispatch thread per pixel, and
-  // width*height feeds the 32-bit group count (the depth shader derives its
-  // own bound from cam.width*cam.height), so a pathological image dimension is
-  // refused here rather than truncated. A frame with no pixels dispatches
-  // nothing.
+  // Every frame checked before any work. The shader indexes a pixel as
+  // v*width + u in 32 bits, so an image past 2^32 pixels is refused here
+  // rather than wrapped. A frame with no pixels dispatches nothing.
   std::vector<std::size_t> live;  // the frames that dispatch, in order
   std::vector<std::uint32_t> pixels(frames.size(), 0);
   for (std::size_t i = 0; i < frames.size(); ++i) {
@@ -557,10 +577,10 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
           const std::size_t i = live[k];
           VR_TRY(batch.upload(camera_params_, 0, &frames[i].camera,
                               sizeof(DepthCameraParams)));
-          const PushConstants push{grid_, pixels[i]};
+          const DepthTiles tiles = depth_tiles(frames[i].camera);
+          const PushConstants push{grid_, tiles.x};
           VR_TRY(batch.dispatch(depth_, depth_sets_[k], &push, sizeof(push),
-                                group_count(pixels[i]), max_workgroup_count_x_,
-                                &stage));
+                                tiles.total, max_workgroup_count_x_, &stage));
         }
         return {};
       },

@@ -104,7 +104,8 @@ const int kFailSlots = 6;
 #ifndef VR_HASH_COMMON_NO_PUSH_CONSTANTS
 layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;
-  uint arg;  // allocate: input coord count; compact: output capacity.
+  uint arg;  // allocate: input coord count; compact: output capacity;
+             // depth: the frame's tile count along x.
 } pc;
 #endif
 
