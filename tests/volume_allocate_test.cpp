@@ -205,6 +205,55 @@ int main() {
   if (collect_active(map, depth_got2) != 0) return 1;
   CHECK(depth_got2 == depth_want);
 
+  // --- allocate-from-depth over several tiles -------------------------------
+  // The kernel works a 16 x 16 tile a workgroup and dilates each distinct
+  // block once, so a frame several tiles wide and ragged at both edges, with
+  // holes, a smooth half (many pixels a block) and a jagged half (many blocks
+  // a tile), must still allocate exactly the union of every pixel's band.
+  // Every value is dyadic -- focal length 128, voxel 1/128 m, depths in 32nds,
+  // a power-of-two pose -- so the host's unprojection is the shader's exactly
+  // and no sample can round across a block boundary differently.
+  {
+    vol::VoxelGridParams tiled = grid;
+    tiled.voxel_size = 1.0f / 128.0f;  // a block is 1/16 m; tb stays 1
+    vr::Result<vol::VoxelHashMap> tiled_map =
+        vol::VoxelHashMap::create(device.value(), allocator.value(), tiled);
+    CHECK(tiled_map.ok());
+    vr::DepthCameraParams wide = cam;
+    wide.fx = 128.0f;
+    wide.fy = 128.0f;
+    wide.cx = 0.5f;
+    wide.cy = 0.5f;
+    wide.min_depth = 0.2f;
+    wide.max_depth = 2.0f;
+    wide.width = 37;   // 3 tiles, the last 5 pixels wide
+    wide.height = 23;  // 2 tiles, the last 7 pixels tall
+    wide.cam_to_world[3] = vr::Vec4f(0.25f, -0.125f, 0.375f, 1.0f);
+    std::vector<float> wide_depth(std::size_t{wide.width} * wide.height);
+    std::set<Coord> tiled_want;
+    for (std::uint32_t v = 0; v < wide.height; ++v) {
+      for (std::uint32_t u = 0; u < wide.width; ++u) {
+        float d =
+            u < 18 ? 0.5f + static_cast<float>(v) / 64.0f
+                   : 0.25f + static_cast<float>((u * 5 + v * 3) % 24) / 32.0f;
+        if ((u + 2 * v) % 7 == 0) d = 0.0f;   // no return
+        if ((u * 3 + v) % 11 == 0) d = 4.0f;  // past max_depth
+        wide_depth[std::size_t{v} * wide.width + u] = d;
+        if (d >= wide.min_depth && d <= wide.max_depth) {
+          insert_cube(tiled, unproject_to_block(wide, tiled, u, v, d),
+                      tiled_want);
+        }
+      }
+    }
+    vr::Result<std::uint32_t> tiled_fail =
+        tiled_map.value().allocate_from_depth(wide_depth.data(), wide);
+    CHECK(tiled_fail.ok() && tiled_fail.value() == 0);
+    std::set<Coord> tiled_got;
+    if (collect_active(tiled_map.value(), tiled_got) != 0) return 1;
+    std::printf("  tiled depth: %zu blocks\n", tiled_got.size());
+    CHECK(tiled_got == tiled_want);
+  }
+
   // --- allocate-from-points -------------------------------------------------
   // Fresh table. clear() must actually empty it -- assert that directly, since
   // reusing the map below could otherwise let a no-op clear() slip through.

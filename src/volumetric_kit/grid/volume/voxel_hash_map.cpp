@@ -58,6 +58,22 @@ std::uint32_t group_count(std::uint32_t items) {
   return volumetric_kit::recon::group_count(items, kLocalSize);
 }
 
+// The depth kernel's tile side: a workgroup is a kDepthTile x kDepthTile tile
+// of pixels (hash_allocate_depth.comp's kTile), so it dispatches a group a
+// tile.
+constexpr std::uint32_t kDepthTile = 16;
+static_assert(kDepthTile * kDepthTile == kLocalSize,
+              "a depth tile is one workgroup");
+
+// Past uint32 it saturates, which the dispatch's workgroup limit refuses.
+std::uint32_t depth_tiles(const DepthCameraParams& camera) {
+  const std::uint64_t tiles =
+      ((std::uint64_t{camera.width} + kDepthTile - 1) / kDepthTile) *
+      ((std::uint64_t{camera.height} + kDepthTile - 1) / kDepthTile);
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      tiles, std::numeric_limits<std::uint32_t>::max()));
+}
+
 // All the persistent device buffers, sized for one grid. Returned as a bundle
 // so a caller commits them only once every allocation has succeeded: create()
 // into a fresh map, resize() as an all-or-nothing swap over the live one (a
@@ -559,8 +575,8 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
                               sizeof(DepthCameraParams)));
           const PushConstants push{grid_, pixels[i]};
           VR_TRY(batch.dispatch(depth_, depth_sets_[k], &push, sizeof(push),
-                                group_count(pixels[i]), max_workgroup_count_x_,
-                                &stage));
+                                depth_tiles(frames[i].camera),
+                                max_workgroup_count_x_, &stage));
         }
         return {};
       },

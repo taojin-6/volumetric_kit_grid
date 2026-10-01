@@ -1,24 +1,32 @@
 #version 450
 
-// Allocate voxel blocks from a posed depth frame: one thread per pixel
-// unprojects its depth sample to a world point, finds the block containing it,
-// and dilates that into the (2*tb+1)^3 truncation-band cube
-// (allocate_truncation_band). Mirrors allocateBlocksFromDepth in hash_ops.metal.
+// Allocate voxel blocks from a posed depth frame. Each workgroup is a
+// kTile x kTile tile of pixels: every pixel unprojects its depth sample to a
+// world point and finds the block containing it, the tile keeps each distinct
+// block once, and the workgroup's lanes then share out the (2*tb+1)^3
+// truncation-band cube around each. Mirrors allocateBlocksFromDepth in
+// hash_ops.metal, whose leader election this is in shared memory.
 //
 // Depth is float metres -- the host applies any raw sensor depth-scale before
 // upload, so the shader stays format-agnostic. Non-finite / out-of-range
 // samples are dropped.
 //
-// TODO(volume): port the intra-warp leader election from hash_ops.metal (dedup
-// adjacent pixels that hit the same block before expanding the cube). Omitted
-// here: allocate_block is idempotent, so overlapping per-pixel bands merge at
-// the table -- the election is a throughput optimization, not a correctness one.
+// Neighbouring pixels nearly always land in one block: a 1 cm-voxel block at
+// 1.5 m covers a few hundred pixels. Dilating per pixel probed the same 27
+// blocks hundreds of times and set those pixels racing for one bucket's lock;
+// one dilation per distinct block does neither. The allocated set is the same,
+// since allocate_block is idempotent and the band of a block is the same
+// whoever dilates it.
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
 #include "hash_allocate_common.glsl"
 
 layout(local_size_x = 256) in;
+
+// The tile's side, so a workgroup is kTile * kTile = 256 pixels. The host's
+// kDepthTile, which sizes the dispatch.
+const uint kTile = 16u;
 
 // binding 4: the depth image, row-major float metres (width*height samples).
 layout(set = 0, binding = 4, scalar) readonly buffer Depth {
@@ -46,30 +54,75 @@ layout(set = 0, binding = 6, scalar) readonly buffer Camera {
   CameraParams cam;
 };
 
+// Each lane's centre block, and whether it has one; then the tile's distinct
+// centres.
+shared ivec3 s_block[256];
+shared uint s_valid[256];
+shared ivec3 s_centre[256];
+shared uint s_centres;
+
 void main() {
-  uint gid = gl_GlobalInvocationID.x;
-  uint pixel_count = cam.width * cam.height;
-  if (gid >= pixel_count) {
-    return;
+  // No lane returns early: every one reaches both barriers.
+  uint lid = gl_LocalInvocationID.x;
+  uint tiles_x = (cam.width + kTile - 1u) / kTile;
+  uint u = (gl_WorkGroupID.x % tiles_x) * kTile + lid % kTile;
+  uint v = (gl_WorkGroupID.x / tiles_x) * kTile + lid / kTile;
+  bool valid = u < cam.width && v < cam.height;
+  ivec3 block = ivec3(0);
+  if (valid) {
+    // Reject out-of-range and non-finite samples (the range test also drops
+    // NaN, whose comparisons are all false).
+    float depth = depth_data[v * cam.width + u];
+    valid = depth >= cam.min_depth && depth <= cam.max_depth;
+    if (valid) {
+      // Unproject to camera space, then to world via the rigid pose.
+      float x = (float(u) - cam.cx) * depth / cam.fx;
+      float y = (float(v) - cam.cy) * depth / cam.fy;
+      vec3 world = (cam.cam_to_world * vec4(x, y, depth, 1.0)).xyz;
+      valid = !(any(isinf(world)) || any(isnan(world)));
+      block = worldToBlock(world, pc.grid);
+    }
   }
-
-  // Reject out-of-range and non-finite samples (the range test also drops NaN,
-  // whose comparisons are all false).
-  float depth = depth_data[gid];
-  if (!(depth >= cam.min_depth && depth <= cam.max_depth)) {
-    return;
+  s_block[lid] = block;
+  s_valid[lid] = valid ? 1u : 0u;
+  if (lid == 0u) {
+    s_centres = 0u;
   }
+  barrier();
 
-  uint u = gid % cam.width;
-  uint v = gid / cam.width;
-
-  // Unproject to camera space, then to world via the rigid pose.
-  float x = (float(u) - cam.cx) * depth / cam.fx;
-  float y = (float(v) - cam.cy) * depth / cam.fy;
-  vec3 world = (cam.cam_to_world * vec4(x, y, depth, 1.0)).xyz;
-  if (any(isinf(world)) || any(isnan(world))) {
-    return;
+  // A lane keeps its block when no earlier lane of the tile has it. Its left or
+  // upper neighbour settles almost every lane; only the first of each block in
+  // the tile scans the lanes before it.
+  if (valid) {
+    uint col = lid % kTile;
+    bool first;
+    if (col > 0u && s_valid[lid - 1u] != 0u && s_block[lid - 1u] == block) {
+      first = false;
+    } else if (lid >= kTile && s_valid[lid - kTile] != 0u &&
+               s_block[lid - kTile] == block) {
+      first = false;
+    } else {
+      first = true;
+      for (uint j = 0u; j < lid && first; ++j) {
+        first = !(s_valid[j] != 0u && s_block[j] == block);
+      }
+    }
+    if (first) {
+      s_centre[atomicAdd(s_centres, 1u)] = block;
+    }
   }
+  barrier();
 
-  allocate_truncation_band(worldToBlock(world, pc.grid));
+  // Every distinct centre's band, its blocks shared out over the lanes rather
+  // than walked by the one lane that found it.
+  int tb = truncationBlocks(pc.grid);
+  uint side = uint(2 * tb + 1);
+  uint cube = side * side * side;
+  uint items = s_centres * cube;
+  for (uint item = lid; item < items; item += gl_WorkGroupSize.x) {
+    uint o = item % cube;
+    ivec3 d = ivec3(int(o % side), int((o / side) % side),
+                    int(o / (side * side))) - ivec3(tb);
+    report_alloc_fail(allocate_block(s_centre[item / cube] + d));
+  }
 }
