@@ -235,9 +235,11 @@ class VR_VOLUME_API VoxelHashMap {
   ///
   /// Each round dispatches every frame, in order, in one batch, and reads the
   /// tally back once. A retry round dispatches them all again, the blocks
-  /// already present taking the lookup's lock-free path. The blocks allocated
-  /// are those allocating the frames one after another gives; only the slot
-  /// each lands in can differ, as it can between two runs of one frame.
+  /// already present taking the lookup's lock-free path. The rounds are the
+  /// call's, not each frame's: a set has the retry budget one frame has.
+  /// Once every frame's blocks are in, they are the blocks allocating the
+  /// frames one after another gives, each perhaps in another slot; short of
+  /// that, a capacity limit can leave other frames' blocks out.
   /// @param frames        The frames. Every one is checked, as the
   ///                      one-frame overloads check theirs, before any work;
   ///                      none allocates nothing.
@@ -634,12 +636,6 @@ class VR_VOLUME_API VoxelHashMap {
       AllocFailures* out_failures,
       const std::function<Status(CommandBatch&)>& prepare = {});
 
-  /// The set the depth kernel binds for a call's @p i-th frame: its own for
-  /// the first, one of @ref depth_sets_ for each after it.
-  const DescriptorSet& depth_set(std::size_t i) const noexcept {
-    return i == 0 ? depth_.set : depth_sets_.sets[i - 1];
-  }
-
   /// Create a transient device-local buffer that @p batch fills with @p bytes
   /// of @p data, and bind it at @p binding of @p set. The caller keeps the
   /// returned @ref Buffer alive until the batch, and any round after it that
@@ -753,9 +749,10 @@ class VR_VOLUME_API VoxelHashMap {
   // draw), so per-voxel data survives a resize. Same 6-binding shape as
   // allocate_ (its input at binding 4 is BlockIndex{coord, ptr}, ptr read).
   ComputeKernel rehash_;
-  // The depth kernel's sets for every frame of a call after the first, so a
-  // round dispatches several cameras in one batch. Grown to the most frames a
-  // call has had; written whole each call, so a resize leaves none stale.
+  // The depth kernel's sets, one a frame of a call, so a round dispatches
+  // several cameras in one batch; depth_.set goes unused. Grown to the most
+  // frames a call has had; written whole each call, so a resize leaves none
+  // stale.
   KernelSets depth_sets_;
 };
 

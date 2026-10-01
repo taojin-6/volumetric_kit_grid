@@ -43,6 +43,9 @@ constexpr std::uint32_t kLocalSize = 256;
 // though the set fit the old table -- from looping forever.
 constexpr int kReinsertPasses = 3;
 
+// dispatch_with_retry's bound on rounds; see there.
+constexpr std::uint32_t kMaxRounds = 10;
+
 // The push-constant block every kernel shares: the grid shape plus one
 // kernel-specific argument (mirrors `PushConstants` in hash_common.glsl).
 struct PushConstants {
@@ -139,8 +142,8 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   map.active_count_ = std::move(bufs.active_count);
 
   // Camera params for allocate_from_depth: a small (96 B), fixed-size buffer,
-  // so persist it (bound once at binding 6 of depth_.set) and rewrite it
-  // inline in each call's batch. Grid-independent, so it is not part of the
+  // so persist it (binding 6 of every depth set) and rewrite it inline ahead
+  // of each frame's dispatch. Grid-independent, so it is not part of the
   // resized bundle.
   VR_ASSIGN(map.camera_params_,
             device_storage_buffer(allocator, sizeof(DepthCameraParams)));
@@ -213,35 +216,31 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
 
 void VoxelHashMap::write_persistent_bindings() {
   // Bindings 0-3 (the table) are identical across the init, allocate, delete,
-  // depth, points, and triangles sets. The allocate-family sets (allocate /
-  // delete / depth / points / triangles) additionally share the fail-counts
-  // buffer at binding 5 -- they never run in the same dispatch, and each
-  // re-zeroes it before use. Their per-call input (coords / points at binding
-  // 4, delete's done flags at 6, depth+camera at 4+6, vertices+indices+offsets
-  // at 4+6+7) is
-  // written before each dispatch. Compact uses entries + the compaction output
-  // + its counter.
+  // points, and triangles sets. The allocate-family sets (allocate / delete /
+  // points / triangles) additionally share the fail-counts buffer at binding
+  // 5 -- they never run in the same dispatch, and each re-zeroes it before
+  // use. Their per-call input (coords / points at binding 4, delete's done
+  // flags at 6, vertices+indices+offsets at 4+6+7) is written before each
+  // dispatch. The depth kernel's sets (depth_sets_) are written whole by each
+  // allocate_from_depth. Compact uses entries + the compaction output + its
+  // counter.
   const VkBuffer entries = entries_.handle();
   const VkBuffer heap = heap_.handle();
   const VkBuffer counter = heap_counter_.handle();
   const VkBuffer mutex = bucket_mutex_.handle();
   for (const DescriptorSet* set :
-       {&init_.set, &allocate_.set, &delete_.set, &depth_.set, &points_.set,
-        &triangles_.set, &rehash_.set}) {
+       {&init_.set, &allocate_.set, &delete_.set, &points_.set, &triangles_.set,
+        &rehash_.set}) {
     set->write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(1, heap, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(3, mutex, 0, VK_WHOLE_SIZE);
   }
   const VkBuffer fail = fail_counts_.handle();
-  for (const DescriptorSet* set :
-       {&allocate_.set, &delete_.set, &depth_.set, &points_.set,
-        &triangles_.set, &rehash_.set}) {
+  for (const DescriptorSet* set : {&allocate_.set, &delete_.set, &points_.set,
+                                   &triangles_.set, &rehash_.set}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
-  // depth_.set alone has binding 6: the persistent camera params (its contents
-  // are rewritten per call; only the depth buffer at binding 4 is transient).
-  depth_.set.write_storage_buffer(6, camera_params_.handle(), 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(2, active_count_.handle(), 0,
@@ -348,8 +347,8 @@ Status VoxelHashMap::rebuild_heap_excluding(
   return {};
 }
 
-// Dispatch `kernel` (push arg = `arg`) over `groups` groups, re-dispatching
-// while failures remain, up to kMaxRounds.
+// Record what `dispatches` records each round, re-dispatching while failures
+// remain, up to kMaxRounds.
 // Allocations spuriously fail under heavy same-bucket contention (a GPU
 // spin-lock livelock within a SIMD group) -- worst for depth, whose adjacent
 // pixels hammer the same block. Already-processed elements take the lock-free
@@ -377,13 +376,12 @@ Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     const std::function<Status(CommandBatch&)>& dispatches,
     AllocFailures* out_failures,
     const std::function<Status(CommandBatch&)>& prepare) {
-  constexpr int kMaxRounds = 10;
   constexpr int kStallLimit = 2;  // consecutive no-progress rounds -> give up
   std::uint32_t failures = 0;
   std::uint32_t terminal = 0;
   std::uint32_t prev_failures = std::numeric_limits<std::uint32_t>::max();
   int stall = 0;
-  for (int round = 0; round < kMaxRounds; ++round) {
+  for (std::uint32_t round = 0; round < kMaxRounds; ++round) {
     // One submit a round: the call's parameters (the first round only -- they
     // persist), the cleared tally, the dispatch, and the two small results
     // the host decides on -- the tally, and the heap counter behind
@@ -540,11 +538,10 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
   if (live.empty()) {
     return std::uint32_t{0};
   }
-  if (live.size() - 1 > depth_sets_.sets.size()) {
-    VR_ASSIGN(depth_sets_, allocate_kernel_sets(
-                               *device_, depth_, 7,
-                               static_cast<std::uint32_t>(live.size() - 1)));
-  }
+  // A set a frame, and a device span a frame a round.
+  const auto count = static_cast<std::uint32_t>(live.size());
+  VR_TRY(depth_sets_.reserve(*device_, depth_, count));
+  VR_TRY(gpu_timer_.reserve(*device_, kMaxRounds * count));
 
   // Each frame's depth is per-call (binding 4: a host array's device copy, or
   // the caller's buffer), and the camera rides the one persistent
@@ -553,12 +550,15 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
   std::vector<Buffer> uploads(frames.size());  // alive across every round
   return dispatch_with_retry(
       [&](CommandBatch& batch) -> Status {
+        // TODO(volume): re-dispatch only the frames that failed, from a tally
+        // of each frame's own, if retries stay common after PERF.md's P3
+        // (DECISIONS.md, 2026-09-30).
         for (std::size_t k = 0; k < live.size(); ++k) {
           const std::size_t i = live[k];
           VR_TRY(batch.upload(camera_params_, 0, &frames[i].camera,
                               sizeof(DepthCameraParams)));
           const PushConstants push{grid_, pixels[i]};
-          VR_TRY(batch.dispatch(depth_, depth_set(k), &push, sizeof(push),
+          VR_TRY(batch.dispatch(depth_, depth_sets_[k], &push, sizeof(push),
                                 group_count(pixels[i]), max_workgroup_count_x_,
                                 &stage));
         }
@@ -574,7 +574,7 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
           VR_ASSIGN(
               const VkBuffer depth,
               frames[i].depth.buffer(batch, *allocator_, bytes, uploads[i]));
-          const DescriptorSet& set = depth_set(k);
+          const DescriptorSet& set = depth_sets_[k];
           set.write_storage_buffer(0, entries_.handle(), 0, VK_WHOLE_SIZE);
           set.write_storage_buffer(1, heap_.handle(), 0, VK_WHOLE_SIZE);
           set.write_storage_buffer(2, heap_counter_.handle(), 0, VK_WHOLE_SIZE);
