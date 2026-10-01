@@ -30,6 +30,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
+#define VR_STAMPS_BINDING 8
 #include "hash_allocate_common.glsl"
 // The decode and the band test, shared with tsdf's mesh_bin.comp so the blocks
 // allocated here and the blocks the mesh integrator bins cannot drift apart.

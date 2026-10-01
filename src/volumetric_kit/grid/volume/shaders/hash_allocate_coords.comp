@@ -9,6 +9,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
+#define VR_STAMPS_BINDING 6
 #include "hash_allocate_common.glsl"
 
 layout(local_size_x = 256) in;

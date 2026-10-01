@@ -1,0 +1,68 @@
+#version 450
+
+// The block pass behind VoxelBlockGrid::stamp_blocks: one workgroup per active
+// block. It reduces "is any voxel observed" over the block and stamps the
+// slot's `weighted` with the map's tick; with a max_age, it also lists the
+// blocks neither an allocation nor weight has stamped in that many ticks.
+
+#extension GL_GOOGLE_include_directive : require
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "hash_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer Weight { float weight[]; };
+layout(set = 0, binding = 1, scalar) readonly buffer Active {
+  BlockIndex active_blocks[];
+};
+layout(set = 0, binding = 2, scalar) buffer Stamps { BlockStamp stamps[]; };
+layout(set = 0, binding = 3, scalar) writeonly buffer Stale {
+  BlockIndex stale[];
+};
+layout(set = 0, binding = 4, scalar) buffer StaleCount { uint stale_count; };
+
+layout(push_constant, scalar) uniform Push {
+  uint base;  // this dispatch's first active block
+  uint voxels_per_block;
+  uint tick;
+  uint max_age;  // 0 lists nothing
+  float observed_weight;  // volume::kObservedWeight
+} pc;
+
+shared uint s_weighted;
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  if (lid == 0u) {
+    s_weighted = 0u;
+  }
+  barrier();
+  // One group per active block, so the group is in range.
+  BlockIndex block = active_blocks[pc.base + gl_WorkGroupID.x];
+  uint first = uint(block.ptr);
+  bool any = false;
+  for (uint k = lid; k < pc.voxels_per_block && !any; k += gl_WorkGroupSize.x) {
+    any = weight[first + k] >= pc.observed_weight;
+  }
+  if (any) {
+    atomicOr(s_weighted, 1u);
+  }
+  barrier();
+  if (lid != 0u) {
+    return;
+  }
+  uint slot = first / pc.voxels_per_block;
+  if (s_weighted != 0u) {
+    stamps[slot].weighted = pc.tick;
+  }
+  // Ages are differences, so they hold across the clock's wrap; 0 is no
+  // tick, and every active block has been requested.
+  BlockStamp st = stamps[slot];
+  uint age = pc.tick - st.requested;
+  if (st.weighted != 0u) {
+    age = min(age, pc.tick - st.weighted);
+  }
+  if (pc.max_age != 0u && age >= pc.max_age) {
+    stale[atomicAdd(stale_count, 1u)] = block;
+  }
+}

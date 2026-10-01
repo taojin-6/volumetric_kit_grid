@@ -42,14 +42,14 @@ layout(set = 0, binding = VR_HASH_ENTRIES_BINDING, scalar) readonly buffer
 /// @return The block's voxel-array base pointer, or -1 when @p coord is not
 ///         allocated.
 ///
-/// The traversal mirrors block_exists in hash_allocate_common.glsl -- scan the
-/// primary bucket, then walk the anchor's collision chain -- with two
-/// differences: it returns the pointer, and it takes neither the bucket lock nor
-/// the acquire memoryBarrierBuffer() that guards block_exists's ptr/pos pair.
+/// The traversal mirrors find_block in hash_allocate_common.glsl -- scan the
+/// primary bucket, then walk the anchor's collision chain -- with one
+/// difference: it takes neither the bucket lock nor the acquire
+/// memoryBarrierBuffer() that guards find_block's ptr/pos pair.
 ///
 /// Dropping BOTH is sound for the same single reason, and only for that reason:
 /// the caller's dispatch is **quiescent** -- see VoxelHashMap::entries_buffer's
-/// @warning and the precondition on MarchingCubes::extract_device. block_exists
+/// @warning and the precondition on MarchingCubes::extract_device. find_block
 /// needs its acquire because it runs *inside* an allocating dispatch, where a
 /// concurrent invocation's just-published ptr could be observed beside that
 /// slot's stale init-sentinel pos and false-match coord (0,0,0). With no
@@ -62,7 +62,7 @@ layout(set = 0, binding = VR_HASH_ENTRIES_BINDING, scalar) readonly buffer
 /// The primary scan reads all @p bucket_size slots and MUST NOT exit early on
 /// the first free one. Insertion takes the first empty slot, but delete_coords
 /// clears an arbitrary slot in place (hash_delete_coords.comp::delete_primary),
-/// so a bucket may hold a free slot ahead of an occupied one. block_exists scans
+/// so a bucket may hold a free slot ahead of an occupied one. find_block scans
 /// in full for exactly this reason.
 int vrFindBlockPtr(ivec3 coord, int num_buckets, int bucket_size,
                    int max_chain) {
