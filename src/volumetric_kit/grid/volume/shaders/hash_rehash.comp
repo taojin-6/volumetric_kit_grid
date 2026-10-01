@@ -29,5 +29,6 @@ void main() {
     return;
   }
   // preset_ptr = the block's preserved pointer, so its per-voxel data survives.
-  report_alloc_fail(insert_block(snapshot[gid].coord, snapshot[gid].ptr));
+  int ptr;
+  report_alloc_fail(insert_block(snapshot[gid].coord, snapshot[gid].ptr, ptr));
 }

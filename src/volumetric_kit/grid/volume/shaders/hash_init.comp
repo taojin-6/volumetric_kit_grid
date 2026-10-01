@@ -1,9 +1,10 @@
 #version 450
 
 // Initialize the hash table on the device: every entry free, the heap filled
-// with all block indices, the heap counter at capacity, and every bucket mutex
-// unlocked. One dispatch covers all three arrays (each thread does the slice its
-// index falls in). Mirrors initHashTable in hash_ops.metal.
+// with all block indices, the heap counter at capacity, every bucket mutex
+// unlocked, and every block slot's stamps zeroed. One dispatch covers all the
+// arrays (each thread does the slice its index falls in). Mirrors
+// initHashTable in hash_ops.metal.
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
@@ -16,6 +17,9 @@ layout(set = 0, binding = 0, scalar) writeonly buffer Entries {
 layout(set = 0, binding = 1) writeonly buffer Heap { uint heap[]; };
 layout(set = 0, binding = 2) buffer HeapCounter { uint heap_counter; };
 layout(set = 0, binding = 3) writeonly buffer BucketMutex { int bucket_mutex[]; };
+layout(set = 0, binding = 4, scalar) writeonly buffer Stamps {
+  BlockStamp stamps[];
+};
 
 void main() {
   uint gid = gl_GlobalInvocationID.x;
@@ -30,6 +34,7 @@ void main() {
   }
   if (gid < num_blocks) {
     heap[gid] = gid;
+    stamps[gid] = BlockStamp(0u, 0u);
   }
   if (gid == 0u) {
     heap_counter = num_blocks;

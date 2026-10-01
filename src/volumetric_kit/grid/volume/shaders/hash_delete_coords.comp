@@ -51,6 +51,9 @@ layout(set = 0, binding = 4, scalar) readonly buffer Coords {
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
 // One flag per coord, zeroed by the host before the first round.
 layout(set = 0, binding = 6) buffer Done { uint done[]; };
+layout(set = 0, binding = 7, scalar) writeonly buffer Stamps {
+  BlockStamp stamps[];
+};
 
 // --- helpers (the allocate kernel has its own lock copies) ---
 
@@ -76,6 +79,9 @@ void unlock_bucket(uint bucket) {
 // coord list finds it absent and counts nothing. The host accumulates this
 // slot across rounds instead (see VoxelHashMap::dispatch_with_retry).
 void free_block(uint block_idx) {
+  // The slot's stamps go with its block, so the next block drawn there is
+  // stamped afresh.
+  stamps[block_idx] = BlockStamp(0u, 0u);
   if (!append_heap(block_idx)) {
     atomicAdd(fail_count[kFailTerminal], 1u);
   }

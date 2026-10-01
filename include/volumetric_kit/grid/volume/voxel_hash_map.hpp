@@ -459,7 +459,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// coordinate lookups plus an upload -- 102 ms of a 133 ms mesh extract at
   /// 107k blocks, measured on an M5 iPad Pro -- to hand the GPU a table it
   /// could have built itself in parallel. `volume/shaders/hash_lookup.glsl` is
-  /// the read-only traversal to bind this with; it mirrors `block_exists` and
+  /// the read-only traversal to bind this with; it mirrors `find_block` and
   /// takes the table shape (`num_buckets` / `bucket_size` / `max_chain`) as
   /// arguments.
   ///
@@ -572,6 +572,20 @@ class VR_VOLUME_API VoxelHashMap {
   /// whole point of the index-preserving rehash).
   /// @return The token; 0 only on a moved-from map, which no live token equals.
   std::uint64_t topology_epoch() const noexcept { return topology_epoch_; }
+
+  /// @brief The map's clock, which every @ref BlockStamp is a reading of.
+  ///        Starts at 1; 0 is no tick.
+  std::uint32_t tick() const noexcept { return tick_; }
+  /// @brief Advance @ref tick by one: once per set of frames fused, say, so
+  ///        an age in ticks is an age in sets. Skips 0 when it wraps.
+  void advance_tick() noexcept { tick_ = tick_ + 1 == 0 ? 1 : tick_ + 1; }
+  /// @brief The device buffer of one @ref BlockStamp per block slot, for a
+  ///        kernel that reads or writes a stamp. Every allocation stamps
+  ///        `requested`; @ref remove, @ref clear and @ref create zero a slot's
+  ///        record, and @ref resize keeps each where it is.
+  const Buffer& stamps_buffer() const noexcept { return stamps_; }
+  /// @brief Every block slot's record, read back: for tests and diagnostics.
+  Result<std::vector<BlockStamp>> read_block_stamps() const;
 
   /// @return The grid + hash-table parameters this map was built with.
   const VoxelGridParams& grid() const noexcept { return grid_; }
@@ -708,6 +722,9 @@ class VR_VOLUME_API VoxelHashMap {
   Buffer fail_counts_;
   Buffer compacted_;
   Buffer active_count_;
+  // One BlockStamp per block slot (see stamps_buffer()), and the clock.
+  Buffer stamps_;
+  std::uint32_t tick_ = 1;
   // Persistent camera params for allocate_from_depth (bound at binding 6 of
   // every depth set, rewritten inline ahead of each frame's dispatch);
   // grid-independent, so not in the bundle.

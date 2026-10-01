@@ -1,0 +1,35 @@
+#version 450
+
+// Zero one attribute of the blocks free_stale_blocks lists, a workgroup a
+// block: one dispatch an attribute, where a fill a block cost MoltenVK a
+// dispatch each.
+
+#extension GL_GOOGLE_include_directive : require
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "hash_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Attr { uint words[]; };
+layout(set = 0, binding = 1, scalar) readonly buffer Blocks {
+  BlockIndex blocks[];
+};
+
+layout(push_constant, scalar) uniform Push {
+  uint base;  // this dispatch's first listed block
+  uint voxels_per_block;
+  uint words_per_block;
+  uint num_words;  // the array's, so an out-of-lockstep one is left alone
+} pc;
+
+void main() {
+  BlockIndex block = blocks[pc.base + gl_WorkGroupID.x];
+  uint first = uint(block.ptr) / pc.voxels_per_block * pc.words_per_block;
+  if (first + pc.words_per_block > pc.num_words) {
+    return;
+  }
+  for (uint k = gl_LocalInvocationID.x; k < pc.words_per_block;
+       k += gl_WorkGroupSize.x) {
+    words[first + k] = 0u;
+  }
+}

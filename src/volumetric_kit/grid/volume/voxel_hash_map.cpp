@@ -51,6 +51,7 @@ constexpr std::uint32_t kMaxRounds = 10;
 struct PushConstants {
   VoxelGridParams grid;
   std::uint32_t arg;
+  std::uint32_t tick;  // what allocation stamps a block with
 };
 
 // This tier's local_size, bound once so every call site reads group_count(n).
@@ -93,6 +94,7 @@ struct PersistentBuffers {
   Buffer fail_counts;
   Buffer compacted;
   Buffer active_count;
+  Buffer stamps;
 };
 
 Result<PersistentBuffers> make_persistent_buffers(Allocator& allocator,
@@ -127,6 +129,9 @@ Result<PersistentBuffers> make_persistent_buffers(Allocator& allocator,
                 allocator, VkDeviceSize(num_blocks) * sizeof(BlockIndex)));
   VR_ASSIGN(bufs.active_count,
             device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  VR_ASSIGN(bufs.stamps,
+            device_storage_buffer(
+                allocator, VkDeviceSize(num_blocks) * sizeof(BlockStamp)));
   return bufs;
 }
 
@@ -162,6 +167,7 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   map.fail_counts_ = std::move(bufs.fail_counts);
   map.compacted_ = std::move(bufs.compacted);
   map.active_count_ = std::move(bufs.active_count);
+  map.stamps_ = std::move(bufs.stamps);
 
   // Camera params for allocate_from_depth: a small (96 B), fixed-size buffer,
   // so persist it (binding 6 of every depth set) and rewrite it inline ahead
@@ -192,10 +198,11 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
   // via KernelSetBuilder (core/compute_kernel.hpp) -- one add() per shader, its
   // storage-buffer binding count matching that shader's set 0. Every kernel
   // pushes the shared PushConstants block. allocate-from-coords and
-  // -from-points have the same 6-binding shape but each owns its kernel; depth
-  // adds the camera-params buffer at binding 6 (7 bindings), delete its done
+  // -from-points have the same 7-binding shape but each owns its kernel; depth
+  // adds the camera-params buffer at binding 6 (8 bindings), delete its done
   // flags there; frustum compaction adds the planes buffer at binding 3 (4
-  // bindings).
+  // bindings). The stamps go last in every kernel that writes them: init's 4,
+  // the allocators' and delete's after their own inputs.
   VkPushConstantRange push{};
   push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   push.offset = 0;
@@ -203,24 +210,24 @@ Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
 
   KernelSetBuilder kb(device);
   VR_TRY(kb.add(map.init_, "hash_init", vr_hash_init_comp_spv,
-                vr_hash_init_comp_spv_size, 4, &push));
+                vr_hash_init_comp_spv_size, 5, &push));
   VR_TRY(kb.add(map.allocate_, "hash_allocate_coords",
                 vr_hash_allocate_coords_comp_spv,
-                vr_hash_allocate_coords_comp_spv_size, 6, &push));
+                vr_hash_allocate_coords_comp_spv_size, 7, &push));
   VR_TRY(kb.add(map.compact_, "hash_compact", vr_hash_compact_comp_spv,
                 vr_hash_compact_comp_spv_size, 3, &push));
   VR_TRY(kb.add(map.delete_, "hash_delete_coords",
                 vr_hash_delete_coords_comp_spv,
-                vr_hash_delete_coords_comp_spv_size, 7, &push));
+                vr_hash_delete_coords_comp_spv_size, 8, &push));
   VR_TRY(kb.add(map.depth_, "hash_allocate_depth",
                 vr_hash_allocate_depth_comp_spv,
-                vr_hash_allocate_depth_comp_spv_size, 7, &push));
+                vr_hash_allocate_depth_comp_spv_size, 8, &push));
   VR_TRY(kb.add(map.points_, "hash_allocate_points",
                 vr_hash_allocate_points_comp_spv,
-                vr_hash_allocate_points_comp_spv_size, 6, &push));
+                vr_hash_allocate_points_comp_spv_size, 7, &push));
   VR_TRY(kb.add(map.triangles_, "hash_allocate_triangles",
                 vr_hash_allocate_triangles_comp_spv,
-                vr_hash_allocate_triangles_comp_spv_size, 8, &push));
+                vr_hash_allocate_triangles_comp_spv_size, 9, &push));
   VR_TRY(kb.add(map.compact_frustum_, "hash_compact_frustum",
                 vr_hash_compact_frustum_comp_spv,
                 vr_hash_compact_frustum_comp_spv_size, 4, &push));
@@ -263,6 +270,12 @@ void VoxelHashMap::write_persistent_bindings() {
                                    &triangles_.set, &rehash_.set}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
+  const VkBuffer stamps = stamps_.handle();
+  init_.set.write_storage_buffer(4, stamps, 0, VK_WHOLE_SIZE);
+  allocate_.set.write_storage_buffer(6, stamps, 0, VK_WHOLE_SIZE);
+  points_.set.write_storage_buffer(6, stamps, 0, VK_WHOLE_SIZE);
+  delete_.set.write_storage_buffer(7, stamps, 0, VK_WHOLE_SIZE);
+  triangles_.set.write_storage_buffer(8, stamps, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(2, active_count_.handle(), 0,
@@ -293,6 +306,7 @@ void VoxelHashMap::write_persistent_bindings() {
         {fail, "hash.fail_counts"},
         {compacted_.handle(), "hash.compacted"},
         {active_count_.handle(), "hash.active_count"},
+        {stamps, "hash.stamps"},
         {camera_params_.handle(), "hash.camera_params"},
         {frustum_planes_.handle(), "hash.frustum_planes"},
     };
@@ -329,7 +343,7 @@ Status VoxelHashMap::init_table() {
   const std::uint32_t widest =
       std::max({total_entries(), static_cast<std::uint32_t>(grid_.num_blocks),
                 static_cast<std::uint32_t>(grid_.num_buckets)});
-  const PushConstants push{grid_, 0};
+  const PushConstants push{grid_, 0, tick_};
   VR_TRY(dispatch(*device_, init_, &push, sizeof(push), group_count(widest),
                   max_workgroup_count_x_));
   // The init kernel hands every block back to the heap.
@@ -478,7 +492,7 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
       check_storage_buffer_range(op, input_bytes, max_storage_buffer_range_));
   Buffer input_buf;  // alive across every round
   Buffer done_buf;
-  const PushConstants push{grid_, count};
+  const PushConstants push{grid_, count, tick_};
   return dispatch_with_retry(
       [&](CommandBatch& batch) {
         return batch.dispatch(kernel, &push, sizeof(push), group_count(count),
@@ -578,7 +592,7 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
           VR_TRY(batch.upload(camera_params_, 0, &frames[i].camera,
                               sizeof(DepthCameraParams)));
           const DepthTiles tiles = depth_tiles(frames[i].camera);
-          const PushConstants push{grid_, tiles.x};
+          const PushConstants push{grid_, tiles.x, tick_};
           VR_TRY(batch.dispatch(depth_, depth_sets_[k], &push, sizeof(push),
                                 tiles.total, max_workgroup_count_x_, &stage));
         }
@@ -603,6 +617,7 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
           set.write_storage_buffer(5, fail_counts_.handle(), 0, VK_WHOLE_SIZE);
           set.write_storage_buffer(6, camera_params_.handle(), 0,
                                    VK_WHOLE_SIZE);
+          set.write_storage_buffer(7, stamps_.handle(), 0, VK_WHOLE_SIZE);
         }
         return {};
       });
@@ -663,7 +678,7 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
 
   // pc.arg is the TRIANGLE count (the kernel's binary-search bound), not the
   // dispatch width -- the kernel reads that from offsets[pc.arg].
-  const PushConstants push{grid_, triangle_count};
+  const PushConstants push{grid_, triangle_count, tick_};
   return dispatch_with_retry(
       [&](CommandBatch& batch) {
         return batch.dispatch(triangles_, &push, sizeof(push),
@@ -702,7 +717,7 @@ Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
-  const PushConstants push{grid_, capacity};
+  const PushConstants push{grid_, capacity, tick_};
   ++compaction_serial_;  // before the submit, which may have run in part
   std::uint32_t count = 0;
   CommandBatch batch(*device_, *allocator_);
@@ -918,7 +933,7 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   PersistentBuffers old{std::move(entries_),      std::move(heap_),
                         std::move(heap_counter_), std::move(bucket_mutex_),
                         std::move(fail_counts_),  std::move(compacted_),
-                        std::move(active_count_)};
+                        std::move(active_count_), std::move(stamps_)};
   const VoxelGridParams old_grid = grid_;
   const std::uint32_t old_heap_free = heap_free_;
   auto commit = [this](PersistentBuffers& b, const VoxelGridParams& g) {
@@ -930,6 +945,7 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     compacted_ = std::move(b.compacted);
     ++compaction_serial_;
     active_count_ = std::move(b.active_count);
+    stamps_ = std::move(b.stamps);
     grid_ = g;
     write_persistent_bindings();  // point the sets at the committed buffers
   };
@@ -940,6 +956,13 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   auto grow = [&]() -> Status {
     VR_TRY(
         init_table());  // entries free, heap holds every index, mutexes clear
+    // Each slot keeps its stamps, as it keeps its index; the new slots stay
+    // zeroed.
+    {
+      CommandBatch batch(*device_, *allocator_);
+      VR_TRY(batch.copy(old.stamps, 0, stamps_, 0, old.stamps.size()));
+      VR_TRY(batch.submit());
+    }
     if (active.empty()) {
       return {};  // fresh table + full heap is complete; nothing to rehash
     }
@@ -963,7 +986,7 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     // the new table reads very differently from residual lock contention.
     std::uint32_t failed = 0;
     AllocFailures rehash_failures{};
-    const PushConstants push{grid_, count};
+    const PushConstants push{grid_, count, tick_};
     const auto rehash = [&](CommandBatch& batch) {
       return batch.dispatch(rehash_, &push, sizeof(push), group_count(count),
                             max_workgroup_count_x_);
@@ -994,6 +1017,18 @@ Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     return st;
   }
   return {};
+}
+
+Result<std::vector<BlockStamp>> VoxelHashMap::read_block_stamps() const {
+  if (!valid()) {
+    return Status::invalid_argument(
+        "VoxelHashMap::read_block_stamps: moved-from map");
+  }
+  std::vector<BlockStamp> out(stamps_.size() / sizeof(BlockStamp));
+  CommandBatch batch(*device_, *allocator_);
+  VR_TRY(batch.readback(stamps_, 0, stamps_.size(), out.data()));
+  VR_TRY(batch.submit());
+  return out;
 }
 
 Result<std::vector<HashEntry>> VoxelHashMap::read_entries() {
