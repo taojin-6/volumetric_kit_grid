@@ -38,6 +38,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
@@ -124,6 +125,25 @@ bool write_attributes(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
          vr_test::write_attribute(ctx.device, ctx.allocator, g, "weight",
                                   weight)
              .ok();
+}
+
+// Stamp `changed` with the map's next tick on `slots` of `g`, as a pass that
+// writes voxels does, so the extractor's test of what to re-mesh is driven
+// without fusing. Returns false on any device error.
+bool stamp_changed(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+                   const std::vector<std::uint32_t>& slots) {
+  vr::Result<std::vector<vol::BlockStamp>> stamps = g.map().read_block_stamps();
+  if (!stamps.ok()) return false;
+  g.map().advance_tick();
+  for (const std::uint32_t slot : slots) {
+    stamps.value()[slot].changed = g.map().tick();
+  }
+  vr::CommandBatch batch(ctx.device, ctx.allocator);
+  return batch
+             .upload(g.map().stamps_buffer(), 0, stamps.value().data(),
+                     stamps.value().size() * sizeof(vol::BlockStamp))
+             .ok() &&
+         batch.submit().ok();
 }
 
 // Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (at the
@@ -950,8 +970,7 @@ int main() {
   // --- track_block_spans is off by default -----------------------------------
   // The table is sized by the GRID (num_blocks * 16, which is 24 MB at
   // VoxelGridParams::defaults and doubles with every resize), so a caller who
-  // never reads it must not pay for it -- the bargain
-  // TsdfIntegratorConfig::track_dirty_blocks strikes for the same table shape.
+  // never reads it must not pay for it.
   // Asserted through arena_bytes, which is what makes "costs nothing" a
   // measurable claim rather than a comment: it counts the span table, so an
   // ungated allocation would show up here.
@@ -1011,9 +1030,8 @@ int main() {
   // and because resize PRESERVES each block's index (which is why
   // topology_epoch deliberately does not move across one), a slot means the
   // same block on both sides. The grow therefore carries the old spans forward
-  // and zeroes only the new tail, exactly as
-  // TsdfIntegrator::prepare_dirty_flags does for the sibling slot-keyed table
-  // -- replacing it wholesale would discard every span on the one event the
+  // and zeroes only the new tail, exactly as the map does its block stamps --
+  // replacing it wholesale would discard every span on the one event the
   // volume tier guarantees they survive.
   {
     vr::Result<vol::VoxelBlockGrid> grow_grid_result =
@@ -1761,19 +1779,20 @@ int main() {
   // Comparing an incremental extract against a full one over the SAME field
   // proves nothing: a pass that silently fell back to full returns the
   // identical mesh, and so does one that skipped correctly. So the field is
-  // CHANGED under the extractor between passes, with the flags still saying
-  // nothing moved.
+  // CHANGED under the extractor between passes, written straight into the
+  // attributes -- which stamps nothing -- and the `changed` stamps are set by
+  // hand (stamp_changed) to say which blocks moved.
   //
-  //   flags all zero, field changed  -> every block takes the early return, so
-  //     the mesh must still be the OLD surface. A fallback to full, or a dirty
+  //   nothing stamped, field changed -> every block takes the early return, so
+  //     the mesh must still be the OLD surface. A fallback to full, or a stamp
   //     test that reads the wrong way, returns the new one and fails here.
-  //   flags MIXED, same new field    -> the case the feature actually runs in,
+  //   one block stamped, same field  -> the case the feature actually runs in,
   //     and the only one where the two halves can disagree: a clean block has
-  //     to keep its range while a dirty neighbour relocates past it. Under a
-  //     uniform flag array every block's old range is being rewritten anyway,
-  //     so a kernel that ignored `s_neighbour` entirely -- or retired the wrong
+  //     to keep its range while a changed neighbour relocates past it. When
+  //     every block is stamped every old range is being rewritten anyway, so a
+  //     kernel that ignored `s_neighbour` entirely -- or retired the wrong
   //     range -- passes both of the other two unchanged.
-  //   flags all one, same new field  -> every block re-meshes into the range it
+  //   all stamped, same new field    -> every block re-meshes into the range it
   //     already owns, so in-place reuse, the span read and the retire pass all
   //     run, and the mesh must now be the NEW surface.
   //
@@ -1868,30 +1887,16 @@ int main() {
     }
     CHECK(have_flag_slot);
 
-    // One flag per block slot, as the tsdf tier publishes them. Built here
-    // rather than by fusing: the contract is a buffer, and this is a test of
-    // the extractor rather than of the integrator.
-    const auto slots = static_cast<std::uint32_t>(gp.num_blocks);
-    vr::Result<vr::Buffer> flags_result = vr::storage_buffer(
-        allocator.value(),
-        static_cast<VkDeviceSize>(slots) * sizeof(std::uint32_t),
-        vr::HostAccess::SequentialWrite);
-    CHECK(flags_result.ok());
-    vr::Buffer flags = std::move(flags_result).value();
-    auto* flag_ptr = static_cast<std::uint32_t*>(flags.mapped());
+    // Every block slot, for the pass that stamps them all. A pass that falls
+    // back to a full extract would make every assertion about skipping stop
+    // testing anything, hence the ExtractTimings::incremental check on each.
+    std::vector<std::uint32_t> all_slots(
+        static_cast<std::uint32_t>(gp.num_blocks));
+    for (std::uint32_t i = 0; i < all_slots.size(); ++i) all_slots[i] = i;
 
-    // The epoch travels with the flags, so every pass below names the grid it
-    // is meshing. Omitting it is not a compile error -- it is an aggregate
-    // field -- so a pass built without it would silently take the full-extract
-    // fallback and every assertion about skipping would quietly stop testing
-    // anything. Hence the ExtractTimings::incremental check on each.
-    const mesh::DirtyBlocks dirty_blocks{flags.handle(), slots,
-                                         inc_grid.topology_epoch()};
-
-    for (std::uint32_t i = 0; i < slots; ++i) flag_ptr[i] = 0u;
     mesh::ExtractTimings clean_rt{};
-    vr::Result<mesh::DeviceMesh> clean = inc_mc.extract_device_incremental(
-        inc_grid, 0.0f, dirty_blocks, &clean_rt);
+    vr::Result<mesh::DeviceMesh> clean =
+        inc_mc.extract_device_incremental(inc_grid, 0.0f, &clean_rt);
     CHECK(clean.ok());
     CHECK(clean_rt.incremental);           // not the fallback
     CHECK(clean_rt.remeshed_blocks == 0);  // and nothing was re-meshed
@@ -1901,20 +1906,19 @@ int main() {
 
     // --- The mixed pass -------------------------------------------------
     //
-    // One flagged block, dilated on-device into the up-to-eight blocks whose
+    // One stamped block, dilated on-device into the up-to-eight blocks whose
     // `+{0,1}^3` neighbourhood contains it. So a handful of blocks relocate or
     // shrink while every other block keeps the range it already owns, in an
     // arena being appended to at the same time -- which is the only
     // configuration where keeping and re-meshing can disagree.
-    for (std::uint32_t i = 0; i < slots; ++i) flag_ptr[i] = 0u;
-    flag_ptr[flag_slot] = 1u;
+    CHECK(stamp_changed(ctx, inc_grid, {flag_slot}));
     mesh::ExtractTimings mixed_rt{};
-    vr::Result<mesh::DeviceMesh> mixed = inc_mc.extract_device_incremental(
-        inc_grid, 0.0f, dirty_blocks, &mixed_rt);
+    vr::Result<mesh::DeviceMesh> mixed =
+        inc_mc.extract_device_incremental(inc_grid, 0.0f, &mixed_rt);
     CHECK(mixed.ok());
     CHECK(mixed_rt.incremental);
     // Genuinely mixed, on the kernel's own count: some blocks re-meshed, and
-    // not all of them. Without this the flag pattern could dilate to everything
+    // not all of them. Without this the stamps could dilate to everything
     // (or to nothing) and the assertions below would still pass, describing a
     // uniform pass by another name.
     CHECK(mixed_rt.remeshed_blocks > 0);
@@ -1947,17 +1951,30 @@ int main() {
         if (in_new && !in_old) ++remeshed;
       }
       CHECK(kept > 0);      // clean blocks really did keep their triangles
-      CHECK(remeshed > 0);  // and the flagged neighbourhood really did redo its
+      CHECK(remeshed > 0);  // and the stamped neighbourhood really did redo its
+    }
+
+    // --- A stamp at or before the extract's tick is already meshed --------
+    //
+    // The mixed pass recorded the tick it ran at, so the block it re-meshed
+    // is not re-meshed again: nothing has been stamped since.
+    {
+      mesh::ExtractTimings again_rt{};
+      vr::Result<mesh::DeviceMesh> again =
+          inc_mc.extract_device_incremental(inc_grid, 0.0f, &again_rt);
+      CHECK(again.ok());
+      CHECK(again_rt.incremental);
+      CHECK(again_rt.remeshed_blocks == 0);
     }
 
     // --- And then all of it ----------------------------------------------
-    for (std::uint32_t i = 0; i < slots; ++i) flag_ptr[i] = 1u;
+    CHECK(stamp_changed(ctx, inc_grid, all_slots));
     mesh::ExtractTimings dirty_rt{};
-    vr::Result<mesh::DeviceMesh> dirty = inc_mc.extract_device_incremental(
-        inc_grid, 0.0f, dirty_blocks, &dirty_rt);
+    vr::Result<mesh::DeviceMesh> dirty =
+        inc_mc.extract_device_incremental(inc_grid, 0.0f, &dirty_rt);
     CHECK(dirty.ok());
     CHECK(dirty_rt.incremental);
-    // Every block, and the kernel's own count says so rather than the flags.
+    // Every block, and the kernel's own count says so rather than the stamps.
     CHECK(dirty_rt.remeshed_blocks == dirty_rt.active_blocks);
     vr::Result<mesh::Mesh> dirty_host = inc_mc.download(dirty.value());
     CHECK(dirty_host.ok());
@@ -2000,29 +2017,11 @@ int main() {
       shrunk_surface = canonical_triangles(shrunk.value());
       CHECK(shrunk_surface != new_surface);
     }
-    // All-zero flags throughout, so an incremental pass returns the arena's
-    // previous contents and a full one returns the shrunk sphere. The two are
-    // distinguishable, which is the whole point.
-    for (std::uint32_t i = 0; i < slots; ++i) flag_ptr[i] = 0u;
+    // Nothing is stamped from here on, so an incremental pass returns the
+    // arena's previous contents and a full one returns the shrunk sphere. The
+    // two are distinguishable, which is the whole point.
 
-    // (a) Flags the integrator will not vouch for. dirty_flags_buffer() returns
-    //     null and dirty_epoch() returns 0 on every staleness this tier can
-    //     see, so both are refusals a caller can pass through verbatim.
-    for (const mesh::DirtyBlocks& refused :
-         {mesh::DirtyBlocks{VK_NULL_HANDLE, slots, inc_grid.topology_epoch()},
-          mesh::DirtyBlocks{flags.handle(), slots, 0},
-          mesh::DirtyBlocks{flags.handle(), 0, inc_grid.topology_epoch()}}) {
-      mesh::ExtractTimings rt{};
-      vr::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, refused, &rt);
-      CHECK(dm.ok());
-      CHECK(!rt.incremental);
-      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
-      CHECK(host.ok());
-      CHECK(canonical_triangles(host.value()) == shrunk_surface);
-    }
-
-    // (b) A CULLED extract in between, and the one the first cut of the
+    // (a) A CULLED extract in between, and the one the first cut of the
     //     caller-supplied set missed. A culled pass rebuilds
     //     the arena from the blocks it was handed and so stamps spans for only
     //     those; every other block keeps a range naming the arena that pass
@@ -2031,10 +2030,10 @@ int main() {
     //     unmoved, serial equal, since the serial it compares is the culled
     //     call's own -- and re-meshed against a table describing an arena that
     //     was gone: half the sphere returned with Status::ok and
-    //     `incremental == 1`, and a dirty block outside the cull wrote over
+    //     `incremental == 1`, and a changed block outside the cull wrote over
     //     live triangles belonging to blocks the pass had promised to keep.
     //
-    //     Run with all-zero flags, exactly like (a): a correct fallback
+    //     Run with nothing stamped: a correct fallback
     //     re-meshes everything and returns the shrunk sphere, while a pass that
     //     wrongly went incremental keeps whatever the culled arena holds. The
     //     two differ by the whole culled-away half, so this cannot pass by
@@ -2059,7 +2058,7 @@ int main() {
 
       mesh::ExtractTimings rt{};
       vr::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, dirty_blocks, &rt);
+          inc_mc.extract_device_incremental(inc_grid, 0.0f, &rt);
       CHECK(dm.ok());
       CHECK(!rt.incremental);
       vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
@@ -2067,26 +2066,21 @@ int main() {
       CHECK(canonical_triangles(host.value()) == shrunk_surface);
     }
 
-    // (c) A topology change. remove() re-draws the grid's epoch and puts the
+    // (b) A topology change. remove() re-draws the grid's epoch and puts the
     //     freed indices back on the LIFO list, so a slot now names a different
-    //     block and BOTH the flags and the spans describe geometry that is
-    //     gone. The re-anchor that ensure_block_spans does on the way past is
-    //     what made this look sound: comparing the table's anchor to the grid
-    //     AFTER re-anchoring it compares a value with itself.
+    //     block and the spans describe geometry that is gone. The re-anchor
+    //     that ensure_block_spans does on the way past is what made this look
+    //     sound: comparing the table's anchor to the grid AFTER re-anchoring it
+    //     compares a value with itself.
     {
       vol::BlockIndex corner{};
       corner.coord = vr::Vec3i(0, 0, 0);
       vr::Result<std::uint32_t> removed = inc_grid.remove(&corner, 1);
       CHECK(removed.ok());
 
-      // Built AFTER the remove, so the flags name the grid's current epoch and
-      // only the ARENA's anchor is stale. Passing the pre-remove epoch would
-      // fail on clause (a) instead and never reach the one under test.
-      const mesh::DirtyBlocks post_remove{flags.handle(), slots,
-                                          inc_grid.topology_epoch()};
       mesh::ExtractTimings rt{};
       vr::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, post_remove, &rt);
+          inc_mc.extract_device_incremental(inc_grid, 0.0f, &rt);
       CHECK(dm.ok());
       CHECK(!rt.incremental);
     }

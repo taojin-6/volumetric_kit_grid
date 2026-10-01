@@ -73,6 +73,7 @@ layout(local_size_x = 256) in;
 // (one definition, not a mirror -- see hash_lookup.glsl).
 #define VR_HASH_ENTRIES_BINDING 2
 #include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#include "volumetric_kit/recon/volume/shaders/block_stamp.glsl"
 
 // One mesh vertex (mirrors mesh::Vertex).
 struct Vertex {
@@ -139,20 +140,22 @@ layout(set = 0, binding = 7, scalar) buffer DrawCommand {
 layout(set = 0, binding = 8, scalar) buffer BlockSpans {
   BlockSpan block_spans[];
 };
-// One flag per block slot, produced by the tsdf tier's opt-in dirty tracking and
-// read here rather than taken back through the host. Bound only when
-// pc.incremental != 0; a 1-element dummy otherwise, the color_dummy_ pattern.
+// The map's block stamps (volume::BlockStamp), whose `changed` every pass that
+// writes voxels stamps with the map's tick; read here rather than taken back
+// through the host. A block changed since the extract this one updates is one
+// stamped after pc.since. Bound only when pc.incremental != 0; a 1-element
+// dummy otherwise, the color_dummy_ pattern.
 //
 // This is the CHANGED set, not the re-mesh set. A cell reads corners at
 // `base + {0,1}^3`, so a block whose voxels changed invalidates the mesh of
 // every block in its `{0,-1}^3` octant -- which, read from this end, is: this
-// block re-meshes when any of its OWN `+{0,1}^3` neighbourhood is flagged. That
+// block re-meshes when any of its OWN `+{0,1}^3` neighbourhood changed. That
 // neighbourhood is exactly `s_neighbour`, already resolved for the corner
 // gather, so the dilation costs eight shared reads and no host pass. Doing it on
 // the host instead would mean a readback, a set union and an upload, on the
 // tier whose host-built table the 2026-08-08 decision deleted.
-layout(set = 0, binding = 9, scalar) readonly buffer DirtyFlags {
-  uint dirty_flags[];
+layout(set = 0, binding = 9, scalar) readonly buffer Stamps {
+  BlockStamp stamps[];
 };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -187,13 +190,13 @@ layout(push_constant, scalar) uniform PushConstants {
   // write_spans is: this block is one ABI shared with the sharing kernel and
   // SparsePushConstants.
   uint incremental;
-  // Slots `dirty_flags` addresses. A block past it is treated as dirty -- the
-  // conservative direction, and it re-meshes rather than going stale.
-  uint dirty_capacity;
+  // The map's tick at the extract this one updates: a block whose `changed`
+  // stamp is newer re-meshes, compared modulo 2^32.
+  uint since;
   // Block slots the grid's heap holds, so a BlockIndex::ptr this kernel did not
-  // produce can be bounded in one comparison. Appended at the END for the
-  // reason dirty_capacity was: this block is one ABI shared with the sibling
-  // sparse kernel and SparsePushConstants on the host.
+  // produce can be bounded in one comparison -- and the stamps' length. Appended
+  // at the END for the reason `since` was: this block is one ABI shared with
+  // the sibling sparse kernel and SparsePushConstants on the host.
   uint num_block_slots;
 } pc;
 
@@ -390,13 +393,14 @@ void main() {
 
   // Dilate the changed set into the re-mesh set, on the eight blocks
   // `s_neighbour` already holds. A neighbour that is unallocated (-1) cannot
-  // have changed; one past `dirty_capacity` is treated as changed, which
-  // re-meshes a block that might not need it rather than leaving it stale.
+  // have changed; one past the heap is treated as changed, which re-meshes a
+  // block that might not need it rather than leaving it stale.
   if (pc.incremental != 0u && tid < 8u) {
     int nptr = s_neighbour[tid];
     if (nptr >= 0) {
       uint nslot = uint(nptr) / uint(pc.voxels_per_block);
-      if (nslot >= pc.dirty_capacity || dirty_flags[nslot] != 0u) {
+      if (nslot >= pc.num_block_slots ||
+          int(stamps[nslot].changed - pc.since) > 0) {
         atomicOr(s_dirty, 1u);
       }
     }

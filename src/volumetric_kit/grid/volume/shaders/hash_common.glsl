@@ -52,11 +52,7 @@ struct BlockIndex {
   int ptr;
 };
 
-// One block slot's stamps, ticks of the map's clock (mirrors volume::BlockStamp).
-struct BlockStamp {
-  uint requested;
-  uint weighted;
-};
+#include "block_stamp.glsl"
 
 // --- Hash-table constants (mirror volume/hash.hpp). ---
 const int kFreeEntry = -1;

@@ -81,7 +81,7 @@ void unlock_bucket(uint bucket) {
 void free_block(uint block_idx) {
   // The slot's stamps go with its block, so the next block drawn there is
   // stamped afresh.
-  stamps[block_idx] = BlockStamp(0u, 0u);
+  stamps[block_idx] = BlockStamp(0u, 0u, 0u);
   if (!append_heap(block_idx)) {
     atomicAdd(fail_count[kFailTerminal], 1u);
   }

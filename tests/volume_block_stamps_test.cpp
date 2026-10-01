@@ -19,6 +19,7 @@
 
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -164,8 +165,20 @@ int main() {
   auto freed = grid.free_stale_blocks(3);
   CHECK(freed.ok() && freed.value() == 0);
 
-  // Tick 4: the second block is three ticks old and goes, its record zeroed;
-  // the weighted one and the one asked for at tick 3 stay.
+  // Tick 4: the second block is three ticks old and goes, its record zeroed --
+  // `changed` too, set here as a writer would so the zero has something to
+  // clear; the weighted one and the one asked for at tick 3 stay.
+  {
+    auto all = map.read_block_stamps();
+    CHECK(all.ok());
+    all.value()[b].changed = 3;
+    vr::CommandBatch batch(dev, alloc);
+    CHECK(batch
+              .upload(map.stamps_buffer(), 0, all.value().data(),
+                      all.value().size() * sizeof(vol::BlockStamp))
+              .ok());
+    CHECK(batch.submit().ok());
+  }
   map.advance_tick();
   freed = grid.free_stale_blocks(3);
   CHECK(freed.ok() && freed.value() == 1);
@@ -174,7 +187,8 @@ int main() {
         slot.value().count(Coord{1, 0, 0}) == 0);
   st = map.read_block_stamps();
   CHECK(st.ok());
-  CHECK(st.value()[b].requested == 0 && st.value()[b].weighted == 0);
+  CHECK(st.value()[b].requested == 0 && st.value()[b].weighted == 0 &&
+        st.value()[b].changed == 0);
   CHECK(st.value()[a].weighted == 4);
   // Its voxels are zeroed, every attribute, and the kept block's stay.
   {
@@ -259,7 +273,8 @@ int main() {
   CHECK(grown.ok() && grown.value().size() == 2 * st.value().size());
   for (std::size_t i = 0; i < st.value().size(); ++i) {
     CHECK(grown.value()[i].requested == st.value()[i].requested &&
-          grown.value()[i].weighted == st.value()[i].weighted);
+          grown.value()[i].weighted == st.value()[i].weighted &&
+          grown.value()[i].changed == st.value()[i].changed);
   }
   CHECK(grown.value().back().requested == 0);
 
@@ -268,7 +283,7 @@ int main() {
   auto cleared = map.read_block_stamps();
   CHECK(cleared.ok());
   for (const vol::BlockStamp& s : cleared.value()) {
-    CHECK(s.requested == 0 && s.weighted == 0);
+    CHECK(s.requested == 0 && s.weighted == 0 && s.changed == 0);
   }
 
   // Refusals: a max_age of 0, and a grid with no weight.
