@@ -143,8 +143,7 @@ layout(set = 0, binding = 8, scalar) buffer BlockSpans {
 // The map's block stamps (volume::BlockStamp), whose `changed` every pass that
 // writes voxels stamps with the map's tick; read here rather than taken back
 // through the host. A block changed since the extract this one updates is one
-// stamped after pc.since. Bound only when pc.incremental != 0; a 1-element
-// dummy otherwise, the color_dummy_ pattern.
+// stamped after pc.since. Read only when pc.incremental != 0.
 //
 // This is the CHANGED set, not the re-mesh set. A cell reads corners at
 // `base + {0,1}^3`, so a block whose voxels changed invalidates the mesh of
@@ -400,7 +399,7 @@ void main() {
     if (nptr >= 0) {
       uint nslot = uint(nptr) / uint(pc.voxels_per_block);
       if (nslot >= pc.num_block_slots ||
-          int(stamps[nslot].changed - pc.since) > 0) {
+          tick_after(stamps[nslot].changed, pc.since)) {
         atomicOr(s_dirty, 1u);
       }
     }

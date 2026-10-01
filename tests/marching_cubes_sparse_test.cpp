@@ -2066,7 +2066,31 @@ int main() {
       CHECK(canonical_triangles(host.value()) == shrunk_surface);
     }
 
-    // (b) A topology change. remove() re-draws the grid's epoch and puts the
+    // (b) Another iso. Every triangle a block keeps lies on the last
+    //     extract's surface, so with nothing stamped a pass that wrongly went
+    //     incremental returns the sphere at iso 0 rather than the one at 0.1.
+    {
+      vr::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
+          device.value(), allocator.value(), inc_config);
+      CHECK(ref_result.ok());
+      vr::Result<mesh::Mesh> wider =
+          std::move(ref_result).value().extract_host(inc_grid, 0.1f);
+      CHECK(wider.ok());
+      const std::vector<std::array<float, 9>> wider_surface =
+          canonical_triangles(wider.value());
+      CHECK(wider_surface != shrunk_surface);
+
+      mesh::ExtractTimings rt{};
+      vr::Result<mesh::DeviceMesh> dm =
+          inc_mc.extract_device_incremental(inc_grid, 0.1f, &rt);
+      CHECK(dm.ok());
+      CHECK(!rt.incremental);
+      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
+      CHECK(host.ok());
+      CHECK(canonical_triangles(host.value()) == wider_surface);
+    }
+
+    // (c) A topology change. remove() re-draws the grid's epoch and puts the
     //     freed indices back on the LIFO list, so a slot now names a different
     //     block and the spans describe geometry that is gone. The re-anchor
     //     that ensure_block_spans does on the way past is what made this look

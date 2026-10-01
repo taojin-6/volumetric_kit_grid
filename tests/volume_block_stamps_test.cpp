@@ -5,10 +5,10 @@
 // blocks it asks for -- inserted or already there -- with the map's tick
 // (`requested`); the grid's block pass stamps the blocks holding an observed
 // voxel (`weighted`); and free_stale_blocks frees exactly the blocks that have
-// been neither for max_age ticks, zeroing their voxels. A freed slot's record
-// is zeroed, resize keeps every record in its slot (the rehash does not
-// restamp), and clear zeroes them all. Exits 0 (skip) where no device is
-// present.
+// been neither for more than max_age ticks, zeroing their voxels. A freed
+// slot's record is zeroed, resize keeps every record in its slot (the rehash
+// does not restamp), and clear zeroes them all. Exits 0 (skip) where no device
+// is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -161,8 +161,9 @@ int main() {
   CHECK(st.value()[b].requested == 1 && st.value()[b].weighted == 0);
   CHECK(st.value()[c].requested == 3 && st.value()[c].weighted == 0);
 
-  // Tick 3, max_age 3: the second block is two ticks old, so nothing goes.
-  auto freed = grid.free_stale_blocks(3);
+  // Tick 3, max_age 2: the second block is two ticks old, no more, so nothing
+  // goes.
+  auto freed = grid.free_stale_blocks(2);
   CHECK(freed.ok() && freed.value() == 0);
 
   // Tick 4: the second block is three ticks old and goes, its record zeroed --
@@ -180,7 +181,7 @@ int main() {
     CHECK(batch.submit().ok());
   }
   map.advance_tick();
-  freed = grid.free_stale_blocks(3);
+  freed = grid.free_stale_blocks(2);
   CHECK(freed.ok() && freed.value() == 1);
   slot = slots(grid);
   CHECK(slot.ok() && slot.value().size() == 2 &&
@@ -222,8 +223,13 @@ int main() {
     CHECK(wide->map().allocate(three, 1).ok());
     CHECK(narrow->stamp_blocks().ok());
     narrow.value() = std::move(wide).value();
+    // A block asked for before the writer that advances the clock is a tick
+    // old, and stays at max_age 1; a tick later it goes.
     narrow->map().advance_tick();
     auto gone = narrow->free_stale_blocks(1);
+    CHECK(gone.ok() && gone.value() == 0);
+    narrow->map().advance_tick();
+    gone = narrow->free_stale_blocks(1);
     CHECK(gone.ok() && gone.value() == 1);
   }
 

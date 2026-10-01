@@ -1594,8 +1594,9 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       blocks == nullptr && incremental_request && config_.track_block_spans &&
       slot_count_ == 1 && prev_arena.watermark != 0 &&
       prev_arena.epoch == grid.topology_epoch() &&
-      prev_arena.serial == span_serial_ && arena().valid() &&
-      planned_verts <= arena_vertex_capacity() && capacity <= arena_capacity();
+      prev_arena.serial == span_serial_ && prev_arena.iso == iso &&
+      arena().valid() && planned_verts <= arena_vertex_capacity() &&
+      capacity <= arena_capacity();
 
   VR_TRY(ensure_block_spans(grid));
   // The reset is only recorded, so a failure here disarms what the last
@@ -1648,16 +1649,14 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
                                             VK_WHOLE_SIZE);
   }
 
-  // The map's block stamps the kernel dilates on-device, or the same
-  // 1-element dummy the colour slot uses when this pass is full: a descriptor
-  // must be bound either way, and a full pass never reads it. Binding 9
-  // without sharing, 10 with -- that kernel spends 8 on the index run it
-  // writes itself and 9 on the spans. The map sized the buffer to the heap,
-  // which `num_block_slots` bounds the kernel's reads by.
-  kernel_sparse_.set.write_storage_buffer(
-      config_.share_vertices ? 10 : 9,
-      incremental ? grid.map().stamps_buffer().handle() : color_dummy_.handle(),
-      0, VK_WHOLE_SIZE);
+  // The map's block stamps the kernel dilates on-device, read only when this
+  // pass is incremental. Binding 9 without sharing, 10 with -- that kernel
+  // spends 8 on the index run it writes itself and 9 on the spans. The map
+  // sized the buffer to the heap, which `num_block_slots` bounds the kernel's
+  // reads by.
+  kernel_sparse_.set.write_storage_buffer(config_.share_vertices ? 10 : 9,
+                                          grid.map().stamps_buffer().handle(),
+                                          0, VK_WHOLE_SIZE);
 
   if (config_.share_vertices) {
     // The sharing kernel's ninth binding. It writes the indices itself, because
@@ -2045,6 +2044,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     arena_state_.epoch = grid.topology_epoch();
     arena_state_.serial = span_serial_;
     arena_state_.tick = grid.map().tick();
+    arena_state_.iso = iso;
     // The vertex counterpart, and the number the sharing kernel's atomic
     // appends past. Recorded on both paths so a later `share_vertices` reader
     // never sees a watermark pair only half established.

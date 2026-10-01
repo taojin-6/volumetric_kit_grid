@@ -116,7 +116,7 @@ struct ExtractTimings {
   /// the trade soundly -- the first extract against a grid, a topology change,
   /// a preceding culled extract, a
   /// @ref MarchingCubesConfig::slot_count above one, an arena that had to
-  /// grow, or flags the integrator will not vouch for. Each of those is
+  /// grow, or an iso other than the last extract's. Each of those is
   /// invisible to the caller and each turns the feature off *permanently*
   /// (a config flag) or *silently* (a fallback), so the answer is reported
   /// rather than left to be inferred: @ref dispatches counts refit rounds and
@@ -791,7 +791,9 @@ class VR_MESH_API MarchingCubes {
   /// every pass that writes voxels stamps with the map's tick after advancing
   /// it. This extractor keeps the tick its last publishing extract ran at, so
   /// it re-meshes exactly what was written since, however many fuses ran
-  /// between, and nothing has to be reset.
+  /// between, and nothing has to be reset. A caller writing voxels any other
+  /// way, through @ref volume::VoxelBlockGrid::attribute, stamps nothing, so
+  /// its next extract after such a write must be a full @ref extract_device.
   ///
   /// The blocks whose `+{0,1}^3` neighbourhood carries no change keep the
   /// triangles they already have, at the offsets @ref block_spans already
@@ -808,6 +810,8 @@ class VR_MESH_API MarchingCubes {
   ///
   /// - the first extract against a grid, which is what *establishes* the
   ///   arena and spans an incremental pass reads;
+  /// - an @p iso other than the last extract's, whose surface every kept
+  ///   block's triangles lie on;
   /// - a `remove()`/`clear()` since then, which hands a block slot to a
   ///   different block, so the span table's anchor no longer matches the
   ///   grid;
@@ -1164,6 +1168,8 @@ class VR_MESH_API MarchingCubes {
     // The map's tick when the extract that wrote all this ran, so the next
     // incremental pass re-meshes the blocks stamped changed after it.
     std::uint32_t tick = 0;
+    // The iso it meshed at, which every triangle a block keeps lies on.
+    float iso = 0.0f;
   };
   ArenaState arena_state_{};
 

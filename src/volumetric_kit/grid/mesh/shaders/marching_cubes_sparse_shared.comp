@@ -156,8 +156,8 @@ layout(set = 0, binding = 9, scalar) buffer BlockSpans {
 // The map's block stamps, dilated on-device exactly as the sibling kernel
 // dilates them -- a block re-meshes when any of its own `+{0,1}^3`
 // neighbourhood was stamped changed after pc.since, the `{0,-1}^3` relation a
-// change has to the cells that read it, read from the other end. Bound only
-// when pc.incremental != 0; a 1-element dummy otherwise.
+// change has to the cells that read it, read from the other end. Read only
+// when pc.incremental != 0.
 layout(set = 0, binding = 10, scalar) readonly buffer Stamps {
   BlockStamp stamps[];
 };
@@ -707,7 +707,7 @@ void main() {
     if (nptr >= 0) {
       uint nslot = uint(nptr) / uint(pc.voxels_per_block);
       if (nslot >= pc.num_block_slots ||
-          int(stamps[nslot].changed - pc.since) > 0) {
+          tick_after(stamps[nslot].changed, pc.since)) {
         atomicOr(s_dirty, 1u);
       }
     }
