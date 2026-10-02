@@ -13,7 +13,7 @@
 /// @code
 ///   offset  size  field
 ///        0     4  magic "VRTC"
-///        4     2  version (1)
+///        4     2  version (2)
 ///        6     1  frame type (0 = intra)
 ///        7     1  reserved, 0
 ///        8     4  voxel_size          (f32, metres)
@@ -39,10 +39,16 @@
 /// body reads.
 ///
 /// Inside a segment each block is, in order: its coordinate (the segment's
-/// first in full, the rest as deltas from the block before), its mask class
-/// (and, for a partial mask, its 64 bytes), then its K coefficients. Every
-/// integer is a *class* -- its bit length -- through a table, plus the bits
-/// below its leading one (and a sign) raw.
+/// first in full, the rest as deltas from the block before), its mask class,
+/// then its K coefficients. A partial mask follows its class a z plane at a
+/// time: each plane the same as the one before, empty, full, or coded line by
+/// line, each line (one byte, eight voxels along x) against the line before
+/// it. Every integer is a *class* -- its bit length -- through a table, plus
+/// one raw field of the bits below its leading one, and below those its sign.
+///
+/// Version 2 (2026-10-01) is version 1 with that mask and sign; version 1
+/// sent a partial mask as 64 bytes through one table and a sign as a field
+/// of its own.
 
 #include <algorithm>
 #include <cstddef>
@@ -60,7 +66,7 @@ namespace volumetric_kit::recon::codec::detail {
 /// The four bytes every frame starts with.
 inline constexpr std::uint8_t kFrameMagic[4] = {'V', 'R', 'T', 'C'};
 /// The layout this file writes and reads.
-inline constexpr std::uint16_t kFrameVersion = 1;
+inline constexpr std::uint16_t kFrameVersion = 2;
 /// Bytes before the section table.
 inline constexpr std::size_t kFrameHeaderBytes = 44;
 /// Bytes per section-table entry.
@@ -109,13 +115,9 @@ struct IntraFrame {
   DctBlocks blocks;
 };
 
-/// @return `true` if @p a sorts before @p b: by z, then y, then x -- so a run
-///         of blocks along x is a run of consecutive entries.
-inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
-  if (a.z != b.z) return a.z < b.z;
-  if (a.y != b.y) return a.y < b.y;
-  return a.x < b.x;
-}
+/// The frame's order: @ref volume::coord_less, by z, then y, then x -- so a
+/// run of blocks along x is a run of consecutive entries.
+using volume::coord_less;
 
 /// @brief Sort @p blocks into the order a frame holds them in (@ref
 ///        coord_less): the order the encoder writes and the decoder's merge
@@ -170,9 +172,9 @@ VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
 /// @param max_blocks  The most blocks the caller can hold. A frame's size does
 ///                    not bound its block count -- a block whose every symbol
 ///                    has probability one costs no bits -- so this is what
-///                    bounds the work and the allocation: `12 + 64 + 4 K`
+///                    bounds the work and the allocation: `12 + 64 + 2 K`
 ///                    bytes per block, with K from the header (at most 512),
-///                    so at most ~2.1 KB -- about half of the 4 KB of
+///                    so at most ~1.1 KB -- about a quarter of the 4 KB of
 ///                    `tsdf` + `weight` the grid it decodes into holds per
 ///                    block. Checked once the block count agrees with the
 ///                    segment table, so a corrupt count is refused as corrupt

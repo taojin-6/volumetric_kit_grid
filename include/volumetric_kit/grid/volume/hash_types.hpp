@@ -55,6 +55,15 @@ static_assert(sizeof(BlockIndex) == 16, "BlockIndex must be 16 bytes");
 static_assert(offsetof(BlockIndex, coord) == 0, "BlockIndex layout drift");
 static_assert(offsetof(BlockIndex, ptr) == 12, "BlockIndex layout drift");
 
+/// @return `true` if block coordinate @p a sorts before @p b: by z, then y,
+///         then x. The one order every sorted block list here uses, the
+///         codec's frames included.
+inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
+  if (a.z != b.z) return a.z < b.z;
+  if (a.y != b.y) return a.y < b.y;
+  return a.x < b.x;
+}
+
 /// @brief One block slot's stamps: ticks of the map's clock
 ///        (@ref VoxelHashMap::tick), each written by the pass that knows its
 ///        fact, so a consumer reads a block's age against a tick of its own
@@ -71,8 +80,8 @@ struct BlockStamp {
   /// block's voxels holding weight; 0 until one does.
   std::uint32_t weighted = 0;
   /// The last tick a pass that writes voxels changed any of the block's:
-  /// `tsdf::TsdfIntegrator` where a value changed, `tsdf::MeshIntegrator`
-  /// and the codec's decoder on every block they write. 0 until one does.
+  /// `tsdf::TsdfIntegrator` and the codec's decoder where a value changed,
+  /// `tsdf::MeshIntegrator` on every block it writes. 0 until one does.
   std::uint32_t changed = 0;
 };
 static_assert(sizeof(BlockStamp) == 12, "BlockStamp must be 12 bytes");

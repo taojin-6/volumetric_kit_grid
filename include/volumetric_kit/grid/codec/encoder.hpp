@@ -81,16 +81,21 @@ class VR_CODEC_API Encoder {
   /// @param grid     A grid with 4-byte float `tsdf` and `weight` attributes
   ///                 and `block_size` 8. Its blocks and voxels are read,
   ///                 never written; the reference is non-const only because
-  ///                 compacting the active set runs the map's own kernels, as
-  ///                 @ref mesh::MarchingCubes::extract_host takes it.
+  ///                 the active set is the map's own list
+  ///                 (@ref
+  ///                 volume::VoxelHashMap::compact_active_blocks_on_device),
+  ///                 which an extract after this takes back from it as it
+  ///                 would a fuse's.
   /// @param metrics  Optional @ref StageMetrics collecting a `"codec encode"`
   ///                 row with both halves -- its device half is the transform
   ///                 -- over the breakdown rows `"  ..active set"` (the
-  ///                 compaction), `"  ..sort"`, `"  ..forward"` (the
-  ///                 transform, and dropping never-observed blocks) and
-  ///                 `"  ..rans encode"` (writing the frame). Named apart from
-  ///                 the @ref Decoder's, so both timed into one
-  ///                 @ref StageMetrics stay apart. `nullptr` measures nothing.
+  ///                 compaction, when the map holds no list that is still
+  ///                 its active set), `"  ..observed"` (finding the blocks
+  ///                 with an observed voxel), `"  ..sort"`, `"  ..forward"`
+  ///                 (the transform) and `"  ..rans encode"` (writing the
+  ///                 frame). Named apart from the @ref Decoder's, so both
+  ///                 timed into one @ref StageMetrics stay apart. `nullptr`
+  ///                 measures nothing.
   /// @return The frame's bytes (an empty grid is a valid frame of no blocks),
   ///         or @ref Status::Code::InvalidArgument for a moved-from encoder
   ///         or a grid the transform refuses (moved-from, another block size,

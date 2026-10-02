@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Shared by dct_forward.comp and dct_inverse.comp: the push-constant block, the
-// block list, the basis + zigzag table buffer, the live-block probe, the
-// shared-memory work cube, and the one separable 8-point line transform both
-// directions are made of.
+// Shared by dct_forward.comp, dct_inverse.comp and dct_observed.comp: the
+// push-constant block, the block list, the basis + zigzag table buffer, the
+// block lookup, the shared-memory work cube, the one separable 8-point line
+// transform both directions are made of, and the packing of two quantized
+// coefficients to a word.
 //
 // ONE WORKGROUP OF kLanes (64) INVOCATIONS PER BLOCK, each owning one kEdge-voxel
 // line per pass. A separable 8^3 transform is three passes of 64 independent
@@ -91,37 +92,33 @@ layout(set = 0, binding = VR_DCT_BINDING_TABLES, scalar) readonly buffer
   uint zigzag[kBlockVoxels];
 };
 
-// Entries block_is_live rejected, summed over every batch for the host to
-// report.
+// Entries block_ptr found no block for, summed over every batch for the host
+// to report.
 layout(set = 0, binding = VR_DCT_BINDING_REJECTED, scalar) buffer Rejected {
   uint rejected;
 };
 
 shared float s_work[2u * kBlockVoxels];
 shared float s_basis[kBasisSize];
-shared uint s_live;
+shared int s_ptr;
 
-// Whether list entry `entry` names a live block of this grid: its coord must
-// resolve through the hash table to exactly its ptr. That one probe subsumes a
-// ptr range check -- every ptr the table holds is a heap slot -- and catches
-// what a range check cannot: a free slot, or a coord paired with another
-// block's ptr, either of which the inverse would write into. Lane 0 probes and
-// the verdict is shared, so every lane returns on it or none does. Sound only
-// while nothing allocates into the map, the same quiescence hash_lookup.glsl
-// states.
-bool block_is_live(uint entry, uint lane) {
+// The block list entry `entry` names: its coord, found through the hash table,
+// whatever ptr the entry carries -- so a ptr is never trusted, and the decoder
+// can hand over blocks it has just allocated without reading their slots
+// back. -1 when the table holds no such block, which the call reports and
+// neither kernel reads or writes. Lane 0 probes and the answer is shared, so
+// every lane returns on it or none does. Sound only while nothing allocates
+// into the map, the same quiescence hash_lookup.glsl states.
+int block_ptr(uint entry, uint lane) {
   if (lane == 0u) {
-    BlockIndex b = blocks[entry];
-    int found =
-        vrFindBlockPtr(b.coord, pc.num_buckets, pc.bucket_size, pc.max_chain);
-    bool live = b.ptr >= 0 && found == b.ptr;
-    s_live = live ? 1u : 0u;
-    if (!live) {
+    s_ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+                           pc.bucket_size, pc.max_chain);
+    if (s_ptr < 0) {
       atomicAdd(rejected, 1u);
     }
   }
   barrier();
-  return s_live != 0u;
+  return s_ptr;
 }
 
 // Transform one kEdge-point line of the cube held in s_work from `src`,
@@ -170,5 +167,11 @@ void transform_cube(uint lane, bool inverse) {
 
 // The step coefficient j (zigzag index) was quantized with.
 float step_for(uint j) { return j == 0u ? pc.dc_step : pc.ac_step; }
+
+// The quantized coefficients travel two to a 32-bit word, coefficient 2p in
+// the low half of word p and 2p + 1 in the high, each entry starting a word of
+// its own: K = 64 is 32 words an entry, and an odd K pads the last high half
+// with 0. Each fits 16 bits, being within +-max_quantized.
+uint coefficient_words() { return (pc.coefficient_count + 1u) / 2u; }
 
 #endif  // VR_DCT_COMMON_GLSL

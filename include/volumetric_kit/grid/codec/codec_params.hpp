@@ -7,7 +7,6 @@
 /// @brief The knobs of the per-frame TSDF geometry codec: how many DCT
 ///        coefficients each block keeps and how coarsely they are quantized.
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -50,8 +49,26 @@ inline constexpr std::int32_t kMaxQuantizedMagnitude =
 /// therefore keeps every quantized value inside @ref kMaxQuantizedMagnitude, so
 /// the clamp is a guard against float drift and never a silent loss.
 /// @ref CodecParams::validate refuses anything finer.
-inline const float kMinStep = static_cast<float>(
-    std::sqrt(double(kVoxelsPerBlock)) / kMaxQuantizedMagnitude);
+///
+/// A literal, the formula's float, rather than the formula: `std::sqrt` is not
+/// `constexpr`, so the formula was initialized at run time, and a validate()
+/// in another file's static initializer could read it as 0. The params test
+/// holds the two equal.
+inline constexpr float kMinStep = 6.90555025e-4f;
+
+/// @brief The coarsest quantization step the codec accepts, as a fraction of
+///        `trunc_dist`.
+///
+/// Past `2 sqrt(kVoxelsPerBlock)` (~45.3) every coefficient quantizes to 0, so
+/// a coarser step codes nothing more, and this is the power of two past it.
+/// It is what keeps a decoded frame finite: a step from a corrupt header
+/// times a coefficient of up to @ref kMaxQuantizedMagnitude stays far inside
+/// a float, where 1e38 would make it infinite and the inverse transform's
+/// sums of opposite infinities NaN. @ref CodecParams::validate refuses
+/// anything coarser.
+inline constexpr float kMaxStep = 64.0f;
+static_assert(kMaxStep * kMaxStep >= 4.0f * kVoxelsPerBlock,
+              "kMaxStep must quantize every coefficient to 0");
 
 /// @brief How a frame's blocks are transformed and quantized.
 ///
@@ -83,7 +100,7 @@ struct VR_CODEC_API CodecParams {
   /// @brief Check that every field is one the transform can honour.
   /// @return OK, or @ref Status::invalid_argument naming the field: a
   ///         @ref coefficient_count outside [1, @ref kVoxelsPerBlock], or a
-  ///         step that is not finite or is below @ref kMinStep.
+  ///         step outside [@ref kMinStep, @ref kMaxStep] (NaN included).
   Status validate() const;
 };
 

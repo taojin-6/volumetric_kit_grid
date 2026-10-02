@@ -74,11 +74,7 @@ inline vr::Result<vol::VoxelBlockGrid> make_grid(Gpu& gpu,
                                      attrs.data(), attrs.size());
 }
 
-inline bool coord_less(const vr::Vec3i& a, const vr::Vec3i& b) {
-  if (a.z != b.z) return a.z < b.z;
-  if (a.y != b.y) return a.y < b.y;
-  return a.x < b.x;
-}
+using vol::coord_less;
 
 // The grid's active blocks, in the codec's (z, y, x) order.
 inline vr::Result<std::vector<vol::BlockIndex>> active_sorted(

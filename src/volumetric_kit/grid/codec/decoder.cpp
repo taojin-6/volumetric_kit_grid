@@ -3,7 +3,6 @@
 
 #include "volumetric_kit/recon/codec/decoder.hpp"
 
-#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -103,6 +102,22 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                 " attributes; a frame carries tsdf and weight alone, so a grid "
                 "it decodes into must declare only those");
   }
+  // Exact, not approximate: the coordinates are in this grid's voxels, and
+  // the coefficients are fractions of its band. A frame from a grid of other
+  // geometry would decode into the wrong place at the wrong scale and say OK.
+  // Read off the header, before the frame is decoded, so such a frame is
+  // never mistaken for one the grid is too small for.
+  VR_ASSIGN(const detail::FrameHeader header,
+            detail::read_frame_header(data, size));
+  if (header.voxel_size != gp.voxel_size ||
+      header.trunc_dist != gp.trunc_dist) {
+    return fail("the frame's geometry (voxel_size " +
+                std::to_string(header.voxel_size) + ", trunc_dist " +
+                std::to_string(header.trunc_dist) + ") is not this grid's (" +
+                std::to_string(gp.voxel_size) + ", " +
+                std::to_string(gp.trunc_dist) +
+                "); build the grid from read_frame_info");
+  }
   detail::IntraFrame frame;
   {
     // The whole frame, entropy-decoded: a corrupt one is refused here, with
@@ -122,18 +137,6 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     }
     frame = std::move(r).value();
   }
-  // Exact, not approximate: the coordinates are in this grid's voxels, and
-  // the coefficients are fractions of its band. A frame from a grid of other
-  // geometry would decode into the wrong place at the wrong scale and say OK.
-  if (frame.voxel_size != gp.voxel_size ||
-      frame.blocks.trunc_dist != gp.trunc_dist) {
-    return fail("the frame's geometry (voxel_size " +
-                std::to_string(frame.voxel_size) + ", trunc_dist " +
-                std::to_string(frame.blocks.trunc_dist) +
-                ") is not this grid's (" + std::to_string(gp.voxel_size) +
-                ", " + std::to_string(gp.trunc_dist) +
-                "); build the grid from read_frame_info");
-  }
   // Nor can the inverse's maxStorageBufferRange checks refuse once the grid
   // starts to change. The frame fits the heap, so every buffer it binds --
   // K <= 512 coefficients and 16 mask words and one list entry per block, 20
@@ -145,16 +148,16 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // A merge of two sorted lists: what the grid holds that the frame lacks is
   // removed (VoxelBlockGrid::remove zeroes it, so a later reuse of its slot
   // starts fresh), and what the frame holds that the grid lacks is allocated.
-  // Blocks in both are kept, and their tsdf/weight are rewritten in full
-  // below, so nothing of the previous frame survives in them.
+  // Blocks in both are kept in their slots, and their tsdf/weight are
+  // rewritten in full below, so nothing of the previous frame survives in
+  // them.
   VR_ASSIGN(std::vector<volume::BlockIndex> current,
             grid.map().compact_active_blocks(metrics));
-  std::vector<volume::BlockIndex> kept;
-  std::vector<volume::BlockIndex> missing;
   {
     StageScope apply(metrics, "  ..apply");
     detail::sort_by_coord(current);
     std::vector<volume::BlockIndex> gone;
+    std::vector<volume::BlockIndex> missing;
     std::size_t i = 0;
     std::size_t j = 0;
     while (i < current.size() || j < frame.coords.size()) {
@@ -168,7 +171,7 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
         b.coord = frame.coords[j++];
         missing.push_back(b);
       } else {
-        kept.push_back(current[i++]);
+        ++i;
         ++j;
       }
     }
@@ -183,12 +186,13 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
       }
       // Out of the table but refused by the heap: the heap only takes back
       // what it handed out, so this is a grid whose accounting is already
-      // broken, and every later frame would find it a block shorter.
+      // broken, and every later frame would find it a block shorter. Not
+      // IoError, which says decode again: no retry mends it.
       if (failures.terminal != 0) {
-        return Status::io_error(
-            "Decoder::decode: the grid's free heap refused " +
-            std::to_string(failures.terminal) +
-            " removed blocks; its block accounting is broken");
+        return fail("the grid's free heap refused " +
+                    std::to_string(failures.terminal) +
+                    " removed blocks; its block accounting is broken, which "
+                    "neither decoding again nor a resize mends");
       }
       if (round + 1 == kRounds) {
         return contended("removing", failed);
@@ -217,33 +221,13 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   }
 
   // --- The frame's blocks, in the frame's order, reconstructed. -----------
-  std::vector<volume::BlockIndex> blocks;
-  if (missing.empty()) {
-    // Nothing was allocated, so the kept blocks are the frame's, in its
-    // order, and in the slots the compaction above read: a removal frees
-    // other blocks' slots and moves none, and only an allocation could hand
-    // a freed one out again.
-    blocks = std::move(kept);
-  } else {
-    // An allocation does not say which slot each block drew, so the placed
-    // set is read back.
-    VR_ASSIGN(blocks, grid.map().compact_active_blocks(metrics));
-    StageScope apply(metrics, "  ..apply");
-    detail::sort_by_coord(blocks);
-    // Both are strictly increasing, so equal sizes and equal coordinates mean
-    // the grid holds exactly the frame. Anything else is a grid changed under
-    // this call.
-    const bool exact =
-        blocks.size() == frame.coords.size() &&
-        std::equal(blocks.begin(), blocks.end(), frame.coords.begin(),
-                   [](const volume::BlockIndex& b, const Vec3i& c) {
-                     return b.coord == c;
-                   });
-    if (!exact) {
-      return fail(
-          "the grid does not hold exactly the frame's blocks after "
-          "applying it (was it modified during the call?)");
-    }
+  // By coordinate alone: the inverse finds each block in the hash table, so
+  // the slots the allocation drew need not be read back, and a frame block
+  // the grid does not hold -- a grid changed under this call -- is refused
+  // there rather than written.
+  std::vector<volume::BlockIndex> blocks(frame.coords.size());
+  for (std::size_t b = 0; b < blocks.size(); ++b) {
+    blocks[b].coord = frame.coords[b];
   }
   StageScope inverse(metrics, "  ..inverse");
   return transform_->inverse(grid, grid.block_list(blocks), frame.blocks,

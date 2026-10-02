@@ -137,8 +137,8 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   CHECK(enc.encode(grid, &m).ok());
   const vr::StageRow* top = find_row(m, "codec encode");
   CHECK(top != nullptr);
-  for (const char* sub :
-       {"  ..active set", "  ..sort", "  ..forward", "  ..rans encode"}) {
+  for (const char* sub : {"  ..active set", "  ..observed", "  ..sort",
+                          "  ..forward", "  ..rans encode"}) {
     const vr::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
@@ -156,6 +156,39 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   vol::VoxelBlockGrid moved = std::move(grid);
   CHECK(!enc.encode(grid, &refused).ok());  // NOLINT(bugprone-use-after-move)
   CHECK(find_row(refused, "codec encode") != nullptr);
+  return 0;
+}
+
+// The active set is the map's own list: a list a fuse left that still holds
+// is taken back, compacting nothing, and is still the map's for the extract
+// after -- and one the encoder compacts is left for it too.
+int device_list_case(Gpu& gpu, codec::Encoder& enc) {
+  vr::Result<vol::VoxelBlockGrid> g =
+      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.07f});
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vr::Result<vol::DeviceBlockList> fused =
+      grid.map().compact_active_blocks_on_device();
+  CHECK(fused.ok());
+  vr::StageMetrics m;
+  vr::Result<std::vector<std::uint8_t>> a = enc.encode(grid, &m);
+  CHECK(a.ok());
+  CHECK(find_row(m, "  ..active set") == nullptr);
+  CHECK(grid.map().check_device_block_list(fused.value(), "test").ok());
+
+  // A list the encoder compacted itself, after an allocation, holds for the
+  // next caller, and the content -- one block more, never observed -- codes
+  // the same.
+  CHECK(allocate(grid, {{50, 50, 50}}).ok());
+  vr::StageMetrics again;
+  vr::Result<std::vector<std::uint8_t>> b = enc.encode(grid, &again);
+  CHECK(b.ok() && b.value() == a.value());
+  CHECK(find_row(again, "  ..active set") != nullptr);
+  vr::StageMetrics extract;  // the extract's compaction, which it skips
+  vr::Result<vol::DeviceBlockList> next =
+      grid.map().compact_active_blocks_on_device(&extract);
+  CHECK(next.ok() && extract.rows().empty());
+  CHECK(next.value().serial != fused.value().serial);
   return 0;
 }
 
@@ -260,6 +293,7 @@ int main() {
   if (order_independent_case(gpu, enc) != 0) return 1;
   if (unobserved_dropped_case(gpu, enc) != 0) return 1;
   if (metrics_case(gpu, enc) != 0) return 1;
+  if (device_list_case(gpu, enc) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");

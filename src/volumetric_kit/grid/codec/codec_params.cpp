@@ -3,20 +3,19 @@
 
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
-#include <cmath>
 #include <string>
 
 namespace volumetric_kit::recon::codec {
 namespace {
 
 Status check_step(const char* field, float step) {
-  // !(step >= kMinStep) rather than step < kMinStep, so a NaN is refused too.
-  if (!std::isfinite(step) || !(step >= kMinStep)) {
+  // Negated, so a NaN is refused too.
+  if (!(step >= kMinStep && step <= kMaxStep)) {
     return Status::invalid_argument(
-        std::string("CodecParams: ") + field +
-        " must be finite and >= " + std::to_string(kMinStep) +
-        " (a fraction of trunc_dist), or a quantized coefficient could "
-        "overflow its clamp");
+        std::string("CodecParams: ") + field + " must be in [" +
+        std::to_string(kMinStep) + ", " + std::to_string(kMaxStep) +
+        "] (a fraction of trunc_dist): finer, a quantized coefficient could "
+        "overflow its clamp; coarser codes nothing more");
   }
   return {};
 }

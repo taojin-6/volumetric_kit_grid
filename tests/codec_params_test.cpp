@@ -67,6 +67,24 @@ int params_validate_case() {
   CHECK(!p.validate().ok());
   p.ac_step = std::numeric_limits<float>::infinity();
   CHECK(!p.validate().ok());
+
+  // The literal is the formula's float.
+  CHECK(codec::kMinStep ==
+        static_cast<float>(std::sqrt(double(kVoxelsPerBlock)) /
+                           codec::kMaxQuantizedMagnitude));
+
+  // The ceiling is inclusive, and at it every coefficient quantizes to 0: the
+  // largest, sqrt(kVoxelsPerBlock), is under half a step.
+  p.ac_step = codec::kMaxStep;
+  CHECK(p.validate().ok());
+  CHECK(std::sqrt(double(kVoxelsPerBlock)) < 0.5 * double(codec::kMaxStep));
+  p.ac_step = std::nextafter(codec::kMaxStep, 2.0f * codec::kMaxStep);
+  CHECK(!p.validate().ok());
+  p.ac_step = 1e38f;  // finite, and what a corrupt header could carry
+  CHECK(!p.validate().ok());
+  p.ac_step = 0.2f;
+  p.dc_step = 1e38f;
+  CHECK(!p.validate().ok());
   return 0;
 }
 

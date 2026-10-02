@@ -3,9 +3,8 @@
 
 #include "volumetric_kit/recon/codec/encoder.hpp"
 
-#include <algorithm>
-#include <cstddef>
 #include <utility>
+#include <vector>
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
@@ -81,56 +80,38 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
     return Status::invalid_argument("Encoder::encode: moved-from grid");
   }
 
-  // The active set, compacted inside this stage so its row is a breakdown
-  // ("  ..active set"), then put in the order the frame requires. The hash
-  // table's order is whatever the allocate atomics left, so sorting is also
-  // what makes the same content give the same bytes.
-  VR_ASSIGN(std::vector<volume::BlockIndex> active,
-            grid.map().compact_active_blocks(metrics));
+  // The active set, on the device and inside this stage, so its row is a
+  // breakdown ("  ..active set"). The map hands back the list a fuse just
+  // compacted while it still holds, and keeps this one for the extract after,
+  // so encoding between the two costs neither of them a compaction.
+  VR_ASSIGN(const volume::DeviceBlockList list,
+            grid.map().compact_active_blocks_on_device(metrics));
+  // Only the blocks with an observed voxel are coded, found on the device
+  // before the transform: a fused band is mostly never integrated, and
+  // transforming those blocks only to drop them read every one back.
+  std::vector<volume::BlockIndex> blocks;
+  {
+    StageScope observed(metrics, "  ..observed");
+    VR_ASSIGN(blocks, transform_->observed(grid, list, &stage));
+  }
+  // Then into the order the frame requires. The hash table's order is
+  // whatever the allocate atomics left, so sorting is also what makes the
+  // same content give the same bytes.
   {
     StageScope sort(metrics, "  ..sort");
-    detail::sort_by_coord(active);
+    detail::sort_by_coord(blocks);
   }
 
-  // Transform all of them, then keep the blocks with at least one observed
-  // voxel. The mask is what says which, and it comes out of the transform, so
-  // the filter runs after it rather than before -- in place, sliding each kept
-  // block down over the dropped ones, so the readback is never held twice.
   detail::IntraFrame frame;
   frame.voxel_size = grid.grid().voxel_size;
   {
     StageScope forward(metrics, "  ..forward");
-    detail::DctBlocks all;
-    VR_TRY(transform_->forward(grid, grid.block_list(active), config_.params,
-                               all, &stage));
-    const std::size_t k = config_.params.coefficient_count;
-    frame.coords.reserve(active.size());
-    std::size_t kept = 0;
-    for (std::size_t i = 0; i < active.size(); ++i) {
-      const auto mask = all.masks.begin() +
-                        static_cast<std::ptrdiff_t>(i * kMaskWordsPerBlock);
-      const bool observed =
-          std::any_of(mask, mask + kMaskWordsPerBlock,
-                      [](std::uint32_t w) { return w != 0u; });
-      if (!observed) {
-        continue;
-      }
-      if (kept != i) {  // kept < i: the destination is a block already read
-        std::copy(mask, mask + kMaskWordsPerBlock,
-                  all.masks.begin() +
-                      static_cast<std::ptrdiff_t>(kept * kMaskWordsPerBlock));
-        const auto coeffs =
-            all.coefficients.begin() + static_cast<std::ptrdiff_t>(i * k);
-        std::copy(
-            coeffs, coeffs + static_cast<std::ptrdiff_t>(k),
-            all.coefficients.begin() + static_cast<std::ptrdiff_t>(kept * k));
-      }
-      frame.coords.push_back(active[i].coord);
-      ++kept;
-    }
-    all.masks.resize(kept * kMaskWordsPerBlock);
-    all.coefficients.resize(kept * k);
-    frame.blocks = std::move(all);
+    VR_TRY(transform_->forward(grid, grid.block_list(blocks), config_.params,
+                               frame.blocks, &stage));
+  }
+  frame.coords.reserve(blocks.size());
+  for (const volume::BlockIndex& b : blocks) {
+    frame.coords.push_back(b.coord);
   }
 
   StageScope entropy(metrics, "  ..rans encode");

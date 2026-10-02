@@ -28,8 +28,9 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace volumetric_kit::recon {
+class CommandBatch;
 class Device;
-}
+}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::volume {
 
@@ -264,17 +265,21 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// first-observation-assigns colour gate. This zeroes each removed block's
   /// range first, matching the state @ref create leaves a fresh array in.
   ///
-  /// The ranges are resolved from a snapshot of the active set, so a coord that
-  /// is not currently allocated costs nothing and clears nothing. They are
-  /// zeroed before the map's remove runs, so a block that call leaves in the
-  /// table (@ref AllocFailures::lock) is left zeroed, reading as a freshly
+  /// Each coord is found in the hash table on the device, by the kernel that
+  /// zeroes its block, so the cost is the count's, not the grid's, and a
+  /// coord that is not currently allocated costs nothing and clears nothing.
+  /// (An attribute whose blocks share 4-byte words, from an odd block size
+  /// and an element under 4 bytes, is resolved from a snapshot of the active
+  /// set instead, and zeroed by fills.) The blocks are zeroed before the
+  /// map's remove runs, so a block that call leaves in the table
+  /// (@ref AllocFailures::lock) is left zeroed, reading as a freshly
   /// allocated block until a later call removes it.
   /// @param coords  The block coordinates to remove (only `coord` is read).
   /// @param count   How many.
   /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
   /// @return What @ref VoxelHashMap::remove returns, or a non-OK @ref Status if
-  ///         the grid is moved-from, @p coords is null, or the snapshot or the
-  ///         zeroing fails. Either failure comes before any index is freed.
+  ///         the grid is moved-from, @p coords is null, or the zeroing fails,
+  ///         which comes before any index is freed.
   Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
                                AllocFailures* out_failures = nullptr);
 
@@ -384,15 +389,27 @@ class VR_VOLUME_API VoxelBlockGrid {
   };
 
   // Build the block pass's kernels, timer and count on its first call, so a
-  // grid that never runs one never pays for them.
+  // grid that never runs one never pays for them; the pass also checks for a
+  // float weight, which the zeroing alone does not need.
   Status prepare_block_pass();
+  Status prepare_block_kernels();
+  // Whether every attribute's blocks are whole 4-byte words, so the zero
+  // kernel can clear each block alone.
+  bool whole_word_blocks() const noexcept;
+  // Record the zero kernel over the first `count` entries of `list`, an
+  // attribute a dispatch, each block found by its coord.
+  Status record_zero(CommandBatch& batch, const Buffer& list,
+                     std::uint32_t count, GpuStageScope* stage);
+  // Upload `coords` and zero their blocks, in one batch.
+  Status zero_listed_blocks(const BlockIndex* coords, std::uint32_t count);
   // The block pass: stamps, and with a max_age the stale blocks listed in
   // stale_list_. Returns how many.
   Result<std::uint32_t> block_pass(std::uint32_t max_age, GpuStageScope& stage,
                                    StageMetrics* metrics);
-  // Zero every attribute of the blocks whose first voxels these are, in one
-  // batch: sorted and merged runs, attribute by attribute.
-  Status zero_blocks(std::vector<std::uint64_t> firsts);
+  // Find `coords`' blocks from a snapshot of the active set and zero every
+  // attribute of them by fills, in one batch: for an attribute whose blocks
+  // share words.
+  Status fill_listed_blocks(const BlockIndex* coords, std::uint32_t count);
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
