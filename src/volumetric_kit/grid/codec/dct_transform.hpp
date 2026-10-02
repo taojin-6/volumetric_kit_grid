@@ -14,6 +14,7 @@
 /// against it in a shared-library build too.
 
 #include <cstdint>
+#include <vector>
 
 #include "dct_blocks.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
@@ -28,6 +29,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::recon {
+class CommandBatch;
 class Device;
 class GpuStageScope;
 }  // namespace volumetric_kit::recon
@@ -49,7 +51,8 @@ struct DctTransformConfig {
   std::uint32_t max_blocks_per_dispatch = 0;
 };
 
-/// @brief The forward and inverse block DCT, as two GLSL compute kernels.
+/// @brief The forward and inverse block DCT, as two GLSL compute kernels, and
+///        a third that finds the blocks holding an observed voxel.
 ///
 /// One workgroup of `kEdge^2` (64) invocations per listed block; each owns one
 /// `kEdge`-voxel line per separable pass. The forward kernel reads `weight`,
@@ -73,16 +76,20 @@ struct DctTransformConfig {
 /// Output is indexed by **list position**, not by `ptr` (see @ref DctBlocks).
 /// The order the blocks travel in is the caller's (the encoder sorts them).
 ///
-/// Each workgroup first checks, through the grid's hash table, that its entry's
-/// `coord` resolves to exactly its `ptr`; one that does not is neither read nor
-/// written, and the call reports how many there were. That refuses a `ptr`
-/// outside the heap, a free slot, and a coord paired with another block's ptr,
-/// for the cost of one probe per block where a host scan would be O(count) per
-/// call. Like the mesher's probe, it needs the map quiescent: no allocate may
-/// run into the grid during a call.
+/// Each workgroup first finds its entry's block by its `coord`, through the
+/// grid's hash table, and never reads its `ptr`: so no ptr is trusted, and the
+/// decoder can list blocks it has just allocated without reading their slots
+/// back. A coord the table does not hold is neither read nor written, and the
+/// call reports how many there were. That costs one probe per block, where a
+/// host scan would be O(count) per call. Like the mesher's probe, it needs the
+/// map quiescent: no allocate may run into the grid during a call.
 ///
-/// Per-call buffers are allocated per call, as the integrator's are: at ~98 k
+/// Every buffer is device-local, and each call is one @ref CommandBatch: the
+/// list and the coefficients staged up, the dispatches, and the results and
+/// the reject count read back, one submit (the 2026-09-28 residency rule). The
+/// per-call buffers are allocated per call, as the integrator's are: at ~98 k
 /// blocks the three cost 0.03 ms of a 1.4 ms forward (Apple M5 Max, Release).
+/// The coefficients travel two to a word, 16 bits each.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -128,7 +135,7 @@ class VR_CODEC_API DctTransform {
   ///         another block size, a non-positive `trunc_dist`, or lacks a float
   ///         `tsdf` / `weight`; a list that
   ///         @ref volume::VoxelBlockGrid::check_block_list refuses, or one with
-  ///         an entry that is not a live block of @p grid; or a buffer that
+  ///         an entry whose coord @p grid does not hold; or a buffer that
   ///         would exceed `maxStorageBufferRange`. Otherwise a buffer or
   ///         dispatch failure.
   ///         On failure @p out is left empty.
@@ -143,21 +150,43 @@ class VR_CODEC_API DctTransform {
   /// writing one block).
   /// @param grid    As @ref forward, written in place.
   /// @param blocks  The blocks to reconstruct, in the order @p in was produced
-  ///                in; each must be live in @p grid.
+  ///                in; each coord must be one @p grid holds, and each ptr is
+  ///                ignored.
   /// @param in      A @ref forward output, or one read back from a frame.
   /// @param stage   As @ref forward.
   /// @return OK, the same refusals as @ref forward, or
   ///         @ref Status::Code::InvalidArgument when @p in carries invalid
   ///         params, another `trunc_dist` than @p grid, or a size that does
-  ///         not match the list. A refusal for entries that are not live comes
-  ///         from the device, after every live entry has been written; the
-  ///         others refuse before anything is.
+  ///         not match the list. A refusal for entries whose coord the grid
+  ///         does not hold comes from the device, after every other entry has
+  ///         been written; the others refuse before anything is.
   Status inverse(volume::VoxelBlockGrid& grid, const volume::BlockList& blocks,
                  const DctBlocks& in, GpuStageScope* stage = nullptr);
 
-  /// @return `true` if this owns both live pipelines (`false` when moved-from).
+  /// @brief The entries of @p list whose block holds an observed voxel
+  ///        (`weight >= volume::kObservedWeight`), in @p list's order.
+  ///
+  /// What the encoder keeps, found before the forward transform rather than
+  /// after it: this reads each block's weights alone and one word back per
+  /// entry, where transforming a never-observed block reads all of it and
+  /// writes and reads back K coefficients and a mask of zeros.
+  /// @param grid   As @ref forward.
+  /// @param list   The map's own active list, bound where it is
+  ///               (@ref
+  ///               volume::VoxelHashMap::compact_active_blocks_on_device).
+  /// @param stage  As @ref forward.
+  /// @return The observed entries; @ref Status::Code::InvalidArgument for a
+  ///         list @ref volume::VoxelHashMap::check_device_block_list refuses,
+  ///         a grid @ref forward refuses, or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer or dispatch failure.
+  Result<std::vector<volume::BlockIndex>> observed(
+      const volume::VoxelBlockGrid& grid, const volume::DeviceBlockList& list,
+      GpuStageScope* stage = nullptr);
+
+  /// @return `true` if this owns its live pipelines (`false` when moved-from).
   bool valid() const noexcept {
-    return forward_kernel_.valid() && inverse_kernel_.valid();
+    return forward_kernel_.valid() && inverse_kernel_.valid() &&
+           observed_kernel_.valid();
   }
 
  private:
@@ -176,14 +205,20 @@ class VR_CODEC_API DctTransform {
                                  const volume::BlockList& blocks,
                                  const CodecParams& params) const;
 
-  /// Upload the list, bind the per-call buffers and run @p kernel over it in
-  /// batches of at most @ref blocks_per_dispatch_ workgroups; refuses if any
-  /// entry was not live.
-  Status run(const char* op, ComputeKernel& kernel,
-             const volume::VoxelBlockGrid& grid, const GridViews& views,
-             const volume::BlockList& blocks, const CodecParams& params,
-             const Buffer& coefficients, const Buffer& masks,
-             GpuStageScope* stage);
+  /// Bind the call's buffers and record @p kernel over the @p count entries
+  /// of @p list into @p batch, in dispatches of at most
+  /// @ref blocks_per_dispatch_ workgroups, the reject count zeroed first.
+  /// @p coefficients may be null for the kernel that reads none.
+  Status record(CommandBatch& batch, ComputeKernel& kernel,
+                const volume::VoxelBlockGrid& grid, const GridViews& views,
+                VkBuffer list, std::uint32_t count, const CodecParams& params,
+                VkBuffer coefficients, VkBuffer masks, GpuStageScope* stage);
+  /// Stage @p blocks onto a device buffer of its own, in @p batch.
+  Result<Buffer> upload_list(CommandBatch& batch,
+                             const volume::BlockList& blocks);
+  /// The refusal for @p rejected entries the kernels found no block for.
+  static Status check_rejected(const char* op, std::uint32_t rejected,
+                               std::uint32_t count);
 
   // Borrowed (must outlive this).
   Device* device_ = nullptr;
@@ -196,16 +231,17 @@ class VR_CODEC_API DctTransform {
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // Both kernels share one layout shape (eight storage buffers + the push
-  // range) and one pool. Declared before pool_ and tables_, so those are
-  // destroyed first -- the kernels' sets are freed with the pool.
+  // The kernels share one layout shape (nine storage buffers + the push range)
+  // and one pool. Declared before pool_ and tables_, so those are destroyed
+  // first -- the kernels' sets are freed with the pool.
   ComputeKernel forward_kernel_;
   ComputeKernel inverse_kernel_;
+  ComputeKernel observed_kernel_;
   DescriptorPool pool_;
-  // The basis + zigzag tables (binding 3 of both kernels), uploaded once.
+  // The basis + zigzag tables (binding 3), uploaded once.
   Buffer tables_;
-  // The count of entries the kernels found not live (binding 7 of both),
-  // zeroed before each call and read after it.
+  // The count of entries the kernels found no block for (binding 7), zeroed
+  // in each call's batch and read back at its end.
   Buffer rejected_;
 };
 

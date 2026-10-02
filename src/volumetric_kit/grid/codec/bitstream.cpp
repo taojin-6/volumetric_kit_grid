@@ -12,6 +12,10 @@
 
 #include "rans.hpp"
 
+#if defined(_MSC_VER)
+#include <intrin.h>  // _BitScanReverse64
+#endif
+
 namespace volumetric_kit::recon::codec::detail {
 namespace {
 
@@ -22,6 +26,12 @@ namespace {
 // (kDxRun codes step - 1, so a run is a stream of zeros), within the same z
 // slice the y step is non-negative (kDySame), and after a step in z the other
 // two are free to go either way.
+//
+// A partial mask is coded a z plane at a time, and a plane a line (one byte,
+// eight voxels along x) at a time, each against the one before it: a fused
+// band's mask edge is a smooth surface, so most planes and lines repeat their
+// neighbour or are all one value. On room0 that is 2.2 bytes a block where
+// the 64 raw bytes through one table were 8.3 (the 2026-10-01 entry).
 enum Model : std::uint32_t {
   kDz = 0,     // unsigned: z step
   kDySame,     // unsigned: y step, z unchanged
@@ -29,8 +39,10 @@ enum Model : std::uint32_t {
   kDxRun,      // unsigned: x step - 1, y and z unchanged
   kDxFree,     // signed:   x step after a y or z step
   kMaskClass,  // 0 all observed, 1 none observed, 2 partial
-  kMaskByte,   // a partial mask's bytes
-  kFirstCoef,  // then one model per coefficient index j < K
+  kPlane,      // a partial mask's plane: same as the last, empty, full, lines
+  kLine,       // then a line of it, three models by its predictor's class
+  kByte = kLine + 3,       // then a line's byte, by the same three
+  kFirstCoef = kByte + 3,  // then one model per coefficient index j < K
 };
 
 // A class is a bit length: 0 for zero, else 1 + floor(log2 |v|). Coordinate
@@ -39,37 +51,59 @@ enum Model : std::uint32_t {
 constexpr std::uint32_t kCoordClasses = 33;
 constexpr std::uint32_t kCoefClasses = 16;
 constexpr std::uint32_t kMaskClasses = 3;
-constexpr std::uint32_t kMaskByteSymbols = 256;
 constexpr std::uint32_t kMaskFull = 0;
 constexpr std::uint32_t kMaskEmpty = 1;
 constexpr std::uint32_t kMaskPartial = 2;
+// A plane or a line: the same as its predictor, all unobserved, all observed,
+// or neither -- a plane then coded line by line, a line by its byte. The
+// writer tries them in this order, so a value two of them name is written as
+// the first.
+constexpr std::uint32_t kSame = 0;
+constexpr std::uint32_t kAllEmpty = 1;
+constexpr std::uint32_t kAllFull = 2;
+constexpr std::uint32_t kOther = 3;
+constexpr std::uint32_t kRunClasses = 4;
+constexpr std::uint32_t kByteSymbols = 256;
+constexpr std::uint32_t kLinesPerPlane = kBlockSize;  // y
+constexpr std::uint32_t kPlanes = kBlockSize;         // z
+static_assert(kMaskWordsPerBlock * 4 == kLinesPerPlane * kPlanes,
+              "a mask byte is one line of the block");
 
 std::uint32_t model_count(std::uint32_t k) { return kFirstCoef + k; }
 
 std::uint32_t alphabet(std::uint32_t model) {
-  switch (model) {
-    case kDz:
-    case kDySame:
-    case kDyFree:
-    case kDxRun:
-    case kDxFree:
-      return kCoordClasses;
-    case kMaskClass:
-      return kMaskClasses;
-    case kMaskByte:
-      return kMaskByteSymbols;
-    default:
-      return kCoefClasses;
-  }
+  if (model <= kDxFree) return kCoordClasses;
+  if (model == kMaskClass) return kMaskClasses;
+  if (model < kByte) return kRunClasses;  // kPlane and the kLine models
+  if (model < kFirstCoef) return kByteSymbols;
+  return kCoefClasses;
 }
 
 std::uint32_t bit_length(std::uint64_t v) {
-  std::uint32_t n = 0;
-  while (v != 0) {
-    ++n;
-    v >>= 1;
-  }
-  return n;
+#if defined(_MSC_VER)
+  unsigned long top = 0;
+  return _BitScanReverse64(&top, v) ? std::uint32_t(top) + 1 : 0;
+#else
+  return v == 0 ? 0 : 64 - std::uint32_t(__builtin_clzll(v));
+#endif
+}
+
+// A partial mask's line l = y + 8 z is byte l % 4 of word l / 4.
+std::uint32_t mask_line(const std::uint32_t* mask, std::uint32_t l) {
+  return (mask[l / 4] >> (8 * (l % 4))) & 0xFFu;
+}
+
+// Which of the three line models a predictor selects.
+std::uint32_t line_context(std::uint32_t predictor) {
+  return predictor == 0x00u ? 0 : predictor == 0xFFu ? 1 : 2;
+}
+
+// A line's predictor: the line before it in its plane, else the same line of
+// the plane before, else (the first line of the block) unobserved.
+std::uint32_t line_predictor(const std::uint32_t* mask, std::uint32_t z,
+                             std::uint32_t y) {
+  if (y > 0) return mask_line(mask, 8 * z + y - 1);
+  return z > 0 ? mask_line(mask, 8 * (z - 1)) : 0x00u;
 }
 
 // --- The one description of a block's symbols.
@@ -91,23 +125,62 @@ void emit_unsigned(Sink& sink, std::uint32_t model, std::uint64_t u) {
   }
 }
 
+// The sign is the low bit of one raw field of c bits, above it the c - 1 below
+// the leading one, so a value of class c <= 12 costs one coder step rather
+// than two. c is at most 32 (a step across all of int32), so the field fits.
 template <typename Sink>
 void emit_signed(Sink& sink, std::uint32_t model, std::int64_t v) {
   const std::uint64_t m = v < 0 ? std::uint64_t(-v) : std::uint64_t(v);
   const std::uint32_t c = bit_length(m);
   sink.symbol(model, c);
   if (c > 0) {
-    sink.bits(v < 0 ? 1u : 0u, 1);
-    if (c > 1) {
-      sink.bits(static_cast<std::uint32_t>(m - (std::uint64_t(1) << (c - 1))),
-                c - 1);
+    const std::uint64_t below = m - (std::uint64_t(1) << (c - 1));
+    sink.bits(static_cast<std::uint32_t>((below << 1) | (v < 0 ? 1u : 0u)), c);
+  }
+}
+
+// What a partial mask's plane z is against the plane before it (unobserved
+// before the first), and so whether its lines follow.
+std::uint32_t plane_symbol(const std::uint32_t* mask, std::uint32_t z) {
+  bool same = true;
+  bool empty = true;
+  bool full = true;
+  for (std::uint32_t y = 0; y < kLinesPerPlane; ++y) {
+    const std::uint32_t line = mask_line(mask, 8 * z + y);
+    same = same && line == (z > 0 ? mask_line(mask, 8 * (z - 1) + y) : 0x00u);
+    empty = empty && line == 0x00u;
+    full = full && line == 0xFFu;
+  }
+  return same ? kSame : empty ? kAllEmpty : full ? kAllFull : kOther;
+}
+
+template <typename Sink>
+void emit_partial_mask(Sink& sink, const std::uint32_t* mask) {
+  for (std::uint32_t z = 0; z < kPlanes; ++z) {
+    const std::uint32_t plane = plane_symbol(mask, z);
+    sink.symbol(kPlane, plane);
+    if (plane != kOther) {
+      continue;
+    }
+    for (std::uint32_t y = 0; y < kLinesPerPlane; ++y) {
+      const std::uint32_t line = mask_line(mask, 8 * z + y);
+      const std::uint32_t predictor = line_predictor(mask, z, y);
+      const std::uint32_t context = line_context(predictor);
+      const std::uint32_t s = line == predictor ? kSame
+                              : line == 0x00u   ? kAllEmpty
+                              : line == 0xFFu   ? kAllFull
+                                                : kOther;
+      sink.symbol(kLine + context, s);
+      if (s == kOther) {
+        sink.symbol(kByte + context, line);
+      }
     }
   }
 }
 
 template <typename Sink>
 void emit_block(Sink& sink, const Vec3i* prev, const Vec3i& cur,
-                const std::uint32_t* mask, const std::int32_t* coeffs,
+                const std::uint32_t* mask, const std::int16_t* coeffs,
                 std::uint32_t k) {
   if (prev == nullptr) {
     // A segment's first block, in full: the segment decodes on its own.
@@ -140,11 +213,7 @@ void emit_block(Sink& sink, const Vec3i* prev, const Vec3i& cur,
   }
   sink.symbol(kMaskClass, full ? kMaskFull : none ? kMaskEmpty : kMaskPartial);
   if (!full && !none) {
-    for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
-      for (std::uint32_t b = 0; b < 4; ++b) {
-        sink.symbol(kMaskByte, (mask[w] >> (8 * b)) & 0xFFu);
-      }
-    }
+    emit_partial_mask(sink, mask);
   }
 
   for (std::uint32_t j = 0; j < k; ++j) {
@@ -343,10 +412,38 @@ std::int64_t get_signed(RansReader& r, const FrequencyTable& t) {
   if (c == 0) {
     return 0;
   }
-  const bool negative = r.get_bits(1) != 0;
-  const std::uint64_t m =
-      c == 1 ? 1 : (std::uint64_t(1) << (c - 1)) + r.get_bits(c - 1);
-  return negative ? -std::int64_t(m) : std::int64_t(m);
+  const std::uint32_t field = r.get_bits(c);
+  const std::uint64_t m = (std::uint64_t(1) << (c - 1)) + (field >> 1);
+  return (field & 1u) != 0 ? -std::int64_t(m) : std::int64_t(m);
+}
+
+// The mirror of emit_partial_mask.
+void read_partial_mask(RansReader& r, const std::vector<FrequencyTable>& t,
+                       std::uint32_t* mask) {
+  for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
+    mask[w] = 0;
+  }
+  for (std::uint32_t z = 0; z < kPlanes; ++z) {
+    const std::uint32_t plane = r.get(t[kPlane]);
+    for (std::uint32_t y = 0; y < kLinesPerPlane; ++y) {
+      std::uint32_t line = 0;
+      if (plane == kOther) {
+        const std::uint32_t predictor = line_predictor(mask, z, y);
+        const std::uint32_t context = line_context(predictor);
+        const std::uint32_t s = r.get(t[kLine + context]);
+        line = s == kSame       ? predictor
+               : s == kAllEmpty ? 0x00u
+               : s == kAllFull  ? 0xFFu
+                                : r.get(t[kByte + context]);
+      } else if (plane == kSame) {
+        line = z > 0 ? mask_line(mask, 8 * (z - 1) + y) : 0x00u;
+      } else {
+        line = plane == kAllFull ? 0xFFu : 0x00u;
+      }
+      const std::uint32_t l = 8 * z + y;
+      mask[l / 4] |= line << (8 * (l % 4));
+    }
+  }
 }
 
 // A coordinate the deltas produced, or false if it left int32.
@@ -365,7 +462,7 @@ bool to_coord(std::int64_t v, std::int32_t& out) {
 // and could be misreported as leaving int32.
 bool read_block(RansReader& r, const std::vector<FrequencyTable>& t,
                 const Vec3i* prev, Vec3i& cur, std::uint32_t* mask,
-                std::int32_t* coeffs, std::uint32_t k) {
+                std::int16_t* coeffs, std::uint32_t k) {
   if (prev == nullptr) {
     cur.x = static_cast<std::int32_t>(r.get_bits(32));
     cur.y = static_cast<std::int32_t>(r.get_bits(32));
@@ -391,25 +488,24 @@ bool read_block(RansReader& r, const std::vector<FrequencyTable>& t,
     }
   }
 
-  // TODO(codec): refuse a partial mask that decodes all-full or all-empty.
-  // The writer never makes one and it decodes correctly, so it is a second
-  // spelling of one frame rather than a wrong one (the 2026-09-27 entry).
+  // TODO(codec): refuse a partial mask that decodes all-full or all-empty,
+  // and the mask code's other second spellings: a plane coded line by line
+  // that one plane symbol names, a line coded as the byte another line
+  // symbol names. The writer makes none of them and each decodes correctly,
+  // so each is a second spelling of one frame rather than a wrong one (the
+  // 2026-09-27 and 2026-10-01 entries).
   const std::uint32_t cls = r.get(t[kMaskClass]);
-  for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
-    if (cls == kMaskPartial) {
-      std::uint32_t word = 0;
-      for (std::uint32_t b = 0; b < 4; ++b) {
-        word |= r.get(t[kMaskByte]) << (8 * b);
-      }
-      mask[w] = word;
-    } else {
+  if (cls == kMaskPartial) {
+    read_partial_mask(r, t, mask);
+  } else {
+    for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
       mask[w] = cls == kMaskFull ? ~0u : 0u;
     }
   }
 
   for (std::uint32_t j = 0; j < k; ++j) {
     // Class < 16, so |value| <= 32767: every coefficient is in range.
-    coeffs[j] = static_cast<std::int32_t>(get_signed(r, t[kFirstCoef + j]));
+    coeffs[j] = static_cast<std::int16_t>(get_signed(r, t[kFirstCoef + j]));
   }
   return true;
 }
@@ -473,7 +569,7 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
           std::to_string(i));
     }
   }
-  for (std::int32_t c : b.coefficients) {
+  for (std::int16_t c : b.coefficients) {
     if (c < -kMaxQuantizedMagnitude || c > kMaxQuantizedMagnitude) {
       return bad_write("a coefficient is outside +-" +
                        std::to_string(kMaxQuantizedMagnitude));

@@ -33,6 +33,9 @@ struct ZeroPush {
   std::uint32_t voxels_per_block;
   std::uint32_t words_per_block;
   std::uint32_t num_words;
+  std::int32_t num_buckets;
+  std::int32_t bucket_size;
+  std::int32_t max_chain;
 };
 
 // One workgroup per listed block, in dispatches of at most the device's
@@ -291,38 +294,12 @@ Result<std::uint32_t> VoxelBlockGrid::remove(const BlockIndex* coords,
     return Status::invalid_argument("VoxelBlockGrid::remove: coords is null");
   }
 
-  // Resolve each coord to the block pointer it currently holds. The map keys
-  // coords to pointers on the device, and the compacted active set is the
-  // existing way to read that mapping out -- no new kernel, and the dispatch is
-  // quiescent between calls, so the snapshot is exact. Only needed when the
-  // grid actually carries attributes.
   if (!attributes_.empty()) {
-    VR_ASSIGN(std::vector<BlockIndex> active, map_.compact_active_blocks());
-    // Sorted once, so each coord is a binary search: a scan of the whole
-    // active set per coord made removing k of n blocks O(k * n), which a
-    // decoder removing thousands of blocks a frame cannot afford.
-    const auto less = [](const Vec3i& a, const Vec3i& b) {
-      if (a.z != b.z) return a.z < b.z;
-      if (a.y != b.y) return a.y < b.y;
-      return a.x < b.x;
-    };
-    std::sort(active.begin(), active.end(),
-              [&](const BlockIndex& a, const BlockIndex& b) {
-                return less(a.coord, b.coord);
-              });
-    std::vector<std::uint64_t> firsts;  // each found block's first voxel
-    for (std::uint32_t i = 0; i < count; ++i) {
-      const auto block =
-          std::lower_bound(active.begin(), active.end(), coords[i].coord,
-                           [&](const BlockIndex& b, const Vec3i& c) {
-                             return less(b.coord, c);
-                           });
-      if (block == active.end() || block->coord != coords[i].coord) {
-        continue;
-      }
-      firsts.push_back(static_cast<std::uint64_t>(block->ptr));
-    }
-    VR_TRY(zero_blocks(std::move(firsts)));
+    // The zero kernel finds each coord's block in the table itself, so this
+    // costs the count, not the grid -- unless an attribute's blocks share
+    // words, which only fills can zero apart.
+    VR_TRY(whole_word_blocks() ? zero_listed_blocks(coords, count)
+                               : fill_listed_blocks(coords, count));
   }
 
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
@@ -347,6 +324,15 @@ Status VoxelBlockGrid::clear() {
   return map_.clear();  // moves the topology epoch; see topology_epoch()
 }
 
+bool VoxelBlockGrid::whole_word_blocks() const noexcept {
+  const auto voxels_per_block =
+      static_cast<std::uint64_t>(map_.grid().voxels_per_block);
+  return std::all_of(attributes_.begin(), attributes_.end(),
+                     [&](const Attribute& attr) {
+                       return voxels_per_block * attr.element_size % 4 == 0;
+                     });
+}
+
 Status VoxelBlockGrid::prepare_block_pass() {
   if (!valid()) {
     return Status::invalid_argument("VoxelBlockGrid: moved-from grid");
@@ -356,6 +342,10 @@ Status VoxelBlockGrid::prepare_block_pass() {
     return Status::invalid_argument(
         "VoxelBlockGrid: the block pass needs a float weight attribute");
   }
+  return prepare_block_kernels();
+}
+
+Status VoxelBlockGrid::prepare_block_kernels() {
   if (stamp_kernel_.valid()) return {};
   // Built aside and committed at the end, the stamp kernel last, since it is
   // what says the pass is built.
@@ -372,7 +362,7 @@ Status VoxelBlockGrid::prepare_block_pass() {
   VR_TRY(kb.add(stamp, "block_stamp", vr_block_stamp_comp_spv,
                 vr_block_stamp_comp_spv_size, 5, &stamp_push));
   VR_TRY(kb.add(zero, "block_zero", vr_block_zero_comp_spv,
-                vr_block_zero_comp_spv_size, 2, &zero_push));
+                vr_block_zero_comp_spv_size, 3, &zero_push));
   VR_ASSIGN(DescriptorPool pool, kb.build());
   KernelSets sets;
   VR_TRY(sets.reserve(*device_, zero,
@@ -440,14 +430,10 @@ Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(std::uint32_t max_age,
         "VoxelBlockGrid::free_stale_blocks: max_age must be at least 1");
   }
   VR_TRY(prepare_block_pass());
-  const auto voxels_per_block =
-      static_cast<std::uint32_t>(map_.grid().voxels_per_block);
-  for (const Attribute& attr : attributes_) {
-    if (std::uint64_t{voxels_per_block} * attr.element_size % 4 != 0) {
-      return Status::invalid_argument(
-          "VoxelBlockGrid::free_stale_blocks: attribute '" + attr.name +
-          "' does not fill whole 4-byte words a block");
-    }
+  if (!whole_word_blocks()) {
+    return Status::invalid_argument(
+        "VoxelBlockGrid::free_stale_blocks: an attribute does not fill whole "
+        "4-byte words a block");
   }
   GpuStageScope stage(metrics, gpu_timer_, "block stamps");
   VR_ASSIGN(const std::uint32_t stale, block_pass(max_age, stage, metrics));
@@ -457,31 +443,80 @@ Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(std::uint32_t max_age,
   const VkDeviceSize list_bytes = VkDeviceSize(stale) * sizeof(BlockIndex);
   std::vector<BlockIndex> blocks(stale);
   CommandBatch batch(*device_, *allocator_);
-  for (std::size_t i = 0; i < attributes_.size(); ++i) {
-    const Attribute& attr = attributes_[i];
-    const DescriptorSet& set = zero_sets_[i];
-    set.write_storage_buffer(0, attr.buffer.handle(), 0, VK_WHOLE_SIZE);
-    set.write_storage_buffer(1, stale_list_.handle(), 0, list_bytes);
-    const ZeroPush push{0, voxels_per_block,
-                        voxels_per_block * attr.element_size / 4,
-                        static_cast<std::uint32_t>(attr.buffer.size() / 4)};
-    VR_TRY(dispatch_per_block(batch, zero_kernel_, set, push, stale,
-                              max_workgroup_count_x_, &stage));
-  }
+  VR_TRY(record_zero(batch, stale_list_, stale, &stage));
   VR_TRY(batch.readback(stale_list_, 0, list_bytes, blocks.data()));
   VR_TRY(batch.submit());
   VR_ASSIGN(const std::uint32_t failed, map_.remove(blocks.data(), stale));
   return stale - std::min(failed, stale);
 }
 
-Status VoxelBlockGrid::zero_blocks(std::vector<std::uint64_t> firsts) {
+Status VoxelBlockGrid::record_zero(CommandBatch& batch, const Buffer& list,
+                                   std::uint32_t count, GpuStageScope* stage) {
+  const VoxelGridParams& gp = map_.grid();
+  const auto voxels_per_block = static_cast<std::uint32_t>(gp.voxels_per_block);
+  const VkDeviceSize list_bytes = VkDeviceSize(count) * sizeof(BlockIndex);
+  const VkDeviceSize entries_bytes = map_.entries_buffer_size();
+  VR_TRY(check_storage_buffer_range("VoxelBlockGrid: the hash entries",
+                                    entries_bytes, max_storage_buffer_range_));
+  for (std::size_t i = 0; i < attributes_.size(); ++i) {
+    const Attribute& attr = attributes_[i];
+    const DescriptorSet& set = zero_sets_[i];
+    set.write_storage_buffer(0, attr.buffer.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(1, list.handle(), 0, list_bytes);
+    set.write_storage_buffer(2, map_.entries_buffer(), 0, entries_bytes);
+    const ZeroPush push{0,
+                        voxels_per_block,
+                        voxels_per_block * attr.element_size / 4,
+                        static_cast<std::uint32_t>(attr.buffer.size() / 4),
+                        gp.num_buckets,
+                        gp.bucket_size,
+                        gp.max_chain};
+    VR_TRY(dispatch_per_block(batch, zero_kernel_, set, push, count,
+                              max_workgroup_count_x_, stage));
+  }
+  return {};
+}
+
+Status VoxelBlockGrid::zero_listed_blocks(const BlockIndex* coords,
+                                          std::uint32_t count) {
+  VR_TRY(prepare_block_kernels());
+  const VkDeviceSize list_bytes = VkDeviceSize(count) * sizeof(BlockIndex);
+  VR_TRY(check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
+                                    list_bytes, max_storage_buffer_range_));
+  VR_ASSIGN(const Buffer list, device_storage_buffer(*allocator_, list_bytes));
+  CommandBatch batch(*device_, *allocator_);
+  VR_TRY(batch.upload(list, 0, coords, list_bytes));
+  VR_TRY(record_zero(batch, list, count, nullptr));
+  return batch.submit();
+}
+
+Status VoxelBlockGrid::fill_listed_blocks(const BlockIndex* coords,
+                                          std::uint32_t count) {
+  // Each coord's block pointer, from a snapshot of the active set --
+  // quiescent between calls, so exact -- sorted once, so each coord is a
+  // binary search. Only for an attribute whose blocks share words, which
+  // block_zero.comp cannot zero apart; MoltenVK runs each fill as a dispatch
+  // of its own.
+  VR_ASSIGN(std::vector<BlockIndex> active, map_.compact_active_blocks());
+  std::sort(active.begin(), active.end(),
+            [](const BlockIndex& a, const BlockIndex& b) {
+              return coord_less(a.coord, b.coord);
+            });
+  std::vector<std::uint64_t> firsts;  // each found block's first voxel
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const auto block =
+        std::lower_bound(active.begin(), active.end(), coords[i].coord,
+                         [](const BlockIndex& b, const Vec3i& c) {
+                           return coord_less(b.coord, c);
+                         });
+    if (block != active.end() && block->coord == coords[i].coord) {
+      firsts.push_back(static_cast<std::uint64_t>(block->ptr));
+    }
+  }
   // Zero each block's slice of every attribute on the device, in one batch.
   // Sorted and merged, so blocks the LIFO heap handed out side by side cost
   // one fill, not one each; and attribute by attribute, so each array's
   // fills rise through it and share one barrier (see CommandBatch).
-  // TODO(volume): zero through block_zero.comp, as free_stale_blocks does, if
-  // removing thousands of scattered blocks becomes common: MoltenVK runs each
-  // fill as a dispatch of its own (2026-10-01).
   const auto voxels_per_block =
       static_cast<std::uint64_t>(map_.grid().voxels_per_block);
   std::sort(firsts.begin(), firsts.end());

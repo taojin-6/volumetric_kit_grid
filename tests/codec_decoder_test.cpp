@@ -143,6 +143,17 @@ int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
       CHECK(st.value()[static_cast<std::uint32_t>(b.ptr) / 512u].changed ==
             out.map().tick());
     }
+    // The same frame again leaves every block as it was, and so stamps none:
+    // what lets an incremental extract follow a decoded stream.
+    const std::uint32_t first = out.map().tick();
+    CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
+    CHECK(out.map().tick() != first);
+    st = out.map().read_block_stamps();
+    CHECK(st.ok());
+    for (const vol::BlockIndex& b : active.value()) {
+      CHECK(st.value()[static_cast<std::uint32_t>(b.ptr) / 512u].changed ==
+            first);
+    }
   }
 
   const float bound = std::sqrt(512.0f) * 0.002f / 2.0f * kTrunc + 1e-6f;
@@ -406,6 +417,14 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(s.domain() == vr::Status::Code::OutOfMemory);
   vr::Result<Snapshot> small_after = snapshot(gpu, small);
   CHECK(small_after.ok() && small_after.value() == small_before.value());
+  // Another geometry with more blocks than the grid has slots is refused for
+  // its geometry, read off the header, and not for its size: a player must
+  // not be sent to grow a grid that could never take the frame.
+  vr::Result<codec::FrameInfo> other_info =
+      codec::read_frame_info(fo.value().data(), fo.value().size());
+  CHECK(other_info.ok() && other_info.value().block_count > 32);
+  const vr::Status so = dec.decode(fo.value().data(), fo.value().size(), small);
+  CHECK(!so.ok() && so.domain() == vr::Status::Code::InvalidArgument);
   std::int32_t buckets = tiny.num_buckets;
   while (buckets * tiny.bucket_size <
          std::int32_t(info.value().block_count) * 4) {
@@ -494,9 +513,9 @@ int frame_info_case(Gpu& gpu) {
   bad[0] = 'X';
   CHECK(!codec::read_frame_info(bad.data(), bad.size()).ok());
   bad = frame.value();
-  bad[4] = 2;  // version 2
-  vr::Result<codec::FrameInfo> v2 = codec::read_frame_info(bad.data(), 44);
-  CHECK(!v2.ok() && v2.status().domain() == vr::Status::Code::Unsupported);
+  bad[4] = 3;  // version 3
+  vr::Result<codec::FrameInfo> v3 = codec::read_frame_info(bad.data(), 44);
+  CHECK(!v3.ok() && v3.status().domain() == vr::Status::Code::Unsupported);
   return 0;
 }
 

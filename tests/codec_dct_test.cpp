@@ -25,6 +25,7 @@
 #include "grid_readback.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -297,7 +298,7 @@ int check_against_reference(const DctBlocks& out, const Cube* content,
                             std::size_t count, int& exact, int& near_half) {
   const auto zigzag = codec::detail::zigzag_order();
   const codec::CodecParams& params = out.params;
-  const std::vector<std::int32_t>& coeffs = out.coefficients;
+  const std::vector<std::int16_t>& coeffs = out.coefficients;
   const std::size_t k = params.coefficient_count;
   CHECK(coeffs.size() == count * k);
   for (std::size_t i = 0; i < count; ++i) {
@@ -359,6 +360,20 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
   // Every voxel was observed.
   for (std::uint32_t m : out.masks) {
     CHECK(m == 0xFFFFFFFFu);
+  }
+
+  // An odd K pads each entry's last word on the device: the pad is dropped
+  // from every row on the way out and put back on the way in, whatever the
+  // row, so each block still matches the reference both ways.
+  params.coefficient_count = 35;
+  CHECK(t.forward(grid, grid.block_list(blocks), params, out).ok());
+  CHECK(out.coefficients.size() == 4u * 35u);
+  CHECK(check_against_reference(out, content, 4, exact, near_half) == 0);
+  CHECK(t.inverse(grid, grid.block_list(blocks), out).ok());
+  for (int i = 0; i < 4; ++i) {
+    const Cube want = reference_round_trip(content[i], params);
+    CHECK(rms_diff(read_block(ctx, grid, blocks[std::size_t(i)]), want) <=
+          1e-3);
   }
   return 0;
 }
@@ -832,10 +847,12 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   vol::BlockList null_list{nullptr, 3, grid.topology_epoch()};
   CHECK(!t.forward(grid, null_list, params, out).ok());
 
-  // Entries that are not live blocks: a ptr outside the heap, negative, off a
-  // block boundary, a free slot, and a coord paired with another block's ptr.
-  // The first three would be out-of-bounds device accesses, and the last two
-  // in-bounds writes the inverse would make into the wrong slot.
+  // Every entry is found by its coord and its ptr never read, so a ptr
+  // outside the heap, negative, off a block boundary, a free slot, or another
+  // block's transforms the coord's own block, and none of them can make a
+  // kernel read or write where it should not.
+  DctBlocks honest;
+  CHECK(t.forward(grid, grid.block_list(blocks), params, honest).ok());
   const std::int32_t unused = free_ptr(grid, blocks);
   CHECK(unused >= 0);
   const std::int32_t vpb = std::int32_t(kVpb);
@@ -844,18 +861,25 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   for (std::int32_t p : bad_ptrs) {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = p;
-    out.coefficients = {1};
-    CHECK(!t.forward(grid, grid.block_list(forged), params, out).ok());
-    CHECK(out.coefficients.empty());  // a refusal leaves the outputs empty
+    CHECK(t.forward(grid, grid.block_list(forged), params, out).ok());
+    CHECK(out.coefficients == honest.coefficients);
+    CHECK(out.masks == honest.masks);
   }
+  // A coord the grid does not hold is refused, and leaves the outputs empty.
+  std::vector<vol::BlockIndex> absent = blocks;
+  absent[1].coord = vr::Vec3i(99, 99, 99);
+  out.coefficients = {1};
+  CHECK(!t.forward(grid, grid.block_list(absent), params, out).ok());
+  CHECK(out.coefficients.empty());
 
-  // The inverse writes nothing for such an entry -- a free slot must stay the
-  // zeros a fresh block reads, or the next allocate hands out a block that
-  // meshes as observed -- and still decodes every live entry.
-  CHECK(t.forward(grid, grid.block_list(blocks), params, out).ok());
+  // The inverse writes nothing for such a coord, and nothing at a forged
+  // ptr -- a free slot must stay the zeros a fresh block reads, or the next
+  // allocate hands out a block that meshes as observed -- and still decodes
+  // every other entry, at its coord's own block.
   {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = unused;
+    forged[2].coord = vr::Vec3i(99, 99, 99);
     std::vector<float> tsdf = attr(ctx, grid, "tsdf");
     for (const vol::BlockIndex& b : blocks) {
       for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -863,16 +887,18 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
       }
     }
     put(ctx, grid, "tsdf", tsdf);
-    CHECK(!t.inverse(grid, grid.block_list(forged), out).ok());
+    CHECK(!t.inverse(grid, grid.block_list(forged), honest).ok());
     tsdf = attr(ctx, grid, "tsdf");
     const std::vector<float> weight = attr(ctx, grid, "weight");
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       CHECK(weight[std::uint32_t(unused) + v] == 0.0f);
       CHECK(tsdf[std::uint32_t(unused) + v] == 0.0f);
       CHECK(tsdf[std::uint32_t(blocks[0].ptr) + v] != 9.0f);
-      CHECK(tsdf[std::uint32_t(blocks[1].ptr) + v] == 9.0f);
+      CHECK(tsdf[std::uint32_t(blocks[1].ptr) + v] != 9.0f);
+      CHECK(tsdf[std::uint32_t(blocks[2].ptr) + v] == 9.0f);
     }
   }
+  out = honest;
 
   // Coefficients the inverse cannot trust: a size that does not match the
   // list, invalid params, and another band than the grid's.
@@ -928,6 +954,119 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
            .ok());
   CHECK(!t.forward(no_weight, vol::BlockList{}, params, out).ok());
   CHECK(!t.inverse(no_weight, vol::BlockList{}, DctBlocks{}).ok());
+  return 0;
+}
+
+// The observed pass keeps exactly the entries of the map's own list whose
+// block holds a voxel at or above kObservedWeight, in the list's order, and
+// refuses a list the map has moved past.
+int observed_case(vr::Device& device, vr::Allocator& allocator,
+                  DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
+  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  CHECK(active.ok());
+  const std::vector<vol::BlockIndex>& blocks = active.value();
+  // Block 0 all observed; 1 none; 2 one voxel at the threshold; 3 one voxel
+  // just under it.
+  write_block(ctx, grid, blocks[0], random_cube(1), observed);
+  write_block(ctx, grid, blocks[1], random_cube(2),
+              [](std::uint32_t) { return 0.0f; });
+  write_block(ctx, grid, blocks[2], random_cube(3), [](std::uint32_t v) {
+    return v == 300 ? vol::kObservedWeight : 0.0f;
+  });
+  write_block(ctx, grid, blocks[3], random_cube(4),
+              [](std::uint32_t v) { return v == 7 ? 5e-7f : 0.0f; });
+
+  vr::Result<vol::DeviceBlockList> list =
+      grid.map().compact_active_blocks_on_device();
+  CHECK(list.ok() && list.value().count == 4);
+  vr::Result<std::vector<vol::BlockIndex>> kept =
+      t.observed(grid, list.value());
+  CHECK(kept.ok());
+  // The map's list, filtered: the same entries in the same order.
+  std::vector<vol::BlockIndex> entries(4);
+  vr::CommandBatch batch(device, allocator);
+  CHECK(batch
+            .readback(*list.value().buffer, 0, 4 * sizeof(vol::BlockIndex),
+                      entries.data())
+            .ok());
+  CHECK(batch.submit().ok());
+  std::vector<vol::BlockIndex> expected;
+  for (const vol::BlockIndex& e : entries) {
+    if (e.coord.x == 0 || e.coord.x == 2) expected.push_back(e);
+  }
+  CHECK(kept.value().size() == 2);
+  for (std::size_t i = 0; i < 2; ++i) {
+    CHECK(kept.value()[i].coord == expected[i].coord);
+    CHECK(kept.value()[i].ptr == expected[i].ptr);
+  }
+
+  // A list an allocation has made stale is refused.
+  std::vector<vol::BlockIndex> one(1);
+  one[0].coord = vr::Vec3i(9, 9, 9);
+  CHECK(grid.map().allocate(one.data(), 1).ok());
+  CHECK(!t.observed(grid, list.value()).ok());
+
+  // An empty list keeps nothing.
+  vr::Result<vol::VoxelBlockGrid> e = make_grid(device, allocator);
+  CHECK(e.ok());
+  vr::Result<vol::DeviceBlockList> none =
+      e.value().map().compact_active_blocks_on_device();
+  CHECK(none.ok());
+  vr::Result<std::vector<vol::BlockIndex>> nothing =
+      t.observed(e.value(), none.value());
+  CHECK(nothing.ok() && nothing.value().empty());
+  return 0;
+}
+
+// The inverse stamps changed only on a block it leaves different, as the
+// integrator does, so decoding a block's last frame again leaves it to an
+// incremental extract.
+int inverse_stamps_case(vr::Device& device, vr::Allocator& allocator,
+                        DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
+  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  CHECK(active.ok());
+  const std::vector<vol::BlockIndex>& blocks = active.value();
+  for (std::size_t i = 0; i < 3; ++i) {
+    write_block(ctx, grid, blocks[i], random_cube(500u + std::uint32_t(i)),
+                observed);
+  }
+  const vol::BlockList list = grid.block_list(blocks);
+  DctBlocks out;
+  CHECK(t.forward(grid, list, codec::CodecParams{}, out).ok());
+  auto changed = [&](std::size_t i) {
+    return grid.map()
+        .read_block_stamps()
+        .value()[std::uint32_t(blocks[i].ptr) / kVpb]
+        .changed;
+  };
+
+  CHECK(t.inverse(grid, list, out).ok());
+  const std::uint32_t first = grid.map().tick();
+  for (std::size_t i = 0; i < 3; ++i) {
+    CHECK(changed(i) == first);
+  }
+  // The same coefficients again: a tick of its own, and nothing changed.
+  CHECK(t.inverse(grid, list, out).ok());
+  CHECK(grid.map().tick() != first);
+  for (std::size_t i = 0; i < 3; ++i) {
+    CHECK(changed(i) == first);
+  }
+  // One block's DC moved: that block alone.
+  DctBlocks moved = out;
+  moved.coefficients[out.params.coefficient_count] = static_cast<std::int16_t>(
+      moved.coefficients[out.params.coefficient_count] + 1);
+  CHECK(t.inverse(grid, list, moved).ok());
+  CHECK(changed(0) == first);
+  CHECK(changed(1) == grid.map().tick());
+  CHECK(changed(2) == first);
   return 0;
 }
 
@@ -1018,6 +1157,8 @@ int main() {
   if (order_follows_list_case(dev, alloc, t) != 0) return 1;
   if (batching_case(dev, alloc, t) != 0) return 1;
   if (refusals_case(dev, alloc, t) != 0) return 1;
+  if (observed_case(dev, alloc, t) != 0) return 1;
+  if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
   if (moves_case(dev, alloc) != 0) return 1;
   std::printf("codec DctTransform: OK\n");
   return 0;

@@ -1,0 +1,58 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// Which listed blocks hold an observed voxel (weight >= observed_weight): 1 or
+// 0 per list entry, for the encoder to drop the rest before the forward
+// transform rather than transform them and read their zeros back. A fused
+// grid's band is mostly never integrated -- room0 codes about one block in
+// five of those it allocates -- so this reads weights alone where the forward
+// would read the block, transform it and write it out. An entry whose coord
+// the table does not hold (see block_ptr) is reported and written nothing.
+
+#extension GL_GOOGLE_include_directive : require
+#include "dct_common.glsl"
+
+layout(local_size_x = kLanes) in;
+
+layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) readonly buffer
+    Weight {
+  float weight[];
+};
+// One word per list entry, on the masks' binding: this kernel writes no mask.
+layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) writeonly buffer
+    Observed {
+  uint observed[];
+};
+
+shared uint s_observed;
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.block_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup; see dct_forward.comp.
+  if (entry >= pc.num_blocks) {
+    return;
+  }
+  int ptr = block_ptr(entry, lane);
+  if (ptr < 0) {
+    return;
+  }
+  if (lane == 0u) {
+    s_observed = 0u;
+  }
+  barrier();
+  uint first = uint(ptr) + x_line_base(lane);
+  bool any = false;
+  for (uint x = 0u; x < kEdge; ++x) {
+    any = any || weight[first + x] >= pc.observed_weight;
+  }
+  if (any) {
+    atomicOr(s_observed, 1u);
+  }
+  barrier();
+  if (lane == 0u) {
+    observed[entry] = s_observed;
+  }
+}

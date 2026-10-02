@@ -8,8 +8,9 @@
 // orthonormal 8^3 DCT-II, and write the first K coefficients in zigzag order,
 // each rounded half-to-even after dividing by its step and clamped to +-32767
 // (CodecParams::validate keeps the step coarse enough that the clamp never
-// engages on in-range input). Also pack the observed mask: bit v % 32 of word
-// v / 32 is set where voxel v's weight >= observed_weight.
+// engages on in-range input), two to a word (see coefficient_words). Also
+// pack the observed mask: bit v % 32 of word v / 32 is set where voxel v's
+// weight >= observed_weight.
 //
 // Re-implements the prior engine's computeDCTKernel (compute_dct.cu) with one
 // lane per line instead of one thread per voxel -- see dct_common.glsl. Output
@@ -29,7 +30,7 @@ layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) readonly buffer
 };
 layout(set = 0, binding = VR_DCT_BINDING_COEFFICIENTS, scalar) writeonly buffer
     Coefficients {
-  int coefficients[];
+  uint coefficients[];
 };
 layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) writeonly buffer
     Masks {
@@ -91,15 +92,26 @@ void fill_unobserved(uint lane) {
   barrier();
 }
 
+// Coefficient j, quantized: rounded half-to-even and clamped.
+int quantized(uint j) {
+  float q = roundEven(s_work[kHalf + zigzag[j]] / step_for(j));
+  float bound = float(pc.max_quantized);
+  return int(clamp(q, -bound, bound));
+}
+
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.block_base + gl_WorkGroupID.x;
   // Uniform across the workgroup (it depends only on the group id), so every
   // barrier below is still reached by all of this group's lanes or none.
-  if (entry >= pc.num_blocks || !block_is_live(entry, lane)) {
+  if (entry >= pc.num_blocks) {
     return;
   }
-  uint voxel_base = uint(blocks[entry].ptr);
+  int ptr = block_ptr(entry, lane);
+  if (ptr < 0) {
+    return;
+  }
+  uint voxel_base = uint(ptr);
 
   s_basis[lane] = basis[lane];
   if (lane < kMaskWords) {
@@ -133,10 +145,11 @@ void main() {
   transform_cube(lane, false);
 
   uint k = pc.coefficient_count;
-  for (uint j = lane; j < k; j += kLanes) {
-    float q = roundEven(s_work[kHalf + zigzag[j]] / step_for(j));
-    float bound = float(pc.max_quantized);
-    coefficients[entry * k + j] = int(clamp(q, -bound, bound));
+  uint words = coefficient_words();
+  for (uint p = lane; p < words; p += kLanes) {
+    uint lo = uint(quantized(2u * p)) & 0xFFFFu;
+    uint hi = 2u * p + 1u < k ? uint(quantized(2u * p + 1u)) & 0xFFFFu : 0u;
+    coefficients[entry * words + p] = lo | (hi << 16);
   }
   if (lane < kMaskWords) {
     masks[entry * kMaskWords + lane] = s_mask[lane];

@@ -1,12 +1,15 @@
 #version 450
 
-// Zero one attribute of the blocks free_stale_blocks lists, a workgroup a
-// block: one dispatch an attribute, where a fill a block cost MoltenVK a
-// dispatch each.
+// Zero one attribute of each listed block, a workgroup a block: one dispatch
+// an attribute, where a fill a block cost MoltenVK a dispatch each. A block is
+// found by its coordinate in the hash table, its ptr in the list never read,
+// so VoxelBlockGrid::remove hands it coordinates alone, and a coordinate the
+// table does not hold zeroes nothing. The table must be quiescent, as
+// hash_lookup.glsl says, which it is between the map's calls.
 
 #extension GL_GOOGLE_include_directive : require
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "hash_common.glsl"
+#define VR_HASH_ENTRIES_BINDING 2
+#include "hash_lookup.glsl"
 
 layout(local_size_x = 256) in;
 
@@ -20,11 +23,23 @@ layout(push_constant, scalar) uniform Push {
   uint voxels_per_block;
   uint words_per_block;
   uint num_words;  // the array's, so an out-of-lockstep one is left alone
+  int num_buckets;  // the hash table's shape
+  int bucket_size;
+  int max_chain;
 } pc;
 
+shared int s_ptr;
+
 void main() {
-  BlockIndex block = blocks[pc.base + gl_WorkGroupID.x];
-  uint first = uint(block.ptr) / pc.voxels_per_block * pc.words_per_block;
+  if (gl_LocalInvocationID.x == 0u) {
+    s_ptr = vrFindBlockPtr(blocks[pc.base + gl_WorkGroupID.x].coord,
+                           pc.num_buckets, pc.bucket_size, pc.max_chain);
+  }
+  barrier();
+  if (s_ptr < 0) {
+    return;
+  }
+  uint first = uint(s_ptr) / pc.voxels_per_block * pc.words_per_block;
   if (first + pc.words_per_block > pc.num_words) {
     return;
   }

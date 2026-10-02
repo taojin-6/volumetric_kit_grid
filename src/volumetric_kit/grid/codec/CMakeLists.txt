@@ -7,7 +7,7 @@
 # the Encoder and Decoder built on the private pieces (encoder.cpp, decoder.cpp)
 # -- the DctTransform (the GLSL forward/inverse 8^3 DCT that turns a block list
 # into quantized coefficients plus an observed mask, and back), the host rANS
-# reference coder (rans.hpp, header-only) and the v1 intra frame built on it
+# reference coder (rans.hpp, header-only) and the intra frame built on it
 # (bitstream.cpp; the 2026-09-27 decisions). Links recon_volume ALONE -- it
 # reads a grid's tsdf/weight and re-creates blocks through the map, and needs
 # neither the integrator that produced the field nor the mesher that consumes
@@ -57,13 +57,14 @@ target_include_directories(
          "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>"
          "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 
-# Compile the two DCT kernels to SPIR-V and embed them (dct_transform.cpp
+# Compile the three DCT kernels to SPIR-V and embed them (dct_transform.cpp
 # #includes the generated *.spv.hpp on a PRIVATE path), so recon_codec ships the
 # transform with no runtime shader files.
 include(vr_embed)
 vr_embed_shaders(
   recon_codec SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_forward.comp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp")
 
 vr_target_warnings(recon_codec)
 

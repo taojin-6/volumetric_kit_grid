@@ -49,9 +49,29 @@ struct Lcg {
   std::uint32_t below(std::uint32_t n) { return next() % n; }
 };
 
+// A partial mask shaped like a fused band's edge: the voxels on one side of a
+// plane through the block, so its planes and lines repeat, run full or empty,
+// or cut across -- every symbol the mask code has.
+void slab_mask(Lcg& rng, std::uint32_t* mask) {
+  const int a = int(rng.below(7)) - 3;
+  const int b = int(rng.below(7)) - 3;
+  const int c = int(rng.below(7)) - 3;
+  const int d = int(rng.below(40)) - 20;
+  for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
+    mask[w] = 0;
+  }
+  for (std::uint32_t v = 0; v < codec::kVoxelsPerBlock; ++v) {
+    const int x = int(v % 8), y = int(v / 8 % 8), z = int(v / 64);
+    if (a * x + b * y + c * z < d) {
+      mask[v / 32] |= 1u << (v % 32);
+    }
+  }
+}
+
 // A frame shaped like a real one: blocks in runs along x with jumps between
-// them, masks mostly full with some empty and some partial, coefficients
-// small and sparser at higher indices, and the odd extreme value.
+// them, masks mostly full with some empty and some partial -- noise, or a
+// slab's edge -- coefficients small and sparser at higher indices, and the
+// odd extreme value.
 d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
   Lcg rng{seed};
   auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
@@ -78,9 +98,16 @@ d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
   f.blocks.trunc_dist = 0.04f;
   for (std::size_t i = 0; i < n; ++i) {
     const std::uint32_t cls = rng.below(10);
-    for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
-      f.blocks.masks.push_back(cls < 6 ? ~0u : cls < 7 ? 0u : rng.next());
+    std::uint32_t mask[codec::kMaskWordsPerBlock];
+    if (cls < 8) {
+      for (std::uint32_t& w : mask) {
+        w = cls < 6 ? ~0u : cls < 7 ? 0u : rng.next();
+      }
+    } else {
+      slab_mask(rng, mask);
     }
+    f.blocks.masks.insert(f.blocks.masks.end(), mask,
+                          mask + codec::kMaskWordsPerBlock);
     for (std::uint32_t j = 0; j < k; ++j) {
       std::int32_t v = 0;
       const std::uint32_t spread = 1 + 64 / (1 + j);
@@ -91,7 +118,7 @@ d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
         v = rng.below(2) == 0 ? codec::kMaxQuantizedMagnitude
                               : -codec::kMaxQuantizedMagnitude;
       }
-      f.blocks.coefficients.push_back(v);
+      f.blocks.coefficients.push_back(static_cast<std::int16_t>(v));
     }
   }
   return f;
@@ -187,11 +214,8 @@ int write_refusals_case() {
   f = good;
   f.blocks.masks.push_back(0);
   CHECK(refused(f));
-  f = good;
-  f.blocks.coefficients[5] = codec::kMaxQuantizedMagnitude + 1;
-  CHECK(refused(f));
-  f = good;
-  f.blocks.coefficients[5] = -codec::kMaxQuantizedMagnitude - 1;
+  f = good;  // the one int16 past the clamp
+  f.blocks.coefficients[5] = std::numeric_limits<std::int16_t>::min();
   CHECK(refused(f));
   f = good;
   f.blocks.params.ac_step = 0.0f;
@@ -294,8 +318,11 @@ int header_refusals_case() {
   b[0] = 'X';
   CHECK(refused_as(b, C::InvalidArgument));  // magic
   b = good;
-  b[4] = 2;
-  CHECK(refused_as(b, C::Unsupported));  // version 2
+  b[4] = 3;
+  CHECK(refused_as(b, C::Unsupported));  // version 3
+  b = good;
+  b[4] = 1;
+  CHECK(refused_as(b, C::Unsupported));  // version 1, whose mask code differs
   b = good;
   b[6] = 1;
   CHECK(refused_as(b, C::Unsupported));  // frame type 1 (inter)
@@ -317,6 +344,11 @@ int header_refusals_case() {
   b = good;
   put_f32(b, 24, std::numeric_limits<float>::quiet_NaN());
   CHECK(refused_as(b, C::InvalidArgument));  // dc_step
+  // A step past kMaxStep, finite but enough to make a decoded coefficient
+  // infinite and the inverse's sums NaN.
+  b = good;
+  put_f32(b, 28, 1e38f);
+  CHECK(refused_as(b, C::InvalidArgument));  // ac_step
   b = good;
   put_u32(b, 36, 0);
   CHECK(refused_as(b, C::InvalidArgument));  // segment size
@@ -400,45 +432,50 @@ int section_rules_case() {
 }
 
 // TABLES, on a frame with no blocks so the tables are all that is read. With
-// K = 1 there are 8 models, each written as a varint count of used symbols.
+// K = 1 there are 14 models -- five for the coordinates, the mask class, the
+// plane, three line and three byte models, and one coefficient -- each written
+// as a varint count of used symbols.
 int table_rules_case() {
+  constexpr std::size_t kModels = 14;
   const d::IntraFrame f = make_frame(0, 1, 1);
   const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
   std::vector<Section> s = sections_of(good);
-  CHECK(s[0].body == std::vector<std::uint8_t>(8, 0));
+  CHECK(s[0].body == std::vector<std::uint8_t>(kModels, 0));
   using C = vr::Status::Code;
-  auto with_tables = [&](std::vector<std::uint8_t> body) {
+  // @p head, then an empty table for each model it leaves.
+  auto with_tables = [&](std::vector<std::uint8_t> head, std::size_t models) {
+    head.insert(head.end(), kModels - models, 0);
     std::vector<Section> t = s;
-    t[0].body = std::move(body);
+    t[0].body = std::move(head);
     return assemble(good, t);
   };
   // Model 0 with one symbol at 4096 (a two-byte varint): valid.
-  CHECK(read(with_tables({1, 0, 0x80, 0x20, 0, 0, 0, 0, 0, 0, 0})).ok());
+  CHECK(read(with_tables({1, 0, 0x80, 0x20}, 1)).ok());
   // Not summing to 4096.
-  CHECK(refused_as(with_tables({1, 0, 100, 0, 0, 0, 0, 0, 0, 0}),
+  CHECK(refused_as(with_tables({1, 0, 100}, 1), C::InvalidArgument));
+  // A symbol past its alphabet: model 5, the mask class, has 3, and model 6,
+  // the plane, has 4.
+  CHECK(refused_as(with_tables({0, 0, 0, 0, 0, 1, 5, 0x80, 0x20}, 6),
                    C::InvalidArgument));
-  // A symbol past its alphabet: model 5, the mask class, has 3.
-  CHECK(refused_as(with_tables({0, 0, 0, 0, 0, 1, 5, 0x80, 0x20, 0, 0}),
+  CHECK(read(with_tables({0, 0, 0, 0, 0, 0, 1, 3, 0x80, 0x20}, 7)).ok());
+  CHECK(refused_as(with_tables({0, 0, 0, 0, 0, 0, 1, 4, 0x80, 0x20}, 7),
                    C::InvalidArgument));
   // A zero frequency.
-  CHECK(refused_as(with_tables({2, 0, 0, 0, 0x80, 0x20, 0, 0, 0, 0, 0, 0}),
-                   C::InvalidArgument));
+  CHECK(
+      refused_as(with_tables({2, 0, 0, 0, 0x80, 0x20}, 1), C::InvalidArgument));
   // Too few models, and a trailing byte.
-  CHECK(refused_as(with_tables({0, 0, 0}), C::InvalidArgument));
-  CHECK(refused_as(with_tables(std::vector<std::uint8_t>(9, 0)),
-                   C::InvalidArgument));
+  CHECK(refused_as(with_tables({}, kModels - 3), C::InvalidArgument));
+  CHECK(refused_as(with_tables({0}, 0), C::InvalidArgument));
   // A varint of more than 32 bits.
-  CHECK(refused_as(
-      with_tables({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0, 0, 0, 0, 0, 0, 0}),
-      C::InvalidArgument));
+  CHECK(refused_as(with_tables({0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F}, 1),
+                   C::InvalidArgument));
   // An overlong varint: the valid table above with its gap of 0 spelled
   // {0x80, 0x00}, then with 4096 spelled in three bytes. Each value has one
   // spelling, so a frame's tables have one too.
-  CHECK(
-      refused_as(with_tables({1, 0x80, 0x00, 0x80, 0x20, 0, 0, 0, 0, 0, 0, 0}),
-                 C::InvalidArgument));
-  CHECK(refused_as(with_tables({1, 0, 0x80, 0xA0, 0x00, 0, 0, 0, 0, 0, 0, 0}),
+  CHECK(refused_as(with_tables({1, 0x80, 0x00, 0x80, 0x20}, 1),
                    C::InvalidArgument));
+  CHECK(
+      refused_as(with_tables({1, 0, 0x80, 0xA0, 0x00}, 1), C::InvalidArgument));
   return 0;
 }
 

@@ -67,7 +67,9 @@ VR_CODEC_API Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// its decoded SDF and weight 1.0, an unobserved one as a fresh block holds
 /// it. So a player decodes frame after frame into one grid and meshes it after
 /// each; nothing is cleared between frames, and a block present in both costs
-/// no allocation.
+/// no allocation. A block the decode leaves different is stamped `changed`
+/// (@ref volume::BlockStamp) and one it leaves as it was is not, so an
+/// incremental extract re-meshes only what the stream changed.
 ///
 /// Only `tsdf` and `weight` are written, so a grid that declares any other
 /// attribute is refused: a block kept across frames would carry that
@@ -94,16 +96,16 @@ class VR_CODEC_API Decoder {
 
   /// @brief Decode one intra frame into @p grid.
   ///
-  /// Everything that can be checked before the grid is touched is: the whole
-  /// frame is parsed and entropy-decoded, and the grid's attributes, geometry
-  /// and heap are checked against it. A refusal there leaves @p grid exactly
-  /// as it was. A failure **after** the grid starts to change -- the hash
-  /// table cannot place every block, its bucket locks keep losing races, or a
-  /// dispatch fails -- leaves it valid but holding **neither** frame: blocks
-  /// the two frames share still hold the previous frame's voxels, and blocks
-  /// new to this one are empty, so it is not worth meshing. The next
-  /// successful decode restores it exactly, since each decode starts from
-  /// whatever the grid holds.
+  /// Everything that can be checked before the grid is touched is: the grid's
+  /// attributes, its geometry against the frame's header, the whole frame
+  /// parsed and entropy-decoded, and the grid's heap against its block count.
+  /// A refusal there leaves @p grid exactly as it was. A failure **after** the
+  /// grid starts to change -- the hash table cannot place every block, its
+  /// bucket locks keep losing races, or a dispatch fails -- leaves it valid but
+  /// holding **neither** frame: blocks the two frames share still hold the
+  /// previous frame's voxels, and blocks new to this one are empty, so it is
+  /// not worth meshing. The next successful decode restores it exactly, since
+  /// each decode starts from whatever the grid holds.
   /// @param data     The frame.
   /// @param size     Its exact length.
   /// @param grid     The grid to decode into: 4-byte float `tsdf` and
@@ -114,27 +116,27 @@ class VR_CODEC_API Decoder {
   ///                 row with both halves -- its device half is the inverse
   ///                 transform -- over the breakdown rows `"  ..rans decode"`
   ///                 (parsing and decoding the frame), `"  ..active set"`
-  ///                 (the compactions), `"  ..apply"` (merging the two block
-  ///                 sets, removing and allocating blocks, and ordering and
-  ///                 checking the placed set) and `"  ..inverse"` (the
-  ///                 transform). Named apart from the @ref Encoder's, so both
-  ///                 timed into one @ref StageMetrics stay apart. `nullptr`
-  ///                 measures nothing.
+  ///                 (the compaction), `"  ..apply"` (merging the two block
+  ///                 sets, and removing and allocating blocks) and
+  ///                 `"  ..inverse"` (the transform). Named apart from the @ref
+  ///                 Encoder's, so both timed into one @ref StageMetrics stay
+  ///                 apart. `nullptr` measures nothing.
   /// @return OK, or: whatever the frame reader refuses
   ///         (@ref Status::Code::Unsupported, @ref
   ///         Status::Code::InvalidArgument for a malformed or corrupt frame);
-  ///         @ref Status::Code::InvalidArgument for a moved-from decoder, or
-  ///         a grid that is moved-from, has another block size or geometry,
+  ///         @ref Status::Code::InvalidArgument for a moved-from decoder, a
+  ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other
-  ///         attribute; @ref Status::Code::OutOfMemory when the grid is too
-  ///         small for the frame -- fewer block slots (`num_blocks`) than the
-  ///         frame has blocks, or a hash table that cannot place them all --
-  ///         which @ref volume::VoxelBlockGrid::resize and decoding again
-  ///         recovers; @ref Status::Code::IoError when bucket-lock contention
+  ///         attribute, or a grid whose free heap refuses a removed block
+  ///         (its accounting was already broken, which nothing here mends);
+  ///         @ref Status::Code::OutOfMemory when the grid is too small for
+  ///         the frame -- fewer block slots (`num_blocks`) than the frame has
+  ///         blocks, or a hash table that cannot place them all -- which
+  ///         @ref volume::VoxelBlockGrid::resize and decoding again recovers;
+  ///         @ref Status::Code::IoError only when bucket-lock contention
   ///         outlasts the retries over a table with room (decode again; a
-  ///         resize would not help), or the grid's free heap refuses a
-  ///         removed block (its accounting was already broken); otherwise a
-  ///         compaction, buffer or dispatch failure.
+  ///         resize would not help); otherwise a compaction, buffer or
+  ///         dispatch failure.
   Status decode(const std::uint8_t* data, std::size_t size,
                 volume::VoxelBlockGrid& grid, StageMetrics* metrics = nullptr);
 
