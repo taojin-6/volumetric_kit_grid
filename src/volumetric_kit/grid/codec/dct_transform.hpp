@@ -200,6 +200,16 @@ class VR_CODEC_API DctTransform {
   Status inverse(volume::VoxelBlockGrid& grid, const volume::BlockList& blocks,
                  const DctBlocks& in, GpuStageScope* stage = nullptr);
 
+  /// @brief @ref inverse from blocks the device holds (the device frame
+  ///        reader's), bound where they are rather than uploaded.
+  ///
+  /// The list must be duplicate-free, and the coefficients made against the
+  /// grid's `trunc_dist` (both unchecked: the reader decoded them from a
+  /// frame whose order and header the caller checked).
+  /// @return As @ref inverse.
+  Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
+                 const CodecParams& params, GpuStageScope* stage = nullptr);
+
   /// @brief The entries of @p list whose block holds an observed voxel
   ///        (`weight >= volume::kObservedWeight`), in unspecified order.
   ///
@@ -260,6 +270,11 @@ class VR_CODEC_API DctTransform {
   Status ensure_scratch(Buffer& buffer, VkDeviceSize bytes, const char* name);
   /// Stage @p blocks onto the retained block-list buffer, in @p batch.
   Status upload_list(CommandBatch& batch, const volume::BlockList& blocks);
+  /// Record the inverse over @p in into @p batch after what it holds, then
+  /// submit it and take the reject count's refusal.
+  Status run_inverse(CommandBatch& batch, volume::VoxelBlockGrid& grid,
+                     const GridViews& views, const ResidentBlocks& in,
+                     const CodecParams& params, GpuStageScope* stage);
 
   // Borrowed (must outlive this).
   Device* device_ = nullptr;

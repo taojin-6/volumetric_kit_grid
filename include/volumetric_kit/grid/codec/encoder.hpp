@@ -29,27 +29,6 @@ class DctTransform;
 class DeviceFrameWriter;
 }  // namespace detail
 
-/// @brief Where an @ref Encoder runs a frame's rANS coding. Every choice
-///        writes the same bytes, so it changes only the time a frame takes.
-enum class EntropyCoding {
-  /// The device for a frame of at least @ref kMinDeviceSegments segments,
-  /// the host for a smaller one, which has too few segments for the device
-  /// to run in parallel. A frame the device cannot code -- one past
-  /// `maxStorageBufferRange` or free memory, or a device whose rANS kernels
-  /// do not build -- is coded on the host.
-  kAuto,
-  /// On the host, after the quantized coefficients and masks are read back.
-  kHost,
-  /// On the device, beside the transform: one invocation per segment, and
-  /// only the symbol counts and the coded frame cross to the host.
-  kDevice,
-};
-
-/// The fewest segments @ref EntropyCoding::kAuto codes on the device: about
-/// where the device stopped losing to the host on Apple M5 Max (the RTX 5090
-/// broke even near 20; the 2026-10-03 decision).
-inline constexpr std::uint32_t kMinDeviceSegments = 48;
-
 /// @brief How an @ref Encoder codes a frame.
 struct EncoderConfig {
   /// Coefficients kept per block and their quantization steps.

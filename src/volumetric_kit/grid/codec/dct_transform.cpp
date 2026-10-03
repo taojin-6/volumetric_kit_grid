@@ -454,7 +454,6 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
   VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
   VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
 
-  std::uint32_t rejected = 0;
   CommandBatch batch(*device_, *allocator_);
   VR_TRY(upload_list(batch, blocks));
   if (padded == k) {
@@ -471,14 +470,52 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
     }
   }
   VR_TRY(batch.upload(masks_, 0, in.masks.data(), mask_bytes));
+  ResidentBlocks resident;
+  resident.list = &block_list_;
+  resident.masks = &masks_;
+  resident.coefficients = &coefficients_;
+  resident.count = blocks.count;
+  resident.coefficient_count = k;
+  return run_inverse(batch, grid, views, resident, in.params, stage);
+}
+
+Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
+                             const ResidentBlocks& in,
+                             const CodecParams& params, GpuStageScope* stage) {
+  VR_ASSIGN(GridViews views,
+            check_inputs("inverse", grid, volume::BlockList{}, params));
+  if (in.coefficient_count != params.coefficient_count) {
+    return fail("inverse", "the blocks hold " +
+                               std::to_string(in.coefficient_count) +
+                               " coefficients, and the params " +
+                               std::to_string(params.coefficient_count));
+  }
+  if (in.count > static_cast<std::uint32_t>(grid.grid().num_blocks)) {
+    return fail("inverse", std::to_string(in.count) +
+                               " blocks, more than this grid's block heap (" +
+                               std::to_string(grid.grid().num_blocks) + ")");
+  }
+  if (in.count == 0) {
+    return {};
+  }
+  CommandBatch batch(*device_, *allocator_);
+  return run_inverse(batch, grid, views, in, params, stage);
+}
+
+Status DctTransform::run_inverse(
+    CommandBatch& batch, volume::VoxelBlockGrid& grid, const GridViews& views,
+    const ResidentBlocks& in, const CodecParams& params, GpuStageScope* stage) {
+  std::uint32_t rejected = 0;
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();
-  VR_TRY(record(batch, inverse_kernel_, grid, views, block_list_.handle(),
-                blocks.count, in.params, coefficients_.handle(),
-                masks_.handle(), mask_bytes, stage));
+  VR_TRY(record(
+      batch, inverse_kernel_, grid, views, in.list->handle(), in.count, params,
+      in.coefficients->handle(), in.masks->handle(),
+      VkDeviceSize(in.count) * kMaskWordsPerBlock * sizeof(std::uint32_t),
+      stage));
   VR_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
   VR_TRY(batch.submit());
-  return check_rejected("inverse", rejected, blocks.count);
+  return check_rejected("inverse", rejected, in.count);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

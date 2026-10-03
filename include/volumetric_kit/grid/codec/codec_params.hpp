@@ -71,6 +71,39 @@ inline constexpr float kMaxStep = 64.0f;
 static_assert(kMaxStep * kMaxStep >= 4.0f * kVoxelsPerBlock,
               "kMaxStep must quantize every coefficient to 0");
 
+/// @brief Where an @ref Encoder or a @ref Decoder runs a frame's rANS
+///        coding. Every choice gives the same result -- the same bytes
+///        written, the same blocks decoded, the same refusals -- so it
+///        changes only the time a frame takes.
+enum class EntropyCoding {
+  /// The device for a frame of at least @ref kMinDeviceEncodeSegments
+  /// segments when encoding, or @ref kMinDeviceDecodeSegments when decoding;
+  /// the host for a smaller one, which has too few segments for the device
+  /// to run in parallel. A frame the device cannot code -- one past
+  /// `maxStorageBufferRange` or free memory, or a device whose rANS kernels
+  /// do not build -- is coded on the host.
+  kAuto,
+  /// On the host: the coefficients and masks cross the bus, read back to
+  /// encode or uploaded once decoded.
+  kHost,
+  /// On the device, one invocation per segment: the coefficients and masks
+  /// stay in device memory, and only the frame, the symbol counts (encoding)
+  /// and the coordinates (decoding) cross the bus.
+  kDevice,
+};
+
+/// The fewest segments @ref EntropyCoding::kAuto encodes on the device:
+/// about where the device stopped losing to the host on Apple M5 Max (the
+/// RTX 5090 broke even near 20; the 2026-10-03 encoding decision).
+inline constexpr std::uint32_t kMinDeviceEncodeSegments = 48;
+
+/// The fewest segments @ref EntropyCoding::kAuto decodes on the device: at
+/// the default 64-block segments, about where the device stopped losing to
+/// the host on both Apple M5 Max and RTX 5090, for content as cheap to decode
+/// on the host as room0 (the 2026-10-03 decoding decision). Decoding takes
+/// more than encoding: its symbol walk is inside the serial chain.
+inline constexpr std::uint32_t kMinDeviceDecodeSegments = 80;
+
 /// @brief How a frame's blocks are transformed and quantized.
 ///
 /// A coefficient at frequency `(x, y, z)` is quantized with step

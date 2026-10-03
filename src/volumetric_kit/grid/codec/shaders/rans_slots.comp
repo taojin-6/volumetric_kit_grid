@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The decoder's lookup: for each model and each of its 4096 slots, the
+// symbol whose [cum, cum + freq) holds the slot, as FrequencyTable's
+// slot_symbol, packed with what the decode step needs. Built on the device
+// from the frame's tables, so only those (8 KB at K = 64) cross the bus. One
+// invocation per model and slot.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 256) in;
+
+#include "rans_models.glsl"
+#include "rans_push.glsl"
+
+layout(set = 0, binding = 0, std430) readonly buffer Tables {
+  uint tables[];  // per model, per symbol, at model_base: cum | freq << 16
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Slots {
+  // symbol | (freq - 1) << 8 | (slot - cum) << 20, 4096 a model. An empty
+  // model's slots hold kEmptySlot, whose offset is not below its freq.
+  uint slots[];
+};
+
+const uint kEmptySlot = 0xFFF00000u;
+
+void main() {
+  const uint item = pc.item_base + gl_GlobalInvocationID.x;
+  const uint model = item >> 12u;
+  if (model >= kFirstCoef + pc.coefficient_count) return;
+  const uint slot = item & 4095u;
+  const uint base = model_base(model);
+  // The last symbol whose cum is at most the slot: every later one starts
+  // past it, and one of frequency 0 before it shares its cum.
+  uint lo = 0u;  // the first symbol whose cum exceeds the slot
+  uint hi = model_alphabet(model);
+  while (lo < hi) {
+    const uint mid = (lo + hi) / 2u;
+    if ((tables[base + mid] & 0xFFFFu) <= slot) {
+      lo = mid + 1u;
+    } else {
+      hi = mid;
+    }
+  }
+  const uint s = lo - 1u;  // cum[0] = 0, so lo >= 1
+  const uint entry = tables[base + s];
+  const uint freq = entry >> 16u;
+  slots[item] = freq == 0u ? kEmptySlot
+                           : s | ((freq - 1u) << 8u) |
+                                 ((slot - (entry & 0xFFFFu)) << 20u);
+}

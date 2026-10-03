@@ -152,7 +152,7 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
       detail::frame_segment_count(blocks.size(), config_.segment_size);
   if (config_.entropy == EntropyCoding::kDevice ||
       (config_.entropy == EntropyCoding::kAuto &&
-       segments >= kMinDeviceSegments)) {
+       segments >= kMinDeviceEncodeSegments)) {
     Result<std::vector<std::uint8_t>> frame =
         encode_on_device(grid, blocks, metrics, stage);
     // kAuto codes on the host whatever the device could not: a frame past

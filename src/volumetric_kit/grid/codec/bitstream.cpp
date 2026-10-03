@@ -809,13 +809,12 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   return header;
 }
 
-Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
-                                    std::uint32_t max_blocks) {
+Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
+                                      std::size_t size,
+                                      std::uint32_t max_blocks) {
   VR_ASSIGN(const FrameHeader header, read_frame_header(data, size));
-  IntraFrame frame;
-  frame.voxel_size = header.voxel_size;
-  frame.blocks.trunc_dist = header.trunc_dist;
-  frame.blocks.params = header.params;
+  ParsedFrame frame;
+  frame.header = header;
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;
   const std::uint32_t section_count = header.section_count;
@@ -873,16 +872,17 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   const SectionBody& segments_section = section(found, SectionId::kSegments);
   const SectionBody& payload_section = section(found, SectionId::kPayload);
 
-  const std::uint32_t k = frame.blocks.params.coefficient_count;
-  std::vector<FrequencyTable> tables;
-  VR_TRY(read_tables(tables_section.data, tables_section.size, k, tables));
+  const std::uint32_t k = header.params.coefficient_count;
+  VR_TRY(
+      read_tables(tables_section.data, tables_section.size, k, frame.tables));
 
   const std::uint64_t segments = frame_segment_count(n, r_size);
   if (segments_section.size != segments * 4) {
     return bad("the SEGMENTS section does not list one length per segment");
   }
   ByteReader lens(segments_section.data, segments_section.size);
-  std::vector<std::uint32_t> lengths(segments);
+  std::vector<std::uint32_t>& lengths = frame.segment_lengths;
+  lengths.resize(segments);
   std::uint64_t total = 0;
   for (std::uint64_t s = 0; s < segments; ++s) {
     lengths[s] = lens.u32();
@@ -904,7 +904,47 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
                                  std::to_string(max_blocks) +
                                  " the caller can hold");
   }
+  frame.payload = payload_section.data;
+  frame.payload_size = payload_section.size;
+  return frame;
+}
 
+Status check_segment(std::uint64_t s, SegmentFault fault,
+                     const Vec3i* prev_last, const Vec3i& first) {
+  if (fault == SegmentFault::kCoordOverflow) {
+    return bad("segment " + std::to_string(s) +
+               " steps a coordinate outside int32");
+  }
+  if (fault != SegmentFault::kNone) {
+    return bad("segment " + std::to_string(s) + " is corrupt");
+  }
+  // Within a segment the deltas cannot step backwards; its first coordinate
+  // is raw bits, which no end check sees, so the order across segments is
+  // checked here. Without it a flipped bit decodes a duplicate, and the
+  // inverse transform races two workgroups on one block.
+  if (prev_last != nullptr && !coord_less(*prev_last, first)) {
+    return bad("segment " + std::to_string(s) +
+               " does not start after the one before ends");
+  }
+  return {};
+}
+
+Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
+                                    std::uint32_t max_blocks) {
+  VR_ASSIGN(const ParsedFrame parsed,
+            parse_intra_frame(data, size, max_blocks));
+  return decode_intra_frame(parsed);
+}
+
+Result<IntraFrame> decode_intra_frame(const ParsedFrame& parsed) {
+  const FrameHeader& header = parsed.header;
+  const std::uint32_t n = header.block_count;
+  const std::uint32_t r_size = header.segment_size;
+  const std::uint32_t k = header.params.coefficient_count;
+  IntraFrame frame;
+  frame.voxel_size = header.voxel_size;
+  frame.blocks.trunc_dist = header.trunc_dist;
+  frame.blocks.params = header.params;
   // max_blocks bounds these in bytes, but not below what a 32-bit size_t can
   // count: n * K reaches 2^41. Past this check every index below fits.
   if (n > frame.coords.max_size() ||
@@ -918,33 +958,28 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   frame.coords.resize(n);
   frame.blocks.coefficients.resize(std::size_t(n) * k);
   frame.blocks.masks.resize(std::size_t(n) * kMaskWordsPerBlock);
-  const std::uint8_t* stream = payload_section.data;
-  for (std::uint64_t s = 0; s < segments; ++s) {
-    RansReader r(stream, lengths[s]);
-    const std::size_t first = static_cast<std::size_t>(s * r_size);  // < n
+  const std::uint8_t* stream = parsed.payload;
+  for (std::size_t s = 0; s < parsed.segment_lengths.size(); ++s) {
+    RansReader r(stream, parsed.segment_lengths[s]);
+    const std::size_t first = s * r_size;  // < n
     const std::size_t end = static_cast<std::size_t>(
         std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
+    SegmentFault fault = SegmentFault::kNone;
     for (std::size_t i = first; i < end && !r.failed(); ++i) {
       const Vec3i* prev = i == first ? nullptr : &frame.coords[i - 1];
-      if (!read_block(r, tables, prev, frame.coords[i],
+      if (!read_block(r, parsed.tables, prev, frame.coords[i],
                       &frame.blocks.masks[i * kMaskWordsPerBlock],
                       &frame.blocks.coefficients[i * k], k)) {
-        return bad("segment " + std::to_string(s) +
-                   " steps a coordinate outside int32");
+        fault = SegmentFault::kCoordOverflow;
+        break;
       }
     }
-    if (!r.finish()) {
-      return bad("segment " + std::to_string(s) + " is corrupt");
+    if (fault == SegmentFault::kNone && !r.finish()) {
+      fault = SegmentFault::kCorrupt;
     }
-    // Within a segment the deltas cannot step backwards; its first coordinate
-    // is raw bits, which no end check sees, so the order across segments is
-    // checked here. Without it a flipped bit decodes a duplicate, and the
-    // inverse transform races two workgroups on one block.
-    if (s > 0 && !coord_less(frame.coords[first - 1], frame.coords[first])) {
-      return bad("segment " + std::to_string(s) +
-                 " does not start after the one before ends");
-    }
-    stream += lengths[s];
+    VR_TRY(check_segment(s, fault, s > 0 ? &frame.coords[first - 1] : nullptr,
+                         frame.coords[first]));
+    stream += parsed.segment_lengths[s];
   }
   return frame;
 }

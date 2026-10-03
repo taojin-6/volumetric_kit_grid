@@ -194,7 +194,8 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
 
 // Device coding writes the host's bytes, here through the public encoder on
 // a fused-looking grid, for the default and a finer segmentation; the
-// automatic choice codes the second on the device, past kMinDeviceSegments.
+// automatic choice codes the second on the device, past
+// kMinDeviceEncodeSegments.
 int device_matches_host_case(Gpu& gpu) {
   const Sphere s{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
@@ -225,7 +226,8 @@ int device_matches_host_case(Gpu& gpu) {
         codec::read_frame_info(a.value().data(), a.value().size());
     CHECK(info.ok());
     if (segment_size == 3) {
-      CHECK((info.value().block_count + 2) / 3 >= codec::kMinDeviceSegments);
+      CHECK((info.value().block_count + 2) / 3 >=
+            codec::kMinDeviceEncodeSegments);
     }
   }
   return 0;

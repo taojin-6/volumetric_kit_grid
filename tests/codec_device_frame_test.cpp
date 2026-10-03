@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The device frame writer against the host's: every frame it writes must be
-// write_intra_frame's, byte for byte -- the test the 2026-09-26 decision set
-// for the GPU coder. Skips where no device is present.
+// The device frame writer and reader against the host's: every frame the
+// writer writes must be write_intra_frame's, byte for byte, and every frame
+// the reader reads must decode to read_intra_frame's blocks or be refused as
+// it refuses it -- the test the 2026-09-26 decision set for the GPU coder.
+// Skips where no device is present.
 
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "bitstream.hpp"
 #include "codec_frames.hpp"
+#include "device_frame_reader.hpp"
 #include "device_frame_writer.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
@@ -22,6 +26,7 @@
 namespace vr = volumetric_kit::recon;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+using codec_frames::Lcg;
 using codec_frames::make_frame;
 
 #define CHECK(cond)                                                        \
@@ -34,9 +39,43 @@ using codec_frames::make_frame;
 
 namespace {
 
-// The host's frame and the device's, for one frame and segment size.
-int same_bytes(d::DeviceFrameWriter& writer, const d::IntraFrame& frame,
-               std::uint32_t segment_size) {
+constexpr std::uint32_t kMaxBlocks = 1u << 20;
+
+// The host's decode of a frame and the device's: the same blocks, or the same
+// refusal, which @p refusal receives.
+int same_read(d::DeviceFrameReader& reader,
+              const std::vector<std::uint8_t>& bytes,
+              std::string* refusal = nullptr) {
+  const vr::Result<d::IntraFrame> host =
+      d::read_intra_frame(bytes.data(), bytes.size(), kMaxBlocks);
+  const vr::Result<d::IntraFrame> device =
+      reader.read(bytes.data(), bytes.size(), kMaxBlocks);
+  if (host.ok() != device.ok() ||
+      (!host.ok() && host.status().message() != device.status().message())) {
+    std::fprintf(stderr, "host: %s; device: %s\n",
+                 host.ok() ? "OK" : host.status().message().c_str(),
+                 device.ok() ? "OK" : device.status().message().c_str());
+    return 1;
+  }
+  if (!host.ok()) {
+    CHECK(host.status().domain() == device.status().domain());
+    if (refusal != nullptr) *refusal = host.status().message();
+    return 0;
+  }
+  if (refusal != nullptr) refusal->clear();
+  const d::IntraFrame& a = host.value();
+  const d::IntraFrame& b = device.value();
+  CHECK(a.voxel_size == b.voxel_size);
+  CHECK(a.coords == b.coords);
+  CHECK(a.blocks.masks == b.blocks.masks);
+  CHECK(a.blocks.coefficients == b.blocks.coefficients);
+  return 0;
+}
+
+// The host's frame and the device's, for one frame and segment size, and the
+// device's decode of it.
+int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
+               const d::IntraFrame& frame, std::uint32_t segment_size) {
   d::FrameWriteOptions options;
   options.segment_size = segment_size;
   const vr::Result<std::vector<std::uint8_t>> host =
@@ -55,21 +94,10 @@ int same_bytes(d::DeviceFrameWriter& writer, const d::IntraFrame& frame,
                  segment_size, device.value().size(), host.value().size());
   }
   CHECK(device.value() == host.value());
-  return 0;
+  return same_read(reader, host.value());
 }
 
-int matches_host_case(d::DeviceFrameWriter& writer) {
-  // Block counts on and off a segment boundary, K odd and even up to the
-  // whole transform, and segments of one block through more than the frame.
-  for (std::size_t n : {std::size_t(0), std::size_t(1), std::size_t(63),
-                        std::size_t(64), std::size_t(65), std::size_t(700)}) {
-    for (std::uint32_t k : {1u, 20u, 64u, codec::kVoxelsPerBlock}) {
-      for (std::uint32_t r : {1u, 16u, 64u, 1024u}) {
-        CHECK(same_bytes(writer, make_frame(n, k, 31 * n + k), r) == 0);
-      }
-    }
-  }
-  // Steps across all of int32, and a segment of first blocks only.
+d::IntraFrame extreme_frame() {
   d::IntraFrame f = make_frame(0, 4, 1);
   constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
   constexpr std::int32_t kMin = std::numeric_limits<std::int32_t>::min();
@@ -77,10 +105,72 @@ int matches_host_case(d::DeviceFrameWriter& writer) {
               {0, 0, kMax},       {1, 0, kMax},       {kMax, kMax, kMax}};
   f.blocks.masks.assign(f.coords.size() * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(f.coords.size() * 4, 0);
-  CHECK(same_bytes(writer, f, 64) == 0);
-  CHECK(same_bytes(writer, f, 1) == 0);
+  return f;
+}
+
+int matches_host_case(d::DeviceFrameWriter& writer,
+                      d::DeviceFrameReader& reader) {
+  // Block counts on and off a segment boundary, K odd and even up to the
+  // whole transform, and segments of one block through more than the frame.
+  for (std::size_t n : {std::size_t(0), std::size_t(1), std::size_t(63),
+                        std::size_t(64), std::size_t(65), std::size_t(700)}) {
+    for (std::uint32_t k : {1u, 20u, 64u, codec::kVoxelsPerBlock}) {
+      for (std::uint32_t r : {1u, 16u, 64u, 1024u}) {
+        CHECK(same_bytes(writer, reader, make_frame(n, k, 31 * n + k), r) == 0);
+      }
+    }
+  }
+  // Steps across all of int32, and a segment of first blocks only.
+  const d::IntraFrame f = extreme_frame();
+  CHECK(same_bytes(writer, reader, f, 64) == 0);
+  CHECK(same_bytes(writer, reader, f, 1) == 0);
   // A smaller frame after larger ones reuses the retained buffers.
-  CHECK(same_bytes(writer, make_frame(5, 64, 7), 64) == 0);
+  CHECK(same_bytes(writer, reader, make_frame(5, 64, 7), 64) == 0);
+  return 0;
+}
+
+// Corrupt payloads: the device refuses each one the host refuses, with the
+// same message, and decodes the rest to the same blocks. Every verdict the
+// segments have is reached.
+int corruption_case(d::DeviceFrameReader& reader) {
+  d::FrameWriteOptions sixteen;
+  sixteen.segment_size = 16;
+  d::FrameWriteOptions two;
+  two.segment_size = 2;
+  const std::vector<std::uint8_t> frames[] = {
+      d::write_intra_frame(make_frame(300, 32, 13), sixteen).value(),
+      d::write_intra_frame(extreme_frame(), two).value()};
+  Lcg rng{29};
+  int decoded = 0;
+  int overflow = 0;
+  int corrupt = 0;
+  int order = 0;
+  for (const std::vector<std::uint8_t>& good : frames) {
+    const vr::Result<d::ParsedFrame> parsed =
+        d::parse_intra_frame(good.data(), good.size(), kMaxBlocks);
+    CHECK(parsed.ok());
+    const auto payload =
+        static_cast<std::uint32_t>(parsed.value().payload - good.data());
+    for (int trial = 0; trial < 400; ++trial) {
+      std::vector<std::uint8_t> b = good;
+      const std::uint32_t edits = 1 + rng.below(3);
+      for (std::uint32_t e = 0; e < edits; ++e) {
+        b[payload + rng.below(std::uint32_t(b.size()) - payload)] ^=
+            static_cast<std::uint8_t>(1 + rng.below(255));
+      }
+      std::string why;
+      CHECK(same_read(reader, b, &why) == 0);
+      decoded += why.empty() ? 1 : 0;
+      overflow += why.find("outside int32") != std::string::npos ? 1 : 0;
+      corrupt += why.find("is corrupt") != std::string::npos ? 1 : 0;
+      order += why.find("does not start after") != std::string::npos ? 1 : 0;
+    }
+  }
+  std::printf(
+      "corrupt payloads: %d decoded, %d overflow, %d corrupt, %d "
+      "out of order\n",
+      decoded, overflow, corrupt, order);
+  CHECK(decoded > 0 && overflow > 0 && corrupt > 0 && order > 0);
   return 0;
 }
 
@@ -141,10 +231,11 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   return 0;
 }
 
-// The move rules: a moved-from writer is empty and refuses, a move-assign
-// over a live one works, and a self-move leaves it intact.
+// The move rules, for the writer and the reader: a moved-from one is empty
+// and refuses, a move-assign over a live one works, and a self-move leaves it
+// intact.
 int moves_case(vr::Device& device, vr::Allocator& allocator,
-               d::DeviceFrameWriter& writer) {
+               d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   d::DeviceFrameWriter moved = std::move(writer);
   CHECK(moved.valid());
   CHECK(!writer.valid());  // NOLINT(bugprone-use-after-move): the source
@@ -158,9 +249,28 @@ int moves_case(vr::Device& device, vr::Allocator& allocator,
   d::DeviceFrameWriter* alias = &live.value();
   live.value() = std::move(*alias);  // self-move, laundered past -Wself-move
   CHECK(live.value().valid());
-  CHECK(same_bytes(live.value(), make_frame(70, 8, 5), 16) == 0);
+  CHECK(same_bytes(live.value(), reader, make_frame(70, 8, 5), 16) == 0);
   writer = std::move(live.value());
   CHECK(writer.valid());
+
+  const std::vector<std::uint8_t> bytes =
+      d::write_intra_frame(make_frame(10, 8, 3)).value();
+  d::DeviceFrameReader moved_reader = std::move(reader);
+  CHECK(moved_reader.valid());
+  CHECK(!reader.valid());  // NOLINT(bugprone-use-after-move): the source
+  CHECK(!reader.read(bytes.data(), bytes.size(), kMaxBlocks).ok());
+  vr::Result<d::DeviceFrameReader> live_reader =
+      d::DeviceFrameReader::create(device, allocator);
+  CHECK(live_reader.ok());
+  live_reader.value() = std::move(moved_reader);  // over a live reader
+  CHECK(live_reader.value().valid());
+  CHECK(!moved_reader.valid());  // NOLINT(bugprone-use-after-move)
+  d::DeviceFrameReader* reader_alias = &live_reader.value();
+  live_reader.value() = std::move(*reader_alias);  // self-move
+  CHECK(live_reader.value().valid());
+  CHECK(same_read(live_reader.value(), bytes) == 0);
+  reader = std::move(live_reader.value());
+  CHECK(reader.valid());
   return 0;
 }
 
@@ -188,7 +298,11 @@ int main() {
   vr::Result<d::DeviceFrameWriter> writer =
       d::DeviceFrameWriter::create(device.value(), allocator.value());
   CHECK(writer.ok());
-  if (matches_host_case(writer.value()) != 0) return 1;
+  vr::Result<d::DeviceFrameReader> reader =
+      d::DeviceFrameReader::create(device.value(), allocator.value());
+  CHECK(reader.ok());
+  if (matches_host_case(writer.value(), reader.value()) != 0) return 1;
+  if (corruption_case(reader.value()) != 0) return 1;
   if (out_of_range_case(device.value(), allocator.value(), writer.value()) !=
       0) {
     return 1;
@@ -196,7 +310,8 @@ int main() {
   if (refusals_case(device.value(), allocator.value(), writer.value()) != 0) {
     return 1;
   }
-  if (moves_case(device.value(), allocator.value(), writer.value()) != 0) {
+  if (moves_case(device.value(), allocator.value(), writer.value(),
+                 reader.value()) != 0) {
     return 1;
   }
   std::puts("codec device frame: OK");
