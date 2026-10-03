@@ -7,6 +7,8 @@
 // tinyply, including in static builds. Include at global scope so the vendor's
 // standard-library includes remain in their normal namespaces. The remapping
 // applies only during this private include and never reaches a public header.
+// The macro must be named after the vendor's namespace to rename it, so it is
+// the one exception to the VR_ prefix; only tinyply.h sees it.
 #define tinyply volumetric_kit_recon_io_tinyply
 #include "tinyply.h"
 #undef tinyply

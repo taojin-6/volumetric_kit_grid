@@ -17,11 +17,12 @@ namespace volumetric_kit::recon::io {
 /// @brief Serialize a mesh to a binary little-endian PLY file.
 ///
 /// Writes float `x y z nx ny nz`, then uchar `red green blue`, per vertex.
-/// Linear BT.709/D65 RGB is clamped to [0,1] and encoded with the exact sRGB
-/// curve. Faces contain a uchar count (3) and three signed 32-bit indices.
-/// Alpha, tangent, and UV attributes are omitted. Empty meshes are supported.
+/// Linear BT.709/D65 RGB is clamped to [0,1] (NaN writes 0) and encoded with
+/// the exact sRGB curve. Faces contain a uchar count (3) and three signed
+/// 32-bit indices. Alpha, tangent, and UV attributes are omitted. Empty meshes
+/// are supported.
 ///
-/// Positions, normals and RGB must be finite; indices must form complete
+/// Positions and normals must be finite; indices must form complete
 /// triangles, reference existing vertices, and fit int32. Invalid input is
 /// rejected before opening the output. A write failure can leave a partial
 /// file.
@@ -29,8 +30,8 @@ namespace volumetric_kit::recon::io {
 /// success.
 /// @param mesh Mesh to serialize; geometry and winding are preserved.
 /// @return OK after closing the file, or non-OK Status for invalid input,
-///         allocation failure, an unsupported host byte order, or write
-///         failure.
+///         failure to allocate the export buffers, an unsupported host byte
+///         order, or write failure.
 VR_IO_API Status write_ply(const std::string& path, const mesh::Mesh& mesh);
 
 }  // namespace volumetric_kit::recon::io

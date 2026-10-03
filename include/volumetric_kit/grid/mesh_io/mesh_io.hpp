@@ -38,17 +38,21 @@ struct TriangleMesh {
 ///
 /// This is host asset I/O: it creates no Vulkan resources or GPU submissions.
 /// It does not choose a physical scale, normalize height, repair topology or
-/// evaluate animation. The supported formats are those in the installed
-/// Assimp library. Link @c volumetric_kit::recon_io_assimp, enabled with
+/// evaluate animation. Importer unit and up-axis conversions are disabled
+/// where the installed Assimp allows it: Assimp before 5.3 still scales
+/// Collada by its `<unit>`, and Assimp 5.4.x converts FBX axes and units. The
+/// supported formats are those in the installed Assimp library. Link @c
+/// volumetric_kit::recon_io_assimp, enabled with
 /// @c VR_WITH_ASSIMP=ON; Assimp types and ownership stay private.
 ///
 /// @param path Asset path without embedded NUL; sidecar files resolve relative
 ///             to this file.
 /// @return Owned geometry on success; InvalidArgument for an empty path,
-///         malformed geometry or invalid transforms; NotFound for a missing
-///         file; Unsupported for animation, skinning, morphs or non-triangle
-///         primitives; IoError for import/read failures; OutOfMemory for
-///         allocation failure or geometry exceeding 32-bit indexing.
+///         malformed geometry or an invalid transform on a mesh instance;
+///         NotFound for a missing file; Unsupported for animation, skinning,
+///         morphs or non-triangle primitives; IoError for import/read failures;
+///         OutOfMemory for allocation failure or geometry exceeding 32-bit
+///         indexing.
 VR_IO_ASSIMP_API Result<TriangleMesh> load_mesh(const std::string& path);
 
 }  // namespace volumetric_kit::recon::io

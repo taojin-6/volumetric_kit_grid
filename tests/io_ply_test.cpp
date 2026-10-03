@@ -134,15 +134,11 @@ int main() {
   CHECK(!vr::io::write_ply(path, invalid));
   invalid = mesh;
   invalid.vertices.back().position.z = std::numeric_limits<float>::quiet_NaN();
-  CHECK(!vr::io::write_ply(path, invalid));
+  const vr::Status nonfinite = vr::io::write_ply(path, invalid);
+  CHECK(!nonfinite);
+  CHECK(nonfinite.message().find("vertex 2") != std::string::npos);
   invalid = mesh;
   invalid.vertices.back().normal.x = std::numeric_limits<float>::infinity();
-  CHECK(!vr::io::write_ply(path, invalid));
-  invalid = mesh;
-  invalid.vertices.back().color.y = -std::numeric_limits<float>::infinity();
-  CHECK(!vr::io::write_ply(path, invalid));
-  invalid = mesh;
-  invalid.vertices.back().color.z = std::numeric_limits<float>::quiet_NaN();
   CHECK(!vr::io::write_ply(path, invalid));
   CHECK(!vr::io::write_ply(path + std::string("\0tail", 5), mesh));
   CHECK(read_bytes(path) == bytes);
@@ -158,6 +154,16 @@ int main() {
   omitted.vertices[0].color.w = std::numeric_limits<float>::quiet_NaN();
   CHECK(vr::io::write_ply(path, omitted));
   CHECK(read_bytes(path) == bytes);
+  // Color clamps rather than refusing the export; NaN writes 0.
+  auto clamped = mesh;
+  clamped.vertices[2].color = {std::numeric_limits<float>::quiet_NaN(),
+                               -std::numeric_limits<float>::infinity(),
+                               std::numeric_limits<float>::infinity(), 1.0f};
+  CHECK(vr::io::write_ply(path, clamped));
+  const auto clamped_bytes = read_bytes(path);
+  CHECK(clamped_bytes.size() == bytes.size());
+  const auto* rgb = clamped_bytes.data() + payload + 2 * 27 + 24;
+  CHECK(rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 255);
   CHECK(vr::io::write_ply(path, {}));
   const auto empty = read_bytes(path);
   const std::string empty_text(empty.begin(), empty.end());

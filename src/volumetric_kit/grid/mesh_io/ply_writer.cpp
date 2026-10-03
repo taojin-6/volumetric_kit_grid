@@ -3,16 +3,14 @@
 
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <exception>
 #include <fstream>
 #include <limits>
-#include <new>
 #include <ostream>
 #include <vector>
 
+#include "io_detail.hpp"
 #include "tinyply_backend.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
 
@@ -30,10 +28,14 @@ namespace tinyply = detail::tinyply;
 // linear value straight out would therefore render visibly dark, so the encode
 // happens here. glTF export does the opposite and passes COLOR_0 through
 // unchanged, which is why the two exporters cannot share one path.
+//
+// Out-of-range values clamp, and NaN writes 0, so one bad color never costs
+// the export.
 std::uint8_t to_u8(float linear_channel) {
-  const float scaled =
-      linear_to_srgb(std::clamp(linear_channel, 0.0f, 1.0f)) * 255.0f + 0.5f;
-  return static_cast<std::uint8_t>(scaled);
+  if (!(linear_channel > 0.0f)) return 0;
+  if (linear_channel >= 1.0f) return 255;
+  return static_cast<std::uint8_t>(linear_to_srgb(linear_channel) * 255.0f +
+                                   0.5f);
 }
 
 bool finite(Vec3f v) {
@@ -43,9 +45,7 @@ bool finite(Vec3f v) {
 }  // namespace
 
 Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
-  if (path.empty() || path.find('\0') != std::string::npos) {
-    return Status::invalid_argument("write_ply: empty path or embedded NUL");
-  }
+  VR_TRY(detail::check_path("write_ply", path));
   if (mesh.indices.size() % 3 != 0) {
     return Status::invalid_argument("write_ply: incomplete triangle indices");
   }
@@ -56,9 +56,12 @@ Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
     return Status::invalid_argument(
         "write_ply: mesh exceeds host array limits");
   }
-  for (const auto& v : mesh.vertices) {
-    if (!finite(v.position) || !finite(v.normal) || !finite(Vec3f(v.color))) {
-      return Status::invalid_argument("write_ply: nonfinite vertex attribute");
+  for (std::size_t i = 0; i < vertex_count; ++i) {
+    const mesh::Vertex& v = mesh.vertices[i];
+    if (!finite(v.position) || !finite(v.normal)) {
+      return Status::invalid_argument(
+          "write_ply: nonfinite position or normal at vertex " +
+          std::to_string(i));
     }
   }
   for (std::uint32_t index : mesh.indices) {
@@ -119,6 +122,8 @@ Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
   if (!out) {
     return Status::io_error("write_ply: cannot open " + path);
   }
+  // tinyply's writer is noexcept: only its small per-property tables allocate
+  // there, so the large buffers above carry the allocation failure contract.
   ply.write(out, /*isBinary=*/true);
   // Explicit close includes the final flush and reports a delayed write error.
   out.close();
@@ -126,10 +131,8 @@ Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
     return Status::io_error("write_ply: write failed for " + path);
   }
   return {};
-} catch (const std::bad_alloc&) {
-  return Status::out_of_memory({});
 } catch (...) {
-  return Status::io_error({});
+  return detail::exception_status("write_ply");
 }
 
 }  // namespace volumetric_kit::recon::io

@@ -5,18 +5,36 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
-#include <map>
-#include <new>
+#include <unordered_map>
 #include <utility>
 
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
 
+#include "io_detail.hpp"
+
 namespace volumetric_kit::recon::io {
 namespace {
+
+// Positions are finite and have no negative zero, so equal bits mean equal
+// values.
+struct PositionHash {
+  std::size_t operator()(const std::array<float, 3>& p) const noexcept {
+    std::size_t seed = 0;
+    for (const float value : p) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &value, sizeof(bits));
+      seed ^= std::hash<std::uint32_t>{}(bits) + 0x9e3779b9u + (seed << 6) +
+              (seed >> 2);
+    }
+    return seed;
+  }
+};
 
 Result<bool> reflected(const aiMatrix4x4& m) {
   const std::array<ai_real, 16> values = {m.a1, m.a2, m.a3, m.a4, m.b1, m.b2,
@@ -61,9 +79,7 @@ Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
 }
 
 Result<TriangleMesh> import_mesh(const std::string& path) {
-  if (path.empty() || path.find('\0') != std::string::npos) {
-    return Status::invalid_argument("load_mesh: empty path or embedded NUL");
-  }
+  VR_TRY(detail::check_path("load_mesh", path));
   std::error_code error;
   const auto file = std::filesystem::status(path, error);
   if (error == std::errc::no_such_file_or_directory ||
@@ -76,6 +92,13 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
   }
 
   Assimp::Importer importer;
+  // Keep source coordinates: Collada and FBX importers otherwise apply the
+  // file's unit and up axis. Literal names build against releases that lack a
+  // property. Assimp before 5.3 still applies Collada's <unit>, and 5.4.x
+  // converts FBX regardless.
+  importer.SetPropertyBool("IMPORT_COLLADA_IGNORE_UP_DIRECTION", true);
+  importer.SetPropertyBool("IMPORT_COLLADA_IGNORE_UNIT_SIZE", true);
+  importer.SetPropertyBool("AI_CONFIG_IMPORT_FBX_IGNORE_UP_DIRECTION", true);
   // Avoid repair, approximate vertex joining and automatic scene scaling.
   // Exact joining below ignores discarded UV/normal/material seams.
   const aiScene* scene = importer.ReadFile(
@@ -97,13 +120,25 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
     aiMatrix4x4 parent;
   };
   std::vector<Node> pending{{scene->mRootNode, aiMatrix4x4{}}};
-  std::map<std::array<float, 3>, std::uint32_t> positions;
+  std::size_t source_vertices = 0;
+  for (unsigned i = 0; i < scene->mNumMeshes; ++i) {
+    if (scene->mMeshes[i] != nullptr)
+      source_vertices += scene->mMeshes[i]->mNumVertices;
+  }
+  std::unordered_map<std::array<float, 3>, std::uint32_t, PositionHash>
+      positions;
+  positions.reserve(source_vertices);
   TriangleMesh result;
   while (!pending.empty()) {
     const Node node = pending.back();
     pending.pop_back();
     const aiMatrix4x4 world = node.parent * node.source->mTransformation;
-    VR_ASSIGN(const bool flip, reflected(world));
+    // Only transforms that place geometry are validated; helper, camera or
+    // hidden nodes without meshes do not refuse the asset.
+    bool flip = false;
+    if (node.source->mNumMeshes != 0) {
+      VR_ASSIGN(flip, reflected(world));
+    }
     for (unsigned index = 0; index < node.source->mNumMeshes; ++index) {
       const unsigned mesh_index = node.source->mMeshes[index];
       if (mesh_index >= scene->mNumMeshes ||
@@ -177,10 +212,8 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
 Result<TriangleMesh> load_mesh(const std::string& path) {
   try {
     return import_mesh(path);
-  } catch (const std::bad_alloc&) {
-    return Status::out_of_memory({});
   } catch (...) {
-    return Status::io_error({});
+    return detail::exception_status("load_mesh");
   }
 }
 
