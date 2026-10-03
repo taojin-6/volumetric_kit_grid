@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The device frame's pass 1: every model's symbol counts, and each block's
+// coder steps, which place its steps (rans_ops.comp) and size its segment's
+// output slot. One invocation per block.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64) in;
+
+#include "rans_walk.glsl"
+
+// Bindings 0-2 are the walk's.
+layout(set = 0, binding = 3, std430) buffer Counts {
+  uint counts[];  // per model, per symbol, at bases[model]
+};
+layout(set = 0, binding = 4, std430) writeonly buffer Steps {
+  uint steps[];  // per block
+};
+
+uint g_steps = 0u;
+
+void sink_symbol(uint model, uint symbol) {
+  atomicAdd(counts[model_base(model) + symbol], 1u);
+  g_steps += 1u;
+}
+
+void sink_bits(uint value, uint bits) { g_steps += (bits + 11u) / 12u; }
+
+
+void main() {
+  const uint i = pc.item_base + gl_GlobalInvocationID.x;
+  if (i >= pc.num_blocks) return;
+  walk_block(i, i % pc.segment_size == 0u);
+  steps[i] = g_steps;
+}

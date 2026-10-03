@@ -52,6 +52,19 @@ struct DctTransformConfig {
   std::uint32_t max_blocks_per_dispatch = 0;
 };
 
+/// @brief A forward output where the device left it: @ref count entries of a
+///        block list, their masks and their coefficients, in the layout the
+///        kernels write. Borrowed from the transform, valid until its next
+///        call.
+struct ResidentBlocks {
+  const Buffer* list = nullptr;  ///< `volume::BlockIndex` entries, frame order.
+  const Buffer* masks = nullptr;  ///< `kMaskWordsPerBlock` words an entry.
+  /// Two int16 a word, coefficient 2p low; `(K + 1) / 2` words an entry.
+  const Buffer* coefficients = nullptr;
+  std::uint32_t count = 0;
+  std::uint32_t coefficient_count = 0;  ///< K.
+};
+
 /// @brief The forward and inverse block DCT, as two GLSL compute kernels, and
 ///        a third that finds the blocks holding an observed voxel.
 ///
@@ -96,9 +109,8 @@ struct DctTransformConfig {
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object; it stores references to them.
 ///
-/// TODO(codec): a device-resident forward output, so the GPU entropy coder
-/// (the 2026-09-26 decision's fifth PR) reads the coefficients where they were
-/// written rather than through this host round trip.
+/// @ref record_forward leaves the forward output on the device for the device
+/// frame writer, which reads the coefficients where they were written.
 class VR_CODEC_API DctTransform {
  public:
   /// @brief Build both kernels and upload the basis and zigzag tables.
@@ -144,6 +156,29 @@ class VR_CODEC_API DctTransform {
   Status forward(const volume::VoxelBlockGrid& grid,
                  const volume::BlockList& blocks, const CodecParams& params,
                  DctBlocks& out, GpuStageScope* stage = nullptr);
+
+  /// @brief Record @ref forward into @p batch, leaving its output on the
+  ///        device for the device frame writer.
+  ///
+  /// The list, masks and coefficients stay in this transform's buffers until
+  /// its next call. When @p batch is submitted, @p rejected receives the
+  /// entries the kernel found no block for, which @ref check_rejected turns
+  /// into the refusal @ref forward makes.
+  /// @param batch     The batch to record into; submitted by the caller.
+  /// @param rejected  Written at submit; must outlive it.
+  /// @return The resident output (no entries for an empty list, which records
+  ///         nothing), or the refusals @ref forward makes before dispatching.
+  Result<ResidentBlocks> record_forward(CommandBatch& batch,
+                                        const volume::VoxelBlockGrid& grid,
+                                        const volume::BlockList& blocks,
+                                        const CodecParams& params,
+                                        std::uint32_t& rejected,
+                                        GpuStageScope* stage = nullptr);
+
+  /// @return The refusal for @p rejected entries of @p count the kernels
+  ///         found no block for, or OK when there are none.
+  static Status check_rejected(const char* op, std::uint32_t rejected,
+                               std::uint32_t count);
 
   /// @brief Reconstruct every block in @p blocks from its coefficients and
   ///        mask, overwriting its `tsdf` and `weight`.
@@ -225,9 +260,6 @@ class VR_CODEC_API DctTransform {
   Status ensure_scratch(Buffer& buffer, VkDeviceSize bytes, const char* name);
   /// Stage @p blocks onto the retained block-list buffer, in @p batch.
   Status upload_list(CommandBatch& batch, const volume::BlockList& blocks);
-  /// The refusal for @p rejected entries the kernels found no block for.
-  static Status check_rejected(const char* op, std::uint32_t rejected,
-                               std::uint32_t count);
 
   // Borrowed (must outlive this).
   Device* device_ = nullptr;

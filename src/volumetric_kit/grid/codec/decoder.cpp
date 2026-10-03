@@ -123,6 +123,9 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     // The whole frame, entropy-decoded: a corrupt one is refused here, with
     // the grid untouched. The heap bounds the block count the reader will
     // allocate for, so a frame the grid cannot hold is refused here too.
+    // TODO(codec): decode on the device, one invocation per segment as the
+    // encoder codes, writing the coefficients where the inverse reads them
+    // (the 2026-10-03 decision).
     StageScope read(metrics, "  ..rans decode");
     Result<detail::IntraFrame> r = detail::read_intra_frame(
         data, size, static_cast<std::uint32_t>(gp.num_blocks));

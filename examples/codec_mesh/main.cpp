@@ -52,7 +52,8 @@ vr::Result<Options> parse_args(int argc, char** argv) {
     const bool takes_value =
         a == "--height" || a == "--up-axis" || a == "--up-vector" ||
         a == "--voxel" || a == "--mode" || a == "--shell-voxels" ||
-        a == "--step" || a == "--k" || a == "-o" || a == "--quant-table";
+        a == "--step" || a == "--k" || a == "-o" || a == "--quant-table" ||
+        a == "--entropy" || a == "--segment-size";
     if (takes_value && i + 1 == argc) {
       return vr::Status::invalid_argument(a + " needs a value");
     }
@@ -95,6 +96,13 @@ vr::Result<Options> parse_args(int argc, char** argv) {
       VR_TRY(vr_example::parse_number(a, v, o.codec.params.quantization_scale));
     } else if (a == "--quant-table") {
       o.quant_table = v;
+    } else if (a == "--entropy") {
+      VR_TRY(vr_example::parse_entropy(a, v, o.codec.entropy));
+    } else if (a == "--segment-size") {
+      int r = 0;
+      VR_TRY(vr_example::parse_number(a, v, r));
+      if (r < 1) return vr::Status::invalid_argument(a + " must be >= 1");
+      o.codec.segment_size = std::uint32_t(r);
     } else if (a == "--k") {
       int k = 0;
       VR_TRY(vr_example::parse_number(a, v, k));
@@ -127,7 +135,8 @@ vr::Result<Options> parse_args(int argc, char** argv) {
         "usage: codec_mesh mesh-file --height metres "
         "(--up-axis y | --up-vector x,y,z) [--voxel metres] "
         "[--mode signed|shell] [--shell-voxels 1.5] [--k 64] [--step 0.2] "
-        "[--quant-table uniform|band|radial] [--sweep] [--inspect-only] "
+        "[--quant-table uniform|band|radial] [--entropy auto|host|device] "
+        "[--segment-size n] [--sweep] [--inspect-only] "
         "[-o prefix]");
   }
   if (!(o.voxel > 0.0f) || !std::isfinite(4.0f * o.voxel)) {
@@ -296,7 +305,7 @@ vr::Status run(const Options& opt) {
   vr_example::print_comparison(total_error, opt.voxel);
   if (opt.sweep) {
     VR_TRY(vr_example::run_codec_sweep(device, allocator, volume,
-                                       source_reference, extractor,
+                                       source_reference, extractor, opt.codec,
                                        stream.player()));
   }
   return {};

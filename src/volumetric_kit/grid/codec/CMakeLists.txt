@@ -20,8 +20,9 @@ set(_vr_codec_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(recon_codec)
 add_library(volumetric_kit::recon_codec ALIAS recon_codec)
 
-target_sources(recon_codec PRIVATE bitstream.cpp codec_params.cpp
-                                   dct_transform.cpp decoder.cpp encoder.cpp)
+target_sources(
+  recon_codec PRIVATE bitstream.cpp codec_params.cpp dct_transform.cpp
+                      decoder.cpp device_frame_writer.cpp encoder.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.
@@ -62,9 +63,16 @@ target_include_directories(
 # transform with no runtime shader files.
 include(vr_embed)
 vr_embed_shaders(
-  recon_codec SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_forward.comp"
+  recon_codec
+  SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_forward.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_count.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_ops.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_encode.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_scan.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_gather.comp")
 
 vr_target_warnings(recon_codec)
 

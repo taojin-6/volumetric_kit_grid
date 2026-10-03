@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// Each segment's byte offset in the payload: an exclusive scan of the stream
+// lengths, then the total and the gather's dispatch size. One workgroup, a
+// chunk of lengths at a time; a frame has thousands of segments, not millions.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 256) in;
+
+#include "rans_push.glsl"
+
+layout(set = 0, binding = 0, std430) readonly buffer Lengths {
+  uint lengths[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer PayloadOffsets {
+  uint payload_offsets[];  // segment_count + 1
+};
+layout(set = 0, binding = 2, std430) writeonly buffer GatherArgs {
+  uvec3 gather_groups;  // rans_gather.comp's VkDispatchIndirectCommand
+};
+
+// rans_gather.comp's width, and the fewest groups every device dispatches.
+const uint kGatherLanes = 256u;
+const uint kMaxGroups = 65535u;
+
+shared uint s_sum[256];
+
+void main() {
+  const uint lane = gl_LocalInvocationID.x;
+  uint carry = 0u;
+  for (uint base = 0u; base < pc.segment_count; base += 256u) {
+    const uint i = base + lane;
+    const uint length = i < pc.segment_count ? lengths[i] : 0u;
+    s_sum[lane] = length;
+    barrier();
+    for (uint step = 1u; step < 256u; step <<= 1u) {
+      const uint left = lane >= step ? s_sum[lane - step] : 0u;
+      barrier();
+      s_sum[lane] += left;
+      barrier();
+    }
+    if (i < pc.segment_count) payload_offsets[i] = carry + s_sum[lane] - length;
+    carry += s_sum[255];
+    barrier();
+  }
+  if (lane == 0u) {
+    payload_offsets[pc.segment_count] = carry;
+    const uint words = (carry + 3u) / 4u;
+    gather_groups =
+        uvec3(min((words + kGatherLanes - 1u) / kGatherLanes, kMaxGroups), 1u,
+              1u);
+  }
+}

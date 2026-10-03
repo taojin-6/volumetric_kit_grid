@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "bitstream.hpp"
+#include "codec_frames.hpp"
 #include "dct_tables.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
@@ -41,89 +42,8 @@ namespace {
 constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
 constexpr std::int32_t kMin32 = std::numeric_limits<std::int32_t>::min();
 
-struct Lcg {
-  std::uint64_t state;
-  std::uint32_t next() {
-    state = state * 6364136223846793005ull + 1442695040888963407ull;
-    return static_cast<std::uint32_t>(state >> 32);
-  }
-  std::uint32_t below(std::uint32_t n) { return next() % n; }
-};
-
-// A partial mask shaped like a fused band's edge: the voxels on one side of a
-// plane through the block, so its planes and lines repeat, run full or empty,
-// or cut across -- every symbol the mask code has.
-void slab_mask(Lcg& rng, std::uint32_t* mask) {
-  const int a = int(rng.below(7)) - 3;
-  const int b = int(rng.below(7)) - 3;
-  const int c = int(rng.below(7)) - 3;
-  const int d = int(rng.below(40)) - 20;
-  for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
-    mask[w] = 0;
-  }
-  for (std::uint32_t v = 0; v < codec::kVoxelsPerBlock; ++v) {
-    const int x = int(v % 8), y = int(v / 8 % 8), z = int(v / 64);
-    if (a * x + b * y + c * z < d) {
-      mask[v / 32] |= 1u << (v % 32);
-    }
-  }
-}
-
-// A frame shaped like a real one: blocks in runs along x with jumps between
-// them, masks mostly full with some empty and some partial -- noise, or a
-// slab's edge -- coefficients small and sparser at higher indices, and the
-// odd extreme value.
-d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
-  Lcg rng{seed};
-  auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
-    return d::coord_less(a, b);
-  };
-  std::set<vr::Vec3i, decltype(less)> coords(less);
-  while (coords.size() < n) {
-    // One draw per statement: the order a function's arguments are evaluated
-    // in is unspecified (GCC and Clang disagree), and a fixture must be the
-    // same frame on every compiler.
-    const int sx = int(rng.below(200)) - 100;
-    const int sy = int(rng.below(60)) - 30;
-    const int sz = int(rng.below(60)) - 30;
-    const vr::Vec3i start(sx, sy, sz);
-    const std::uint32_t run = 1 + rng.below(12);
-    for (std::uint32_t i = 0; i < run && coords.size() < n; ++i) {
-      coords.insert(vr::Vec3i(start.x + int(i), start.y, start.z));
-    }
-  }
-  d::IntraFrame f;
-  f.voxel_size = 0.005f;
-  f.coords.assign(coords.begin(), coords.end());
-  f.blocks.params.coefficient_count = k;
-  f.blocks.trunc_dist = 0.04f;
-  for (std::size_t i = 0; i < n; ++i) {
-    const std::uint32_t cls = rng.below(10);
-    std::uint32_t mask[codec::kMaskWordsPerBlock];
-    if (cls < 8) {
-      for (std::uint32_t& w : mask) {
-        w = cls < 6 ? ~0u : cls < 7 ? 0u : rng.next();
-      }
-    } else {
-      slab_mask(rng, mask);
-    }
-    f.blocks.masks.insert(f.blocks.masks.end(), mask,
-                          mask + codec::kMaskWordsPerBlock);
-    for (std::uint32_t j = 0; j < k; ++j) {
-      std::int32_t v = 0;
-      const std::uint32_t spread = 1 + 64 / (1 + j);
-      if (rng.below(1 + j / 4) == 0) {
-        v = int(rng.below(2 * spread + 1)) - int(spread);
-      }
-      if (rng.below(500) == 0) {
-        v = rng.below(2) == 0 ? codec::kMaxQuantizedMagnitude
-                              : -codec::kMaxQuantizedMagnitude;
-      }
-      f.blocks.coefficients.push_back(static_cast<std::int16_t>(v));
-    }
-  }
-  return f;
-}
+using codec_frames::Lcg;
+using codec_frames::make_frame;
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 
@@ -250,6 +170,50 @@ int write_refusals_case() {
   d::FrameWriteOptions zero;
   zero.segment_size = 0;
   CHECK(refused(good, zero));
+  return 0;
+}
+
+// The container check the device writer relies on: assemble_intra_frame
+// refuses a coded frame whose header fields or sections disagree.
+int assemble_refusals_case() {
+  d::CodedFrame good;
+  good.voxel_size = 0.005f;
+  good.trunc_dist = 0.04f;
+  good.params.coefficient_count = 8;
+  good.block_count = 10;
+  good.segment_size = 4;  // three segments
+  std::vector<std::vector<std::uint64_t>> counts(d::frame_model_count(8));
+  for (std::uint32_t m = 0; m < counts.size(); ++m) {
+    counts[m].assign(d::frame_model_alphabet(m), 1);
+  }
+  good.tables = d::frame_tables(counts);
+  good.segment_lengths = {4, 4, 4};
+  good.payload.assign(12, 0);
+  CHECK(d::assemble_intra_frame(good).ok());
+  auto refused = [](const d::CodedFrame& f) {
+    return !d::assemble_intra_frame(f).ok();
+  };
+  d::CodedFrame f = good;
+  f.voxel_size = std::numeric_limits<float>::infinity();
+  CHECK(refused(f));
+  f = good;
+  f.trunc_dist = 0.0f;
+  CHECK(refused(f));
+  f = good;
+  f.params.coefficient_count = codec::kVoxelsPerBlock + 1;
+  CHECK(refused(f));
+  f = good;
+  f.segment_size = 0;
+  CHECK(refused(f));
+  f = good;
+  f.tables.pop_back();
+  CHECK(refused(f));
+  f = good;
+  f.block_count = 13;  // four segments, three lengths
+  CHECK(refused(f));
+  f = good;
+  f.payload.pop_back();
+  CHECK(refused(f));
   return 0;
 }
 
@@ -678,6 +642,7 @@ int main() {
   if (round_trip_case() != 0) return 1;
   if (extreme_coords_case() != 0) return 1;
   if (write_refusals_case() != 0) return 1;
+  if (assemble_refusals_case() != 0) return 1;
   if (header_refusals_case() != 0) return 1;
   if (section_rules_case() != 0) return 1;
   if (table_rules_case() != 0) return 1;
