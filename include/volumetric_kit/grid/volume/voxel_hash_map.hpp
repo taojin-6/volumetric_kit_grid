@@ -227,7 +227,8 @@ class VR_VOLUME_API VoxelHashMap {
   ///               for the call; the writer's dispatch must have finished,
   ///               which a `dispatch` on this device guarantees.
   /// @return As the host overload; @ref Status::Code::InvalidArgument also for
-  ///         a @p depth that is empty, not a storage buffer, or smaller than
+  ///         a @p depth that is empty, not a storage buffer, has unknown or
+  ///         non-device-local memory, or is smaller than
   ///         the image.
   Result<std::uint32_t> allocate_from_depth(
       const Buffer& depth, const DepthCameraParams& camera,
