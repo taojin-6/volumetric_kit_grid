@@ -72,10 +72,11 @@ void main() {
   bool valid = u < cam.width && v < cam.height;
   ivec3 block = ivec3(0);
   if (valid) {
-    // Reject out-of-range and non-finite samples (the range test also drops
-    // NaN, whose comparisons are all false).
+    // Reject holes, out-of-range and non-finite samples (the range test also
+    // drops NaN, whose comparisons are all false). Zero is a missing
+    // measurement, even when the accepted near bound is 0.
     float depth = depth_data[v * cam.width + u];
-    valid = depth >= cam.min_depth && depth <= cam.max_depth;
+    valid = depth > 0.0 && depth >= cam.min_depth && depth <= cam.max_depth;
     if (valid) {
       // Unproject to camera space, then to world via the rigid pose.
       float x = (float(u) - cam.cx) * depth / cam.fx;

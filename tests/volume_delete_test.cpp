@@ -14,9 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include "buffer_readback.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/command_batch.hpp"
-#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -212,17 +211,10 @@ int main() {
   device_coords.push_back(absent);
   const auto device_count = static_cast<std::uint32_t>(device_coords.size());
   device_coords.push_back(vol::BlockIndex{});  // centre (0,0,0): must survive
-  auto device_list = vr::device_storage_buffer(
-      allocator.value(), device_coords.size() * sizeof(vol::BlockIndex));
+  auto device_list = vr_test::upload_device_buffer(
+      device.value(), allocator.value(), device_coords.data(),
+      device_coords.size() * sizeof(vol::BlockIndex));
   CHECK(device_list.ok() && device_list->mapped() == nullptr);
-  {
-    vr::CommandBatch batch(device.value(), allocator.value());
-    CHECK(batch
-              .upload(device_list.value(), 0, device_coords.data(),
-                      device_coords.size() * sizeof(vol::BlockIndex))
-              .ok());
-    CHECK(batch.submit().ok());
-  }
   auto cached = map.compact_active_blocks_on_device();
   CHECK(cached.ok() &&
         map.check_device_block_list(cached.value(), "test").ok());
@@ -240,8 +232,14 @@ int main() {
   auto device_ptrs = active_ptrs(map);
   CHECK(device_ptrs.ok() && device_ptrs.value() == ptrs_before.value());
 
+  // An empty, zero-count or refused call frees nothing, so it must leave a
+  // cached block list valid.
+  auto kept = map.compact_active_blocks_on_device();
+  CHECK(kept.ok());
   const vr::Buffer empty;
   CHECK(map.remove(empty, 0).ok());
+  CHECK(map.remove(device_list.value(), 0).ok());
+  CHECK(map.remove(corners.data(), 0).ok());
   CHECK(map.remove(empty, 1).status().domain() ==
         vr::Status::Code::InvalidArgument);
   CHECK(map.remove(device_list.value(), device_count + 2).status().domain() ==
@@ -254,6 +252,7 @@ int main() {
   CHECK(transfer_only.ok());
   CHECK(map.remove(transfer_only.value(), 1).status().domain() ==
         vr::Status::Code::InvalidArgument);
+  CHECK(map.check_device_block_list(kept.value(), "test").ok());
 
   // Thousands of blocks freed in one call all go back to the heap, and are
   // drawn off it again with no pass calling a half-free heap empty. A capped
@@ -294,17 +293,10 @@ int main() {
       return occupancy.ok() && occupancy.value() == want;
     };
     CHECK(place(slab));
-    auto half_on_device = vr::device_storage_buffer(
-        allocator.value(), half.size() * sizeof(vol::BlockIndex));
+    auto half_on_device = vr_test::upload_device_buffer(
+        device.value(), allocator.value(), half.data(),
+        half.size() * sizeof(vol::BlockIndex));
     CHECK(half_on_device.ok());
-    {
-      vr::CommandBatch batch(device.value(), allocator.value());
-      CHECK(batch
-                .upload(half_on_device.value(), 0, half.data(),
-                        half.size() * sizeof(vol::BlockIndex))
-                .ok());
-      CHECK(batch.submit().ok());
-    }
     vr::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
     for (int cycle = 0; cycle < 3; ++cycle) {
