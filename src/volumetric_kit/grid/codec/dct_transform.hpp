@@ -231,7 +231,7 @@ class VR_CODEC_API DctTransform {
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // The kernels share one layout shape (nine storage buffers + the push range)
+  // The kernels share one layout shape (ten storage buffers + the push range)
   // and one pool. Declared before pool_ and tables_, so those are destroyed
   // first -- the kernels' sets are freed with the pool.
   ComputeKernel forward_kernel_;
@@ -240,6 +240,9 @@ class VR_CODEC_API DctTransform {
   DescriptorPool pool_;
   // The basis + zigzag tables (binding 3), uploaded once.
   Buffer tables_;
+  // Canonical per-basis effective steps (binding 9), computed on the host
+  // and uploaded in each transform batch.
+  Buffer quantization_steps_;
   // The count of entries the kernels found no block for (binding 7), zeroed
   // in each call's batch and read back at its end.
   Buffer rejected_;

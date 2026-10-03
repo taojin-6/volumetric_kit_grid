@@ -200,7 +200,7 @@ int refusals_case(Gpu& gpu) {
   bad.params.coefficient_count = 0;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
   bad = codec::EncoderConfig{};
-  bad.params.ac_step = 0.0f;
+  bad.params.quantization_weights[511] = 0.0f;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
 
   vr::Result<codec::Encoder> e =
@@ -232,9 +232,13 @@ int moves_case(Gpu& gpu) {
   CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
   // Its configuration went with it: nothing a moved-from encoder reports
   // looks like one that could encode.
-  CHECK(a.config().params.coefficient_count == 0);  // NOLINT
-  CHECK(a.config().segment_size == 0);              // NOLINT
-  CHECK(!a.config().params.validate().ok());        // NOLINT
+  CHECK(a.config().params.coefficient_count == 0);               // NOLINT
+  CHECK(a.config().params.quantization_scale == 0.0f);           // NOLINT
+  for (float weight : a.config().params.quantization_weights) {  // NOLINT
+    CHECK(weight == 0.0f);
+  }
+  CHECK(a.config().segment_size == 0);        // NOLINT
+  CHECK(!a.config().params.validate().ok());  // NOLINT
 
   codec::EncoderConfig other;
   other.params.coefficient_count = 8;

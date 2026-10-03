@@ -131,8 +131,10 @@ bool same_frame(const d::IntraFrame& a, const d::IntraFrame& b) {
          same_bits(a.blocks.trunc_dist, b.blocks.trunc_dist) &&
          a.blocks.params.coefficient_count ==
              b.blocks.params.coefficient_count &&
-         same_bits(a.blocks.params.dc_step, b.blocks.params.dc_step) &&
-         same_bits(a.blocks.params.ac_step, b.blocks.params.ac_step) &&
+         same_bits(a.blocks.params.quantization_scale,
+                   b.blocks.params.quantization_scale) &&
+         a.blocks.params.quantization_weights ==
+             b.blocks.params.quantization_weights &&
          a.coords == b.coords &&
          a.blocks.coefficients == b.blocks.coefficients &&
          a.blocks.masks == b.blocks.masks;
@@ -172,8 +174,11 @@ int round_trip_case() {
   CHECK(round_trip(make_frame(40, codec::kVoxelsPerBlock, 5), 16) == 0);
   // The default segment size, and non-default steps carried bit for bit.
   d::IntraFrame f = make_frame(300, 32, 9);
-  f.blocks.params.dc_step = 0.3141f;
-  f.blocks.params.ac_step = codec::kMinStep;
+  f.blocks.params.quantization_scale = 0.3141f;
+  for (std::size_t i = 0; i < f.blocks.params.quantization_weights.size();
+       ++i) {
+    f.blocks.params.quantization_weights[i] = 0.25f + float(i % 97) * 0.03125f;
+  }
   CHECK(round_trip(f, d::kDefaultSegmentSize) == 0);
   // No blocks at all: no segments, empty tables.
   CHECK(round_trip(make_frame(0, 32, 1), 64) == 0);
@@ -218,7 +223,7 @@ int write_refusals_case() {
   f.blocks.coefficients[5] = std::numeric_limits<std::int16_t>::min();
   CHECK(refused(f));
   f = good;
-  f.blocks.params.ac_step = 0.0f;
+  f.blocks.params.quantization_weights[511] = 0.0f;
   CHECK(refused(f));
   f = good;
   f.voxel_size = std::numeric_limits<float>::quiet_NaN();
@@ -318,8 +323,11 @@ int header_refusals_case() {
   b[0] = 'X';
   CHECK(refused_as(b, C::InvalidArgument));  // magic
   b = good;
-  b[4] = 3;
-  CHECK(refused_as(b, C::Unsupported));  // version 3
+  b[4] = 4;
+  CHECK(refused_as(b, C::Unsupported));  // future version 4
+  b = good;
+  b[4] = 2;
+  CHECK(refused_as(b, C::Unsupported));  // version 2, whose quantizer differs
   b = good;
   b[4] = 1;
   CHECK(refused_as(b, C::Unsupported));  // version 1, whose mask code differs
@@ -343,12 +351,24 @@ int header_refusals_case() {
   CHECK(refused_as(b, C::InvalidArgument));  // K
   b = good;
   put_f32(b, 24, std::numeric_limits<float>::quiet_NaN());
-  CHECK(refused_as(b, C::InvalidArgument));  // dc_step
+  CHECK(refused_as(b, C::InvalidArgument));  // quantization scale
   // A step past kMaxStep, finite but enough to make a decoded coefficient
   // infinite and the inverse's sums NaN.
   b = good;
-  put_f32(b, 28, 1e38f);
-  CHECK(refused_as(b, C::InvalidArgument));  // ac_step
+  put_f32(b, d::kFramePrefixBytes, 1e38f);
+  CHECK(refused_as(b, C::InvalidArgument));  // effective step exceeds ceiling
+  b = good;
+  put_u32(b, 28, codec::kVoxelsPerBlock - 1);
+  CHECK(refused_as(b, C::InvalidArgument));  // incomplete table
+  for (std::size_t i : {std::size_t(0), std::size_t(511)}) {
+    for (float value : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::infinity(), 1e-20f}) {
+      b = good;
+      put_f32(b, d::kFramePrefixBytes + i * sizeof(float), value);
+      CHECK(refused_as(b, C::InvalidArgument));
+      CHECK(!d::read_frame_header(b.data(), b.size()).ok());
+    }
+  }
   b = good;
   put_u32(b, 36, 0);
   CHECK(refused_as(b, C::InvalidArgument));  // segment size
@@ -621,12 +641,14 @@ int zero_frame_cost_case() {
               b.size(), s[2].body.size());
   // 4 bytes of state + 12 of coordinate per segment, give or take a word.
   CHECK(s[2].body.size() <= segments * 18);
-  CHECK(b.size() <= 450);
+  // Complete 2092-byte quantizer header plus segment/table overhead.
+  CHECK(b.size() <= d::kFrameHeaderBytes + 406);
   // And a frame with something to say costs far more: the zero case is not
   // passing by encoding nothing.
   const std::vector<std::uint8_t> busy =
       d::write_intra_frame(make_frame(640, 32, 2)).value();
-  CHECK(busy.size() > 20 * b.size());
+  CHECK(busy.size() - d::kFrameHeaderBytes >
+        20 * (b.size() - d::kFrameHeaderBytes));
   return 0;
 }
 

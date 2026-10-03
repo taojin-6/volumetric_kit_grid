@@ -25,8 +25,8 @@ static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
 EncoderConfig empty_config() {
   EncoderConfig c;
   c.params.coefficient_count = 0;
-  c.params.dc_step = 0.0f;
-  c.params.ac_step = 0.0f;
+  c.params.quantization_scale = 0.0f;
+  c.params.quantization_weights.fill(0.0f);
   c.segment_size = 0;
   return c;
 }

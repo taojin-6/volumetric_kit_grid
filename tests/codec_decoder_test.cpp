@@ -65,8 +65,7 @@ vr::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
 codec::EncoderConfig near_lossless() {
   codec::EncoderConfig c;
   c.params.coefficient_count = codec::kVoxelsPerBlock;
-  c.params.dc_step = 0.002f;
-  c.params.ac_step = 0.002f;
+  c.params.quantization_scale = 0.002f;
   return c;
 }
 
@@ -374,7 +373,15 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
     return now.ok() && now.value() == before.value();
   };
 
-  // Truncated, and one byte flipped in the middle of the payload.
+  // An invalid table entry beyond K is refused before the grid is touched.
+  Bytes invalid_table = fb.value();
+  const float zero_weight = 0.0f;
+  std::memcpy(invalid_table.data() + 44 + 511 * sizeof(float), &zero_weight,
+              sizeof(zero_weight));
+  CHECK(!dec.decode(invalid_table.data(), invalid_table.size(), player).ok());
+  CHECK(unchanged());
+
+  // Truncated, and one byte flipped in the middle of the frame.
   CHECK(!dec.decode(fb.value().data(), fb.value().size() - 1, player).ok());
   CHECK(unchanged());
   Bytes flipped = fb.value();
@@ -486,14 +493,60 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
   return 0;
 }
 
+// A frame carries every table entry itself: a reused decoder must not retain
+// the previous frame's quantizer, even when its block coordinates are equal.
+int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
+  vr::Result<vol::VoxelBlockGrid> source =
+      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
+  CHECK(source.ok());
+  codec::EncoderConfig a;
+  a.params.coefficient_count = 35;
+  a.params.quantization_scale = 0.03f;
+  a.params.quantization_weights[1] = 4.0f;
+  a.params.quantization_weights[8] = 2.0f;
+  a.params.quantization_weights[64] = 0.5f;
+  codec::EncoderConfig b = a;
+  b.params.quantization_scale = 0.07f;
+  std::swap(b.params.quantization_weights[1],
+            b.params.quantization_weights[64]);
+  vr::Result<Bytes> fa = encode_with(gpu, source.value(), a);
+  vr::Result<Bytes> fb = encode_with(gpu, source.value(), b);
+  CHECK(fa.ok() && fb.ok() && fa.value() != fb.value());
+  vr::Result<vol::VoxelBlockGrid> out = grid_for(gpu, fa.value());
+  CHECK(out.ok());
+  Snapshot first;
+  for (const Bytes* frame : {&fa.value(), &fb.value(), &fa.value()}) {
+    CHECK(dec.decode(frame->data(), frame->size(), out.value()).ok());
+    vr::Result<Snapshot> current = snapshot(gpu, out.value());
+    CHECK(current.ok());
+    if (first.coords.empty()) first = current.value();
+    if (frame == &fa.value()) CHECK(first == current.value());
+    if (frame == &fb.value()) CHECK(!(first == current.value()));
+
+    // Its result agrees with a new decoder that has never seen another table.
+    vr::Result<codec::Decoder> fresh =
+        codec::Decoder::create(gpu.device, gpu.allocator);
+    vr::Result<vol::VoxelBlockGrid> reference = grid_for(gpu, *frame);
+    CHECK(fresh.ok() && reference.ok());
+    CHECK(fresh.value()
+              .decode(frame->data(), frame->size(), reference.value())
+              .ok());
+    vr::Result<Snapshot> expected = snapshot(gpu, reference.value());
+    CHECK(expected.ok() && expected.value() == current.value());
+  }
+  return 0;
+}
+
 int frame_info_case(Gpu& gpu) {
   const Sphere s{vr::Vec3f(0.0f), 0.05f};
   vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   codec::EncoderConfig config;
   config.params.coefficient_count = 20;
-  config.params.dc_step = 0.3f;
-  config.params.ac_step = 0.07f;
+  config.params.quantization_scale = 0.07f;
+  for (std::size_t i = 0; i < config.params.quantization_weights.size(); ++i) {
+    config.params.quantization_weights[i] = 0.5f + 0.125f * float(i % 31);
+  }
   vr::Result<Bytes> frame = encode_with(gpu, g.value(), config);
   CHECK(frame.ok());
   vr::Result<codec::FrameInfo> info =
@@ -502,20 +555,23 @@ int frame_info_case(Gpu& gpu) {
   CHECK(info.value().voxel_size == kVoxel);
   CHECK(info.value().trunc_dist == kTrunc);
   CHECK(info.value().params.coefficient_count == 20);
-  CHECK(info.value().params.dc_step == 0.3f);
-  CHECK(info.value().params.ac_step == 0.07f);
+  CHECK(info.value().params.quantization_scale ==
+        config.params.quantization_scale);
+  CHECK(info.value().params.quantization_weights ==
+        config.params.quantization_weights);
   CHECK(info.value().block_count > 0);
   // The header alone is enough; less than it is not.
-  CHECK(codec::read_frame_info(frame.value().data(), 44).ok());
-  CHECK(!codec::read_frame_info(frame.value().data(), 43).ok());
+  constexpr std::size_t header_bytes = 44 + 512 * sizeof(float);
+  CHECK(codec::read_frame_info(frame.value().data(), header_bytes).ok());
+  CHECK(!codec::read_frame_info(frame.value().data(), header_bytes - 1).ok());
   CHECK(!codec::read_frame_info(nullptr, 0).ok());
   Bytes bad = frame.value();
   bad[0] = 'X';
   CHECK(!codec::read_frame_info(bad.data(), bad.size()).ok());
   bad = frame.value();
-  bad[4] = 3;  // version 3
-  vr::Result<codec::FrameInfo> v3 = codec::read_frame_info(bad.data(), 44);
-  CHECK(!v3.ok() && v3.status().domain() == vr::Status::Code::Unsupported);
+  bad[4] = 2;  // version 2
+  vr::Result<codec::FrameInfo> v2 = codec::read_frame_info(bad.data(), 44);
+  CHECK(!v2.ok() && v2.status().domain() == vr::Status::Code::Unsupported);
   return 0;
 }
 
@@ -665,6 +721,7 @@ int main() {
   if (sequence_case(gpu, dec) != 0) return 1;
   if (untouched_case(gpu, dec) != 0) return 1;
   if (out_of_memory_case(gpu, dec) != 0) return 1;
+  if (quantization_sequence_case(gpu, dec) != 0) return 1;
   if (frame_info_case(gpu) != 0) return 1;
   if (refusals_case(gpu, dec) != 0) return 1;
   if (metrics_case(gpu, dec) != 0) return 1;

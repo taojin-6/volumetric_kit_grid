@@ -644,8 +644,8 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   w.f32(b.trunc_dist);
   w.u32(static_cast<std::uint32_t>(kBlockSize));
   w.u32(k);
-  w.f32(b.params.dc_step);
-  w.f32(b.params.ac_step);
+  w.f32(b.params.quantization_scale);
+  w.u32(kVoxelsPerBlock);
   w.u32(static_cast<std::uint32_t>(n));
   w.u32(r_size);
   const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>,
@@ -654,6 +654,9 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
                    {SectionId::kSegments, &segments_body},
                    {SectionId::kPayload, &payload}}};
   w.u32(kSectionCount);
+  for (float weight : b.params.quantization_weights) {
+    w.f32(weight);
+  }
   for (const auto& [id, body] : sections) {
     w.u16(static_cast<std::uint32_t>(id));
     w.u16(kSectionRequired);
@@ -667,32 +670,43 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
 
 Result<FrameHeader> read_frame_header(const std::uint8_t* data,
                                       std::size_t size) {
-  if (data == nullptr || size < kFrameHeaderBytes) {
+  if (data == nullptr || size < 8) {
     return bad("shorter than a frame header");
   }
   if (std::memcmp(data, kFrameMagic, sizeof(kFrameMagic)) != 0) {
     return bad("not a codec frame (bad magic)");
   }
-  ByteReader h(data + sizeof(kFrameMagic), kFrameHeaderBytes - 4);
+  ByteReader h(data + sizeof(kFrameMagic), size - sizeof(kFrameMagic));
   const std::uint32_t version = h.u16();
   const std::uint32_t type = h.u8();
   const std::uint32_t reserved = h.u8();
-  FrameHeader header;
-  header.voxel_size = h.f32();
-  header.trunc_dist = h.f32();
-  const std::uint32_t block_size = h.u32();
-  header.params.coefficient_count = h.u32();
-  header.params.dc_step = h.f32();
-  header.params.ac_step = h.f32();
-  header.block_count = h.u32();
-  header.segment_size = h.u32();
-  header.section_count = h.u32();
-
   if (version != kFrameVersion) {
     return Status::unsupported("codec frame: version " +
                                std::to_string(version) + " (this reads " +
                                std::to_string(kFrameVersion) + ")");
   }
+  if (size < kFrameHeaderBytes) {
+    return bad(
+        "shorter than a frame header (including the quantization table)");
+  }
+  FrameHeader header;
+  header.voxel_size = h.f32();
+  header.trunc_dist = h.f32();
+  const std::uint32_t block_size = h.u32();
+  header.params.coefficient_count = h.u32();
+  header.params.quantization_scale = h.f32();
+  const std::uint32_t weight_count = h.u32();
+  header.block_count = h.u32();
+  header.segment_size = h.u32();
+  header.section_count = h.u32();
+  if (weight_count != kVoxelsPerBlock) {
+    return bad("quantization weight count must be " +
+               std::to_string(kVoxelsPerBlock));
+  }
+  for (float& weight : header.params.quantization_weights) {
+    weight = h.f32();
+  }
+
   if (type != static_cast<std::uint32_t>(FrameType::kIntra)) {
     return Status::unsupported("codec frame: type " + std::to_string(type) +
                                " (this reads intra)");
@@ -752,7 +766,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
       if ((flags & ~std::uint32_t(kSectionKnownFlags)) != 0) {
         return Status::unsupported(
             "codec frame: section " + std::to_string(id) + " sets flags " +
-            std::to_string(flags) + ", which v1 does not define");
+            std::to_string(flags) + ", which v3 does not define");
       }
       SectionBody& f = found[id - 1];
       if (f.data != nullptr) {
@@ -764,7 +778,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
                                  std::to_string(id));
     }
     // TODO(codec): the optional CRC section of the 2026-09-27 entry, should a
-    // consumer ever keep frames where nothing else checks them. A v1 reader
+    // consumer ever keep frames where nothing else checks them. A v3 reader
     // skips it here, so adding it needs no new version.
     offset += length;
   }

@@ -4,7 +4,7 @@
 #pragma once
 
 /// @file bitstream.hpp
-/// @brief The v1 intra frame: what a frame holds, and its byte layout.
+/// @brief The v3 intra frame: what a frame holds, and its byte layout.
 ///
 /// Internal (under src/, never installed): the `Encoder` and `Decoder` build
 /// and consume it; nothing outside the tier should see the layout. The layout
@@ -13,19 +13,20 @@
 /// @code
 ///   offset  size  field
 ///        0     4  magic "VRTC"
-///        4     2  version (2)
+///        4     2  version (3)
 ///        6     1  frame type (0 = intra)
 ///        7     1  reserved, 0
 ///        8     4  voxel_size          (f32, metres)
 ///       12     4  trunc_dist          (f32, metres)
 ///       16     4  block_size          (8)
 ///       20     4  coefficient_count K
-///       24     4  dc_step             (f32, fraction of trunc_dist)
-///       28     4  ac_step             (f32)
+///       24     4  quantization_scale  (f32, fraction of trunc_dist)
+///       28     4  quantization weight count (512)
 ///       32     4  block_count N
 ///       36     4  segment_size R
 ///       40     4  section_count S
-///       44  8 * S  section table: {u16 id, u16 flags, u32 length} each
+///       44  2048  quantization weights (512 f32, x + 8*y + 64*z order)
+///     2092  8 * S  section table: {u16 id, u16 flags, u32 length} each
 ///       ...        the section bodies, in table order, back to back
 /// @endcode
 ///
@@ -34,7 +35,7 @@
 /// consecutive blocks coded as one independent rANS stream (@ref rans.hpp);
 /// the last may be shorter. A decoder refuses an unknown section flagged
 /// @ref kSectionRequired and skips an unknown optional one. Every other flag
-/// bit is reserved: zero in v1, and a decoder refuses a known section that
+/// bit is reserved: zero in v3, and a decoder refuses a known section that
 /// sets one, since a later version may define a flag that changes how the
 /// body reads.
 ///
@@ -45,6 +46,11 @@
 /// line, each line (one byte, eight voxels along x) against the line before
 /// it. Every integer is a *class* -- its bit length -- through a table, plus
 /// one raw field of the bits below its leading one, and below those its sign.
+///
+/// Version 3 replaces DC/AC steps with a global scale and a complete per-basis
+/// table, carried once per frame even for K < 512. Older versions are refused.
+/// The complete fixed header includes the table, so `read_frame_info` needs no
+/// entropy decode and returns every parameter needed by the transform.
 ///
 /// Version 2 (2026-10-01) is version 1 with that mask and sign; version 1
 /// sent a partial mask as 64 bytes through one table and a sign as a field
@@ -66,15 +72,18 @@ namespace volumetric_kit::recon::codec::detail {
 /// The four bytes every frame starts with.
 inline constexpr std::uint8_t kFrameMagic[4] = {'V', 'R', 'T', 'C'};
 /// The layout this file writes and reads.
-inline constexpr std::uint16_t kFrameVersion = 2;
-/// Bytes before the section table.
-inline constexpr std::size_t kFrameHeaderBytes = 44;
+inline constexpr std::uint16_t kFrameVersion = 3;
+/// Bytes before the quantization table (the metadata prefix).
+inline constexpr std::size_t kFramePrefixBytes = 44;
+/// Bytes before the section table, including every quantization weight.
+inline constexpr std::size_t kFrameHeaderBytes =
+    kFramePrefixBytes + kVoxelsPerBlock * sizeof(float);
 /// Bytes per section-table entry.
 inline constexpr std::size_t kSectionEntryBytes = 8;
 /// Section flag: a decoder that does not know the section must refuse the
 /// frame rather than skip it.
 inline constexpr std::uint16_t kSectionRequired = 1;
-/// Every section flag v1 defines. A known section with any other bit set is
+/// Every section flag v3 defines. A known section with any other bit set is
 /// refused as @ref Status::Code::Unsupported.
 inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// Blocks per segment unless the writer is told otherwise: about 1% of a
@@ -87,13 +96,13 @@ enum class FrameType : std::uint8_t {
   kIntra = 0,  ///< Self-contained: decodes with no reference frame.
 };
 
-/// The sections v1 defines, numbered `1..kSectionCount`.
+/// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
   kTables = 1,    ///< The frequency tables, one per model.
   kSegments = 2,  ///< Each segment's stream length in bytes, u32.
   kPayload = 3,   ///< The segment streams, back to back.
 };
-/// How many sections v1 defines.
+/// How many sections v3 defines.
 inline constexpr std::uint32_t kSectionCount = 3;
 static_assert(static_cast<std::uint32_t>(SectionId::kPayload) == kSectionCount,
               "section ids run 1..kSectionCount");
@@ -131,11 +140,11 @@ inline void sort_by_coord(std::vector<volume::BlockIndex>& blocks) {
 
 /// @brief A frame's header, parsed and checked without decoding anything.
 struct FrameHeader {
-  float voxel_size = 0.0f;          ///< Metres per voxel edge.
-  float trunc_dist = 0.0f;          ///< Metres; the steps are fractions of it.
-  CodecParams params;               ///< K and the two steps.
-  std::uint32_t block_count = 0;    ///< Blocks the frame holds.
-  std::uint32_t segment_size = 0;   ///< Blocks per segment, at least 1.
+  float voxel_size = 0.0f;         ///< Metres per voxel edge.
+  float trunc_dist = 0.0f;         ///< Metres; the steps are fractions of it.
+  CodecParams params;              ///< K, global scale, and every basis weight.
+  std::uint32_t block_count = 0;   ///< Blocks the frame holds.
+  std::uint32_t segment_size = 0;  ///< Blocks per segment, at least 1.
   std::uint32_t section_count = 0;  ///< Entries in the section table.
 };
 
@@ -181,7 +190,7 @@ VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
 ///                    and only a sound frame is refused for its size.
 /// @return The frame, or: @ref Status::Code::Unsupported for another version,
 ///         frame type, block size, an unknown required section, or a known
-///         section with a flag v1 does not define;
+///         section with a flag v3 does not define;
 ///         @ref Status::Code::InvalidArgument for anything malformed,
 ///         truncated or inconsistent (coordinates out of order across
 ///         segments included); @ref Status::Code::OutOfMemory for a

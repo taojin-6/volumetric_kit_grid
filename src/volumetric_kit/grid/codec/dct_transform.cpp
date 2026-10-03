@@ -31,8 +31,6 @@ struct PushConstants {
   std::uint32_t num_blocks;
   std::uint32_t coefficient_count;
   float trunc_dist;
-  float dc_step;
-  float ac_step;
   float observed_weight;
   float decoded_weight;
   std::int32_t num_buckets;
@@ -41,20 +39,18 @@ struct PushConstants {
   std::int32_t max_quantized;
   std::uint32_t tick;  // the map's tick, which the inverse stamps blocks with
 };
-static_assert(sizeof(PushConstants) == 52, "PushConstants must be 52 bytes");
+static_assert(sizeof(PushConstants) == 44, "PushConstants must be 44 bytes");
 static_assert(offsetof(PushConstants, block_base) == 0, "layout drift");
 static_assert(offsetof(PushConstants, num_blocks) == 4, "layout drift");
 static_assert(offsetof(PushConstants, coefficient_count) == 8, "layout drift");
 static_assert(offsetof(PushConstants, trunc_dist) == 12, "layout drift");
-static_assert(offsetof(PushConstants, dc_step) == 16, "layout drift");
-static_assert(offsetof(PushConstants, ac_step) == 20, "layout drift");
-static_assert(offsetof(PushConstants, observed_weight) == 24, "layout drift");
-static_assert(offsetof(PushConstants, decoded_weight) == 28, "layout drift");
-static_assert(offsetof(PushConstants, num_buckets) == 32, "layout drift");
-static_assert(offsetof(PushConstants, bucket_size) == 36, "layout drift");
-static_assert(offsetof(PushConstants, max_chain) == 40, "layout drift");
-static_assert(offsetof(PushConstants, max_quantized) == 44, "layout drift");
-static_assert(offsetof(PushConstants, tick) == 48, "layout drift");
+static_assert(offsetof(PushConstants, observed_weight) == 16, "layout drift");
+static_assert(offsetof(PushConstants, decoded_weight) == 20, "layout drift");
+static_assert(offsetof(PushConstants, num_buckets) == 24, "layout drift");
+static_assert(offsetof(PushConstants, bucket_size) == 28, "layout drift");
+static_assert(offsetof(PushConstants, max_chain) == 32, "layout drift");
+static_assert(offsetof(PushConstants, max_quantized) == 36, "layout drift");
+static_assert(offsetof(PushConstants, tick) == 40, "layout drift");
 
 // The kernels' lane-to-line mapping is written for this edge (kEdge in
 // dct_common.glsl), which is why a grid with another block size is refused.
@@ -81,7 +77,8 @@ enum Binding : std::uint32_t {
   kBindingEntries = 6,
   kBindingRejected = 7,
   kBindingStamps = 8,
-  kBindingCount = 9,
+  kBindingQuantization = 9,
+  kBindingCount = 10,
 };
 
 Status fail(const char* op, const std::string& why) {
@@ -140,6 +137,8 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
   VR_ASSIGN(t.tables_, device_storage_buffer(allocator, sizeof(tables)));
   VR_ASSIGN(t.rejected_,
             device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  VR_ASSIGN(t.quantization_steps_,
+            device_storage_buffer(allocator, kVoxelsPerBlock * sizeof(float)));
   CommandBatch batch(device, allocator);
   VR_TRY(batch.upload(t.tables_, 0, &tables, sizeof(tables)));
   VR_TRY(batch.submit());
@@ -149,10 +148,15 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(t.rejected_.handle()),
                          "codec.rejected");
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         debug_object_handle(t.quantization_steps_.handle()),
+                         "codec.quantization_steps");
   for (ComputeKernel* kernel :
        {&t.forward_kernel_, &t.inverse_kernel_, &t.observed_kernel_}) {
     kernel->set.write_storage_buffer(kBindingTables, t.tables_.handle(), 0,
                                      VK_WHOLE_SIZE);
+    kernel->set.write_storage_buffer(
+        kBindingQuantization, t.quantization_steps_.handle(), 0, VK_WHOLE_SIZE);
     kernel->set.write_storage_buffer(kBindingRejected, t.rejected_.handle(), 0,
                                      VK_WHOLE_SIZE);
   }
@@ -226,8 +230,17 @@ Status DctTransform::record(CommandBatch& batch, ComputeKernel& kernel,
   push.num_blocks = count;
   push.coefficient_count = params.coefficient_count;
   push.trunc_dist = gp.trunc_dist;
-  push.dc_step = params.dc_step;
-  push.ac_step = params.ac_step;
+  if (coefficients != VK_NULL_HANDLE) {
+    // Compute once on the host, with the same float product validate() checked.
+    // A valid product may have a subnormal factor; Vulkan may flush such an
+    // operand to zero, so only the bounded normal effective steps reach it.
+    // Each call stages its own table before any dispatch reads it.
+    std::array<float, kVoxelsPerBlock> steps{};
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+      steps[i] = params.quantization_scale * params.quantization_weights[i];
+    }
+    VR_TRY(batch.upload(quantization_steps_, 0, steps.data(), sizeof(steps)));
+  }
   push.observed_weight = volume::kObservedWeight;
   push.decoded_weight = kDecodedWeight;
   push.num_buckets = gp.num_buckets;

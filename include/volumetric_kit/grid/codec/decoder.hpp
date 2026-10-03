@@ -39,16 +39,18 @@ struct FrameInfo {
   /// Blocks the frame holds; a grid decoding it needs at least this many
   /// (`num_blocks`), plus the hash-table room to place them.
   std::uint32_t block_count = 0;
-  /// The coefficient count and steps it was coded with.
+  /// The coefficient count, scale, and complete per-basis table it was coded
+  /// with.
   CodecParams params;
 };
 
-/// @brief Read a frame's header, and nothing after it.
+/// @brief Read a frame's complete header, including its quantization table.
 ///
 /// What a player calls on its first frame to build a grid of the geometry the
 /// stream carries (`voxel_size`, `trunc_dist`, `block_size` 8, and room for
 /// `block_count` blocks), before it can @ref Decoder::decode anything.
-/// @param data  The frame (at least its header).
+/// No entropy payload is read.
+/// @param data  The frame (at least its complete header).
 /// @param size  Bytes available at @p data.
 /// @return The header, or @ref Status::Code::Unsupported for another version,
 ///         frame type or block size, and @ref Status::Code::InvalidArgument
