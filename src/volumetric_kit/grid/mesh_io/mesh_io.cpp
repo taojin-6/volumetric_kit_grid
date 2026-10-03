@@ -16,7 +16,7 @@
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
 
-#include "io_detail.hpp"
+#include "errors.hpp"
 
 namespace volumetric_kit::recon::io {
 namespace {

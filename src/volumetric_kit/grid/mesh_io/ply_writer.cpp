@@ -10,7 +10,7 @@
 #include <ostream>
 #include <vector>
 
-#include "io_detail.hpp"
+#include "errors.hpp"
 #include "tinyply_backend.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
 
