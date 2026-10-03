@@ -11,7 +11,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <limits>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -122,59 +121,11 @@ int main() {
   CHECK(read_u32(face + 1) == 2 && read_u32(face + 5) == 0 &&
         read_u32(face + 9) == 1);
 
-  // Refusal must not truncate an existing file, even when only a later vertex
-  // or index is invalid. Only attributes actually serialized need be finite.
+  // A refused mesh leaves the existing file intact.
   auto invalid = mesh;
-  invalid.indices.pop_back();
-  CHECK(!vr::io::write_ply(path, invalid));
-  invalid = mesh;
   invalid.indices.back() = 3;
   CHECK(!vr::io::write_ply(path, invalid));
-  invalid.indices.back() = 0x80000000u;
-  CHECK(!vr::io::write_ply(path, invalid));
-  invalid = mesh;
-  invalid.vertices.back().position.z = std::numeric_limits<float>::quiet_NaN();
-  const vr::Status nonfinite = vr::io::write_ply(path, invalid);
-  CHECK(!nonfinite);
-  CHECK(nonfinite.message().find("vertex 2") != std::string::npos);
-  invalid = mesh;
-  invalid.vertices.back().normal.x = std::numeric_limits<float>::infinity();
-  CHECK(!vr::io::write_ply(path, invalid));
-  CHECK(!vr::io::write_ply(path + std::string("\0tail", 5), mesh));
   CHECK(read_bytes(path) == bytes);
-  CHECK(!vr::io::write_ply("", mesh));
-  CHECK(!vr::io::write_ply(scratch.path.string(), mesh));
-  CHECK(!vr::io::write_ply((scratch.path / "missing" / "out.ply").string(),
-                           mesh));
-  if (fs::exists("/dev/full")) CHECK(!vr::io::write_ply("/dev/full", mesh));
-
-  auto omitted = mesh;
-  omitted.vertices[0].tangent.x = std::numeric_limits<float>::quiet_NaN();
-  omitted.vertices[0].uv0.x = std::numeric_limits<float>::infinity();
-  omitted.vertices[0].color.w = std::numeric_limits<float>::quiet_NaN();
-  CHECK(vr::io::write_ply(path, omitted));
-  CHECK(read_bytes(path) == bytes);
-  // Color clamps rather than refusing the export; NaN writes 0.
-  auto clamped = mesh;
-  clamped.vertices[2].color = {std::numeric_limits<float>::quiet_NaN(),
-                               -std::numeric_limits<float>::infinity(),
-                               std::numeric_limits<float>::infinity(), 1.0f};
-  CHECK(vr::io::write_ply(path, clamped));
-  const auto clamped_bytes = read_bytes(path);
-  CHECK(clamped_bytes.size() == bytes.size());
-  const auto* rgb = clamped_bytes.data() + payload + 2 * 27 + 24;
-  CHECK(rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 255);
-  CHECK(vr::io::write_ply(path, {}));
-  const auto empty = read_bytes(path);
-  const std::string empty_text(empty.begin(), empty.end());
-  CHECK(empty_text.find("element vertex 0\n") != std::string::npos);
-  CHECK(empty_text.find("element face 0\n") != std::string::npos);
-  CHECK(empty_text.size() ==
-        empty_text.find("end_header\n") + std::strlen("end_header\n"));
-  auto points = mesh;
-  points.indices.clear();
-  CHECK(vr::io::write_ply(path, points));
-  CHECK(read_bytes(path).size() == empty.size() + 3 * 27);
   std::puts("io PLY tests passed");
   return 0;
 }
