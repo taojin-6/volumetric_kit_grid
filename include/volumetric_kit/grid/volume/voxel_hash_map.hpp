@@ -343,6 +343,21 @@ class VR_VOLUME_API VoxelHashMap {
   Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
                                AllocFailures* out_failures = nullptr);
 
+  /// @brief Remove blocks from a device buffer of @ref BlockIndex without
+  ///        downloading or uploading the coordinate list.
+  ///
+  /// As with the host overload, only coordinates are read, absent coordinates
+  /// are ignored, and attributes are not cleared. The caller must zero any
+  /// attributes before removing their blocks. The buffer must remain alive
+  /// and unchanged until this synchronous call returns.
+  /// @param coords  Storage buffer holding at least @p count block indices.
+  /// @param count   Number of entries; zero is a no-op.
+  /// @param out_failures  Optional per-reason failure counts.
+  /// @return The number of failed removals, or a non-OK @ref Status for an
+  ///         invalid input, allocation failure, or failed dispatch.
+  Result<std::uint32_t> remove(const Buffer& coords, std::uint32_t count,
+                               AllocFailures* out_failures = nullptr);
+
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
   /// @param metrics  Optional @ref StageMetrics collecting an `"active set"`
   ///                 row -- host and device. Named with @ref
@@ -682,18 +697,16 @@ class VR_VOLUME_API VoxelHashMap {
                                    VkDeviceSize bytes);
 
   /// Shared body of the per-element allocate kernels (@ref allocate,
-  /// @ref remove, @ref allocate_from_points): upload @p count elements of
-  /// @p elem_size bytes to the input binding (4) of @p kernel's set, then run
+  /// @ref remove, @ref allocate_from_points): stage or bind @p count elements
+  /// of @p elem_size bytes at input binding (4) of @p kernel's set, then run
   /// @p kernel over them (one thread per element) via @ref dispatch_with_retry.
   /// @p op names the caller for diagnostics. @p done_flags binds a zeroed
   /// flag per element at binding 6, which @ref remove's kernel sets on each
   /// coord it finishes so later rounds skip it.
-  Result<std::uint32_t> run_input_kernel(const char* op, const void* data,
-                                         std::size_t elem_size,
-                                         std::uint32_t count,
-                                         const ComputeKernel& kernel,
-                                         AllocFailures* out_failures,
-                                         bool done_flags = false);
+  Result<std::uint32_t> run_input_kernel(
+      const char* op, const StorageInput& input, std::size_t elem_size,
+      std::uint32_t count, const ComputeKernel& kernel,
+      AllocFailures* out_failures, bool done_flags = false);
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and

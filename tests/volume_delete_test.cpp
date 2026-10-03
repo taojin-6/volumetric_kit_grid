@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -202,6 +204,57 @@ int main() {
   CHECK(ptrs_after.ok());
   CHECK(ptrs_after.value() == ptrs_before.value());
 
+  // Device coordinates follow exactly the same retry/heap protocol. Duplicate
+  // and absent entries must not free twice; an occupied trailing entry beyond
+  // count must not be read. This list has no host mapping.
+  std::vector<vol::BlockIndex> device_coords = corners;
+  device_coords.insert(device_coords.end(), corners.begin(), corners.end());
+  device_coords.push_back(absent);
+  const auto device_count = static_cast<std::uint32_t>(device_coords.size());
+  device_coords.push_back(vol::BlockIndex{});  // centre (0,0,0): must survive
+  auto device_list = vr::device_storage_buffer(
+      allocator.value(), device_coords.size() * sizeof(vol::BlockIndex));
+  CHECK(device_list.ok() && device_list->mapped() == nullptr);
+  {
+    vr::CommandBatch batch(device.value(), allocator.value());
+    CHECK(batch
+              .upload(device_list.value(), 0, device_coords.data(),
+                      device_coords.size() * sizeof(vol::BlockIndex))
+              .ok());
+    CHECK(batch.submit().ok());
+  }
+  auto cached = map.compact_active_blocks_on_device();
+  CHECK(cached.ok() &&
+        map.check_device_block_list(cached.value(), "test").ok());
+  auto device_removed = map.remove(device_list.value(), device_count);
+  CHECK(device_removed.ok() && device_removed.value() == 0);
+  CHECK(!map.check_device_block_list(cached.value(), "test").ok());
+  auto device_survivors = active_set(map);
+  CHECK(device_survivors.ok() &&
+        device_survivors.value() == after_remove.value());
+  device_removed = map.remove(device_list.value(), device_count);
+  CHECK(device_removed.ok() && device_removed.value() == 0);
+  realloc_fail =
+      map.allocate(corners.data(), static_cast<std::uint32_t>(corners.size()));
+  CHECK(realloc_fail.ok() && realloc_fail.value() == 0);
+  auto device_ptrs = active_ptrs(map);
+  CHECK(device_ptrs.ok() && device_ptrs.value() == ptrs_before.value());
+
+  const vr::Buffer empty;
+  CHECK(map.remove(empty, 0).ok());
+  CHECK(map.remove(empty, 1).status().domain() ==
+        vr::Status::Code::InvalidArgument);
+  CHECK(map.remove(device_list.value(), device_count + 2).status().domain() ==
+        vr::Status::Code::InvalidArgument);
+  vr::BufferDesc transfer_desc;
+  transfer_desc.size = sizeof(vol::BlockIndex);
+  transfer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  transfer_desc.memory = vr::MemoryUsage::DeviceLocal;
+  auto transfer_only = allocator.value().create_buffer(transfer_desc);
+  CHECK(transfer_only.ok());
+  CHECK(map.remove(transfer_only.value(), 1).status().domain() ==
+        vr::Status::Code::InvalidArgument);
+
   // Thousands of blocks freed in one call all go back to the heap, and are
   // drawn off it again with no pass calling a half-free heap empty. A capped
   // compare-and-swap loop lost about 960 of 2 048 removed blocks for good, and
@@ -241,6 +294,17 @@ int main() {
       return occupancy.ok() && occupancy.value() == want;
     };
     CHECK(place(slab));
+    auto half_on_device = vr::device_storage_buffer(
+        allocator.value(), half.size() * sizeof(vol::BlockIndex));
+    CHECK(half_on_device.ok());
+    {
+      vr::CommandBatch batch(device.value(), allocator.value());
+      CHECK(batch
+                .upload(half_on_device.value(), 0, half.data(),
+                        half.size() * sizeof(vol::BlockIndex))
+                .ok());
+      CHECK(batch.submit().ok());
+    }
     vr::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
     for (int cycle = 0; cycle < 3; ++cycle) {
@@ -249,7 +313,10 @@ int main() {
       // (terminal) and blocks left behind fail on separate lines.
       vol::AllocFailures failures{};
       vr::Result<std::uint32_t> removed =
-          big.remove(half.data(), std::uint32_t(half.size()), &failures);
+          cycle % 2 == 0
+              ? big.remove(half_on_device.value(), std::uint32_t(half.size()),
+                           &failures)
+              : big.remove(half.data(), std::uint32_t(half.size()), &failures);
       CHECK(removed.ok());
       CHECK(failures.terminal == 0);
       CHECK(removed.value() == 0);
