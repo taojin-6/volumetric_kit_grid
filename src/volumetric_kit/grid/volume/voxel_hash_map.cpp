@@ -471,7 +471,7 @@ Result<Buffer> VoxelHashMap::upload_to_binding(CommandBatch& batch,
 Result<std::uint32_t> VoxelHashMap::run_input_kernel(
     const char* op, const StorageInput& input, std::size_t elem_size,
     std::uint32_t count, const ComputeKernel& kernel,
-    AllocFailures* out_failures, bool done_flags) {
+    AllocFailures* out_failures, bool removes) {
   if (!valid()) {
     return Status::invalid_argument(std::string(op) + ": moved-from map");
   }
@@ -486,6 +486,15 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   VR_TRY(input.check(op, input_bytes));
   VR_TRY(
       check_storage_buffer_range(op, input_bytes, max_storage_buffer_range_));
+  if (removes) {
+    // Moved once the input is accepted and BEFORE the dispatch: this is the
+    // only place a block index is handed back to the heap, so a slot-keyed
+    // cache is stale the moment the kernel runs -- whether it removes every
+    // coord, some of them, or reports failures. A caller that reads the token
+    // between the dispatch and a check placed after it would read the
+    // pre-removal value.
+    topology_epoch_ = next_topology_epoch();
+  }
   Buffer input_buf;  // alive across every round
   Buffer done_buf;
   const PushConstants push{grid_, count, tick_};
@@ -499,7 +508,7 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
         VR_ASSIGN(const VkBuffer input_handle,
                   input.buffer(batch, *allocator_, input_bytes, input_buf));
         kernel.set.write_storage_buffer(4, input_handle, 0, input_bytes);
-        if (done_flags) {
+        if (removes) {
           const VkDeviceSize bytes =
               VkDeviceSize(count) * sizeof(std::uint32_t);
           VR_ASSIGN(done_buf, device_storage_buffer(*allocator_, bytes));
@@ -698,12 +707,6 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
 Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
                                            std::uint32_t count,
                                            AllocFailures* out_failures) {
-  // Moved BEFORE the dispatch and unconditionally: this is the only place a
-  // block index is handed back to the heap, so a slot-keyed cache is stale the
-  // moment the kernel runs -- whether it removes every coord, some of them, or
-  // reports failures. A caller that reads the token between the dispatch and a
-  // check placed after it would read the pre-removal value.
-  topology_epoch_ = next_topology_epoch();
   return run_input_kernel("VoxelHashMap::remove", StorageInput(coords),
                           sizeof(BlockIndex), count, delete_, out_failures,
                           true);
@@ -712,9 +715,6 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
 Result<std::uint32_t> VoxelHashMap::remove(const Buffer& coords,
                                            std::uint32_t count,
                                            AllocFailures* out_failures) {
-  // The same invalidation and retry protocol as the host overload. Deleting
-  // through the producer's buffer must also invalidate cached block lists.
-  topology_epoch_ = next_topology_epoch();
   return run_input_kernel("VoxelHashMap::remove", StorageInput(coords),
                           sizeof(BlockIndex), count, delete_, out_failures,
                           true);
