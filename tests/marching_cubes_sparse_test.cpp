@@ -556,6 +556,112 @@ std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
   return tris;
 }
 
+// Removal, a full fallback, and later slot reuse must keep the survivor.
+int reused_slot_case(const vr_test::Gpu& ctx, bool share, bool empty_first) {
+  auto gp = sphere_grid_params();
+  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
+                                      {"weight", sizeof(float)}};
+  auto made =
+      vol::VoxelBlockGrid::create(ctx.device, ctx.allocator, gp, attrs, 2);
+  CHECK(made.ok());
+  auto grid = std::move(made).value();
+  vol::BlockIndex coords[2]{};
+  coords[0].coord = vr::Vec3i(0, 0, 0);
+  coords[1].coord = vr::Vec3i(3, 0, 0);
+  CHECK(grid.map().allocate(coords, 2).value() == 0);
+  auto active = grid.map().compact_active_blocks();
+  CHECK(active.ok() && active->size() == 2);
+  std::vector<float> field(gp.num_blocks * 512, 0),
+      weights(gp.num_blocks * 512, 0);
+  std::vector<std::uint32_t> slots;
+  for (const auto& b : active.value()) {
+    slots.push_back(b.ptr / 512);
+    for (int i = 0; i < 512; ++i) {
+      field[b.ptr + i] = (float(i / 64) - 3.5f) * gp.voxel_size;
+      weights[b.ptr + i] = 1.0f;
+    }
+  }
+  CHECK(write_attributes(ctx, grid, field, weights));
+  CHECK(stamp_changed(ctx, grid, slots));
+  mesh::MarchingCubesConfig cfg;
+  cfg.track_block_spans = true;
+  cfg.share_vertices = share;
+  auto mc_result = mesh::MarchingCubes::create(ctx.device, ctx.allocator, cfg);
+  CHECK(mc_result.ok());
+  auto mc = std::move(mc_result).value();
+  auto first = mc.extract_device(grid);
+  CHECK(first.ok());
+  auto initial = mc.download(first.value());
+  CHECK(initial.ok() && initial->indices.size() / 3 == 196);
+  vol::BlockIndex removed{}, survivor{};
+  for (const auto& b : active.value()) {
+    if (mc.block_spans()[b.ptr / 512].triangle_base == 0)
+      removed = b;
+    else
+      survivor = b;
+  }
+  CHECK(removed.ptr != survivor.ptr);
+  CHECK(grid.remove(&removed, 1).value() == 0);
+  mesh::ExtractTimings fallback_time;
+  auto fallback = mc.extract_device_incremental(grid, 0.0f, &fallback_time);
+  CHECK(fallback.ok() && !fallback_time.incremental);
+  auto fallback_mesh = mc.download(fallback.value());
+  CHECK(fallback_mesh.ok() && fallback_mesh->indices.size() / 3 == 98);
+  CHECK(!mc.block_span_valid(grid, removed.ptr / 512));
+  vol::BlockIndex replacement{};
+  replacement.coord = vr::Vec3i(6, 0, 0);
+  CHECK(grid.map().allocate(&replacement, 1).value() == 0);
+  auto now = grid.map().compact_active_blocks();
+  CHECK(now.ok() && now->size() == 2);
+  for (const auto& b : now.value())
+    if (b.coord == replacement.coord) replacement = b;
+  CHECK(replacement.ptr == removed.ptr);
+  if (empty_first) {
+    // A newly allocated block without observations is clean. It must not
+    // inherit geometry before its first voxel write either.
+    mesh::ExtractTimings clean_time;
+    auto clean = mc.extract_device_incremental(grid, 0.0f, &clean_time);
+    CHECK(clean.ok() && clean_time.incremental);
+    CHECK(mc.block_spans()[replacement.ptr / 512].triangle_count == 0);
+    auto clean_mesh = mc.download(clean.value());
+    CHECK(clean_mesh.ok() && clean_mesh->indices.size() / 3 == 98);
+  }
+  auto field_now =
+      vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, "tsdf");
+  auto weight_now =
+      vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, "weight");
+  CHECK(field_now.ok() && weight_now.ok());
+  for (int i = 0; i < 512; ++i) {
+    (field_now.value())[replacement.ptr + i] =
+        (float(i / 64) - 3.5f) * gp.voxel_size;
+    (weight_now.value())[replacement.ptr + i] = 1.0f;
+  }
+  CHECK(write_attributes(ctx, grid, field_now.value(), weight_now.value()));
+  CHECK(stamp_changed(ctx, grid, {std::uint32_t(replacement.ptr / 512)}));
+  mesh::ExtractTimings inc_time;
+  auto incremental = mc.extract_device_incremental(grid, 0.0f, &inc_time);
+  CHECK(incremental.ok());
+  auto got = mc.download(incremental.value());
+  CHECK(got.ok());
+  auto full_made = mesh::MarchingCubes::create(ctx.device, ctx.allocator, cfg);
+  CHECK(full_made.ok());
+  auto full = full_made->extract_host(grid);
+  CHECK(full.ok());
+  std::size_t surviving = 0;
+  const float xmin = survivor.coord.x * 8 * gp.voxel_size;
+  const float xmax = xmin + 7 * gp.voxel_size;
+  for (std::size_t i = 0; i < got->indices.size(); i += 3) {
+    float x = got->vertices[got->indices[i]].position.x;
+    if (x >= xmin && x <= xmax) ++surviving;
+  }
+  CHECK(inc_time.incremental && inc_time.remeshed_blocks == 1);
+  CHECK(full->indices.size() / 3 == 196 && surviving == 98);
+  CHECK(canonical_triangles(got.value()) == canonical_triangles(full.value()));
+  CHECK(spans_describe(mc, got.value(), now.value(), gp.block_size,
+                       gp.voxel_size));
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -586,6 +692,11 @@ int main() {
     return 1;
   }
   const vr_test::Gpu ctx{device.value(), allocator.value()};
+  for (bool share : {false, true}) {
+    for (bool empty_first : {false, true}) {
+      CHECK(reused_slot_case(ctx, share, empty_first) == 0);
+    }
+  }
 
   // The main extractor asks for the span table; most of the fixtures below do
   // not, which is the point -- track_block_spans is off by default and the

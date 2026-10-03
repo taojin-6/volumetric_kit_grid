@@ -661,10 +661,11 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   // and a stamp is only ever equal to the one that wrote it, so every stamp
   // standing from before this call already fails block_span_valid's equality
   // test -- clearing them would be a 12 MB write to reach a state that already
-  // holds. The span buffer keeps its old contents for the same reason: an entry
-  // no stamp vouches for is unreadable through the documented path, and zeroing
-  // 24 MB to make it unreadable twice buys nothing. (The grow below still
-  // zeroes the tail it adds -- that memory is uninitialized, not merely stale.)
+  // holds. The span buffer keeps its old contents too: host reads require a
+  // matching stamp, and extract_device_impl clears only the active entries
+  // the previous extract did not own before an incremental GPU dispatch.
+  // There is no whole-table clear. The grow below still zeroes the tail it
+  // adds -- that memory is uninitialized, not merely stale.
   //
   // The token alone is the anchor: it is drawn from a process-wide counter, so
   // it names one table's one topology across the whole program. A grid pointer
@@ -1599,6 +1600,20 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       capacity <= arena_capacity();
 
   VR_TRY(ensure_block_spans(grid));
+  if (incremental) {
+    // The host stamps also guard the GPU's reuse. A slot absent from the
+    // previous extract can still hold a span from before a remove and full
+    // fallback; that range now belongs to another block. Clear only such
+    // entries before either kernel reads them, including newly allocated
+    // blocks that have not yet been stamped changed.
+    auto* spans = static_cast<BlockSpan*>(block_spans_.mapped());
+    for (std::uint32_t i = 0; i < active.count; ++i) {
+      const auto slot = static_cast<std::uint32_t>(active.blocks[i].ptr) / vpb;
+      if (span_stamp_[slot] != prev_arena.serial) {
+        spans[slot] = BlockSpan{};
+      }
+    }
+  }
   // The reset is only recorded, so a failure here disarms what the last
   // extract left in the command -- a grow may already have freed its arena.
   if (Status sized = ensure_output_buffers(
@@ -1910,19 +1925,10 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       const volume::BlockIndex& b = active.blocks[i];
       const auto slot =
           static_cast<std::uint32_t>(b.ptr) / static_cast<std::uint32_t>(vpb);
-      // Summed BEFORE the stamp below overwrites it, and only for a slot the
-      // PREVIOUS extract vouched for. Capacity alone is not that test: a span
-      // sits in the table until something overwrites it, so a block the last
-      // pass never dispatched still holds a range from whenever it last was --
-      // describing an arena that has since been rebuilt. Counting those
-      // inflates the occupancy denominator, which is the wrong direction
-      // twice: `over_occupied` is what forces the compacting full pass, so an
-      // inflated `live` is exactly what stops the recovery from firing.
-      // Compared against prev_arena.serial rather than span_serial_, which
-      // ensure_block_spans has already bumped -- that would compare a value
-      // with itself.
-      if (incremental && slot < stamps &&
-          span_stamp_[slot] == prev_arena.serial) {
+      // Every active slot is now current: an incremental pass cleared entries
+      // the previous extract did not own before dispatch. Include new blocks'
+      // freshly emitted spans as well as retained ones in the live count.
+      if (incremental && slot < stamps) {
         live_sum += spans[slot].triangle_count;
         live_vert_sum += spans[slot].vertex_count;
       }
