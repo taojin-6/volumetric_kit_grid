@@ -438,15 +438,13 @@ Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(std::uint32_t max_age,
   GpuStageScope stage(metrics, gpu_timer_, "block stamps");
   VR_ASSIGN(const std::uint32_t stale, block_pass(max_age, stage, metrics));
   if (stale == 0) return std::uint32_t{0};
-  // Zero the blocks where the pass listed them, a dispatch an attribute, and
-  // read the list back for remove, which takes host coordinates.
-  const VkDeviceSize list_bytes = VkDeviceSize(stale) * sizeof(BlockIndex);
-  std::vector<BlockIndex> blocks(stale);
+  // Both zeroing and deletion consume the device list the stamp pass wrote.
+  // Only the small stale/failure counts reach the host; the coordinates never
+  // make a round trip through a host vector and a second device allocation.
   CommandBatch batch(*device_, *allocator_);
   VR_TRY(record_zero(batch, stale_list_, stale, &stage));
-  VR_TRY(batch.readback(stale_list_, 0, list_bytes, blocks.data()));
   VR_TRY(batch.submit());
-  VR_ASSIGN(const std::uint32_t failed, map_.remove(blocks.data(), stale));
+  VR_ASSIGN(const std::uint32_t failed, map_.remove(stale_list_, stale));
   return stale - std::min(failed, stale);
 }
 

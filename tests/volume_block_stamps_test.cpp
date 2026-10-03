@@ -292,6 +292,25 @@ int main() {
     CHECK(s.requested == 0 && s.weighted == 0 && s.changed == 0);
   }
 
+  // Repeated GC grows then reuses a device stale-list buffer. A later short
+  // list must delete only its live prefix, without stale entries from the
+  // longer previous pass or a host coordinate copy.
+  for (const int count : {7, 120, 3}) {
+    std::vector<vol::BlockIndex> coords;
+    for (int i = 0; i < count; ++i) coords.push_back(at(1000 + i));
+    auto placed =
+        map.allocate(coords.data(), static_cast<std::uint32_t>(count));
+    CHECK(placed.ok() && placed.value() == 0);
+    map.advance_tick();
+    map.advance_tick();
+    auto gone = grid.free_stale_blocks(1);
+    CHECK(gone.ok() && gone.value() == static_cast<std::uint32_t>(count));
+    auto remaining = slots(grid);
+    CHECK(remaining.ok() && remaining.value().empty());
+    auto again = grid.free_stale_blocks(1);
+    CHECK(again.ok() && again.value() == 0);
+  }
+
   // Refusals: a max_age of 0, and a grid with no weight.
   CHECK(grid.free_stale_blocks(0).status().domain() ==
         vr::Status::Code::InvalidArgument);

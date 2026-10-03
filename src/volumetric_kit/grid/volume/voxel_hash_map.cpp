@@ -469,7 +469,7 @@ Result<Buffer> VoxelHashMap::upload_to_binding(CommandBatch& batch,
 }
 
 Result<std::uint32_t> VoxelHashMap::run_input_kernel(
-    const char* op, const void* data, std::size_t elem_size,
+    const char* op, const StorageInput& input, std::size_t elem_size,
     std::uint32_t count, const ComputeKernel& kernel,
     AllocFailures* out_failures, bool done_flags) {
   if (!valid()) {
@@ -478,16 +478,12 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   if (count == 0) {
     return std::uint32_t{0};
   }
-  if (data == nullptr) {
-    return Status::invalid_argument(std::string(op) + ": input is null");
-  }
-
-  // The input is genuinely per-call (variable count), so this buffer is
-  // transient; fail_counts_ is persistent and re-zeroed per round inside
-  // dispatch_with_retry. It is bound whole, so reject one past what a single
-  // binding may cover rather than leaving invalid usage the validation layer
-  // alone would notice.
+  // Host input is staged once; a device input stays where its producer wrote
+  // it. fail_counts_ is persistent and re-zeroed per round inside
+  // dispatch_with_retry. Bound the input to the logical count and reject a
+  // range larger than one storage binding may cover.
   const VkDeviceSize input_bytes = VkDeviceSize(count) * elem_size;
+  VR_TRY(input.check(op, input_bytes));
   VR_TRY(
       check_storage_buffer_range(op, input_bytes, max_storage_buffer_range_));
   Buffer input_buf;  // alive across every round
@@ -500,8 +496,9 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
       },
       out_failures,
       [&](CommandBatch& batch) -> Status {
-        VR_ASSIGN(input_buf,
-                  upload_to_binding(batch, kernel.set, 4, data, input_bytes));
+        VR_ASSIGN(const VkBuffer input_handle,
+                  input.buffer(batch, *allocator_, input_bytes, input_buf));
+        kernel.set.write_storage_buffer(4, input_handle, 0, input_bytes);
         if (done_flags) {
           const VkDeviceSize bytes =
               VkDeviceSize(count) * sizeof(std::uint32_t);
@@ -517,8 +514,8 @@ Result<std::uint32_t> VoxelHashMap::run_input_kernel(
 Result<std::uint32_t> VoxelHashMap::allocate(const BlockIndex* coords,
                                              std::uint32_t count,
                                              AllocFailures* out_failures) {
-  return run_input_kernel("VoxelHashMap::allocate", coords, sizeof(BlockIndex),
-                          count, allocate_, out_failures);
+  return run_input_kernel("VoxelHashMap::allocate", StorageInput(coords),
+                          sizeof(BlockIndex), count, allocate_, out_failures);
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
@@ -625,8 +622,9 @@ Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_points(
     const Vec3f* points, std::uint32_t count, AllocFailures* out_failures) {
-  return run_input_kernel("VoxelHashMap::allocate_from_points", points,
-                          sizeof(Vec3f), count, points_, out_failures);
+  return run_input_kernel("VoxelHashMap::allocate_from_points",
+                          StorageInput(points), sizeof(Vec3f), count, points_,
+                          out_failures);
 }
 
 Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
@@ -706,8 +704,20 @@ Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
   // reports failures. A caller that reads the token between the dispatch and a
   // check placed after it would read the pre-removal value.
   topology_epoch_ = next_topology_epoch();
-  return run_input_kernel("VoxelHashMap::remove", coords, sizeof(BlockIndex),
-                          count, delete_, out_failures, true);
+  return run_input_kernel("VoxelHashMap::remove", StorageInput(coords),
+                          sizeof(BlockIndex), count, delete_, out_failures,
+                          true);
+}
+
+Result<std::uint32_t> VoxelHashMap::remove(const Buffer& coords,
+                                           std::uint32_t count,
+                                           AllocFailures* out_failures) {
+  // The same invalidation and retry protocol as the host overload. Deleting
+  // through the producer's buffer must also invalidate cached block lists.
+  topology_epoch_ = next_topology_epoch();
+  return run_input_kernel("VoxelHashMap::remove", StorageInput(coords),
+                          sizeof(BlockIndex), count, delete_, out_failures,
+                          true);
 }
 
 Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
