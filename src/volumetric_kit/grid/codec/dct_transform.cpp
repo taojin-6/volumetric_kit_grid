@@ -25,7 +25,7 @@ namespace {
 
 // Mirrors `PushConstants` in dct_common.glsl. All 4-byte scalars, so scalar
 // layout puts each at its host offset; a drift is a compile error here, not a
-// kernel reading the steps as the block count.
+// kernel reading one field as another.
 struct PushConstants {
   std::uint32_t block_base;
   std::uint32_t num_blocks;
@@ -242,10 +242,8 @@ Status DctTransform::record(CommandBatch& batch, ComputeKernel& kernel,
   push.coefficient_count = params.coefficient_count;
   push.trunc_dist = gp.trunc_dist;
   if (coefficients != VK_NULL_HANDLE) {
-    // Compute once on the host, with the same float product validate() checked.
-    // A valid product may have a subnormal factor; Vulkan may flush such an
-    // operand to zero, so only the bounded normal effective steps reach it.
-    // Each call stages its own table before any dispatch reads it.
+    // The same float products validate() checked, staged before any dispatch
+    // reads them.
     std::array<float, kVoxelsPerBlock> steps{};
     for (std::size_t i = 0; i < steps.size(); ++i) {
       steps[i] = params.quantization_scale * params.quantization_weights[i];
@@ -284,13 +282,8 @@ Status DctTransform::check_rejected(const char* op, std::uint32_t rejected,
 
 Status DctTransform::ensure_scratch(Buffer& buffer, VkDeviceSize bytes,
                                     const char* name) {
-  VR_TRY(check_storage_buffer_range(name, bytes, max_storage_buffer_range_));
-  if (!buffer.valid() || buffer.size() < bytes) {
-    VR_ASSIGN(buffer, device_storage_buffer(*allocator_, bytes));
-    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                             debug_object_handle(buffer.handle()), name);
-  }
-  return {};
+  return ensure_device_scratch(*device_, *allocator_, buffer, bytes,
+                               max_storage_buffer_range_, name);
 }
 
 Status DctTransform::upload_list(CommandBatch& batch,
@@ -309,23 +302,22 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
   VR_TRY(grid.map().check_device_block_list(list, "DctTransform::observed"));
   std::vector<volume::BlockIndex> out;
   if (list.count == 0) {
-    last_observed_count_ = 0;
-    has_observed_count_ = true;
+    last_observed_.count = 0;
     return out;
   }
   const VkDeviceSize list_bytes =
       VkDeviceSize(list.count) * sizeof(volume::BlockIndex);
   VR_TRY(ensure_scratch(observed_blocks_, list_bytes, "codec.observed_blocks"));
   // Read a predicted prefix beside the count, rather than pay a second fence
-  // on every call. The first call takes the input count; later calls take the
-  // last observed count plus 25%, capped by the current input count. Only an
-  // outgrown prefix costs another transfer, just as collect_compacted does.
+  // on every call: the last observed count plus 25%, capped by the current
+  // input count, or the whole input when there is no last count (the first
+  // call, or one after an empty result). Only an outgrown prefix costs
+  // another transfer, just as collect_compacted does.
+  const std::uint32_t last = last_observed_.count;
   const std::uint32_t guess =
-      has_observed_count_
-          ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                list.count,
-                std::uint64_t(last_observed_count_) + last_observed_count_ / 4))
-          : list.count;
+      last == 0 ? list.count
+                : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                      list.count, std::uint64_t(last) + last / 4));
   out.resize(guess);
   Counts counts;
   CommandBatch batch(*device_, *allocator_);
@@ -350,8 +342,7 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
         out.data() + guess));
     VR_TRY(tail.submit());
   }
-  last_observed_count_ = counts.observed;
-  has_observed_count_ = true;
+  last_observed_.count = counts.observed;
   return out;
 }
 
@@ -372,10 +363,6 @@ Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
         VkDeviceSize(blocks.count) * padded * sizeof(std::int16_t);
     const VkDeviceSize mask_bytes =
         VkDeviceSize(blocks.count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
-    VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
-                                      coeff_bytes, max_storage_buffer_range_));
-    VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
-                                      max_storage_buffer_range_));
     VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
     VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
 
@@ -442,10 +429,6 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
       VkDeviceSize(blocks.count) * padded * sizeof(std::int16_t);
   const VkDeviceSize mask_bytes =
       VkDeviceSize(mask_count) * sizeof(std::uint32_t);
-  VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
-                                    coeff_bytes, max_storage_buffer_range_));
-  VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
-                                    max_storage_buffer_range_));
   VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
   VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
 

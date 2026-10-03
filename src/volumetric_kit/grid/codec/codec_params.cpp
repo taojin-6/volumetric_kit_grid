@@ -6,6 +6,8 @@
 #include <cmath>
 #include <string>
 
+#include "dct_tables.hpp"
+
 namespace volumetric_kit::recon::codec {
 namespace {
 
@@ -30,16 +32,21 @@ Status CodecParams::validate() const {
         "CodecParams: coefficient_count must be in [1, " +
         std::to_string(kVoxelsPerBlock) + "]");
   }
-  if (!(quantization_scale > 0.0f) || !std::isfinite(quantization_scale)) {
+  // Normal, not merely positive: a host or device that flushes subnormals to
+  // zero would otherwise disagree about whether the frame is valid.
+  if (!(quantization_scale > 0.0f) || !std::isnormal(quantization_scale)) {
     return Status::invalid_argument(
-        "CodecParams: quantization_scale must be finite and positive");
+        "CodecParams: quantization_scale must be normal and positive");
   }
-  for (std::size_t i = 0; i < quantization_weights.size(); ++i) {
+  // Only the K kept frequencies are quantized, so only their weights count.
+  static const auto zigzag = detail::zigzag_order();
+  for (std::uint32_t j = 0; j < coefficient_count; ++j) {
+    const std::size_t i = zigzag[j];
     const float weight = quantization_weights[i];
-    if (!(weight > 0.0f) || !std::isfinite(weight)) {
+    if (!(weight > 0.0f) || !std::isnormal(weight)) {
       return Status::invalid_argument("CodecParams: quantization_weights[" +
                                       std::to_string(i) +
-                                      "] must be finite and positive");
+                                      "] must be normal and positive");
     }
     VR_TRY(check_step(i, quantization_scale * weight));
   }

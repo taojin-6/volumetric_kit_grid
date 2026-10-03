@@ -69,9 +69,9 @@ int params_validate_case() {
     CHECK(!p.validate().ok());
   }
 
-  // Validate every canonical table entry, including those beyond K; no
-  // special DC rule exists. Bad products include overflow and underflow.
-  p.coefficient_count = 1;
+  // Validate the kept table entries; no special DC rule exists. Bad products
+  // include overflow and underflow, and a subnormal factor is refused.
+  p.coefficient_count = kVoxelsPerBlock;
   p.quantization_scale = 0.2f;
   for (std::size_t i : {std::size_t(0), std::size_t(1), std::size_t(8),
                         std::size_t(64), std::size_t(511)}) {
@@ -90,14 +90,25 @@ int params_validate_case() {
   p.quantization_weights.fill(1e-30f);
   CHECK(!p.validate().ok());  // finite factors, zero product
 
-  // Subnormal factors are permitted when their product is a valid normal
-  // step. The transform stages this host product, never the tiny GPU operand.
+  // A subnormal factor is refused even when the product is a normal step, so
+  // validity cannot depend on a host's denormals-as-zero mode.
   p.quantization_scale = 1e-40f;
   p.quantization_weights.fill(1e38f);
-  CHECK(p.validate().ok());
+  CHECK(!p.validate().ok());
   p.quantization_scale = 1e38f;
   p.quantization_weights.fill(1e-40f);
+  CHECK(!p.validate().ok());
+
+  // Only kept weights count: K = 1 keeps DC alone.
+  p.coefficient_count = 1;
+  p.quantization_scale = 0.2f;
+  p.quantization_weights.fill(1.0f);
+  p.quantization_weights[511] = 0.0f;
   CHECK(p.validate().ok());
+  p.quantization_weights[0] = 0.0f;
+  CHECK(!p.validate().ok());
+  p.quantization_weights.fill(1.0f);
+  p.coefficient_count = kVoxelsPerBlock;
 
   // Only the product is bounded: rescaling a table is permitted, and DC
   // weight 1 is a preset convention rather than an API restriction.

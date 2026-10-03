@@ -14,6 +14,7 @@
 /// against it in a shared-library build too.
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "dct_blocks.hpp"
@@ -170,10 +171,11 @@ class VR_CODEC_API DctTransform {
   /// What the encoder keeps, found before the forward transform rather than
   /// after it. This reads each block's weights alone and appends only observed
   /// entries to a device list. A predicted prefix (the last count plus 25%,
-  /// bounded by the input count; the full input count on the first call) is
-  /// read back with the count and rejection tally. A growing result reads its
-  /// remaining tail in a second batch. The encoder sorts the returned entries
-  /// by coordinate before transforming, so append order cannot affect bytes.
+  /// bounded by the input count; the full input count when the last count is
+  /// zero or there is none) is read back with the count and rejection tally. A
+  /// growing result reads its remaining tail in a second batch. The encoder
+  /// sorts the returned entries by coordinate before transforming, so append
+  /// order cannot affect bytes.
   /// @param grid   As @ref forward.
   /// @param list   The map's own active list, bound where it is
   ///               (@ref
@@ -218,7 +220,8 @@ class VR_CODEC_API DctTransform {
                 VkBuffer list, std::uint32_t count, const CodecParams& params,
                 VkBuffer coefficients, VkBuffer masks, VkDeviceSize masks_bytes,
                 GpuStageScope* stage);
-  /// Grow @p buffer if needed, retaining it for later calls.
+  /// Grow @p buffer if needed, retaining it for later calls
+  /// (@ref ensure_device_scratch).
   Status ensure_scratch(Buffer& buffer, VkDeviceSize bytes, const char* name);
   /// Stage @p blocks onto the retained block-list buffer, in @p batch.
   Status upload_list(CommandBatch& batch, const volume::BlockList& blocks);
@@ -258,9 +261,20 @@ class VR_CODEC_API DctTransform {
   Buffer block_list_;
   Buffer coefficients_;
   Buffer masks_;
-  // Readback prediction only: every call still obtains and checks its count.
-  std::uint32_t last_observed_count_ = 0;
-  bool has_observed_count_ = false;
+  // The last observed count, the readback prediction only: every call still
+  // obtains and checks its count. 0 predicts the whole input. Reset on move,
+  // like every owned member.
+  struct ObservedCount {
+    std::uint32_t count = 0;
+    ObservedCount() = default;
+    ObservedCount(ObservedCount&& other) noexcept
+        : count(std::exchange(other.count, 0)) {}
+    ObservedCount& operator=(ObservedCount&& other) noexcept {
+      count = std::exchange(other.count, 0);
+      return *this;
+    }
+  };
+  ObservedCount last_observed_;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

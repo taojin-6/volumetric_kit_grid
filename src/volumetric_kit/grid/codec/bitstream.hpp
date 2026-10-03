@@ -21,12 +21,12 @@
 ///       16     4  block_size          (8)
 ///       20     4  coefficient_count K
 ///       24     4  quantization_scale  (f32, fraction of trunc_dist)
-///       28     4  quantization weight count (512)
+///       28     4  quantization weight count (K)
 ///       32     4  block_count N
 ///       36     4  segment_size R
 ///       40     4  section_count S
-///       44  2048  quantization weights (512 f32, x + 8*y + 64*z order)
-///     2092  8 * S  section table: {u16 id, u16 flags, u32 length} each
+///       44   4 K  quantization weights (K f32, kept bases, zigzag order)
+///   44+4K  8 * S  section table: {u16 id, u16 flags, u32 length} each
 ///       ...        the section bodies, in table order, back to back
 /// @endcode
 ///
@@ -47,10 +47,11 @@
 /// it. Every integer is a *class* -- its bit length -- through a table, plus
 /// one raw field of the bits below its leading one, and below those its sign.
 ///
-/// Version 3 replaces DC/AC steps with a global scale and a complete per-basis
-/// table, carried once per frame even for K < 512. Older versions are refused.
-/// The complete fixed header includes the table, so `read_frame_info` needs no
-/// entropy decode and returns every parameter needed by the transform.
+/// Version 3 replaces DC/AC steps with a global scale and a weight for each of
+/// the K kept bases, 256 bytes at the default K = 64; weights beyond K never
+/// apply and are not carried. Older versions are refused. The fixed header
+/// includes the weights, so `read_frame_info` needs no entropy decode and
+/// returns every parameter the transform uses.
 ///
 /// Version 2 (2026-10-01) is version 1 with that mask and sign; version 1
 /// sent a partial mask as 64 bytes through one table and a sign as a field
@@ -73,11 +74,13 @@ namespace volumetric_kit::recon::codec::detail {
 inline constexpr std::uint8_t kFrameMagic[4] = {'V', 'R', 'T', 'C'};
 /// The layout this file writes and reads.
 inline constexpr std::uint16_t kFrameVersion = 3;
-/// Bytes before the quantization table (the metadata prefix).
+/// Bytes before the quantization weights (the metadata prefix).
 inline constexpr std::size_t kFramePrefixBytes = 44;
-/// Bytes before the section table, including every quantization weight.
-inline constexpr std::size_t kFrameHeaderBytes =
-    kFramePrefixBytes + kVoxelsPerBlock * sizeof(float);
+/// Bytes before the section table of a frame keeping @p k coefficients:
+/// the prefix and one weight per kept basis.
+constexpr std::size_t frame_header_bytes(std::uint32_t k) {
+  return kFramePrefixBytes + std::size_t{k} * sizeof(float);
+}
 /// Bytes per section-table entry.
 inline constexpr std::size_t kSectionEntryBytes = 8;
 /// Section flag: a decoder that does not know the section must refuse the
@@ -140,16 +143,16 @@ inline void sort_by_coord(std::vector<volume::BlockIndex>& blocks) {
 
 /// @brief A frame's header, parsed and checked without decoding anything.
 struct FrameHeader {
-  float voxel_size = 0.0f;         ///< Metres per voxel edge.
-  float trunc_dist = 0.0f;         ///< Metres; the steps are fractions of it.
-  CodecParams params;              ///< K, global scale, and every basis weight.
-  std::uint32_t block_count = 0;   ///< Blocks the frame holds.
-  std::uint32_t segment_size = 0;  ///< Blocks per segment, at least 1.
+  float voxel_size = 0.0f;  ///< Metres per voxel edge.
+  float trunc_dist = 0.0f;  ///< Metres; the steps are fractions of it.
+  CodecParams params;       ///< K, global scale, and the kept bases' weights.
+  std::uint32_t block_count = 0;    ///< Blocks the frame holds.
+  std::uint32_t segment_size = 0;   ///< Blocks per segment, at least 1.
   std::uint32_t section_count = 0;  ///< Entries in the section table.
 };
 
 /// @brief Parse and check a frame's fixed header -- the first
-///        @ref kFrameHeaderBytes -- and nothing after it.
+///        @ref frame_header_bytes -- and nothing after it.
 /// @return The header, or the same header refusals as @ref read_intra_frame.
 VR_CODEC_API Result<FrameHeader> read_frame_header(const std::uint8_t* data,
                                                    std::size_t size);

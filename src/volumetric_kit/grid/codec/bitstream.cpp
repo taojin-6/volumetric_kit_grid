@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "dct_tables.hpp"
 #include "rans.hpp"
 
 #if defined(_MSC_VER)
@@ -645,7 +646,7 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   w.u32(static_cast<std::uint32_t>(kBlockSize));
   w.u32(k);
   w.f32(b.params.quantization_scale);
-  w.u32(kVoxelsPerBlock);
+  w.u32(k);  // one weight per kept basis
   w.u32(static_cast<std::uint32_t>(n));
   w.u32(r_size);
   const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>,
@@ -654,8 +655,9 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
                    {SectionId::kSegments, &segments_body},
                    {SectionId::kPayload, &payload}}};
   w.u32(kSectionCount);
-  for (float weight : b.params.quantization_weights) {
-    w.f32(weight);
+  static const auto zigzag = zigzag_order();
+  for (std::uint32_t j = 0; j < k; ++j) {
+    w.f32(b.params.quantization_weights[zigzag[j]]);
   }
   for (const auto& [id, body] : sections) {
     w.u16(static_cast<std::uint32_t>(id));
@@ -685,9 +687,8 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
                                std::to_string(version) + " (this reads " +
                                std::to_string(kFrameVersion) + ")");
   }
-  if (size < kFrameHeaderBytes) {
-    return bad(
-        "shorter than a frame header (including the quantization table)");
+  if (size < kFramePrefixBytes) {
+    return bad("shorter than a frame header");
   }
   FrameHeader header;
   header.voxel_size = h.f32();
@@ -699,12 +700,22 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   header.block_count = h.u32();
   header.segment_size = h.u32();
   header.section_count = h.u32();
-  if (weight_count != kVoxelsPerBlock) {
-    return bad("quantization weight count must be " +
-               std::to_string(kVoxelsPerBlock));
+  // K bounds the weights to read; validate() below checks the rest.
+  const std::uint32_t k = header.params.coefficient_count;
+  if (k < 1 || k > kVoxelsPerBlock) {
+    return bad("coefficient count must be in [1, " +
+               std::to_string(kVoxelsPerBlock) + "]");
   }
-  for (float& weight : header.params.quantization_weights) {
-    weight = h.f32();
+  if (weight_count != k) {
+    return bad("quantization weight count must equal the coefficient count");
+  }
+  if (size < frame_header_bytes(k)) {
+    return bad(
+        "shorter than a frame header (including the quantization weights)");
+  }
+  static const auto zigzag = zigzag_order();
+  for (std::uint32_t j = 0; j < k; ++j) {
+    header.params.quantization_weights[zigzag[j]] = h.f32();
   }
 
   if (type != static_cast<std::uint32_t>(FrameType::kIntra)) {
@@ -742,17 +753,19 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;
   const std::uint32_t section_count = header.section_count;
+  const std::size_t header_bytes =
+      frame_header_bytes(header.params.coefficient_count);
 
   // The section table, then each body's place in the frame. Lengths are summed
   // in 64 bits, and must account for every byte after the table exactly.
-  if (section_count > (size - kFrameHeaderBytes) / kSectionEntryBytes) {
+  if (section_count > (size - header_bytes) / kSectionEntryBytes) {
     return bad("the section table runs past the end");
   }
-  ByteReader st(data + kFrameHeaderBytes, section_count * kSectionEntryBytes);
+  ByteReader st(data + header_bytes, section_count * kSectionEntryBytes);
   const std::uint8_t* body =
-      data + kFrameHeaderBytes + section_count * kSectionEntryBytes;
+      data + header_bytes + section_count * kSectionEntryBytes;
   const std::uint64_t body_bytes =
-      size - kFrameHeaderBytes - section_count * kSectionEntryBytes;
+      size - header_bytes - section_count * kSectionEntryBytes;
   std::uint64_t offset = 0;
   std::array<SectionBody, kSectionCount> found{};  // by id - 1
   for (std::uint32_t i = 0; i < section_count; ++i) {

@@ -93,12 +93,14 @@ struct VR_CODEC_API CodecParams {
   /// first). In [1, @ref kVoxelsPerBlock]; @ref kVoxelsPerBlock keeps the
   /// whole transform. This cutoff is independent of the quantization table.
   std::uint32_t coefficient_count = 64;
-  /// Positive finite scale shared by every basis; effective steps are fractions
-  /// of `trunc_dist` and must each lie in [@ref kMinStep, @ref kMaxStep].
+  /// Positive normal scale shared by every basis; effective steps are
+  /// fractions of `trunc_dist` and must each lie in
+  /// [@ref kMinStep, @ref kMaxStep].
   float quantization_scale = 0.2f;
-  /// Positive finite relative steps in canonical frequency order
+  /// Positive normal relative steps in canonical frequency order
   /// `x + 8*y + 64*z`, with each frequency in [0, 7], not in zigzag order.
-  /// Every entry is carried in a frame, including entries beyond the K cutoff.
+  /// Only the K frequencies the zigzag cutoff keeps are used, checked and
+  /// carried in a frame; the rest are ignored and decode as 1.
   std::array<float, kVoxelsPerBlock> quantization_weights = [] {
     std::array<float, kVoxelsPerBlock> weights{};
     for (float& weight : weights) weight = 1.0f;
@@ -107,9 +109,10 @@ struct VR_CODEC_API CodecParams {
 
   /// @brief Check that every field is one the transform can honour.
   /// @return OK, or @ref Status::invalid_argument naming the field: a
-  ///         @ref coefficient_count outside [1, @ref kVoxelsPerBlock],
-  ///         a non-positive or non-finite scale or weight, or any effective
-  ///         step outside [@ref kMinStep, @ref kMaxStep], even beyond K.
+  ///         @ref coefficient_count outside [1, @ref kVoxelsPerBlock], a
+  ///         scale or kept weight that is not positive and normal (zero,
+  ///         subnormal, infinite or NaN), or a kept frequency's effective
+  ///         step outside [@ref kMinStep, @ref kMaxStep].
   Status validate() const;
 };
 

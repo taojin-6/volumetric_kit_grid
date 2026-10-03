@@ -200,7 +200,7 @@ int refusals_case(Gpu& gpu) {
   bad.params.coefficient_count = 0;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
   bad = codec::EncoderConfig{};
-  bad.params.quantization_weights[511] = 0.0f;
+  bad.params.quantization_weights[0] = 0.0f;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
 
   vr::Result<codec::Encoder> e =

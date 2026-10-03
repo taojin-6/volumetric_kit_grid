@@ -412,18 +412,16 @@ int per_basis_sequence_case(vr::Device& device, vr::Allocator& allocator,
   codec::CodecParams b = a;
   b.quantization_scale = 0.15f;
   std::swap(b.quantization_weights[1], b.quantization_weights[64]);
-  // Reciprocal extreme factors have normal products, but a shader multiply
-  // could flush the subnormal operand. Both factorizations must work.
+  // A subnormal factor is refused even when its product is a normal step: a
+  // denormals-as-zero host or device would read it as 0.
   codec::CodecParams tiny_scale = a;
   tiny_scale.quantization_scale = 1e-40f;
   tiny_scale.quantization_weights.fill(1e38f);
-  codec::CodecParams tiny_weights = a;
-  tiny_weights.quantization_scale = 1e38f;
-  tiny_weights.quantization_weights.fill(1e-40f);
+  DctBlocks refused;
+  CHECK(!t.forward(grid, list, tiny_scale, refused).ok());
   const std::uint32_t modes[] = {0, 64, 8, 1};
   std::vector<std::int16_t> first;
-  for (const codec::CodecParams* params :
-       {&a, &b, &a, &tiny_scale, &tiny_weights, &a}) {
+  for (const codec::CodecParams* params : {&a, &b, &a}) {
     write_block(ctx, grid, block, content, observed);
     DctBlocks out;
     CHECK(t.forward(grid, list, *params, out).ok());
@@ -981,7 +979,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
     short_masks.masks.pop_back();
     CHECK(!t.inverse(grid, grid.block_list(blocks), short_masks).ok());
     DctBlocks bad_params = out;
-    bad_params.params.quantization_weights[511] = 0.0f;
+    bad_params.params.quantization_weights[0] = 0.0f;
     CHECK(!t.inverse(grid, grid.block_list(blocks), bad_params).ok());
     DctBlocks other_band = out;
     other_band.trunc_dist = kTrunc * 0.2f;

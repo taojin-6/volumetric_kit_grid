@@ -6,10 +6,8 @@
 // choices applied after the IO tier imports geometry in source coordinates.
 
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -18,6 +16,7 @@
 #include "codec_stream.hpp"
 #include "codec_sweep.hpp"
 #include "mesh_normalization.hpp"
+#include "parse_number.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
@@ -45,25 +44,6 @@ struct Options {
   bool inspect_only = false;
 };
 
-vr::Status number(const std::string& flag, const char* text, double& value) {
-  char* end = nullptr;
-  errno = 0;
-  value = std::strtod(text, &end);
-  if (end == text || *end != '\0' || errno != 0 || !std::isfinite(value)) {
-    return vr::Status::invalid_argument(flag + ": expected a finite number");
-  }
-  return {};
-}
-vr::Status number(const std::string& flag, const char* text, float& value) {
-  double parsed = 0.0;
-  VR_TRY(number(flag, text, parsed));
-  if (std::abs(parsed) > std::numeric_limits<float>::max()) {
-    return vr::Status::invalid_argument(flag + ": number too large");
-  }
-  value = float(parsed);
-  return {};
-}
-
 vr::Result<Options> parse_args(int argc, char** argv) {
   Options o;
   bool have_up = false;
@@ -78,7 +58,7 @@ vr::Result<Options> parse_args(int argc, char** argv) {
     }
     const char* v = takes_value ? argv[++i] : nullptr;
     if (a == "--height") {
-      VR_TRY(number(a, v, o.height));
+      VR_TRY(vr_example::parse_number(a, v, o.height));
     } else if (a == "--up-axis" || a == "--up-vector") {
       if (have_up)
         return vr::Status::invalid_argument("specify head-up only once");
@@ -108,19 +88,18 @@ vr::Result<Options> parse_args(int argc, char** argv) {
         }
       }
     } else if (a == "--voxel") {
-      VR_TRY(number(a, v, o.voxel));
+      VR_TRY(vr_example::parse_number(a, v, o.voxel));
     } else if (a == "--shell-voxels") {
-      VR_TRY(number(a, v, o.sdf.shell_voxels));
+      VR_TRY(vr_example::parse_number(a, v, o.sdf.shell_voxels));
     } else if (a == "--step") {
-      VR_TRY(number(a, v, o.codec.params.quantization_scale));
+      VR_TRY(vr_example::parse_number(a, v, o.codec.params.quantization_scale));
     } else if (a == "--quant-table") {
       o.quant_table = v;
     } else if (a == "--k") {
-      double k = 0.0;
-      VR_TRY(number(a, v, k));
-      if (k < 1.0 || k > 512.0 || std::floor(k) != k) {
-        return vr::Status::invalid_argument(
-            "--k must be an integer in [1, 512]");
+      int k = 0;
+      VR_TRY(vr_example::parse_number(a, v, k));
+      if (k < 1 || k > 512) {
+        return vr::Status::invalid_argument("--k must be in [1, 512]");
       }
       o.codec.params.coefficient_count = std::uint32_t(k);
     } else if (a == "--mode") {
@@ -171,9 +150,11 @@ void print_bounds(const char* label, const vr_example::MeshBounds& b) {
 
 vr::Status run(const Options& opt) {
   VR_ASSIGN(vr::io::TriangleMesh geometry, vr::io::load_mesh(opt.input));
-  const auto topology = vr_example::audit_mesh_topology(geometry);
   VR_ASSIGN(const auto normalization,
             vr_example::normalize_mesh_height(geometry, opt.height, opt.up));
+  // Audited after normalization, on the float metres the conversion reads,
+  // so a triangle that collapses in the conversion counts as degenerate.
+  const auto topology = vr_example::audit_mesh_topology(geometry);
   std::printf(
       "mesh: %zu vertices, %zu triangles; geometry only, physical scale "
       "set by --height\n",
@@ -194,8 +175,7 @@ vr::Status run(const Options& opt) {
       "inconsistently oriented; "
       "%zu degenerate triangles, %zu components (%zu nonpositive signed "
       "volumes); "
-      "signed volume %.12g source units cubed; self-intersections not "
-      "checked\n",
+      "signed volume %.12g cubic metres; self-intersections not checked\n",
       topology.edges, topology.boundary_edges, topology.nonmanifold_edges,
       topology.inconsistent_edges, topology.degenerate_triangles,
       topology.components, topology.nonpositive_components,
@@ -228,11 +208,23 @@ vr::Status run(const Options& opt) {
   VR_TRY(volume.clear());
   const auto vertices = std::uint32_t(geometry.positions.size());
   const auto triangles = std::uint32_t(geometry.indices.size() / 3);
-  for (;;) {
-    VR_ASSIGN(const auto failures, volume.map().allocate_from_triangles(
-                                       geometry.positions.data(), vertices,
-                                       geometry.indices.data(), triangles));
-    if (failures == 0) break;
+  // Grow only for a capacity limit. Lost bucket-lock races leave a residue
+  // over a table with room, which a retry places (fuse_frame.hpp's
+  // allocate_band_with does the same).
+  for (int contended = 0;;) {
+    vr::volume::AllocFailures failures;
+    VR_ASSIGN(const auto failed,
+              volume.map().allocate_from_triangles(
+                  geometry.positions.data(), vertices, geometry.indices.data(),
+                  triangles, &failures));
+    if (failed == 0) break;
+    if (!failures.capacity_limited()) {
+      if (++contended == 5) {
+        return vr::Status::io_error(
+            "mesh allocation kept losing bucket-lock races");
+      }
+      continue;
+    }
     const std::int64_t buckets = 2 * std::int64_t(volume.grid().num_buckets);
     if (buckets * vr_example::kExampleBucketSize >
         std::numeric_limits<std::int32_t>::max()) {

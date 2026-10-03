@@ -493,7 +493,7 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
   return 0;
 }
 
-// A frame carries every table entry itself: a reused decoder must not retain
+// A frame carries its kept weights itself: a reused decoder must not retain
 // the previous frame's quantizer, even when its block coordinates are equal.
 int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
   vr::Result<vol::VoxelBlockGrid> source =
@@ -557,11 +557,13 @@ int frame_info_case(Gpu& gpu) {
   CHECK(info.value().params.coefficient_count == 20);
   CHECK(info.value().params.quantization_scale ==
         config.params.quantization_scale);
-  CHECK(info.value().params.quantization_weights ==
-        config.params.quantization_weights);
+  // The kept bases' weights travel (DC always is); one beyond K reads as 1.
+  CHECK(info.value().params.quantization_weights[0] ==
+        config.params.quantization_weights[0]);
+  CHECK(info.value().params.quantization_weights[511] == 1.0f);
   CHECK(info.value().block_count > 0);
   // The header alone is enough; less than it is not.
-  constexpr std::size_t header_bytes = 44 + 512 * sizeof(float);
+  constexpr std::size_t header_bytes = 44 + 20 * sizeof(float);
   CHECK(codec::read_frame_info(frame.value().data(), header_bytes).ok());
   CHECK(!codec::read_frame_info(frame.value().data(), header_bytes - 1).ok());
   CHECK(!codec::read_frame_info(nullptr, 0).ok());
