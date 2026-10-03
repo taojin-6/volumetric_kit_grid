@@ -19,13 +19,13 @@
 /// one. A naive `std430` block does *not* match -- `std430` 16-byte-aligns a
 /// three-component vector, placing `pos` at offset 16 and spanning 32 B. The
 /// `static_assert`s below guard only the host side; the shader keeps its
-/// `layout(scalar)` definition in lockstep (see the gotchas in CLAUDE.md).
+/// `layout(scalar)` definition in lockstep (see the gotchas in DESIGN.md).
 ///
 /// The sparse-hashing scheme (a hash table of block coordinates into a heap of
 /// fixed-size voxel blocks) keeps memory proportional to the observed surface
 /// rather than the bounding volume. The prior engine's per-voxel neural
 /// "feature"/triplane channels are intentionally absent here (see the exclusion
-/// policy in CLAUDE.md): this carries only SDF, weight, and optional color.
+/// policy in AGENTS.md): this carries only SDF, weight, and optional color.
 
 #include <cstddef>
 #include <cstdint>
