@@ -3,7 +3,7 @@
 
 // Geometry-only mesh -> TSDF -> codec -> marching cubes evaluation. The input
 // is never changed. Height and head-up direction are explicit normalization
-// choices, because OBJ has no standard physical-unit metadata.
+// choices applied after the IO tier imports geometry in source coordinates.
 
 #include <algorithm>
 #include <cerrno>
@@ -17,12 +17,13 @@
 #include "codec_quantization.hpp"
 #include "codec_stream.hpp"
 #include "codec_sweep.hpp"
-#include "mesh_input.hpp"
-#include "ply_writer.hpp"
+#include "mesh_normalization.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
+#include "volumetric_kit/recon/io/mesh_io.hpp"
+#include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
 
@@ -144,7 +145,7 @@ vr::Result<Options> parse_args(int argc, char** argv) {
   }
   if (o.input.empty() || !(o.height > 0.0) || !have_up) {
     return vr::Status::invalid_argument(
-        "usage: codec_mesh mesh.obj --height metres "
+        "usage: codec_mesh mesh-file --height metres "
         "(--up-axis y | --up-vector x,y,z) [--voxel metres] "
         "[--mode signed|shell] [--shell-voxels 1.5] [--k 64] [--step 0.2] "
         "[--quant-table uniform|band|radial] [--sweep] [--inspect-only] "
@@ -169,14 +170,13 @@ void print_bounds(const char* label, const vr_example::MeshBounds& b) {
 }
 
 vr::Status run(const Options& opt) {
-  VR_ASSIGN(vr_example::ObjGeometry geometry,
-            vr_example::read_obj_geometry(opt.input));
+  VR_ASSIGN(vr::io::TriangleMesh geometry, vr::io::load_mesh(opt.input));
   const auto topology = vr_example::audit_mesh_topology(geometry);
   VR_ASSIGN(const auto normalization,
             vr_example::normalize_mesh_height(geometry, opt.height, opt.up));
   std::printf(
-      "OBJ: %zu vertices, %zu triangles; geometry only, source units "
-      "unspecified\n",
+      "mesh: %zu vertices, %zu triangles; geometry only, physical scale "
+      "set by --height\n",
       geometry.positions.size(), geometry.indices.size() / 3);
   print_bounds("input bounds (source units)", normalization.original);
   std::printf(
@@ -202,7 +202,7 @@ vr::Status run(const Options& opt) {
       topology.signed_volume);
   const mesh::Mesh input = vr_example::geometry_mesh(geometry);
   if (!opt.out_prefix.empty()) {
-    VR_TRY(vr_example::write_ply(opt.out_prefix + "_input.ply", input));
+    VR_TRY(vr::io::write_ply(opt.out_prefix + "_input.ply", input));
   }
   if (opt.inspect_only) return {};
   if (opt.sdf.mode == vr::tsdf::MeshSdfMode::Signed &&
@@ -275,8 +275,8 @@ vr::Status run(const Options& opt) {
   VR_ASSIGN(const mesh::Mesh source, extractor.extract_host(volume));
   VR_ASSIGN(const mesh::Mesh decoded, extractor.extract_host(stream.player()));
   if (!opt.out_prefix.empty()) {
-    VR_TRY(vr_example::write_ply(opt.out_prefix + "_source.ply", source));
-    VR_TRY(vr_example::write_ply(opt.out_prefix + "_decoded.ply", decoded));
+    VR_TRY(vr::io::write_ply(opt.out_prefix + "_source.ply", source));
+    VR_TRY(vr::io::write_ply(opt.out_prefix + "_decoded.ply", decoded));
   }
   eval::CompareOptions compare;
   compare.reach = std::max(trunc, 0.02f);
