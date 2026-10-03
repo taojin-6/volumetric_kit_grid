@@ -305,7 +305,7 @@ vr::Status run(const Options& opt) {
   vr_example::print_comparison(total_error, opt.voxel);
   if (opt.sweep) {
     VR_TRY(vr_example::run_codec_sweep(device, allocator, volume,
-                                       source_reference, extractor,
+                                       source_reference, extractor, opt.codec,
                                        stream.player()));
   }
   return {};

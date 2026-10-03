@@ -2,12 +2,15 @@
 // Copyright (c) 2026 Tao Jin
 
 // Each segment's byte offset in the payload: an exclusive scan of the stream
-// lengths, then the total. One workgroup, a chunk of lengths at a time; a
-// frame has thousands of segments, not millions.
+// lengths, then the total and the gather's dispatch size. One workgroup, a
+// chunk of lengths at a time; a frame has thousands of segments, not millions.
 
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
+
+#include "rans_push.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer Lengths {
   uint lengths[];
@@ -15,15 +18,13 @@ layout(set = 0, binding = 0, std430) readonly buffer Lengths {
 layout(set = 0, binding = 1, std430) writeonly buffer PayloadOffsets {
   uint payload_offsets[];  // segment_count + 1
 };
+layout(set = 0, binding = 2, std430) writeonly buffer GatherArgs {
+  uvec3 gather_groups;  // rans_gather.comp's VkDispatchIndirectCommand
+};
 
-layout(push_constant, std430) uniform Push {
-  uint item_base;
-  uint num_blocks;
-  uint coefficient_count;
-  uint segment_size;
-  uint segment_count;
-}
-pc;
+// rans_gather.comp's width, and the fewest groups every device dispatches.
+const uint kGatherLanes = 256u;
+const uint kMaxGroups = 65535u;
 
 shared uint s_sum[256];
 
@@ -45,5 +46,11 @@ void main() {
     carry += s_sum[255];
     barrier();
   }
-  if (lane == 0u) payload_offsets[pc.segment_count] = carry;
+  if (lane == 0u) {
+    payload_offsets[pc.segment_count] = carry;
+    const uint words = (carry + 3u) / 4u;
+    gather_groups =
+        uvec3(min((words + kGatherLanes - 1u) / kGatherLanes, kMaxGroups), 1u,
+              1u);
+  }
 }

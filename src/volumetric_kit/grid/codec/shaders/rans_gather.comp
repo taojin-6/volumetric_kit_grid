@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Pack every segment's stream into one payload: each invocation writes one
-// 32-bit word, finding the segment each of its two 16-bit halves came from.
-// Streams are 16-bit aligned, so no word is written twice.
+// Pack every segment's stream into one payload: each invocation writes a
+// 32-bit word at a time, finding the segment each of its two 16-bit halves
+// came from. Streams are 16-bit aligned, so no word is written twice.
+// rans_scan.comp sizes the dispatch from the payload, so no invocation starts
+// past it; a payload past the group cap loops.
 
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
+
+#include "rans_push.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer SlotOffsets {
   uint slot_offsets[];  // in 16-bit words, segment_count + 1
@@ -24,15 +29,6 @@ layout(set = 0, binding = 3, std430) readonly buffer PayloadOffsets {
 layout(set = 0, binding = 4, std430) writeonly buffer Payload {
   uint payload[];
 };
-
-layout(push_constant, std430) uniform Push {
-  uint item_base;
-  uint num_blocks;
-  uint coefficient_count;
-  uint segment_size;
-  uint segment_count;
-}
-pc;
 
 // The payload's 16-bit word q, from the segment whose stream holds it.
 uint payload16(uint q) {
@@ -53,10 +49,12 @@ uint payload16(uint q) {
 }
 
 void main() {
-  const uint w = pc.item_base + gl_GlobalInvocationID.x;
   const uint total = payload_offsets[pc.segment_count];
-  if (w >= (total + 3u) / 4u) return;
-  const uint low = payload16(2u * w);
-  const uint high = 4u * w + 2u < total ? payload16(2u * w + 1u) : 0u;
-  payload[w] = low | (high << 16u);
+  const uint words = (total + 3u) / 4u;
+  const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+  for (uint w = gl_GlobalInvocationID.x; w < words; w += stride) {
+    const uint low = payload16(2u * w);
+    const uint high = 4u * w + 2u < total ? payload16(2u * w + 1u) : 0u;
+    payload[w] = low | (high << 16u);
+  }
 }

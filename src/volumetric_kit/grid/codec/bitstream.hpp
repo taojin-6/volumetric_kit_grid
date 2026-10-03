@@ -60,6 +60,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "dct_blocks.hpp"
@@ -94,6 +95,16 @@ inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// default frame in per-segment overhead, and room0's ~107 k blocks in ~1.7 k
 /// independently decodable segments.
 inline constexpr std::uint32_t kDefaultSegmentSize = 64;
+/// The most segments a frame holds: SEGMENTS' u32 length bounds it.
+inline constexpr std::uint64_t kMaxFrameSegments =
+    std::numeric_limits<std::uint32_t>::max() / 4;
+
+/// @return How many segments a frame of @p blocks blocks has at
+///         @p segment_size (at least 1) blocks a segment.
+constexpr std::uint64_t frame_segment_count(std::uint64_t blocks,
+                                            std::uint32_t segment_size) {
+  return blocks == 0 ? 0 : (blocks - 1) / segment_size + 1;
+}
 
 /// What a frame's header says it is.
 enum class FrameType : std::uint8_t {
@@ -213,7 +224,11 @@ struct CodedFrame {
 ///        PAYLOAD. Shared by the host and device writers, so their containers
 ///        cannot differ.
 /// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
-///         payload past 4 GiB or more than 2^30 - 1 segments.
+///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
+///         params, a segment size of 0, tables or segment lengths whose
+///         count the block count and K disagree with, lengths that do not
+///         sum to the payload, a payload past 4 GiB or more than 2^30 - 1
+///         segments.
 VR_CODEC_API Result<std::vector<std::uint8_t>> assemble_intra_frame(
     const CodedFrame& frame);
 

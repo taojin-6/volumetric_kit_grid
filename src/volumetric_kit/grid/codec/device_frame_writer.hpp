@@ -16,6 +16,7 @@
 /// that unified memory would.
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -45,7 +46,8 @@ namespace volumetric_kit::recon::codec::detail {
 /// block's steps. The device writes each block's steps in parallel, runs each
 /// segment's serial rANS chain over its run of them into a slot sized by its
 /// steps, packs the streams into one payload, and reads back only that payload
-/// and the segment lengths.
+/// and the segment lengths. The payload is read up to the last frame's bytes
+/// per block plus 25% with the lengths, and any rest in a second batch.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
@@ -68,7 +70,8 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @param blocks        The forward output, coordinates strictly
   ///                      increasing in frame order and coefficients within
   ///                      +-32767 (what the transform writes).
-  /// @param segment_size  Blocks per segment, at least 1.
+  /// @param segment_size  Blocks per segment, at least 1, which @ref finish
+  ///                      codes at.
   /// @return OK, or @ref Status::Code::InvalidArgument for a moved-from
   ///         writer, a segment size of 0, more than 2^30 - 1 segments, or a
   ///         buffer past `maxStorageBufferRange`; otherwise a buffer failure.
@@ -76,20 +79,20 @@ class VR_CODEC_API DeviceFrameWriter {
                       std::uint32_t segment_size,
                       GpuStageScope* stage = nullptr);
 
-  /// @brief Code the frame @ref record_count counted and lay it out.
-  /// @param blocks        The same output @ref record_count was given.
-  /// @param segment_size  The same segment size.
+  /// @brief Code the frame @ref record_count counted, at the segment size it
+  ///        counted with, and lay it out.
+  /// @param blocks      The same output @ref record_count was given.
   /// @param voxel_size  The grid's voxel edge, metres.
   /// @param trunc_dist  The grid's `trunc_dist`, which the coefficients are
   ///                    fractions of.
   /// @param params      The params the coefficients were made with.
   /// @return The frame's bytes, identical to @ref write_intra_frame's for the
   ///         same content; @ref Status::Code::InvalidArgument for invalid
-  ///         params or one @ref assemble_intra_frame refuses; or a buffer or
-  ///         dispatch failure. @ref Status::Code::IoError only if a kernel's
+  ///         params, blocks @ref record_count did not count, or a frame
+  ///         @ref assemble_intra_frame refuses; or a buffer or dispatch
+  ///         failure. @ref Status::Code::IoError only if a kernel's
   ///         table refused a symbol it was counted from, which is a bug here.
   Result<std::vector<std::uint8_t>> finish(const ResidentBlocks& blocks,
-                                           std::uint32_t segment_size,
                                            float voxel_size, float trunc_dist,
                                            const CodecParams& params,
                                            GpuStageScope* stage = nullptr);
@@ -136,7 +139,8 @@ class VR_CODEC_API DeviceFrameWriter {
   Buffer lengths_;          // bytes per segment
   Buffer payload_offsets_;  // bytes, segment count + 1
   Buffer payload_;
-  Buffer failed_;  // set when a table refuses a symbol
+  Buffer gather_args_;  // the gather's dispatch, which the scan sizes
+  Buffer failed_;       // set when a table refuses a symbol
   // write()'s uploads of a host frame.
   Buffer upload_list_;
   Buffer upload_masks_;
@@ -147,6 +151,23 @@ class VR_CODEC_API DeviceFrameWriter {
   std::vector<std::uint32_t> bases_host_;
   std::vector<std::uint32_t> counts_host_;
   std::vector<std::uint32_t> steps_host_;
+  // The segment size record_count counted with (0 before any), and the last
+  // frame's payload bytes per block plus 25%, the readback's prediction (0
+  // before any). Reset on move, like every owned member.
+  struct FrameState {
+    std::uint32_t segment_size = 0;
+    std::uint32_t payload_per_block = 0;
+    FrameState() = default;
+    FrameState(FrameState&& other) noexcept
+        : segment_size(std::exchange(other.segment_size, 0)),
+          payload_per_block(std::exchange(other.payload_per_block, 0)) {}
+    FrameState& operator=(FrameState&& other) noexcept {
+      segment_size = std::exchange(other.segment_size, 0);
+      payload_per_block = std::exchange(other.payload_per_block, 0);
+      return *this;
+    }
+  };
+  FrameState state_;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

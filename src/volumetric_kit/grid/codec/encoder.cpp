@@ -75,13 +75,44 @@ Result<Encoder> Encoder::create(Device& device, Allocator& allocator,
   VR_ASSIGN(detail::DctTransform transform,
             detail::DctTransform::create(device, allocator));
   e.transform_ = std::make_unique<detail::DctTransform>(std::move(transform));
-  if (config.entropy != EntropyCoding::kHost) {
-    VR_ASSIGN(detail::DeviceFrameWriter writer,
-              detail::DeviceFrameWriter::create(device, allocator));
-    e.writer_ = std::make_unique<detail::DeviceFrameWriter>(std::move(writer));
-  }
+  // kAuto builds the writer at its first device frame, which a small scene
+  // never reaches.
+  if (config.entropy == EntropyCoding::kDevice) VR_TRY(e.ensure_writer());
   VR_ASSIGN(e.gpu_timer_, GpuTimer::create(device));
   return e;
+}
+
+Status Encoder::ensure_writer() {
+  if (writer_ != nullptr) return {};
+  VR_ASSIGN(detail::DeviceFrameWriter writer,
+            detail::DeviceFrameWriter::create(*device_, *allocator_));
+  writer_ = std::make_unique<detail::DeviceFrameWriter>(std::move(writer));
+  return {};
+}
+
+Result<std::vector<std::uint8_t>> Encoder::encode_on_device(
+    volume::VoxelBlockGrid& grid, const std::vector<volume::BlockIndex>& blocks,
+    StageMetrics* metrics, GpuStageScope& stage) {
+  VR_TRY(ensure_writer());
+  // The forward output stays on the device; the same batch counts its
+  // symbols, so only the counts cross before the coding.
+  std::uint32_t rejected = 0;
+  detail::ResidentBlocks resident;
+  {
+    StageScope forward(metrics, "  ..forward");
+    CommandBatch batch(*device_, *allocator_);
+    VR_ASSIGN(resident,
+              transform_->record_forward(batch, grid, grid.block_list(blocks),
+                                         config_.params, rejected, &stage));
+    VR_TRY(
+        writer_->record_count(batch, resident, config_.segment_size, &stage));
+    VR_TRY(batch.submit());
+    VR_TRY(detail::DctTransform::check_rejected("forward", rejected,
+                                                resident.count));
+  }
+  StageScope entropy(metrics, "  ..rans encode");
+  return writer_->finish(resident, grid.grid().voxel_size,
+                         grid.grid().trunc_dist, config_.params, &stage);
 }
 
 Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
@@ -118,33 +149,16 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
   }
 
   const std::uint64_t segments =
-      blocks.empty()
-          ? 0
-          : (std::uint64_t(blocks.size()) - 1) / config_.segment_size + 1;
-  const bool on_device =
-      writer_ != nullptr && (config_.entropy == EntropyCoding::kDevice ||
-                             segments >= kMinDeviceSegments);
-  if (on_device) {
-    // The forward output stays on the device; the same batch counts its
-    // symbols, so only the counts cross before the coding.
-    std::uint32_t rejected = 0;
-    detail::ResidentBlocks resident;
-    {
-      StageScope forward(metrics, "  ..forward");
-      CommandBatch batch(*device_, *allocator_);
-      VR_ASSIGN(resident,
-                transform_->record_forward(batch, grid, grid.block_list(blocks),
-                                           config_.params, rejected, &stage));
-      VR_TRY(
-          writer_->record_count(batch, resident, config_.segment_size, &stage));
-      VR_TRY(batch.submit());
-      VR_TRY(detail::DctTransform::check_rejected("forward", rejected,
-                                                  resident.count));
-    }
-    StageScope entropy(metrics, "  ..rans encode");
-    return writer_->finish(resident, config_.segment_size,
-                           grid.grid().voxel_size, grid.grid().trunc_dist,
-                           config_.params, &stage);
+      detail::frame_segment_count(blocks.size(), config_.segment_size);
+  if (config_.entropy == EntropyCoding::kDevice ||
+      (config_.entropy == EntropyCoding::kAuto &&
+       segments >= kMinDeviceSegments)) {
+    Result<std::vector<std::uint8_t>> frame =
+        encode_on_device(grid, blocks, metrics, stage);
+    // kAuto codes on the host whatever the device could not: a frame past
+    // maxStorageBufferRange or free VRAM, or kernels that would not build.
+    // The host refuses a bad input again, with its own message.
+    if (frame.ok() || config_.entropy == EntropyCoding::kDevice) return frame;
   }
 
   detail::IntraFrame frame;

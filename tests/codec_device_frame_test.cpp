@@ -14,6 +14,8 @@
 #include "codec_frames.hpp"
 #include "device_frame_writer.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 
@@ -82,17 +84,82 @@ int matches_host_case(d::DeviceFrameWriter& writer) {
   return 0;
 }
 
-int refusals_case(d::DeviceFrameWriter& writer) {
+// -32768, which the transform never writes but a rejected entry's stale
+// word can hold, is clamped into the model's 16 classes when counted: the
+// frame codes -32767 rather than counting past its table.
+int out_of_range_case(vr::Device& device, vr::Allocator& allocator,
+                      d::DeviceFrameWriter& writer) {
+  const vr::volume::BlockIndex block{};
+  const std::uint32_t masks[codec::kMaskWordsPerBlock] = {};
+  const std::uint32_t coefficient = 0x8000u;  // K = 1
+  vr::Result<vr::Buffer> list = vr::device_storage_buffer(allocator, 16);
+  vr::Result<vr::Buffer> mask = vr::device_storage_buffer(allocator, 64);
+  vr::Result<vr::Buffer> coeff = vr::device_storage_buffer(allocator, 4);
+  CHECK(list.ok() && mask.ok() && coeff.ok());
+  d::ResidentBlocks blocks;
+  blocks.list = &list.value();
+  blocks.masks = &mask.value();
+  blocks.coefficients = &coeff.value();
+  blocks.count = 1;
+  blocks.coefficient_count = 1;
+  vr::CommandBatch batch(device, allocator);
+  CHECK(batch.upload(list.value(), 0, &block, sizeof(block)).ok());
+  CHECK(batch.upload(mask.value(), 0, masks, sizeof(masks)).ok());
+  CHECK(batch.upload(coeff.value(), 0, &coefficient, 4).ok());
+  CHECK(writer.record_count(batch, blocks, 64).ok());
+  CHECK(batch.submit().ok());
+  codec::CodecParams params;
+  params.coefficient_count = 1;
+  vr::Result<std::vector<std::uint8_t>> frame =
+      writer.finish(blocks, 0.005f, 0.04f, params);
+  CHECK(frame.ok());
+  vr::Result<d::IntraFrame> read =
+      d::read_intra_frame(frame.value().data(), frame.value().size(), 1);
+  CHECK(read.ok());
+  CHECK(read.value().blocks.coefficients[0] == -codec::kMaxQuantizedMagnitude);
+  return 0;
+}
+
+int refusals_case(vr::Device& device, vr::Allocator& allocator,
+                  d::DeviceFrameWriter& writer) {
   d::IntraFrame f = make_frame(10, 8, 3);
   std::swap(f.coords[3], f.coords[4]);
   CHECK(!writer.write(f, {}).ok());
   d::FrameWriteOptions zero;
   zero.segment_size = 0;
   CHECK(!writer.write(make_frame(10, 8, 3), zero).ok());
+  // finish with nothing counted refuses rather than coding stale steps.
+  vr::Result<d::DeviceFrameWriter> fresh =
+      d::DeviceFrameWriter::create(device, allocator);
+  CHECK(fresh.ok());
+  d::ResidentBlocks uncounted;
+  uncounted.count = 10;
+  uncounted.coefficient_count = 8;
+  codec::CodecParams params;
+  params.coefficient_count = 8;
+  CHECK(!fresh.value().finish(uncounted, 0.005f, 0.04f, params).ok());
+  return 0;
+}
+
+// The move rules: a moved-from writer is empty and refuses, a move-assign
+// over a live one works, and a self-move leaves it intact.
+int moves_case(vr::Device& device, vr::Allocator& allocator,
+               d::DeviceFrameWriter& writer) {
   d::DeviceFrameWriter moved = std::move(writer);
-  CHECK(!writer.valid());
+  CHECK(moved.valid());
+  CHECK(!writer.valid());  // NOLINT(bugprone-use-after-move): the source
   CHECK(!writer.write(make_frame(10, 8, 3), {}).ok());
-  writer = std::move(moved);
+  vr::Result<d::DeviceFrameWriter> live =
+      d::DeviceFrameWriter::create(device, allocator);
+  CHECK(live.ok());
+  live.value() = std::move(moved);  // over a live writer
+  CHECK(live.value().valid());
+  CHECK(!moved.valid());  // NOLINT(bugprone-use-after-move)
+  d::DeviceFrameWriter* alias = &live.value();
+  live.value() = std::move(*alias);  // self-move, laundered past -Wself-move
+  CHECK(live.value().valid());
+  CHECK(same_bytes(live.value(), make_frame(70, 8, 5), 16) == 0);
+  writer = std::move(live.value());
   CHECK(writer.valid());
   return 0;
 }
@@ -122,7 +189,16 @@ int main() {
       d::DeviceFrameWriter::create(device.value(), allocator.value());
   CHECK(writer.ok());
   if (matches_host_case(writer.value()) != 0) return 1;
-  if (refusals_case(writer.value()) != 0) return 1;
+  if (out_of_range_case(device.value(), allocator.value(), writer.value()) !=
+      0) {
+    return 1;
+  }
+  if (refusals_case(device.value(), allocator.value(), writer.value()) != 0) {
+    return 1;
+  }
+  if (moves_case(device.value(), allocator.value(), writer.value()) != 0) {
+    return 1;
+  }
   std::puts("codec device frame: OK");
   return 0;
 }

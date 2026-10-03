@@ -173,6 +173,50 @@ int write_refusals_case() {
   return 0;
 }
 
+// The container check the device writer relies on: assemble_intra_frame
+// refuses a coded frame whose header fields or sections disagree.
+int assemble_refusals_case() {
+  d::CodedFrame good;
+  good.voxel_size = 0.005f;
+  good.trunc_dist = 0.04f;
+  good.params.coefficient_count = 8;
+  good.block_count = 10;
+  good.segment_size = 4;  // three segments
+  std::vector<std::vector<std::uint64_t>> counts(d::frame_model_count(8));
+  for (std::uint32_t m = 0; m < counts.size(); ++m) {
+    counts[m].assign(d::frame_model_alphabet(m), 1);
+  }
+  good.tables = d::frame_tables(counts);
+  good.segment_lengths = {4, 4, 4};
+  good.payload.assign(12, 0);
+  CHECK(d::assemble_intra_frame(good).ok());
+  auto refused = [](const d::CodedFrame& f) {
+    return !d::assemble_intra_frame(f).ok();
+  };
+  d::CodedFrame f = good;
+  f.voxel_size = std::numeric_limits<float>::infinity();
+  CHECK(refused(f));
+  f = good;
+  f.trunc_dist = 0.0f;
+  CHECK(refused(f));
+  f = good;
+  f.params.coefficient_count = codec::kVoxelsPerBlock + 1;
+  CHECK(refused(f));
+  f = good;
+  f.segment_size = 0;
+  CHECK(refused(f));
+  f = good;
+  f.tables.pop_back();
+  CHECK(refused(f));
+  f = good;
+  f.block_count = 13;  // four segments, three lengths
+  CHECK(refused(f));
+  f = good;
+  f.payload.pop_back();
+  CHECK(refused(f));
+  return 0;
+}
+
 // --- Editing a valid frame.
 // ----------------------------------------------------
 
@@ -598,6 +642,7 @@ int main() {
   if (round_trip_case() != 0) return 1;
   if (extreme_coords_case() != 0) return 1;
   if (write_refusals_case() != 0) return 1;
+  if (assemble_refusals_case() != 0) return 1;
   if (header_refusals_case() != 0) return 1;
   if (section_rules_case() != 0) return 1;
   if (table_rules_case() != 0) return 1;

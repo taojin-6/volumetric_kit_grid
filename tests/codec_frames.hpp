@@ -31,7 +31,7 @@ struct Lcg {
 // A partial mask shaped like a fused band's edge: the voxels on one side of a
 // plane through the block, so its planes and lines repeat, run full or empty,
 // or cut across -- every symbol the mask code has.
-void slab_mask(Lcg& rng, std::uint32_t* mask) {
+inline void slab_mask(Lcg& rng, std::uint32_t* mask) {
   const int a = int(rng.below(7)) - 3;
   const int b = int(rng.below(7)) - 3;
   const int c = int(rng.below(7)) - 3;
@@ -51,7 +51,8 @@ void slab_mask(Lcg& rng, std::uint32_t* mask) {
 // them, masks mostly full with some empty and some partial -- noise, or a
 // slab's edge -- coefficients small and sparser at higher indices, and the
 // odd extreme value.
-d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
+inline d::IntraFrame make_frame(std::size_t n, std::uint32_t k,
+                                std::uint64_t seed) {
   Lcg rng{seed};
   auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
     return d::coord_less(a, b);

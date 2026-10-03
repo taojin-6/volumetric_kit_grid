@@ -63,12 +63,15 @@ inline std::vector<SweepConfig> sweep_configs() {
 /// counts the vertices past it -- floaters -- and `cov>r` the source
 /// vertices with no decoded surface within it -- holes.
 ///
+/// @param base    The command line's configuration: each row keeps its
+///                entropy coding and segment size, and sets the params.
 /// @param player  The grid to decode into: a stream's player, already built
 ///                for this geometry (it grows if a frame needs it).
 inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
                                   vr::volume::VoxelBlockGrid& source,
                                   const vr::eval::ReferenceMesh& reference,
                                   vr::mesh::MarchingCubes& extractor,
+                                  const vr::codec::EncoderConfig& base,
                                   vr::volume::VoxelBlockGrid& player) {
   VR_ASSIGN(vr::codec::Decoder dec,
             vr::codec::Decoder::create(device, allocator));
@@ -91,7 +94,8 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
       "acc max", "acc>r", "cov rms", "cov>r", "F", "enc ms", "dec ms",
       "enc gpu", "dec gpu");
   for (const SweepConfig& cfg : sweep_configs()) {
-    vr::codec::EncoderConfig ec;
+    vr::codec::EncoderConfig ec = base;
+    ec.params = vr::codec::CodecParams{};
     ec.params.coefficient_count = cfg.k;
     ec.params.quantization_scale = cfg.scale;
     VR_TRY(apply_quantization_table(ec.params, cfg.family));

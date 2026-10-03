@@ -34,7 +34,9 @@ class DeviceFrameWriter;
 enum class EntropyCoding {
   /// The device for a frame of at least @ref kMinDeviceSegments segments,
   /// the host for a smaller one, which has too few segments for the device
-  /// to run in parallel.
+  /// to run in parallel. A frame the device cannot code -- one past
+  /// `maxStorageBufferRange` or free memory, or a device whose rANS kernels
+  /// do not build -- is coded on the host.
   kAuto,
   /// On the host, after the quantized coefficients and masks are read back.
   kHost,
@@ -83,7 +85,9 @@ struct EncoderConfig {
 ///          outlive this object. Not thread-safe: one call at a time.
 class VR_CODEC_API Encoder {
  public:
-  /// @brief Build the forward transform's kernels.
+  /// @brief Build the forward transform's kernels, and with
+  ///        @ref EntropyCoding::kDevice the rANS coder's; @ref
+  ///        EntropyCoding::kAuto builds those at its first device frame.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -111,19 +115,22 @@ class VR_CODEC_API Encoder {
   ///                 would a fuse's.
   /// @param metrics  Optional @ref StageMetrics collecting a `"codec encode"`
   ///                 row with both halves -- its device half is the transform
-  ///                 -- over the breakdown rows `"  ..active set"` (the
-  ///                 compaction, when the map holds no list that is still
-  ///                 its active set), `"  ..observed"` (finding the blocks
-  ///                 with an observed voxel), `"  ..sort"`, `"  ..forward"`
-  ///                 (the transform) and `"  ..rans encode"` (writing the
-  ///                 frame). Named apart from the @ref Decoder's, so both
-  ///                 timed into one @ref StageMetrics stay apart. `nullptr`
-  ///                 measures nothing.
+  ///                 and, coded on the device, the rANS kernels -- over the
+  ///                 breakdown rows `"  ..active set"` (the compaction, when
+  ///                 the map holds no list that is still its active set),
+  ///                 `"  ..observed"` (finding the blocks with an observed
+  ///                 voxel), `"  ..sort"`, `"  ..forward"` (the transform;
+  ///                 on the device, also the symbol count, which shares its
+  ///                 batch) and `"  ..rans encode"` (writing the frame; on
+  ///                 the host, counting included). Named apart from the
+  ///                 @ref Decoder's, so both timed into one
+  ///                 @ref StageMetrics stay apart. `nullptr` measures
+  ///                 nothing.
   /// @return The frame's bytes (an empty grid is a valid frame of no blocks),
-  ///         or @ref Status::Code::InvalidArgument for a moved-from encoder
-  ///         or a grid the transform refuses (moved-from, another block size,
-  ///         no float `tsdf` / `weight`); otherwise a compaction, buffer or
-  ///         dispatch failure.
+  ///         or @ref Status::Code::InvalidArgument for a moved-from encoder,
+  ///         a grid the transform refuses (moved-from, another block size,
+  ///         no float `tsdf` / `weight`) or a non-finite `voxel_size`;
+  ///         otherwise a compaction, buffer, pipeline or dispatch failure.
   Result<std::vector<std::uint8_t>> encode(volume::VoxelBlockGrid& grid,
                                            StageMetrics* metrics = nullptr);
 
@@ -137,12 +144,21 @@ class VR_CODEC_API Encoder {
  private:
   Encoder();
 
+  /// Build @ref writer_ unless it is built.
+  Status ensure_writer();
+  /// The forward and the rANS coding on the device.
+  Result<std::vector<std::uint8_t>> encode_on_device(
+      volume::VoxelBlockGrid& grid,
+      const std::vector<volume::BlockIndex>& blocks, StageMetrics* metrics,
+      GpuStageScope& stage);
+
   EncoderConfig config_;
   // Borrowed (must outlive this); what the device coding's batch runs on.
   Device* device_ = nullptr;
   Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
-  // Only with EntropyCoding::kDevice.
+  // Built at create for kDevice, at the first device frame for kAuto, and
+  // never for kHost.
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
   // Device spans for the transform; idle until a caller asks for metrics.
   GpuTimer gpu_timer_;

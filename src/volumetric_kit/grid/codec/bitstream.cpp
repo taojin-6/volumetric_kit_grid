@@ -558,10 +558,7 @@ Status check_intra_frame(const IntraFrame& frame,
     return bad_write("expected " + std::to_string(mask_count) +
                      " mask words, got " + std::to_string(b.masks.size()));
   }
-  const std::uint32_t r_size = options.segment_size;
-  const std::uint64_t segments =
-      n == 0 ? 0 : (std::uint64_t(n) - 1) / r_size + 1;
-  if (segments > std::numeric_limits<std::uint32_t>::max() / 4) {
+  if (frame_segment_count(n, options.segment_size) > kMaxFrameSegments) {
     return bad_write(
         "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
         "u32 length");
@@ -590,8 +587,7 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   const std::size_t n = frame.coords.size();
   const std::uint32_t k = b.params.coefficient_count;
   const std::uint32_t r_size = options.segment_size;
-  const std::uint64_t segments =
-      n == 0 ? 0 : (std::uint64_t(n) - 1) / r_size + 1;
+  const std::uint64_t segments = frame_segment_count(n, r_size);
 
   auto prev_of = [&](std::size_t i) -> const Vec3i* {
     return i % r_size == 0 ? nullptr : &frame.coords[i - 1];
@@ -659,17 +655,39 @@ std::vector<FrequencyTable> frame_tables(
 
 Result<std::vector<std::uint8_t>> assemble_intra_frame(
     const CodedFrame& frame) {
+  // The header's fields as check_intra_frame checks them, for the device
+  // writer, which codes without an IntraFrame.
+  if (!positive_finite(frame.voxel_size)) {
+    return bad_write("voxel_size must be finite and positive");
+  }
+  if (!positive_finite(frame.trunc_dist)) {
+    return bad_write("trunc_dist must be finite and positive");
+  }
+  VR_TRY(frame.params.validate());
+  if (frame.segment_size == 0) {
+    return bad_write("segment_size must be at least 1");
+  }
   const std::uint32_t k = frame.params.coefficient_count;
+  const std::uint64_t segments =
+      frame_segment_count(frame.block_count, frame.segment_size);
+  if (segments > kMaxFrameSegments) {
+    return bad_write(
+        "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
+        "u32 length");
+  }
+  if (frame.tables.size() != frame_model_count(k) ||
+      frame.segment_lengths.size() != segments) {
+    return bad_write("tables or segment lengths disagree with the header");
+  }
   // Every segment's length is at most the payload's, so this bounds both.
   if (std::uint64_t(frame.payload.size()) >
       std::numeric_limits<std::uint32_t>::max()) {
     return bad_write("the payload outgrows its u32 length (4 GiB)");
   }
-  if (frame.segment_lengths.size() >
-      std::numeric_limits<std::uint32_t>::max() / 4) {
-    return bad_write(
-        "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
-        "u32 length");
+  std::uint64_t total = 0;
+  for (std::uint32_t length : frame.segment_lengths) total += length;
+  if (total != frame.payload.size()) {
+    return bad_write("the segment lengths do not sum to the payload");
   }
   std::vector<std::uint8_t> segments_body;
   ByteWriter sw(segments_body);
@@ -859,8 +877,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   std::vector<FrequencyTable> tables;
   VR_TRY(read_tables(tables_section.data, tables_section.size, k, tables));
 
-  const std::uint64_t segments =
-      n == 0 ? 0 : (std::uint64_t(n) - 1) / r_size + 1;
+  const std::uint64_t segments = frame_segment_count(n, r_size);
   if (segments_section.size != segments * 4) {
     return bad("the SEGMENTS section does not list one length per segment");
   }

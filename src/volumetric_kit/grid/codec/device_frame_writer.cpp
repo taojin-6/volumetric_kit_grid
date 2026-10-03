@@ -22,7 +22,7 @@
 namespace volumetric_kit::recon::codec::detail {
 namespace {
 
-// Mirrors `Push` in rans_walk.glsl, rans_scan.comp and rans_gather.comp.
+// Mirrors `Push` in rans_push.glsl.
 struct Push {
   std::uint32_t item_base = 0;
   std::uint32_t num_blocks = 0;
@@ -36,19 +36,14 @@ static_assert(sizeof(Push) == 20, "Push must be 20 bytes");
 constexpr std::uint32_t kCountLanes = 64;
 constexpr std::uint32_t kOpsLanes = 64;
 constexpr std::uint32_t kEncodeLanes = 32;
-constexpr std::uint32_t kGatherLanes = 256;
 
-// Readback budget for the payload before its size is known: about three
-// times what room0 codes, so the second transfer is for unusual frames only.
-constexpr std::uint64_t kPayloadGuessPerBlock = 32;
+// The payload readback's prediction before any frame: about three times
+// what room0 codes.
+constexpr std::uint64_t kFirstPayloadPerBlock = 32;
 
 Status fail(const char* op, const std::string& why) {
   return Status::invalid_argument(std::string("DeviceFrameWriter::") + op +
                                   ": " + why);
-}
-
-std::uint64_t segment_count(std::uint32_t n, std::uint32_t r) {
-  return n == 0 ? 0 : (std::uint64_t(n) - 1) / r + 1;
 }
 
 // One invocation per item, in as many dispatches as the device's group limit
@@ -87,7 +82,7 @@ Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
   VR_TRY(kb.add(w.encode_kernel_, "codec_rans_encode", vr_rans_encode_comp_spv,
                 vr_rans_encode_comp_spv_size, 6, &push));
   VR_TRY(kb.add(w.scan_kernel_, "codec_rans_scan", vr_rans_scan_comp_spv,
-                vr_rans_scan_comp_spv_size, 2, &push));
+                vr_rans_scan_comp_spv_size, 3, &push));
   VR_TRY(kb.add(w.gather_kernel_, "codec_rans_gather", vr_rans_gather_comp_spv,
                 vr_rans_gather_comp_spv_size, 5, &push));
   VR_ASSIGN(w.pool_, kb.build());
@@ -99,6 +94,12 @@ Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(w.failed_.handle()),
                          "codec.rans_failed");
+  VR_ASSIGN(w.gather_args_,
+            device_storage_buffer(allocator, sizeof(VkDispatchIndirectCommand),
+                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         debug_object_handle(w.gather_args_.handle()),
+                         "codec.rans_gather_args");
   return w;
 }
 
@@ -112,10 +113,11 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
   }
   const std::uint32_t n = blocks.count;
   const std::uint32_t k = blocks.coefficient_count;
-  const std::uint64_t segments = segment_count(n, segment_size);
-  if (segments > std::numeric_limits<std::uint32_t>::max() / 4) {
+  const std::uint64_t segments = frame_segment_count(n, segment_size);
+  if (segments > kMaxFrameSegments) {
     return fail("record_count", "more than 2^30 - 1 segments");
   }
+  state_.segment_size = segment_size;
   // Each model's first entry in the per-symbol arrays, in TABLES order.
   const std::uint32_t models = frame_model_count(k);
   bases_host_.assign(models + 1, 0);
@@ -158,19 +160,20 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
 }
 
 Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
-    const ResidentBlocks& blocks, std::uint32_t segment_size, float voxel_size,
-    float trunc_dist, const CodecParams& params, GpuStageScope* stage) {
+    const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
+    const CodecParams& params, GpuStageScope* stage) {
   if (!valid()) return fail("finish", "moved-from writer");
   VR_TRY(params.validate());
   const std::uint32_t n = blocks.count;
   const std::uint32_t k = params.coefficient_count;
-  const std::uint64_t segments64 = segment_count(n, segment_size);
-  if (k != blocks.coefficient_count ||
+  const std::uint32_t segment_size = state_.segment_size;
+  if (segment_size == 0 || k != blocks.coefficient_count ||
       bases_host_.size() != frame_model_count(k) + 1 ||
       steps_host_.size() != n) {
     return fail("finish", "these blocks were not the ones record_count saw");
   }
-  const auto segments = static_cast<std::uint32_t>(segments64);
+  const auto segments =
+      static_cast<std::uint32_t>(frame_segment_count(n, segment_size));
 
   // The tables, from the device's counts through the host's normalization.
   const std::uint32_t models = frame_model_count(k);
@@ -288,6 +291,8 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   scan_kernel_.set.write_storage_buffer(0, lengths_.handle(), 0, length_bytes);
   scan_kernel_.set.write_storage_buffer(1, payload_offsets_.handle(), 0,
                                         offset_bytes);
+  scan_kernel_.set.write_storage_buffer(2, gather_args_.handle(), 0,
+                                        sizeof(VkDispatchIndirectCommand));
   ComputeKernel& gather = gather_kernel_;
   gather.set.write_storage_buffer(0, slot_offsets_.handle(), 0, offset_bytes);
   gather.set.write_storage_buffer(1, slots_.handle(), 0, slot_bytes);
@@ -307,16 +312,17 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
                         max_workgroup_count_x_, stage));
   VR_TRY(batch.dispatch(scan_kernel_, &push, sizeof(push), 1,
                         max_workgroup_count_x_, stage));
-  // The payload is at most the slots; words past its end return at once.
-  VR_TRY(dispatch_items(batch, gather, push,
-                        static_cast<std::uint32_t>(slot_bytes / 4),
-                        kGatherLanes, max_workgroup_count_x_, stage));
+  VR_TRY(batch.dispatch_indirect(gather, &push, sizeof(push), gather_args_, 0,
+                                 stage));
 
   // Read the payload's likely size with the lengths, and any rest after.
   std::vector<std::uint32_t> lengths(segments);
   std::uint32_t failed = 0;
+  const std::uint64_t per_block = state_.payload_per_block != 0
+                                      ? state_.payload_per_block
+                                      : kFirstPayloadPerBlock;
   const VkDeviceSize guess = std::min<VkDeviceSize>(
-      slot_bytes, (kPayloadGuessPerBlock * n + 3) & ~VkDeviceSize{3});
+      slot_bytes, (per_block * n + 3) & ~VkDeviceSize{3});
   std::vector<std::uint8_t> payload(static_cast<std::size_t>(guess));
   VR_TRY(batch.readback(lengths_, 0, length_bytes, lengths.data()));
   VR_TRY(batch.readback(failed_, 0, sizeof(failed), &failed));
@@ -342,6 +348,8 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     VR_TRY(tail.submit());
   }
   payload.resize(static_cast<std::size_t>(total));
+  state_.payload_per_block =
+      static_cast<std::uint32_t>((total + total / 4) / n + 1);
   coded.segment_lengths = std::move(lengths);
   coded.payload = std::move(payload);
   return assemble_intra_frame(coded);
@@ -396,8 +404,8 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::write(
   }
   VR_TRY(record_count(batch, blocks, options.segment_size));
   VR_TRY(batch.submit());
-  return finish(blocks, options.segment_size, frame.voxel_size,
-                frame.blocks.trunc_dist, frame.blocks.params);
+  return finish(blocks, frame.voxel_size, frame.blocks.trunc_dist,
+                frame.blocks.params);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

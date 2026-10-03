@@ -8,8 +8,11 @@
 // order: the final state's two words, then the words last emitted first.
 
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 32) in;
+
+#include "rans_push.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer Steps {
   uint steps[];  // start | freq << 16
@@ -29,15 +32,6 @@ layout(set = 0, binding = 4, std430) writeonly buffer Lengths {
 layout(set = 0, binding = 5, std430) buffer Status {
   uint failed;  // nonzero when a step has frequency 0 or outgrows the slot
 };
-
-layout(push_constant, std430) uniform Push {
-  uint item_base;
-  uint num_blocks;
-  uint coefficient_count;
-  uint segment_size;
-  uint segment_count;
-}
-pc;
 
 const uint kScaleBits = 12u;
 const uint kRenormShift = 32u - kScaleBits;

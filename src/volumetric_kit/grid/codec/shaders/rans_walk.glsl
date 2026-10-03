@@ -41,15 +41,7 @@ const uint kAllFull = 2u;
 const uint kOther = 3u;
 const uint kMaskWords = 16u;
 
-// Mirrors `Push` in device_frame_writer.cpp.
-layout(push_constant, scalar) uniform Push {
-  uint item_base;          // first block / segment / word this dispatch covers
-  uint num_blocks;
-  uint coefficient_count;  // K
-  uint segment_size;       // R
-  uint segment_count;
-}
-pc;
+#include "rans_push.glsl"
 
 layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
   BlockIndex blocks[];  // in frame order; only coord is read
@@ -143,7 +135,10 @@ void walk_block(uint i, bool first) {
       const uint j = 2u * w + part;
       if (j >= k) continue;  // an odd K's pad
       const int v = bitfieldExtract(int(word), int(16u * part), 16);
-      walk_signed(kFirstCoef + j, uint(abs(v)), v < 0);
+      // Within the transform's +-32767, except in an entry the forward
+      // rejected and never wrote: clamped, so the count kernel, which runs
+      // before the rejection is refused, stays within the model's classes.
+      walk_signed(kFirstCoef + j, min(uint(abs(v)), 32767u), v < 0);
     }
   }
 
