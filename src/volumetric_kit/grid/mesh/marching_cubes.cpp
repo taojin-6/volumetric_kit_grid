@@ -927,7 +927,7 @@ Result<MarchingCubes> MarchingCubes::create(Device& device,
                                             const MarchingCubesConfig& config) {
   // Reject the one usage bit this repo's Device provably cannot honour, here
   // where the caller supplied it rather than inside the first extract's arena
-  // grow (CLAUDE.md's "validate before creating"). Device::create never enables
+  // grow (AGENTS.md's "validate before creating"). Device::create never enables
   // bufferDeviceAddress, and the allocator is built without
   // VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT, so this bit trips a VMA
   // assert in a debug build and drops VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT in

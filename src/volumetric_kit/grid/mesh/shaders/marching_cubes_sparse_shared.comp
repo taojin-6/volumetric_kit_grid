@@ -855,7 +855,7 @@ void main() {
     // reservation as well as the live count (a private per-slot table; not
     // these four fields, whose ABI is pinned) would remove the relocation
     // entirely, and is worth building only once relocation is measured to be
-    // common rather than rare. That measurement is the one CLAUDE.md already
+    // common rather than rare. That measurement is the one DESIGN.md already
     // parks beside degenerate retirement, and room0 cannot supply it: it
     // re-meshes 81.67% of its blocks per window, so nearly everything
     // relocates there for reasons that have nothing to do with this.
