@@ -36,55 +36,88 @@ namespace {
 
 int params_validate_case() {
   codec::CodecParams p;
-  CHECK(p.validate().ok());  // the defaults pass
-
-  p.coefficient_count = 0;
-  CHECK(!p.validate().ok());
-  p.coefficient_count = 513;
-  CHECK(!p.validate().ok());
-  p.coefficient_count = 1;
   CHECK(p.validate().ok());
-  p.coefficient_count = kVoxelsPerBlock;
-  CHECK(p.validate().ok());
+  CHECK(p.quantization_scale == 0.2f);
+  for (float weight : p.quantization_weights) CHECK(weight == 1.0f);
+  for (std::uint32_t k : {0u, 513u}) {
+    p.coefficient_count = k;
+    CHECK(!p.validate().ok());
+  }
+  for (std::uint32_t k : {1u, kVoxelsPerBlock}) {
+    p.coefficient_count = k;
+    CHECK(p.validate().ok());
+  }
 
-  // The floor is inclusive, and it is what keeps the clamp from engaging:
-  // the largest possible coefficient, sqrt(kVoxelsPerBlock), divided by the
-  // floor step rounds to no more than the clamp.
-  p.dc_step = codec::kMinStep;
-  p.ac_step = codec::kMinStep;
-  CHECK(p.validate().ok());
-  CHECK(std::nearbyint(std::sqrt(double(kVoxelsPerBlock)) /
-                       double(codec::kMinStep)) <=
-        double(codec::kMaxQuantizedMagnitude));
-  p.dc_step = codec::kMinStep * 0.99f;
-  CHECK(!p.validate().ok());
-  p.dc_step = 0.25f;
-  p.ac_step = 0.0f;
-  CHECK(!p.validate().ok());
-  p.ac_step = -0.05f;
-  CHECK(!p.validate().ok());
-  p.ac_step = std::numeric_limits<float>::quiet_NaN();
-  CHECK(!p.validate().ok());
-  p.ac_step = std::numeric_limits<float>::infinity();
-  CHECK(!p.validate().ok());
-
-  // The literal is the formula's float.
+  // The literal is the formula's float, and both effective-step bounds are
+  // inclusive. Even the largest possible coefficient fits the int16 clamp.
   CHECK(codec::kMinStep ==
         static_cast<float>(std::sqrt(double(kVoxelsPerBlock)) /
                            codec::kMaxQuantizedMagnitude));
-
-  // The ceiling is inclusive, and at it every coefficient quantizes to 0: the
-  // largest, sqrt(kVoxelsPerBlock), is under half a step.
-  p.ac_step = codec::kMaxStep;
-  CHECK(p.validate().ok());
+  CHECK(std::nearbyint(std::sqrt(double(kVoxelsPerBlock)) /
+                       double(codec::kMinStep)) <=
+        double(codec::kMaxQuantizedMagnitude));
   CHECK(std::sqrt(double(kVoxelsPerBlock)) < 0.5 * double(codec::kMaxStep));
-  p.ac_step = std::nextafter(codec::kMaxStep, 2.0f * codec::kMaxStep);
+  for (float step : {codec::kMinStep, codec::kMaxStep}) {
+    p.quantization_scale = step;
+    CHECK(p.validate().ok());
+  }
+  for (float scale :
+       {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(), codec::kMinStep * 0.99f,
+        std::nextafter(codec::kMaxStep, 128.0f), 1e38f}) {
+    p.quantization_scale = scale;
+    CHECK(!p.validate().ok());
+  }
+
+  // Validate the kept table entries; no special DC rule exists. Bad products
+  // include overflow and underflow, and a subnormal factor is refused.
+  p.coefficient_count = kVoxelsPerBlock;
+  p.quantization_scale = 0.2f;
+  for (std::size_t i : {std::size_t(0), std::size_t(1), std::size_t(8),
+                        std::size_t(64), std::size_t(511)}) {
+    for (float weight : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::infinity(),
+                         std::numeric_limits<float>::denorm_min(), 1e38f}) {
+      p.quantization_weights[i] = weight;
+      CHECK(!p.validate().ok());
+    }
+    p.quantization_weights[i] = 1.0f;
+  }
+  p.quantization_scale = 1e30f;
+  p.quantization_weights.fill(1e30f);
+  CHECK(!p.validate().ok());  // finite factors, infinite product
+  p.quantization_scale = 1e-30f;
+  p.quantization_weights.fill(1e-30f);
+  CHECK(!p.validate().ok());  // finite factors, zero product
+
+  // A subnormal factor is refused even when the product is a normal step, so
+  // validity cannot depend on a host's denormals-as-zero mode.
+  p.quantization_scale = 1e-40f;
+  p.quantization_weights.fill(1e38f);
   CHECK(!p.validate().ok());
-  p.ac_step = 1e38f;  // finite, and what a corrupt header could carry
+  p.quantization_scale = 1e38f;
+  p.quantization_weights.fill(1e-40f);
   CHECK(!p.validate().ok());
-  p.ac_step = 0.2f;
-  p.dc_step = 1e38f;
+
+  // Only kept weights count: K = 1 keeps DC alone.
+  p.coefficient_count = 1;
+  p.quantization_scale = 0.2f;
+  p.quantization_weights.fill(1.0f);
+  p.quantization_weights[511] = 0.0f;
+  CHECK(p.validate().ok());
+  p.quantization_weights[0] = 0.0f;
   CHECK(!p.validate().ok());
+  p.quantization_weights.fill(1.0f);
+  p.coefficient_count = kVoxelsPerBlock;
+
+  // Only the product is bounded: rescaling a table is permitted, and DC
+  // weight 1 is a preset convention rather than an API restriction.
+  p.quantization_scale = 128.0f;
+  p.quantization_weights.fill(0.25f);
+  CHECK(p.validate().ok());
+  p.quantization_scale = codec::kMinStep * 0.5f;
+  p.quantization_weights.fill(2.0f);
+  CHECK(p.validate().ok());
   return 0;
 }
 

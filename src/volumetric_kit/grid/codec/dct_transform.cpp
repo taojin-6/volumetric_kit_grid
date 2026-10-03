@@ -25,14 +25,12 @@ namespace {
 
 // Mirrors `PushConstants` in dct_common.glsl. All 4-byte scalars, so scalar
 // layout puts each at its host offset; a drift is a compile error here, not a
-// kernel reading the steps as the block count.
+// kernel reading one field as another.
 struct PushConstants {
   std::uint32_t block_base;
   std::uint32_t num_blocks;
   std::uint32_t coefficient_count;
   float trunc_dist;
-  float dc_step;
-  float ac_step;
   float observed_weight;
   float decoded_weight;
   std::int32_t num_buckets;
@@ -41,20 +39,18 @@ struct PushConstants {
   std::int32_t max_quantized;
   std::uint32_t tick;  // the map's tick, which the inverse stamps blocks with
 };
-static_assert(sizeof(PushConstants) == 52, "PushConstants must be 52 bytes");
+static_assert(sizeof(PushConstants) == 44, "PushConstants must be 44 bytes");
 static_assert(offsetof(PushConstants, block_base) == 0, "layout drift");
 static_assert(offsetof(PushConstants, num_blocks) == 4, "layout drift");
 static_assert(offsetof(PushConstants, coefficient_count) == 8, "layout drift");
 static_assert(offsetof(PushConstants, trunc_dist) == 12, "layout drift");
-static_assert(offsetof(PushConstants, dc_step) == 16, "layout drift");
-static_assert(offsetof(PushConstants, ac_step) == 20, "layout drift");
-static_assert(offsetof(PushConstants, observed_weight) == 24, "layout drift");
-static_assert(offsetof(PushConstants, decoded_weight) == 28, "layout drift");
-static_assert(offsetof(PushConstants, num_buckets) == 32, "layout drift");
-static_assert(offsetof(PushConstants, bucket_size) == 36, "layout drift");
-static_assert(offsetof(PushConstants, max_chain) == 40, "layout drift");
-static_assert(offsetof(PushConstants, max_quantized) == 44, "layout drift");
-static_assert(offsetof(PushConstants, tick) == 48, "layout drift");
+static_assert(offsetof(PushConstants, observed_weight) == 16, "layout drift");
+static_assert(offsetof(PushConstants, decoded_weight) == 20, "layout drift");
+static_assert(offsetof(PushConstants, num_buckets) == 24, "layout drift");
+static_assert(offsetof(PushConstants, bucket_size) == 28, "layout drift");
+static_assert(offsetof(PushConstants, max_chain) == 32, "layout drift");
+static_assert(offsetof(PushConstants, max_quantized) == 36, "layout drift");
+static_assert(offsetof(PushConstants, tick) == 40, "layout drift");
 
 // The kernels' lane-to-line mapping is written for this edge (kEdge in
 // dct_common.glsl), which is why a grid with another block size is refused.
@@ -69,6 +65,15 @@ static_assert(sizeof(Tables) == kBasisSize * sizeof(float) +
                                     kVoxelsPerBlock * sizeof(std::uint32_t),
               "Tables layout drift");
 
+// Mirrors the counter buffer in dct_common.glsl. Only the observed pass uses
+// the second word; the transform directions read back the first alone.
+struct Counts {
+  std::uint32_t rejected = 0;
+  std::uint32_t observed = 0;
+};
+static_assert(sizeof(Counts) == 8, "Counts layout drift");
+static_assert(offsetof(Counts, observed) == 4, "Counts layout drift");
+
 // The set-0 bindings of both kernels, mirroring the VR_DCT_BINDING_* defines in
 // dct_common.glsl -- the compute core is explicit, not reflected (2026-07-05).
 enum Binding : std::uint32_t {
@@ -81,7 +86,8 @@ enum Binding : std::uint32_t {
   kBindingEntries = 6,
   kBindingRejected = 7,
   kBindingStamps = 8,
-  kBindingCount = 9,
+  kBindingQuantization = 9,
+  kBindingCount = 10,
 };
 
 Status fail(const char* op, const std::string& why) {
@@ -138,8 +144,9 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
   std::copy(basis.begin(), basis.end(), tables.basis);
   std::copy(zigzag.begin(), zigzag.end(), tables.zigzag);
   VR_ASSIGN(t.tables_, device_storage_buffer(allocator, sizeof(tables)));
-  VR_ASSIGN(t.rejected_,
-            device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  VR_ASSIGN(t.rejected_, device_storage_buffer(allocator, sizeof(Counts)));
+  VR_ASSIGN(t.quantization_steps_,
+            device_storage_buffer(allocator, kVoxelsPerBlock * sizeof(float)));
   CommandBatch batch(device, allocator);
   VR_TRY(batch.upload(t.tables_, 0, &tables, sizeof(tables)));
   VR_TRY(batch.submit());
@@ -149,10 +156,15 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(t.rejected_.handle()),
                          "codec.rejected");
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         debug_object_handle(t.quantization_steps_.handle()),
+                         "codec.quantization_steps");
   for (ComputeKernel* kernel :
        {&t.forward_kernel_, &t.inverse_kernel_, &t.observed_kernel_}) {
     kernel->set.write_storage_buffer(kBindingTables, t.tables_.handle(), 0,
                                      VK_WHOLE_SIZE);
+    kernel->set.write_storage_buffer(
+        kBindingQuantization, t.quantization_steps_.handle(), 0, VK_WHOLE_SIZE);
     kernel->set.write_storage_buffer(kBindingRejected, t.rejected_.handle(), 0,
                                      VK_WHOLE_SIZE);
   }
@@ -198,7 +210,7 @@ Status DctTransform::record(CommandBatch& batch, ComputeKernel& kernel,
                             const GridViews& views, VkBuffer list,
                             std::uint32_t count, const CodecParams& params,
                             VkBuffer coefficients, VkBuffer masks,
-                            GpuStageScope* stage) {
+                            VkDeviceSize masks_bytes, GpuStageScope* stage) {
   // Another tier sized this one (and every resize doubles it), so it is bound
   // at its real size and range-checked, as the mesher binds it.
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
@@ -212,10 +224,13 @@ Status DctTransform::record(CommandBatch& batch, ComputeKernel& kernel,
   kernel.set.write_storage_buffer(kBindingWeight, views.weight.buffer->handle(),
                                   0, VK_WHOLE_SIZE);
   if (coefficients != VK_NULL_HANDLE) {
+    const VkDeviceSize coeff_bytes = VkDeviceSize(count) *
+                                     padded_count(params.coefficient_count) *
+                                     sizeof(std::int16_t);
     kernel.set.write_storage_buffer(kBindingCoefficients, coefficients, 0,
-                                    VK_WHOLE_SIZE);
+                                    coeff_bytes);
   }
-  kernel.set.write_storage_buffer(kBindingMasks, masks, 0, VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(kBindingMasks, masks, 0, masks_bytes);
   kernel.set.write_storage_buffer(kBindingEntries, grid.map().entries_buffer(),
                                   0, entries_bytes);
   kernel.set.write_storage_buffer(
@@ -226,8 +241,15 @@ Status DctTransform::record(CommandBatch& batch, ComputeKernel& kernel,
   push.num_blocks = count;
   push.coefficient_count = params.coefficient_count;
   push.trunc_dist = gp.trunc_dist;
-  push.dc_step = params.dc_step;
-  push.ac_step = params.ac_step;
+  if (coefficients != VK_NULL_HANDLE) {
+    // The same float products validate() checked, staged before any dispatch
+    // reads them.
+    std::array<float, kVoxelsPerBlock> steps{};
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+      steps[i] = params.quantization_scale * params.quantization_weights[i];
+    }
+    VR_TRY(batch.upload(quantization_steps_, 0, steps.data(), sizeof(steps)));
+  }
   push.observed_weight = volume::kObservedWeight;
   push.decoded_weight = kDecodedWeight;
   push.num_buckets = gp.num_buckets;
@@ -235,7 +257,7 @@ Status DctTransform::record(CommandBatch& batch, ComputeKernel& kernel,
   push.max_chain = gp.max_chain;
   push.max_quantized = kMaxQuantizedMagnitude;
   push.tick = grid.map().tick();
-  VR_TRY(batch.fill(rejected_, 0, sizeof(std::uint32_t), 0u));
+  VR_TRY(batch.fill(rejected_, 0, sizeof(Counts), 0u));
   // The batch barriers every dispatch, so the batches see each other's writes
   // -- and they touch disjoint list entries.
   for (std::uint32_t base = 0; base < count; base += blocks_per_dispatch_) {
@@ -258,18 +280,18 @@ Status DctTransform::check_rejected(const char* op, std::uint32_t rejected,
   return {};
 }
 
-Result<Buffer> DctTransform::upload_list(CommandBatch& batch,
-                                         const volume::BlockList& blocks) {
+Status DctTransform::ensure_scratch(Buffer& buffer, VkDeviceSize bytes,
+                                    const char* name) {
+  return ensure_device_scratch(*device_, *allocator_, buffer, bytes,
+                               max_storage_buffer_range_, name);
+}
+
+Status DctTransform::upload_list(CommandBatch& batch,
+                                 const volume::BlockList& blocks) {
   const VkDeviceSize list_bytes =
       VkDeviceSize(blocks.count) * sizeof(volume::BlockIndex);
-  VR_TRY(check_storage_buffer_range("DctTransform: the block list", list_bytes,
-                                    max_storage_buffer_range_));
-  VR_ASSIGN(Buffer list, device_storage_buffer(*allocator_, list_bytes));
-  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                           debug_object_handle(list.handle()),
-                           "codec.block_list");
-  VR_TRY(batch.upload(list, 0, blocks.blocks, list_bytes));
-  return list;
+  VR_TRY(ensure_scratch(block_list_, list_bytes, "codec.block_list"));
+  return batch.upload(block_list_, 0, blocks.blocks, list_bytes);
 }
 
 Result<std::vector<volume::BlockIndex>> DctTransform::observed(
@@ -280,35 +302,47 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
   VR_TRY(grid.map().check_device_block_list(list, "DctTransform::observed"));
   std::vector<volume::BlockIndex> out;
   if (list.count == 0) {
+    last_observed_.count = 0;
     return out;
   }
-  const VkDeviceSize flag_bytes =
-      VkDeviceSize(list.count) * sizeof(std::uint32_t);
-  VR_TRY(check_storage_buffer_range("DctTransform: the observed flags",
-                                    flag_bytes, max_storage_buffer_range_));
-  VR_ASSIGN(const Buffer flags, device_storage_buffer(*allocator_, flag_bytes));
-  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                           debug_object_handle(flags.handle()),
-                           "codec.observed");
-  std::vector<volume::BlockIndex> entries(list.count);
-  std::vector<std::uint32_t> observed(list.count);
-  std::uint32_t rejected = 0;
+  const VkDeviceSize list_bytes =
+      VkDeviceSize(list.count) * sizeof(volume::BlockIndex);
+  VR_TRY(ensure_scratch(observed_blocks_, list_bytes, "codec.observed_blocks"));
+  // Read a predicted prefix beside the count, rather than pay a second fence
+  // on every call: the last observed count plus 25%, capped by the current
+  // input count, or the whole input when there is no last count (the first
+  // call, or one after an empty result). Only an outgrown prefix costs
+  // another transfer, just as collect_compacted does.
+  const std::uint32_t last = last_observed_.count;
+  const std::uint32_t guess =
+      last == 0 ? list.count
+                : static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                      list.count, std::uint64_t(last) + last / 4));
+  out.resize(guess);
+  Counts counts;
   CommandBatch batch(*device_, *allocator_);
   VR_TRY(record(batch, observed_kernel_, grid, views, list.buffer->handle(),
-                list.count, CodecParams{}, VK_NULL_HANDLE, flags.handle(),
-                stage));
-  VR_TRY(batch.readback(*list.buffer, 0,
-                        VkDeviceSize(list.count) * sizeof(volume::BlockIndex),
-                        entries.data()));
-  VR_TRY(batch.readback(flags, 0, flag_bytes, observed.data()));
-  VR_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
+                list.count, CodecParams{}, VK_NULL_HANDLE,
+                observed_blocks_.handle(), list_bytes, stage));
+  VR_TRY(batch.readback(rejected_, 0, sizeof(counts), &counts));
+  VR_TRY(batch.readback(observed_blocks_, 0,
+                        VkDeviceSize(guess) * sizeof(volume::BlockIndex),
+                        out.data()));
   VR_TRY(batch.submit());
-  VR_TRY(check_rejected("observed", rejected, list.count));
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (observed[i] != 0) {
-      out.push_back(entries[i]);
-    }
+  VR_TRY(check_rejected("observed", counts.rejected, list.count));
+  if (counts.observed > list.count) {
+    return fail("observed", "the device observed count exceeds the input list");
   }
+  out.resize(counts.observed);
+  if (counts.observed > guess) {
+    CommandBatch tail(*device_, *allocator_);
+    VR_TRY(tail.readback(
+        observed_blocks_, VkDeviceSize(guess) * sizeof(volume::BlockIndex),
+        VkDeviceSize(counts.observed - guess) * sizeof(volume::BlockIndex),
+        out.data() + guess));
+    VR_TRY(tail.submit());
+  }
+  last_observed_.count = counts.observed;
   return out;
 }
 
@@ -329,32 +363,20 @@ Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
         VkDeviceSize(blocks.count) * padded * sizeof(std::int16_t);
     const VkDeviceSize mask_bytes =
         VkDeviceSize(blocks.count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
-    VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
-                                      coeff_bytes, max_storage_buffer_range_));
-    VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
-                                      max_storage_buffer_range_));
-    VR_ASSIGN(const Buffer coeff_buf,
-              device_storage_buffer(*allocator_, coeff_bytes));
-    VR_ASSIGN(const Buffer mask_buf,
-              device_storage_buffer(*allocator_, mask_bytes));
-    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                             debug_object_handle(coeff_buf.handle()),
-                             "codec.coefficients");
-    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                             debug_object_handle(mask_buf.handle()),
-                             "codec.masks");
+    VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
+    VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
 
     std::vector<std::int16_t> coefficients(std::size_t(blocks.count) * padded);
     std::vector<std::uint32_t> masks(std::size_t(blocks.count) *
                                      kMaskWordsPerBlock);
     std::uint32_t rejected = 0;
     CommandBatch batch(*device_, *allocator_);
-    VR_ASSIGN(const Buffer list, upload_list(batch, blocks));
-    VR_TRY(record(batch, forward_kernel_, grid, views, list.handle(),
-                  blocks.count, params, coeff_buf.handle(), mask_buf.handle(),
-                  stage));
-    VR_TRY(batch.readback(coeff_buf, 0, coeff_bytes, coefficients.data()));
-    VR_TRY(batch.readback(mask_buf, 0, mask_bytes, masks.data()));
+    VR_TRY(upload_list(batch, blocks));
+    VR_TRY(record(batch, forward_kernel_, grid, views, block_list_.handle(),
+                  blocks.count, params, coefficients_.handle(), masks_.handle(),
+                  mask_bytes, stage));
+    VR_TRY(batch.readback(coefficients_, 0, coeff_bytes, coefficients.data()));
+    VR_TRY(batch.readback(masks_, 0, mask_bytes, masks.data()));
     VR_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
     VR_TRY(batch.submit());
     VR_TRY(check_rejected("forward", rejected, blocks.count));
@@ -407,29 +429,18 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
       VkDeviceSize(blocks.count) * padded * sizeof(std::int16_t);
   const VkDeviceSize mask_bytes =
       VkDeviceSize(mask_count) * sizeof(std::uint32_t);
-  VR_TRY(check_storage_buffer_range("DctTransform: the coefficients",
-                                    coeff_bytes, max_storage_buffer_range_));
-  VR_TRY(check_storage_buffer_range("DctTransform: the masks", mask_bytes,
-                                    max_storage_buffer_range_));
-  VR_ASSIGN(const Buffer coeff_buf,
-            device_storage_buffer(*allocator_, coeff_bytes));
-  VR_ASSIGN(const Buffer mask_buf,
-            device_storage_buffer(*allocator_, mask_bytes));
-  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                           debug_object_handle(coeff_buf.handle()),
-                           "codec.coefficients");
-  device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                           debug_object_handle(mask_buf.handle()),
-                           "codec.masks");
+  VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
+  VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
 
   std::uint32_t rejected = 0;
   CommandBatch batch(*device_, *allocator_);
-  VR_ASSIGN(const Buffer list, upload_list(batch, blocks));
+  VR_TRY(upload_list(batch, blocks));
   if (padded == k) {
-    VR_TRY(batch.upload(coeff_buf, 0, in.coefficients.data(), coeff_bytes));
+    VR_TRY(batch.upload(coefficients_, 0, in.coefficients.data(), coeff_bytes));
   } else {
     // Each entry padded to a whole word, as the kernel reads it.
-    VR_ASSIGN(void* staged, batch.reserve_upload(coeff_buf, 0, coeff_bytes));
+    VR_ASSIGN(void* staged,
+              batch.reserve_upload(coefficients_, 0, coeff_bytes));
     auto* rows = static_cast<std::int16_t*>(staged);
     for (std::size_t i = 0; i < blocks.count; ++i) {
       std::copy_n(in.coefficients.begin() + std::ptrdiff_t(i * k), k,
@@ -437,12 +448,12 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
       rows[i * padded + k] = 0;
     }
   }
-  VR_TRY(batch.upload(mask_buf, 0, in.masks.data(), mask_bytes));
+  VR_TRY(batch.upload(masks_, 0, in.masks.data(), mask_bytes));
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();
-  VR_TRY(record(batch, inverse_kernel_, grid, views, list.handle(),
-                blocks.count, in.params, coeff_buf.handle(), mask_buf.handle(),
-                stage));
+  VR_TRY(record(batch, inverse_kernel_, grid, views, block_list_.handle(),
+                blocks.count, in.params, coefficients_.handle(),
+                masks_.handle(), mask_bytes, stage));
   VR_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
   VR_TRY(batch.submit());
   return check_rejected("inverse", rejected, blocks.count);

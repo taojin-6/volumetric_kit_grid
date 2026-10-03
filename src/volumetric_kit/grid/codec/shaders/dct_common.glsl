@@ -50,6 +50,7 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 #define VR_DCT_BINDING_ENTRIES 6
 #define VR_DCT_BINDING_REJECTED 7
 #define VR_DCT_BINDING_STAMPS 8
+#define VR_DCT_BINDING_QUANTIZATION 9
 
 // BlockIndex and the read-only hash lookup from the volume tier (one
 // definition, not a mirror -- see hash_lookup.glsl), which brings hash_common
@@ -58,15 +59,13 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 #include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
-// layout places each at its host offset (52 bytes).
+// layout places each at its host offset (44 bytes).
 layout(push_constant, scalar) uniform PushConstants {
   uint block_base;         // first list entry this dispatch covers
   uint num_blocks;         // entries in the whole list
   uint coefficient_count;  // K, in [1, kBlockVoxels]
   float trunc_dist;        // metres; the SDF is divided by it (forward) and
                            // multiplied back (inverse)
-  float dc_step;           // quantization steps, fractions of trunc_dist
-  float ac_step;
   float observed_weight;   // weight >= this marks a voxel observed
   float decoded_weight;    // what the inverse writes on an observed voxel
   int num_buckets;         // the hash table's shape, for the live-block probe
@@ -92,10 +91,18 @@ layout(set = 0, binding = VR_DCT_BINDING_TABLES, scalar) readonly buffer
   uint zigzag[kBlockVoxels];
 };
 
-// Entries block_ptr found no block for, summed over every batch for the host
-// to report.
+// One effective step per canonical frequency x + 8*y + 64*z, staged for
+// this call after the host multiplies the scale and weights.
+layout(set = 0, binding = VR_DCT_BINDING_QUANTIZATION, scalar) readonly buffer
+    Quantization {
+  float quantization_steps[kBlockVoxels];
+};
+
+// Mirrors Counts in dct_transform.cpp: rejected entries and the observed
+// kernel's append count, summed over every dispatch in the call.
 layout(set = 0, binding = VR_DCT_BINDING_REJECTED, scalar) buffer Rejected {
   uint rejected;
+  uint observed_count;
 };
 
 shared float s_work[2u * kBlockVoxels];
@@ -166,7 +173,9 @@ void transform_cube(uint lane, bool inverse) {
 }
 
 // The step coefficient j (zigzag index) was quantized with.
-float step_for(uint j) { return j == 0u ? pc.dc_step : pc.ac_step; }
+float step_for(uint j) {
+  return quantization_steps[zigzag[j]];
+}
 
 // The quantized coefficients travel two to a 32-bit word, coefficient 2p in
 // the low half of word p and 2p + 1 in the high, each entry starting a word of

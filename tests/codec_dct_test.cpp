@@ -258,7 +258,8 @@ Cube reference_round_trip(const Cube& in, const codec::CodecParams& params) {
   const auto zigzag = codec::detail::zigzag_order();
   Cube kept{};
   for (std::uint32_t j = 0; j < params.coefficient_count; ++j) {
-    const double step = j == 0 ? params.dc_step : params.ac_step;
+    const double step =
+        params.quantization_scale * params.quantization_weights[zigzag[j]];
     kept[zigzag[j]] = std::nearbyint(coeffs[zigzag[j]] / step) * step;
   }
   Cube out = reference_dct(kept, true);
@@ -304,7 +305,8 @@ int check_against_reference(const DctBlocks& out, const Cube* content,
   for (std::size_t i = 0; i < count; ++i) {
     const Cube ref = reference_dct(content[i], false);
     for (std::uint32_t j = 0; j < k; ++j) {
-      const double step = j == 0 ? params.dc_step : params.ac_step;
+      const double step =
+          params.quantization_scale * params.quantization_weights[zigzag[j]];
       const double r = ref[zigzag[j]] / step;
       const double q = coeffs[i * k + j];
       CHECK(std::fabs(q - r) <= 0.5 + 0.05);
@@ -341,15 +343,18 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
 
   codec::CodecParams params;
   params.coefficient_count = kVpb;
-  params.dc_step = 1e-3f;
-  params.ac_step = 2e-3f;
+  params.quantization_scale = 1e-3f;
+  for (std::size_t i = 0; i < params.quantization_weights.size(); ++i) {
+    params.quantization_weights[i] = 1.0f + 0.25f * float((i * 37) % 8);
+  }
   DctBlocks out;
   CHECK(t.forward(grid, grid.block_list(blocks), params, out).ok());
   CHECK(out.coefficients.size() == 4u * kVpb);
   CHECK(out.masks.size() == 4u * codec::kMaskWordsPerBlock);
   // The params and the band travel with the coefficients.
   CHECK(out.params.coefficient_count == params.coefficient_count);
-  CHECK(out.params.dc_step == params.dc_step);
+  CHECK(out.params.quantization_scale == params.quantization_scale);
+  CHECK(out.params.quantization_weights == params.quantization_weights);
   CHECK(out.trunc_dist == kTrunc);
 
   int exact = 0;
@@ -378,9 +383,71 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
   return 0;
 }
 
+// Independently placed x/y/z basis coefficients make canonical indexing
+// observable: zigzag begins [0, 64, 8, 1], not [0, 1, 2, 3]. Reuse one live
+// transform with A, B, then A again to catch a stale per-call table upload.
+int per_basis_sequence_case(vr::Device& device, vr::Allocator& allocator,
+                            DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
+  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  CHECK(active.ok());
+  const vol::BlockIndex block = active.value()[0];
+  const vol::BlockList list = grid.block_list(active.value());
+  Cube spectral{};
+  spectral[0] = 0.47;
+  spectral[1] = 1.37;
+  spectral[8] = 2.19;
+  spectral[64] = -0.83;
+  const Cube content = reference_dct(spectral, true);
+  codec::CodecParams a;
+  a.coefficient_count = 4;
+  a.quantization_scale = 0.1f;
+  a.quantization_weights[0] = 2.0f;
+  a.quantization_weights[1] = 0.5f;
+  a.quantization_weights[8] = 2.0f;
+  a.quantization_weights[64] = 4.0f;
+  codec::CodecParams b = a;
+  b.quantization_scale = 0.15f;
+  std::swap(b.quantization_weights[1], b.quantization_weights[64]);
+  // A subnormal factor is refused even when its product is a normal step: a
+  // denormals-as-zero host or device would read it as 0.
+  codec::CodecParams tiny_scale = a;
+  tiny_scale.quantization_scale = 1e-40f;
+  tiny_scale.quantization_weights.fill(1e38f);
+  DctBlocks refused;
+  CHECK(!t.forward(grid, list, tiny_scale, refused).ok());
+  const std::uint32_t modes[] = {0, 64, 8, 1};
+  std::vector<std::int16_t> first;
+  for (const codec::CodecParams* params : {&a, &b, &a}) {
+    write_block(ctx, grid, block, content, observed);
+    DctBlocks out;
+    CHECK(t.forward(grid, list, *params, out).ok());
+    CHECK(out.params.quantization_weights == params->quantization_weights);
+    Cube reconstructed{};
+    for (std::size_t j = 0; j < 4; ++j) {
+      const std::uint32_t v = modes[j];
+      const double step =
+          params->quantization_scale * params->quantization_weights[v];
+      const double q = std::nearbyint(spectral[v] / step);
+      CHECK(out.coefficients[j] == q);
+      reconstructed[v] = q * step;
+    }
+    if (first.empty()) first = out.coefficients;
+    if (params == &a) CHECK(first == out.coefficients);
+    if (params == &b) CHECK(first != out.coefficients);
+    CHECK(t.inverse(grid, list, out).ok());
+    CHECK(rms_diff(read_block(ctx, grid, block),
+                   reference_dct(reconstructed, true)) < 1e-6);
+  }
+  return 0;
+}
+
 // Orthonormal, so the reconstruction error's norm IS the quantization error's
 // norm: with all 512 coefficients kept, each off by at most half its step,
-// a block's RMS error is at most sqrt(((dc/2)^2 + 511 (ac/2)^2) / 512).
+// a block's RMS error is at most sqrt(sum_j (step[j]/2)^2 / 512).
 int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
                           DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
@@ -398,16 +465,21 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
 
   codec::CodecParams params;
   params.coefficient_count = kVpb;
-  params.dc_step = 0.02f;
-  params.ac_step = 0.01f;
+  params.quantization_scale = 0.01f;
+  for (std::size_t i = 0; i < params.quantization_weights.size(); ++i) {
+    params.quantization_weights[i] = 1.0f + 0.125f * float(i % 9);
+  }
   DctBlocks out;
   const vol::BlockList list = grid.block_list(blocks);
   CHECK(t.forward(grid, list, params, out).ok());
   CHECK(t.inverse(grid, list, out).ok());
 
-  const double dc = params.dc_step, ac = params.ac_step;
-  const double bound =
-      std::sqrt((dc * dc / 4.0 + (kVpb - 1) * ac * ac / 4.0) / kVpb) + 1e-5;
+  double squared_steps = 0.0;
+  for (float weight : params.quantization_weights) {
+    const double step = params.quantization_scale * weight;
+    squared_steps += step * step;
+  }
+  const double bound = std::sqrt(squared_steps / (4.0 * kVpb)) + 1e-5;
   const std::vector<float> weight = attr(ctx, grid, "weight");
   for (int i = 0; i < 4; ++i) {
     const double err =
@@ -447,8 +519,7 @@ int truncation_matches_reference_case(vr::Device& device,
     write_block(ctx, grid, block, content, observed);
     codec::CodecParams params;
     params.coefficient_count = k;
-    params.dc_step = codec::kMinStep;
-    params.ac_step = codec::kMinStep;
+    params.quantization_scale = codec::kMinStep;
     DctBlocks out;
     const vol::BlockList list = grid.block_list(active.value());
     CHECK(t.forward(grid, list, params, out).ok());
@@ -562,8 +633,7 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
 
   codec::CodecParams full;
   full.coefficient_count = kVpb;
-  full.dc_step = codec::kMinStep;
-  full.ac_step = 1e-3f;
+  full.quantization_scale = codec::kMinStep;
   DctBlocks out;
   CHECK(t.forward(grid, list, full, out).ok());
   for (std::size_t i = 0; i < 2; ++i) {
@@ -576,10 +646,10 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(out.coefficients[kVpb] >= codec::kMaxQuantizedMagnitude - 1);
 
   // DC alone reconstructs the constant to within half a DC step, spread over
-  // the block: |error| <= dc_step / (2 sqrt(512)).
+  // the block: |error| <= DC step / (2 sqrt(512)).
   codec::CodecParams dc_only;
   dc_only.coefficient_count = 1;
-  dc_only.dc_step = 0.01f;
+  dc_only.quantization_scale = 0.01f;
   CHECK(t.forward(grid, list, dc_only, out).ok());
   CHECK(out.coefficients.size() == 2);
   CHECK(t.inverse(grid, list, out).ok());
@@ -611,8 +681,7 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
 
   codec::CodecParams params;
   params.coefficient_count = 4;
-  params.dc_step = codec::kMinStep;
-  params.ac_step = codec::kMinStep;
+  params.quantization_scale = codec::kMinStep;
   DctBlocks out;
   const vol::BlockList list = grid.block_list(active.value());
   CHECK(t.forward(grid, list, params, out).ok());
@@ -673,8 +742,8 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
 
   codec::CodecParams params;
   params.coefficient_count = 32;
-  params.dc_step = 0.25f;
-  params.ac_step = 0.05f;
+  params.quantization_scale = 0.05f;
+  params.quantization_weights[0] = 5.0f;
   const vol::BlockList list = grid.block_list(active.value());
   DctBlocks out;
   CHECK(t.forward(grid, list, params, out).ok());
@@ -910,7 +979,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
     short_masks.masks.pop_back();
     CHECK(!t.inverse(grid, grid.block_list(blocks), short_masks).ok());
     DctBlocks bad_params = out;
-    bad_params.params.ac_step = 0.0f;
+    bad_params.params.quantization_weights[0] = 0.0f;
     CHECK(!t.inverse(grid, grid.block_list(blocks), bad_params).ok());
     DctBlocks other_band = out;
     other_band.trunc_dist = kTrunc * 0.2f;
@@ -958,8 +1027,8 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
 }
 
 // The observed pass keeps exactly the entries of the map's own list whose
-// block holds a voxel at or above kObservedWeight, in the list's order, and
-// refuses a list the map has moved past.
+// block holds a voxel at or above kObservedWeight, with each original ptr,
+// and refuses a list the map has moved past. Append order is unspecified.
 int observed_case(vr::Device& device, vr::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
@@ -986,22 +1055,37 @@ int observed_case(vr::Device& device, vr::Allocator& allocator,
   vr::Result<std::vector<vol::BlockIndex>> kept =
       t.observed(grid, list.value());
   CHECK(kept.ok());
-  // The map's list, filtered: the same entries in the same order.
-  std::vector<vol::BlockIndex> entries(4);
-  vr::CommandBatch batch(device, allocator);
-  CHECK(batch
-            .readback(*list.value().buffer, 0, 4 * sizeof(vol::BlockIndex),
-                      entries.data())
-            .ok());
-  CHECK(batch.submit().ok());
-  std::vector<vol::BlockIndex> expected;
-  for (const vol::BlockIndex& e : entries) {
-    if (e.coord.x == 0 || e.coord.x == 2) expected.push_back(e);
-  }
+  const auto by_x = [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
+    return a.coord.x < b.coord.x;
+  };
+  std::sort(kept.value().begin(), kept.value().end(), by_x);
   CHECK(kept.value().size() == 2);
   for (std::size_t i = 0; i < 2; ++i) {
-    CHECK(kept.value()[i].coord == expected[i].coord);
-    CHECK(kept.value()[i].ptr == expected[i].ptr);
+    CHECK(kept.value()[i].coord == blocks[2 * i].coord);
+    CHECK(kept.value()[i].ptr == blocks[2 * i].ptr);
+  }
+
+  // Grow beyond the two-entry readback prediction, then shrink to none and
+  // regrow from a zero-entry prediction. No old append count or stale list
+  // tail may survive a call. The all-observed result also checks no duplicate
+  // append and every ptr, across dispatches in the chunked variant below.
+  for (bool all : {true, false, true}) {
+    std::vector<float> weights = attr(ctx, grid, "weight");
+    std::fill(weights.begin(), weights.end(), 0.0f);
+    if (all) {
+      for (const vol::BlockIndex& block : blocks) {
+        weights[std::size_t(block.ptr) + 511] = vol::kObservedWeight;
+      }
+    }
+    put(ctx, grid, "weight", weights);
+    kept = t.observed(grid, list.value());
+    CHECK(kept.ok());
+    CHECK(kept.value().size() == (all ? blocks.size() : 0u));
+    std::sort(kept.value().begin(), kept.value().end(), by_x);
+    for (std::size_t i = 0; i < kept.value().size(); ++i) {
+      CHECK(kept.value()[i].coord == blocks[i].coord);
+      CHECK(kept.value()[i].ptr == blocks[i].ptr);
+    }
   }
 
   // A list an allocation has made stale is refused.
@@ -1019,6 +1103,94 @@ int observed_case(vr::Device& device, vr::Allocator& allocator,
   vr::Result<std::vector<vol::BlockIndex>> nothing =
       t.observed(e.value(), none.value());
   CHECK(nothing.ok() && nothing.value().empty());
+
+  // An empty input followed by a smaller grid reuses the former capacity,
+  // and a larger one grows it. Both must ignore the previous list's suffix.
+  for (int size : {1, 17, 3}) {
+    auto resized = make_grid(device, allocator);
+    CHECK(resized.ok());
+    auto row = allocate_row(resized.value(), size);
+    CHECK(row.ok());
+    std::vector<float> weights = attr(ctx, resized.value(), "weight");
+    for (const vol::BlockIndex& block : row.value()) {
+      if (block.coord.x % 2 == 0) {
+        weights[std::size_t(block.ptr) + 300] = vol::kObservedWeight;
+      }
+    }
+    put(ctx, resized.value(), "weight", weights);
+    auto device_list = resized.value().map().compact_active_blocks_on_device();
+    CHECK(device_list.ok());
+    auto result = t.observed(resized.value(), device_list.value());
+    CHECK(result.ok());
+    CHECK(result.value().size() == std::size_t((size + 1) / 2));
+    std::sort(result.value().begin(), result.value().end(), by_x);
+    for (std::size_t i = 0; i < result.value().size(); ++i) {
+      CHECK(result.value()[i].coord == row.value()[2 * i].coord);
+      CHECK(result.value()[i].ptr == row.value()[2 * i].ptr);
+    }
+  }
+  return 0;
+}
+
+// Reuse scratch through count/K growth, shrink, odd padding and an empty
+// transform. Coefficients and inverse output must still match the independent
+// CPU reference; inverse must not touch a retained list's obsolete suffix.
+int scratch_reuse_case(vr::Device& device, vr::Allocator& allocator,
+                       DctTransform& t) {
+  const vr_test::Gpu ctx{device, allocator};
+  auto made = make_grid(device, allocator);
+  CHECK(made.ok());
+  auto& grid = made.value();
+  auto active = allocate_row(grid, 17);
+  CHECK(active.ok());
+  const auto& blocks = active.value();
+  std::vector<Cube> content;
+  std::vector<float> original = attr(ctx, grid, "tsdf");
+  std::vector<float> weights = attr(ctx, grid, "weight");
+  for (const vol::BlockIndex& block : blocks) {
+    content.push_back(random_cube(std::uint32_t(block.coord.x) + 713));
+    for (std::size_t v = 0; v < kVpb; ++v) {
+      original[std::size_t(block.ptr) + v] = float(content.back()[v]) * kTrunc;
+      weights[std::size_t(block.ptr) + v] = codec::detail::kDecodedWeight;
+    }
+  }
+  put(ctx, grid, "weight", weights);
+  const std::array<std::pair<std::size_t, std::uint32_t>, 7> calls = {
+      {{1, 1}, {17, 512}, {3, 35}, {0, 64}, {17, 64}, {1, 512}, {17, 512}}};
+  for (const auto& [count, k] : calls) {
+    put(ctx, grid, "tsdf", original);
+    const std::vector<vol::BlockIndex> prefix(
+        blocks.begin(), blocks.begin() + std::ptrdiff_t(count));
+    codec::CodecParams params;
+    params.coefficient_count = k;
+    params.quantization_scale = 0.02f;
+    for (std::size_t i = 0; i < params.quantization_weights.size(); ++i) {
+      params.quantization_weights[i] = 1.0f + 0.25f * float((i + count) % 5);
+    }
+    DctBlocks out;
+    const auto list = grid.block_list(prefix);
+    CHECK(t.forward(grid, list, params, out).ok());
+    CHECK(out.coefficients.size() == count * k);
+    CHECK(out.masks.size() == count * codec::kMaskWordsPerBlock);
+    int exact = 0;
+    int near_half = 0;
+    CHECK(check_against_reference(out, content.data(), count, exact,
+                                  near_half) == 0);
+    CHECK(t.inverse(grid, list, out).ok());
+    const auto decoded = attr(ctx, grid, "tsdf");
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+      Cube actual;
+      for (std::size_t v = 0; v < kVpb; ++v) {
+        const std::size_t offset = std::size_t(blocks[i].ptr) + v;
+        if (i >= count) CHECK(decoded[offset] == original[offset]);
+        actual[v] = decoded[offset] / kTrunc;
+      }
+      if (i < count) {
+        CHECK(rms_diff(actual, reference_round_trip(content[i], params)) <=
+              1e-3);
+      }
+    }
+  }
   return 0;
 }
 
@@ -1148,6 +1320,7 @@ int main() {
   DctTransform t = std::move(t_r).value();
 
   if (forward_matches_reference_case(dev, alloc, t) != 0) return 1;
+  if (per_basis_sequence_case(dev, alloc, t) != 0) return 1;
   if (round_trip_bound_case(dev, alloc, t) != 0) return 1;
   if (truncation_matches_reference_case(dev, alloc, t) != 0) return 1;
   if (mask_case(dev, alloc, t) != 0) return 1;
@@ -1158,6 +1331,10 @@ int main() {
   if (batching_case(dev, alloc, t) != 0) return 1;
   if (refusals_case(dev, alloc, t) != 0) return 1;
   if (observed_case(dev, alloc, t) != 0) return 1;
+  auto chunked = DctTransform::create(dev, alloc, DctTransformConfig{2});
+  CHECK(chunked.ok());
+  if (observed_case(dev, alloc, chunked.value()) != 0) return 1;
+  if (scratch_reuse_case(dev, alloc, chunked.value()) != 0) return 1;
   if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
   if (moves_case(dev, alloc) != 0) return 1;
   std::printf("codec DctTransform: OK\n");

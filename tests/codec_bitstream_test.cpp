@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "bitstream.hpp"
+#include "dct_tables.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace vr = volumetric_kit::recon;
@@ -126,13 +127,27 @@ d::IntraFrame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 
+// A frame carries the weights of the K kept bases only.
+bool same_kept_weights(const codec::CodecParams& a,
+                       const codec::CodecParams& b) {
+  const auto zigzag = codec::detail::zigzag_order();
+  for (std::uint32_t j = 0; j < a.coefficient_count; ++j) {
+    if (!same_bits(a.quantization_weights[zigzag[j]],
+                   b.quantization_weights[zigzag[j]])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool same_frame(const d::IntraFrame& a, const d::IntraFrame& b) {
   return same_bits(a.voxel_size, b.voxel_size) &&
          same_bits(a.blocks.trunc_dist, b.blocks.trunc_dist) &&
          a.blocks.params.coefficient_count ==
              b.blocks.params.coefficient_count &&
-         same_bits(a.blocks.params.dc_step, b.blocks.params.dc_step) &&
-         same_bits(a.blocks.params.ac_step, b.blocks.params.ac_step) &&
+         same_bits(a.blocks.params.quantization_scale,
+                   b.blocks.params.quantization_scale) &&
+         same_kept_weights(a.blocks.params, b.blocks.params) &&
          a.coords == b.coords &&
          a.blocks.coefficients == b.blocks.coefficients &&
          a.blocks.masks == b.blocks.masks;
@@ -172,8 +187,11 @@ int round_trip_case() {
   CHECK(round_trip(make_frame(40, codec::kVoxelsPerBlock, 5), 16) == 0);
   // The default segment size, and non-default steps carried bit for bit.
   d::IntraFrame f = make_frame(300, 32, 9);
-  f.blocks.params.dc_step = 0.3141f;
-  f.blocks.params.ac_step = codec::kMinStep;
+  f.blocks.params.quantization_scale = 0.3141f;
+  for (std::size_t i = 0; i < f.blocks.params.quantization_weights.size();
+       ++i) {
+    f.blocks.params.quantization_weights[i] = 0.25f + float(i % 97) * 0.03125f;
+  }
   CHECK(round_trip(f, d::kDefaultSegmentSize) == 0);
   // No blocks at all: no segments, empty tables.
   CHECK(round_trip(make_frame(0, 32, 1), 64) == 0);
@@ -218,8 +236,11 @@ int write_refusals_case() {
   f.blocks.coefficients[5] = std::numeric_limits<std::int16_t>::min();
   CHECK(refused(f));
   f = good;
-  f.blocks.params.ac_step = 0.0f;
+  f.blocks.params.quantization_weights[0] = 0.0f;
   CHECK(refused(f));
+  f = good;  // a weight beyond K is never used, so never refused
+  f.blocks.params.quantization_weights[511] = 0.0f;
+  CHECK(!refused(f));
   f = good;
   f.voxel_size = std::numeric_limits<float>::quiet_NaN();
   CHECK(refused(f));
@@ -266,9 +287,10 @@ struct Section {
 std::vector<Section> sections_of(const std::vector<std::uint8_t>& b) {
   std::vector<Section> out;
   const std::uint32_t count = get_u32(b, 40);
-  std::size_t body = d::kFrameHeaderBytes + count * d::kSectionEntryBytes;
+  const std::size_t header = d::frame_header_bytes(get_u32(b, 20));
+  std::size_t body = header + count * d::kSectionEntryBytes;
   for (std::uint32_t i = 0; i < count; ++i) {
-    const std::size_t e = d::kFrameHeaderBytes + i * d::kSectionEntryBytes;
+    const std::size_t e = header + i * d::kSectionEntryBytes;
     Section s;
     s.id = static_cast<std::uint16_t>(b[e] | (b[e + 1] << 8));
     s.flags = static_cast<std::uint16_t>(b[e + 2] | (b[e + 3] << 8));
@@ -283,8 +305,9 @@ std::vector<Section> sections_of(const std::vector<std::uint8_t>& b) {
 
 std::vector<std::uint8_t> assemble(const std::vector<std::uint8_t>& frame,
                                    const std::vector<Section>& sections) {
-  std::vector<std::uint8_t> b(frame.begin(),
-                              frame.begin() + d::kFrameHeaderBytes);
+  std::vector<std::uint8_t> b(
+      frame.begin(), frame.begin() + std::ptrdiff_t(d::frame_header_bytes(
+                                         get_u32(frame, 20))));
   put_u32(b, 40, static_cast<std::uint32_t>(sections.size()));
   for (const Section& s : sections) {
     b.push_back(static_cast<std::uint8_t>(s.id));
@@ -318,8 +341,11 @@ int header_refusals_case() {
   b[0] = 'X';
   CHECK(refused_as(b, C::InvalidArgument));  // magic
   b = good;
-  b[4] = 3;
-  CHECK(refused_as(b, C::Unsupported));  // version 3
+  b[4] = 4;
+  CHECK(refused_as(b, C::Unsupported));  // future version 4
+  b = good;
+  b[4] = 2;
+  CHECK(refused_as(b, C::Unsupported));  // version 2, whose quantizer differs
   b = good;
   b[4] = 1;
   CHECK(refused_as(b, C::Unsupported));  // version 1, whose mask code differs
@@ -343,12 +369,26 @@ int header_refusals_case() {
   CHECK(refused_as(b, C::InvalidArgument));  // K
   b = good;
   put_f32(b, 24, std::numeric_limits<float>::quiet_NaN());
-  CHECK(refused_as(b, C::InvalidArgument));  // dc_step
+  CHECK(refused_as(b, C::InvalidArgument));  // quantization scale
   // A step past kMaxStep, finite but enough to make a decoded coefficient
   // infinite and the inverse's sums NaN.
   b = good;
-  put_f32(b, 28, 1e38f);
-  CHECK(refused_as(b, C::InvalidArgument));  // ac_step
+  put_f32(b, d::kFramePrefixBytes, 1e38f);
+  CHECK(refused_as(b, C::InvalidArgument));  // effective step exceeds ceiling
+  b = good;
+  put_u32(b, 28, 15);
+  CHECK(refused_as(b, C::InvalidArgument));  // weight count other than K
+  // The first and last kept weights; a subnormal one is refused too.
+  for (std::size_t i : {std::size_t(0), std::size_t(15)}) {
+    for (float value : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::infinity(), 1e-20f,
+                        std::numeric_limits<float>::denorm_min()}) {
+      b = good;
+      put_f32(b, d::kFramePrefixBytes + i * sizeof(float), value);
+      CHECK(refused_as(b, C::InvalidArgument));
+      CHECK(!d::read_frame_header(b.data(), b.size()).ok());
+    }
+  }
   b = good;
   put_u32(b, 36, 0);
   CHECK(refused_as(b, C::InvalidArgument));  // segment size
@@ -621,12 +661,14 @@ int zero_frame_cost_case() {
               b.size(), s[2].body.size());
   // 4 bytes of state + 12 of coordinate per segment, give or take a word.
   CHECK(s[2].body.size() <= segments * 18);
-  CHECK(b.size() <= 450);
+  // The 172-byte header (32 kept weights) plus segment/table overhead.
+  const std::size_t header = d::frame_header_bytes(32);
+  CHECK(b.size() <= header + 406);
   // And a frame with something to say costs far more: the zero case is not
   // passing by encoding nothing.
   const std::vector<std::uint8_t> busy =
       d::write_intra_frame(make_frame(640, 32, 2)).value();
-  CHECK(busy.size() > 20 * b.size());
+  CHECK(busy.size() - header > 20 * (b.size() - header));
   return 0;
 }
 

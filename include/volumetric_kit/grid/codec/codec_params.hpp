@@ -7,6 +7,7 @@
 /// @brief The knobs of the per-frame TSDF geometry codec: how many DCT
 ///        coefficients each block keeps and how coarsely they are quantized.
 
+#include <array>
 #include <cstdint>
 #include <limits>
 
@@ -72,35 +73,46 @@ static_assert(kMaxStep * kMaxStep >= 4.0f * kVoxelsPerBlock,
 
 /// @brief How a frame's blocks are transformed and quantized.
 ///
-/// Both steps are **fractions of the grid's `trunc_dist`**, not metres: the
-/// transform runs on SDF divided by `trunc_dist`, so one setting holds across
-/// scenes whatever their truncation band.
+/// A coefficient at frequency `(x, y, z)` is quantized with step
+/// `quantization_scale * quantization_weights[x + 8*y + 64*z]`, a fraction of
+/// the grid's `trunc_dist`. The transform runs on SDF divided by `trunc_dist`,
+/// so one setting holds across scenes whatever their truncation band. DC is
+/// the ordinary entry at `(0, 0, 0)`.
 ///
-/// The defaults -- K = 64, one step of 0.2 for DC and AC alike -- are
-/// room0's (the 2026-09-27 measurement), and **provisional** until the
-/// per-band quantization study. Against the prior engine's K = 32 with a DC
-/// step five times its AC step, which they replaced, they are 7% smaller and
-/// 28% more accurate at 1 cm, and fit a frame interval on the host. A DC step
-/// coarser than the AC one bought nothing: the transform is orthonormal, so a
-/// unit of error costs the same in any coefficient.
+/// The table controls relative precision; the scale changes overall quality.
+/// Multiplying the table and dividing the scale by the same positive number
+/// describes the same steps. Presets should use weight 1 at DC to make their
+/// scales comparable, but this is a convention, not a validation requirement.
 ///
-/// TODO(codec): re-choose the defaults with the per-band quantization study
-/// -- a step per `x + y + z` band, judged on room0 and on the decoder test's
-/// sphere, where these lose (the 2026-09-27 decision).
+/// Defaults keep K = 64 and a uniform step of 0.2, the provisional room0
+/// settings. TODO(codec): tune per-basis tables at matched rates across room0,
+/// normalized Rafa2 and the analytic sphere before changing the defaults;
+/// the first band/radial candidates did not establish a consistent win.
 struct VR_CODEC_API CodecParams {
   /// Coefficients kept per block, taken in 3-D zigzag order (lowest `x+y+z`
   /// first). In [1, @ref kVoxelsPerBlock]; @ref kVoxelsPerBlock keeps the
-  /// whole transform.
+  /// whole transform. This cutoff is independent of the quantization table.
   std::uint32_t coefficient_count = 64;
-  /// Quantization step of the DC coefficient (zigzag index 0).
-  float dc_step = 0.2f;
-  /// Quantization step of every AC coefficient.
-  float ac_step = 0.2f;
+  /// Positive normal scale shared by every basis; effective steps are
+  /// fractions of `trunc_dist` and must each lie in
+  /// [@ref kMinStep, @ref kMaxStep].
+  float quantization_scale = 0.2f;
+  /// Positive normal relative steps in canonical frequency order
+  /// `x + 8*y + 64*z`, with each frequency in [0, 7], not in zigzag order.
+  /// Only the K frequencies the zigzag cutoff keeps are used, checked and
+  /// carried in a frame; the rest are ignored and decode as 1.
+  std::array<float, kVoxelsPerBlock> quantization_weights = [] {
+    std::array<float, kVoxelsPerBlock> weights{};
+    for (float& weight : weights) weight = 1.0f;
+    return weights;
+  }();
 
   /// @brief Check that every field is one the transform can honour.
   /// @return OK, or @ref Status::invalid_argument naming the field: a
-  ///         @ref coefficient_count outside [1, @ref kVoxelsPerBlock], or a
-  ///         step outside [@ref kMinStep, @ref kMaxStep] (NaN included).
+  ///         @ref coefficient_count outside [1, @ref kVoxelsPerBlock], a
+  ///         scale or kept weight that is not positive and normal (zero,
+  ///         subnormal, infinite or NaN), or a kept frequency's effective
+  ///         step outside [@ref kMinStep, @ref kMaxStep].
   Status validate() const;
 };
 

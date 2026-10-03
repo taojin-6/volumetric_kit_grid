@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "dct_tables.hpp"
 #include "rans.hpp"
 
 #if defined(_MSC_VER)
@@ -644,8 +645,8 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   w.f32(b.trunc_dist);
   w.u32(static_cast<std::uint32_t>(kBlockSize));
   w.u32(k);
-  w.f32(b.params.dc_step);
-  w.f32(b.params.ac_step);
+  w.f32(b.params.quantization_scale);
+  w.u32(k);  // one weight per kept basis
   w.u32(static_cast<std::uint32_t>(n));
   w.u32(r_size);
   const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>,
@@ -654,6 +655,10 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
                    {SectionId::kSegments, &segments_body},
                    {SectionId::kPayload, &payload}}};
   w.u32(kSectionCount);
+  static const auto zigzag = zigzag_order();
+  for (std::uint32_t j = 0; j < k; ++j) {
+    w.f32(b.params.quantization_weights[zigzag[j]]);
+  }
   for (const auto& [id, body] : sections) {
     w.u16(static_cast<std::uint32_t>(id));
     w.u16(kSectionRequired);
@@ -667,32 +672,52 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
 
 Result<FrameHeader> read_frame_header(const std::uint8_t* data,
                                       std::size_t size) {
-  if (data == nullptr || size < kFrameHeaderBytes) {
+  if (data == nullptr || size < 8) {
     return bad("shorter than a frame header");
   }
   if (std::memcmp(data, kFrameMagic, sizeof(kFrameMagic)) != 0) {
     return bad("not a codec frame (bad magic)");
   }
-  ByteReader h(data + sizeof(kFrameMagic), kFrameHeaderBytes - 4);
+  ByteReader h(data + sizeof(kFrameMagic), size - sizeof(kFrameMagic));
   const std::uint32_t version = h.u16();
   const std::uint32_t type = h.u8();
   const std::uint32_t reserved = h.u8();
-  FrameHeader header;
-  header.voxel_size = h.f32();
-  header.trunc_dist = h.f32();
-  const std::uint32_t block_size = h.u32();
-  header.params.coefficient_count = h.u32();
-  header.params.dc_step = h.f32();
-  header.params.ac_step = h.f32();
-  header.block_count = h.u32();
-  header.segment_size = h.u32();
-  header.section_count = h.u32();
-
   if (version != kFrameVersion) {
     return Status::unsupported("codec frame: version " +
                                std::to_string(version) + " (this reads " +
                                std::to_string(kFrameVersion) + ")");
   }
+  if (size < kFramePrefixBytes) {
+    return bad("shorter than a frame header");
+  }
+  FrameHeader header;
+  header.voxel_size = h.f32();
+  header.trunc_dist = h.f32();
+  const std::uint32_t block_size = h.u32();
+  header.params.coefficient_count = h.u32();
+  header.params.quantization_scale = h.f32();
+  const std::uint32_t weight_count = h.u32();
+  header.block_count = h.u32();
+  header.segment_size = h.u32();
+  header.section_count = h.u32();
+  // K bounds the weights to read; validate() below checks the rest.
+  const std::uint32_t k = header.params.coefficient_count;
+  if (k < 1 || k > kVoxelsPerBlock) {
+    return bad("coefficient count must be in [1, " +
+               std::to_string(kVoxelsPerBlock) + "]");
+  }
+  if (weight_count != k) {
+    return bad("quantization weight count must equal the coefficient count");
+  }
+  if (size < frame_header_bytes(k)) {
+    return bad(
+        "shorter than a frame header (including the quantization weights)");
+  }
+  static const auto zigzag = zigzag_order();
+  for (std::uint32_t j = 0; j < k; ++j) {
+    header.params.quantization_weights[zigzag[j]] = h.f32();
+  }
+
   if (type != static_cast<std::uint32_t>(FrameType::kIntra)) {
     return Status::unsupported("codec frame: type " + std::to_string(type) +
                                " (this reads intra)");
@@ -728,17 +753,19 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;
   const std::uint32_t section_count = header.section_count;
+  const std::size_t header_bytes =
+      frame_header_bytes(header.params.coefficient_count);
 
   // The section table, then each body's place in the frame. Lengths are summed
   // in 64 bits, and must account for every byte after the table exactly.
-  if (section_count > (size - kFrameHeaderBytes) / kSectionEntryBytes) {
+  if (section_count > (size - header_bytes) / kSectionEntryBytes) {
     return bad("the section table runs past the end");
   }
-  ByteReader st(data + kFrameHeaderBytes, section_count * kSectionEntryBytes);
+  ByteReader st(data + header_bytes, section_count * kSectionEntryBytes);
   const std::uint8_t* body =
-      data + kFrameHeaderBytes + section_count * kSectionEntryBytes;
+      data + header_bytes + section_count * kSectionEntryBytes;
   const std::uint64_t body_bytes =
-      size - kFrameHeaderBytes - section_count * kSectionEntryBytes;
+      size - header_bytes - section_count * kSectionEntryBytes;
   std::uint64_t offset = 0;
   std::array<SectionBody, kSectionCount> found{};  // by id - 1
   for (std::uint32_t i = 0; i < section_count; ++i) {
@@ -752,7 +779,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
       if ((flags & ~std::uint32_t(kSectionKnownFlags)) != 0) {
         return Status::unsupported(
             "codec frame: section " + std::to_string(id) + " sets flags " +
-            std::to_string(flags) + ", which v1 does not define");
+            std::to_string(flags) + ", which v3 does not define");
       }
       SectionBody& f = found[id - 1];
       if (f.data != nullptr) {
@@ -764,7 +791,7 @@ Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
                                  std::to_string(id));
     }
     // TODO(codec): the optional CRC section of the 2026-09-27 entry, should a
-    // consumer ever keep frames where nothing else checks them. A v1 reader
+    // consumer ever keep frames where nothing else checks them. A v3 reader
     // skips it here, so adding it needs no new version.
     offset += length;
   }
