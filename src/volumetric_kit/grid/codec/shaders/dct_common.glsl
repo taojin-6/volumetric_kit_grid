@@ -98,10 +98,11 @@ layout(set = 0, binding = VR_DCT_BINDING_QUANTIZATION, scalar) readonly buffer
   float quantization_steps[kBlockVoxels];
 };
 
-// Entries block_ptr found no block for, summed over every batch for the host
-// to report.
+// Mirrors Counts in dct_transform.cpp: rejected entries and the observed
+// kernel's append count, summed over every dispatch in the call.
 layout(set = 0, binding = VR_DCT_BINDING_REJECTED, scalar) buffer Rejected {
   uint rejected;
+  uint observed_count;
 };
 
 shared float s_work[2u * kBlockVoxels];

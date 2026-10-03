@@ -84,11 +84,12 @@ struct DctTransformConfig {
 /// host scan would be O(count) per call. Like the mesher's probe, it needs the
 /// map quiescent: no allocate may run into the grid during a call.
 ///
-/// Every buffer is device-local, and each call is one @ref CommandBatch: the
-/// list and the coefficients staged up, the dispatches, and the results and
-/// the reject count read back, one submit (the 2026-09-28 residency rule). The
-/// per-call buffers are allocated per call, as the integrator's are: at ~98 k
-/// blocks the three cost 0.03 ms of a 1.4 ms forward (Apple M5 Max, Release).
+/// Every buffer is device-local. Forward and inverse each use one
+/// @ref CommandBatch: the inputs staged up, the dispatches, and the results
+/// and reject count read back. Scratch buffers grow when needed and remain
+/// allocated for later calls. The observed filter compacts its result on the
+/// device and reads back a predicted prefix with the count in one batch; only
+/// a result that outgrows that prefix needs another, transfer-only batch.
 /// The coefficients travel two to a word, 16 bits each.
 ///
 /// @warning The @ref Device and @ref Allocator passed to @ref create must
@@ -101,7 +102,7 @@ class VR_CODEC_API DctTransform {
  public:
   /// @brief Build both kernels and upload the basis and zigzag tables.
   /// @param device     The compute device (must outlive this object).
-  /// @param allocator  The allocator the per-call buffers come from (must
+  /// @param allocator  The allocator the scratch buffers come from (must
   ///                   outlive this object).
   /// @param config     Construction-time options.
   /// @return The transform, or a non-OK @ref Status if a pipeline, the pool or
@@ -164,12 +165,15 @@ class VR_CODEC_API DctTransform {
                  const DctBlocks& in, GpuStageScope* stage = nullptr);
 
   /// @brief The entries of @p list whose block holds an observed voxel
-  ///        (`weight >= volume::kObservedWeight`), in @p list's order.
+  ///        (`weight >= volume::kObservedWeight`), in unspecified order.
   ///
   /// What the encoder keeps, found before the forward transform rather than
-  /// after it: this reads each block's weights alone and one word back per
-  /// entry, where transforming a never-observed block reads all of it and
-  /// writes and reads back K coefficients and a mask of zeros.
+  /// after it. This reads each block's weights alone and appends only observed
+  /// entries to a device list. A predicted prefix (the last count plus 25%,
+  /// bounded by the input count; the full input count on the first call) is
+  /// read back with the count and rejection tally. A growing result reads its
+  /// remaining tail in a second batch. The encoder sorts the returned entries
+  /// by coordinate before transforming, so append order cannot affect bytes.
   /// @param grid   As @ref forward.
   /// @param list   The map's own active list, bound where it is
   ///               (@ref
@@ -212,10 +216,12 @@ class VR_CODEC_API DctTransform {
   Status record(CommandBatch& batch, ComputeKernel& kernel,
                 const volume::VoxelBlockGrid& grid, const GridViews& views,
                 VkBuffer list, std::uint32_t count, const CodecParams& params,
-                VkBuffer coefficients, VkBuffer masks, GpuStageScope* stage);
-  /// Stage @p blocks onto a device buffer of its own, in @p batch.
-  Result<Buffer> upload_list(CommandBatch& batch,
-                             const volume::BlockList& blocks);
+                VkBuffer coefficients, VkBuffer masks, VkDeviceSize masks_bytes,
+                GpuStageScope* stage);
+  /// Grow @p buffer if needed, retaining it for later calls.
+  Status ensure_scratch(Buffer& buffer, VkDeviceSize bytes, const char* name);
+  /// Stage @p blocks onto the retained block-list buffer, in @p batch.
+  Status upload_list(CommandBatch& batch, const volume::BlockList& blocks);
   /// The refusal for @p rejected entries the kernels found no block for.
   static Status check_rejected(const char* op, std::uint32_t rejected,
                                std::uint32_t count);
@@ -243,9 +249,18 @@ class VR_CODEC_API DctTransform {
   // Canonical per-basis effective steps (binding 9), computed on the host
   // and uploaded in each transform batch.
   Buffer quantization_steps_;
-  // The count of entries the kernels found no block for (binding 7), zeroed
-  // in each call's batch and read back at its end.
+  // Rejected entries followed by the observed count (binding 7), zeroed
+  // in each call's batch. Forward/inverse only read the first word back.
   Buffer rejected_;
+  // Scratch stays alive between calls; each binding uses its logical range,
+  // not the retained capacity. No allocation when a call fits these buffers.
+  Buffer observed_blocks_;
+  Buffer block_list_;
+  Buffer coefficients_;
+  Buffer masks_;
+  // Readback prediction only: every call still obtains and checks its count.
+  std::uint32_t last_observed_count_ = 0;
+  bool has_observed_count_ = false;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail
