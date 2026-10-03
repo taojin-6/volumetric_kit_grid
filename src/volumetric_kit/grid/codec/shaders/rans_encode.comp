@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The device frame's coding: one invocation per segment runs rans.hpp's
+// RansWriter::finish over the segment's coder steps (rans_ops.comp), already
+// in the order it takes them, with the same 32-bit integer arithmetic. Words
+// go down from the top of the segment's slot, so the stream lands in decode
+// order: the final state's two words, then the words last emitted first.
+
+#version 450
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Steps {
+  uint steps[];  // start | freq << 16
+};
+layout(set = 0, binding = 1, std430) readonly buffer SegmentSteps {
+  uint segment_steps[];  // each segment's first step, segment_count + 1
+};
+layout(set = 0, binding = 2, std430) readonly buffer SlotOffsets {
+  uint slot_offsets[];  // in 16-bit words, segment_count + 1, each even
+};
+layout(set = 0, binding = 3, std430) writeonly buffer Slots {
+  uint slots[];
+};
+layout(set = 0, binding = 4, std430) writeonly buffer Lengths {
+  uint lengths[];  // bytes of each segment's stream
+};
+layout(set = 0, binding = 5, std430) buffer Status {
+  uint failed;  // nonzero when a step has frequency 0 or outgrows the slot
+};
+
+layout(push_constant, std430) uniform Push {
+  uint item_base;
+  uint num_blocks;
+  uint coefficient_count;
+  uint segment_size;
+  uint segment_count;
+}
+pc;
+
+const uint kScaleBits = 12u;
+const uint kRenormShift = 32u - kScaleBits;
+
+uint g_high = 0u;  // an odd word waiting for the even one below it
+
+// Words go down from an even slot top, so each odd word arrives first and is
+// held until its even partner completes the 32-bit word: no read back.
+void put16(uint at, uint word) {
+  if ((at & 1u) != 0u) {
+    g_high = word;
+  } else {
+    slots[at >> 1u] = word | (g_high << 16u);
+  }
+}
+
+void main() {
+  const uint s = pc.item_base + gl_GlobalInvocationID.x;
+  if (s >= pc.segment_count) return;
+  const uint floor16 = slot_offsets[s];
+  uint out16 = slot_offsets[s + 1u];  // the next free word is out16 - 1
+  uint x = 1u << 16u;                 // kRansLower
+  bool bad = false;
+  const uint end = segment_steps[s + 1u];
+  // Four steps a round, the next four loaded while these are coded: with
+  // one chain per invocation, a load consumed at once would stall it.
+  uint at = segment_steps[s];
+  uvec4 batch = uvec4(at < end ? steps[at] : 0u,
+                      at + 1u < end ? steps[at + 1u] : 0u,
+                      at + 2u < end ? steps[at + 2u] : 0u,
+                      at + 3u < end ? steps[at + 3u] : 0u);
+  while (at < end && !bad) {
+    const uint ahead = at + 4u;
+    const uvec4 next = uvec4(ahead < end ? steps[ahead] : 0u,
+                             ahead + 1u < end ? steps[ahead + 1u] : 0u,
+                             ahead + 2u < end ? steps[ahead + 2u] : 0u,
+                             ahead + 3u < end ? steps[ahead + 3u] : 0u);
+    for (uint c = 0u; c < 4u && at + c < end; ++c) {
+      const uint start = batch[c] & 0xFFFFu;
+      const uint freq = batch[c] >> 16u;
+      if (freq == 0u || out16 <= floor16 + 2u) {
+        bad = true;
+        break;
+      }
+      if ((x >> kRenormShift) >= freq) {
+        out16 -= 1u;
+        put16(out16, x & 0xFFFFu);
+        x >>= 16u;
+      }
+      x = ((x / freq) << kScaleBits) + (x % freq) + start;
+    }
+    batch = next;
+    at = ahead;
+  }
+  if (bad) {
+    atomicOr(failed, 1u);
+    lengths[s] = 0u;
+    return;
+  }
+  put16(out16 - 1u, x & 0xFFFFu);
+  put16(out16 - 2u, x >> 16u);
+  // A stream starting on an odd word leaves that word's low half unused.
+  if (((out16 - 2u) & 1u) != 0u) put16(out16 - 3u, 0u);
+  lengths[s] = 2u * (slot_offsets[s + 1u] - (out16 - 2u));
+}

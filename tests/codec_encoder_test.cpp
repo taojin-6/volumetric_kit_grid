@@ -192,6 +192,45 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
+// Device coding writes the host's bytes, here through the public encoder on
+// a fused-looking grid, for the default and a finer segmentation; the
+// automatic choice codes the second on the device, past kMinDeviceSegments.
+int device_matches_host_case(Gpu& gpu) {
+  const Sphere s{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  for (std::uint32_t segment_size : {64u, 3u}) {
+    codec::EncoderConfig config;
+    config.params.coefficient_count = 37;
+    config.segment_size = segment_size;
+    config.entropy = codec::EntropyCoding::kHost;
+    vr::Result<codec::Encoder> host =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    config.entropy = codec::EntropyCoding::kDevice;
+    vr::Result<codec::Encoder> device =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    config.entropy = codec::EntropyCoding::kAuto;
+    vr::Result<codec::Encoder> automatic =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(host.ok() && device.ok() && automatic.ok());
+    vr::Result<std::vector<std::uint8_t>> a = host.value().encode(grid);
+    vr::Result<std::vector<std::uint8_t>> b = device.value().encode(grid);
+    vr::Result<std::vector<std::uint8_t>> c = automatic.value().encode(grid);
+    CHECK(a.ok() && b.ok() && c.ok());
+    CHECK(a.value().size() > 1000);
+    CHECK(a.value() == b.value());
+    CHECK(a.value() == c.value());
+    vr::Result<codec::FrameInfo> info =
+        codec::read_frame_info(a.value().data(), a.value().size());
+    CHECK(info.ok());
+    if (segment_size == 3) {
+      CHECK((info.value().block_count + 2) / 3 >= codec::kMinDeviceSegments);
+    }
+  }
+  return 0;
+}
+
 int refusals_case(Gpu& gpu) {
   codec::EncoderConfig bad;
   bad.segment_size = 0;
@@ -298,6 +337,19 @@ int main() {
   if (unobserved_dropped_case(gpu, enc) != 0) return 1;
   if (metrics_case(gpu, enc) != 0) return 1;
   if (device_list_case(gpu, enc) != 0) return 1;
+  if (device_matches_host_case(gpu) != 0) return 1;
+  // The same contract with the coding on the device.
+  codec::EncoderConfig device_config;
+  device_config.entropy = codec::EntropyCoding::kDevice;
+  vr::Result<codec::Encoder> d =
+      codec::Encoder::create(gpu.device, gpu.allocator, device_config);
+  CHECK(d.ok());
+  codec::Encoder device_enc = std::move(d).value();
+  if (empty_grid_case(gpu, device_enc) != 0) return 1;
+  if (order_independent_case(gpu, device_enc) != 0) return 1;
+  if (unobserved_dropped_case(gpu, device_enc) != 0) return 1;
+  if (metrics_case(gpu, device_enc) != 0) return 1;
+  if (device_list_case(gpu, device_enc) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");

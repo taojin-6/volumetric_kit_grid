@@ -346,6 +346,36 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
   return out;
 }
 
+Result<ResidentBlocks> DctTransform::record_forward(
+    CommandBatch& batch, const volume::VoxelBlockGrid& grid,
+    const volume::BlockList& blocks, const CodecParams& params,
+    std::uint32_t& rejected, GpuStageScope* stage) {
+  rejected = 0;
+  VR_ASSIGN(GridViews views, check_inputs("forward", grid, blocks, params));
+  ResidentBlocks out;
+  out.coefficient_count = params.coefficient_count;
+  if (blocks.count == 0) {
+    return out;
+  }
+  const VkDeviceSize coeff_bytes = VkDeviceSize(blocks.count) *
+                                   padded_count(params.coefficient_count) *
+                                   sizeof(std::int16_t);
+  const VkDeviceSize mask_bytes =
+      VkDeviceSize(blocks.count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
+  VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
+  VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
+  VR_TRY(upload_list(batch, blocks));
+  VR_TRY(record(batch, forward_kernel_, grid, views, block_list_.handle(),
+                blocks.count, params, coefficients_.handle(), masks_.handle(),
+                mask_bytes, stage));
+  VR_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
+  out.list = &block_list_;
+  out.masks = &masks_;
+  out.coefficients = &coefficients_;
+  out.count = blocks.count;
+  return out;
+}
+
 Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
                              const volume::BlockList& blocks,
                              const CodecParams& params, DctBlocks& out,
@@ -354,40 +384,32 @@ Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
   out.trunc_dist = 0.0f;
   out.coefficients.clear();
   out.masks.clear();
-  VR_ASSIGN(GridViews views, check_inputs("forward", grid, blocks, params));
-
   const std::uint32_t k = params.coefficient_count;
   const std::size_t padded = padded_count(k);
-  if (blocks.count != 0) {
-    const VkDeviceSize coeff_bytes =
-        VkDeviceSize(blocks.count) * padded * sizeof(std::int16_t);
-    const VkDeviceSize mask_bytes =
-        VkDeviceSize(blocks.count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
-    VR_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
-    VR_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
-
-    std::vector<std::int16_t> coefficients(std::size_t(blocks.count) * padded);
-    std::vector<std::uint32_t> masks(std::size_t(blocks.count) *
+  std::uint32_t rejected = 0;
+  CommandBatch batch(*device_, *allocator_);
+  VR_ASSIGN(const ResidentBlocks resident,
+            record_forward(batch, grid, blocks, params, rejected, stage));
+  if (resident.count != 0) {
+    std::vector<std::int16_t> coefficients(std::size_t(resident.count) *
+                                           padded);
+    std::vector<std::uint32_t> masks(std::size_t(resident.count) *
                                      kMaskWordsPerBlock);
-    std::uint32_t rejected = 0;
-    CommandBatch batch(*device_, *allocator_);
-    VR_TRY(upload_list(batch, blocks));
-    VR_TRY(record(batch, forward_kernel_, grid, views, block_list_.handle(),
-                  blocks.count, params, coefficients_.handle(), masks_.handle(),
-                  mask_bytes, stage));
-    VR_TRY(batch.readback(coefficients_, 0, coeff_bytes, coefficients.data()));
-    VR_TRY(batch.readback(masks_, 0, mask_bytes, masks.data()));
-    VR_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
+    VR_TRY(batch.readback(coefficients_, 0,
+                          coefficients.size() * sizeof(std::int16_t),
+                          coefficients.data()));
+    VR_TRY(batch.readback(masks_, 0, masks.size() * sizeof(std::uint32_t),
+                          masks.data()));
     VR_TRY(batch.submit());
-    VR_TRY(check_rejected("forward", rejected, blocks.count));
+    VR_TRY(check_rejected("forward", rejected, resident.count));
     if (padded != k) {
       // Drop each entry's pad, sliding the rows down in place: std::copy
       // runs forwards, which a destination before its source allows.
-      for (std::size_t i = 1; i < blocks.count; ++i) {
+      for (std::size_t i = 1; i < resident.count; ++i) {
         const auto row = coefficients.begin() + std::ptrdiff_t(i * padded);
         std::copy(row, row + k, coefficients.begin() + std::ptrdiff_t(i * k));
       }
-      coefficients.resize(std::size_t(blocks.count) * k);
+      coefficients.resize(std::size_t(resident.count) * k);
     }
     out.coefficients = std::move(coefficients);
     out.masks = std::move(masks);

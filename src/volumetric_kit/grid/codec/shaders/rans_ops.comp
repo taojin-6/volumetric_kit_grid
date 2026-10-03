@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The device frame's coder steps: one invocation per block writes its
+// block's steps, in the order the encoder takes them, from the block's
+// offset, as `start | freq << 16` words. The host lays each segment's blocks last
+// first, so a segment's steps are one run that rans_encode.comp streams
+// through: the branchy symbol walk runs here, a block per invocation, and
+// only the rANS state's chain stays serial.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64) in;
+
+#include "rans_walk.glsl"
+
+// Bindings 0-2 are the walk's.
+layout(set = 0, binding = 3, std430) readonly buffer Tables {
+  uint tables[];  // per model, per symbol, at model_base: cum | freq << 16
+};
+layout(set = 0, binding = 4, std430) readonly buffer StepOffsets {
+  uint step_offsets[];  // per block
+};
+layout(set = 0, binding = 5, std430) writeonly buffer Steps {
+  uint steps[];
+};
+
+const uint kScaleBits = 12u;
+
+uint g_at = 0u;
+
+void sink_symbol(uint model, uint symbol) {
+  steps[g_at++] = tables[model_base(model) + symbol];
+}
+
+// RansWriter::put_bits's chunks, low first in decode order: here high first.
+void sink_bits(uint value, uint bits) {
+  const uint chunks = (bits + 11u) / 12u;
+  for (uint c = chunks; c-- > 0u;) {
+    const uint n = c + 1u == chunks ? bits - 12u * c : 12u;
+    const uint chunk = (value >> (12u * c)) & ((1u << n) - 1u);
+    const uint shift = kScaleBits - n;
+    steps[g_at++] = (chunk << shift) | ((1u << shift) << 16u);
+  }
+}
+
+void main() {
+  const uint i = pc.item_base + gl_GlobalInvocationID.x;
+  if (i >= pc.num_blocks) return;
+  g_at = step_offsets[i];
+  walk_block(i, i % pc.segment_size == 0u);
+}

@@ -8,7 +8,9 @@
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
+#include "device_frame_writer.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
@@ -38,13 +40,19 @@ Encoder::~Encoder() = default;
 
 Encoder::Encoder(Encoder&& other) noexcept
     : config_(std::exchange(other.config_, empty_config())),
+      device_(std::exchange(other.device_, nullptr)),
+      allocator_(std::exchange(other.allocator_, nullptr)),
       transform_(std::move(other.transform_)),
+      writer_(std::move(other.writer_)),
       gpu_timer_(std::move(other.gpu_timer_)) {}
 
 Encoder& Encoder::operator=(Encoder&& other) noexcept {
   if (this != &other) {
     config_ = std::exchange(other.config_, empty_config());
+    device_ = std::exchange(other.device_, nullptr);
+    allocator_ = std::exchange(other.allocator_, nullptr);
     transform_ = std::move(other.transform_);
+    writer_ = std::move(other.writer_);
     gpu_timer_ = std::move(other.gpu_timer_);
   }
   return *this;
@@ -62,9 +70,16 @@ Result<Encoder> Encoder::create(Device& device, Allocator& allocator,
   }
   Encoder e;
   e.config_ = config;
+  e.device_ = &device;
+  e.allocator_ = &allocator;
   VR_ASSIGN(detail::DctTransform transform,
             detail::DctTransform::create(device, allocator));
   e.transform_ = std::make_unique<detail::DctTransform>(std::move(transform));
+  if (config.entropy != EntropyCoding::kHost) {
+    VR_ASSIGN(detail::DeviceFrameWriter writer,
+              detail::DeviceFrameWriter::create(device, allocator));
+    e.writer_ = std::make_unique<detail::DeviceFrameWriter>(std::move(writer));
+  }
   VR_ASSIGN(e.gpu_timer_, GpuTimer::create(device));
   return e;
 }
@@ -100,6 +115,36 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
   {
     StageScope sort(metrics, "  ..sort");
     detail::sort_by_coord(blocks);
+  }
+
+  const std::uint64_t segments =
+      blocks.empty()
+          ? 0
+          : (std::uint64_t(blocks.size()) - 1) / config_.segment_size + 1;
+  const bool on_device =
+      writer_ != nullptr && (config_.entropy == EntropyCoding::kDevice ||
+                             segments >= kMinDeviceSegments);
+  if (on_device) {
+    // The forward output stays on the device; the same batch counts its
+    // symbols, so only the counts cross before the coding.
+    std::uint32_t rejected = 0;
+    detail::ResidentBlocks resident;
+    {
+      StageScope forward(metrics, "  ..forward");
+      CommandBatch batch(*device_, *allocator_);
+      VR_ASSIGN(resident,
+                transform_->record_forward(batch, grid, grid.block_list(blocks),
+                                           config_.params, rejected, &stage));
+      VR_TRY(
+          writer_->record_count(batch, resident, config_.segment_size, &stage));
+      VR_TRY(batch.submit());
+      VR_TRY(detail::DctTransform::check_rejected("forward", rejected,
+                                                  resident.count));
+    }
+    StageScope entropy(metrics, "  ..rans encode");
+    return writer_->finish(resident, config_.segment_size,
+                           grid.grid().voxel_size, grid.grid().trunc_dist,
+                           config_.params, &stage);
   }
 
   detail::IntraFrame frame;

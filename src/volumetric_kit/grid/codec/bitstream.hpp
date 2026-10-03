@@ -63,6 +63,7 @@
 #include <vector>
 
 #include "dct_blocks.hpp"
+#include "rans.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -163,6 +164,11 @@ struct FrameWriteOptions {
   std::uint32_t segment_size = kDefaultSegmentSize;
 };
 
+/// @brief The checks @ref write_intra_frame makes before coding anything.
+/// @return OK, or the same refusals as @ref write_intra_frame.
+VR_CODEC_API Status check_intra_frame(const IntraFrame& frame,
+                                      const FrameWriteOptions& options);
+
 /// @brief Serialize an intra frame.
 /// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
@@ -175,6 +181,41 @@ struct FrameWriteOptions {
 ///         input's.
 VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
     const IntraFrame& frame, const FrameWriteOptions& options = {});
+
+/// @return How many frequency tables a frame keeping @p k coefficients
+///         carries, in TABLES order.
+VR_CODEC_API std::uint32_t frame_model_count(std::uint32_t k);
+/// @return The alphabet size of frequency table @p model.
+VR_CODEC_API std::uint32_t frame_model_alphabet(std::uint32_t model);
+
+/// @brief Normalize a frame's per-model symbol counts into its tables, the
+///        one way every writer builds them.
+VR_CODEC_API std::vector<FrequencyTable> frame_tables(
+    const std::vector<std::vector<std::uint64_t>>& counts);
+
+/// @brief A frame whose segments are already coded, which
+///        @ref assemble_intra_frame lays out.
+struct CodedFrame {
+  float voxel_size = 0.0f;
+  float trunc_dist = 0.0f;
+  CodecParams params;
+  std::uint32_t block_count = 0;
+  std::uint32_t segment_size = 0;
+  /// @ref frame_model_count tables, in TABLES order.
+  std::vector<FrequencyTable> tables;
+  /// Each segment's stream length in bytes.
+  std::vector<std::uint32_t> segment_lengths;
+  /// The segment streams, back to back.
+  std::vector<std::uint8_t> payload;
+};
+
+/// @brief Lay out a coded frame: header, section table, TABLES, SEGMENTS and
+///        PAYLOAD. Shared by the host and device writers, so their containers
+///        cannot differ.
+/// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
+///         payload past 4 GiB or more than 2^30 - 1 segments.
+VR_CODEC_API Result<std::vector<std::uint8_t>> assemble_intra_frame(
+    const CodedFrame& frame);
 
 /// @brief Parse and decode an intra frame.
 ///

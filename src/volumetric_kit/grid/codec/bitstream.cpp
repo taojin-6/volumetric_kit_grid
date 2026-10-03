@@ -70,15 +70,19 @@ constexpr std::uint32_t kPlanes = kBlockSize;         // z
 static_assert(kMaskWordsPerBlock * 4 == kLinesPerPlane * kPlanes,
               "a mask byte is one line of the block");
 
-std::uint32_t model_count(std::uint32_t k) { return kFirstCoef + k; }
+}  // namespace
 
-std::uint32_t alphabet(std::uint32_t model) {
+std::uint32_t frame_model_count(std::uint32_t k) { return kFirstCoef + k; }
+
+std::uint32_t frame_model_alphabet(std::uint32_t model) {
   if (model <= kDxFree) return kCoordClasses;
   if (model == kMaskClass) return kMaskClasses;
   if (model < kByte) return kRunClasses;  // kPlane and the kLine models
   if (model < kFirstCoef) return kByteSymbols;
   return kCoefClasses;
 }
+
+namespace {
 
 std::uint32_t bit_length(std::uint64_t v) {
 #if defined(_MSC_VER)
@@ -365,9 +369,9 @@ void write_tables(ByteWriter& w, const std::vector<FrequencyTable>& tables) {
 Status read_tables(const std::uint8_t* data, std::size_t size, std::uint32_t k,
                    std::vector<FrequencyTable>& tables) {
   ByteReader r(data, size);
-  tables.assign(model_count(k), FrequencyTable{});
-  for (std::uint32_t m = 0; m < model_count(k); ++m) {
-    const std::uint32_t n = alphabet(m);
+  tables.assign(frame_model_count(k), FrequencyTable{});
+  for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
+    const std::uint32_t n = frame_model_alphabet(m);
     FrequencyTable& t = tables[m];
     t.freq.assign(n, 0);
     const std::uint32_t used = r.varint();
@@ -524,8 +528,8 @@ const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
 
 }  // namespace
 
-Result<std::vector<std::uint8_t>> write_intra_frame(
-    const IntraFrame& frame, const FrameWriteOptions& options) {
+Status check_intra_frame(const IntraFrame& frame,
+                         const FrameWriteOptions& options) {
   const DctBlocks& b = frame.blocks;
   if (!positive_finite(frame.voxel_size)) {
     return bad_write("voxel_size must be finite and positive");
@@ -576,26 +580,34 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
                        std::to_string(kMaxQuantizedMagnitude));
     }
   }
+  return {};
+}
+
+Result<std::vector<std::uint8_t>> write_intra_frame(
+    const IntraFrame& frame, const FrameWriteOptions& options) {
+  VR_TRY(check_intra_frame(frame, options));
+  const DctBlocks& b = frame.blocks;
+  const std::size_t n = frame.coords.size();
+  const std::uint32_t k = b.params.coefficient_count;
+  const std::uint32_t r_size = options.segment_size;
+  const std::uint64_t segments =
+      n == 0 ? 0 : (std::uint64_t(n) - 1) / r_size + 1;
 
   auto prev_of = [&](std::size_t i) -> const Vec3i* {
     return i % r_size == 0 ? nullptr : &frame.coords[i - 1];
   };
 
   // Pass 1: every model's histogram, over exactly the symbols pass 2 writes.
-  std::vector<std::vector<std::uint64_t>> counts(model_count(k));
-  for (std::uint32_t m = 0; m < model_count(k); ++m) {
-    counts[m].assign(alphabet(m), 0);
+  std::vector<std::vector<std::uint64_t>> counts(frame_model_count(k));
+  for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
+    counts[m].assign(frame_model_alphabet(m), 0);
   }
   CountSink count_sink{counts};
   for (std::size_t i = 0; i < n; ++i) {
     emit_block(count_sink, prev_of(i), frame.coords[i],
                &b.masks[i * kMaskWordsPerBlock], &b.coefficients[i * k], k);
   }
-  std::vector<FrequencyTable> tables;
-  tables.reserve(counts.size());
-  for (const std::vector<std::uint64_t>& c : counts) {
-    tables.push_back(normalize_counts(c));
-  }
+  std::vector<FrequencyTable> tables = frame_tables(counts);
 
   // Pass 2: each segment as its own stream, appended straight onto the
   // payload.
@@ -603,8 +615,8 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   // by construction, if a finer voxel or K = 128 is wanted in real time (the
   // 2026-09-27 defaults decision); here and in the reader's loop.
   std::vector<std::uint8_t> payload;
-  std::vector<std::uint8_t> segments_body;
-  ByteWriter sw(segments_body);
+  std::vector<std::uint32_t> lengths;
+  lengths.reserve(static_cast<std::size_t>(segments));
   RansWriter writer;
   WriteSink write_sink{writer, tables};
   for (std::uint64_t s = 0; s < segments; ++s) {
@@ -621,17 +633,53 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
       return Status::io_error(
           "write_intra_frame: a table refused a symbol it was counted from");
     }
-    sw.u32(static_cast<std::uint32_t>(payload.size() - stream_at));
+    lengths.push_back(static_cast<std::uint32_t>(payload.size() - stream_at));
   }
+  CodedFrame coded;
+  coded.voxel_size = frame.voxel_size;
+  coded.trunc_dist = b.trunc_dist;
+  coded.params = b.params;
+  coded.block_count = static_cast<std::uint32_t>(n);
+  coded.segment_size = r_size;
+  coded.tables = std::move(tables);
+  coded.segment_lengths = std::move(lengths);
+  coded.payload = std::move(payload);
+  return assemble_intra_frame(coded);
+}
+
+std::vector<FrequencyTable> frame_tables(
+    const std::vector<std::vector<std::uint64_t>>& counts) {
+  std::vector<FrequencyTable> tables;
+  tables.reserve(counts.size());
+  for (const std::vector<std::uint64_t>& c : counts) {
+    tables.push_back(normalize_counts(c));
+  }
+  return tables;
+}
+
+Result<std::vector<std::uint8_t>> assemble_intra_frame(
+    const CodedFrame& frame) {
+  const std::uint32_t k = frame.params.coefficient_count;
   // Every segment's length is at most the payload's, so this bounds both.
-  if (std::uint64_t(payload.size()) >
+  if (std::uint64_t(frame.payload.size()) >
       std::numeric_limits<std::uint32_t>::max()) {
     return bad_write("the payload outgrows its u32 length (4 GiB)");
+  }
+  if (frame.segment_lengths.size() >
+      std::numeric_limits<std::uint32_t>::max() / 4) {
+    return bad_write(
+        "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
+        "u32 length");
+  }
+  std::vector<std::uint8_t> segments_body;
+  ByteWriter sw(segments_body);
+  for (std::uint32_t length : frame.segment_lengths) {
+    sw.u32(length);
   }
 
   std::vector<std::uint8_t> tables_body;  // under 32 KB
   ByteWriter tw(tables_body);
-  write_tables(tw, tables);
+  write_tables(tw, frame.tables);
 
   std::vector<std::uint8_t> out;
   ByteWriter w(out);
@@ -642,22 +690,22 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
   w.u8(static_cast<std::uint32_t>(FrameType::kIntra));
   w.u8(0);  // reserved
   w.f32(frame.voxel_size);
-  w.f32(b.trunc_dist);
+  w.f32(frame.trunc_dist);
   w.u32(static_cast<std::uint32_t>(kBlockSize));
   w.u32(k);
-  w.f32(b.params.quantization_scale);
+  w.f32(frame.params.quantization_scale);
   w.u32(k);  // one weight per kept basis
-  w.u32(static_cast<std::uint32_t>(n));
-  w.u32(r_size);
+  w.u32(frame.block_count);
+  w.u32(frame.segment_size);
   const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>,
                    kSectionCount>
       sections = {{{SectionId::kTables, &tables_body},
                    {SectionId::kSegments, &segments_body},
-                   {SectionId::kPayload, &payload}}};
+                   {SectionId::kPayload, &frame.payload}}};
   w.u32(kSectionCount);
   static const auto zigzag = zigzag_order();
   for (std::uint32_t j = 0; j < k; ++j) {
-    w.f32(b.params.quantization_weights[zigzag[j]]);
+    w.f32(frame.params.quantization_weights[zigzag[j]]);
   }
   for (const auto& [id, body] : sections) {
     w.u16(static_cast<std::uint32_t>(id));
