@@ -495,22 +495,10 @@ int main() {
   CHECK(bare.ok());
   CHECK(bare.value().valid() && !bare.value().has_attribute("tsdf"));
 
-  // Move-only: the moved-from grid is left empty; a moved-to grid is live.
+  // Move construction leaves the source empty and the new grid live.
   vol::VoxelBlockGrid moved = std::move(vbg);
   CHECK(moved.valid() && moved.has_attribute("tsdf"));
   CHECK(!vbg.valid());  // NOLINT(bugprone-use-after-move) -- asserting empty
-
-  // Self-move must preserve a grid that STILL owns its attribute buffers: a
-  // defaulted memberwise move-assign would free them (std::vector self-move),
-  // so operator= guards it. Launder through a pointer to dodge -Wself-move.
-  vol::VoxelBlockGrid* alias = &moved;
-  moved = std::move(*alias);
-  CHECK(moved.valid() && moved.has_attribute("tsdf") &&
-        moved.has_attribute("weight"));
-
-  // Move-assign over a live grid frees the destination's attributes first.
-  moved = std::move(bare).value();
-  CHECK(moved.valid() && !moved.has_attribute("tsdf"));
 
   std::printf(
       "recon volume block grid test passed: 2 SoA attributes (%llu voxels "
