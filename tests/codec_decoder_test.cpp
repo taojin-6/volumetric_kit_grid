@@ -746,15 +746,15 @@ int main() {
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<VkPhysicalDevice> physical =
-      instance.value().select_physical_device();
+  vr::Result<vr::PhysicalDeviceInfo> physical =
+      instance.value().select_physical_device(vr::device_requirements());
   if (!physical) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  physical.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device =
-      vr::Device::create(instance.value(), physical.value(), {});
+  vr::Result<vr::Device> device = vr::Device::create(
+      instance.value(), physical.value(), vr::device_requirements());
   CHECK(device.ok());
   vr::Result<vr::Allocator> allocator =
       vr::Allocator::create(instance.value().handle(), device.value());

@@ -12,15 +12,11 @@
 
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
+#include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/core/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-
-namespace volumetric_kit::recon {
-class Allocator;
-class Device;
-}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::codec {
 

@@ -75,14 +75,15 @@ int main() {
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<VkPhysicalDevice> gpu = instance.value().select_physical_device();
+  vr::Result<vr::PhysicalDeviceInfo> gpu =
+      instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device =
-      vr::Device::create(instance.value(), gpu.value(), {});
+  vr::Result<vr::Device> device = vr::Device::create(
+      instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
@@ -247,7 +248,7 @@ int main() {
   vr::BufferDesc transfer_desc;
   transfer_desc.size = sizeof(vol::BlockIndex);
   transfer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  transfer_desc.memory = vr::MemoryUsage::DeviceLocal;
+  transfer_desc.memory = vr::MemoryUsage::DeviceOnly;
   auto transfer_only = allocator.value().create_buffer(transfer_desc);
   CHECK(transfer_only.ok());
   CHECK(map.remove(transfer_only.value(), 1).status().domain() ==

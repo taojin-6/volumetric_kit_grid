@@ -19,6 +19,7 @@
 #include "volumetric_kit/recon/core/buffer.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
+#include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/core/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/core/stage_metrics.hpp"
@@ -26,11 +27,6 @@
 #include "volumetric_kit/recon/volume/export.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
-
-namespace volumetric_kit::recon {
-class CommandBatch;
-class Device;
-}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::volume {
 

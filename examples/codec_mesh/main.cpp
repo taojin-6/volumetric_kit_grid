@@ -202,8 +202,10 @@ vr::Status run(const Options& opt) {
   }
 
   VR_ASSIGN(vr::Instance instance, vr::Instance::create({}));
-  VR_ASSIGN(VkPhysicalDevice gpu, instance.select_physical_device());
-  VR_ASSIGN(vr::Device device, vr::Device::create(instance, gpu, {}));
+  VR_ASSIGN(vr::PhysicalDeviceInfo gpu,
+            instance.select_physical_device(vr::device_requirements()));
+  VR_ASSIGN(vr::Device device,
+            vr::Device::create(instance, gpu, vr::device_requirements()));
   VR_ASSIGN(vr::Allocator allocator,
             vr::Allocator::create(instance.handle(), device));
   const float trunc = 4.0f * opt.voxel;

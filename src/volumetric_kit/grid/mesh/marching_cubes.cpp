@@ -517,13 +517,12 @@ bool MarchingCubes::block_span_valid(const volume::VoxelBlockGrid& grid,
 }
 
 const BlockSpan* MarchingCubes::block_spans() const noexcept {
-  // Host-visible and mapped, so this is the buffer itself rather than a copy.
-  // It is therefore BORROWED: a grow move-assigns block_spans_, whose
-  // operator= destroys the current state first, so the next extract over a
-  // grown grid unmaps and frees the very pages a cached pointer names. The
-  // caller is told so, and block_spans_generation() is the check that makes the
-  // staleness visible rather than merely documented -- a lifetime the caller
-  // cannot see is this library's to check (2026-08-04).
+  // The host's copy of the device table, which every dispatch reads back. It
+  // is BORROWED: the next extract over a grown grid replaces the copy and
+  // frees the very pages a cached pointer names. The caller is told so, and
+  // block_spans_generation() is the check that makes the staleness visible
+  // rather than merely documented -- a lifetime the caller cannot see is this
+  // library's to check (2026-08-04).
   //
   // Refused outright while no extract has left a table describing its own
   // output. That is what keeps the three failure exits below honest: each
@@ -534,7 +533,7 @@ const BlockSpan* MarchingCubes::block_spans() const noexcept {
   // where disarming the draw command only stopped them being *drawn*.
   return block_spans_generation_ == 0 || block_span_capacity() == 0
              ? nullptr
-             : static_cast<const BlockSpan*>(block_spans_.mapped());
+             : span_host_.get();
 }
 
 void MarchingCubes::release_through(std::uint64_t generation) noexcept {
@@ -682,11 +681,10 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   if (num_blocks <= block_span_capacity()) return {};
   const VkDeviceSize bytes =
       static_cast<VkDeviceSize>(num_blocks) * sizeof(BlockSpan);
-  // Host-visible, unlike every other buffer here: the host is its reader
-  // (block_spans() hands out a pointer, and the live sum below walks it), and
-  // the kernel writes it once per block.
-  VR_ASSIGN(Buffer grown,
-            storage_buffer(*allocator_, bytes, HostAccess::Random));
+  // Device-only like every other buffer here. The host keeps a copy of its
+  // own, span_host_, which each dispatch reads back: block_spans() hands that
+  // out, and the live sum walks it.
+  VR_ASSIGN(Buffer grown, device_storage_buffer(*allocator_, bytes));
 
   // Carry the existing spans forward and zero only the new tail, as the map
   // does its block stamps -- the sibling slot-keyed table, grown by the same
@@ -703,15 +701,22 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   // thousand of 1.5M entries at VoxelGridParams::defaults; the rest are what
   // the accessor publishes as readable, and driver-garbage bases index the
   // arena anywhere. An empty span is a truthful "this block owns no geometry".
-  const auto old_bytes =
-      static_cast<std::size_t>(block_span_capacity()) * sizeof(BlockSpan);
-  auto* dst = static_cast<std::uint8_t*>(grown.mapped());
-  if (old_bytes > 0) {
-    std::memcpy(dst, block_spans_.mapped(), old_bytes);
-  }
-  std::memset(dst + old_bytes, 0, static_cast<std::size_t>(bytes) - old_bytes);
+  //
+  // On the device, in a batch of its own, so the grown table is whole before
+  // anything else records against it.
   const std::uint32_t old_slots = block_span_capacity();
+  const VkDeviceSize old_bytes =
+      static_cast<VkDeviceSize>(old_slots) * sizeof(BlockSpan);
+  CommandBatch batch(*device_, *allocator_);
+  if (old_bytes > 0) VR_TRY(batch.copy(block_spans_, 0, grown, 0, old_bytes));
+  VR_TRY(batch.zero(grown, old_bytes, bytes - old_bytes));
+  VR_TRY(batch.submit());
   block_spans_ = std::move(grown);
+  auto grown_host = std::make_unique<BlockSpan[]>(num_blocks);
+  if (old_slots > 0 && span_host_ != nullptr) {
+    std::copy_n(span_host_.get(), old_slots, grown_host.get());
+  }
+  span_host_ = std::move(grown_host);
   // A fresh handle, and a debug-utils name lives on the handle -- so without
   // this the span table goes anonymous the first time it grows, in exactly the
   // configuration that has one at all (track_block_spans, which incremental
@@ -1600,18 +1605,33 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
       capacity <= arena_capacity();
 
   VR_TRY(ensure_block_spans(grid));
-  if (incremental) {
+  // The slots the kernel can write, all below the highest active one: what
+  // each dispatch reads back into span_host_.
+  std::uint32_t span_slots = 0;
+  if (config_.track_block_spans) {
     // The host stamps also guard the GPU's reuse. A slot absent from the
     // previous extract can still hold a span from before a remove and full
     // fallback; that range now belongs to another block. Clear only such
     // entries before either kernel reads them, including newly allocated
-    // blocks that have not yet been stamped changed.
-    auto* spans = static_cast<BlockSpan*>(block_spans_.mapped());
+    // blocks that have not yet been stamped changed. The upload covers the
+    // cleared range from span_host_, which matches the device everywhere a
+    // kernel reads: the previous dispatch read back every slot it wrote.
+    std::uint32_t clear_lo = 0xFFFFFFFFu;
+    std::uint32_t clear_hi = 0;
     for (std::uint32_t i = 0; i < active.count; ++i) {
       const auto slot = static_cast<std::uint32_t>(active.blocks[i].ptr) / vpb;
-      if (span_stamp_[slot] != prev_arena.serial) {
-        spans[slot] = BlockSpan{};
+      span_slots = std::max(span_slots, slot + 1);
+      if (incremental && span_stamp_[slot] != prev_arena.serial) {
+        span_host_[slot] = BlockSpan{};
+        clear_lo = std::min(clear_lo, slot);
+        clear_hi = std::max(clear_hi, slot + 1);
       }
+    }
+    if (clear_lo < clear_hi) {
+      VR_TRY(first.upload(
+          block_spans_, static_cast<VkDeviceSize>(clear_lo) * sizeof(BlockSpan),
+          span_host_.get() + clear_lo,
+          static_cast<VkDeviceSize>(clear_hi - clear_lo) * sizeof(BlockSpan)));
     }
   }
   // The reset is only recorded, so a failure here disarms what the last
@@ -1745,8 +1765,9 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // workgroup note -- the fix is a specialization constant for local_size_x,
     // and every in-tree caller uses block_size 8.
     //
-    // Only the command and its scratch words come back, in the same batch;
-    // the geometry stays where the kernel wrote it.
+    // Only the command and its scratch words come back, in the same batch,
+    // with the spans when they are tracked; the geometry stays where the
+    // kernel wrote it.
     //
     // A refused dispatch or readback poisons the batch and submit returns that
     // refusal, so every failure takes the one exit below. The reset was only
@@ -1756,6 +1777,12 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     static_cast<void>(batch->dispatch(kernel_sparse_, &push, sizeof(push),
                                       num_active, max_workgroup_count_x_));
     static_cast<void>(batch->readback(indirect(), 0, sizeof(words), &words));
+    if (span_slots > 0) {
+      static_cast<void>(batch->readback(
+          block_spans_, 0,
+          static_cast<VkDeviceSize>(span_slots) * sizeof(BlockSpan),
+          span_host_.get()));
+    }
     if (Status ran = batch->submit(); !ran.ok()) {
       disarm_indirect_command();
       return ran;
@@ -1918,7 +1945,7 @@ Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // one per active block.
     const std::uint32_t stamps =
         span_stamp_ != nullptr ? block_span_capacity() : 0;
-    const auto* spans = static_cast<const BlockSpan*>(block_spans_.mapped());
+    const BlockSpan* spans = span_host_.get();
     std::uint64_t live_sum = 0;
     std::uint64_t live_vert_sum = 0;
     for (std::uint32_t i = 0; i < active.count; ++i) {
