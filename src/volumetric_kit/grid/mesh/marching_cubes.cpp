@@ -931,6 +931,7 @@ void MarchingCubes::name_slot_buffer(const Buffer& buffer,
 Result<MarchingCubes> MarchingCubes::create(Device& device,
                                             Allocator& allocator,
                                             const MarchingCubesConfig& config) {
+  VR_TRY(check_device_requirements(device, "MarchingCubes::create"));
   // Reject the one usage bit this repo's Device provably cannot honour, here
   // where the caller supplied it rather than inside the first extract's arena
   // grow (AGENTS.md's "validate before creating"). Device::create never enables

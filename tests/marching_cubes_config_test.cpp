@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -753,6 +754,28 @@ int main() {
     CHECK(b.value().triangle_count > 0);
     vr::Result<mesh::DeviceMesh> c = one.extract_device(empty_grid, 0.0f);
     CHECK(c.ok() && index_count(c.value()) == 0);
+  }
+
+  // --- A device without recon's features is refused -------------------------
+  // The core's default requirements leave scalarBlockLayout off. The kernels
+  // would build and run on such a device, reading their buffers at the wrong
+  // offsets, so create refuses it.
+  {
+    vr::Result<vr::Device> plain =
+        vr::Device::create(instance.value(), gpu.value(), {});
+    CHECK(plain.ok());
+    vr::Result<vr::Allocator> plain_allocator =
+        vr::Allocator::create(instance.value().handle(), plain.value());
+    CHECK(plain_allocator.ok());
+    vr::Result<mesh::MarchingCubes> refused =
+        mesh::MarchingCubes::create(plain.value(), plain_allocator.value());
+    CHECK(refused.status().domain() == vr::Status::Code::Unsupported);
+    CHECK(refused.status().message().find("scalarBlockLayout") !=
+          std::string::npos);
+    CHECK(vol::VoxelBlockGrid::create(plain.value(), plain_allocator.value(),
+                                      gp, attrs, 2)
+              .status()
+              .domain() == vr::Status::Code::Unsupported);
   }
 
   std::fprintf(stderr, "marching_cubes_config: OK\n");

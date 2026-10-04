@@ -107,6 +107,7 @@ std::size_t padded_count(std::uint32_t k) {
 
 Result<std::unique_ptr<DctTransform>> DctTransform::create(
     Device& device, Allocator& allocator, const DctTransformConfig& config) {
+  VR_TRY(check_device_requirements(device, "DctTransform::create"));
   std::unique_ptr<DctTransform> owned(new DctTransform());
   DctTransform& t = *owned;
   t.device_ = &device;

@@ -139,6 +139,7 @@ Result<PersistentBuffers> make_persistent_buffers(Allocator& allocator,
 
 Result<VoxelHashMap> VoxelHashMap::create(Device& device, Allocator& allocator,
                                           const VoxelGridParams& grid) {
+  VR_TRY(check_device_requirements(device, "VoxelHashMap::create"));
   // Validate the full grid contract -- positivity AND the product invariants
   // (num_blocks == bucket_size*num_buckets, voxels_per_block == block_size^3)
   // that the buffer sizing and the block-pointer math below rely on.

@@ -32,6 +32,7 @@ Status fail(const char* op, const std::string& why) {
 
 Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
     Device& device, Allocator& allocator) {
+  VR_TRY(check_device_requirements(device, "DeviceFrameReader::create"));
   std::unique_ptr<DeviceFrameReader> owned(new DeviceFrameReader());
   DeviceFrameReader& r = *owned;
   r.device_ = &device;
