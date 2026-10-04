@@ -95,8 +95,7 @@ Result<VoxelBlockGrid> VoxelBlockGrid::create(Device& device,
     }
   }
 
-  const VkDeviceSize max_range =
-      max_storage_buffer_range(device.physical_device());
+  const VkDeviceSize max_range = max_storage_buffer_range(device);
 
   // Check every attribute against the binding limit before building the map or
   // allocating anything, for the same reason the spec validation above runs

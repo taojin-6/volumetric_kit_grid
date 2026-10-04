@@ -141,8 +141,9 @@ template <typename T>
 std::vector<T> copy_out(const vr::Device& dev, vr::Allocator& alloc,
                         VkBuffer src, std::size_t count) {
   const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(T);
-  vr::Result<vr::Buffer> staging = vr::storage_buffer(
-      alloc, bytes, vr::HostAccess::Random, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+  vr::Result<vr::Buffer> staging =
+      alloc.create_buffer({bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                           vr::MemoryUsage::Staging, vr::HostAccess::Random});
   if (!staging.ok()) return {};
   const VkBuffer dst = staging.value().handle();
   const vr::Status copied =
@@ -166,14 +167,15 @@ int main() {
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<VkPhysicalDevice> gpu = instance.value().select_physical_device();
+  vr::Result<vr::PhysicalDeviceInfo> gpu =
+      instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device =
-      vr::Device::create(instance.value(), gpu.value(), {});
+  vr::Result<vr::Device> device = vr::Device::create(
+      instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());

@@ -343,6 +343,23 @@ class PhaseClock {
   std::chrono::steady_clock::time_point start_{};
 };
 
+// The block-span table, which the host reads and writes as well as the kernel:
+// mapped device-local memory, so the kernel's stores stay in VRAM on a discrete
+// GPU too. Cached where the device has it (unified memory), where the host's
+// reads are free; else the BAR window, whose host reads cross PCIe uncached --
+// the live sum touches only the active blocks' spans, so that is a few thousand
+// reads, against a kernel that would otherwise store every span across the bus.
+Result<Buffer> span_table(Allocator& allocator, VkDeviceSize bytes) {
+  Result<Buffer> cached =
+      mapped_storage_buffer(allocator, bytes, HostAccess::Random);
+  if (cached || cached.status().domain() != Status::Code::Unsupported) {
+    return cached;
+  }
+  // TODO: if the BAR window's uncached reads show up in a discrete-GPU
+  // profile, keep the table device-only and read the active spans back.
+  return mapped_storage_buffer(allocator, bytes, HostAccess::SequentialWrite);
+}
+
 }  // namespace
 
 std::uint32_t MarchingCubes::plan_capacity(std::uint32_t num_active,
@@ -682,11 +699,10 @@ Status MarchingCubes::ensure_block_spans(const volume::VoxelBlockGrid& grid) {
   if (num_blocks <= block_span_capacity()) return {};
   const VkDeviceSize bytes =
       static_cast<VkDeviceSize>(num_blocks) * sizeof(BlockSpan);
-  // Host-visible, unlike every other buffer here: the host is its reader
+  // Mapped, unlike every other buffer here: the host is its reader
   // (block_spans() hands out a pointer, and the live sum below walks it), and
   // the kernel writes it once per block.
-  VR_ASSIGN(Buffer grown,
-            storage_buffer(*allocator_, bytes, HostAccess::Random));
+  VR_ASSIGN(Buffer grown, span_table(*allocator_, bytes));
 
   // Carry the existing spans forward and zero only the new tail, as the map
   // does its block stamps -- the sibling slot-keyed table, grown by the same

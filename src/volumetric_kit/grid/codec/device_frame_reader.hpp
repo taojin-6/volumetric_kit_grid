@@ -24,15 +24,9 @@
 #include "volumetric_kit/recon/core/buffer.hpp"
 #include "volumetric_kit/recon/core/compute_kernel.hpp"
 #include "volumetric_kit/recon/core/descriptor.hpp"
+#include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
-
-namespace volumetric_kit::recon {
-class Allocator;
-class CommandBatch;
-class Device;
-class GpuStageScope;
-}  // namespace volumetric_kit::recon
 
 namespace volumetric_kit::recon::codec::detail {
 

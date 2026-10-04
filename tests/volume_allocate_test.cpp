@@ -100,14 +100,15 @@ int main() {
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<VkPhysicalDevice> gpu = instance.value().select_physical_device();
+  vr::Result<vr::PhysicalDeviceInfo> gpu =
+      instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device =
-      vr::Device::create(instance.value(), gpu.value(), {});
+  vr::Result<vr::Device> device = vr::Device::create(
+      instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
