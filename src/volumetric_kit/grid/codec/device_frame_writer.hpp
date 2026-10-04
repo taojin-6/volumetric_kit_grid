@@ -16,7 +16,6 @@
 /// that unified memory would.
 
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -58,8 +57,8 @@ class VR_CODEC_API DeviceFrameWriter {
   static Result<DeviceFrameWriter> create(Device& device, Allocator& allocator);
 
   ~DeviceFrameWriter() = default;
-  DeviceFrameWriter(DeviceFrameWriter&&) noexcept = default;
-  DeviceFrameWriter& operator=(DeviceFrameWriter&&) noexcept = default;
+  DeviceFrameWriter(DeviceFrameWriter&& other) noexcept;
+  DeviceFrameWriter& operator=(DeviceFrameWriter&& other) noexcept;
   DeviceFrameWriter(const DeviceFrameWriter&) = delete;
   DeviceFrameWriter& operator=(const DeviceFrameWriter&) = delete;
 
@@ -153,21 +152,9 @@ class VR_CODEC_API DeviceFrameWriter {
   std::vector<std::uint32_t> steps_host_;
   // The segment size record_count counted with (0 before any), and the last
   // frame's payload bytes per block plus 25%, the readback's prediction (0
-  // before any). Reset on move, like every owned member.
-  struct FrameState {
-    std::uint32_t segment_size = 0;
-    std::uint32_t payload_per_block = 0;
-    FrameState() = default;
-    FrameState(FrameState&& other) noexcept
-        : segment_size(std::exchange(other.segment_size, 0)),
-          payload_per_block(std::exchange(other.payload_per_block, 0)) {}
-    FrameState& operator=(FrameState&& other) noexcept {
-      segment_size = std::exchange(other.segment_size, 0);
-      payload_per_block = std::exchange(other.payload_per_block, 0);
-      return *this;
-    }
-  };
-  FrameState state_;
+  // before any).
+  std::uint32_t segment_size_ = 0;
+  std::uint32_t payload_per_block_ = 0;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

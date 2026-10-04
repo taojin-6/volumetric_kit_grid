@@ -286,9 +286,40 @@ int moves_case(vr::Device& device, vr::Allocator& allocator,
   live.value() = std::move(moved);  // over a live writer
   CHECK(live.value().valid());
   CHECK(!moved.valid());  // NOLINT(bugprone-use-after-move)
-  d::DeviceFrameWriter* alias = &live.value();
-  live.value() = std::move(*alias);  // self-move, laundered past -Wself-move
-  CHECK(live.value().valid());
+  // A self-move between record_count and finish keeps what was counted.
+  {
+    const vr::volume::BlockIndex block{};
+    const std::uint32_t masks[codec::kMaskWordsPerBlock] = {1u};
+    const std::uint32_t coefficient = 5u;  // K = 1
+    vr::Result<vr::Buffer> list = vr::device_storage_buffer(allocator, 16);
+    vr::Result<vr::Buffer> mask = vr::device_storage_buffer(allocator, 64);
+    vr::Result<vr::Buffer> coeff = vr::device_storage_buffer(allocator, 4);
+    CHECK(list.ok() && mask.ok() && coeff.ok());
+    d::ResidentBlocks blocks;
+    blocks.list = &list.value();
+    blocks.masks = &mask.value();
+    blocks.coefficients = &coeff.value();
+    blocks.count = 1;
+    blocks.coefficient_count = 1;
+    vr::CommandBatch batch(device, allocator);
+    CHECK(batch.upload(list.value(), 0, &block, sizeof(block)).ok());
+    CHECK(batch.upload(mask.value(), 0, masks, sizeof(masks)).ok());
+    CHECK(batch.upload(coeff.value(), 0, &coefficient, 4).ok());
+    CHECK(live.value().record_count(batch, blocks, 64).ok());
+    CHECK(batch.submit().ok());
+    d::DeviceFrameWriter* alias = &live.value();
+    live.value() = std::move(*alias);  // self-move, laundered past -Wself-move
+    CHECK(live.value().valid());
+    codec::CodecParams params;
+    params.coefficient_count = 1;
+    const vr::Result<std::vector<std::uint8_t>> counted =
+        live.value().finish(blocks, 0.005f, 0.04f, params);
+    CHECK(counted.ok());
+    const vr::Result<d::IntraFrame> read = d::read_intra_frame(
+        counted.value().data(), counted.value().size(), kMaxBlocks);
+    CHECK(read.ok());
+    CHECK(read.value().blocks.coefficients[0] == 5);
+  }
   CHECK(same_bytes(live.value(), reader, make_frame(70, 8, 5), 16) == 0);
   writer = std::move(live.value());
   CHECK(writer.valid());

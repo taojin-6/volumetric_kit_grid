@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <limits>
 #include <string>
+#include <utility>
 
 #include "rans_dispatch.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
@@ -38,6 +39,47 @@ Status fail(const char* op, const std::string& why) {
 }
 
 }  // namespace
+
+DeviceFrameWriter::DeviceFrameWriter(DeviceFrameWriter&& other) noexcept {
+  *this = std::move(other);
+}
+
+DeviceFrameWriter& DeviceFrameWriter::operator=(
+    DeviceFrameWriter&& other) noexcept {
+  if (this == &other) return *this;
+  device_ = std::exchange(other.device_, nullptr);
+  allocator_ = std::exchange(other.allocator_, nullptr);
+  max_workgroup_count_x_ = std::exchange(other.max_workgroup_count_x_, 0);
+  max_storage_buffer_range_ = std::exchange(other.max_storage_buffer_range_, 0);
+  count_kernel_ = std::move(other.count_kernel_);
+  ops_kernel_ = std::move(other.ops_kernel_);
+  encode_kernel_ = std::move(other.encode_kernel_);
+  scan_kernel_ = std::move(other.scan_kernel_);
+  gather_kernel_ = std::move(other.gather_kernel_);
+  pool_ = std::move(other.pool_);
+  counts_ = std::move(other.counts_);
+  block_steps_ = std::move(other.block_steps_);
+  tables_ = std::move(other.tables_);
+  step_offsets_ = std::move(other.step_offsets_);
+  steps_ = std::move(other.steps_);
+  segment_steps_ = std::move(other.segment_steps_);
+  slot_offsets_ = std::move(other.slot_offsets_);
+  slots_ = std::move(other.slots_);
+  lengths_ = std::move(other.lengths_);
+  payload_offsets_ = std::move(other.payload_offsets_);
+  payload_ = std::move(other.payload_);
+  gather_args_ = std::move(other.gather_args_);
+  failed_ = std::move(other.failed_);
+  upload_list_ = std::move(other.upload_list_);
+  upload_masks_ = std::move(other.upload_masks_);
+  upload_coefficients_ = std::move(other.upload_coefficients_);
+  bases_host_ = std::exchange(other.bases_host_, {});
+  counts_host_ = std::exchange(other.counts_host_, {});
+  steps_host_ = std::exchange(other.steps_host_, {});
+  segment_size_ = std::exchange(other.segment_size_, 0);
+  payload_per_block_ = std::exchange(other.payload_per_block_, 0);
+  return *this;
+}
 
 Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
                                                     Allocator& allocator) {
@@ -90,7 +132,7 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
   if (segments > kMaxFrameSegments) {
     return fail("record_count", "more than 2^30 - 1 segments");
   }
-  state_.segment_size = segment_size;
+  segment_size_ = segment_size;
   // Each model's first entry in the per-symbol arrays, in TABLES order.
   const std::uint32_t models = frame_model_count(k);
   bases_host_.assign(models + 1, 0);
@@ -139,7 +181,7 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   VR_TRY(params.validate());
   const std::uint32_t n = blocks.count;
   const std::uint32_t k = params.coefficient_count;
-  const std::uint32_t segment_size = state_.segment_size;
+  const std::uint32_t segment_size = segment_size_;
   if (segment_size == 0 || k != blocks.coefficient_count ||
       bases_host_.size() != frame_model_count(k) + 1 ||
       steps_host_.size() != n) {
@@ -284,9 +326,8 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   // Read the payload's likely size with the lengths, and any rest after.
   std::vector<std::uint32_t> lengths(segments);
   std::uint32_t failed = 0;
-  const std::uint64_t per_block = state_.payload_per_block != 0
-                                      ? state_.payload_per_block
-                                      : kFirstPayloadPerBlock;
+  const std::uint64_t per_block =
+      payload_per_block_ != 0 ? payload_per_block_ : kFirstPayloadPerBlock;
   const VkDeviceSize guess = std::min<VkDeviceSize>(
       slot_bytes, (per_block * n + 3) & ~VkDeviceSize{3});
   std::vector<std::uint8_t> payload(static_cast<std::size_t>(guess));
@@ -314,8 +355,7 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     VR_TRY(tail.submit());
   }
   payload.resize(static_cast<std::size_t>(total));
-  state_.payload_per_block =
-      static_cast<std::uint32_t>((total + total / 4) / n + 1);
+  payload_per_block_ = static_cast<std::uint32_t>((total + total / 4) / n + 1);
   coded.segment_lengths = std::move(lengths);
   coded.payload = std::move(payload);
   return assemble_intra_frame(coded);
