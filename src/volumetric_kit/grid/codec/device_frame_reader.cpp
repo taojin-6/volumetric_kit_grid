@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
-#include <utility>
 
 #include "rans_dispatch.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
@@ -31,37 +30,10 @@ Status fail(const char* op, const std::string& why) {
 
 }  // namespace
 
-DeviceFrameReader::DeviceFrameReader(DeviceFrameReader&& other) noexcept {
-  *this = std::move(other);
-}
-
-DeviceFrameReader& DeviceFrameReader::operator=(
-    DeviceFrameReader&& other) noexcept {
-  if (this == &other) return *this;
-  device_ = std::exchange(other.device_, nullptr);
-  allocator_ = std::exchange(other.allocator_, nullptr);
-  max_workgroup_count_x_ = std::exchange(other.max_workgroup_count_x_, 0);
-  max_storage_buffer_range_ = std::exchange(other.max_storage_buffer_range_, 0);
-  slots_kernel_ = std::move(other.slots_kernel_);
-  decode_kernel_ = std::move(other.decode_kernel_);
-  pool_ = std::move(other.pool_);
-  tables_ = std::move(other.tables_);
-  slots_ = std::move(other.slots_);
-  payload_ = std::move(other.payload_);
-  segment_words_ = std::move(other.segment_words_);
-  list_ = std::move(other.list_);
-  masks_ = std::move(other.masks_);
-  coefficients_ = std::move(other.coefficients_);
-  faults_ = std::move(other.faults_);
-  blocks_host_ = std::exchange(other.blocks_host_, {});
-  faults_host_ = std::exchange(other.faults_host_, {});
-  segment_size_ = std::exchange(other.segment_size_, 0);
-  return *this;
-}
-
-Result<DeviceFrameReader> DeviceFrameReader::create(Device& device,
-                                                    Allocator& allocator) {
-  DeviceFrameReader r;
+Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
+    Device& device, Allocator& allocator) {
+  std::unique_ptr<DeviceFrameReader> owned(new DeviceFrameReader());
+  DeviceFrameReader& r = *owned;
   r.device_ = &device;
   r.allocator_ = &allocator;
   VkPushConstantRange push{};
@@ -77,12 +49,11 @@ Result<DeviceFrameReader> DeviceFrameReader::create(Device& device,
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   r.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   r.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
-  return r;
+  return owned;
 }
 
 Result<ResidentBlocks> DeviceFrameReader::record_decode(
     CommandBatch& batch, const ParsedFrame& frame, GpuStageScope* stage) {
-  if (!valid()) return fail("record_decode", "moved-from reader");
   const std::uint32_t n = frame.header.block_count;
   const std::uint32_t k = frame.header.params.coefficient_count;
   const auto segments =
@@ -208,7 +179,6 @@ Status DeviceFrameReader::check() const {
 Result<IntraFrame> DeviceFrameReader::read(const std::uint8_t* data,
                                            std::size_t size,
                                            std::uint32_t max_blocks) {
-  if (!valid()) return fail("read", "moved-from reader");
   VR_ASSIGN(const ParsedFrame parsed,
             parse_intra_frame(data, size, max_blocks));
   const std::uint32_t n = parsed.header.block_count;

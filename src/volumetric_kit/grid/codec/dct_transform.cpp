@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "dct_tables.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
@@ -104,9 +105,10 @@ std::size_t padded_count(std::uint32_t k) {
 
 }  // namespace
 
-Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
-                                          const DctTransformConfig& config) {
-  DctTransform t;
+Result<std::unique_ptr<DctTransform>> DctTransform::create(
+    Device& device, Allocator& allocator, const DctTransformConfig& config) {
+  std::unique_ptr<DctTransform> owned(new DctTransform());
+  DctTransform& t = *owned;
   t.device_ = &device;
   t.allocator_ = &allocator;
 
@@ -168,15 +170,12 @@ Result<DctTransform> DctTransform::create(Device& device, Allocator& allocator,
     kernel->set.write_storage_buffer(kBindingRejected, t.rejected_.handle(), 0,
                                      VK_WHOLE_SIZE);
   }
-  return t;
+  return owned;
 }
 
 Result<DctTransform::GridViews> DctTransform::check_inputs(
     const char* op, const volume::VoxelBlockGrid& grid,
     const volume::BlockList& blocks, const CodecParams& params) const {
-  if (!valid()) {
-    return fail(op, "moved-from transform");
-  }
   VR_TRY(params.validate());
   if (!grid.valid()) {
     return fail(op, "moved-from grid");
@@ -302,7 +301,7 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
   VR_TRY(grid.map().check_device_block_list(list, "DctTransform::observed"));
   std::vector<volume::BlockIndex> out;
   if (list.count == 0) {
-    last_observed_.count = 0;
+    last_observed_ = 0;
     return out;
   }
   const VkDeviceSize list_bytes =
@@ -313,7 +312,7 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
   // input count, or the whole input when there is no last count (the first
   // call, or one after an empty result). Only an outgrown prefix costs
   // another transfer, just as collect_compacted does.
-  const std::uint32_t last = last_observed_.count;
+  const std::uint32_t last = last_observed_;
   const std::uint32_t guess =
       last == 0 ? list.count
                 : static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -342,7 +341,7 @@ Result<std::vector<volume::BlockIndex>> DctTransform::observed(
         out.data() + guess));
     VR_TRY(tail.submit());
   }
-  last_observed_.count = counts.observed;
+  last_observed_ = counts.observed;
   return out;
 }
 

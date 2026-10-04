@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -813,10 +814,10 @@ int batching_case(vr::Device& device, vr::Allocator& allocator,
   const vr_test::Gpu ctx{device, allocator};
   DctTransformConfig small;
   small.max_blocks_per_dispatch = 3;
-  vr::Result<DctTransform> batched_r =
+  vr::Result<std::unique_ptr<DctTransform>> batched_r =
       DctTransform::create(device, allocator, small);
   CHECK(batched_r.ok());
-  DctTransform batched = std::move(batched_r).value();
+  DctTransform& batched = *batched_r.value();
 
   vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
@@ -1258,43 +1259,6 @@ int inverse_stamps_case(vr::Device& device, vr::Allocator& allocator,
   return 0;
 }
 
-// The move-only type rules: a moved-from transform is empty, a move-assign
-// over a live one works, and a self-move leaves it intact.
-int moves_case(vr::Device& device, vr::Allocator& allocator) {
-  vr::Result<DctTransform> a_r = DctTransform::create(device, allocator);
-  CHECK(a_r.ok());
-  DctTransform a = std::move(a_r).value();
-  CHECK(a.valid());
-
-  DctTransform b(std::move(a));
-  CHECK(b.valid());
-  CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
-
-  vr::Result<DctTransform> c_r = DctTransform::create(device, allocator);
-  CHECK(c_r.ok());
-  DctTransform c = std::move(c_r).value();
-  c = std::move(b);  // over a live transform
-  CHECK(c.valid());
-  CHECK(!b.valid());  // NOLINT(bugprone-use-after-move)
-
-  DctTransform* alias = &c;
-  c = std::move(*alias);  // self-move, laundered past -Wself-move
-  CHECK(c.valid());
-
-  // The survivor still works, and a moved-from one refuses rather than
-  // dispatching through a null pipeline.
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
-  CHECK(g.ok());
-  vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
-  CHECK(active.ok());
-  DctBlocks out;
-  const vol::BlockList list = grid.block_list(active.value());
-  CHECK(c.forward(grid, list, codec::CodecParams{}, out).ok());
-  CHECK(!a.forward(grid, list, codec::CodecParams{}, out).ok());
-  return 0;
-}
-
 }  // namespace
 
 int main() {
@@ -1327,13 +1291,14 @@ int main() {
   vr::Device& dev = device.value();
   vr::Allocator& alloc = allocator.value();
 
-  vr::Result<DctTransform> t_r = DctTransform::create(dev, alloc);
+  vr::Result<std::unique_ptr<DctTransform>> t_r =
+      DctTransform::create(dev, alloc);
   if (!t_r) {
     std::fprintf(stderr, "DctTransform::create failed: %s\n",
                  t_r.status().message().c_str());
     return 1;
   }
-  DctTransform t = std::move(t_r).value();
+  DctTransform& t = *t_r.value();
 
   if (forward_matches_reference_case(dev, alloc, t) != 0) return 1;
   if (per_basis_sequence_case(dev, alloc, t) != 0) return 1;
@@ -1349,10 +1314,9 @@ int main() {
   if (observed_case(dev, alloc, t) != 0) return 1;
   auto chunked = DctTransform::create(dev, alloc, DctTransformConfig{2});
   CHECK(chunked.ok());
-  if (observed_case(dev, alloc, chunked.value()) != 0) return 1;
-  if (scratch_reuse_case(dev, alloc, chunked.value()) != 0) return 1;
+  if (observed_case(dev, alloc, *chunked.value()) != 0) return 1;
+  if (scratch_reuse_case(dev, alloc, *chunked.value()) != 0) return 1;
   if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
-  if (moves_case(dev, alloc) != 0) return 1;
   std::printf("codec DctTransform: OK\n");
   return 0;
 }

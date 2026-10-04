@@ -16,6 +16,7 @@
 /// that unified memory would.
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -54,11 +55,10 @@ class VR_CODEC_API DeviceFrameWriter {
  public:
   /// @brief Build the five kernels.
   /// @return The writer, or a pipeline or pool failure.
-  static Result<DeviceFrameWriter> create(Device& device, Allocator& allocator);
+  static Result<std::unique_ptr<DeviceFrameWriter>> create(
+      Device& device, Allocator& allocator);
 
   ~DeviceFrameWriter() = default;
-  DeviceFrameWriter(DeviceFrameWriter&& other) noexcept;
-  DeviceFrameWriter& operator=(DeviceFrameWriter&& other) noexcept;
   DeviceFrameWriter(const DeviceFrameWriter&) = delete;
   DeviceFrameWriter& operator=(const DeviceFrameWriter&) = delete;
 
@@ -71,9 +71,9 @@ class VR_CODEC_API DeviceFrameWriter {
   ///                      +-32767 (what the transform writes).
   /// @param segment_size  Blocks per segment, at least 1, which @ref finish
   ///                      codes at.
-  /// @return OK, or @ref Status::Code::InvalidArgument for a moved-from
-  ///         writer, a segment size of 0, more than 2^30 - 1 segments, or a
-  ///         buffer past `maxStorageBufferRange`; otherwise a buffer failure.
+  /// @return OK, or @ref Status::Code::InvalidArgument for a segment size of
+  ///         0, more than 2^30 - 1 segments, or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
   Status record_count(CommandBatch& batch, const ResidentBlocks& blocks,
                       std::uint32_t segment_size,
                       GpuStageScope* stage = nullptr);
@@ -101,13 +101,6 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @return As @ref write_intra_frame.
   Result<std::vector<std::uint8_t>> write(const IntraFrame& frame,
                                           const FrameWriteOptions& options);
-
-  /// @return `true` if this owns its live kernels (`false` when moved-from).
-  bool valid() const noexcept {
-    return count_kernel_.valid() && ops_kernel_.valid() &&
-           encode_kernel_.valid() && scan_kernel_.valid() &&
-           gather_kernel_.valid();
-  }
 
  private:
   DeviceFrameWriter() = default;

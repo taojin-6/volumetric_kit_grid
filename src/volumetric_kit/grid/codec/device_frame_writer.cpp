@@ -40,50 +40,10 @@ Status fail(const char* op, const std::string& why) {
 
 }  // namespace
 
-DeviceFrameWriter::DeviceFrameWriter(DeviceFrameWriter&& other) noexcept {
-  *this = std::move(other);
-}
-
-DeviceFrameWriter& DeviceFrameWriter::operator=(
-    DeviceFrameWriter&& other) noexcept {
-  if (this == &other) return *this;
-  device_ = std::exchange(other.device_, nullptr);
-  allocator_ = std::exchange(other.allocator_, nullptr);
-  max_workgroup_count_x_ = std::exchange(other.max_workgroup_count_x_, 0);
-  max_storage_buffer_range_ = std::exchange(other.max_storage_buffer_range_, 0);
-  count_kernel_ = std::move(other.count_kernel_);
-  ops_kernel_ = std::move(other.ops_kernel_);
-  encode_kernel_ = std::move(other.encode_kernel_);
-  scan_kernel_ = std::move(other.scan_kernel_);
-  gather_kernel_ = std::move(other.gather_kernel_);
-  pool_ = std::move(other.pool_);
-  counts_ = std::move(other.counts_);
-  block_steps_ = std::move(other.block_steps_);
-  tables_ = std::move(other.tables_);
-  step_offsets_ = std::move(other.step_offsets_);
-  steps_ = std::move(other.steps_);
-  segment_steps_ = std::move(other.segment_steps_);
-  slot_offsets_ = std::move(other.slot_offsets_);
-  slots_ = std::move(other.slots_);
-  lengths_ = std::move(other.lengths_);
-  payload_offsets_ = std::move(other.payload_offsets_);
-  payload_ = std::move(other.payload_);
-  gather_args_ = std::move(other.gather_args_);
-  failed_ = std::move(other.failed_);
-  upload_list_ = std::move(other.upload_list_);
-  upload_masks_ = std::move(other.upload_masks_);
-  upload_coefficients_ = std::move(other.upload_coefficients_);
-  bases_host_ = std::exchange(other.bases_host_, {});
-  counts_host_ = std::exchange(other.counts_host_, {});
-  steps_host_ = std::exchange(other.steps_host_, {});
-  segment_size_ = std::exchange(other.segment_size_, 0);
-  payload_per_block_ = std::exchange(other.payload_per_block_, 0);
-  return *this;
-}
-
-Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
-                                                    Allocator& allocator) {
-  DeviceFrameWriter w;
+Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
+    Device& device, Allocator& allocator) {
+  std::unique_ptr<DeviceFrameWriter> owned(new DeviceFrameWriter());
+  DeviceFrameWriter& w = *owned;
   w.device_ = &device;
   w.allocator_ = &allocator;
   VkPushConstantRange push{};
@@ -115,14 +75,13 @@ Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(w.gather_args_.handle()),
                          "codec.rans_gather_args");
-  return w;
+  return owned;
 }
 
 Status DeviceFrameWriter::record_count(CommandBatch& batch,
                                        const ResidentBlocks& blocks,
                                        std::uint32_t segment_size,
                                        GpuStageScope* stage) {
-  if (!valid()) return fail("record_count", "moved-from writer");
   if (segment_size == 0) {
     return fail("record_count", "segment_size must be at least 1");
   }
@@ -177,7 +136,6 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
 Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
     const CodecParams& params, GpuStageScope* stage) {
-  if (!valid()) return fail("finish", "moved-from writer");
   VR_TRY(params.validate());
   const std::uint32_t n = blocks.count;
   const std::uint32_t k = params.coefficient_count;
@@ -363,7 +321,6 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
 
 Result<std::vector<std::uint8_t>> DeviceFrameWriter::write(
     const IntraFrame& frame, const FrameWriteOptions& options) {
-  if (!valid()) return fail("write", "moved-from writer");
   VR_TRY(check_intra_frame(frame, options));
   const auto n = static_cast<std::uint32_t>(frame.coords.size());
   const std::uint32_t k = frame.blocks.params.coefficient_count;
