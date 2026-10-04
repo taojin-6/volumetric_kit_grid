@@ -1123,18 +1123,18 @@ int main() {
     CHECK(gated.block_span_capacity() ==
           static_cast<std::uint32_t>(gp.num_blocks));
 
-    // EXACTLY the table AND the host-side stamps beside it, and no more: same
-    // grid, same surface, same plan, so every other resident byte is identical
-    // and the whole difference is what the flag allocates. An equality rather
-    // than a bound, because that is the claim -- and because arena_bytes
-    // silently omitting a component (it counted only the arenas and index runs,
-    // and later the table but not the stamps) is the defect this figure keeps
-    // attracting. Both terms, so leaving either out fails here rather than
-    // under-reporting the feature by a third in a caller's profile.
+    // EXACTLY the table AND the host-side copy and stamps beside it, and no
+    // more: same grid, same surface, same plan, so every other resident byte is
+    // identical and the whole difference is what the flag allocates. An
+    // equality rather than a bound, because that is the claim -- and because
+    // arena_bytes silently omitting a component (it counted only the arenas and
+    // index runs, and later the table but not the stamps) is the defect this
+    // figure keeps attracting. Every term, so leaving one out fails here rather
+    // than under-reporting the feature in a caller's profile.
     CHECK(gated_timings.arena_bytes ==
           ungated_timings.arena_bytes +
               static_cast<std::uint64_t>(gp.num_blocks) *
-                  (sizeof(mesh::BlockSpan) + sizeof(std::uint64_t)));
+                  (2 * sizeof(mesh::BlockSpan) + sizeof(std::uint64_t)));
   }
 
   // --- The span table survives a grid GROW -----------------------------------

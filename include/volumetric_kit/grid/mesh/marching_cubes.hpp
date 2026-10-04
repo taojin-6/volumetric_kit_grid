@@ -91,8 +91,8 @@ struct ExtractTimings {
   double descriptor_ms = 0.0;
   /// Each attempt's submit, including the blocking fence wait: a host active
   /// list's copy and the command reset, the marching-cubes dispatch, and the
-  /// command's readback -- summed over both when a refit forced a second one
-  /// (@ref dispatches).
+  /// command's readback, with the span table's when it is tracked -- summed
+  /// over both when a refit forced a second one (@ref dispatches).
   double dispatch_ms = 0.0;
   /// Getting the result back to the caller: the vertex copy into the host mesh
   /// when one is made. @ref MarchingCubes::extract_host makes one; @ref
@@ -189,11 +189,11 @@ struct ExtractTimings {
   /// ring's runaway growth was diagnosed with.
   ///
   /// Under @ref MarchingCubesConfig::track_block_spans it also includes
-  /// **both** halves of the span table -- the device-side spans and the
-  /// host-side stamps beside them, 24 bytes per block between them, sized by
-  /// the grid rather than the surface. Counting one and not the other
-  /// under-reported that feature by a third, which is the same defect as
-  /// leaving the index runs out.
+  /// **every** part of the span table -- the device-side spans, and the
+  /// host-side copy and stamps beside them, 40 bytes per block between them,
+  /// sized by the grid rather than the surface. Counting one and not the
+  /// others under-reports that feature, which is the same defect as leaving
+  /// the index runs out.
   std::uint64_t arena_bytes = 0;
 
   /// @return The sum of every phase, in milliseconds.
@@ -406,9 +406,10 @@ struct MarchingCubesConfig {
   /// table is sized by the **grid**, not by the surface: `num_blocks` entries
   /// of 16 bytes, which is 24 MB at @ref volume::VoxelGridParams::defaults and
   /// doubles with every @ref volume::VoxelHashMap::resize, held for this
-  /// object's lifetime. A host-side array of the same length carries the
-  /// per-slot stamp @ref MarchingCubes::block_span_valid answers from, for
-  /// another 8 bytes per block; both are counted in
+  /// object's lifetime. The host keeps a copy of it, another 16 bytes per
+  /// block, and an array of the same length carries the per-slot stamp
+  /// @ref MarchingCubes::block_span_valid answers from, for another 8; all
+  /// three are counted in
   /// @ref ExtractTimings::arena_bytes, so the figure there is what the feature
   /// actually costs rather than the visible half of it. With this off the
   /// kernel is told not to write the table, nothing is allocated, and the
@@ -442,8 +443,8 @@ static_assert(offsetof(BlockSpan, vertex_base) == 0, "BlockSpan ABI");
 static_assert(offsetof(BlockSpan, vertex_count) == 4, "BlockSpan ABI");
 static_assert(offsetof(BlockSpan, triangle_base) == 8, "BlockSpan ABI");
 static_assert(offsetof(BlockSpan, triangle_count) == 12, "BlockSpan ABI");
-// block_spans() reinterprets mapped device memory as an array of these, which
-// is defined only for a trivially copyable standard-layout type.
+// Each extract reads the kernel's table back into an array of these byte for
+// byte, which is defined only for a trivially copyable standard-layout type.
 static_assert(std::is_standard_layout_v<BlockSpan>,
               "BlockSpan must be standard layout");
 static_assert(std::is_trivially_copyable_v<BlockSpan>,
@@ -553,6 +554,8 @@ class VR_MESH_API MarchingCubes {
   /// that wrote it. A slot means nothing against a different grid, and nothing
   /// after a `remove()` or `clear()`: the block heap is LIFO, so a reused slot
   /// names a different block.
+  ///
+  /// A host copy of the kernel's device-only table, read back by each extract.
   ///
   /// @warning **Every entry reads as a well-formed span, including the ones
   ///          this extract did not write.** Nothing is cleared on the way past:
@@ -1065,8 +1068,14 @@ class VR_MESH_API MarchingCubes {
   // put each block, which is one dispatch's worth of state rather than a mesh a
   // consumer still holds. Allocated only when config_.track_block_spans is on;
   // otherwise the kernel is told not to write it and block_spans_dummy_ keeps
-  // the binding valid.
+  // the binding valid. Device-only, as every kernel buffer is.
   Buffer block_spans_;
+  // The host's copy of block_spans_, block_span_capacity() entries, allocated
+  // with it: each dispatch reads back every slot it can write, and an
+  // incremental extract uploads the entries it clears. What block_spans()
+  // returns and the live sum walks. A unique_ptr for the reason span_stamp_
+  // below is one.
+  std::unique_ptr<BlockSpan[]> span_host_;
   // A 1-element stand-in bound at the span binding when tracking is off, so
   // that descriptor stays valid without paying num_blocks * 16 bytes for a
   // table nobody asked for. Mirrors color_dummy_ above, and the `write_spans`
@@ -1345,12 +1354,13 @@ class VR_MESH_API MarchingCubes {
   // growth was diagnosed with. Omitting a component of what stays resident is
   // the same defect that folding the index runs in here fixed.
   //
-  // ...and so does the host-side stamp array that parallels it, another
-  // num_blocks * 8 (12 MB at the same defaults), for the same reason and by the
-  // same argument. It is derived from the table's own capacity rather than
-  // measured, because the two are allocated in lockstep by ensure_block_spans.
+  // ...and so do the host-side copy and stamp array that parallel it, another
+  // num_blocks * (16 + 8) (36 MB at the same defaults), for the same reason and
+  // by the same argument. They are derived from the table's own capacity rather
+  // than measured, because the three are allocated in lockstep by
+  // ensure_block_spans.
   std::uint64_t resident_output_bytes() const noexcept {
-    std::uint64_t total = block_spans_.size() +
+    std::uint64_t total = 2 * block_spans_.size() +
                           static_cast<std::uint64_t>(block_span_capacity()) *
                               sizeof(std::uint64_t);
     for (std::size_t i = 0; i < slot_count_; ++i)
