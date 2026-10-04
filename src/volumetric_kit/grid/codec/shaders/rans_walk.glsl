@@ -19,28 +19,7 @@
 #define VR_HASH_COMMON_NO_PUSH_CONSTANTS
 #include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
 
-// Mirrors `Model` in bitstream.cpp.
-const uint kDz = 0u;
-const uint kDySame = 1u;
-const uint kDyFree = 2u;
-const uint kDxRun = 3u;
-const uint kDxFree = 4u;
-const uint kMaskClass = 5u;
-const uint kPlane = 6u;
-const uint kLine = 7u;
-const uint kByte = 10u;
-const uint kFirstCoef = 13u;
-
-// Mask classes, and a plane's or line's symbol, as in bitstream.cpp.
-const uint kMaskFull = 0u;
-const uint kMaskEmpty = 1u;
-const uint kMaskPartial = 2u;
-const uint kSame = 0u;
-const uint kAllEmpty = 1u;
-const uint kAllFull = 2u;
-const uint kOther = 3u;
-const uint kMaskWords = 16u;
-
+#include "rans_models.glsl"
 #include "rans_push.glsl"
 
 layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
@@ -52,24 +31,9 @@ layout(set = 0, binding = 1, scalar) readonly buffer Masks {
 layout(set = 0, binding = 2, scalar) readonly buffer Coefficients {
   uint coefficients[];  // two int16 a word, (K + 1) / 2 words a block
 };
-// Each model's first entry in the per-symbol arrays (the counts, the
-// tables): its alphabet's offset in TABLES order -- five coordinate models of
-// 33 classes, the mask class's 3, the plane's and three lines' 4, three byte
-// models' 256, then 16 classes per coefficient. Mirrors frame_model_alphabet
-// in bitstream.cpp, which the device frame test holds it to.
-uint model_base(uint model) {
-  if (model <= kDxFree) return 33u * model;
-  if (model == kMaskClass) return 165u;
-  if (model < kByte) return 168u + 4u * (model - kPlane);
-  if (model < kFirstCoef) return 184u + 256u * (model - kByte);
-  return 952u + 16u * (model - kFirstCoef);
-}
-
 // What the includer does with each symbol and each raw field of 1-32 bits.
 void sink_symbol(uint model, uint symbol);
 void sink_bits(uint value, uint bits);
-
-uint g_mask[kMaskWords];
 
 uint bit_length(uint v) { return uint(findMSB(v) + 1); }
 
@@ -94,17 +58,6 @@ void walk_step(uint model, int a, int b) {
   const bool negative = b < a;
   walk_signed(model, negative ? uint(a) - uint(b) : uint(b) - uint(a),
               negative);
-}
-
-uint mask_line(uint l) { return (g_mask[l / 4u] >> (8u * (l % 4u))) & 0xFFu; }
-
-uint line_context(uint predictor) {
-  return predictor == 0x00u ? 0u : predictor == 0xFFu ? 1u : 2u;
-}
-
-uint line_predictor(uint z, uint y) {
-  if (y > 0u) return mask_line(8u * z + y - 1u);
-  return z > 0u ? mask_line(8u * (z - 1u)) : 0x00u;
 }
 
 uint plane_symbol(uint z) {

@@ -260,4 +260,56 @@ VR_CODEC_API Result<IntraFrame> read_intra_frame(const std::uint8_t* data,
                                                  std::size_t size,
                                                  std::uint32_t max_blocks);
 
+/// @brief A frame parsed and checked up to its segment streams: what a
+///        reader, on the host or the device, decodes them from.
+struct ParsedFrame {
+  FrameHeader header;
+  /// @ref frame_model_count tables, in TABLES order, without the host
+  /// reader's slot lookups (@ref decode_intra_frame builds them).
+  std::vector<FrequencyTable> tables;
+  /// Each segment's stream length in bytes: even, at least 4, summing to
+  /// `payload_size`.
+  std::vector<std::uint32_t> segment_lengths;
+  /// The segment streams, back to back, inside the caller's frame.
+  const std::uint8_t* payload = nullptr;
+  std::size_t payload_size = 0;
+};
+
+/// @brief Everything @ref read_intra_frame checks before it decodes a
+///        segment: the header, the sections, the tables, the segment
+///        lengths, and the block count against @p max_blocks.
+/// @return The parsed frame, or those refusals, as @ref read_intra_frame
+///         makes them.
+VR_CODEC_API Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
+                                                   std::size_t size,
+                                                   std::uint32_t max_blocks);
+
+/// @brief Decode a parsed frame's segments on the host: @ref read_intra_frame
+///        after @ref parse_intra_frame.
+/// @param parsed  Taken by value: its tables gain the slot lookups only this
+///                reader needs.
+/// @return The frame, or @ref read_intra_frame's refusals of its segments
+///         (and @ref Status::Code::OutOfMemory for arrays past this
+///         platform's address space).
+VR_CODEC_API Result<IntraFrame> decode_intra_frame(ParsedFrame parsed);
+
+/// How a segment's stream failed to decode.
+enum class SegmentFault : std::uint32_t {
+  kNone = 0,
+  /// A delta stepped a coordinate outside int32, before anything else
+  /// failed.
+  kCoordOverflow = 1,
+  /// The stream did not decode cleanly and completely (@ref
+  /// RansReader::finish).
+  kCorrupt = 2,
+};
+
+/// @brief The reader's verdict on segment @p s, taken in segment order: its
+///        fault, else whether its first coordinate follows the segment
+///        before's last. One place for both readers' refusals.
+/// @param prev_last  Segment `s - 1`'s last coordinate; null for the first.
+/// @param first      Segment @p s's first coordinate.
+VR_CODEC_API Status check_segment(std::uint64_t s, SegmentFault fault,
+                                  const Vec3i* prev_last, const Vec3i& first);
+
 }  // namespace volumetric_kit::recon::codec::detail

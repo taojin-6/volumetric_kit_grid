@@ -71,6 +71,52 @@ inline constexpr float kMaxStep = 64.0f;
 static_assert(kMaxStep * kMaxStep >= 4.0f * kVoxelsPerBlock,
               "kMaxStep must quantize every coefficient to 0");
 
+/// @brief Where an @ref Encoder or a @ref Decoder runs a frame's rANS
+///        coding. Every frame both sides can code gives the same result --
+///        the same bytes written, the same blocks decoded, a corrupt frame
+///        refused -- so the choice changes only the time it takes.
+///
+/// The device cannot code a frame past `maxStorageBufferRange` or free
+/// memory, nor decode one whose segments are longer than
+/// @ref kMaxDeviceDecodeSegmentSize. @ref kDevice refuses such a frame
+/// (@ref Status::Code::InvalidArgument or @ref Status::Code::OutOfMemory),
+/// which the host would code, and may refuse a corrupt one with another
+/// message than the host's.
+enum class EntropyCoding {
+  /// The device for a frame of at least @ref kMinDeviceEncodeSegments
+  /// segments when encoding, or @ref kMinDeviceDecodeSegments when decoding;
+  /// the host for a smaller one, which has too few segments for the device
+  /// to run in parallel. A frame the device cannot code is coded on the
+  /// host, and so is every frame once the device's rANS kernels fail to
+  /// build; any other device failure is reported as @ref kDevice reports it.
+  kAuto,
+  /// On the host: the coefficients and masks cross the bus, read back to
+  /// encode or uploaded once decoded.
+  kHost,
+  /// On the device, one invocation per segment: the coefficients and masks
+  /// stay in device memory, and only the frame, the symbol counts (encoding)
+  /// and the coordinates (decoding) cross the bus.
+  kDevice,
+};
+
+/// The fewest segments @ref EntropyCoding::kAuto encodes on the device:
+/// about where the device stopped losing to the host on Apple M5 Max (the
+/// RTX 5090 broke even near 20; the 2026-10-03 encoding decision).
+inline constexpr std::uint32_t kMinDeviceEncodeSegments = 48;
+
+/// The fewest segments @ref EntropyCoding::kAuto decodes on the device: at
+/// the default 64-block segments, about where the device stopped losing to
+/// the host on both Apple M5 Max and RTX 5090, for content as cheap to decode
+/// on the host as room0 (the 2026-10-03 decoding decision). Decoding takes
+/// more than encoding: its symbol walk is inside the serial chain.
+inline constexpr std::uint32_t kMinDeviceDecodeSegments = 80;
+
+/// The longest segment, in blocks, the device decodes. One invocation decodes
+/// a whole segment, at 30 to 45 us a block on Apple M5 Max and RTX 5090, and
+/// the frame sets its length; this keeps one invocation near 50 ms there,
+/// well inside a GPU watchdog's limit on a slower device.
+inline constexpr std::uint32_t kMaxDeviceDecodeSegmentSize = 1024;
+
 /// @brief How a frame's blocks are transformed and quantized.
 ///
 /// A coefficient at frequency `(x, y, z)` is quantized with step

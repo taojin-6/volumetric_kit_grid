@@ -495,7 +495,9 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
 
 // A frame carries its kept weights itself: a reused decoder must not retain
 // the previous frame's quantizer, even when its block coordinates are equal.
-int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
+// @p config is @p dec's.
+int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec,
+                               const codec::DecoderConfig& config = {}) {
   vr::Result<vol::VoxelBlockGrid> source =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
   CHECK(source.ok());
@@ -525,7 +527,7 @@ int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
 
     // Its result agrees with a new decoder that has never seen another table.
     vr::Result<codec::Decoder> fresh =
-        codec::Decoder::create(gpu.device, gpu.allocator);
+        codec::Decoder::create(gpu.device, gpu.allocator, config);
     vr::Result<vol::VoxelBlockGrid> reference = grid_for(gpu, *frame);
     CHECK(fresh.ok() && reference.ok());
     CHECK(fresh.value()
@@ -660,9 +662,9 @@ int metrics_case(Gpu& gpu, codec::Decoder& dec) {
   return 0;
 }
 
-int moves_case(Gpu& gpu) {
+int moves_case(Gpu& gpu, const codec::DecoderConfig& config = {}) {
   vr::Result<codec::Decoder> a_r =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+      codec::Decoder::create(gpu.device, gpu.allocator, config);
   CHECK(a_r.ok());
   codec::Decoder a = std::move(a_r).value();
   CHECK(a.valid());
@@ -670,7 +672,7 @@ int moves_case(Gpu& gpu) {
   CHECK(b.valid());
   CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
   vr::Result<codec::Decoder> c_r =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+      codec::Decoder::create(gpu.device, gpu.allocator, config);
   CHECK(c_r.ok());
   codec::Decoder c = std::move(c_r).value();
   c = std::move(b);  // over a live decoder
@@ -690,6 +692,52 @@ int moves_case(Gpu& gpu) {
 }
 
 }  // namespace
+
+// Device decoding leaves a grid exactly as host decoding does, for the
+// default segments and finer ones, which the automatic choice decodes on the
+// device, past kMinDeviceDecodeSegments.
+int device_matches_host_case(Gpu& gpu) {
+  const Sphere s{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  vr::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
+  CHECK(g.ok());
+  for (std::uint32_t segment_size : {64u, 3u}) {
+    codec::EncoderConfig ec;
+    ec.params.coefficient_count = 37;
+    ec.segment_size = segment_size;
+    vr::Result<Bytes> frame = encode_with(gpu, g.value(), ec);
+    CHECK(frame.ok());
+    vr::Result<codec::FrameInfo> info =
+        codec::read_frame_info(frame.value().data(), frame.value().size());
+    CHECK(info.ok());
+    if (segment_size == 3) {
+      CHECK((info.value().block_count + 2) / 3 >=
+            codec::kMinDeviceDecodeSegments);
+    }
+    std::vector<Snapshot> decoded;
+    for (codec::EntropyCoding entropy :
+         {codec::EntropyCoding::kHost, codec::EntropyCoding::kDevice,
+          codec::EntropyCoding::kAuto}) {
+      codec::DecoderConfig config;
+      config.entropy = entropy;
+      vr::Result<codec::Decoder> dec =
+          codec::Decoder::create(gpu.device, gpu.allocator, config);
+      CHECK(dec.ok());
+      vr::Result<vol::VoxelBlockGrid> player = grid_for(gpu, frame.value());
+      CHECK(player.ok());
+      CHECK(dec.value()
+                .decode(frame.value().data(), frame.value().size(),
+                        player.value())
+                .ok());
+      vr::Result<Snapshot> snap = snapshot(gpu, player.value());
+      CHECK(snap.ok());
+      CHECK(!snap.value().coords.empty());
+      decoded.push_back(std::move(snap).value());
+    }
+    CHECK(decoded[0] == decoded[1]);
+    CHECK(decoded[0] == decoded[2]);
+  }
+  return 0;
+}
 
 int main() {
   vr::Result<vr::Instance> instance = vr::Instance::create({});
@@ -727,7 +775,27 @@ int main() {
   if (frame_info_case(gpu) != 0) return 1;
   if (refusals_case(gpu, dec) != 0) return 1;
   if (metrics_case(gpu, dec) != 0) return 1;
+  if (device_matches_host_case(gpu) != 0) return 1;
+  // The same contract with the decoding on the device.
+  codec::DecoderConfig device_config;
+  device_config.entropy = codec::EntropyCoding::kDevice;
+  vr::Result<codec::Decoder> dd =
+      codec::Decoder::create(gpu.device, gpu.allocator, device_config);
+  CHECK(dd.ok());
+  codec::Decoder device_dec = std::move(dd).value();
+  if (round_trip_case(gpu, device_dec) != 0) return 1;
+  if (mesh_case(gpu, device_dec) != 0) return 1;
+  if (sequence_case(gpu, device_dec) != 0) return 1;
+  if (untouched_case(gpu, device_dec) != 0) return 1;
+  if (out_of_memory_case(gpu, device_dec) != 0) return 1;
+  if (quantization_sequence_case(gpu, device_dec, device_config) != 0) {
+    return 1;
+  }
+  if (refusals_case(gpu, device_dec) != 0) return 1;
+  if (metrics_case(gpu, device_dec) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
+  // Decoders that hold a live device reader.
+  if (moves_case(gpu, device_config) != 0) return 1;
   std::printf("codec Decoder: OK\n");
   return 0;
 }

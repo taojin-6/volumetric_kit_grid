@@ -73,8 +73,10 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
                                   vr::mesh::MarchingCubes& extractor,
                                   const vr::codec::EncoderConfig& base,
                                   vr::volume::VoxelBlockGrid& player) {
+  vr::codec::DecoderConfig dc;
+  dc.entropy = base.entropy;
   VR_ASSIGN(vr::codec::Decoder dec,
-            vr::codec::Decoder::create(device, allocator));
+            vr::codec::Decoder::create(device, allocator, dc));
   int grows = 0;
   const float tau = reference.options().fscore_threshold;
   if (tau > 0.0f) {

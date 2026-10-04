@@ -26,6 +26,7 @@
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
+#include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
 #include "volumetric_kit/recon/core/instance.hpp"
 #include "volumetric_kit/recon/core/result.hpp"
@@ -984,6 +985,21 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
     DctBlocks other_band = out;
     other_band.trunc_dist = kTrunc * 0.2f;
     CHECK(!t.inverse(grid, grid.block_list(blocks), other_band).ok());
+  }
+
+  // Resident blocks the inverse cannot bind: missing buffers, or ones too
+  // small for the count.
+  {
+    vr::Result<vr::Buffer> small = vr::device_storage_buffer(allocator, 16);
+    CHECK(small.ok());
+    codec::detail::ResidentBlocks resident;
+    resident.count = std::uint32_t(blocks.size());
+    resident.coefficient_count = params.coefficient_count;
+    CHECK(!t.inverse(grid, resident, params).ok());
+    resident.list = &small.value();
+    resident.masks = &small.value();
+    resident.coefficients = &small.value();
+    CHECK(!t.inverse(grid, resident, params).ok());
   }
 
   // A list compacted before a remove() names a different block through a

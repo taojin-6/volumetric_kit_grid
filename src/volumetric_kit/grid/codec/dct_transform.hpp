@@ -52,10 +52,11 @@ struct DctTransformConfig {
   std::uint32_t max_blocks_per_dispatch = 0;
 };
 
-/// @brief A forward output where the device left it: @ref count entries of a
-///        block list, their masks and their coefficients, in the layout the
-///        kernels write. Borrowed from the transform, valid until its next
-///        call.
+/// @brief Blocks where the device holds them: @ref count entries of a block
+///        list, their masks and their coefficients, in the layout the
+///        kernels write. Borrowed from what produced them -- the transform's
+///        @ref DctTransform::record_forward or the device frame reader -- and
+///        valid until that object's next call.
 struct ResidentBlocks {
   const Buffer* list = nullptr;  ///< `volume::BlockIndex` entries, frame order.
   const Buffer* masks = nullptr;  ///< `kMaskWordsPerBlock` words an entry.
@@ -200,6 +201,17 @@ class VR_CODEC_API DctTransform {
   Status inverse(volume::VoxelBlockGrid& grid, const volume::BlockList& blocks,
                  const DctBlocks& in, GpuStageScope* stage = nullptr);
 
+  /// @brief @ref inverse from blocks the device holds (the device frame
+  ///        reader's), bound where they are rather than uploaded.
+  ///
+  /// The list must be duplicate-free, and the coefficients made against the
+  /// grid's `trunc_dist` (both unchecked: the reader decoded them from a
+  /// frame whose order and header the caller checked).
+  /// @return As @ref inverse, and @ref Status::Code::InvalidArgument for
+  ///         buffers missing or smaller than @p in's count needs.
+  Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
+                 const CodecParams& params, GpuStageScope* stage = nullptr);
+
   /// @brief The entries of @p list whose block holds an observed voxel
   ///        (`weight >= volume::kObservedWeight`), in unspecified order.
   ///
@@ -260,6 +272,11 @@ class VR_CODEC_API DctTransform {
   Status ensure_scratch(Buffer& buffer, VkDeviceSize bytes, const char* name);
   /// Stage @p blocks onto the retained block-list buffer, in @p batch.
   Status upload_list(CommandBatch& batch, const volume::BlockList& blocks);
+  /// Record the inverse over @p in into @p batch after what it holds, then
+  /// submit it and take the reject count's refusal.
+  Status run_inverse(CommandBatch& batch, volume::VoxelBlockGrid& grid,
+                     const GridViews& views, const ResidentBlocks& in,
+                     const CodecParams& params, GpuStageScope* stage);
 
   // Borrowed (must outlive this).
   Device* device_ = nullptr;

@@ -27,7 +27,10 @@ namespace volumetric_kit::recon::codec {
 
 namespace detail {
 class DctTransform;
-}
+class DeviceFrameReader;
+struct ParsedFrame;
+struct ResidentBlocks;
+}  // namespace detail
 
 /// @brief What a frame's header says: enough to build a grid it decodes into.
 struct FrameInfo {
@@ -60,6 +63,13 @@ struct FrameInfo {
 VR_CODEC_API Result<FrameInfo> read_frame_info(const std::uint8_t* data,
                                                std::size_t size);
 
+/// @brief How a @ref Decoder decodes a frame.
+struct DecoderConfig {
+  /// Where the rANS decoding runs. The device decodes one segment per
+  /// invocation, so a frame of smaller segments gives it more parallelism.
+  EntropyCoding entropy = EntropyCoding::kAuto;
+};
+
 /// @brief Decodes intra frames into a caller's @ref volume::VoxelBlockGrid --
 ///        the codec's playback side (the 2026-09-26 decision).
 ///
@@ -84,12 +94,16 @@ VR_CODEC_API Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 ///          nothing else may modify the grid during one.
 class VR_CODEC_API Decoder {
  public:
-  /// @brief Build the inverse transform's kernels.
+  /// @brief Build the inverse transform's kernels, and with
+  ///        @ref EntropyCoding::kDevice the rANS decoder's; @ref
+  ///        EntropyCoding::kAuto builds those at its first device frame.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
+  /// @param config     How frames are decoded.
   /// @return The decoder, or a pipeline or allocation failure.
-  static Result<Decoder> create(Device& device, Allocator& allocator);
+  static Result<Decoder> create(Device& device, Allocator& allocator,
+                                const DecoderConfig& config = {});
 
   ~Decoder();
   Decoder(Decoder&& other) noexcept;
@@ -117,7 +131,8 @@ class VR_CODEC_API Decoder {
   ///                 @ref read_frame_info).
   /// @param metrics  Optional @ref StageMetrics collecting a `"codec decode"`
   ///                 row with both halves -- its device half is the inverse
-  ///                 transform -- over the breakdown rows `"  ..rans decode"`
+  ///                 transform and, decoded on the device, the rANS
+  ///                 kernels -- over the breakdown rows `"  ..rans decode"`
   ///                 (parsing and decoding the frame), `"  ..active set"`
   ///                 (the compaction), `"  ..apply"` (merging the two block
   ///                 sets, and removing and allocating blocks) and
@@ -127,6 +142,8 @@ class VR_CODEC_API Decoder {
   /// @return OK, or: whatever the frame reader refuses
   ///         (@ref Status::Code::Unsupported, @ref
   ///         Status::Code::InvalidArgument for a malformed or corrupt frame);
+  ///         with @ref EntropyCoding::kDevice, a frame the device cannot
+  ///         decode (see @ref EntropyCoding);
   ///         @ref Status::Code::InvalidArgument for a moved-from decoder, a
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other
@@ -149,7 +166,24 @@ class VR_CODEC_API Decoder {
  private:
   Decoder();
 
+  /// Build @ref reader_ unless it is built, or return the failure of the
+  /// one build tried.
+  Status ensure_reader();
+  /// Decode @p frame's segments on the built reader, through the submit; the
+  /// reader's check() then judges them.
+  Result<detail::ResidentBlocks> decode_on_device(
+      const detail::ParsedFrame& frame, GpuStageScope& stage);
+
+  DecoderConfig config_;
+  // Borrowed (must outlive this); what the device decode's batch runs on.
+  Device* device_ = nullptr;
+  Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
+  // Built at create for kDevice, at the first device frame for kAuto, and
+  // never for kHost; and why that build failed, after which kAuto decodes
+  // every frame on the host.
+  std::unique_ptr<detail::DeviceFrameReader> reader_;
+  Status reader_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
   GpuTimer gpu_timer_;
 };

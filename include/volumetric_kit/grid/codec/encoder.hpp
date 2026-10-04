@@ -29,27 +29,6 @@ class DctTransform;
 class DeviceFrameWriter;
 }  // namespace detail
 
-/// @brief Where an @ref Encoder runs a frame's rANS coding. Every choice
-///        writes the same bytes, so it changes only the time a frame takes.
-enum class EntropyCoding {
-  /// The device for a frame of at least @ref kMinDeviceSegments segments,
-  /// the host for a smaller one, which has too few segments for the device
-  /// to run in parallel. A frame the device cannot code -- one past
-  /// `maxStorageBufferRange` or free memory, or a device whose rANS kernels
-  /// do not build -- is coded on the host.
-  kAuto,
-  /// On the host, after the quantized coefficients and masks are read back.
-  kHost,
-  /// On the device, beside the transform: one invocation per segment, and
-  /// only the symbol counts and the coded frame cross to the host.
-  kDevice,
-};
-
-/// The fewest segments @ref EntropyCoding::kAuto codes on the device: about
-/// where the device stopped losing to the host on Apple M5 Max (the RTX 5090
-/// broke even near 20; the 2026-10-03 decision).
-inline constexpr std::uint32_t kMinDeviceSegments = 48;
-
 /// @brief How an @ref Encoder codes a frame.
 struct EncoderConfig {
   /// Coefficients kept per block and their quantization steps.
@@ -144,9 +123,10 @@ class VR_CODEC_API Encoder {
  private:
   Encoder();
 
-  /// Build @ref writer_ unless it is built.
+  /// Build @ref writer_ unless it is built, or return the failure of the
+  /// one build tried.
   Status ensure_writer();
-  /// The forward and the rANS coding on the device.
+  /// The forward and the rANS coding on the built writer.
   Result<std::vector<std::uint8_t>> encode_on_device(
       volume::VoxelBlockGrid& grid,
       const std::vector<volume::BlockIndex>& blocks, StageMetrics* metrics,
@@ -158,8 +138,10 @@ class VR_CODEC_API Encoder {
   Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
   // Built at create for kDevice, at the first device frame for kAuto, and
-  // never for kHost.
+  // never for kHost; and why that build failed, after which kAuto codes
+  // every frame on the host.
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
+  Status writer_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
   GpuTimer gpu_timer_;
 };
