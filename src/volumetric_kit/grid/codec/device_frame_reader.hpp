@@ -15,7 +15,6 @@
 /// (@ref ensure_device_scratch).
 
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -53,8 +52,8 @@ class VR_CODEC_API DeviceFrameReader {
   static Result<DeviceFrameReader> create(Device& device, Allocator& allocator);
 
   ~DeviceFrameReader() = default;
-  DeviceFrameReader(DeviceFrameReader&&) noexcept = default;
-  DeviceFrameReader& operator=(DeviceFrameReader&&) noexcept = default;
+  DeviceFrameReader(DeviceFrameReader&& other) noexcept;
+  DeviceFrameReader& operator=(DeviceFrameReader&& other) noexcept;
   DeviceFrameReader(const DeviceFrameReader&) = delete;
   DeviceFrameReader& operator=(const DeviceFrameReader&) = delete;
 
@@ -64,9 +63,10 @@ class VR_CODEC_API DeviceFrameReader {
   /// which must happen before @ref check.
   /// @return The decoded blocks where the device holds them, valid until the
   ///         next call (no entries for a frame of none, which records
-  ///         nothing); @ref Status::Code::InvalidArgument for a moved-from
-  ///         reader or a buffer past `maxStorageBufferRange`; otherwise a
-  ///         buffer failure.
+  ///         nothing); @ref Status::Code::InvalidArgument, before any buffer
+  ///         grows, for a moved-from reader, a segment longer than
+  ///         @ref kMaxDeviceDecodeSegmentSize or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
   Result<ResidentBlocks> record_decode(CommandBatch& batch,
                                        const ParsedFrame& frame,
                                        GpuStageScope* stage = nullptr);
@@ -116,22 +116,11 @@ class VR_CODEC_API DeviceFrameReader {
   Buffer coefficients_;  // two int16 a word, (K + 1) / 2 words a block
   Buffer faults_;        // a SegmentFault a segment
 
-  // What the last submit read back, which check() judges.
+  // What the last submit read back, which check() judges, and the segment
+  // size of the frame recorded last.
   std::vector<volume::BlockIndex> blocks_host_;
   std::vector<std::uint32_t> faults_host_;
-  // The segment size of the frame recorded last. Reset on move, like every
-  // owned member.
-  struct FrameState {
-    std::uint32_t segment_size = 0;
-    FrameState() = default;
-    FrameState(FrameState&& other) noexcept
-        : segment_size(std::exchange(other.segment_size, 0)) {}
-    FrameState& operator=(FrameState&& other) noexcept {
-      segment_size = std::exchange(other.segment_size, 0);
-      return *this;
-    }
-  };
-  FrameState state_;
+  std::uint32_t segment_size_ = 0;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

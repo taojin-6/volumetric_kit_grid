@@ -123,9 +123,10 @@ class VR_CODEC_API Encoder {
  private:
   Encoder();
 
-  /// Build @ref writer_ unless it is built.
+  /// Build @ref writer_ unless it is built, or return the failure of the
+  /// one build tried.
   Status ensure_writer();
-  /// The forward and the rANS coding on the device.
+  /// The forward and the rANS coding on the built writer.
   Result<std::vector<std::uint8_t>> encode_on_device(
       volume::VoxelBlockGrid& grid,
       const std::vector<volume::BlockIndex>& blocks, StageMetrics* metrics,
@@ -137,8 +138,10 @@ class VR_CODEC_API Encoder {
   Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
   // Built at create for kDevice, at the first device frame for kAuto, and
-  // never for kHost.
+  // never for kHost; and why that build failed, after which kAuto codes
+  // every frame on the host.
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
+  Status writer_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
   GpuTimer gpu_timer_;
 };

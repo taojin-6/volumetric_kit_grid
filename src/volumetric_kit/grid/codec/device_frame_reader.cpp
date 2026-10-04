@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 
+#include "rans_dispatch.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -18,16 +20,6 @@
 namespace volumetric_kit::recon::codec::detail {
 namespace {
 
-// Mirrors `Push` in rans_push.glsl.
-struct Push {
-  std::uint32_t item_base = 0;
-  std::uint32_t num_blocks = 0;
-  std::uint32_t coefficient_count = 0;
-  std::uint32_t segment_size = 0;
-  std::uint32_t segment_count = 0;
-};
-static_assert(sizeof(Push) == 20, "Push must be 20 bytes");
-
 // The kernels' workgroup widths.
 constexpr std::uint32_t kSlotsLanes = 256;
 constexpr std::uint32_t kDecodeLanes = 1;
@@ -37,25 +29,35 @@ Status fail(const char* op, const std::string& why) {
                                   ": " + why);
 }
 
-// One invocation per item, in as many dispatches as the device's group limit
-// needs; each pushes the first item it covers.
-Status dispatch_items(CommandBatch& batch, const ComputeKernel& kernel,
-                      Push push, std::uint64_t items, std::uint32_t lanes,
-                      std::uint32_t max_groups, GpuStageScope* stage) {
-  const std::uint64_t per_dispatch = std::uint64_t(max_groups) * lanes;
-  for (std::uint64_t base = 0; base < items; base += per_dispatch) {
-    push.item_base = static_cast<std::uint32_t>(base);
-    const std::uint64_t count =
-        std::min<std::uint64_t>(per_dispatch, items - base);
-    VR_TRY(
-        batch.dispatch(kernel, &push, sizeof(push),
-                       static_cast<std::uint32_t>((count + lanes - 1) / lanes),
-                       max_groups, stage));
-  }
-  return {};
+}  // namespace
+
+DeviceFrameReader::DeviceFrameReader(DeviceFrameReader&& other) noexcept {
+  *this = std::move(other);
 }
 
-}  // namespace
+DeviceFrameReader& DeviceFrameReader::operator=(
+    DeviceFrameReader&& other) noexcept {
+  if (this == &other) return *this;
+  device_ = std::exchange(other.device_, nullptr);
+  allocator_ = std::exchange(other.allocator_, nullptr);
+  max_workgroup_count_x_ = std::exchange(other.max_workgroup_count_x_, 0);
+  max_storage_buffer_range_ = std::exchange(other.max_storage_buffer_range_, 0);
+  slots_kernel_ = std::move(other.slots_kernel_);
+  decode_kernel_ = std::move(other.decode_kernel_);
+  pool_ = std::move(other.pool_);
+  tables_ = std::move(other.tables_);
+  slots_ = std::move(other.slots_);
+  payload_ = std::move(other.payload_);
+  segment_words_ = std::move(other.segment_words_);
+  list_ = std::move(other.list_);
+  masks_ = std::move(other.masks_);
+  coefficients_ = std::move(other.coefficients_);
+  faults_ = std::move(other.faults_);
+  blocks_host_ = std::exchange(other.blocks_host_, {});
+  faults_host_ = std::exchange(other.faults_host_, {});
+  segment_size_ = std::exchange(other.segment_size_, 0);
+  return *this;
+}
 
 Result<DeviceFrameReader> DeviceFrameReader::create(Device& device,
                                                     Allocator& allocator) {
@@ -64,7 +66,7 @@ Result<DeviceFrameReader> DeviceFrameReader::create(Device& device,
   r.allocator_ = &allocator;
   VkPushConstantRange push{};
   push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  push.size = sizeof(Push);
+  push.size = sizeof(RansPush);
   KernelSetBuilder kb(device);
   VR_TRY(kb.add(r.slots_kernel_, "codec_rans_slots", vr_rans_slots_comp_spv,
                 vr_rans_slots_comp_spv_size, 2, &push));
@@ -85,38 +87,34 @@ Result<ResidentBlocks> DeviceFrameReader::record_decode(
   const std::uint32_t k = frame.header.params.coefficient_count;
   const auto segments =
       static_cast<std::uint32_t>(frame.segment_lengths.size());
-  state_.segment_size = frame.header.segment_size;
-  blocks_host_.assign(n, volume::BlockIndex{});
-  faults_host_.assign(segments, 0);
+  // One invocation decodes a whole segment, and the frame sets its length.
+  const std::uint32_t longest = std::min(n, frame.header.segment_size);
+  if (longest > kMaxDeviceDecodeSegmentSize) {
+    return fail("record_decode",
+                "segments of " + std::to_string(longest) +
+                    " blocks, past the " +
+                    std::to_string(kMaxDeviceDecodeSegmentSize) +
+                    " one invocation decodes within a GPU watchdog's limit");
+  }
   ResidentBlocks out;
   out.coefficient_count = k;
-  if (n == 0) return out;
+  if (n == 0) {
+    blocks_host_.clear();
+    faults_host_.clear();
+    segment_size_ = frame.header.segment_size;
+    return out;
+  }
 
-  // Each model's symbols as the writer lays them out (rans_models.glsl's
-  // model_base), for the device to expand into its slot lookup.
+  // Every size first, so a frame the device cannot hold grows nothing.
+  const std::vector<std::uint32_t> entries = rans_table_entries(frame.tables);
   const std::uint32_t models = frame_model_count(k);
-  std::vector<std::uint32_t> entries;
-  for (std::uint32_t m = 0; m < models; ++m) {
-    const FrequencyTable& t = frame.tables[m];
-    for (std::size_t s = 0; s < t.freq.size(); ++s) {
-      entries.push_back(std::uint32_t(t.cum[s]) |
-                        (std::uint32_t(t.freq[s]) << 16));
-    }
-  }
-  // Each segment's first 16-bit word; the lengths are even and sum to the
-  // payload, which is under 4 GiB.
-  std::vector<std::uint32_t> segment_words(std::size_t(segments) + 1, 0);
-  for (std::uint32_t s = 0; s < segments; ++s) {
-    segment_words[s + 1] = segment_words[s] + frame.segment_lengths[s] / 2;
-  }
-
-  const VkDeviceSize range = max_storage_buffer_range_;
   const VkDeviceSize entry_bytes = entries.size() * sizeof(std::uint32_t);
   const VkDeviceSize slot_bytes =
       VkDeviceSize(models) * kRansScale * sizeof(std::uint32_t);
   const VkDeviceSize payload_bytes =
       (frame.payload_size + 3) & ~VkDeviceSize{3};
-  const VkDeviceSize word_bytes = segment_words.size() * sizeof(std::uint32_t);
+  const VkDeviceSize word_bytes =
+      (VkDeviceSize(segments) + 1) * sizeof(std::uint32_t);
   const VkDeviceSize list_bytes = VkDeviceSize(n) * sizeof(volume::BlockIndex);
   const VkDeviceSize mask_bytes =
       VkDeviceSize(n) * kMaskWordsPerBlock * sizeof(std::uint32_t);
@@ -124,23 +122,39 @@ Result<ResidentBlocks> DeviceFrameReader::record_decode(
       VkDeviceSize(n) * ((k + 1) / 2) * sizeof(std::uint32_t);
   const VkDeviceSize fault_bytes =
       VkDeviceSize(segments) * sizeof(std::uint32_t);
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, tables_, entry_bytes,
-                               range, "codec.rans_decode_tables"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, slots_, slot_bytes, range,
-                               "codec.rans_slots"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, payload_, payload_bytes,
-                               range, "codec.rans_decode_payload"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, segment_words_,
-                               word_bytes, range, "codec.rans_segment_words"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, list_, list_bytes, range,
-                               "codec.rans_decode_list"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, masks_, mask_bytes, range,
-                               "codec.rans_decode_masks"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, coefficients_,
-                               coeff_bytes, range,
-                               "codec.rans_decode_coefficients"));
-  VR_TRY(ensure_device_scratch(*device_, *allocator_, faults_, fault_bytes,
-                               range, "codec.rans_faults"));
+  struct Scratch {
+    Buffer& buffer;
+    VkDeviceSize bytes;
+    const char* name;
+  };
+  const Scratch scratch[] = {
+      {tables_, entry_bytes, "codec.rans_decode_tables"},
+      {slots_, slot_bytes, "codec.rans_slots"},
+      {payload_, payload_bytes, "codec.rans_decode_payload"},
+      {segment_words_, word_bytes, "codec.rans_segment_words"},
+      {list_, list_bytes, "codec.rans_decode_list"},
+      {masks_, mask_bytes, "codec.rans_decode_masks"},
+      {coefficients_, coeff_bytes, "codec.rans_decode_coefficients"},
+      {faults_, fault_bytes, "codec.rans_faults"},
+  };
+  const VkDeviceSize range = max_storage_buffer_range_;
+  for (const Scratch& b : scratch) {
+    VR_TRY(check_storage_buffer_range(b.name, b.bytes, range));
+  }
+  for (const Scratch& b : scratch) {
+    VR_TRY(ensure_device_scratch(*device_, *allocator_, b.buffer, b.bytes,
+                                 range, b.name));
+  }
+  // Each segment's first 16-bit word. The lengths sum to the payload, which
+  // the range check above holds under 4 GiB, so every offset fits.
+  std::vector<std::uint32_t> segment_words(std::size_t(segments) + 1, 0);
+  for (std::uint32_t s = 0; s < segments; ++s) {
+    segment_words[s + 1] = segment_words[s] + frame.segment_lengths[s] / 2;
+  }
+  segment_size_ = frame.header.segment_size;
+  // Overwritten by the readback.
+  blocks_host_.resize(n);
+  faults_host_.resize(segments);
 
   VR_TRY(batch.upload(tables_, 0, entries.data(), entry_bytes));
   VR_TRY(batch.upload(segment_words_, 0, segment_words.data(), word_bytes));
@@ -160,7 +174,7 @@ Result<ResidentBlocks> DeviceFrameReader::record_decode(
   decode.set.write_storage_buffer(5, coefficients_.handle(), 0, coeff_bytes);
   decode.set.write_storage_buffer(6, faults_.handle(), 0, fault_bytes);
 
-  Push push;
+  RansPush push;
   push.num_blocks = n;
   push.coefficient_count = k;
   push.segment_size = frame.header.segment_size;
@@ -181,7 +195,7 @@ Result<ResidentBlocks> DeviceFrameReader::record_decode(
 }
 
 Status DeviceFrameReader::check() const {
-  const std::size_t r = state_.segment_size;
+  const std::size_t r = segment_size_;
   for (std::size_t s = 0; s < faults_host_.size(); ++s) {
     const std::size_t first = s * r;
     VR_TRY(check_segment(s, static_cast<SegmentFault>(faults_host_[s]),

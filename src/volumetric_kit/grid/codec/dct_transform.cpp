@@ -498,6 +498,16 @@ Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
   if (in.count == 0) {
     return {};
   }
+  // Bound where they are, so each must hold the entries the kernel reads.
+  const VkDeviceSize n = in.count;
+  if (in.list == nullptr || in.masks == nullptr || in.coefficients == nullptr ||
+      in.list->size() < n * sizeof(volume::BlockIndex) ||
+      in.masks->size() < n * kMaskWordsPerBlock * sizeof(std::uint32_t) ||
+      in.coefficients->size() <
+          n * padded_count(params.coefficient_count) * sizeof(std::int16_t)) {
+    return fail("inverse", "the resident buffers do not hold " +
+                               std::to_string(in.count) + " blocks");
+  }
   CommandBatch batch(*device_, *allocator_);
   return run_inverse(batch, grid, views, in, params, stage);
 }

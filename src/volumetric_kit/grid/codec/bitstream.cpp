@@ -394,7 +394,6 @@ Status read_tables(const std::uint8_t* data, std::size_t size, std::uint32_t k,
       return bad("table " + std::to_string(m) + " does not sum to 4096");
     }
     t.finalize();
-    t.build_decode();
   }
   if (!r.at_end()) {
     return bad("the TABLES section has trailing bytes");
@@ -931,12 +930,12 @@ Status check_segment(std::uint64_t s, SegmentFault fault,
 
 Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
                                     std::uint32_t max_blocks) {
-  VR_ASSIGN(const ParsedFrame parsed,
-            parse_intra_frame(data, size, max_blocks));
-  return decode_intra_frame(parsed);
+  VR_ASSIGN(ParsedFrame parsed, parse_intra_frame(data, size, max_blocks));
+  return decode_intra_frame(std::move(parsed));
 }
 
-Result<IntraFrame> decode_intra_frame(const ParsedFrame& parsed) {
+Result<IntraFrame> decode_intra_frame(ParsedFrame parsed) {
+  for (FrequencyTable& t : parsed.tables) t.build_decode();
   const FrameHeader& header = parsed.header;
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;

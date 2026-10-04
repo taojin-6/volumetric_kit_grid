@@ -9,6 +9,7 @@
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_writer.hpp"
+#include "entropy_choice.hpp"
 #include "volumetric_kit/recon/core/allocator.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -44,6 +45,7 @@ Encoder::Encoder(Encoder&& other) noexcept
       allocator_(std::exchange(other.allocator_, nullptr)),
       transform_(std::move(other.transform_)),
       writer_(std::move(other.writer_)),
+      writer_failure_(std::exchange(other.writer_failure_, Status{})),
       gpu_timer_(std::move(other.gpu_timer_)) {}
 
 Encoder& Encoder::operator=(Encoder&& other) noexcept {
@@ -53,6 +55,7 @@ Encoder& Encoder::operator=(Encoder&& other) noexcept {
     allocator_ = std::exchange(other.allocator_, nullptr);
     transform_ = std::move(other.transform_);
     writer_ = std::move(other.writer_);
+    writer_failure_ = std::exchange(other.writer_failure_, Status{});
     gpu_timer_ = std::move(other.gpu_timer_);
   }
   return *this;
@@ -84,16 +87,19 @@ Result<Encoder> Encoder::create(Device& device, Allocator& allocator,
 
 Status Encoder::ensure_writer() {
   if (writer_ != nullptr) return {};
-  VR_ASSIGN(detail::DeviceFrameWriter writer,
-            detail::DeviceFrameWriter::create(*device_, *allocator_));
-  writer_ = std::make_unique<detail::DeviceFrameWriter>(std::move(writer));
+  // A build that failed fails again, so it is tried once.
+  if (!writer_failure_.ok()) return writer_failure_;
+  Result<detail::DeviceFrameWriter> writer =
+      detail::DeviceFrameWriter::create(*device_, *allocator_);
+  if (!writer.ok()) return writer_failure_ = writer.status();
+  writer_ =
+      std::make_unique<detail::DeviceFrameWriter>(std::move(writer).value());
   return {};
 }
 
 Result<std::vector<std::uint8_t>> Encoder::encode_on_device(
     volume::VoxelBlockGrid& grid, const std::vector<volume::BlockIndex>& blocks,
     StageMetrics* metrics, GpuStageScope& stage) {
-  VR_TRY(ensure_writer());
   // The forward output stays on the device; the same batch counts its
   // symbols, so only the counts cross before the coding.
   std::uint32_t rejected = 0;
@@ -150,15 +156,17 @@ Result<std::vector<std::uint8_t>> Encoder::encode(volume::VoxelBlockGrid& grid,
 
   const std::uint64_t segments =
       detail::frame_segment_count(blocks.size(), config_.segment_size);
-  if (config_.entropy == EntropyCoding::kDevice ||
-      (config_.entropy == EntropyCoding::kAuto &&
-       segments >= kMinDeviceEncodeSegments)) {
+  // kAuto codes on the host whatever the device cannot: a frame it cannot
+  // hold, or every frame once its kernels failed to build. The host refuses
+  // a bad input again, with its own message.
+  if (detail::codes_on_device(config_.entropy, segments,
+                              kMinDeviceEncodeSegments) &&
+      ensure_writer().ok()) {
     Result<std::vector<std::uint8_t>> frame =
         encode_on_device(grid, blocks, metrics, stage);
-    // kAuto codes on the host whatever the device could not: a frame past
-    // maxStorageBufferRange or free VRAM, or kernels that would not build.
-    // The host refuses a bad input again, with its own message.
-    if (frame.ok() || config_.entropy == EntropyCoding::kDevice) return frame;
+    if (frame.ok() || !detail::retry_on_host(config_.entropy, frame.status())) {
+      return frame;
+    }
   }
 
   detail::IntraFrame frame;

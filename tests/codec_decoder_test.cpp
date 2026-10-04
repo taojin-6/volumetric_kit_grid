@@ -495,7 +495,9 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
 
 // A frame carries its kept weights itself: a reused decoder must not retain
 // the previous frame's quantizer, even when its block coordinates are equal.
-int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
+// @p config is @p dec's.
+int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec,
+                               const codec::DecoderConfig& config = {}) {
   vr::Result<vol::VoxelBlockGrid> source =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
   CHECK(source.ok());
@@ -525,7 +527,7 @@ int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
 
     // Its result agrees with a new decoder that has never seen another table.
     vr::Result<codec::Decoder> fresh =
-        codec::Decoder::create(gpu.device, gpu.allocator);
+        codec::Decoder::create(gpu.device, gpu.allocator, config);
     vr::Result<vol::VoxelBlockGrid> reference = grid_for(gpu, *frame);
     CHECK(fresh.ok() && reference.ok());
     CHECK(fresh.value()
@@ -660,9 +662,9 @@ int metrics_case(Gpu& gpu, codec::Decoder& dec) {
   return 0;
 }
 
-int moves_case(Gpu& gpu) {
+int moves_case(Gpu& gpu, const codec::DecoderConfig& config = {}) {
   vr::Result<codec::Decoder> a_r =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+      codec::Decoder::create(gpu.device, gpu.allocator, config);
   CHECK(a_r.ok());
   codec::Decoder a = std::move(a_r).value();
   CHECK(a.valid());
@@ -670,7 +672,7 @@ int moves_case(Gpu& gpu) {
   CHECK(b.valid());
   CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
   vr::Result<codec::Decoder> c_r =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+      codec::Decoder::create(gpu.device, gpu.allocator, config);
   CHECK(c_r.ok());
   codec::Decoder c = std::move(c_r).value();
   c = std::move(b);  // over a live decoder
@@ -786,10 +788,14 @@ int main() {
   if (sequence_case(gpu, device_dec) != 0) return 1;
   if (untouched_case(gpu, device_dec) != 0) return 1;
   if (out_of_memory_case(gpu, device_dec) != 0) return 1;
-  if (quantization_sequence_case(gpu, device_dec) != 0) return 1;
+  if (quantization_sequence_case(gpu, device_dec, device_config) != 0) {
+    return 1;
+  }
   if (refusals_case(gpu, device_dec) != 0) return 1;
   if (metrics_case(gpu, device_dec) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
+  // Decoders that hold a live device reader.
+  if (moves_case(gpu, device_config) != 0) return 1;
   std::printf("codec Decoder: OK\n");
   return 0;
 }

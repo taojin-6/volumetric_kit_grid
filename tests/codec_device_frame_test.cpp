@@ -210,6 +210,30 @@ int out_of_range_case(vr::Device& device, vr::Allocator& allocator,
   return 0;
 }
 
+// One invocation decodes a whole segment, so the reader refuses segments
+// longer than kMaxDeviceDecodeSegmentSize, which the host decodes, and
+// decodes one of exactly that length.
+int segment_limit_case(d::DeviceFrameReader& reader) {
+  constexpr std::uint32_t kLimit = codec::kMaxDeviceDecodeSegmentSize;
+  d::FrameWriteOptions whole;
+  whole.segment_size = kLimit + 1;
+  const std::vector<std::uint8_t> long_segment =
+      d::write_intra_frame(make_frame(kLimit + 1, 1, 11), whole).value();
+  CHECK(
+      d::read_intra_frame(long_segment.data(), long_segment.size(), kMaxBlocks)
+          .ok());
+  const vr::Result<d::IntraFrame> refused =
+      reader.read(long_segment.data(), long_segment.size(), kMaxBlocks);
+  CHECK(!refused.ok());
+  CHECK(refused.status().domain() == vr::Status::Code::InvalidArgument);
+  // The header's segment size alone does not count: this frame's one
+  // segment holds kLimit blocks.
+  const std::vector<std::uint8_t> at_limit =
+      d::write_intra_frame(make_frame(kLimit, 1, 11), whole).value();
+  CHECK(same_read(reader, at_limit) == 0);
+  return 0;
+}
+
 int refusals_case(vr::Device& device, vr::Allocator& allocator,
                   d::DeviceFrameWriter& writer) {
   d::IntraFrame f = make_frame(10, 8, 3);
@@ -229,6 +253,22 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   params.coefficient_count = 8;
   CHECK(!fresh.value().finish(uncounted, 0.005f, 0.04f, params).ok());
   return 0;
+}
+
+// A frame that parses but whose segments the readers refuse.
+std::vector<std::uint8_t> faulting_frame() {
+  const std::vector<std::uint8_t> good =
+      d::write_intra_frame(make_frame(10, 8, 3)).value();
+  const vr::Result<d::ParsedFrame> parsed =
+      d::parse_intra_frame(good.data(), good.size(), kMaxBlocks);
+  if (!parsed.ok()) return {};
+  for (std::size_t i = std::size_t(parsed.value().payload - good.data());
+       i < good.size(); ++i) {
+    std::vector<std::uint8_t> b = good;
+    b[i] ^= 0xFFu;
+    if (!d::read_intra_frame(b.data(), b.size(), kMaxBlocks).ok()) return b;
+  }
+  return {};
 }
 
 // The move rules, for the writer and the reader: a moved-from one is empty
@@ -264,10 +304,23 @@ int moves_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(live_reader.ok());
   live_reader.value() = std::move(moved_reader);  // over a live reader
   CHECK(live_reader.value().valid());
-  CHECK(!moved_reader.valid());  // NOLINT(bugprone-use-after-move)
+  CHECK(!moved_reader.valid());          // NOLINT(bugprone-use-after-move)
+  CHECK(moved_reader.blocks().empty());  // NOLINT(bugprone-use-after-move)
+  // A self-move keeps what the last submit read back: a faulted segment
+  // stays refused.
+  const std::vector<std::uint8_t> faulty = faulting_frame();
+  CHECK(!faulty.empty());
+  const vr::Result<d::ParsedFrame> parsed =
+      d::parse_intra_frame(faulty.data(), faulty.size(), kMaxBlocks);
+  CHECK(parsed.ok());
+  vr::CommandBatch batch(device, allocator);
+  CHECK(live_reader.value().record_decode(batch, parsed.value()).ok());
+  CHECK(batch.submit().ok());
+  CHECK(!live_reader.value().check().ok());
   d::DeviceFrameReader* reader_alias = &live_reader.value();
   live_reader.value() = std::move(*reader_alias);  // self-move
   CHECK(live_reader.value().valid());
+  CHECK(!live_reader.value().check().ok());
   CHECK(same_read(live_reader.value(), bytes) == 0);
   reader = std::move(live_reader.value());
   CHECK(reader.valid());
@@ -303,6 +356,7 @@ int main() {
   CHECK(reader.ok());
   if (matches_host_case(writer.value(), reader.value()) != 0) return 1;
   if (corruption_case(reader.value()) != 0) return 1;
+  if (segment_limit_case(reader.value()) != 0) return 1;
   if (out_of_range_case(device.value(), allocator.value(), writer.value()) !=
       0) {
     return 1;

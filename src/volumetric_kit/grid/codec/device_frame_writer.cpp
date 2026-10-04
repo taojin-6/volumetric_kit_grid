@@ -8,6 +8,7 @@
 #include <limits>
 #include <string>
 
+#include "rans_dispatch.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
 #include "volumetric_kit/recon/core/compute_util.hpp"
 #include "volumetric_kit/recon/core/device.hpp"
@@ -21,16 +22,6 @@
 
 namespace volumetric_kit::recon::codec::detail {
 namespace {
-
-// Mirrors `Push` in rans_push.glsl.
-struct Push {
-  std::uint32_t item_base = 0;
-  std::uint32_t num_blocks = 0;
-  std::uint32_t coefficient_count = 0;
-  std::uint32_t segment_size = 0;
-  std::uint32_t segment_count = 0;
-};
-static_assert(sizeof(Push) == 20, "Push must be 20 bytes");
 
 // The kernels' workgroup widths.
 constexpr std::uint32_t kCountLanes = 64;
@@ -46,24 +37,6 @@ Status fail(const char* op, const std::string& why) {
                                   ": " + why);
 }
 
-// One invocation per item, in as many dispatches as the device's group limit
-// needs; each pushes the first item it covers.
-Status dispatch_items(CommandBatch& batch, const ComputeKernel& kernel,
-                      Push push, std::uint32_t items, std::uint32_t lanes,
-                      std::uint32_t max_groups, GpuStageScope* stage) {
-  const std::uint64_t per_dispatch = std::uint64_t(max_groups) * lanes;
-  for (std::uint64_t base = 0; base < items; base += per_dispatch) {
-    push.item_base = static_cast<std::uint32_t>(base);
-    const std::uint64_t count =
-        std::min<std::uint64_t>(per_dispatch, items - base);
-    VR_TRY(
-        batch.dispatch(kernel, &push, sizeof(push),
-                       static_cast<std::uint32_t>((count + lanes - 1) / lanes),
-                       max_groups, stage));
-  }
-  return {};
-}
-
 }  // namespace
 
 Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
@@ -73,7 +46,7 @@ Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
   w.allocator_ = &allocator;
   VkPushConstantRange push{};
   push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  push.size = sizeof(Push);
+  push.size = sizeof(RansPush);
   KernelSetBuilder kb(device);
   VR_TRY(kb.add(w.count_kernel_, "codec_rans_count", vr_rans_count_comp_spv,
                 vr_rans_count_comp_spv_size, 5, &push));
@@ -148,7 +121,7 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
       VkDeviceSize(n) * ((k + 1) / 2) * sizeof(std::uint32_t));
   kernel.set.write_storage_buffer(3, counts_.handle(), 0, count_bytes);
   kernel.set.write_storage_buffer(4, block_steps_.handle(), 0, step_bytes);
-  Push push;
+  RansPush push;
   push.num_blocks = n;
   push.coefficient_count = k;
   push.segment_size = segment_size;
@@ -193,14 +166,7 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
 
   // Each symbol's coder step; frequency 0 for one never counted, which the
   // encoder refuses.
-  std::vector<std::uint32_t> entries(counts_host_.size(), 0);
-  for (std::uint32_t m = 0; m < models; ++m) {
-    const FrequencyTable& t = coded.tables[m];
-    for (std::size_t s = 0; s < t.freq.size(); ++s) {
-      entries[bases_host_[m] + s] =
-          std::uint32_t(t.cum[s]) | (std::uint32_t(t.freq[s]) << 16);
-    }
-  }
+  const std::vector<std::uint32_t> entries = rans_table_entries(coded.tables);
   // Each segment's blocks take their steps last first, so the segment's
   // steps are one run in the order the coder takes them. Its slot holds at
   // most a word per step and the final state's two, rounded up to whole
@@ -301,7 +267,7 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
                                   offset_bytes);
   gather.set.write_storage_buffer(4, payload_.handle(), 0, slot_bytes);
 
-  Push push;
+  RansPush push;
   push.num_blocks = n;
   push.coefficient_count = k;
   push.segment_size = segment_size;

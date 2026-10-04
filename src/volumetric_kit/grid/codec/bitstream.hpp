@@ -264,7 +264,8 @@ VR_CODEC_API Result<IntraFrame> read_intra_frame(const std::uint8_t* data,
 ///        reader, on the host or the device, decodes them from.
 struct ParsedFrame {
   FrameHeader header;
-  /// @ref frame_model_count tables, in TABLES order, built for decoding.
+  /// @ref frame_model_count tables, in TABLES order, without the host
+  /// reader's slot lookups (@ref decode_intra_frame builds them).
   std::vector<FrequencyTable> tables;
   /// Each segment's stream length in bytes: even, at least 4, summing to
   /// `payload_size`.
@@ -285,10 +286,12 @@ VR_CODEC_API Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
 
 /// @brief Decode a parsed frame's segments on the host: @ref read_intra_frame
 ///        after @ref parse_intra_frame.
+/// @param parsed  Taken by value: its tables gain the slot lookups only this
+///                reader needs.
 /// @return The frame, or @ref read_intra_frame's refusals of its segments
 ///         (and @ref Status::Code::OutOfMemory for arrays past this
 ///         platform's address space).
-VR_CODEC_API Result<IntraFrame> decode_intra_frame(const ParsedFrame& parsed);
+VR_CODEC_API Result<IntraFrame> decode_intra_frame(ParsedFrame parsed);
 
 /// How a segment's stream failed to decode.
 enum class SegmentFault : std::uint32_t {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Every rANS kernel's push constants. Mirrors `Push` in
-// device_frame_writer.cpp.
+// Every rANS kernel's push constants. Mirrors `RansPush` in
+// rans_dispatch.hpp.
 
 #ifndef VR_RANS_PUSH_GLSL
 #define VR_RANS_PUSH_GLSL

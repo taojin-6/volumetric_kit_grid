@@ -142,6 +142,8 @@ class VR_CODEC_API Decoder {
   /// @return OK, or: whatever the frame reader refuses
   ///         (@ref Status::Code::Unsupported, @ref
   ///         Status::Code::InvalidArgument for a malformed or corrupt frame);
+  ///         with @ref EntropyCoding::kDevice, a frame the device cannot
+  ///         decode (see @ref EntropyCoding);
   ///         @ref Status::Code::InvalidArgument for a moved-from decoder, a
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other
@@ -164,9 +166,10 @@ class VR_CODEC_API Decoder {
  private:
   Decoder();
 
-  /// Build @ref reader_ unless it is built.
+  /// Build @ref reader_ unless it is built, or return the failure of the
+  /// one build tried.
   Status ensure_reader();
-  /// Decode @p frame's segments on the device, through the submit; the
+  /// Decode @p frame's segments on the built reader, through the submit; the
   /// reader's check() then judges them.
   Result<detail::ResidentBlocks> decode_on_device(
       const detail::ParsedFrame& frame, GpuStageScope& stage);
@@ -177,8 +180,10 @@ class VR_CODEC_API Decoder {
   Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
   // Built at create for kDevice, at the first device frame for kAuto, and
-  // never for kHost.
+  // never for kHost; and why that build failed, after which kAuto decodes
+  // every frame on the host.
   std::unique_ptr<detail::DeviceFrameReader> reader_;
+  Status reader_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
   GpuTimer gpu_timer_;
 };
