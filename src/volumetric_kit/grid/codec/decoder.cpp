@@ -59,9 +59,7 @@ Decoder::~Decoder() = default;
 Decoder::Decoder(Decoder&& other) noexcept = default;
 Decoder& Decoder::operator=(Decoder&& other) noexcept = default;
 
-bool Decoder::valid() const noexcept {
-  return transform_ != nullptr && transform_->valid();
-}
+bool Decoder::valid() const noexcept { return transform_ != nullptr; }
 
 Result<Decoder> Decoder::create(Device& device, Allocator& allocator,
                                 const DecoderConfig& config) {
@@ -69,9 +67,7 @@ Result<Decoder> Decoder::create(Device& device, Allocator& allocator,
   d.config_ = config;
   d.device_ = &device;
   d.allocator_ = &allocator;
-  VR_ASSIGN(detail::DctTransform transform,
-            detail::DctTransform::create(device, allocator));
-  d.transform_ = std::make_unique<detail::DctTransform>(std::move(transform));
+  VR_ASSIGN(d.transform_, detail::DctTransform::create(device, allocator));
   // kAuto builds the reader at its first device frame, which a small scene
   // never reaches.
   if (config.entropy == EntropyCoding::kDevice) VR_TRY(d.ensure_reader());
@@ -83,11 +79,10 @@ Status Decoder::ensure_reader() {
   if (reader_ != nullptr) return {};
   // A build that failed fails again, so it is tried once.
   if (!reader_failure_.ok()) return reader_failure_;
-  Result<detail::DeviceFrameReader> reader =
+  Result<std::unique_ptr<detail::DeviceFrameReader>> reader =
       detail::DeviceFrameReader::create(*device_, *allocator_);
   if (!reader.ok()) return reader_failure_ = reader.status();
-  reader_ =
-      std::make_unique<detail::DeviceFrameReader>(std::move(reader).value());
+  reader_ = std::move(reader).value();
   return {};
 }
 

@@ -16,7 +16,7 @@
 /// that unified memory would.
 
 #include <cstdint>
-#include <utility>
+#include <memory>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -55,11 +55,10 @@ class VR_CODEC_API DeviceFrameWriter {
  public:
   /// @brief Build the five kernels.
   /// @return The writer, or a pipeline or pool failure.
-  static Result<DeviceFrameWriter> create(Device& device, Allocator& allocator);
+  static Result<std::unique_ptr<DeviceFrameWriter>> create(
+      Device& device, Allocator& allocator);
 
   ~DeviceFrameWriter() = default;
-  DeviceFrameWriter(DeviceFrameWriter&&) noexcept = default;
-  DeviceFrameWriter& operator=(DeviceFrameWriter&&) noexcept = default;
   DeviceFrameWriter(const DeviceFrameWriter&) = delete;
   DeviceFrameWriter& operator=(const DeviceFrameWriter&) = delete;
 
@@ -72,9 +71,9 @@ class VR_CODEC_API DeviceFrameWriter {
   ///                      +-32767 (what the transform writes).
   /// @param segment_size  Blocks per segment, at least 1, which @ref finish
   ///                      codes at.
-  /// @return OK, or @ref Status::Code::InvalidArgument for a moved-from
-  ///         writer, a segment size of 0, more than 2^30 - 1 segments, or a
-  ///         buffer past `maxStorageBufferRange`; otherwise a buffer failure.
+  /// @return OK, or @ref Status::Code::InvalidArgument for a segment size of
+  ///         0, more than 2^30 - 1 segments, or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
   Status record_count(CommandBatch& batch, const ResidentBlocks& blocks,
                       std::uint32_t segment_size,
                       GpuStageScope* stage = nullptr);
@@ -102,13 +101,6 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @return As @ref write_intra_frame.
   Result<std::vector<std::uint8_t>> write(const IntraFrame& frame,
                                           const FrameWriteOptions& options);
-
-  /// @return `true` if this owns its live kernels (`false` when moved-from).
-  bool valid() const noexcept {
-    return count_kernel_.valid() && ops_kernel_.valid() &&
-           encode_kernel_.valid() && scan_kernel_.valid() &&
-           gather_kernel_.valid();
-  }
 
  private:
   DeviceFrameWriter() = default;
@@ -153,21 +145,9 @@ class VR_CODEC_API DeviceFrameWriter {
   std::vector<std::uint32_t> steps_host_;
   // The segment size record_count counted with (0 before any), and the last
   // frame's payload bytes per block plus 25%, the readback's prediction (0
-  // before any). Reset on move, like every owned member.
-  struct FrameState {
-    std::uint32_t segment_size = 0;
-    std::uint32_t payload_per_block = 0;
-    FrameState() = default;
-    FrameState(FrameState&& other) noexcept
-        : segment_size(std::exchange(other.segment_size, 0)),
-          payload_per_block(std::exchange(other.payload_per_block, 0)) {}
-    FrameState& operator=(FrameState&& other) noexcept {
-      segment_size = std::exchange(other.segment_size, 0);
-      payload_per_block = std::exchange(other.payload_per_block, 0);
-      return *this;
-    }
-  };
-  FrameState state_;
+  // before any).
+  std::uint32_t segment_size_ = 0;
+  std::uint32_t payload_per_block_ = 0;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

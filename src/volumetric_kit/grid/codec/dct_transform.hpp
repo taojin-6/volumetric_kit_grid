@@ -14,7 +14,7 @@
 /// against it in a shared-library build too.
 
 #include <cstdint>
-#include <utility>
+#include <memory>
 #include <vector>
 
 #include "dct_blocks.hpp"
@@ -121,12 +121,11 @@ class VR_CODEC_API DctTransform {
   /// @param config     Construction-time options.
   /// @return The transform, or a non-OK @ref Status if a pipeline, the pool or
   ///         the table upload fails.
-  static Result<DctTransform> create(Device& device, Allocator& allocator,
-                                     const DctTransformConfig& config = {});
+  static Result<std::unique_ptr<DctTransform>> create(
+      Device& device, Allocator& allocator,
+      const DctTransformConfig& config = {});
 
   ~DctTransform() = default;
-  DctTransform(DctTransform&&) noexcept = default;
-  DctTransform& operator=(DctTransform&&) noexcept = default;
   DctTransform(const DctTransform&) = delete;
   DctTransform& operator=(const DctTransform&) = delete;
 
@@ -145,10 +144,10 @@ class VR_CODEC_API DctTransform {
   /// @param stage   Optional scope the caller's stage row is open under; the
   ///                dispatches record their device spans into it. `nullptr`
   ///                times nothing.
-  /// @return OK, or @ref Status::Code::InvalidArgument for a moved-from
-  ///         transform, invalid @p params, a grid that is moved-from, has
-  ///         another block size, a non-positive `trunc_dist`, or lacks a float
-  ///         `tsdf` / `weight`; a list that
+  /// @return OK, or @ref Status::Code::InvalidArgument for invalid
+  ///         @p params, a grid that is moved-from, has another block size, a
+  ///         non-positive `trunc_dist`, or lacks a float `tsdf` / `weight`; a
+  ///         list that
   ///         @ref volume::VoxelBlockGrid::check_block_list refuses, or one with
   ///         an entry whose coord @p grid does not hold; or a buffer that
   ///         would exceed `maxStorageBufferRange`. Otherwise a buffer or
@@ -236,12 +235,6 @@ class VR_CODEC_API DctTransform {
       const volume::VoxelBlockGrid& grid, const volume::DeviceBlockList& list,
       GpuStageScope* stage = nullptr);
 
-  /// @return `true` if this owns its live pipelines (`false` when moved-from).
-  bool valid() const noexcept {
-    return forward_kernel_.valid() && inverse_kernel_.valid() &&
-           observed_kernel_.valid();
-  }
-
  private:
   DctTransform() = default;
 
@@ -311,19 +304,8 @@ class VR_CODEC_API DctTransform {
   Buffer coefficients_;
   Buffer masks_;
   // The last observed count, the readback prediction only: every call still
-  // obtains and checks its count. 0 predicts the whole input. Reset on move,
-  // like every owned member.
-  struct ObservedCount {
-    std::uint32_t count = 0;
-    ObservedCount() = default;
-    ObservedCount(ObservedCount&& other) noexcept
-        : count(std::exchange(other.count, 0)) {}
-    ObservedCount& operator=(ObservedCount&& other) noexcept {
-      count = std::exchange(other.count, 0);
-      return *this;
-    }
-  };
-  ObservedCount last_observed_;
+  // obtains and checks its count. 0 predicts the whole input.
+  std::uint32_t last_observed_ = 0;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

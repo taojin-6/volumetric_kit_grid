@@ -15,6 +15,7 @@
 /// (@ref ensure_device_scratch).
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -49,11 +50,10 @@ class VR_CODEC_API DeviceFrameReader {
  public:
   /// @brief Build the two kernels.
   /// @return The reader, or a pipeline or pool failure.
-  static Result<DeviceFrameReader> create(Device& device, Allocator& allocator);
+  static Result<std::unique_ptr<DeviceFrameReader>> create(
+      Device& device, Allocator& allocator);
 
   ~DeviceFrameReader() = default;
-  DeviceFrameReader(DeviceFrameReader&& other) noexcept;
-  DeviceFrameReader& operator=(DeviceFrameReader&& other) noexcept;
   DeviceFrameReader(const DeviceFrameReader&) = delete;
   DeviceFrameReader& operator=(const DeviceFrameReader&) = delete;
 
@@ -64,7 +64,7 @@ class VR_CODEC_API DeviceFrameReader {
   /// @return The decoded blocks where the device holds them, valid until the
   ///         next call (no entries for a frame of none, which records
   ///         nothing); @ref Status::Code::InvalidArgument, before any buffer
-  ///         grows, for a moved-from reader, a segment longer than
+  ///         grows, for a segment longer than
   ///         @ref kMaxDeviceDecodeSegmentSize or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.
   Result<ResidentBlocks> record_decode(CommandBatch& batch,
@@ -86,11 +86,6 @@ class VR_CODEC_API DeviceFrameReader {
   /// @return As @ref read_intra_frame.
   Result<IntraFrame> read(const std::uint8_t* data, std::size_t size,
                           std::uint32_t max_blocks);
-
-  /// @return `true` if this owns its live kernels (`false` when moved-from).
-  bool valid() const noexcept {
-    return slots_kernel_.valid() && decode_kernel_.valid();
-  }
 
  private:
   DeviceFrameReader() = default;

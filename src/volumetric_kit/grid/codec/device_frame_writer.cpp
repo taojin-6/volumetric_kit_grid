@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <limits>
 #include <string>
+#include <utility>
 
 #include "rans_dispatch.hpp"
 #include "volumetric_kit/recon/core/command_batch.hpp"
@@ -39,9 +40,10 @@ Status fail(const char* op, const std::string& why) {
 
 }  // namespace
 
-Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
-                                                    Allocator& allocator) {
-  DeviceFrameWriter w;
+Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
+    Device& device, Allocator& allocator) {
+  std::unique_ptr<DeviceFrameWriter> owned(new DeviceFrameWriter());
+  DeviceFrameWriter& w = *owned;
   w.device_ = &device;
   w.allocator_ = &allocator;
   VkPushConstantRange push{};
@@ -73,14 +75,13 @@ Result<DeviceFrameWriter> DeviceFrameWriter::create(Device& device,
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          debug_object_handle(w.gather_args_.handle()),
                          "codec.rans_gather_args");
-  return w;
+  return owned;
 }
 
 Status DeviceFrameWriter::record_count(CommandBatch& batch,
                                        const ResidentBlocks& blocks,
                                        std::uint32_t segment_size,
                                        GpuStageScope* stage) {
-  if (!valid()) return fail("record_count", "moved-from writer");
   if (segment_size == 0) {
     return fail("record_count", "segment_size must be at least 1");
   }
@@ -90,7 +91,7 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
   if (segments > kMaxFrameSegments) {
     return fail("record_count", "more than 2^30 - 1 segments");
   }
-  state_.segment_size = segment_size;
+  segment_size_ = segment_size;
   // Each model's first entry in the per-symbol arrays, in TABLES order.
   const std::uint32_t models = frame_model_count(k);
   bases_host_.assign(models + 1, 0);
@@ -135,11 +136,10 @@ Status DeviceFrameWriter::record_count(CommandBatch& batch,
 Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
     const CodecParams& params, GpuStageScope* stage) {
-  if (!valid()) return fail("finish", "moved-from writer");
   VR_TRY(params.validate());
   const std::uint32_t n = blocks.count;
   const std::uint32_t k = params.coefficient_count;
-  const std::uint32_t segment_size = state_.segment_size;
+  const std::uint32_t segment_size = segment_size_;
   if (segment_size == 0 || k != blocks.coefficient_count ||
       bases_host_.size() != frame_model_count(k) + 1 ||
       steps_host_.size() != n) {
@@ -284,9 +284,8 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   // Read the payload's likely size with the lengths, and any rest after.
   std::vector<std::uint32_t> lengths(segments);
   std::uint32_t failed = 0;
-  const std::uint64_t per_block = state_.payload_per_block != 0
-                                      ? state_.payload_per_block
-                                      : kFirstPayloadPerBlock;
+  const std::uint64_t per_block =
+      payload_per_block_ != 0 ? payload_per_block_ : kFirstPayloadPerBlock;
   const VkDeviceSize guess = std::min<VkDeviceSize>(
       slot_bytes, (per_block * n + 3) & ~VkDeviceSize{3});
   std::vector<std::uint8_t> payload(static_cast<std::size_t>(guess));
@@ -314,8 +313,7 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     VR_TRY(tail.submit());
   }
   payload.resize(static_cast<std::size_t>(total));
-  state_.payload_per_block =
-      static_cast<std::uint32_t>((total + total / 4) / n + 1);
+  payload_per_block_ = static_cast<std::uint32_t>((total + total / 4) / n + 1);
   coded.segment_lengths = std::move(lengths);
   coded.payload = std::move(payload);
   return assemble_intra_frame(coded);
@@ -323,7 +321,6 @@ Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
 
 Result<std::vector<std::uint8_t>> DeviceFrameWriter::write(
     const IntraFrame& frame, const FrameWriteOptions& options) {
-  if (!valid()) return fail("write", "moved-from writer");
   VR_TRY(check_intra_frame(frame, options));
   const auto n = static_cast<std::uint32_t>(frame.coords.size());
   const std::uint32_t k = frame.blocks.params.coefficient_count;

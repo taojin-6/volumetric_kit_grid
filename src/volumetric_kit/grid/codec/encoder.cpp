@@ -61,9 +61,7 @@ Encoder& Encoder::operator=(Encoder&& other) noexcept {
   return *this;
 }
 
-bool Encoder::valid() const noexcept {
-  return transform_ != nullptr && transform_->valid();
-}
+bool Encoder::valid() const noexcept { return transform_ != nullptr; }
 
 Result<Encoder> Encoder::create(Device& device, Allocator& allocator,
                                 const EncoderConfig& config) {
@@ -75,9 +73,7 @@ Result<Encoder> Encoder::create(Device& device, Allocator& allocator,
   e.config_ = config;
   e.device_ = &device;
   e.allocator_ = &allocator;
-  VR_ASSIGN(detail::DctTransform transform,
-            detail::DctTransform::create(device, allocator));
-  e.transform_ = std::make_unique<detail::DctTransform>(std::move(transform));
+  VR_ASSIGN(e.transform_, detail::DctTransform::create(device, allocator));
   // kAuto builds the writer at its first device frame, which a small scene
   // never reaches.
   if (config.entropy == EntropyCoding::kDevice) VR_TRY(e.ensure_writer());
@@ -89,11 +85,10 @@ Status Encoder::ensure_writer() {
   if (writer_ != nullptr) return {};
   // A build that failed fails again, so it is tried once.
   if (!writer_failure_.ok()) return writer_failure_;
-  Result<detail::DeviceFrameWriter> writer =
+  Result<std::unique_ptr<detail::DeviceFrameWriter>> writer =
       detail::DeviceFrameWriter::create(*device_, *allocator_);
   if (!writer.ok()) return writer_failure_ = writer.status();
-  writer_ =
-      std::make_unique<detail::DeviceFrameWriter>(std::move(writer).value());
+  writer_ = std::move(writer).value();
   return {};
 }
 

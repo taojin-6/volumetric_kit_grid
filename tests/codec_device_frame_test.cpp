@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -243,7 +244,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   zero.segment_size = 0;
   CHECK(!writer.write(make_frame(10, 8, 3), zero).ok());
   // finish with nothing counted refuses rather than coding stale steps.
-  vr::Result<d::DeviceFrameWriter> fresh =
+  vr::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
       d::DeviceFrameWriter::create(device, allocator);
   CHECK(fresh.ok());
   d::ResidentBlocks uncounted;
@@ -251,79 +252,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   uncounted.coefficient_count = 8;
   codec::CodecParams params;
   params.coefficient_count = 8;
-  CHECK(!fresh.value().finish(uncounted, 0.005f, 0.04f, params).ok());
-  return 0;
-}
-
-// A frame that parses but whose segments the readers refuse.
-std::vector<std::uint8_t> faulting_frame() {
-  const std::vector<std::uint8_t> good =
-      d::write_intra_frame(make_frame(10, 8, 3)).value();
-  const vr::Result<d::ParsedFrame> parsed =
-      d::parse_intra_frame(good.data(), good.size(), kMaxBlocks);
-  if (!parsed.ok()) return {};
-  for (std::size_t i = std::size_t(parsed.value().payload - good.data());
-       i < good.size(); ++i) {
-    std::vector<std::uint8_t> b = good;
-    b[i] ^= 0xFFu;
-    if (!d::read_intra_frame(b.data(), b.size(), kMaxBlocks).ok()) return b;
-  }
-  return {};
-}
-
-// The move rules, for the writer and the reader: a moved-from one is empty
-// and refuses, a move-assign over a live one works, and a self-move leaves it
-// intact.
-int moves_case(vr::Device& device, vr::Allocator& allocator,
-               d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
-  d::DeviceFrameWriter moved = std::move(writer);
-  CHECK(moved.valid());
-  CHECK(!writer.valid());  // NOLINT(bugprone-use-after-move): the source
-  CHECK(!writer.write(make_frame(10, 8, 3), {}).ok());
-  vr::Result<d::DeviceFrameWriter> live =
-      d::DeviceFrameWriter::create(device, allocator);
-  CHECK(live.ok());
-  live.value() = std::move(moved);  // over a live writer
-  CHECK(live.value().valid());
-  CHECK(!moved.valid());  // NOLINT(bugprone-use-after-move)
-  d::DeviceFrameWriter* alias = &live.value();
-  live.value() = std::move(*alias);  // self-move, laundered past -Wself-move
-  CHECK(live.value().valid());
-  CHECK(same_bytes(live.value(), reader, make_frame(70, 8, 5), 16) == 0);
-  writer = std::move(live.value());
-  CHECK(writer.valid());
-
-  const std::vector<std::uint8_t> bytes =
-      d::write_intra_frame(make_frame(10, 8, 3)).value();
-  d::DeviceFrameReader moved_reader = std::move(reader);
-  CHECK(moved_reader.valid());
-  CHECK(!reader.valid());  // NOLINT(bugprone-use-after-move): the source
-  CHECK(!reader.read(bytes.data(), bytes.size(), kMaxBlocks).ok());
-  vr::Result<d::DeviceFrameReader> live_reader =
-      d::DeviceFrameReader::create(device, allocator);
-  CHECK(live_reader.ok());
-  live_reader.value() = std::move(moved_reader);  // over a live reader
-  CHECK(live_reader.value().valid());
-  CHECK(!moved_reader.valid());          // NOLINT(bugprone-use-after-move)
-  CHECK(moved_reader.blocks().empty());  // NOLINT(bugprone-use-after-move)
-  // A self-move keeps what the last submit read back: a faulted segment
-  // stays refused.
-  const std::vector<std::uint8_t> faulty = faulting_frame();
-  CHECK(!faulty.empty());
-  const vr::Result<d::ParsedFrame> parsed =
-      d::parse_intra_frame(faulty.data(), faulty.size(), kMaxBlocks);
-  CHECK(parsed.ok());
-  vr::CommandBatch batch(device, allocator);
-  CHECK(live_reader.value().record_decode(batch, parsed.value()).ok());
-  CHECK(batch.submit().ok());
-  CHECK(!live_reader.value().check().ok());
-  d::DeviceFrameReader* reader_alias = &live_reader.value();
-  live_reader.value() = std::move(*reader_alias);  // self-move
-  CHECK(live_reader.value().valid());
-  CHECK(!live_reader.value().check().ok());
-  CHECK(same_read(live_reader.value(), bytes) == 0);
-  reader = std::move(live_reader.value());
-  CHECK(reader.valid());
+  CHECK(!fresh.value()->finish(uncounted, 0.005f, 0.04f, params).ok());
   return 0;
 }
 
@@ -348,26 +277,21 @@ int main() {
   vr::Result<vr::Allocator> allocator =
       vr::Allocator::create(instance.value().handle(), device.value());
   CHECK(allocator.ok());
-  vr::Result<d::DeviceFrameWriter> writer =
+  vr::Result<std::unique_ptr<d::DeviceFrameWriter>> w =
       d::DeviceFrameWriter::create(device.value(), allocator.value());
-  CHECK(writer.ok());
-  vr::Result<d::DeviceFrameReader> reader =
+  CHECK(w.ok());
+  vr::Result<std::unique_ptr<d::DeviceFrameReader>> r =
       d::DeviceFrameReader::create(device.value(), allocator.value());
-  CHECK(reader.ok());
-  if (matches_host_case(writer.value(), reader.value()) != 0) return 1;
-  if (corruption_case(reader.value()) != 0) return 1;
-  if (segment_limit_case(reader.value()) != 0) return 1;
-  if (out_of_range_case(device.value(), allocator.value(), writer.value()) !=
-      0) {
+  CHECK(r.ok());
+  d::DeviceFrameWriter& writer = *w.value();
+  d::DeviceFrameReader& reader = *r.value();
+  if (matches_host_case(writer, reader) != 0) return 1;
+  if (corruption_case(reader) != 0) return 1;
+  if (segment_limit_case(reader) != 0) return 1;
+  if (out_of_range_case(device.value(), allocator.value(), writer) != 0) {
     return 1;
   }
-  if (refusals_case(device.value(), allocator.value(), writer.value()) != 0) {
-    return 1;
-  }
-  if (moves_case(device.value(), allocator.value(), writer.value(),
-                 reader.value()) != 0) {
-    return 1;
-  }
+  if (refusals_case(device.value(), allocator.value(), writer) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;
 }
