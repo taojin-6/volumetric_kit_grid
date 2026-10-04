@@ -204,33 +204,15 @@ int main() {
           t.value()[std::size_t{a} * 512 + 7] == 0.25f);
   }
 
-  // Move-assigning carries the block pass along: into a moved-from grid, and
-  // over one that has run its own over fewer attributes.
+  // Move construction carries the block pass along and empties the source.
   {
-    vol::VoxelBlockGrid other = std::move(grid);
-    CHECK(other.stamp_blocks().ok());
-    grid = std::move(other);
-    CHECK(grid.stamp_blocks().ok());
+    auto built = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
+    CHECK(built.ok() && built->stamp_blocks().ok());
+    vol::VoxelBlockGrid moved = std::move(built).value();
+    CHECK(moved.stamp_blocks().ok());
+    CHECK(moved.free_stale_blocks(1).ok());
     // NOLINTNEXTLINE(bugprone-use-after-move) -- asserting it is empty
-    CHECK(other.stamp_blocks().domain() == vr::Status::Code::InvalidArgument);
-
-    const vol::AttributeSpec wider[] = {{"tsdf", sizeof(float)},
-                                        {"weight", sizeof(float)},
-                                        {"color", sizeof(std::uint32_t)}};
-    auto wide = vol::VoxelBlockGrid::create(dev, alloc, params(), wider, 3);
-    auto narrow = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
-    CHECK(wide.ok() && narrow.ok());
-    CHECK(wide->map().allocate(three, 1).ok());
-    CHECK(narrow->stamp_blocks().ok());
-    narrow.value() = std::move(wide).value();
-    // A block asked for before the writer that advances the clock is a tick
-    // old, and stays at max_age 1; a tick later it goes.
-    narrow->map().advance_tick();
-    auto gone = narrow->free_stale_blocks(1);
-    CHECK(gone.ok() && gone.value() == 0);
-    narrow->map().advance_tick();
-    gone = narrow->free_stale_blocks(1);
-    CHECK(gone.ok() && gone.value() == 1);
+    CHECK(built->stamp_blocks().domain() == vr::Status::Code::InvalidArgument);
   }
 
   // Every allocation path stamps what it asks for, through a binding of its

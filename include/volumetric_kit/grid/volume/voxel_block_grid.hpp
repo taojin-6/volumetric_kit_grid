@@ -106,43 +106,15 @@ class VR_VOLUME_API VoxelBlockGrid {
                                        const AttributeSpec* attrs,
                                        std::size_t attr_count);
 
-  // The owned VoxelHashMap and each attribute Buffer self-reset on move, so the
-  // destructor and move-construct are defaulted and a moved-from grid is left
-  // empty (valid() == false). Move-assignment is hand-written for the self-move
-  // guard: a defaulted memberwise version would run
-  // `attributes_ = std::move(attributes_)`, and std::vector
-  // self-move-assignment frees its storage -- destroying every attribute Buffer
-  // while map_ (whose members self-guard) survives, leaving valid() == true
-  // with the attributes gone. The guard below keeps a self-assigned grid
-  // intact.
-  //
-  // Being hand-written, it must name EVERY member, and a forgotten one is
-  // silent: the topology epoch used to be a member here and was not assigned,
-  // so a move-assigned grid took on another grid's blocks while still reporting
-  // the destination's old epoch -- and every slot-keyed cache anchored to it
-  // stayed "valid" across the swap. It now lives in map_ (see topology_epoch),
-  // which is moved, so that particular member cannot be dropped again; the
-  // obligation for anything added below still stands.
+  // Move construction only. The owned VoxelHashMap and each attribute Buffer
+  // self-reset on move, so a moved-from grid is empty (valid() == false). A
+  // defaulted move assignment would self-move `attributes_`, and std::vector
+  // self-move frees every attribute buffer while the map survives; a
+  // hand-written one must name every member, and once missed one. Replace a
+  // grid with std::optional::emplace instead.
   ~VoxelBlockGrid() = default;
   VoxelBlockGrid(VoxelBlockGrid&&) noexcept = default;
-  VoxelBlockGrid& operator=(VoxelBlockGrid&& other) noexcept {
-    if (this != &other) {
-      map_ = std::move(other.map_);
-      attributes_ = std::move(other.attributes_);
-      block_pool_ = std::move(other.block_pool_);
-      stamp_kernel_ = std::move(other.stamp_kernel_);
-      zero_kernel_ = std::move(other.zero_kernel_);
-      zero_sets_ = std::move(other.zero_sets_);
-      gpu_timer_ = std::move(other.gpu_timer_);
-      stale_list_ = std::move(other.stale_list_);
-      stale_count_ = std::move(other.stale_count_);
-      max_workgroup_count_x_ = other.max_workgroup_count_x_;
-      max_storage_buffer_range_ = other.max_storage_buffer_range_;
-      device_ = other.device_;
-      allocator_ = other.allocator_;
-    }
-    return *this;
-  }
+  VoxelBlockGrid& operator=(VoxelBlockGrid&&) = delete;
   VoxelBlockGrid(const VoxelBlockGrid&) = delete;
   VoxelBlockGrid& operator=(const VoxelBlockGrid&) = delete;
 
