@@ -10,12 +10,12 @@
 #include <memory>
 #include <vector>
 
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
-#include "volumetric_kit/recon/core/gpu_timer.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::recon::codec {
@@ -56,7 +56,7 @@ struct EncoderConfig {
 /// Geometry only: colour is not coded. A player textures the decoded mesh
 /// from RGB that travels beside the frame.
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time.
 class VR_CODEC_API Encoder {
  public:
@@ -67,11 +67,12 @@ class VR_CODEC_API Encoder {
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
   /// @param config     How frames are coded.
-  /// @return The encoder, or @ref Status::Code::InvalidArgument for invalid
+  /// @return The encoder, or `Status::Code::InvalidArgument` for invalid
   ///         `config.params` or a `segment_size` of 0; otherwise a pipeline
   ///         or allocation failure.
-  static Result<Encoder> create(Device& device, Allocator& allocator,
-                                const EncoderConfig& config = {});
+  static core::Result<Encoder> create(core::Device& device,
+                                      core::Allocator& allocator,
+                                      const EncoderConfig& config = {});
 
   ~Encoder();
   Encoder(Encoder&& other) noexcept;
@@ -88,7 +89,7 @@ class VR_CODEC_API Encoder {
   ///                 volume::VoxelHashMap::compact_active_blocks_on_device),
   ///                 which an extract after this takes back from it as it
   ///                 would a fuse's.
-  /// @param metrics  Optional @ref StageMetrics collecting a `"codec encode"`
+  /// @param metrics  Optional `StageMetrics` collecting a `"codec encode"`
   ///                 row with both halves -- its device half is the transform
   ///                 and, coded on the device, the rANS kernels -- over the
   ///                 breakdown rows `"  ..active set"` (the compaction, when
@@ -99,15 +100,15 @@ class VR_CODEC_API Encoder {
   ///                 batch) and `"  ..rans encode"` (writing the frame; on
   ///                 the host, counting included). Named apart from the
   ///                 @ref Decoder's, so both timed into one
-  ///                 @ref StageMetrics stay apart. `nullptr` measures
+  ///                 `StageMetrics` stay apart. `nullptr` measures
   ///                 nothing.
   /// @return The frame's bytes (an empty grid is a valid frame of no blocks),
-  ///         or @ref Status::Code::InvalidArgument for a moved-from encoder,
+  ///         or `Status::Code::InvalidArgument` for a moved-from encoder,
   ///         a grid the transform refuses (moved-from, another block size,
   ///         no float `tsdf` / `weight`) or a non-finite `voxel_size`;
   ///         otherwise a compaction, buffer, pipeline or dispatch failure.
-  Result<std::vector<std::uint8_t>> encode(volume::VoxelBlockGrid& grid,
-                                           StageMetrics* metrics = nullptr);
+  core::Result<std::vector<std::uint8_t>> encode(
+      volume::VoxelBlockGrid& grid, core::StageMetrics* metrics = nullptr);
 
   /// @return The configuration frames are coded with; all zeros when
   ///         moved-from, which no valid encoder has.
@@ -121,25 +122,25 @@ class VR_CODEC_API Encoder {
 
   /// Build @ref writer_ unless it is built, or return the failure of the
   /// one build tried.
-  Status ensure_writer();
+  core::Status ensure_writer();
   /// The forward and the rANS coding on the built writer.
-  Result<std::vector<std::uint8_t>> encode_on_device(
+  core::Result<std::vector<std::uint8_t>> encode_on_device(
       volume::VoxelBlockGrid& grid,
-      const std::vector<volume::BlockIndex>& blocks, StageMetrics* metrics,
-      GpuStageScope& stage);
+      const std::vector<volume::BlockIndex>& blocks,
+      core::StageMetrics* metrics, core::GpuStageScope& stage);
 
   EncoderConfig config_;
   // Borrowed (must outlive this); what the device coding's batch runs on.
-  Device* device_ = nullptr;
-  Allocator* allocator_ = nullptr;
+  core::Device* device_ = nullptr;
+  core::Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
   // Built at create for kDevice, at the first device frame for kAuto, and
   // never for kHost; and why that build failed, after which kAuto codes
   // every frame on the host.
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
-  Status writer_failure_;
+  core::Status writer_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
-  GpuTimer gpu_timer_;
+  core::GpuTimer gpu_timer_;
 };
 
 }  // namespace volumetric_kit::recon::codec

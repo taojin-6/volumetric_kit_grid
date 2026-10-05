@@ -15,16 +15,18 @@
 #include <vector>
 
 #include "buffer_readback.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -40,8 +42,9 @@ namespace {
 using Coord = std::tuple<int, int, int>;
 
 // Collect the active-block coords into a set.
-vr::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+vkc::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   if (!active) {
     return active.status();
   }
@@ -54,8 +57,9 @@ vr::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
 
 // Collect the active block pointers into a set (to prove heap reuse: reused
 // blocks draw the same pointers, a leaked free-list hands out fresh ones).
-vr::Result<std::set<std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+vkc::Result<std::set<std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   if (!active) {
     return active.status();
   }
@@ -69,28 +73,28 @@ vr::Result<std::set<std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -115,7 +119,7 @@ int main() {
   grid.num_blocks = 2048;  // == bucket_size * num_buckets (grid invariant)
   grid.max_chain = 128;
 
-  vr::Result<vol::VoxelHashMap> map_result =
+  vkc::Result<vol::VoxelHashMap> map_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
@@ -147,22 +151,22 @@ int main() {
   CHECK(corners.size() == 8);
 
   // Allocate the full cube.
-  vr::Result<std::uint32_t> alloc_fail =
+  vkc::Result<std::uint32_t> alloc_fail =
       map.allocate(all.data(), static_cast<std::uint32_t>(all.size()));
   CHECK(alloc_fail.ok() && alloc_fail.value() == 0);
 
   // Snapshot the block pointers in use, to prove heap reuse after the
   // remove/re-allocate round-trip below.
-  vr::Result<std::set<std::int32_t>> ptrs_before = active_ptrs(map);
+  vkc::Result<std::set<std::int32_t>> ptrs_before = active_ptrs(map);
   CHECK(ptrs_before.ok() && ptrs_before.value().size() == want_all.size());
 
   // Remove the 8 corners.
-  vr::Result<std::uint32_t> remove_fail =
+  vkc::Result<std::uint32_t> remove_fail =
       map.remove(corners.data(), static_cast<std::uint32_t>(corners.size()));
   CHECK(remove_fail.ok() && remove_fail.value() == 0);
 
   // The survivors are exactly the non-corners.
-  vr::Result<std::set<Coord>> after_remove = active_set(map);
+  vkc::Result<std::set<Coord>> after_remove = active_set(map);
   CHECK(after_remove.ok());
   CHECK(after_remove.value().size() == want_all.size() - want_corners.size());
   for (const Coord& corner : want_corners) {
@@ -176,31 +180,31 @@ int main() {
   // Removing an absent coord is a no-op (0 failures, set unchanged).
   vol::BlockIndex absent{};
   absent.coord = vr::Vec3i(100, 100, 100);
-  vr::Result<std::uint32_t> noop = map.remove(&absent, 1);
+  vkc::Result<std::uint32_t> noop = map.remove(&absent, 1);
   CHECK(noop.ok() && noop.value() == 0);
-  vr::Result<std::set<Coord>> unchanged = active_set(map);
+  vkc::Result<std::set<Coord>> unchanged = active_set(map);
   CHECK(unchanged.ok() && unchanged.value() == after_remove.value());
 
   // Removing already-removed coords is also a no-op: their freed slots read as
   // absent under the lock, so no block is double-freed back onto the heap (a
   // double-free would later surface as a duplicate in the pointer set).
-  vr::Result<std::uint32_t> double_remove =
+  vkc::Result<std::uint32_t> double_remove =
       map.remove(corners.data(), static_cast<std::uint32_t>(corners.size()));
   CHECK(double_remove.ok() && double_remove.value() == 0);
-  vr::Result<std::set<Coord>> still_gone = active_set(map);
+  vkc::Result<std::set<Coord>> still_gone = active_set(map);
   CHECK(still_gone.ok() && still_gone.value() == after_remove.value());
 
   // Heap reuse: re-allocating the removed corners restores the full cube AND
   // draws back exactly the block pointers that were freed. If the freed blocks
   // had leaked, the re-allocate would hand out fresh pointers and the set would
   // differ (or fail outright once the heap ran dry).
-  vr::Result<std::uint32_t> realloc_fail =
+  vkc::Result<std::uint32_t> realloc_fail =
       map.allocate(corners.data(), static_cast<std::uint32_t>(corners.size()));
   CHECK(realloc_fail.ok() && realloc_fail.value() == 0);
-  vr::Result<std::set<Coord>> restored = active_set(map);
+  vkc::Result<std::set<Coord>> restored = active_set(map);
   CHECK(restored.ok());
   CHECK(restored.value() == want_all);
-  vr::Result<std::set<std::int32_t>> ptrs_after = active_ptrs(map);
+  vkc::Result<std::set<std::int32_t>> ptrs_after = active_ptrs(map);
   CHECK(ptrs_after.ok());
   CHECK(ptrs_after.value() == ptrs_before.value());
 
@@ -237,22 +241,22 @@ int main() {
   // cached block list valid.
   auto kept = map.compact_active_blocks_on_device();
   CHECK(kept.ok());
-  const vr::Buffer empty;
+  const vkc::Buffer empty;
   CHECK(map.remove(empty, 0).ok());
   CHECK(map.remove(device_list.value(), 0).ok());
   CHECK(map.remove(corners.data(), 0).ok());
   CHECK(map.remove(empty, 1).status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
   CHECK(map.remove(device_list.value(), device_count + 2).status().domain() ==
-        vr::Status::Code::InvalidArgument);
-  vr::BufferDesc transfer_desc;
+        vkc::Status::Code::InvalidArgument);
+  vkc::BufferDesc transfer_desc;
   transfer_desc.size = sizeof(vol::BlockIndex);
   transfer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  transfer_desc.memory = vr::MemoryUsage::DeviceOnly;
+  transfer_desc.memory = vkc::MemoryUsage::DeviceOnly;
   auto transfer_only = allocator.value().create_buffer(transfer_desc);
   CHECK(transfer_only.ok());
   CHECK(map.remove(transfer_only.value(), 1).status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
   CHECK(map.check_device_block_list(kept.value(), "test").ok());
 
   // Thousands of blocks freed in one call all go back to the heap, and are
@@ -264,7 +268,7 @@ int main() {
     wide.bucket_size = 8;
     wide.num_buckets = 4096;
     wide.num_blocks = 8 * 4096;
-    vr::Result<vol::VoxelHashMap> made =
+    vkc::Result<vol::VoxelHashMap> made =
         vol::VoxelHashMap::create(device.value(), allocator.value(), wide);
     CHECK(made.ok());
     vol::VoxelHashMap big = std::move(made).value();
@@ -282,7 +286,7 @@ int main() {
       std::uint32_t left = 1;
       for (int pass = 0; pass < 8 && left != 0; ++pass) {
         vol::AllocFailures failures{};
-        vr::Result<std::uint32_t> r = big.allocate(
+        vkc::Result<std::uint32_t> r = big.allocate(
             blocks.data(), std::uint32_t(blocks.size()), &failures);
         if (!r || failures.capacity_limited()) return false;
         left = r.value();
@@ -290,7 +294,7 @@ int main() {
       return left == 0;
     };
     const auto occupancy_is = [&](float want) {
-      vr::Result<float> occupancy = big.load_factor();
+      vkc::Result<float> occupancy = big.load_factor();
       return occupancy.ok() && occupancy.value() == want;
     };
     CHECK(place(slab));
@@ -298,14 +302,14 @@ int main() {
         device.value(), allocator.value(), half.data(),
         half.size() * sizeof(vol::BlockIndex));
     CHECK(half_on_device.ok());
-    vr::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
+    vkc::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
     for (int cycle = 0; cycle < 3; ++cycle) {
       // One call removes them all: a retry round skips what earlier rounds
       // removed, and contention alone never ends the rounds. Lost blocks
       // (terminal) and blocks left behind fail on separate lines.
       vol::AllocFailures failures{};
-      vr::Result<std::uint32_t> removed =
+      vkc::Result<std::uint32_t> removed =
           cycle % 2 == 0
               ? big.remove(half_on_device.value(), std::uint32_t(half.size()),
                            &failures)
@@ -317,7 +321,7 @@ int main() {
       CHECK(place(half));
       CHECK(occupancy_is(0.5f));
       // The heap is LIFO, so the freed blocks come back, each to one coord.
-      vr::Result<std::set<std::int32_t>> ptrs = active_ptrs(big);
+      vkc::Result<std::set<std::int32_t>> ptrs = active_ptrs(big);
       CHECK(ptrs.ok() && ptrs.value() == slab_ptrs.value());
     }
   }
@@ -333,7 +337,7 @@ int main() {
     one.bucket_size = 8;
     one.num_buckets = 1;
     one.num_blocks = 8;
-    vr::Result<vol::VoxelHashMap> made =
+    vkc::Result<vol::VoxelHashMap> made =
         vol::VoxelHashMap::create(device.value(), allocator.value(), one);
     CHECK(made.ok());
     vol::VoxelHashMap tight = std::move(made).value();
@@ -345,8 +349,9 @@ int main() {
     const auto settle = [&](bool remove) {
       std::uint32_t left = 1;
       for (int pass = 0; pass < 8 && left != 0; ++pass) {
-        vr::Result<std::uint32_t> r = remove ? tight.remove(coords.data(), 8)
-                                             : tight.allocate(coords.data(), 8);
+        vkc::Result<std::uint32_t> r = remove
+                                           ? tight.remove(coords.data(), 8)
+                                           : tight.allocate(coords.data(), 8);
         if (!r) return false;
         left = r.value();
       }
@@ -354,14 +359,14 @@ int main() {
     };
     CHECK(settle(false));
     vol::AllocFailures failures{};
-    vr::Result<std::uint32_t> left = tight.remove(
+    vkc::Result<std::uint32_t> left = tight.remove(
         coords.data(), static_cast<std::uint32_t>(coords.size()), &failures);
     CHECK(left.ok());
     CHECK(failures.lock == left.value());
     CHECK(failures.terminal == 0);
     // Nothing was lost: the blocks still allocated remove, and free the heap.
     CHECK(settle(true));
-    vr::Result<float> occupancy = tight.load_factor();
+    vkc::Result<float> occupancy = tight.load_factor();
     CHECK(occupancy.ok() && occupancy.value() == 0.0f);
   }
 

@@ -18,13 +18,15 @@
 #include "codec_frames.hpp"
 #include "device_frame_reader.hpp"
 #include "device_frame_writer.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/command_batch.hpp"
-#include "volumetric_kit/recon/core/compute_util.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
 using codec_frames::Lcg;
@@ -47,9 +49,9 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 int same_read(d::DeviceFrameReader& reader,
               const std::vector<std::uint8_t>& bytes,
               std::string* refusal = nullptr) {
-  const vr::Result<d::IntraFrame> host =
+  const vkc::Result<d::IntraFrame> host =
       d::read_intra_frame(bytes.data(), bytes.size(), kMaxBlocks);
-  const vr::Result<d::IntraFrame> device =
+  const vkc::Result<d::IntraFrame> device =
       reader.read(bytes.data(), bytes.size(), kMaxBlocks);
   if (host.ok() != device.ok() ||
       (!host.ok() && host.status().message() != device.status().message())) {
@@ -79,9 +81,9 @@ int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
                const d::IntraFrame& frame, std::uint32_t segment_size) {
   d::FrameWriteOptions options;
   options.segment_size = segment_size;
-  const vr::Result<std::vector<std::uint8_t>> host =
+  const vkc::Result<std::vector<std::uint8_t>> host =
       d::write_intra_frame(frame, options);
-  const vr::Result<std::vector<std::uint8_t>> device =
+  const vkc::Result<std::vector<std::uint8_t>> device =
       writer.write(frame, options);
   CHECK(host.ok());
   if (!device.ok()) {
@@ -147,7 +149,7 @@ int corruption_case(d::DeviceFrameReader& reader) {
   int corrupt = 0;
   int order = 0;
   for (const std::vector<std::uint8_t>& good : frames) {
-    const vr::Result<d::ParsedFrame> parsed =
+    const vkc::Result<d::ParsedFrame> parsed =
         d::parse_intra_frame(good.data(), good.size(), kMaxBlocks);
     CHECK(parsed.ok());
     const auto payload =
@@ -178,14 +180,14 @@ int corruption_case(d::DeviceFrameReader& reader) {
 // -32768, which the transform never writes but a rejected entry's stale
 // word can hold, is clamped into the model's 16 classes when counted: the
 // frame codes -32767 rather than counting past its table.
-int out_of_range_case(vr::Device& device, vr::Allocator& allocator,
+int out_of_range_case(vkc::Device& device, vkc::Allocator& allocator,
                       d::DeviceFrameWriter& writer) {
   const vr::volume::BlockIndex block{};
   const std::uint32_t masks[codec::kMaskWordsPerBlock] = {};
   const std::uint32_t coefficient = 0x8000u;  // K = 1
-  vr::Result<vr::Buffer> list = vr::device_storage_buffer(allocator, 16);
-  vr::Result<vr::Buffer> mask = vr::device_storage_buffer(allocator, 64);
-  vr::Result<vr::Buffer> coeff = vr::device_storage_buffer(allocator, 4);
+  vkc::Result<vkc::Buffer> list = vkc::device_storage_buffer(allocator, 16);
+  vkc::Result<vkc::Buffer> mask = vkc::device_storage_buffer(allocator, 64);
+  vkc::Result<vkc::Buffer> coeff = vkc::device_storage_buffer(allocator, 4);
   CHECK(list.ok() && mask.ok() && coeff.ok());
   d::ResidentBlocks blocks;
   blocks.list = &list.value();
@@ -193,7 +195,7 @@ int out_of_range_case(vr::Device& device, vr::Allocator& allocator,
   blocks.coefficients = &coeff.value();
   blocks.count = 1;
   blocks.coefficient_count = 1;
-  vr::CommandBatch batch(device, allocator);
+  vkc::CommandBatch batch(device, allocator);
   CHECK(batch.upload(list.value(), 0, &block, sizeof(block)).ok());
   CHECK(batch.upload(mask.value(), 0, masks, sizeof(masks)).ok());
   CHECK(batch.upload(coeff.value(), 0, &coefficient, 4).ok());
@@ -201,10 +203,10 @@ int out_of_range_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(batch.submit().ok());
   codec::CodecParams params;
   params.coefficient_count = 1;
-  vr::Result<std::vector<std::uint8_t>> frame =
+  vkc::Result<std::vector<std::uint8_t>> frame =
       writer.finish(blocks, 0.005f, 0.04f, params);
   CHECK(frame.ok());
-  vr::Result<d::IntraFrame> read =
+  vkc::Result<d::IntraFrame> read =
       d::read_intra_frame(frame.value().data(), frame.value().size(), 1);
   CHECK(read.ok());
   CHECK(read.value().blocks.coefficients[0] == -codec::kMaxQuantizedMagnitude);
@@ -223,10 +225,10 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   CHECK(
       d::read_intra_frame(long_segment.data(), long_segment.size(), kMaxBlocks)
           .ok());
-  const vr::Result<d::IntraFrame> refused =
+  const vkc::Result<d::IntraFrame> refused =
       reader.read(long_segment.data(), long_segment.size(), kMaxBlocks);
   CHECK(!refused.ok());
-  CHECK(refused.status().domain() == vr::Status::Code::InvalidArgument);
+  CHECK(refused.status().domain() == vkc::Status::Code::InvalidArgument);
   // The header's segment size alone does not count: this frame's one
   // segment holds kLimit blocks.
   const std::vector<std::uint8_t> at_limit =
@@ -235,7 +237,7 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   return 0;
 }
 
-int refusals_case(vr::Device& device, vr::Allocator& allocator,
+int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
                   d::DeviceFrameWriter& writer) {
   d::IntraFrame f = make_frame(10, 8, 3);
   std::swap(f.coords[3], f.coords[4]);
@@ -244,7 +246,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   zero.segment_size = 0;
   CHECK(!writer.write(make_frame(10, 8, 3), zero).ok());
   // finish with nothing counted refuses rather than coding stale steps.
-  vr::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
+  vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
       d::DeviceFrameWriter::create(device, allocator);
   CHECK(fresh.ok());
   d::ResidentBlocks uncounted;
@@ -259,29 +261,29 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   CHECK(device.ok());
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   CHECK(allocator.ok());
-  vr::Result<std::unique_ptr<d::DeviceFrameWriter>> w =
+  vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> w =
       d::DeviceFrameWriter::create(device.value(), allocator.value());
   CHECK(w.ok());
-  vr::Result<std::unique_ptr<d::DeviceFrameReader>> r =
+  vkc::Result<std::unique_ptr<d::DeviceFrameReader>> r =
       d::DeviceFrameReader::create(device.value(), allocator.value());
   CHECK(r.ok());
   d::DeviceFrameWriter& writer = *w.value();

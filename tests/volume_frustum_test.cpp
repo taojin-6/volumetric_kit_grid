@@ -24,17 +24,19 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -78,28 +80,28 @@ int check_result(const std::vector<vol::BlockIndex>& blocks,
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -116,7 +118,7 @@ int main() {
   grid.num_blocks = 8192;
   grid.max_chain = 128;
 
-  vr::Result<vol::VoxelHashMap> map_result =
+  vkc::Result<vol::VoxelHashMap> map_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
@@ -143,12 +145,12 @@ int main() {
     b.coord = c;
     coords.push_back(b);
   }
-  vr::Result<std::uint32_t> fail =
+  vkc::Result<std::uint32_t> fail =
       map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
   CHECK(fail.ok() && fail.value() == 0);
 
   // Plain compaction: all six blocks are active.
-  vr::Result<std::vector<vol::BlockIndex>> all = map.compact_active_blocks();
+  vkc::Result<std::vector<vol::BlockIndex>> all = map.compact_active_blocks();
   CHECK(all.ok());
   CHECK(all.value().size() == 6);
 
@@ -158,7 +160,7 @@ int main() {
   const std::set<Coord> want = {{0, 0, 25}, {14, 0, 25}, {0, 0, 120}};
   const vol::FrustumPlanes planes = vol::make_frustum_planes(
       100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 0.1f, 5.0f, vr::Mat4f(1.0f));
-  vr::Result<std::vector<vol::BlockIndex>> visible =
+  vkc::Result<std::vector<vol::BlockIndex>> visible =
       map.compact_active_blocks_in_frustum(planes);
   CHECK(visible.ok());
   if (check_result(visible.value(), want) != 0) return 1;
@@ -175,7 +177,7 @@ int main() {
   cam.width = 100;
   cam.height = 100;
   cam.cam_to_world = vr::Mat4f(1.0f);
-  vr::Result<std::vector<vol::BlockIndex>> visible_cam =
+  vkc::Result<std::vector<vol::BlockIndex>> visible_cam =
       map.compact_active_blocks_in_frustum(cam);
   CHECK(visible_cam.ok());
   if (check_result(visible_cam.value(), want) != 0) return 1;
@@ -206,13 +208,13 @@ int main() {
     b.coord = c;
     pcoords.push_back(b);
   }
-  vr::Result<std::uint32_t> pfail =
+  vkc::Result<std::uint32_t> pfail =
       map.allocate(pcoords.data(), static_cast<std::uint32_t>(pcoords.size()));
   CHECK(pfail.ok() && pfail.value() == 0);
 
   vr::DepthCameraParams pcam = cam;
   pcam.cam_to_world = pose;
-  vr::Result<std::vector<vol::BlockIndex>> pvisible =
+  vkc::Result<std::vector<vol::BlockIndex>> pvisible =
       map.compact_active_blocks_in_frustum(pcam);
   CHECK(pvisible.ok());
   const std::set<Coord> pwant = {{75, 50, 75}};
@@ -252,7 +254,7 @@ int main() {
     b.coord = c;
     vp_coords.push_back(b);
   }
-  vr::Result<std::uint32_t> vfail = map.allocate(
+  vkc::Result<std::uint32_t> vfail = map.allocate(
       vp_coords.data(), static_cast<std::uint32_t>(vp_coords.size()));
   CHECK(vfail.ok() && vfail.value() == 0);
   // lookAtRH from the origin toward world +Z with up = world -Y. Camera right
@@ -274,7 +276,7 @@ int main() {
   // that one's built-in ~10% side widening, and this is what pins the
   // difference. kNearBand is kept: it is in front of the [0,1] near plane.
   const std::set<Coord> vp_want = {{0, 0, 25}, {0, 0, 120}, {0, 0, 3}};
-  vr::Result<std::vector<vol::BlockIndex>> vp_visible =
+  vkc::Result<std::vector<vol::BlockIndex>> vp_visible =
       map.compact_active_blocks_in_frustum(vol::make_frustum_planes(view_proj));
   CHECK(vp_visible.ok());
   if (check_result(vp_visible.value(), vp_want) != 0) return 1;
@@ -289,7 +291,7 @@ int main() {
       glm::perspectiveRH_NO(kFovY, 1.0f, 0.1f, 5.0f) * view;
   std::set<Coord> gl_want = vp_want;
   gl_want.erase({0, 0, 3});
-  vr::Result<std::vector<vol::BlockIndex>> vp_gl =
+  vkc::Result<std::vector<vol::BlockIndex>> vp_gl =
       map.compact_active_blocks_in_frustum(
           vol::make_frustum_planes(view_proj_gl));
   CHECK(vp_gl.ok());
@@ -302,7 +304,7 @@ int main() {
   // folded into the focal lengths, would not scale this way.
   const std::set<Coord> margin_want = {
       {0, 0, 25}, {14, 0, 25}, {0, 0, 120}, {0, 0, 3}};
-  vr::Result<std::vector<vol::BlockIndex>> vp_margin =
+  vkc::Result<std::vector<vol::BlockIndex>> vp_margin =
       map.compact_active_blocks_in_frustum(
           vol::make_frustum_planes(view_proj, 0.1f));
   CHECK(vp_margin.ok());
@@ -314,7 +316,7 @@ int main() {
   // behind the eye and well inside a 0.5 m lateral widening, so it survives if
   // and only if the near plane moved back with the rest. kBehind, 0.96 m back,
   // is outside the widening either way and cannot witness this.
-  vr::Result<std::vector<vol::BlockIndex>> vp_wide =
+  vkc::Result<std::vector<vol::BlockIndex>> vp_wide =
       map.compact_active_blocks_in_frustum(
           vol::make_frustum_planes(view_proj, 0.5f));
   CHECK(vp_wide.ok());
@@ -347,7 +349,7 @@ int main() {
   // everything, which is an empty mesh every frame with Status::ok. The
   // degenerate branch adds no margin, so this keeps every block instead --
   // conservative, and the direction a cull should fail in.
-  vr::Result<std::vector<vol::BlockIndex>> vp_degenerate =
+  vkc::Result<std::vector<vol::BlockIndex>> vp_degenerate =
       map.compact_active_blocks_in_frustum(
           vol::make_frustum_planes(vr::Mat4f(0.0f), -1e-7f));
   CHECK(vp_degenerate.ok());

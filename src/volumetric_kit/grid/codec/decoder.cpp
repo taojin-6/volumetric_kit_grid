@@ -11,9 +11,9 @@
 #include "dct_transform.hpp"
 #include "device_frame_reader.hpp"
 #include "entropy_choice.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/command_batch.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
 namespace volumetric_kit::recon::codec {
@@ -26,26 +26,27 @@ namespace {
 // already present, is left alone).
 constexpr int kRounds = 4;
 
-Status fail(const std::string& why) {
-  return Status::invalid_argument("Decoder::decode: " + why);
+core::Status fail(const std::string& why) {
+  return core::Status::invalid_argument("Decoder::decode: " + why);
 }
 
 // Every round's residue lost bucket-lock races over a table with room: not a
 // capacity limit, so the answer is to decode again, and a resize would double
 // every attribute array for nothing (see volume::AllocFailures).
-Status contended(const char* doing, std::uint32_t blocks) {
-  return Status::io_error("Decoder::decode: " + std::to_string(blocks) +
-                          " blocks lost bucket-lock races in every round of " +
-                          doing +
-                          ", over a table with room for them; decode again "
-                          "(a resize would not help)");
+core::Status contended(const char* doing, std::uint32_t blocks) {
+  return core::Status::io_error(
+      "Decoder::decode: " + std::to_string(blocks) +
+      " blocks lost bucket-lock races in every round of " + doing +
+      ", over a table with room for them; decode again "
+      "(a resize would not help)");
 }
 
 }  // namespace
 
-Result<FrameInfo> read_frame_info(const std::uint8_t* data, std::size_t size) {
-  VR_ASSIGN(const detail::FrameHeader header,
-            detail::read_frame_header(data, size));
+core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
+                                        std::size_t size) {
+  VKC_ASSIGN(const detail::FrameHeader header,
+             detail::read_frame_header(data, size));
   FrameInfo info;
   info.voxel_size = header.voxel_size;
   info.trunc_dist = header.trunc_dist;
@@ -61,44 +62,46 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept = default;
 
 bool Decoder::valid() const noexcept { return transform_ != nullptr; }
 
-Result<Decoder> Decoder::create(Device& device, Allocator& allocator,
-                                const DecoderConfig& config) {
+core::Result<Decoder> Decoder::create(core::Device& device,
+                                      core::Allocator& allocator,
+                                      const DecoderConfig& config) {
   Decoder d;
   d.config_ = config;
   d.device_ = &device;
   d.allocator_ = &allocator;
-  VR_ASSIGN(d.transform_, detail::DctTransform::create(device, allocator));
+  VKC_ASSIGN(d.transform_, detail::DctTransform::create(device, allocator));
   // kAuto builds the reader at its first device frame, which a small scene
   // never reaches.
-  if (config.entropy == EntropyCoding::kDevice) VR_TRY(d.ensure_reader());
-  VR_ASSIGN(d.gpu_timer_, GpuTimer::create(device));
+  if (config.entropy == EntropyCoding::kDevice) VKC_TRY(d.ensure_reader());
+  VKC_ASSIGN(d.gpu_timer_, core::GpuTimer::create(device));
   return d;
 }
 
-Status Decoder::ensure_reader() {
+core::Status Decoder::ensure_reader() {
   if (reader_ != nullptr) return {};
   // A build that failed fails again, so it is tried once.
   if (!reader_failure_.ok()) return reader_failure_;
-  Result<std::unique_ptr<detail::DeviceFrameReader>> reader =
+  core::Result<std::unique_ptr<detail::DeviceFrameReader>> reader =
       detail::DeviceFrameReader::create(*device_, *allocator_);
   if (!reader.ok()) return reader_failure_ = reader.status();
   reader_ = std::move(reader).value();
   return {};
 }
 
-Result<detail::ResidentBlocks> Decoder::decode_on_device(
-    const detail::ParsedFrame& frame, GpuStageScope& stage) {
-  CommandBatch batch(*device_, *allocator_);
-  VR_ASSIGN(const detail::ResidentBlocks resident,
-            reader_->record_decode(batch, frame, &stage));
-  VR_TRY(batch.submit());
+core::Result<detail::ResidentBlocks> Decoder::decode_on_device(
+    const detail::ParsedFrame& frame, core::GpuStageScope& stage) {
+  core::CommandBatch batch(*device_, *allocator_);
+  VKC_ASSIGN(const detail::ResidentBlocks resident,
+             reader_->record_decode(batch, frame, &stage));
+  VKC_TRY(batch.submit());
   return resident;
 }
 
-Status Decoder::decode(const std::uint8_t* data, std::size_t size,
-                       volume::VoxelBlockGrid& grid, StageMetrics* metrics) {
+core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
+                             volume::VoxelBlockGrid& grid,
+                             core::StageMetrics* metrics) {
   // Before any refusal, so a refused call still costs its row.
-  GpuStageScope stage(metrics, gpu_timer_, "codec decode");
+  core::GpuStageScope stage(metrics, gpu_timer_, "codec decode");
   if (!valid()) {
     return fail("moved-from decoder");
   }
@@ -115,7 +118,7 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
         std::to_string(gp.block_size));
   }
   for (const char* name : {"tsdf", "weight"}) {
-    VR_ASSIGN(const volume::AttributeView view, grid.attribute(name));
+    VKC_ASSIGN(const volume::AttributeView view, grid.attribute(name));
     if (view.element_size != sizeof(float)) {
       return fail(std::string("the grid's ") + name + " is not a 4-byte float");
     }
@@ -133,8 +136,8 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // geometry would decode into the wrong place at the wrong scale and say OK.
   // Read off the header, before the frame is decoded, so such a frame is
   // never mistaken for one the grid is too small for.
-  VR_ASSIGN(const detail::FrameHeader header,
-            detail::read_frame_header(data, size));
+  VKC_ASSIGN(const detail::FrameHeader header,
+             detail::read_frame_header(data, size));
   if (header.voxel_size != gp.voxel_size ||
       header.trunc_dist != gp.trunc_dist) {
     return fail("the frame's geometry (voxel_size " +
@@ -154,16 +157,16 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     // The whole frame, entropy-decoded: a corrupt one is refused here, with
     // the grid untouched. The heap bounds the block count the reader will
     // allocate for, so a frame the grid cannot hold is refused here too.
-    StageScope read(metrics, "  ..rans decode");
-    auto too_big = [](const Status& s) {
-      return s.domain() != Status::Code::OutOfMemory
+    core::StageScope read(metrics, "  ..rans decode");
+    auto too_big = [](const core::Status& s) {
+      return s.domain() != core::Status::Code::OutOfMemory
                  ? s
-                 : Status::out_of_memory(
+                 : core::Status::out_of_memory(
                        "Decoder::decode: " + s.message() +
                        " (the grid's num_blocks); grow it with "
                        "VoxelBlockGrid::resize and decode again");
     };
-    Result<detail::ParsedFrame> parsed = detail::parse_intra_frame(
+    core::Result<detail::ParsedFrame> parsed = detail::parse_intra_frame(
         data, size, static_cast<std::uint32_t>(gp.num_blocks));
     if (!parsed.ok()) return too_big(parsed.status());
     const std::size_t segments = parsed.value().segment_lengths.size();
@@ -172,10 +175,10 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     if (detail::codes_on_device(config_.entropy, segments,
                                 kMinDeviceDecodeSegments) &&
         ensure_reader().ok()) {
-      Result<detail::ResidentBlocks> r =
+      core::Result<detail::ResidentBlocks> r =
           decode_on_device(parsed.value(), stage);
       if (r.ok()) {
-        VR_TRY(reader_->check());
+        VKC_TRY(reader_->check());
         resident = r.value();
         on_device = true;
       } else if (!detail::retry_on_host(config_.entropy, r.status())) {
@@ -183,7 +186,7 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
       }
     }
     if (!on_device) {
-      Result<detail::IntraFrame> r =
+      core::Result<detail::IntraFrame> r =
           detail::decode_intra_frame(std::move(parsed).value());
       if (!r.ok()) return too_big(r.status());
       detail::IntraFrame frame = std::move(r).value();
@@ -210,10 +213,10 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // Blocks in both are kept in their slots, and their tsdf/weight are
   // rewritten in full below, so nothing of the previous frame survives in
   // them.
-  VR_ASSIGN(std::vector<volume::BlockIndex> current,
-            grid.map().compact_active_blocks(metrics));
+  VKC_ASSIGN(std::vector<volume::BlockIndex> current,
+             grid.map().compact_active_blocks(metrics));
   {
-    StageScope apply(metrics, "  ..apply");
+    core::StageScope apply(metrics, "  ..apply");
     detail::sort_by_coord(current);
     std::vector<volume::BlockIndex> gone;
     std::vector<volume::BlockIndex> missing;
@@ -234,7 +237,7 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     }
     for (int round = 0; !gone.empty(); ++round) {
       volume::AllocFailures failures;
-      VR_ASSIGN(
+      VKC_ASSIGN(
           const std::uint32_t failed,
           grid.remove(gone.data(), static_cast<std::uint32_t>(gone.size()),
                       &failures));
@@ -257,15 +260,15 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     }
     for (int round = 0; !missing.empty(); ++round) {
       volume::AllocFailures failures;
-      VR_ASSIGN(const std::uint32_t failed,
-                grid.map().allocate(missing.data(),
-                                    static_cast<std::uint32_t>(missing.size()),
-                                    &failures));
+      VKC_ASSIGN(const std::uint32_t failed,
+                 grid.map().allocate(missing.data(),
+                                     static_cast<std::uint32_t>(missing.size()),
+                                     &failures));
       if (failed == 0) {
         break;
       }
       if (failures.capacity_limited()) {
-        return Status::out_of_memory(
+        return core::Status::out_of_memory(
             "Decoder::decode: the grid's hash table cannot place " +
             std::to_string(failed) + " of the frame's " +
             std::to_string(frame_blocks.size()) +
@@ -282,7 +285,7 @@ Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // the slots the allocation drew need not be read back, and a frame block
   // the grid does not hold -- a grid changed under this call -- is refused
   // there rather than written.
-  StageScope inverse(metrics, "  ..inverse");
+  core::StageScope inverse(metrics, "  ..inverse");
   if (on_device) {
     return transform_->inverse(grid, resident, header.params, &stage);
   }

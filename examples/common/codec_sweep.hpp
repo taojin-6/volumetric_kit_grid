@@ -23,6 +23,8 @@
 
 namespace vr_example {
 
+namespace vkc = volumetric_kit::core;
+
 /// One configuration of the sweep.
 struct SweepConfig {
   const char* family;
@@ -67,16 +69,17 @@ inline std::vector<SweepConfig> sweep_configs() {
 ///                entropy coding and segment size, and sets the params.
 /// @param player  The grid to decode into: a stream's player, already built
 ///                for this geometry (it grows if a frame needs it).
-inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
-                                  vr::volume::VoxelBlockGrid& source,
-                                  const vr::eval::ReferenceMesh& reference,
-                                  vr::mesh::MarchingCubes& extractor,
-                                  const vr::codec::EncoderConfig& base,
-                                  vr::volume::VoxelBlockGrid& player) {
+inline vkc::Status run_codec_sweep(vkc::Device& device,
+                                   vkc::Allocator& allocator,
+                                   vr::volume::VoxelBlockGrid& source,
+                                   const vr::eval::ReferenceMesh& reference,
+                                   vr::mesh::MarchingCubes& extractor,
+                                   const vr::codec::EncoderConfig& base,
+                                   vr::volume::VoxelBlockGrid& player) {
   vr::codec::DecoderConfig dc;
   dc.entropy = base.entropy;
-  VR_ASSIGN(vr::codec::Decoder dec,
-            vr::codec::Decoder::create(device, allocator, dc));
+  VKC_ASSIGN(vr::codec::Decoder dec,
+             vr::codec::Decoder::create(device, allocator, dc));
   int grows = 0;
   const float tau = reference.options().fscore_threshold;
   if (tau > 0.0f) {
@@ -100,32 +103,32 @@ inline vr::Status run_codec_sweep(vr::Device& device, vr::Allocator& allocator,
     ec.params = vr::codec::CodecParams{};
     ec.params.coefficient_count = cfg.k;
     ec.params.quantization_scale = cfg.scale;
-    VR_TRY(apply_quantization_table(ec.params, cfg.family));
-    VR_ASSIGN(vr::codec::Encoder enc,
-              vr::codec::Encoder::create(device, allocator, ec));
-    VR_ASSIGN(const Bytes warm, enc.encode(source));
-    VR_TRY(decode_growing(dec, warm, player, nullptr, &grows));
+    VKC_TRY(apply_quantization_table(ec.params, cfg.family));
+    VKC_ASSIGN(vr::codec::Encoder enc,
+               vr::codec::Encoder::create(device, allocator, ec));
+    VKC_ASSIGN(const Bytes warm, enc.encode(source));
+    VKC_TRY(decode_growing(dec, warm, player, nullptr, &grows));
 
-    vr::StageMetrics enc_rows;
-    vr::StageMetrics dec_rows;
+    vkc::StageMetrics enc_rows;
+    vkc::StageMetrics dec_rows;
     constexpr int kTimedRounds = 3;
     Bytes frame;
     for (int repeat = 0; repeat < kTimedRounds; ++repeat) {
-      VR_ASSIGN(frame, enc.encode(source, &enc_rows));
-      VR_TRY(decode_growing(dec, frame, player, &dec_rows, &grows));
+      VKC_ASSIGN(frame, enc.encode(source, &enc_rows));
+      VKC_TRY(decode_growing(dec, frame, player, &dec_rows, &grows));
     }
-    VR_ASSIGN(const vr::codec::FrameInfo info,
-              vr::codec::read_frame_info(frame.data(), frame.size()));
-    VR_ASSIGN(const vr::mesh::Mesh decoded, extractor.extract_host(player));
-    VR_ASSIGN(const vr::eval::MeshComparison c, reference.compare(decoded));
+    VKC_ASSIGN(const vr::codec::FrameInfo info,
+               vr::codec::read_frame_info(frame.data(), frame.size()));
+    VKC_ASSIGN(const vr::mesh::Mesh decoded, extractor.extract_host(player));
+    VKC_ASSIGN(const vr::eval::MeshComparison c, reference.compare(decoded));
     const double per_block =
         info.block_count > 0 ? double(frame.size()) / info.block_count : 0.0;
     char f[16] = "-";  // not measured, which a 0 would misread as
     if (tau > 0.0f) {
       std::snprintf(f, sizeof f, "%.4f", c.fscore.f);
     }
-    const auto gpu_ms = [](const vr::StageMetrics& rows, const char* name) {
-      for (const vr::StageRow& r : rows.rows()) {
+    const auto gpu_ms = [](const vkc::StageMetrics& rows, const char* name) {
+      for (const vkc::StageRow& r : rows.rows()) {
         if (std::strcmp(r.name, name) == 0 && r.has_gpu) return r.gpu_ms;
       }
       return -1.0;

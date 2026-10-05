@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/io/assimp_export.hpp"
 
 namespace volumetric_kit::recon::io {
@@ -53,6 +53,6 @@ struct TriangleMesh {
 ///         morphs or non-triangle primitives; IoError for import/read failures;
 ///         OutOfMemory for allocation failure or geometry exceeding 32-bit
 ///         indexing.
-VR_IO_ASSIMP_API Result<TriangleMesh> load_mesh(const std::string& path);
+VR_IO_ASSIMP_API core::Result<TriangleMesh> load_mesh(const std::string& path);
 
 }  // namespace volumetric_kit::recon::io

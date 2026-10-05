@@ -12,7 +12,7 @@
 #include <limits>
 #include <type_traits>
 
-#include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/core/base/result.hpp"
 
 namespace volumetric_kit::recon::volume {
 
@@ -52,9 +52,9 @@ struct VoxelGridParams {
   /// rather than per-call on the device hot path; @ref defaults always passes.
   /// The two precomputed fields (`voxels_per_block`, `num_blocks`) are checked
   /// against their defining products so a stale value cannot slip through.
-  /// @return An OK @ref Status when every field is valid, otherwise
-  ///         @ref Status::invalid_argument naming the offending field.
-  Status validate() const;
+  /// @return An OK `Status` when every field is valid, otherwise
+  ///         `Status::invalid_argument` naming the offending field.
+  core::Status validate() const;
 };
 
 // All-scalar, tightly packed: pin the size + offsets so the struct stays the
@@ -95,7 +95,7 @@ constexpr VoxelGridParams VoxelGridParams::defaults() {
   };
 }
 
-inline Status VoxelGridParams::validate() const {
+inline core::Status VoxelGridParams::validate() const {
   // `!(x > 0)` rather than `x <= 0` so a NaN is rejected too: every comparison
   // with a NaN is false, so `<= 0` lets one straight through. It is not a
   // theoretical input -- a metric derived from a sensor's intrinsics is one
@@ -105,10 +105,12 @@ inline Status VoxelGridParams::validate() const {
   // full-size mesh the renderer simply does not draw. Same shape for
   // trunc_dist below, and for every float this struct validates.
   if (!(voxel_size > 0.0f)) {
-    return Status::invalid_argument("VoxelGridParams: voxel_size must be > 0");
+    return core::Status::invalid_argument(
+        "VoxelGridParams: voxel_size must be > 0");
   }
   if (block_size <= 0) {
-    return Status::invalid_argument("VoxelGridParams: block_size must be > 0");
+    return core::Status::invalid_argument(
+        "VoxelGridParams: block_size must be > 0");
   }
   // Bound the edge *before* cubing it. `voxels_per_block` is a signed 32-bit
   // int, so the largest edge whose cube can be represented is 1290 (1291^3
@@ -118,16 +120,17 @@ inline Status VoxelGridParams::validate() const {
   // `voxels_per_block == 0` passes and every block then aliases pointer 0.
   constexpr std::int32_t kMaxBlockSize = 1290;
   if (block_size > kMaxBlockSize) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "VoxelGridParams: block_size must be <= 1290 (block_size^3 must fit a "
         "signed 32-bit voxels_per_block)");
   }
   if (voxels_per_block != block_size * block_size * block_size) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "VoxelGridParams: voxels_per_block must equal block_size^3");
   }
   if (!(trunc_dist > 0.0f)) {
-    return Status::invalid_argument("VoxelGridParams: trunc_dist must be > 0");
+    return core::Status::invalid_argument(
+        "VoxelGridParams: trunc_dist must be > 0");
   }
   // Two, not one. The last entry of each bucket is that bucket's chain anchor,
   // so at bucket_size == 1 *every* slot in the table is an anchor and there is
@@ -138,13 +141,14 @@ inline Status VoxelGridParams::validate() const {
   // hash together fail permanently, and a caller reads that as capacity
   // pressure and grows the volume until it runs out of memory.
   if (bucket_size < 2) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "VoxelGridParams: bucket_size must be >= 2 (the last entry of each "
         "bucket is its chain anchor, so a 1-entry bucket has no room for an "
         "overflow chain)");
   }
   if (num_buckets <= 0) {
-    return Status::invalid_argument("VoxelGridParams: num_buckets must be > 0");
+    return core::Status::invalid_argument(
+        "VoxelGridParams: num_buckets must be > 0");
   }
   // Widened, because the narrow product wraps exactly as the uint32 multiply
   // that produced `num_blocks` in VoxelHashMap::resize does -- so both sides
@@ -153,7 +157,7 @@ inline Status VoxelGridParams::validate() const {
   // positive int32 by the checks above, so their int64 product cannot
   // overflow.)
   if (static_cast<std::int64_t>(bucket_size) * num_buckets != num_blocks) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "VoxelGridParams: num_blocks must equal bucket_size * num_buckets");
   }
   // A block pointer is block_idx * voxels_per_block held as a signed 32-bit int
@@ -163,12 +167,13 @@ inline Status VoxelGridParams::validate() const {
   // rejected before it mutates the live map.)
   if (static_cast<std::int64_t>(num_blocks) * voxels_per_block >
       std::numeric_limits<std::int32_t>::max()) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "VoxelGridParams: num_blocks * voxels_per_block must fit a signed "
         "32-bit block pointer");
   }
   if (max_chain <= 0) {
-    return Status::invalid_argument("VoxelGridParams: max_chain must be > 0");
+    return core::Status::invalid_argument(
+        "VoxelGridParams: max_chain must be > 0");
   }
   return {};
 }

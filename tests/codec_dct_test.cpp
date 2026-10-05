@@ -24,18 +24,20 @@
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
 #include "grid_readback.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/command_batch.hpp"
-#include "volumetric_kit/recon/core/compute_util.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
 using codec::detail::DctBlocks;
@@ -78,8 +80,8 @@ vol::VoxelGridParams small_grid(std::int32_t block_size = codec::kBlockSize) {
   return gp;
 }
 
-vr::Result<vol::VoxelBlockGrid> make_grid(
-    vr::Device& device, vr::Allocator& allocator,
+vkc::Result<vol::VoxelBlockGrid> make_grid(
+    vkc::Device& device, vkc::Allocator& allocator,
     std::int32_t block_size = codec::kBlockSize, bool with_weight = true) {
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
@@ -89,20 +91,20 @@ vr::Result<vol::VoxelBlockGrid> make_grid(
 
 // Allocate blocks (i, 0, 0) for i in [0, count) and return the compacted set
 // sorted by x, so entry i is block i whatever order the compaction produced.
-vr::Result<std::vector<vol::BlockIndex>> allocate_row(vol::VoxelBlockGrid& grid,
-                                                      int count) {
+vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
+    vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) {
     coords[static_cast<std::size_t>(i)].coord = vr::Vec3i(i, 0, 0);
   }
-  VR_ASSIGN(std::uint32_t failed,
-            grid.map().allocate(coords.data(),
-                                static_cast<std::uint32_t>(coords.size())));
+  VKC_ASSIGN(std::uint32_t failed,
+             grid.map().allocate(coords.data(),
+                                 static_cast<std::uint32_t>(coords.size())));
   if (failed != 0) {
-    return vr::Status::invalid_argument("allocate_row: allocation failed");
+    return vkc::Status::invalid_argument("allocate_row: allocation failed");
   }
-  VR_ASSIGN(std::vector<vol::BlockIndex> active,
-            grid.map().compact_active_blocks());
+  VKC_ASSIGN(std::vector<vol::BlockIndex> active,
+             grid.map().compact_active_blocks());
   std::sort(active.begin(), active.end(),
             [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
               return a.coord.x < b.coord.x;
@@ -328,13 +330,13 @@ int check_against_reference(const DctBlocks& out, const Cube* content,
 
 // The kernel computes the reference's coefficients (see
 // check_against_reference), over content from white noise to a constant.
-int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
-                                   DctTransform& t) {
+int forward_matches_reference_case(vkc::Device& device,
+                                   vkc::Allocator& allocator, DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
   CHECK(active.ok() && active.value().size() == 4);
   const std::vector<vol::BlockIndex>& blocks = active.value();
   const Cube content[4] = {random_cube(1), plane_cube(), sphere_cube(),
@@ -388,13 +390,13 @@ int forward_matches_reference_case(vr::Device& device, vr::Allocator& allocator,
 // Independently placed x/y/z basis coefficients make canonical indexing
 // observable: zigzag begins [0, 64, 8, 1], not [0, 1, 2, 3]. Reuse one live
 // transform with A, B, then A again to catch a stale per-call table upload.
-int per_basis_sequence_case(vr::Device& device, vr::Allocator& allocator,
+int per_basis_sequence_case(vkc::Device& device, vkc::Allocator& allocator,
                             DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   const vol::BlockList list = grid.block_list(active.value());
@@ -450,13 +452,13 @@ int per_basis_sequence_case(vr::Device& device, vr::Allocator& allocator,
 // Orthonormal, so the reconstruction error's norm IS the quantization error's
 // norm: with all 512 coefficients kept, each off by at most half its step,
 // a block's RMS error is at most sqrt(sum_j (step[j]/2)^2 / 512).
-int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
+int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
                           DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   Cube content[4];
@@ -500,14 +502,14 @@ int round_trip_bound_case(vr::Device& device, vr::Allocator& allocator,
 // so the kernel pair's RMS error at each K must match what the reference's
 // coefficients predict -- which is what pins both kernels to one zigzag order
 // and one prefix. Steps at the floor keep quantization out of the picture.
-int truncation_matches_reference_case(vr::Device& device,
-                                      vr::Allocator& allocator,
+int truncation_matches_reference_case(vkc::Device& device,
+                                      vkc::Allocator& allocator,
                                       DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   const Cube content = plane_cube();
@@ -546,12 +548,12 @@ int truncation_matches_reference_case(vr::Device& device,
 // of the reference fill over it -- nothing at all for a block with no observed
 // voxel -- and the inverse writes an observed voxel as decoded and an
 // unobserved one as a fresh block holds it.
-int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
+int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 cycles through: none, below the threshold, at it, well above.
@@ -620,13 +622,13 @@ int mask_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
 
 // A constant block is DC-only, and at the floor step a block saturated at +1
 // lands on the clamp's edge without being clamped from further out.
-int constant_case(vr::Device& device, vr::Allocator& allocator,
+int constant_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   write_block(ctx, grid, blocks[0], constant_cube(0.3), observed);
@@ -667,12 +669,13 @@ int constant_case(vr::Device& device, vr::Allocator& allocator,
 // edge reconstructed from few coefficients rings past it (a +-1 step along z
 // at K = 4 peaks near 1.26), and a decoded grid must not hand a later fuse or
 // a consumer SDF outside the band.
-int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
+int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
+               DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   Cube edge{};
@@ -717,13 +720,13 @@ int clamp_case(vr::Device& device, vr::Allocator& allocator, DctTransform& t) {
 // it, so zeros would decode with more than twice the error. Pinned to the
 // prior engine's K = 32 with DC 0.25 / AC 0.05, the case the fill was built
 // for, rather than to the defaults, which room0 moved.
-int partial_block_case(vr::Device& device, vr::Allocator& allocator,
+int partial_block_case(vkc::Device& device, vkc::Allocator& allocator,
                        DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   // A tilted surface, normalized over a band of 4 voxels.
@@ -777,13 +780,13 @@ int partial_block_case(vr::Device& device, vr::Allocator& allocator,
 }
 
 // Output follows the list, not the ptrs: permuting the list permutes the rows.
-int order_follows_list_case(vr::Device& device, vr::Allocator& allocator,
+int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
                             DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
   CHECK(active.ok());
   std::vector<vol::BlockIndex> blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {
@@ -809,20 +812,20 @@ int order_follows_list_case(vr::Device& device, vr::Allocator& allocator,
 
 // A list longer than one dispatch's batch runs as several, with the same
 // result -- the path a list past maxComputeWorkGroupCount[0] takes.
-int batching_case(vr::Device& device, vr::Allocator& allocator,
+int batching_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
   DctTransformConfig small;
   small.max_blocks_per_dispatch = 3;
-  vr::Result<std::unique_ptr<DctTransform>> batched_r =
+  vkc::Result<std::unique_ptr<DctTransform>> batched_r =
       DctTransform::create(device, allocator, small);
   CHECK(batched_r.ok());
   DctTransform& batched = *batched_r.value();
 
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 10);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 10);
   CHECK(active.ok() && active.value().size() == 10);
   const std::vector<vol::BlockIndex>& blocks = active.value();
   std::vector<Cube> content;
@@ -886,13 +889,13 @@ std::int32_t free_ptr(const vol::VoxelBlockGrid& grid,
 // Every input the kernels would index unchecked is refused: the grid, the
 // params and the list's shape on the host, before anything is allocated, and
 // each entry's liveness on the device.
-int refusals_case(vr::Device& device, vr::Allocator& allocator,
+int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex> blocks = active.value();
   for (const vol::BlockIndex& b : blocks) {
@@ -991,7 +994,7 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   // Resident blocks the inverse cannot bind: missing buffers, or ones too
   // small for the count.
   {
-    vr::Result<vr::Buffer> small = vr::device_storage_buffer(allocator, 16);
+    vkc::Result<vkc::Buffer> small = vkc::device_storage_buffer(allocator, 16);
     CHECK(small.ok());
     codec::detail::ResidentBlocks resident;
     resident.count = std::uint32_t(blocks.size());
@@ -1008,31 +1011,31 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
   const vol::BlockList stale = grid.block_list(blocks);
   vol::BlockIndex gone{};
   gone.coord = blocks[0].coord;
-  vr::Result<std::uint32_t> removed = grid.remove(&gone, 1);
+  vkc::Result<std::uint32_t> removed = grid.remove(&gone, 1);
   CHECK(removed.ok());
   CHECK(!t.forward(grid, stale, params, out).ok());
   CHECK(!t.inverse(grid, stale, out).ok());
 
   // A grid with another block size.
-  vr::Result<vol::VoxelBlockGrid> g4 = make_grid(device, allocator, 4);
+  vkc::Result<vol::VoxelBlockGrid> g4 = make_grid(device, allocator, 4);
   CHECK(g4.ok());
   vol::VoxelBlockGrid grid4 = std::move(g4).value();
   std::vector<vol::BlockIndex> one(1);
   one[0].coord = vr::Vec3i(0, 0, 0);
   CHECK(grid4.map().allocate(one.data(), 1).ok());
-  vr::Result<std::vector<vol::BlockIndex>> active4 =
+  vkc::Result<std::vector<vol::BlockIndex>> active4 =
       grid4.map().compact_active_blocks();
   CHECK(active4.ok());
   CHECK(!t.forward(grid4, grid4.block_list(active4.value()), params, out).ok());
 
   // A grid without a weight attribute -- refused for an empty list too, before
   // anything is allocated, rather than only once there is work to bind.
-  vr::Result<vol::VoxelBlockGrid> gw =
+  vkc::Result<vol::VoxelBlockGrid> gw =
       make_grid(device, allocator, codec::kBlockSize, false);
   CHECK(gw.ok());
   vol::VoxelBlockGrid no_weight = std::move(gw).value();
   CHECK(no_weight.map().allocate(one.data(), 1).ok());
-  vr::Result<std::vector<vol::BlockIndex>> active_w =
+  vkc::Result<std::vector<vol::BlockIndex>> active_w =
       no_weight.map().compact_active_blocks();
   CHECK(active_w.ok());
   CHECK(
@@ -1046,13 +1049,13 @@ int refusals_case(vr::Device& device, vr::Allocator& allocator,
 // The observed pass keeps exactly the entries of the map's own list whose
 // block holds a voxel at or above kObservedWeight, with each original ptr,
 // and refuses a list the map has moved past. Append order is unspecified.
-int observed_case(vr::Device& device, vr::Allocator& allocator,
+int observed_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 all observed; 1 none; 2 one voxel at the threshold; 3 one voxel
@@ -1066,10 +1069,10 @@ int observed_case(vr::Device& device, vr::Allocator& allocator,
   write_block(ctx, grid, blocks[3], random_cube(4),
               [](std::uint32_t v) { return v == 7 ? 5e-7f : 0.0f; });
 
-  vr::Result<vol::DeviceBlockList> list =
+  vkc::Result<vol::DeviceBlockList> list =
       grid.map().compact_active_blocks_on_device();
   CHECK(list.ok() && list.value().count == 4);
-  vr::Result<std::vector<vol::BlockIndex>> kept =
+  vkc::Result<std::vector<vol::BlockIndex>> kept =
       t.observed(grid, list.value());
   CHECK(kept.ok());
   const auto by_x = [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
@@ -1112,12 +1115,12 @@ int observed_case(vr::Device& device, vr::Allocator& allocator,
   CHECK(!t.observed(grid, list.value()).ok());
 
   // An empty list keeps nothing.
-  vr::Result<vol::VoxelBlockGrid> e = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> e = make_grid(device, allocator);
   CHECK(e.ok());
-  vr::Result<vol::DeviceBlockList> none =
+  vkc::Result<vol::DeviceBlockList> none =
       e.value().map().compact_active_blocks_on_device();
   CHECK(none.ok());
-  vr::Result<std::vector<vol::BlockIndex>> nothing =
+  vkc::Result<std::vector<vol::BlockIndex>> nothing =
       t.observed(e.value(), none.value());
   CHECK(nothing.ok() && nothing.value().empty());
 
@@ -1152,7 +1155,7 @@ int observed_case(vr::Device& device, vr::Allocator& allocator,
 // Reuse scratch through count/K growth, shrink, odd padding and an empty
 // transform. Coefficients and inverse output must still match the independent
 // CPU reference; inverse must not touch a retained list's obsolete suffix.
-int scratch_reuse_case(vr::Device& device, vr::Allocator& allocator,
+int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
                        DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
   auto made = make_grid(device, allocator);
@@ -1214,13 +1217,13 @@ int scratch_reuse_case(vr::Device& device, vr::Allocator& allocator,
 // The inverse stamps changed only on a block it leaves different, as the
 // integrator does, so decoding a block's last frame again leaves it to an
 // incremental extract.
-int inverse_stamps_case(vr::Device& device, vr::Allocator& allocator,
+int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
                         DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  vr::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vr::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {
@@ -1262,37 +1265,37 @@ int inverse_stamps_case(vr::Device& device, vr::Allocator& allocator,
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
     return 1;
   }
-  vr::Device& dev = device.value();
-  vr::Allocator& alloc = allocator.value();
+  vkc::Device& dev = device.value();
+  vkc::Allocator& alloc = allocator.value();
 
-  vr::Result<std::unique_ptr<DctTransform>> t_r =
+  vkc::Result<std::unique_ptr<DctTransform>> t_r =
       DctTransform::create(dev, alloc);
   if (!t_r) {
     std::fprintf(stderr, "DctTransform::create failed: %s\n",

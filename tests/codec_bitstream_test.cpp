@@ -26,6 +26,7 @@
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
 
@@ -73,8 +74,8 @@ bool same_frame(const d::IntraFrame& a, const d::IntraFrame& b) {
          a.blocks.masks == b.blocks.masks;
 }
 
-vr::Result<d::IntraFrame> read(const std::vector<std::uint8_t>& bytes,
-                               std::uint32_t max_blocks = 1u << 20) {
+vkc::Result<d::IntraFrame> read(const std::vector<std::uint8_t>& bytes,
+                                std::uint32_t max_blocks = 1u << 20) {
   return d::read_intra_frame(bytes.data(), bytes.size(), max_blocks);
 }
 
@@ -83,13 +84,13 @@ vr::Result<d::IntraFrame> read(const std::vector<std::uint8_t>& bytes,
 int round_trip(const d::IntraFrame& f, std::uint32_t segment_size) {
   d::FrameWriteOptions opt;
   opt.segment_size = segment_size;
-  vr::Result<std::vector<std::uint8_t>> bytes = d::write_intra_frame(f, opt);
+  vkc::Result<std::vector<std::uint8_t>> bytes = d::write_intra_frame(f, opt);
   CHECK(bytes.ok());
-  vr::Result<d::IntraFrame> back =
+  vkc::Result<d::IntraFrame> back =
       read(bytes.value(), static_cast<std::uint32_t>(f.coords.size()));
   CHECK(back.ok());
   CHECK(same_frame(f, back.value()));
-  vr::Result<std::vector<std::uint8_t>> again =
+  vkc::Result<std::vector<std::uint8_t>> again =
       d::write_intra_frame(back.value(), opt);
   CHECK(again.ok());
   CHECK(again.value() == bytes.value());
@@ -288,9 +289,9 @@ std::vector<std::uint8_t> assemble(const std::vector<std::uint8_t>& frame,
   return b;
 }
 
-bool refused_as(const std::vector<std::uint8_t>& bytes, vr::Status::Code code,
+bool refused_as(const std::vector<std::uint8_t>& bytes, vkc::Status::Code code,
                 std::uint32_t max_blocks = 1u << 20) {
-  vr::Result<d::IntraFrame> r = read(bytes, max_blocks);
+  vkc::Result<d::IntraFrame> r = read(bytes, max_blocks);
   return !r.ok() && r.status().domain() == code;
 }
 
@@ -298,7 +299,7 @@ int header_refusals_case() {
   const d::IntraFrame f = make_frame(100, 16, 4);
   const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
   CHECK(read(good).ok());
-  using C = vr::Status::Code;
+  using C = vkc::Status::Code;
   std::vector<std::uint8_t> b;
 
   b = good;
@@ -382,7 +383,7 @@ int section_rules_case() {
   const std::vector<Section> s = sections_of(good);
   CHECK(s.size() == 3);
   CHECK(assemble(good, s) == good);  // the helpers are faithful
-  using C = vr::Status::Code;
+  using C = vkc::Status::Code;
 
   // Order does not matter.
   CHECK(read(assemble(good, {s[2], s[0], s[1]})).ok());
@@ -397,7 +398,7 @@ int section_rules_case() {
   // An unknown optional section is skipped; an unknown required one stops
   // the read.
   Section extra{9, 0, {1, 2, 3}};
-  vr::Result<d::IntraFrame> with_extra =
+  vkc::Result<d::IntraFrame> with_extra =
       read(assemble(good, {s[0], extra, s[1], s[2]}));
   CHECK(with_extra.ok());
   CHECK(same_frame(f, with_extra.value()));
@@ -445,7 +446,7 @@ int table_rules_case() {
   const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
   std::vector<Section> s = sections_of(good);
   CHECK(s[0].body == std::vector<std::uint8_t>(kModels, 0));
-  using C = vr::Status::Code;
+  using C = vkc::Status::Code;
   // @p head, then an empty table for each model it leaves.
   auto with_tables = [&](std::vector<std::uint8_t> head, std::size_t models) {
     head.insert(head.end(), kModels - models, 0);
@@ -514,7 +515,7 @@ int coord_overflow_case() {
   CHECK(read(good).ok());
   std::vector<Section> s = sections_of(good);
   set_first_x_low_bits(s[2].body, 0, 0xFFF);
-  vr::Result<d::IntraFrame> r = read(assemble(good, s));
+  vkc::Result<d::IntraFrame> r = read(assemble(good, s));
   CHECK(!r.ok());
   CHECK(r.status().message().find("outside int32") != std::string::npos);
   // The same patch one block earlier is merely a different, valid frame:
@@ -523,7 +524,7 @@ int coord_overflow_case() {
   const std::vector<std::uint8_t> one = d::write_intra_frame(f).value();
   s = sections_of(one);
   set_first_x_low_bits(s[2].body, 0, 0xFFF);
-  vr::Result<d::IntraFrame> moved = read(assemble(one, s));
+  vkc::Result<d::IntraFrame> moved = read(assemble(one, s));
   CHECK(moved.ok());
   CHECK(moved.value().coords[0].x == kMax32);
 
@@ -560,13 +561,13 @@ int segment_order_case() {
   };
   // A duplicate, and a step backwards: both refused.
   for (std::uint32_t x : {4u, 3u}) {
-    vr::Result<d::IntraFrame> r = with_second_x(x);
+    vkc::Result<d::IntraFrame> r = with_second_x(x);
     CHECK(!r.ok());
     CHECK(r.status().message().find("does not start after") !=
           std::string::npos);
   }
   // A step forwards is only a different, valid frame.
-  vr::Result<d::IntraFrame> r = with_second_x(9);
+  vkc::Result<d::IntraFrame> r = with_second_x(9);
   CHECK(r.ok());
   CHECK(r.value().coords[1] == vr::Vec3i(9, 0, 0));
   return 0;

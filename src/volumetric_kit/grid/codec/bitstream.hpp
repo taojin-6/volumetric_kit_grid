@@ -65,9 +65,9 @@
 
 #include "dct_blocks.hpp"
 #include "rans.hpp"
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
@@ -89,7 +89,7 @@ inline constexpr std::size_t kSectionEntryBytes = 8;
 /// frame rather than skip it.
 inline constexpr std::uint16_t kSectionRequired = 1;
 /// Every section flag v3 defines. A known section with any other bit set is
-/// refused as @ref Status::Code::Unsupported.
+/// refused as `Status::Code::Unsupported`.
 inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// Blocks per segment unless the writer is told otherwise: about 1% of a
 /// default frame in per-segment overhead, and room0's ~107 k blocks in ~1.7 k
@@ -166,8 +166,8 @@ struct FrameHeader {
 /// @brief Parse and check a frame's fixed header -- the first
 ///        @ref frame_header_bytes -- and nothing after it.
 /// @return The header, or the same header refusals as @ref read_intra_frame.
-VR_CODEC_API Result<FrameHeader> read_frame_header(const std::uint8_t* data,
-                                                   std::size_t size);
+VR_CODEC_API core::Result<FrameHeader> read_frame_header(
+    const std::uint8_t* data, std::size_t size);
 
 /// Writer options.
 struct FrameWriteOptions {
@@ -177,20 +177,20 @@ struct FrameWriteOptions {
 
 /// @brief The checks @ref write_intra_frame makes before coding anything.
 /// @return OK, or the same refusals as @ref write_intra_frame.
-VR_CODEC_API Status check_intra_frame(const IntraFrame& frame,
-                                      const FrameWriteOptions& options);
+VR_CODEC_API core::Status check_intra_frame(const IntraFrame& frame,
+                                            const FrameWriteOptions& options);
 
 /// @brief Serialize an intra frame.
-/// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
+/// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, arrays whose sizes disagree with `coords`, coordinates not
 ///         strictly increasing, a coefficient outside ±32767, a segment size
 ///         of 0, or a frame whose SEGMENTS or PAYLOAD would outgrow its u32
 ///         length (more than 2^30 - 1 segments, or 4 GiB of payload).
-///         @ref Status::Code::IoError only if the coder refuses a symbol its
+///         `Status::Code::IoError` only if the coder refuses a symbol its
 ///         own tables were counted from, which is a bug here, never the
 ///         input's.
-VR_CODEC_API Result<std::vector<std::uint8_t>> write_intra_frame(
+VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_intra_frame(
     const IntraFrame& frame, const FrameWriteOptions& options = {});
 
 /// @return How many frequency tables a frame keeping @p k coefficients
@@ -223,13 +223,13 @@ struct CodedFrame {
 /// @brief Lay out a coded frame: header, section table, TABLES, SEGMENTS and
 ///        PAYLOAD. Shared by the host and device writers, so their containers
 ///        cannot differ.
-/// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
+/// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, a segment size of 0, tables or segment lengths whose
 ///         count the block count and K disagree with, lengths that do not
 ///         sum to the payload, a payload past 4 GiB or more than 2^30 - 1
 ///         segments.
-VR_CODEC_API Result<std::vector<std::uint8_t>> assemble_intra_frame(
+VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_intra_frame(
     const CodedFrame& frame);
 
 /// @brief Parse and decode an intra frame.
@@ -247,18 +247,17 @@ VR_CODEC_API Result<std::vector<std::uint8_t>> assemble_intra_frame(
 ///                    block. Checked once the block count agrees with the
 ///                    segment table, so a corrupt count is refused as corrupt
 ///                    and only a sound frame is refused for its size.
-/// @return The frame, or: @ref Status::Code::Unsupported for another version,
+/// @return The frame, or: `Status::Code::Unsupported` for another version,
 ///         frame type, block size, an unknown required section, or a known
 ///         section with a flag v3 does not define;
-///         @ref Status::Code::InvalidArgument for anything malformed,
+///         `Status::Code::InvalidArgument` for anything malformed,
 ///         truncated or inconsistent (coordinates out of order across
-///         segments included); @ref Status::Code::OutOfMemory for a
+///         segments included); `Status::Code::OutOfMemory` for a
 ///         well-formed frame of more than @p max_blocks blocks, or one whose
 ///         arrays would not fit this platform's address space (reachable on a
 ///         32-bit build).
-VR_CODEC_API Result<IntraFrame> read_intra_frame(const std::uint8_t* data,
-                                                 std::size_t size,
-                                                 std::uint32_t max_blocks);
+VR_CODEC_API core::Result<IntraFrame> read_intra_frame(
+    const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks);
 
 /// @brief A frame parsed and checked up to its segment streams: what a
 ///        reader, on the host or the device, decodes them from.
@@ -280,18 +279,17 @@ struct ParsedFrame {
 ///        lengths, and the block count against @p max_blocks.
 /// @return The parsed frame, or those refusals, as @ref read_intra_frame
 ///         makes them.
-VR_CODEC_API Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
-                                                   std::size_t size,
-                                                   std::uint32_t max_blocks);
+VR_CODEC_API core::Result<ParsedFrame> parse_intra_frame(
+    const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks);
 
 /// @brief Decode a parsed frame's segments on the host: @ref read_intra_frame
 ///        after @ref parse_intra_frame.
 /// @param parsed  Taken by value: its tables gain the slot lookups only this
 ///                reader needs.
 /// @return The frame, or @ref read_intra_frame's refusals of its segments
-///         (and @ref Status::Code::OutOfMemory for arrays past this
+///         (and `Status::Code::OutOfMemory` for arrays past this
 ///         platform's address space).
-VR_CODEC_API Result<IntraFrame> decode_intra_frame(ParsedFrame parsed);
+VR_CODEC_API core::Result<IntraFrame> decode_intra_frame(ParsedFrame parsed);
 
 /// How a segment's stream failed to decode.
 enum class SegmentFault : std::uint32_t {
@@ -309,7 +307,8 @@ enum class SegmentFault : std::uint32_t {
 ///        before's last. One place for both readers' refusals.
 /// @param prev_last  Segment `s - 1`'s last coordinate; null for the first.
 /// @param first      Segment @p s's first coordinate.
-VR_CODEC_API Status check_segment(std::uint64_t s, SegmentFault fault,
-                                  const Vec3i* prev_last, const Vec3i& first);
+VR_CODEC_API core::Status check_segment(std::uint64_t s, SegmentFault fault,
+                                        const Vec3i* prev_last,
+                                        const Vec3i& first);
 
 }  // namespace volumetric_kit::recon::codec::detail

@@ -68,19 +68,19 @@ Vec3f closest_point_on_edges(Vec3f p, Vec3f a, Vec3f b, Vec3f c) {
 
 // Everything MeshDistance::create refuses, in one pass that allocates nothing,
 // so compare_meshes can check both meshes before it indexes either.
-Status check_surface(const mesh::Mesh& mesh, float reach) {
+core::Status check_surface(const mesh::Mesh& mesh, float reach) {
   if (!positive_finite(reach)) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "MeshDistance: reach must be finite and positive");
   }
   const float cell = reach / float(kRings);
   if (mesh.indices.size() % 3 != 0) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "MeshDistance: the index count is not a multiple of 3");
   }
   for (std::uint32_t i : mesh.indices) {
     if (i >= mesh.vertices.size()) {
-      return Status::invalid_argument(
+      return core::Status::invalid_argument(
           "MeshDistance: an index is past the vertices (" + std::to_string(i) +
           " of " + std::to_string(mesh.vertices.size()) + ")");
     }
@@ -97,11 +97,11 @@ Status check_surface(const mesh::Mesh& mesh, float reach) {
     const Vec3f& c = mesh.vertices[mesh.indices[t + 2]].position;
     for (const Vec3f& p : {a, b, c}) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
-        return Status::invalid_argument(
+        return core::Status::invalid_argument(
             "MeshDistance: a triangle corner is not finite");
       }
       if (!within(cell_of(p, cell), kMaxCell)) {
-        return Status::invalid_argument(
+        return core::Status::invalid_argument(
             "MeshDistance: a triangle corner is more than " +
             std::to_string(std::int64_t(kMaxCell) / kRings) +
             " reaches from the origin");
@@ -116,7 +116,7 @@ Status check_surface(const mesh::Mesh& mesh, float reach) {
     cells +=
         std::uint64_t(span.x) * std::uint64_t(span.y) * std::uint64_t(span.z);
     if (cells > budget) {
-      return Status::invalid_argument(
+      return core::Status::invalid_argument(
           "MeshDistance: the triangles would be filed under more than " +
           std::to_string(MeshDistance::kMaxCellsPerTriangle) +
           " cells each on average; the reach (" + std::to_string(reach) +
@@ -126,17 +126,18 @@ Status check_surface(const mesh::Mesh& mesh, float reach) {
   return {};
 }
 
-Status check_options(const CompareOptions& o) {
+core::Status check_options(const CompareOptions& o) {
   if (!positive_finite(o.reach)) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "CompareOptions: reach must be finite and positive");
   }
   if (o.stride == 0) {
-    return Status::invalid_argument("CompareOptions: stride must be >= 1");
+    return core::Status::invalid_argument(
+        "CompareOptions: stride must be >= 1");
   }
   if (!std::isfinite(o.fscore_threshold) || o.fscore_threshold < 0.0f ||
       o.fscore_threshold > o.reach) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "CompareOptions: the F-score threshold must be in [0, reach]");
   }
   return {};
@@ -243,8 +244,9 @@ Vec3f closest_point_on_triangle(Vec3f p, Vec3f a, Vec3f b, Vec3f c) {
   return closest_point_on_edges(p, a, b, c);
 }
 
-Result<MeshDistance> MeshDistance::create(const mesh::Mesh& mesh, float reach) {
-  VR_TRY(check_surface(mesh, reach));
+core::Result<MeshDistance> MeshDistance::create(const mesh::Mesh& mesh,
+                                                float reach) {
+  VKC_TRY(check_surface(mesh, reach));
   MeshDistance d;
   d.reach_ = reach;
   d.cell_ = reach / float(kRings);
@@ -350,20 +352,20 @@ DistanceStats summarize(std::vector<float> distances, float reach) {
   return s;
 }
 
-Result<MeshComparison> compare_meshes(const mesh::Mesh& reference,
-                                      const mesh::Mesh& test,
-                                      const CompareOptions& options) {
-  VR_TRY(check_options(options));
-  VR_TRY(check_surface(reference, options.reach));
-  VR_TRY(check_surface(test, options.reach));
+core::Result<MeshComparison> compare_meshes(const mesh::Mesh& reference,
+                                            const mesh::Mesh& test,
+                                            const CompareOptions& options) {
+  VKC_TRY(check_options(options));
+  VKC_TRY(check_surface(reference, options.reach));
+  VKC_TRY(check_surface(test, options.reach));
   std::vector<float> acc;
   {
-    VR_ASSIGN(const MeshDistance to_reference,
-              MeshDistance::create(reference, options.reach));
+    VKC_ASSIGN(const MeshDistance to_reference,
+               MeshDistance::create(reference, options.reach));
     acc = distances_to(sample_points(test, options.stride), to_reference);
   }
-  VR_ASSIGN(const MeshDistance to_test,
-            MeshDistance::create(test, options.reach));
+  VKC_ASSIGN(const MeshDistance to_test,
+             MeshDistance::create(test, options.reach));
   std::vector<float> cov =
       distances_to(sample_points(reference, options.stride), to_test);
   return combine(std::move(acc), std::move(cov), options);
@@ -375,18 +377,19 @@ ReferenceMesh::ReferenceMesh(const CompareOptions& options,
       surface_(std::move(surface)),
       points_(std::move(points)) {}
 
-Result<ReferenceMesh> ReferenceMesh::create(const mesh::Mesh& reference,
-                                            const CompareOptions& options) {
-  VR_TRY(check_options(options));
-  VR_ASSIGN(MeshDistance surface,
-            MeshDistance::create(reference, options.reach));
+core::Result<ReferenceMesh> ReferenceMesh::create(
+    const mesh::Mesh& reference, const CompareOptions& options) {
+  VKC_TRY(check_options(options));
+  VKC_ASSIGN(MeshDistance surface,
+             MeshDistance::create(reference, options.reach));
   return ReferenceMesh(options, std::move(surface),
                        sample_points(reference, options.stride));
 }
 
-Result<MeshComparison> ReferenceMesh::compare(const mesh::Mesh& test) const {
-  VR_ASSIGN(const MeshDistance to_test,
-            MeshDistance::create(test, options_.reach));
+core::Result<MeshComparison> ReferenceMesh::compare(
+    const mesh::Mesh& test) const {
+  VKC_ASSIGN(const MeshDistance to_test,
+             MeshDistance::create(test, options_.reach));
   std::vector<float> acc =
       distances_to(sample_points(test, options_.stride), surface_);
   std::vector<float> cov = distances_to(points_, to_test);

@@ -336,12 +336,12 @@ class ByteReader {
   bool failed_ = false;
 };
 
-Status bad(const std::string& why) {
-  return Status::invalid_argument("codec frame: " + why);
+core::Status bad(const std::string& why) {
+  return core::Status::invalid_argument("codec frame: " + why);
 }
 
-Status bad_write(const std::string& why) {
-  return Status::invalid_argument("write_intra_frame: " + why);
+core::Status bad_write(const std::string& why) {
+  return core::Status::invalid_argument("write_intra_frame: " + why);
 }
 
 bool positive_finite(float f) { return std::isfinite(f) && f > 0.0f; }
@@ -366,8 +366,8 @@ void write_tables(ByteWriter& w, const std::vector<FrequencyTable>& tables) {
   }
 }
 
-Status read_tables(const std::uint8_t* data, std::size_t size, std::uint32_t k,
-                   std::vector<FrequencyTable>& tables) {
+core::Status read_tables(const std::uint8_t* data, std::size_t size,
+                         std::uint32_t k, std::vector<FrequencyTable>& tables) {
   ByteReader r(data, size);
   tables.assign(frame_model_count(k), FrequencyTable{});
   for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
@@ -527,8 +527,8 @@ const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
 
 }  // namespace
 
-Status check_intra_frame(const IntraFrame& frame,
-                         const FrameWriteOptions& options) {
+core::Status check_intra_frame(const IntraFrame& frame,
+                               const FrameWriteOptions& options) {
   const DctBlocks& b = frame.blocks;
   if (!positive_finite(frame.voxel_size)) {
     return bad_write("voxel_size must be finite and positive");
@@ -536,7 +536,7 @@ Status check_intra_frame(const IntraFrame& frame,
   if (!positive_finite(b.trunc_dist)) {
     return bad_write("trunc_dist must be finite and positive");
   }
-  VR_TRY(b.params.validate());
+  VKC_TRY(b.params.validate());
   if (options.segment_size == 0) {
     return bad_write("segment_size must be at least 1");
   }
@@ -579,9 +579,9 @@ Status check_intra_frame(const IntraFrame& frame,
   return {};
 }
 
-Result<std::vector<std::uint8_t>> write_intra_frame(
+core::Result<std::vector<std::uint8_t>> write_intra_frame(
     const IntraFrame& frame, const FrameWriteOptions& options) {
-  VR_TRY(check_intra_frame(frame, options));
+  VKC_TRY(check_intra_frame(frame, options));
   const DctBlocks& b = frame.blocks;
   const std::size_t n = frame.coords.size();
   const std::uint32_t k = b.params.coefficient_count;
@@ -625,7 +625,7 @@ Result<std::vector<std::uint8_t>> write_intra_frame(
     const std::size_t stream_at = payload.size();
     if (!writer.finish(payload)) {
       // Pass 1 counted every symbol pass 2 puts, so this is a bug here.
-      return Status::io_error(
+      return core::Status::io_error(
           "write_intra_frame: a table refused a symbol it was counted from");
     }
     lengths.push_back(static_cast<std::uint32_t>(payload.size() - stream_at));
@@ -652,7 +652,7 @@ std::vector<FrequencyTable> frame_tables(
   return tables;
 }
 
-Result<std::vector<std::uint8_t>> assemble_intra_frame(
+core::Result<std::vector<std::uint8_t>> assemble_intra_frame(
     const CodedFrame& frame) {
   // The header's fields as check_intra_frame checks them, for the device
   // writer, which codes without an IntraFrame.
@@ -662,7 +662,7 @@ Result<std::vector<std::uint8_t>> assemble_intra_frame(
   if (!positive_finite(frame.trunc_dist)) {
     return bad_write("trunc_dist must be finite and positive");
   }
-  VR_TRY(frame.params.validate());
+  VKC_TRY(frame.params.validate());
   if (frame.segment_size == 0) {
     return bad_write("segment_size must be at least 1");
   }
@@ -735,8 +735,8 @@ Result<std::vector<std::uint8_t>> assemble_intra_frame(
   return out;
 }
 
-Result<FrameHeader> read_frame_header(const std::uint8_t* data,
-                                      std::size_t size) {
+core::Result<FrameHeader> read_frame_header(const std::uint8_t* data,
+                                            std::size_t size) {
   if (data == nullptr || size < 8) {
     return bad("shorter than a frame header");
   }
@@ -748,9 +748,9 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   const std::uint32_t type = h.u8();
   const std::uint32_t reserved = h.u8();
   if (version != kFrameVersion) {
-    return Status::unsupported("codec frame: version " +
-                               std::to_string(version) + " (this reads " +
-                               std::to_string(kFrameVersion) + ")");
+    return core::Status::unsupported("codec frame: version " +
+                                     std::to_string(version) + " (this reads " +
+                                     std::to_string(kFrameVersion) + ")");
   }
   if (size < kFramePrefixBytes) {
     return bad("shorter than a frame header");
@@ -784,14 +784,14 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   }
 
   if (type != static_cast<std::uint32_t>(FrameType::kIntra)) {
-    return Status::unsupported("codec frame: type " + std::to_string(type) +
-                               " (this reads intra)");
+    return core::Status::unsupported(
+        "codec frame: type " + std::to_string(type) + " (this reads intra)");
   }
   if (reserved != 0) {
     return bad("the reserved header byte is not zero");
   }
   if (block_size != static_cast<std::uint32_t>(kBlockSize)) {
-    return Status::unsupported(
+    return core::Status::unsupported(
         "codec frame: block size " + std::to_string(block_size) +
         " (the codec's is " + std::to_string(kBlockSize) + ")");
   }
@@ -799,7 +799,7 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
       !positive_finite(header.trunc_dist)) {
     return bad("voxel_size and trunc_dist must be finite and positive");
   }
-  if (Status s = header.params.validate(); !s.ok()) {
+  if (core::Status s = header.params.validate(); !s.ok()) {
     return bad("invalid codec params: " + s.message());
   }
   if (header.segment_size == 0) {
@@ -808,10 +808,10 @@ Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   return header;
 }
 
-Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
-                                      std::size_t size,
-                                      std::uint32_t max_blocks) {
-  VR_ASSIGN(const FrameHeader header, read_frame_header(data, size));
+core::Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
+                                            std::size_t size,
+                                            std::uint32_t max_blocks) {
+  VKC_ASSIGN(const FrameHeader header, read_frame_header(data, size));
   ParsedFrame frame;
   frame.header = header;
   const std::uint32_t n = header.block_count;
@@ -841,7 +841,7 @@ Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
     }
     if (id >= 1 && id <= kSectionCount) {
       if ((flags & ~std::uint32_t(kSectionKnownFlags)) != 0) {
-        return Status::unsupported(
+        return core::Status::unsupported(
             "codec frame: section " + std::to_string(id) + " sets flags " +
             std::to_string(flags) + ", which v3 does not define");
       }
@@ -851,8 +851,8 @@ Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
       }
       f = SectionBody{body + offset, length};
     } else if ((flags & kSectionRequired) != 0) {
-      return Status::unsupported("codec frame: unknown required section " +
-                                 std::to_string(id));
+      return core::Status::unsupported(
+          "codec frame: unknown required section " + std::to_string(id));
     }
     // TODO(codec): the optional CRC section of the 2026-09-27 entry, should a
     // consumer ever keep frames where nothing else checks them. A v3 reader
@@ -872,7 +872,7 @@ Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
   const SectionBody& payload_section = section(found, SectionId::kPayload);
 
   const std::uint32_t k = header.params.coefficient_count;
-  VR_TRY(
+  VKC_TRY(
       read_tables(tables_section.data, tables_section.size, k, frame.tables));
 
   const std::uint64_t segments = frame_segment_count(n, r_size);
@@ -898,18 +898,18 @@ Result<ParsedFrame> parse_intra_frame(const std::uint8_t* data,
   // room is a sound frame too big to hold -- which the caller answers by
   // growing, not by dropping the frame.
   if (n > max_blocks) {
-    return Status::out_of_memory("codec frame: it holds " + std::to_string(n) +
-                                 " blocks, more than the " +
-                                 std::to_string(max_blocks) +
-                                 " the caller can hold");
+    return core::Status::out_of_memory(
+        "codec frame: it holds " + std::to_string(n) +
+        " blocks, more than the " + std::to_string(max_blocks) +
+        " the caller can hold");
   }
   frame.payload = payload_section.data;
   frame.payload_size = payload_section.size;
   return frame;
 }
 
-Status check_segment(std::uint64_t s, SegmentFault fault,
-                     const Vec3i* prev_last, const Vec3i& first) {
+core::Status check_segment(std::uint64_t s, SegmentFault fault,
+                           const Vec3i* prev_last, const Vec3i& first) {
   if (fault == SegmentFault::kCoordOverflow) {
     return bad("segment " + std::to_string(s) +
                " steps a coordinate outside int32");
@@ -928,13 +928,14 @@ Status check_segment(std::uint64_t s, SegmentFault fault,
   return {};
 }
 
-Result<IntraFrame> read_intra_frame(const std::uint8_t* data, std::size_t size,
-                                    std::uint32_t max_blocks) {
-  VR_ASSIGN(ParsedFrame parsed, parse_intra_frame(data, size, max_blocks));
+core::Result<IntraFrame> read_intra_frame(const std::uint8_t* data,
+                                          std::size_t size,
+                                          std::uint32_t max_blocks) {
+  VKC_ASSIGN(ParsedFrame parsed, parse_intra_frame(data, size, max_blocks));
   return decode_intra_frame(std::move(parsed));
 }
 
-Result<IntraFrame> decode_intra_frame(ParsedFrame parsed) {
+core::Result<IntraFrame> decode_intra_frame(ParsedFrame parsed) {
   for (FrequencyTable& t : parsed.tables) t.build_decode();
   const FrameHeader& header = parsed.header;
   const std::uint32_t n = header.block_count;
@@ -949,7 +950,7 @@ Result<IntraFrame> decode_intra_frame(ParsedFrame parsed) {
   if (n > frame.coords.max_size() ||
       std::uint64_t(n) * k > frame.blocks.coefficients.max_size() ||
       std::uint64_t(n) * kMaskWordsPerBlock > frame.blocks.masks.max_size()) {
-    return Status::out_of_memory(
+    return core::Status::out_of_memory(
         "codec frame: " + std::to_string(n) + " blocks of " +
         std::to_string(k) +
         " coefficients exceed this platform's address space");
@@ -976,8 +977,8 @@ Result<IntraFrame> decode_intra_frame(ParsedFrame parsed) {
     if (fault == SegmentFault::kNone && !r.finish()) {
       fault = SegmentFault::kCorrupt;
     }
-    VR_TRY(check_segment(s, fault, s > 0 ? &frame.coords[first - 1] : nullptr,
-                         frame.coords[first]));
+    VKC_TRY(check_segment(s, fault, s > 0 ? &frame.coords[first - 1] : nullptr,
+                          frame.coords[first]));
     stream += parsed.segment_lengths[s];
   }
   return frame;

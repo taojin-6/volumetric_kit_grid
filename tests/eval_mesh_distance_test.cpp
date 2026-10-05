@@ -27,6 +27,7 @@
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace eval = volumetric_kit::recon::eval;
 namespace mesh = volumetric_kit::recon::mesh;
 
@@ -232,7 +233,7 @@ int search_case() {
     m.indices[t + 1] = m.indices[t];  // a segment, still surface
   }
   const float reach = 0.04f;
-  vr::Result<eval::MeshDistance> d = eval::MeshDistance::create(m, reach);
+  vkc::Result<eval::MeshDistance> d = eval::MeshDistance::create(m, reach);
   CHECK(d.ok());
   int within = 0;
   for (int i = 0; i < 3000; ++i) {
@@ -254,7 +255,7 @@ int search_case() {
 }
 
 int distance_case() {
-  vr::Result<eval::MeshDistance> r =
+  vkc::Result<eval::MeshDistance> r =
       eval::MeshDistance::create(plane(20, 0.01f, 0.0f), 0.05f);  // 0.2 m
   CHECK(r.ok());
   // The mesh was a temporary: the index copied what it needs.
@@ -268,7 +269,7 @@ int distance_case() {
   CHECK(d.distance({0.1f, 0.1f, 0.2f}) == 0.05f);
   CHECK(d.distance({5.0f, 5.0f, 0.0f}) == 0.05f);
   // An empty mesh is nothing within reach anywhere.
-  vr::Result<eval::MeshDistance> empty =
+  vkc::Result<eval::MeshDistance> empty =
       eval::MeshDistance::create(mesh::Mesh{}, 0.05f);
   CHECK(empty.ok() && empty.value().distance({0, 0, 0}) == 0.05f);
 
@@ -282,14 +283,14 @@ int distance_case() {
     sliver.vertices.push_back(v);
   }
   sliver.indices = {0, 0, 2};
-  vr::Result<eval::MeshDistance> s = eval::MeshDistance::create(sliver, 0.02f);
+  vkc::Result<eval::MeshDistance> s = eval::MeshDistance::create(sliver, 0.02f);
   CHECK(s.ok());
   CHECK(near(double(s.value().distance({0.001f, 0.005f, 0.0f})), 0.001, 1e-6));
 
   // A triangle collapsed to one point is not surface: it is what an
   // incremental extract retires a triangle to.
   sliver.indices = {2, 2, 2};
-  vr::Result<eval::MeshDistance> point =
+  vkc::Result<eval::MeshDistance> point =
       eval::MeshDistance::create(sliver, 0.02f);
   CHECK(point.ok());
   CHECK(point.value().distance({0.0f, 0.01f, 0.001f}) == 0.02f);
@@ -335,7 +336,7 @@ int compare_case() {
   const mesh::Mesh shifted = plane(40, 0.005f, 0.003f);
   eval::CompareOptions opt;
   opt.reach = 0.02f;
-  vr::Result<eval::MeshComparison> c =
+  vkc::Result<eval::MeshComparison> c =
       eval::compare_meshes(reference, shifted, opt);
   CHECK(c.ok());
   for (const eval::DistanceStats& s :
@@ -348,7 +349,7 @@ int compare_case() {
   CHECK(c.value().fscore.threshold == 0.0f && c.value().fscore.f == 0.0);
 
   // Identical: zero everywhere.
-  vr::Result<eval::MeshComparison> same =
+  vkc::Result<eval::MeshComparison> same =
       eval::compare_meshes(reference, reference, opt);
   CHECK(same.ok());
   CHECK(same.value().accuracy.max == 0.0 && same.value().coverage.max == 0.0);
@@ -357,7 +358,7 @@ int compare_case() {
   // still exactly on the surface, but the reference past the cut plus the
   // reach is uncovered.
   const mesh::Mesh half = plane(40, 0.005f, 0.0f, 0.1f);
-  vr::Result<eval::MeshComparison> h =
+  vkc::Result<eval::MeshComparison> h =
       eval::compare_meshes(reference, half, opt);
   CHECK(h.ok());
   CHECK(h.value().accuracy.max == 0.0);
@@ -366,7 +367,7 @@ int compare_case() {
 
   // A stride measures about one vertex in seven...
   opt.stride = 7;
-  vr::Result<eval::MeshComparison> sparse =
+  vkc::Result<eval::MeshComparison> sparse =
       eval::compare_meshes(reference, shifted, opt);
   CHECK(sparse.ok());
   const std::size_t n = reference.vertices.size();
@@ -381,9 +382,9 @@ int compare_case() {
   for (std::size_t v = 0; v < bumpy.vertices.size(); ++v) {
     bumpy.vertices[v].position.z = 1e-4f * float(v % 17);
   }
-  vr::Result<eval::MeshComparison> again =
+  vkc::Result<eval::MeshComparison> again =
       eval::compare_meshes(reordered(reference), reordered(bumpy), opt);
-  vr::Result<eval::MeshComparison> first =
+  vkc::Result<eval::MeshComparison> first =
       eval::compare_meshes(reference, bumpy, opt);
   CHECK(again.ok() && first.ok());
   CHECK(identical(again.value(), first.value()));
@@ -398,7 +399,7 @@ int surface_case() {
   eval::CompareOptions opt;
   opt.reach = 0.02f;
   opt.fscore_threshold = 0.001f;
-  vr::Result<eval::MeshComparison> clean =
+  vkc::Result<eval::MeshComparison> clean =
       eval::compare_meshes(reference, reference, opt);
   CHECK(clean.ok());
 
@@ -424,7 +425,8 @@ int surface_case() {
   const mesh::Mesh* const stale_mesh = &stale;
   for (const auto& [ref, test] :
        {std::pair{clean_mesh, stale_mesh}, std::pair{stale_mesh, clean_mesh}}) {
-    vr::Result<eval::MeshComparison> c = eval::compare_meshes(*ref, *test, opt);
+    vkc::Result<eval::MeshComparison> c =
+        eval::compare_meshes(*ref, *test, opt);
     CHECK(c.ok());
     CHECK(identical(c.value(), clean.value()));
   }
@@ -438,15 +440,15 @@ int reference_case() {
   opt.reach = 0.02f;
   opt.stride = 3;
   opt.fscore_threshold = 0.004f;
-  vr::Result<eval::ReferenceMesh> ref =
+  vkc::Result<eval::ReferenceMesh> ref =
       eval::ReferenceMesh::create(plane(40, 0.005f, 0.0f), opt);
   CHECK(ref.ok());
   CHECK(ref.value().options().stride == 3);
   const mesh::Mesh reference = plane(40, 0.005f, 0.0f);
   for (const mesh::Mesh& test :
        {plane(40, 0.005f, 0.003f), plane(40, 0.005f, 0.0f, 0.1f)}) {
-    vr::Result<eval::MeshComparison> once = ref.value().compare(test);
-    vr::Result<eval::MeshComparison> each =
+    vkc::Result<eval::MeshComparison> once = ref.value().compare(test);
+    vkc::Result<eval::MeshComparison> each =
         eval::compare_meshes(reference, test, opt);
     CHECK(once.ok() && each.ok());
     CHECK(identical(once.value(), each.value()));
@@ -471,7 +473,7 @@ int fscore_case() {
   eval::CompareOptions opt;
   opt.reach = 0.02f;
   opt.fscore_threshold = 0.004f;
-  vr::Result<eval::MeshComparison> above =
+  vkc::Result<eval::MeshComparison> above =
       eval::compare_meshes(reference, shifted, opt);
   CHECK(above.ok());
   CHECK(above.value().fscore.threshold == 0.004f);
@@ -479,7 +481,7 @@ int fscore_case() {
   CHECK(above.value().fscore.recall == 1.0);
   CHECK(above.value().fscore.f == 1.0);
   opt.fscore_threshold = 0.002f;
-  vr::Result<eval::MeshComparison> below =
+  vkc::Result<eval::MeshComparison> below =
       eval::compare_meshes(reference, shifted, opt);
   CHECK(below.ok());
   CHECK(below.value().fscore.precision == 0.0);
@@ -502,7 +504,7 @@ int fscore_case() {
   const double expected = double(covered) / double(reference.vertices.size());
   CHECK(expected > 0.5 && expected < 0.55);  // the premise: about half
   opt.fscore_threshold = 0.001f;
-  vr::Result<eval::MeshComparison> h =
+  vkc::Result<eval::MeshComparison> h =
       eval::compare_meshes(reference, half, opt);
   CHECK(h.ok());
   CHECK(h.value().fscore.precision == 1.0);
@@ -555,7 +557,7 @@ int refusals_case() {
   // A bad reach is named as the reach, not as the threshold left at 0.
   eval::CompareOptions bad_reach;
   bad_reach.reach = -0.01f;
-  vr::Result<eval::MeshComparison> r =
+  vkc::Result<eval::MeshComparison> r =
       eval::compare_meshes(good, good, bad_reach);
   CHECK(!r.ok());
   CHECK(r.status().message().find("reach must be") != std::string::npos);

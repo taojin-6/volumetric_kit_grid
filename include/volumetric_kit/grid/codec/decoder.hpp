@@ -11,12 +11,12 @@
 #include <cstdint>
 #include <memory>
 
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
-#include "volumetric_kit/recon/core/gpu_timer.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::recon::codec {
@@ -52,12 +52,12 @@ struct FrameInfo {
 /// @param data  The frame (at least its complete header: 44 bytes plus four
 ///              per kept coefficient).
 /// @param size  Bytes available at @p data.
-/// @return The header, or @ref Status::Code::Unsupported for another version,
-///         frame type or block size, and @ref Status::Code::InvalidArgument
+/// @return The header, or `Status::Code::Unsupported` for another version,
+///         frame type or block size, and `Status::Code::InvalidArgument`
 ///         for anything else malformed. It does not check the rest of the
 ///         frame, which @ref Decoder::decode does.
-VR_CODEC_API Result<FrameInfo> read_frame_info(const std::uint8_t* data,
-                                               std::size_t size);
+VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
+                                                     std::size_t size);
 
 /// @brief How a @ref Decoder decodes a frame.
 struct DecoderConfig {
@@ -85,7 +85,7 @@ struct DecoderConfig {
 /// attribute's previous values (a `color`, say) under the new geometry, and
 /// nothing could tell which blocks those were.
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time, and
 ///          nothing else may modify the grid during one.
 class VR_CODEC_API Decoder {
@@ -98,8 +98,9 @@ class VR_CODEC_API Decoder {
   ///                   this object).
   /// @param config     How frames are decoded.
   /// @return The decoder, or a pipeline or allocation failure.
-  static Result<Decoder> create(Device& device, Allocator& allocator,
-                                const DecoderConfig& config = {});
+  static core::Result<Decoder> create(core::Device& device,
+                                      core::Allocator& allocator,
+                                      const DecoderConfig& config = {});
 
   ~Decoder();
   Decoder(Decoder&& other) noexcept;
@@ -125,7 +126,7 @@ class VR_CODEC_API Decoder {
   ///                 `weight` and no other attribute, `block_size` 8, and the
   ///                 frame's `voxel_size` and `trunc_dist` exactly (see
   ///                 @ref read_frame_info).
-  /// @param metrics  Optional @ref StageMetrics collecting a `"codec decode"`
+  /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
   ///                 row with both halves -- its device half is the inverse
   ///                 transform and, decoded on the device, the rANS
   ///                 kernels -- over the breakdown rows `"  ..rans decode"`
@@ -133,28 +134,29 @@ class VR_CODEC_API Decoder {
   ///                 (the compaction), `"  ..apply"` (merging the two block
   ///                 sets, and removing and allocating blocks) and
   ///                 `"  ..inverse"` (the transform). Named apart from the @ref
-  ///                 Encoder's, so both timed into one @ref StageMetrics stay
+  ///                 Encoder's, so both timed into one `StageMetrics` stay
   ///                 apart. `nullptr` measures nothing.
   /// @return OK, or: whatever the frame reader refuses
-  ///         (@ref Status::Code::Unsupported, @ref
+  ///         (`Status::Code::Unsupported`, @ref
   ///         Status::Code::InvalidArgument for a malformed or corrupt frame);
   ///         with @ref EntropyCoding::kDevice, a frame the device cannot
   ///         decode (see @ref EntropyCoding);
-  ///         @ref Status::Code::InvalidArgument for a moved-from decoder, a
+  ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other
   ///         attribute, or a grid whose free heap refuses a removed block
   ///         (its accounting was already broken, which nothing here mends);
-  ///         @ref Status::Code::OutOfMemory when the grid is too small for
+  ///         `Status::Code::OutOfMemory` when the grid is too small for
   ///         the frame -- fewer block slots (`num_blocks`) than the frame has
   ///         blocks, or a hash table that cannot place them all -- which
   ///         @ref volume::VoxelBlockGrid::resize and decoding again recovers;
-  ///         @ref Status::Code::IoError only when bucket-lock contention
+  ///         `Status::Code::IoError` only when bucket-lock contention
   ///         outlasts the retries over a table with room (decode again; a
   ///         resize would not help); otherwise a compaction, buffer or
   ///         dispatch failure.
-  Status decode(const std::uint8_t* data, std::size_t size,
-                volume::VoxelBlockGrid& grid, StageMetrics* metrics = nullptr);
+  core::Status decode(const std::uint8_t* data, std::size_t size,
+                      volume::VoxelBlockGrid& grid,
+                      core::StageMetrics* metrics = nullptr);
 
   /// @return `true` if this owns a live transform (`false` when moved-from).
   bool valid() const noexcept;
@@ -164,24 +166,24 @@ class VR_CODEC_API Decoder {
 
   /// Build @ref reader_ unless it is built, or return the failure of the
   /// one build tried.
-  Status ensure_reader();
+  core::Status ensure_reader();
   /// Decode @p frame's segments on the built reader, through the submit; the
   /// reader's check() then judges them.
-  Result<detail::ResidentBlocks> decode_on_device(
-      const detail::ParsedFrame& frame, GpuStageScope& stage);
+  core::Result<detail::ResidentBlocks> decode_on_device(
+      const detail::ParsedFrame& frame, core::GpuStageScope& stage);
 
   DecoderConfig config_;
   // Borrowed (must outlive this); what the device decode's batch runs on.
-  Device* device_ = nullptr;
-  Allocator* allocator_ = nullptr;
+  core::Device* device_ = nullptr;
+  core::Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
   // Built at create for kDevice, at the first device frame for kAuto, and
   // never for kHost; and why that build failed, after which kAuto decodes
   // every frame on the host.
   std::unique_ptr<detail::DeviceFrameReader> reader_;
-  Status reader_failure_;
+  core::Status reader_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
-  GpuTimer gpu_timer_;
+  core::GpuTimer gpu_timer_;
 };
 
 }  // namespace volumetric_kit::recon::codec

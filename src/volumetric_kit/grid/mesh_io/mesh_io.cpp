@@ -36,30 +36,32 @@ struct PositionHash {
   }
 };
 
-Result<bool> reflected(const aiMatrix4x4& m) {
+core::Result<bool> reflected(const aiMatrix4x4& m) {
   const std::array<ai_real, 16> values = {m.a1, m.a2, m.a3, m.a4, m.b1, m.b2,
                                           m.b3, m.b4, m.c1, m.c2, m.c3, m.c4,
                                           m.d1, m.d2, m.d3, m.d4};
   for (const auto value : values) {
     if (!std::isfinite(value)) {
-      return Status::invalid_argument("load_mesh: nonfinite node transform");
+      return core::Status::invalid_argument(
+          "load_mesh: nonfinite node transform");
     }
   }
   if (m.d1 != 0 || m.d2 != 0 || m.d3 != 0 || m.d4 != 1) {
-    return Status::invalid_argument("load_mesh: non-affine node transform");
+    return core::Status::invalid_argument(
+        "load_mesh: non-affine node transform");
   }
   const double determinant =
       double(m.a1) * (double(m.b2) * m.c3 - double(m.b3) * m.c2) -
       double(m.a2) * (double(m.b1) * m.c3 - double(m.b3) * m.c1) +
       double(m.a3) * (double(m.b1) * m.c2 - double(m.b2) * m.c1);
   if (!std::isfinite(determinant) || determinant == 0) {
-    return Status::invalid_argument("load_mesh: singular node transform");
+    return core::Status::invalid_argument("load_mesh: singular node transform");
   }
   return determinant < 0;
 }
 
-Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
-                                                const aiVector3D& p) {
+core::Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
+                                                      const aiVector3D& p) {
   const std::array<double, 3> transformed = {
       double(m.a1) * p.x + double(m.a2) * p.y + double(m.a3) * p.z + m.a4,
       double(m.b1) * p.x + double(m.b2) * p.y + double(m.b3) * p.z + m.b4,
@@ -69,7 +71,7 @@ Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
     const double value = transformed[axis];
     if (!std::isfinite(value) ||
         std::abs(value) > std::numeric_limits<float>::max()) {
-      return Status::invalid_argument(
+      return core::Status::invalid_argument(
           "load_mesh: nonfinite/overflowing position");
     }
     result[axis] = static_cast<float>(value);
@@ -78,17 +80,17 @@ Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
   return result;
 }
 
-Result<TriangleMesh> import_mesh(const std::string& path) {
-  VR_TRY(detail::check_path("load_mesh", path));
+core::Result<TriangleMesh> import_mesh(const std::string& path) {
+  VKC_TRY(detail::check_path("load_mesh", path));
   std::error_code error;
   const auto file = std::filesystem::status(path, error);
   if (error == std::errc::no_such_file_or_directory ||
       (!error && !std::filesystem::exists(file))) {
-    return Status::not_found("load_mesh: missing file: " + path);
+    return core::Status::not_found("load_mesh: missing file: " + path);
   }
-  if (error) return Status::io_error("load_mesh: " + error.message());
+  if (error) return core::Status::io_error("load_mesh: " + error.message());
   if (!std::filesystem::is_regular_file(file)) {
-    return Status::invalid_argument("load_mesh: expected a regular file");
+    return core::Status::invalid_argument("load_mesh: expected a regular file");
   }
 
   Assimp::Importer importer;
@@ -104,14 +106,15 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
   const aiScene* scene = importer.ReadFile(
       path, aiProcess_Triangulate | aiProcess_ValidateDataStructure);
   if (scene == nullptr) {
-    return Status::io_error("load_mesh: " + path + ": " +
-                            importer.GetErrorString());
+    return core::Status::io_error("load_mesh: " + path + ": " +
+                                  importer.GetErrorString());
   }
   if (scene->mRootNode == nullptr || scene->mNumMeshes == 0) {
-    return Status::invalid_argument("load_mesh: asset has no mesh geometry");
+    return core::Status::invalid_argument(
+        "load_mesh: asset has no mesh geometry");
   }
   if (scene->mNumAnimations != 0) {
-    return Status::unsupported(
+    return core::Status::unsupported(
         "load_mesh: animation requires an evaluated static asset");
   }
 
@@ -137,31 +140,33 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
     // hidden nodes without meshes do not refuse the asset.
     bool flip = false;
     if (node.source->mNumMeshes != 0) {
-      VR_ASSIGN(flip, reflected(world));
+      VKC_ASSIGN(flip, reflected(world));
     }
     for (unsigned index = 0; index < node.source->mNumMeshes; ++index) {
       const unsigned mesh_index = node.source->mMeshes[index];
       if (mesh_index >= scene->mNumMeshes ||
           scene->mMeshes[mesh_index] == nullptr) {
-        return Status::invalid_argument("load_mesh: invalid scene mesh index");
+        return core::Status::invalid_argument(
+            "load_mesh: invalid scene mesh index");
       }
       const aiMesh& mesh = *scene->mMeshes[mesh_index];
       if (mesh.HasBones() || mesh.mNumAnimMeshes != 0) {
-        return Status::unsupported(
+        return core::Status::unsupported(
             "load_mesh: skinning/morphs require an evaluated static asset");
       }
       if (mesh.mNumVertices == 0 || mesh.mVertices == nullptr) {
-        return Status::invalid_argument("load_mesh: mesh has no positions");
+        return core::Status::invalid_argument(
+            "load_mesh: mesh has no positions");
       }
       std::vector<std::uint32_t> remap(mesh.mNumVertices);
       for (unsigned vertex = 0; vertex < mesh.mNumVertices; ++vertex) {
-        VR_ASSIGN(const auto position,
-                  transform_position(world, mesh.mVertices[vertex]));
+        VKC_ASSIGN(const auto position,
+                   transform_position(world, mesh.mVertices[vertex]));
         auto found = positions.find(position);
         if (found == positions.end()) {
           if (result.positions.size() >=
               std::numeric_limits<std::uint32_t>::max()) {
-            return Status::out_of_memory(
+            return core::Status::out_of_memory(
                 "load_mesh: geometry exceeds 32-bit indexing");
           }
           const auto id = static_cast<std::uint32_t>(result.positions.size());
@@ -173,17 +178,17 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
       for (unsigned face_index = 0; face_index < mesh.mNumFaces; ++face_index) {
         const aiFace& face = mesh.mFaces[face_index];
         if (face.mNumIndices != 3 || face.mIndices == nullptr) {
-          return Status::unsupported(
+          return core::Status::unsupported(
               "load_mesh: asset contains non-triangle primitives");
         }
         if (result.indices.size() / 3 >=
             std::numeric_limits<std::uint32_t>::max()) {
-          return Status::out_of_memory("load_mesh: too many triangles");
+          return core::Status::out_of_memory("load_mesh: too many triangles");
         }
         std::array<std::uint32_t, 3> triangle{};
         for (std::size_t corner = 0; corner < triangle.size(); ++corner) {
           if (face.mIndices[corner] >= remap.size()) {
-            return Status::invalid_argument(
+            return core::Status::invalid_argument(
                 "load_mesh: out-of-range vertex index");
           }
           triangle[corner] = remap[face.mIndices[corner]];
@@ -197,19 +202,19 @@ Result<TriangleMesh> import_mesh(const std::string& path) {
     for (unsigned child = node.source->mNumChildren; child != 0; --child) {
       const aiNode* next = node.source->mChildren[child - 1];
       if (next == nullptr)
-        return Status::invalid_argument("load_mesh: null scene node");
+        return core::Status::invalid_argument("load_mesh: null scene node");
       pending.push_back({next, world});
     }
   }
   if (result.indices.empty()) {
-    return Status::invalid_argument("load_mesh: asset has no triangles");
+    return core::Status::invalid_argument("load_mesh: asset has no triangles");
   }
   return result;
 }
 
 }  // namespace
 
-Result<TriangleMesh> load_mesh(const std::string& path) {
+core::Result<TriangleMesh> load_mesh(const std::string& path) {
   try {
     return import_mesh(path);
   } catch (...) {

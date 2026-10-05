@@ -29,13 +29,14 @@
 #include <utility>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/buffer.hpp"
-#include "volumetric_kit/recon/core/compute_util.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -44,6 +45,7 @@
 #include "grid_readback.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 namespace mesh = volumetric_kit::recon::mesh;
 
@@ -77,7 +79,7 @@ vol::VoxelGridParams grid_params() {
 // surface crosses the volume and marching cubes emits a triangle count that
 // scales with the block count -- which is what lets the second extract outgrow
 // the arena the first one sized.
-bool fill_sphere(const vr::Device& dev, vr::Allocator& alloc,
+bool fill_sphere(const vkc::Device& dev, vkc::Allocator& alloc,
                  vol::VoxelBlockGrid& g, int blocks) {
   const int n = kBlock * blocks;
   const float centre = static_cast<float>(n - 1) * 0.5f * kH;
@@ -93,20 +95,20 @@ bool fill_sphere(const vr::Device& dev, vr::Allocator& alloc,
       }
     }
   }
-  vr::Result<std::uint32_t> failed = g.map().allocate(
+  vkc::Result<std::uint32_t> failed = g.map().allocate(
       coords.data(), static_cast<std::uint32_t>(coords.size()));
   if (!failed || failed.value() != 0) {
     return false;
   }
-  vr::Result<std::vector<vol::BlockIndex>> active =
+  vkc::Result<std::vector<vol::BlockIndex>> active =
       g.map().compact_active_blocks();
   if (!active || active.value().size() != coords.size()) {
     return false;
   }
 
-  vr::Result<std::vector<float>> tsdf =
+  vkc::Result<std::vector<float>> tsdf =
       vr_test::read_attribute<float>(dev, alloc, g, "tsdf");
-  vr::Result<std::vector<float>> weight =
+  vkc::Result<std::vector<float>> weight =
       vr_test::read_attribute<float>(dev, alloc, g, "weight");
   if (!tsdf || !weight) {
     return false;
@@ -139,15 +141,15 @@ bool fill_sphere(const vr::Device& dev, vr::Allocator& alloc,
 // The first `count` elements of `src`, a buffer the test holds only as a
 // VkBuffer (a DeviceMesh's), copied into host memory; empty on failure.
 template <typename T>
-std::vector<T> copy_out(const vr::Device& dev, vr::Allocator& alloc,
+std::vector<T> copy_out(const vkc::Device& dev, vkc::Allocator& alloc,
                         VkBuffer src, std::size_t count) {
   const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(T);
-  vr::Result<vr::Buffer> staging =
+  vkc::Result<vkc::Buffer> staging =
       alloc.create_buffer({bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                           vr::MemoryUsage::Staging, vr::HostAccess::Random});
+                           vkc::MemoryUsage::Staging, vkc::HostAccess::Random});
   if (!staging.ok()) return {};
   const VkBuffer dst = staging.value().handle();
-  const vr::Status copied =
+  const vkc::Status copied =
       dev.submit_single_time([src, dst, bytes](VkCommandBuffer cb) {
         VkBufferCopy region{};
         region.size = bytes;
@@ -162,28 +164,28 @@ std::vector<T> copy_out(const vr::Device& dev, vr::Allocator& alloc,
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -199,19 +201,19 @@ int main() {
   config.extra_vertex_usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
   config.extra_index_usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
-  vr::Result<mesh::MarchingCubes> mc_result =
+  vkc::Result<mesh::MarchingCubes> mc_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(), config);
   CHECK(mc_result.ok());
   mesh::MarchingCubes extractor = std::move(mc_result).value();
 
-  vr::Result<vol::VoxelBlockGrid> small_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> small_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(small_result.ok());
   vol::VoxelBlockGrid small = std::move(small_result).value();
   CHECK(fill_sphere(device.value(), allocator.value(), small, 2));
 
   mesh::ExtractTimings first{};
-  vr::Result<mesh::DeviceMesh> small_mesh =
+  vkc::Result<mesh::DeviceMesh> small_mesh =
       extractor.extract_device(small, 0.0f, &first);
   CHECK(small_mesh.ok());
   CHECK(!small_mesh.value().empty());
@@ -236,14 +238,14 @@ int main() {
   // --- ...and keeps them across an arena grow --------------------------------
   // The arena is destroyed and rebuilt here, so the flags have to be reapplied
   // rather than surviving in the old allocation.
-  vr::Result<vol::VoxelBlockGrid> big_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> big_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(big_result.ok());
   vol::VoxelBlockGrid big = std::move(big_result).value();
   CHECK(fill_sphere(device.value(), allocator.value(), big, 6));
 
   mesh::ExtractTimings second{};
-  vr::Result<mesh::DeviceMesh> big_mesh =
+  vkc::Result<mesh::DeviceMesh> big_mesh =
       extractor.extract_device(big, 0.0f, &second);
   CHECK(big_mesh.ok());
   CHECK(!big_mesh.value().empty());
@@ -274,12 +276,12 @@ int main() {
   constexpr VkBufferUsageFlags kBase = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  vr::Result<mesh::MarchingCubes> plain_result =
+  vkc::Result<mesh::MarchingCubes> plain_result =
       mesh::MarchingCubes::create(device.value(), allocator.value());
   CHECK(plain_result.ok());
   mesh::MarchingCubes plain = std::move(plain_result).value();
 
-  vr::Result<mesh::DeviceMesh> plain_mesh = plain.extract_device(small, 0.0f);
+  vkc::Result<mesh::DeviceMesh> plain_mesh = plain.extract_device(small, 0.0f);
   CHECK(plain_mesh.ok());
   CHECK(plain_mesh.value().vertex_usage == kBase);
   CHECK(plain_mesh.value().index_usage == kBase);
@@ -301,44 +303,44 @@ int main() {
   // reporting cleanly from create().
   mesh::MarchingCubesConfig bad_vertex;
   bad_vertex.extra_vertex_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-  vr::Result<mesh::MarchingCubes> bad_vertex_result =
+  vkc::Result<mesh::MarchingCubes> bad_vertex_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(),
                                   bad_vertex);
   CHECK(!bad_vertex_result.ok());
   CHECK(bad_vertex_result.status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
 
   // The index field is guarded too, not just the vertex one.
   mesh::MarchingCubesConfig bad_index;
   bad_index.extra_index_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-  vr::Result<mesh::MarchingCubes> bad_index_result =
+  vkc::Result<mesh::MarchingCubes> bad_index_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(), bad_index);
   CHECK(!bad_index_result.ok());
   CHECK(bad_index_result.status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
 
   // And the indirect field: it takes consumer usage the same way, so leaving it
   // out of the guard would let the bit through on the one buffer nothing else
   // checks.
   mesh::MarchingCubesConfig bad_indirect;
   bad_indirect.extra_indirect_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-  vr::Result<mesh::MarchingCubes> bad_indirect_result =
+  vkc::Result<mesh::MarchingCubes> bad_indirect_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(),
                                   bad_indirect);
   CHECK(!bad_indirect_result.ok());
   CHECK(bad_indirect_result.status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
 
   // A queue-family list longer than the fixed array is refused at create, not
   // at the first arena grow several frames into a scan.
   mesh::MarchingCubesConfig bad_families;
-  bad_families.queue_family_count = vr::BufferDesc::kMaxQueueFamilies + 1;
-  vr::Result<mesh::MarchingCubes> bad_families_result =
+  bad_families.queue_family_count = vkc::BufferDesc::kMaxQueueFamilies + 1;
+  vkc::Result<mesh::MarchingCubes> bad_families_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(),
                                   bad_families);
   CHECK(!bad_families_result.ok());
   CHECK(bad_families_result.status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
 
   // --- Queue families reach every output buffer ------------------------------
   // Naming two distinct families must give CONCURRENT on all three, or a
@@ -354,11 +356,12 @@ int main() {
     shared_config.queue_families[0] = 0;
     shared_config.queue_families[1] = family_count > 1 ? 1 : 0;
     shared_config.queue_family_count = 2;
-    vr::Result<mesh::MarchingCubes> shared_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), shared_config);
+    vkc::Result<mesh::MarchingCubes> shared_result =
+        mesh::MarchingCubes::create(device.value(), allocator.value(),
+                                    shared_config);
     CHECK(shared_result.ok());
     mesh::MarchingCubes shared = std::move(shared_result).value();
-    vr::Result<mesh::DeviceMesh> shared_mesh =
+    vkc::Result<mesh::DeviceMesh> shared_mesh =
         shared.extract_device(small, 0.0f);
     CHECK(shared_mesh.ok());
     const VkSharingMode expected = family_count > 1 ? VK_SHARING_MODE_CONCURRENT
@@ -398,12 +401,12 @@ int main() {
   {
     mesh::MarchingCubesConfig cmd_config;
     cmd_config.extra_indirect_usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    vr::Result<mesh::MarchingCubes> cmd_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> cmd_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), cmd_config);
     CHECK(cmd_result.ok());
     mesh::MarchingCubes cmd_extractor = std::move(cmd_result).value();
 
-    vr::Result<mesh::DeviceMesh> cmd_mesh =
+    vkc::Result<mesh::DeviceMesh> cmd_mesh =
         cmd_extractor.extract_device(small, 0.0f);
     CHECK(cmd_mesh.ok());
     CHECK(!cmd_mesh.value().empty());
@@ -434,12 +437,12 @@ int main() {
   for (std::uint32_t bad_count : {0u, 9u}) {
     mesh::MarchingCubesConfig bad_slots;
     bad_slots.slot_count = bad_count;
-    vr::Result<mesh::MarchingCubes> bad_slots_result =
+    vkc::Result<mesh::MarchingCubes> bad_slots_result =
         mesh::MarchingCubes::create(device.value(), allocator.value(),
                                     bad_slots);
     CHECK(!bad_slots_result.ok());
     CHECK(bad_slots_result.status().domain() ==
-          vr::Status::Code::InvalidArgument);
+          vkc::Status::Code::InvalidArgument);
   }
 
   // Two slots, and the property the whole feature exists for: consecutive
@@ -449,17 +452,17 @@ int main() {
   // the hazard.
   mesh::MarchingCubesConfig ringed;
   ringed.slot_count = 2;
-  vr::Result<mesh::MarchingCubes> ring_result =
+  vkc::Result<mesh::MarchingCubes> ring_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(), ringed);
   CHECK(ring_result.ok());
   mesh::MarchingCubes ring = std::move(ring_result).value();
 
-  vr::Result<mesh::DeviceMesh> gen1 = ring.extract_device(small, 0.0f);
+  vkc::Result<mesh::DeviceMesh> gen1 = ring.extract_device(small, 0.0f);
   CHECK(gen1.ok());
   CHECK(gen1.value().valid());
 
   // Nothing released yet, so the only other slot is free and this succeeds.
-  vr::Result<mesh::DeviceMesh> gen2 = ring.extract_device(small, 0.0f);
+  vkc::Result<mesh::DeviceMesh> gen2 = ring.extract_device(small, 0.0f);
   CHECK(gen2.ok());
   CHECK(gen2.value().valid());
   CHECK(gen2.value().generation != gen1.value().generation);
@@ -473,9 +476,9 @@ int main() {
   // Now both slots are outstanding. A third extract would have to overwrite the
   // one holding gen1, which the consumer has not finished with -- refused,
   // rather than corrupting a live read.
-  vr::Result<mesh::DeviceMesh> gen3 = ring.extract_device(small, 0.0f);
+  vkc::Result<mesh::DeviceMesh> gen3 = ring.extract_device(small, 0.0f);
   CHECK(!gen3.ok());
-  CHECK(gen3.status().domain() == vr::Status::Code::InvalidArgument);
+  CHECK(gen3.status().domain() == vkc::Status::Code::InvalidArgument);
 
   // ...and the refusal costs the consumer nothing. This is the whole point of
   // refusing: gen2's slot was not touched, so gen2 must still be downloadable.
@@ -483,7 +486,7 @@ int main() {
   // bumps generation_, or download()'s currency check retires the very mesh the
   // refusal was protecting. Moving claim_output_slot() back after the bump
   // fails here, and nothing else in the suite notices.
-  vr::Result<mesh::Mesh> gen2_after_refusal = ring.download(gen2.value());
+  vkc::Result<mesh::Mesh> gen2_after_refusal = ring.download(gen2.value());
   CHECK(gen2_after_refusal.ok());
 
   // Releasing gen1 frees its slot and the next extract proceeds. What is
@@ -496,7 +499,7 @@ int main() {
   // a new allocation. Pinning the handle would have been testing the growth
   // policy while claiming to test the ring.
   ring.release_through(gen1.value().generation);
-  vr::Result<mesh::DeviceMesh> gen4 = ring.extract_device(small, 0.0f);
+  vkc::Result<mesh::DeviceMesh> gen4 = ring.extract_device(small, 0.0f);
   CHECK(gen4.ok());
   CHECK(gen4.value().vertices != gen2.value().vertices);
 
@@ -514,7 +517,7 @@ int main() {
   ring.release_through(gen4.value().generation);
   ring.release_through(gen2.value().generation);  // stale: older than the mark
   ring.release_through(0);                        // and the oldest of all
-  vr::Result<mesh::DeviceMesh> gen5 = ring.extract_device(small, 0.0f);
+  vkc::Result<mesh::DeviceMesh> gen5 = ring.extract_device(small, 0.0f);
   CHECK(gen5.ok());
 
   // The arena must not ratchet as the ring turns.
@@ -541,7 +544,7 @@ int main() {
 
     mesh::MarchingCubesConfig ratchet_config;
     ratchet_config.slot_count = kRatchetSlots;
-    vr::Result<mesh::MarchingCubes> ratchet_result =
+    vkc::Result<mesh::MarchingCubes> ratchet_result =
         mesh::MarchingCubes::create(device.value(), allocator.value(),
                                     ratchet_config);
     CHECK(ratchet_result.ok());
@@ -550,7 +553,7 @@ int main() {
     std::uint64_t bytes[kRatchetExtracts] = {};
     for (int i = 0; i < kRatchetExtracts; ++i) {
       mesh::ExtractTimings t{};
-      vr::Result<mesh::DeviceMesh> m = ratchet.extract_device(small, 0.0f, &t);
+      vkc::Result<mesh::DeviceMesh> m = ratchet.extract_device(small, 0.0f, &t);
       CHECK(m.ok());
       // Released immediately: this is testing the plan, not the ring's ability
       // to refuse, and an exhausted ring would end the loop early.
@@ -604,7 +607,7 @@ int main() {
   ring = std::move(*ring_alias);
   CHECK(ring.valid());
   ring.release_through(gen4.value().generation);
-  vr::Result<mesh::DeviceMesh> after_self_move =
+  vkc::Result<mesh::DeviceMesh> after_self_move =
       ring.extract_device(small, 0.0f);
   CHECK(after_self_move.ok());
   CHECK(after_self_move.value().valid());
@@ -622,13 +625,13 @@ int main() {
   {
     mesh::MarchingCubesConfig host_ring;
     host_ring.slot_count = 2;
-    vr::Result<mesh::MarchingCubes> host_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> host_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), host_ring);
     CHECK(host_result.ok());
     mesh::MarchingCubes host = std::move(host_result).value();
 
     for (int i = 0; i < 5; ++i) {
-      vr::Result<mesh::Mesh> host_mesh = host.extract_host(small, 0.0f);
+      vkc::Result<mesh::Mesh> host_mesh = host.extract_host(small, 0.0f);
       CHECK(host_mesh.ok());
       CHECK(!host_mesh.value().vertices.empty());
     }
@@ -649,23 +652,23 @@ int main() {
   {
     mesh::MarchingCubesConfig mixed_config;
     mixed_config.slot_count = 2;
-    vr::Result<mesh::MarchingCubes> mixed_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> mixed_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), mixed_config);
     CHECK(mixed_result.ok());
     mesh::MarchingCubes mixed = std::move(mixed_result).value();
 
     // Outstanding for the rest of the block, and never released: this stands
     // in for a renderer with the mesh bound in an in-flight draw.
-    vr::Result<mesh::DeviceMesh> live = mixed.extract_device(small, 0.0f);
+    vkc::Result<mesh::DeviceMesh> live = mixed.extract_device(small, 0.0f);
     CHECK(live.ok());
 
     // A host extract takes the *other* slot and gives it straight back.
-    vr::Result<mesh::Mesh> host_copy = mixed.extract_host(small, 0.0f);
+    vkc::Result<mesh::Mesh> host_copy = mixed.extract_host(small, 0.0f);
     CHECK(host_copy.ok());
 
     // So a slot is free for this one -- and it must be the freed one, never
     // the one `live` names.
-    vr::Result<mesh::DeviceMesh> next = mixed.extract_device(small, 0.0f);
+    vkc::Result<mesh::DeviceMesh> next = mixed.extract_device(small, 0.0f);
     CHECK(next.ok());
     CHECK(next.value().vertices != live.value().vertices);
 
@@ -674,7 +677,7 @@ int main() {
     // generation would have been marked released, `next` would have landed on
     // `live`'s slot, and the other slot would still be free here -- so this
     // would succeed.
-    vr::Result<mesh::DeviceMesh> refused = mixed.extract_device(small, 0.0f);
+    vkc::Result<mesh::DeviceMesh> refused = mixed.extract_device(small, 0.0f);
     CHECK(!refused.ok());
   }
 
@@ -684,7 +687,7 @@ int main() {
   // name its command, claim its own slot, and leave a consumer able to draw
   // (nothing) without special-casing.
   {
-    vr::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
+    vkc::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
         device.value(), allocator.value(), gp, attrs, 2);
     CHECK(empty_result.ok());
     vol::VoxelBlockGrid empty_grid =
@@ -692,18 +695,18 @@ int main() {
 
     mesh::MarchingCubesConfig empty_config;
     empty_config.slot_count = 2;
-    vr::Result<mesh::MarchingCubes> empty_ex = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> empty_ex = mesh::MarchingCubes::create(
         device.value(), allocator.value(), empty_config);
     CHECK(empty_ex.ok());
     mesh::MarchingCubes ex = std::move(empty_ex).value();
 
     // A real mesh first, so the empty extract that follows has a live previous
     // generation to *not* disturb.
-    vr::Result<mesh::DeviceMesh> real = ex.extract_device(small, 0.0f);
+    vkc::Result<mesh::DeviceMesh> real = ex.extract_device(small, 0.0f);
     CHECK(real.ok());
     CHECK(!real.value().empty());
 
-    vr::Result<mesh::DeviceMesh> none = ex.extract_device(empty_grid, 0.0f);
+    vkc::Result<mesh::DeviceMesh> none = ex.extract_device(empty_grid, 0.0f);
     CHECK(none.ok());
     CHECK(none.value().empty());
     CHECK(none.value().triangle_count == 0);
@@ -724,7 +727,7 @@ int main() {
     // release_through is a high-water mark, so this releases it too) -- the
     // point being simply that the empty extract consumed a slot rather than
     // vanishing, which the generation inequality above already shows.
-    vr::Result<mesh::Mesh> none_host = ex.download(none.value());
+    vkc::Result<mesh::Mesh> none_host = ex.download(none.value());
     CHECK(none_host.ok());
     CHECK(none_host.value().vertices.empty());
   }
@@ -733,11 +736,11 @@ int main() {
   // only when it is not empty already, and the real extract between the two
   // must count as not empty, or the second would hand out the real one's count.
   {
-    vr::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
+    vkc::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
         device.value(), allocator.value(), gp, attrs, 2);
     CHECK(empty_result.ok());
     vol::VoxelBlockGrid empty_grid = std::move(empty_result).value();
-    vr::Result<mesh::MarchingCubes> one_result =
+    vkc::Result<mesh::MarchingCubes> one_result =
         mesh::MarchingCubes::create(device.value(), allocator.value());
     CHECK(one_result.ok());
     mesh::MarchingCubes one = std::move(one_result).value();
@@ -747,12 +750,12 @@ int main() {
               device.value(), allocator.value(), m.indirect, 1);
       return c.empty() ? ~0u : c[0].indexCount;
     };
-    vr::Result<mesh::DeviceMesh> a = one.extract_device(empty_grid, 0.0f);
+    vkc::Result<mesh::DeviceMesh> a = one.extract_device(empty_grid, 0.0f);
     CHECK(a.ok() && index_count(a.value()) == 0);
-    vr::Result<mesh::DeviceMesh> b = one.extract_device(small, 0.0f);
+    vkc::Result<mesh::DeviceMesh> b = one.extract_device(small, 0.0f);
     CHECK(b.ok() && index_count(b.value()) == b.value().triangle_count * 3);
     CHECK(b.value().triangle_count > 0);
-    vr::Result<mesh::DeviceMesh> c = one.extract_device(empty_grid, 0.0f);
+    vkc::Result<mesh::DeviceMesh> c = one.extract_device(empty_grid, 0.0f);
     CHECK(c.ok() && index_count(c.value()) == 0);
   }
 
@@ -761,21 +764,21 @@ int main() {
   // would build and run on such a device, reading their buffers at the wrong
   // offsets, so create refuses it.
   {
-    vr::Result<vr::Device> plain =
-        vr::Device::create(instance.value(), gpu.value(), {});
+    vkc::Result<vkc::Device> plain =
+        vkc::Device::create(instance.value(), gpu.value(), {});
     CHECK(plain.ok());
-    vr::Result<vr::Allocator> plain_allocator =
-        vr::Allocator::create(instance.value().handle(), plain.value());
+    vkc::Result<vkc::Allocator> plain_allocator =
+        vkc::Allocator::create(instance.value().handle(), plain.value());
     CHECK(plain_allocator.ok());
-    vr::Result<mesh::MarchingCubes> refused =
+    vkc::Result<mesh::MarchingCubes> refused =
         mesh::MarchingCubes::create(plain.value(), plain_allocator.value());
-    CHECK(refused.status().domain() == vr::Status::Code::Unsupported);
+    CHECK(refused.status().domain() == vkc::Status::Code::Unsupported);
     CHECK(refused.status().message().find("scalarBlockLayout") !=
           std::string::npos);
     CHECK(vol::VoxelBlockGrid::create(plain.value(), plain_allocator.value(),
                                       gp, attrs, 2)
               .status()
-              .domain() == vr::Status::Code::Unsupported);
+              .domain() == vkc::Status::Code::Unsupported);
   }
 
   std::fprintf(stderr, "marching_cubes_config: OK\n");

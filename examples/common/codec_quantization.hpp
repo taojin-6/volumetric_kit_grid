@@ -20,13 +20,14 @@ namespace vr_example {
 ///             (squared frequency magnitude, different within a total band).
 /// @return OK, or InvalidArgument for an unknown table; on error @p params
 ///         is unchanged.
-inline volumetric_kit::recon::Status apply_quantization_table(
+inline volumetric_kit::core::Status apply_quantization_table(
     volumetric_kit::recon::codec::CodecParams& params,
     const std::string& name) {
-  namespace vr = volumetric_kit::recon;
+  namespace vkc = volumetric_kit::core;
   if (name != "uniform" && name != "band" && name != "radial") {
-    return vr::Status::invalid_argument("unknown quantization table: " + name +
-                                        " (expected uniform, band, or radial)");
+    return vkc::Status::invalid_argument(
+        "unknown quantization table: " + name +
+        " (expected uniform, band, or radial)");
   }
   for (std::uint32_t w = 0; w < 8; ++w) {
     for (std::uint32_t v = 0; v < 8; ++v) {

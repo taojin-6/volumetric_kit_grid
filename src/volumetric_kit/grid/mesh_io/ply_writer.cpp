@@ -44,22 +44,23 @@ bool finite(Vec3f v) {
 
 }  // namespace
 
-Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
-  VR_TRY(detail::check_path("write_ply", path));
+core::Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
+  VKC_TRY(detail::check_path("write_ply", path));
   if (mesh.indices.size() % 3 != 0) {
-    return Status::invalid_argument("write_ply: incomplete triangle indices");
+    return core::Status::invalid_argument(
+        "write_ply: incomplete triangle indices");
   }
   const std::size_t vertex_count = mesh.vertices.size();
   const std::size_t face_count = mesh.indices.size() / 3;
   if (vertex_count > std::vector<float>().max_size() / 3 ||
       mesh.indices.size() > std::vector<std::int32_t>().max_size()) {
-    return Status::invalid_argument(
+    return core::Status::invalid_argument(
         "write_ply: mesh exceeds host array limits");
   }
   for (std::size_t i = 0; i < vertex_count; ++i) {
     const mesh::Vertex& v = mesh.vertices[i];
     if (!finite(v.position) || !finite(v.normal)) {
-      return Status::invalid_argument(
+      return core::Status::invalid_argument(
           "write_ply: nonfinite position or normal at vertex " +
           std::to_string(i));
     }
@@ -68,13 +69,15 @@ Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
     if (index >= vertex_count ||
         index > static_cast<std::uint32_t>(
                     std::numeric_limits<std::int32_t>::max())) {
-      return Status::invalid_argument("write_ply: invalid signed int32 index");
+      return core::Status::invalid_argument(
+          "write_ply: invalid signed int32 index");
     }
   }
   // tinyply labels newly written files little-endian but writes native values.
   const std::uint16_t endian = 1;
   if (*reinterpret_cast<const std::uint8_t*>(&endian) != 1) {
-    return Status::unsupported("write_ply: requires a little-endian host");
+    return core::Status::unsupported(
+        "write_ply: requires a little-endian host");
   }
 
   // tinyply writes each property group from a tightly-packed array, so
@@ -120,7 +123,7 @@ Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
 
   std::ofstream out(path, std::ios::binary);
   if (!out) {
-    return Status::io_error("write_ply: cannot open " + path);
+    return core::Status::io_error("write_ply: cannot open " + path);
   }
   // tinyply's writer is noexcept: only its small per-property tables allocate
   // there, so the large buffers above carry the allocation failure contract.
@@ -128,7 +131,7 @@ Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
   // Explicit close includes the final flush and reports a delayed write error.
   out.close();
   if (!out) {
-    return Status::io_error("write_ply: write failed for " + path);
+    return core::Status::io_error("write_ply: write failed for " + path);
   }
   return {};
 } catch (...) {
