@@ -119,15 +119,15 @@ struct DeviceBlockList {
 ///        pipelines that operate on them, and drives block allocation and
 ///        active-block compaction.
 ///
-/// Built on the `core` compute foundation (@ref Allocator, @ref Buffer,
-/// @ref ComputePipeline, @ref Device::submit_single_time). The GLSL kernels
+/// Built on the `core` compute foundation (`Allocator`, `Buffer`,
+/// `ComputePipeline`, `Device::submit_single_time`). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
 /// byte-for-byte. Covers init, allocate-from-coords / -depth / -points, remove,
 /// compact / compact-in-frustum, diagnostics, and an **index-preserving**
 /// @ref resize (the GPU rehash that keeps each block's `ptr`).
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
 class VR_VOLUME_API VoxelHashMap {
  public:
@@ -137,9 +137,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator its buffers come from (must outlive this).
   /// @param grid       The grid resolution + hash-table shape.
-  /// @return The hash map, or a non-OK @ref Status if a buffer, pipeline, or
+  /// @return The hash map, or a non-OK `Status` if a buffer, pipeline, or
   /// the
-  ///         init dispatch fails; @ref Status::Code::InvalidArgument for a grid
+  ///         init dispatch fails; `Status::Code::InvalidArgument` for a grid
   ///         that fails @ref VoxelGridParams::validate.
   static core::Result<VoxelHashMap> create(core::Device& device,
                                            core::Allocator& allocator,
@@ -162,7 +162,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param coords  The block coordinates to insert.
   /// @param count   How many.
   /// @return The number of allocations that failed (0 = all succeeded), or a
-  ///         non-OK @ref Status if a buffer or the dispatch fails. Allocation
+  ///         non-OK `Status` if a buffer or the dispatch fails. Allocation
   ///         re-dispatches to converge under contention; a non-zero count means
   ///         a genuine capacity limit (chain full / heap empty) -- grow with
   ///         @ref resize -- but read @p out_failures rather than assuming that,
@@ -195,7 +195,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///                      table with ample room. @ref
   ///                      AllocFailures::capacity_limited is the test @ref
   ///                      resize answers.
-  /// @param metrics  Optional @ref StageMetrics collecting an `"allocate"` host
+  /// @param metrics  Optional `StageMetrics` collecting an `"allocate"` host
   ///                  row and, from timestamp spans around the dispatches, its
   ///                  device half. `nullptr` measures nothing. The retry loop
   ///                  contributes one span per round and they **accumulate**
@@ -210,7 +210,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///                  cover -- a @ref resize between retries, say -- and give
   ///                  that its own row.
   /// @return The number of block allocations that failed (0 = all succeeded),
-  ///         or a non-OK @ref Status if a buffer or the dispatch fails, or the
+  ///         or a non-OK `Status` if a buffer or the dispatch fails, or the
   ///         map is moved-from / @p depth is null.
   core::Result<std::uint32_t> allocate_from_depth(
       const float* depth, const DepthCameraParams& camera,
@@ -225,7 +225,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///               `camera.width * camera.height` floats, row-major. Borrowed
   ///               for the call; the writer's dispatch must have finished,
   ///               which a `dispatch` on this device guarantees.
-  /// @return As the host overload; @ref Status::Code::InvalidArgument also for
+  /// @return As the host overload; `Status::Code::InvalidArgument` also for
   ///         a @p depth that is empty, not a storage buffer, has unknown or
   ///         non-device-local memory, or is smaller than
   ///         the image.
@@ -266,7 +266,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param points  World-space points, metres.
   /// @param count   How many.
   /// @return The number of block allocations that failed (0 = all succeeded),
-  ///         or a non-OK @ref Status if a buffer or the dispatch fails, or the
+  ///         or a non-OK `Status` if a buffer or the dispatch fails, or the
   ///         map is moved-from / @p points is null.
   /// @param out_failures  Optional: receives the per-reason split (see
   ///                      @ref AllocFailures). Untouched when null.
@@ -289,7 +289,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// unbounded, and one lane owning a large triangle's whole bounding box is
   /// the dispatch shape that hangs a mobile GPU. The work is therefore split
   /// per *candidate block*, which costs a host pass over the triangles to count
-  /// them (@ref StageMetrics reports it in the row's CPU half).
+  /// them (`StageMetrics` reports it in the row's CPU half).
   ///
   /// A triangle is skipped, costing nothing, when it holds a non-finite vertex
   /// or has zero area; a zero-area triangle is dropped here rather than guarded
@@ -305,7 +305,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param metrics       Optional: receives an `"allocate"` row, as
   ///                      @ref allocate_from_depth.
   /// @return The number of block allocations that failed (0 = all succeeded),
-  ///         or a non-OK @ref Status: @ref Status::Code::InvalidArgument for a
+  ///         or a non-OK `Status`: `Status::Code::InvalidArgument` for a
   ///         moved-from map, a null @p vertices / @p indices, an index at or
   ///         past @p vertex_count, or a candidate-block total past 2^32 (a
   ///         mesh grossly mis-scaled against the grid -- metres read as
@@ -334,7 +334,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///          @ref VoxelBlockGrid::remove, which clears them first, on any grid
   ///          that carries attributes.
   /// @return The number of removals that failed (0 = all done), or a non-OK
-  ///         @ref Status if a buffer or the dispatch fails. A non-zero count
+  ///         `Status` if a buffer or the dispatch fails. A non-zero count
   ///         here is **not** capacity pressure. It is the sum of blocks
   ///         removed from the table whose index the free heap refused, i.e.
   ///         leaked capacity (@ref AllocFailures::terminal), and coords
@@ -358,7 +358,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///                least @p count block indices.
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional per-reason failure counts.
-  /// @return The number of failed removals, or a non-OK @ref Status for an
+  /// @return The number of failed removals, or a non-OK `Status` for an
   ///         invalid input, allocation failure, or failed dispatch. An
   ///         empty, refused or zero-count call leaves @ref topology_epoch
   ///         unchanged.
@@ -367,9 +367,9 @@ class VR_VOLUME_API VoxelHashMap {
                                      AllocFailures* out_failures = nullptr);
 
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
-  /// @param metrics  Optional @ref StageMetrics collecting an `"active set"`
+  /// @param metrics  Optional `StageMetrics` collecting an `"active set"`
   ///                 row -- host and device. Named with @ref
-  ///                 StageMetrics::kBreakdownPrefix when a @ref StageScope is
+  ///                 StageMetrics::kBreakdownPrefix when a `StageScope` is
   ///                 already open on @p metrics and plainly when it is not,
   ///                 because which of the two it is depends on the caller, not
   ///                 on this operation: `tsdf`'s `"integrate"` host row wraps
@@ -379,9 +379,9 @@ class VR_VOLUME_API VoxelHashMap {
   ///                 `integrate`'s halves reading as submit overhead when it is
   ///                 a second kernel) -- while a caller that compacts at top
   ///                 level is asking for a stage, and a prefixed row there
-  ///                 would be left out of @ref StageMetrics::total_cpu_ms
+  ///                 would be left out of `StageMetrics::total_cpu_ms`
   ///                 entirely.
-  /// @return The active blocks (order unspecified), or a non-OK @ref Status.
+  /// @return The active blocks (order unspecified), or a non-OK `Status`.
   core::Result<std::vector<BlockIndex>> compact_active_blocks(
       core::StageMetrics* metrics = nullptr);
 
@@ -394,7 +394,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
   /// @return The list, which @ref check_device_block_list accepts until this
   ///         map compacts another, allocates a block, resizes, removes,
-  ///         clears or moves; or a non-OK @ref Status.
+  ///         clears or moves; or a non-OK `Status`.
   core::Result<DeviceBlockList> compact_active_blocks_on_device(
       core::StageMetrics* metrics = nullptr);
 
@@ -403,7 +403,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param list  From @ref compact_active_blocks_on_device. An empty one is
   ///              always accepted: it names no block.
   /// @param who   The caller, for the message.
-  /// @return OK; or @ref Status::Code::InvalidArgument when this map is
+  /// @return OK; or `Status::Code::InvalidArgument` when this map is
   ///         moved-from, did not compact @p list, has moved since, or has
   ///         compacted another list, allocated, resized, removed or cleared
   ///         since.
@@ -426,7 +426,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///                 be able to read what that bought rather than watch the row
   ///                 disappear.
   /// @return The visible active blocks (order unspecified), or a non-OK
-  ///         @ref Status if a buffer or the dispatch fails / the map is
+  ///         `Status` if a buffer or the dispatch fails / the map is
   ///         moved-from.
   core::Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
       const FrustumPlanes& planes, core::StageMetrics* metrics = nullptr);
@@ -436,12 +436,12 @@ class VR_VOLUME_API VoxelHashMap {
   ///        range, and pose, then culls.
   /// @param camera  The same camera passed to @ref allocate_from_depth.
   /// @param metrics  As @ref compact_active_blocks.
-  /// @return The visible active blocks, or a non-OK @ref Status.
+  /// @return The visible active blocks, or a non-OK `Status`.
   core::Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
       const DepthCameraParams& camera, core::StageMetrics* metrics = nullptr);
 
   /// @brief Reset the table to empty (re-runs the init kernel).
-  /// @return An OK @ref Status, or a non-OK one if the init dispatch fails or
+  /// @return An OK `Status`, or a non-OK one if the init dispatch fails or
   ///         the map is moved-from.
   core::Status clear();
 
@@ -459,9 +459,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// grid that carries attributes through @ref VoxelBlockGrid::resize, which
   /// grows them first.
   /// @param new_num_buckets  The new bucket count (> the current @ref grid).
-  /// @return OK on success, or a non-OK @ref Status:
-  ///         @ref Status::Code::InvalidArgument for a non-growing count;
-  ///         @ref Status::Code::OutOfMemory if the re-insert overflows.
+  /// @return OK on success, or a non-OK `Status`:
+  ///         `Status::Code::InvalidArgument` for a non-growing count;
+  ///         `Status::Code::OutOfMemory` if the re-insert overflows.
   core::Status resize(std::int32_t new_num_buckets);
 
   /// @brief Read the raw hash-entry slots back to the host.
@@ -471,7 +471,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// host<->shader layout. @ref compact_active_blocks is the normal way to get
   /// the active set.
   /// @return All hash-entry slots (length `num_buckets * bucket_size`), or a
-  ///         non-OK @ref Status if the map is moved-from.
+  ///         non-OK `Status` if the map is moved-from.
   core::Result<std::vector<HashEntry>> read_entries();
 
   /// @brief The device hash-entry array, for a kernel that resolves blocks by
@@ -535,7 +535,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// necessarily spends time at the occupancy where collision chains are
   /// longest and every insert is slowest. Grow at @ref kGrowThreshold rather
   /// than at the cliff.
-  /// @return The occupancy in `[0, 1]`, or a non-OK @ref Status if the map is
+  /// @return The occupancy in `[0, 1]`, or a non-OK `Status` if the map is
   ///         moved-from.
   core::Result<float> load_factor() const;
 
@@ -560,7 +560,7 @@ class VR_VOLUME_API VoxelHashMap {
   /// A host-side scan of the entries, read back whole, plus the device's heap
   /// counter -- O(total slots), so call it for inspection/logging, not per
   /// frame. A GPU-side scan is a perf follow-up for very large tables.
-  /// @return The statistics, or a non-OK @ref Status (e.g. moved-from map).
+  /// @return The statistics, or a non-OK `Status` (e.g. moved-from map).
   core::Result<HashDiagnostics> diagnostics();
 
   /// @brief A token identifying this table's *current* block-index assignment:
@@ -667,7 +667,7 @@ class VR_VOLUME_API VoxelHashMap {
       BlockIndex* head = nullptr, std::uint32_t head_count = 0);
 
   /// The row label both compaction entry points report under, carrying
-  /// @ref StageMetrics::kBreakdownPrefix or not according to whether @p metrics
+  /// `StageMetrics::kBreakdownPrefix` or not according to whether @p metrics
   /// already has a stage open.
   static const char* active_set_row(const core::StageMetrics* metrics) noexcept;
 
@@ -697,7 +697,7 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// Create a transient device-local buffer that @p batch fills with @p bytes
   /// of @p data, and bind it at @p binding of @p set. The caller keeps the
-  /// returned @ref Buffer alive until the batch, and any round after it that
+  /// returned `Buffer` alive until the batch, and any round after it that
   /// reads the binding, has run.
   core::Result<core::Buffer> upload_to_binding(core::CommandBatch& batch,
                                                const core::DescriptorSet& set,
@@ -792,7 +792,7 @@ class VR_VOLUME_API VoxelHashMap {
   // a caller passes a StageMetrics.
   core::GpuTimer gpu_timer_;
   // One ComputeKernel per shader -- its descriptor-set layout, pipeline, and
-  // the set allocated from the shared pool_ (see @ref ComputeKernel). The
+  // the set allocated from the shared pool_ (see `ComputeKernel`). The
   // KernelSetBuilder in create() builds all seven and sizes pool_ to them.
   // Every persistent-buffer binding is written once by
   // write_persistent_bindings(); only the genuinely per-call input (coords /

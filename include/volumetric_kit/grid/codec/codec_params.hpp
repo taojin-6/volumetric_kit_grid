@@ -79,7 +79,7 @@ static_assert(kMaxStep * kMaxStep >= 4.0f * kVoxelsPerBlock,
 /// The device cannot code a frame past `maxStorageBufferRange` or free
 /// memory, nor decode one whose segments are longer than
 /// @ref kMaxDeviceDecodeSegmentSize. @ref kDevice refuses such a frame
-/// (@ref Status::Code::InvalidArgument or @ref Status::Code::OutOfMemory),
+/// (`Status::Code::InvalidArgument` or `Status::Code::OutOfMemory`),
 /// which the host would code, and may refuse a corrupt one with another
 /// message than the host's.
 enum class EntropyCoding {
@@ -154,7 +154,7 @@ struct VR_CODEC_API CodecParams {
   }();
 
   /// @brief Check that every field is one the transform can honour.
-  /// @return OK, or @ref Status::invalid_argument naming the field: a
+  /// @return OK, or `Status::invalid_argument` naming the field: a
   ///         @ref coefficient_count outside [1, @ref kVoxelsPerBlock], a
   ///         scale or kept weight that is not positive and normal (zero,
   ///         subnormal, infinite or NaN), or a kept frequency's effective

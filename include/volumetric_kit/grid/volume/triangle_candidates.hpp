@@ -53,7 +53,7 @@ namespace volumetric_kit::recon::volume {
 ///                        this function instead).
 /// @return `triangle_count + 1` offsets, the last being the total work-item
 ///         count (0 when every triangle was skipped); or
-///         @ref Status::Code::InvalidArgument for a null @p vertices or
+///         `Status::Code::InvalidArgument` for a null @p vertices or
 ///         @p indices with triangles to read, an index at or past
 ///         @p vertex_count, or a total past 2^32 (a mesh grossly mis-scaled
 ///         against the grid -- millimetres read as metres, say).

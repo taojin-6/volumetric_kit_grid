@@ -86,7 +86,7 @@ class VR_EVAL_API MeshDistance {
   /// @param mesh   The surface: `indices` taken three at a time.
   /// @param reach  The farthest distance measured, metres. It is also the cell
   ///               edge, so it should exceed the mesh's triangle size.
-  /// @return The index, or @ref Status::Code::InvalidArgument for:
+  /// @return The index, or `Status::Code::InvalidArgument` for:
   ///         - a `reach` that is not finite and positive;
   ///         - an index count that is not a multiple of 3, or an index past
   ///           the vertices;
@@ -174,7 +174,7 @@ struct MeshComparison {
 /// @param reference  The mesh taken as the truth.
 /// @param test       The mesh being judged.
 /// @param options    Reach, stride and F-score threshold.
-/// @return The comparison, or @ref Status::Code::InvalidArgument for a mesh
+/// @return The comparison, or `Status::Code::InvalidArgument` for a mesh
 ///         @ref MeshDistance::create refuses, a reach that is not finite and
 ///         positive, a stride of 0, or an F-score threshold that is negative,
 ///         not finite, or past the reach.
@@ -195,14 +195,14 @@ class VR_EVAL_API ReferenceMesh {
   /// @param reference  The mesh taken as the truth.
   /// @param options    Reach, stride and F-score threshold, for every
   ///                   comparison made against it.
-  /// @return The reference, or @ref Status::Code::InvalidArgument for
+  /// @return The reference, or `Status::Code::InvalidArgument` for
   ///         anything @ref compare_meshes refuses.
   static core::Result<ReferenceMesh> create(const mesh::Mesh& reference,
                                             const CompareOptions& options = {});
 
   /// @brief Compare @p test against the reference.
   /// @param test  The mesh being judged.
-  /// @return The comparison, or @ref Status::Code::InvalidArgument for a mesh
+  /// @return The comparison, or `Status::Code::InvalidArgument` for a mesh
   ///         @ref MeshDistance::create refuses.
   core::Result<MeshComparison> compare(const mesh::Mesh& test) const;
 

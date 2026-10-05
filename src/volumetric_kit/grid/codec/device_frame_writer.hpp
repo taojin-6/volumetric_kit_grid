@@ -11,8 +11,8 @@
 /// memory: the host reads back only the symbol counts, to build the frame's
 /// tables with the host's own @ref frame_tables, and the coded segments. Every
 /// bulk buffer is device-local and retained between frames
-/// (@ref ensure_device_scratch); the host reaches them only through
-/// @ref CommandBatch, so a discrete GPU moves the same few bytes across PCIe
+/// (`ensure_device_scratch`); the host reaches them only through
+/// `CommandBatch`, so a discrete GPU moves the same few bytes across PCIe
 /// that unified memory would.
 
 #include <cstdint>
@@ -43,7 +43,7 @@ namespace volumetric_kit::recon::codec::detail {
 /// and the segment lengths. The payload is read up to the last frame's bytes
 /// per block plus 25% with the lengths, and any rest in a second batch.
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
 class VR_CODEC_API DeviceFrameWriter {
  public:
@@ -65,7 +65,7 @@ class VR_CODEC_API DeviceFrameWriter {
   ///                      +-32767 (what the transform writes).
   /// @param segment_size  Blocks per segment, at least 1, which @ref finish
   ///                      codes at.
-  /// @return OK, or @ref Status::Code::InvalidArgument for a segment size of
+  /// @return OK, or `Status::Code::InvalidArgument` for a segment size of
   ///         0, more than 2^30 - 1 segments, or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.
   core::Status record_count(core::CommandBatch& batch,
@@ -81,10 +81,10 @@ class VR_CODEC_API DeviceFrameWriter {
   ///                    fractions of.
   /// @param params      The params the coefficients were made with.
   /// @return The frame's bytes, identical to @ref write_intra_frame's for the
-  ///         same content; @ref Status::Code::InvalidArgument for invalid
+  ///         same content; `Status::Code::InvalidArgument` for invalid
   ///         params, blocks @ref record_count did not count, or a frame
   ///         @ref assemble_intra_frame refuses; or a buffer or dispatch
-  ///         failure. @ref Status::Code::IoError only if a kernel's
+  ///         failure. `Status::Code::IoError` only if a kernel's
   ///         table refused a symbol it was counted from, which is a bug here.
   core::Result<std::vector<std::uint8_t>> finish(
       const ResidentBlocks& blocks, float voxel_size, float trunc_dist,

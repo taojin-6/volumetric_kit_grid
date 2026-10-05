@@ -57,7 +57,7 @@ struct PushConstants {
 
 // This tier's local_size, bound once so every call site reads group_count(n).
 std::uint32_t group_count(std::uint32_t items) {
-  return volumetric_kit::core::group_count(items, kLocalSize);
+  return core::group_count(items, kLocalSize);
 }
 
 // The depth kernel's tile side: a workgroup is a kDepthTile x kDepthTile tile
@@ -198,12 +198,12 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   map.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
 
   // Build every kernel's layout + pipeline and size the shared pool_ to them
-  // via KernelSetBuilder (core/compute_kernel.hpp) -- one add() per shader, its
-  // storage-buffer binding count matching that shader's set 0. Every kernel
-  // pushes the shared PushConstants block. allocate-from-coords and
-  // -from-points have the same 7-binding shape but each owns its kernel; depth
-  // adds the camera-params buffer at binding 6 (8 bindings), delete its done
-  // flags there; frustum compaction adds the planes buffer at binding 3 (4
+  // via KernelSetBuilder (core/vulkan/compute_kernel.hpp) -- one add() per
+  // shader, its storage-buffer binding count matching that shader's set 0.
+  // Every kernel pushes the shared PushConstants block. allocate-from-coords
+  // and -from-points have the same 7-binding shape but each owns its kernel;
+  // depth adds the camera-params buffer at binding 6 (8 bindings), delete its
+  // done flags there; frustum compaction adds the planes buffer at binding 3 (4
   // bindings). The stamps go last in every kernel that writes them: init's 4,
   // the allocators' and delete's after their own inputs.
   VkPushConstantRange push{};

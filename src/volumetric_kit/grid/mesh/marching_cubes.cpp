@@ -1002,7 +1002,7 @@ core::Result<MarchingCubes> MarchingCubes::create(
   // on the last grow. The count below and the two shaders' `binding =`
   // literals are the only statement of any of this, so they are maintained
   // together, and the count is `? 11 : 10` for that reason.
-  // KernelSetBuilder (core/compute_kernel.hpp) builds each
+  // KernelSetBuilder (core/vulkan/compute_kernel.hpp) builds each
   // layout + pipeline and allocates its set from a shared pool sized to the
   // exact descriptor total.
   //

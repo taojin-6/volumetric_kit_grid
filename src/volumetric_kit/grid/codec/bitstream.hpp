@@ -89,7 +89,7 @@ inline constexpr std::size_t kSectionEntryBytes = 8;
 /// frame rather than skip it.
 inline constexpr std::uint16_t kSectionRequired = 1;
 /// Every section flag v3 defines. A known section with any other bit set is
-/// refused as @ref Status::Code::Unsupported.
+/// refused as `Status::Code::Unsupported`.
 inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// Blocks per segment unless the writer is told otherwise: about 1% of a
 /// default frame in per-segment overhead, and room0's ~107 k blocks in ~1.7 k
@@ -181,13 +181,13 @@ VR_CODEC_API core::Status check_intra_frame(const IntraFrame& frame,
                                             const FrameWriteOptions& options);
 
 /// @brief Serialize an intra frame.
-/// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
+/// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, arrays whose sizes disagree with `coords`, coordinates not
 ///         strictly increasing, a coefficient outside ±32767, a segment size
 ///         of 0, or a frame whose SEGMENTS or PAYLOAD would outgrow its u32
 ///         length (more than 2^30 - 1 segments, or 4 GiB of payload).
-///         @ref Status::Code::IoError only if the coder refuses a symbol its
+///         `Status::Code::IoError` only if the coder refuses a symbol its
 ///         own tables were counted from, which is a bug here, never the
 ///         input's.
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_intra_frame(
@@ -223,7 +223,7 @@ struct CodedFrame {
 /// @brief Lay out a coded frame: header, section table, TABLES, SEGMENTS and
 ///        PAYLOAD. Shared by the host and device writers, so their containers
 ///        cannot differ.
-/// @return The frame's bytes, or @ref Status::Code::InvalidArgument for a
+/// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, a segment size of 0, tables or segment lengths whose
 ///         count the block count and K disagree with, lengths that do not
@@ -247,12 +247,12 @@ VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_intra_frame(
 ///                    block. Checked once the block count agrees with the
 ///                    segment table, so a corrupt count is refused as corrupt
 ///                    and only a sound frame is refused for its size.
-/// @return The frame, or: @ref Status::Code::Unsupported for another version,
+/// @return The frame, or: `Status::Code::Unsupported` for another version,
 ///         frame type, block size, an unknown required section, or a known
 ///         section with a flag v3 does not define;
-///         @ref Status::Code::InvalidArgument for anything malformed,
+///         `Status::Code::InvalidArgument` for anything malformed,
 ///         truncated or inconsistent (coordinates out of order across
-///         segments included); @ref Status::Code::OutOfMemory for a
+///         segments included); `Status::Code::OutOfMemory` for a
 ///         well-formed frame of more than @p max_blocks blocks, or one whose
 ///         arrays would not fit this platform's address space (reachable on a
 ///         32-bit build).
@@ -287,7 +287,7 @@ VR_CODEC_API core::Result<ParsedFrame> parse_intra_frame(
 /// @param parsed  Taken by value: its tables gain the slot lookups only this
 ///                reader needs.
 /// @return The frame, or @ref read_intra_frame's refusals of its segments
-///         (and @ref Status::Code::OutOfMemory for arrays past this
+///         (and `Status::Code::OutOfMemory` for arrays past this
 ///         platform's address space).
 VR_CODEC_API core::Result<IntraFrame> decode_intra_frame(ParsedFrame parsed);
 

@@ -12,7 +12,7 @@
 /// decoded coefficients and masks stay in device memory, where the inverse
 /// transform reads them, and only the coordinates and each segment's fault
 /// come back. Every bulk buffer is device-local and retained between frames
-/// (@ref ensure_device_scratch).
+/// (`ensure_device_scratch`).
 
 #include <cstdint>
 #include <memory>
@@ -38,7 +38,7 @@ namespace volumetric_kit::recon::codec::detail {
 /// the inverse transform's layout, and the coordinates and faults come back.
 /// After the caller submits it, @ref check gives the host reader's verdict.
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
 class VR_CODEC_API DeviceFrameReader {
  public:
@@ -57,7 +57,7 @@ class VR_CODEC_API DeviceFrameReader {
   /// which must happen before @ref check.
   /// @return The decoded blocks where the device holds them, valid until the
   ///         next call (no entries for a frame of none, which records
-  ///         nothing); @ref Status::Code::InvalidArgument, before any buffer
+  ///         nothing); `Status::Code::InvalidArgument`, before any buffer
   ///         grows, for a segment longer than
   ///         @ref kMaxDeviceDecodeSegmentSize or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.

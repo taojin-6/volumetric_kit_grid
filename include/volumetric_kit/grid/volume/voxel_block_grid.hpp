@@ -45,7 +45,7 @@ struct AttributeSpec {
 /// @brief Non-owning view of one attribute's backing store.
 ///
 /// @ref buffer is the device-local buffer to bind to a compute kernel (the
-/// host reaches it through a @ref CommandBatch); it holds
+/// host reaches it through a `CommandBatch`); it holds
 /// @ref element_count voxels of @ref element_size bytes each. Re-fetch the view
 /// (do not cache @ref buffer or its handle) across a move **or a
 /// @ref VoxelBlockGrid::resize** of the owning grid -- resize replaces every
@@ -78,7 +78,7 @@ inline constexpr float kObservedWeight = 1e-6f;
 /// attributes costs no per-voxel memory. The TSDF / colour integrators and mesh
 /// extraction bind the attribute buffers they read or write.
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them (through the
 ///          owned
 ///          @ref VoxelHashMap, and the allocator backs every attribute buffer).
@@ -93,8 +93,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// attr_count
   ///                   is 0).
   /// @param attr_count How many @p attrs.
-  /// @return The grid, or a non-OK @ref Status: whatever @ref
-  ///         VoxelHashMap::create returns; @ref Status::Code::InvalidArgument
+  /// @return The grid, or a non-OK `Status`: whatever @ref
+  ///         VoxelHashMap::create returns; `Status::Code::InvalidArgument`
   ///         for a null list, an empty name, a zero element size, or a
   ///         duplicate name; or an allocation failure.
   static core::Result<VoxelBlockGrid> create(core::Device& device,
@@ -125,7 +125,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///            grown capacity addresses past them. Use @ref resize, which
   ///            grows both. Reaching it through this handle anyway is caught
   ///            rather than silently tolerated: @ref attribute then **refuses**
-  ///            (see there), so the desync surfaces as a clean @ref Status at
+  ///            (see there), so the desync surfaces as a clean `Status` at
   ///            the next bind instead of an out-of-bounds device write.
   ///          - @ref VoxelHashMap::remove frees a block index without clearing
   ///            the per-voxel data it addressed, and the free heap is LIFO, so
@@ -201,7 +201,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// O(count) per call, and every consumer answers it on the device instead.
   /// @param blocks  The list.
   /// @param who     Prefixes the error message (the consumer's entry point).
-  /// @return OK, or @ref Status::Code::InvalidArgument naming the refusal.
+  /// @return OK, or `Status::Code::InvalidArgument` naming the refusal.
   core::Status check_block_list(const BlockList& blocks, const char* who) const;
 
   /// @brief Look up an attribute's backing store by name.
@@ -210,14 +210,14 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// because every consumer that binds one passes through here. An array that
   /// no longer covers `num_blocks * voxels_per_block` -- which is what calling
   /// @ref VoxelHashMap::resize through @ref map() leaves behind -- is refused,
-  /// so the mismatch becomes a clean @ref Status at the binding site rather
+  /// so the mismatch becomes a clean `Status` at the binding site rather
   /// than a kernel indexing past the end of a buffer bound `VK_WHOLE_SIZE`.
   ///
   /// A write through the view stamps no block `changed` (@ref BlockStamp),
   /// as the library's own writers do, so an incremental mesh extract after it
   /// keeps the old triangles: mesh such a grid in full next.
   /// @param name  The attribute name (as declared at @ref create).
-  /// @return A view of the attribute, or @ref Status::Code::InvalidArgument if
+  /// @return A view of the attribute, or `Status::Code::InvalidArgument` if
   ///         no attribute of that name was declared (or the grid is
   ///         moved-from), or if the array no longer covers the live grid.
   core::Result<AttributeView> attribute(std::string_view name) const;
@@ -246,7 +246,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @param coords  The block coordinates to remove (only `coord` is read).
   /// @param count   How many.
   /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
-  /// @return What @ref VoxelHashMap::remove returns, or a non-OK @ref Status if
+  /// @return What @ref VoxelHashMap::remove returns, or a non-OK `Status` if
   ///         the grid is moved-from, @p coords is null, or the zeroing fails,
   ///         which comes before any index is freed.
   core::Result<std::uint32_t> remove(const BlockIndex* coords,
@@ -260,7 +260,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// "a freshly allocated block reads as zero" true after a clear, exactly as
   /// it is after @ref create. The zeroing runs first, so a failure never frees
   /// an index over stale data.
-  /// @return OK, or a non-OK @ref Status if the grid is moved-from, the
+  /// @return OK, or a non-OK `Status` if the grid is moved-from, the
   ///         zeroing fails, or the underlying @ref VoxelHashMap::clear fails.
   core::Status clear();
 
@@ -284,10 +284,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// before the map resize and committed only once it succeeds, so an
   /// allocation failure leaves the grid untouched.
   /// @param new_num_buckets  The new bucket count (> the current @ref grid).
-  /// @return OK on success, or a non-OK @ref Status: @ref
+  /// @return OK on success, or a non-OK `Status`: @ref
   ///         Status::Code::InvalidArgument for a moved-from grid or a
   ///         non-growing count; an allocation failure; or whatever @ref
-  ///         VoxelHashMap::resize returns (e.g. @ref Status::Code::OutOfMemory
+  ///         VoxelHashMap::resize returns (e.g. `Status::Code::OutOfMemory`
   ///         on a rehash overflow).
   core::Status resize(std::int32_t new_num_buckets);
 
@@ -304,7 +304,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// on the first call.
   /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
   ///                 over the compaction's `"  ..active set"`.
-  /// @return OK; @ref Status::Code::InvalidArgument for a moved-from grid or
+  /// @return OK; `Status::Code::InvalidArgument` for a moved-from grid or
   ///         one without a `float` `weight` attribute; or a dispatch failure.
   core::Status stamp_blocks(core::StageMetrics* metrics = nullptr);
 
@@ -323,7 +323,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// Ages are differences of ticks, so they hold across the clock's wrap.
   /// @param max_age  Ticks a block may be neither and stay; at least 1.
   /// @param metrics  As @ref stamp_blocks, the row spanning the frees too.
-  /// @return The blocks freed; @ref Status::Code::InvalidArgument for a
+  /// @return The blocks freed; `Status::Code::InvalidArgument` for a
   ///         @p max_age of 0 or an attribute whose block is not whole 4-byte
   ///         words (an odd block size with an element under 4 bytes), or what
   ///         @ref stamp_blocks and @ref VoxelHashMap::remove refuse.

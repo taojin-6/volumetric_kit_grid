@@ -97,14 +97,14 @@ struct ResidentBlocks {
 /// map quiescent: no allocate may run into the grid during a call.
 ///
 /// Every buffer is device-local. Forward and inverse each use one
-/// @ref CommandBatch: the inputs staged up, the dispatches, and the results
+/// `CommandBatch`: the inputs staged up, the dispatches, and the results
 /// and reject count read back. Scratch buffers grow when needed and remain
 /// allocated for later calls. The observed filter compacts its result on the
 /// device and reads back a predicted prefix with the count in one batch; only
 /// a result that outgrows that prefix needs another, transfer-only batch.
 /// The coefficients travel two to a word, 16 bits each.
 ///
-/// @warning The @ref Device and @ref Allocator passed to @ref create must
+/// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
 ///
 /// @ref record_forward leaves the forward output on the device for the device
@@ -116,7 +116,7 @@ class VR_CODEC_API DctTransform {
   /// @param allocator  The allocator the scratch buffers come from (must
   ///                   outlive this object).
   /// @param config     Construction-time options.
-  /// @return The transform, or a non-OK @ref Status if a pipeline, the pool or
+  /// @return The transform, or a non-OK `Status` if a pipeline, the pool or
   ///         the table upload fails.
   static core::Result<std::unique_ptr<DctTransform>> create(
       core::Device& device, core::Allocator& allocator,
@@ -141,7 +141,7 @@ class VR_CODEC_API DctTransform {
   /// @param stage   Optional scope the caller's stage row is open under; the
   ///                dispatches record their device spans into it. `nullptr`
   ///                times nothing.
-  /// @return OK, or @ref Status::Code::InvalidArgument for invalid
+  /// @return OK, or `Status::Code::InvalidArgument` for invalid
   ///         @p params, a grid that is moved-from, has another block size, a
   ///         non-positive `trunc_dist`, or lacks a float `tsdf` / `weight`; a
   ///         list that
@@ -188,7 +188,7 @@ class VR_CODEC_API DctTransform {
   /// @param in      A @ref forward output, or one read back from a frame.
   /// @param stage   As @ref forward.
   /// @return OK, the same refusals as @ref forward, or
-  ///         @ref Status::Code::InvalidArgument when @p in carries invalid
+  ///         `Status::Code::InvalidArgument` when @p in carries invalid
   ///         params, another `trunc_dist` than @p grid, or a size that does
   ///         not match the list. A refusal for entries whose coord the grid
   ///         does not hold comes from the device, after every other entry has
@@ -203,7 +203,7 @@ class VR_CODEC_API DctTransform {
   /// The list must be duplicate-free, and the coefficients made against the
   /// grid's `trunc_dist` (both unchecked: the reader decoded them from a
   /// frame whose order and header the caller checked).
-  /// @return As @ref inverse, and @ref Status::Code::InvalidArgument for
+  /// @return As @ref inverse, and `Status::Code::InvalidArgument` for
   ///         buffers missing or smaller than @p in's count needs.
   core::Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
                        const CodecParams& params,
@@ -225,7 +225,7 @@ class VR_CODEC_API DctTransform {
   ///               (@ref
   ///               volume::VoxelHashMap::compact_active_blocks_on_device).
   /// @param stage  As @ref forward.
-  /// @return The observed entries; @ref Status::Code::InvalidArgument for a
+  /// @return The observed entries; `Status::Code::InvalidArgument` for a
   ///         list @ref volume::VoxelHashMap::check_device_block_list refuses,
   ///         a grid @ref forward refuses, or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer or dispatch failure.
@@ -260,7 +260,7 @@ class VR_CODEC_API DctTransform {
                       VkBuffer coefficients, VkBuffer masks,
                       VkDeviceSize masks_bytes, core::GpuStageScope* stage);
   /// Grow @p buffer if needed, retaining it for later calls
-  /// (@ref ensure_device_scratch).
+  /// (`ensure_device_scratch`).
   core::Status ensure_scratch(core::Buffer& buffer, VkDeviceSize bytes,
                               const char* name);
   /// Stage @p blocks onto the retained block-list buffer, in @p batch.

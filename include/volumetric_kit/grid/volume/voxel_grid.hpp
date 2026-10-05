@@ -52,8 +52,8 @@ struct VoxelGridParams {
   /// rather than per-call on the device hot path; @ref defaults always passes.
   /// The two precomputed fields (`voxels_per_block`, `num_blocks`) are checked
   /// against their defining products so a stale value cannot slip through.
-  /// @return An OK @ref Status when every field is valid, otherwise
-  ///         @ref Status::invalid_argument naming the offending field.
+  /// @return An OK `Status` when every field is valid, otherwise
+  ///         `Status::invalid_argument` naming the offending field.
   core::Status validate() const;
 };
 

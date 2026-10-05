@@ -22,12 +22,12 @@ namespace volumetric_kit::recon::mesh {
 /// The `mesh` tier writes its geometry into a `VkBuffer` and the `texture` tier
 /// rewrites `Vertex::uv0` in place, so routing one to the other through a host
 /// `Mesh` costs a full readback *and* a full re-upload of the same bytes
-/// (~45 MB each at a ~940 k-vertex room scan) for no reason. A @ref DeviceMesh
+/// (~45 MB each at a ~940 k-vertex room scan) for no reason. A `Device`Mesh
 /// names those buffers instead, and the host copy happens once, when a caller
 /// actually needs a `Mesh`.
 ///
 /// **Borrowed, not owned.** The buffers belong to the producing extractor,
-/// which reuses them across calls, so a @ref DeviceMesh is valid only until the
+/// which reuses them across calls, so a `Device`Mesh is valid only until the
 /// next extract on that same extractor -- exactly like a pointer into a
 /// container that the next insert may invalidate. Copying the struct copies the
 /// handles, not the storage.
