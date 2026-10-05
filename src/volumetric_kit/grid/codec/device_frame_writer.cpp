@@ -42,6 +42,7 @@ Status fail(const char* op, const std::string& why) {
 
 Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
     Device& device, Allocator& allocator) {
+  VR_TRY(check_device_requirements(device, "DeviceFrameWriter::create"));
   std::unique_ptr<DeviceFrameWriter> owned(new DeviceFrameWriter());
   DeviceFrameWriter& w = *owned;
   w.device_ = &device;
