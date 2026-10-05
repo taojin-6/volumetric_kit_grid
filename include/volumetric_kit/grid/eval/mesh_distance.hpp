@@ -39,8 +39,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/eval/export.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
@@ -94,7 +94,7 @@ class VR_EVAL_API MeshDistance {
   ///           a million reaches from the origin, past the cell keys' range;
   ///         - triangles that would be filed under more than
   ///           @ref kMaxCellsPerTriangle cells each on average.
-  static Result<MeshDistance> create(const mesh::Mesh& mesh, float reach);
+  static core::Result<MeshDistance> create(const mesh::Mesh& mesh, float reach);
 
   /// @brief How far @p p is from the surface.
   /// @param p  The query point.
@@ -178,7 +178,7 @@ struct MeshComparison {
 ///         @ref MeshDistance::create refuses, a reach that is not finite and
 ///         positive, a stride of 0, or an F-score threshold that is negative,
 ///         not finite, or past the reach.
-VR_EVAL_API Result<MeshComparison> compare_meshes(
+VR_EVAL_API core::Result<MeshComparison> compare_meshes(
     const mesh::Mesh& reference, const mesh::Mesh& test,
     const CompareOptions& options = {});
 
@@ -197,14 +197,14 @@ class VR_EVAL_API ReferenceMesh {
   ///                   comparison made against it.
   /// @return The reference, or @ref Status::Code::InvalidArgument for
   ///         anything @ref compare_meshes refuses.
-  static Result<ReferenceMesh> create(const mesh::Mesh& reference,
-                                      const CompareOptions& options = {});
+  static core::Result<ReferenceMesh> create(const mesh::Mesh& reference,
+                                            const CompareOptions& options = {});
 
   /// @brief Compare @p test against the reference.
   /// @param test  The mesh being judged.
   /// @return The comparison, or @ref Status::Code::InvalidArgument for a mesh
   ///         @ref MeshDistance::create refuses.
-  Result<MeshComparison> compare(const mesh::Mesh& test) const;
+  core::Result<MeshComparison> compare(const mesh::Mesh& test) const;
 
   /// @return The options every comparison is measured with.
   const CompareOptions& options() const noexcept { return options_; }

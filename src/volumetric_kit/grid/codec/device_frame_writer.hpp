@@ -21,12 +21,12 @@
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/compute_kernel.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/buffer.hpp"
-#include "volumetric_kit/recon/core/compute_kernel.hpp"
-#include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
 
@@ -49,8 +49,8 @@ class VR_CODEC_API DeviceFrameWriter {
  public:
   /// @brief Build the five kernels.
   /// @return The writer, or a pipeline or pool failure.
-  static Result<std::unique_ptr<DeviceFrameWriter>> create(
-      Device& device, Allocator& allocator);
+  static core::Result<std::unique_ptr<DeviceFrameWriter>> create(
+      core::Device& device, core::Allocator& allocator);
 
   ~DeviceFrameWriter() = default;
   DeviceFrameWriter(const DeviceFrameWriter&) = delete;
@@ -68,9 +68,10 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @return OK, or @ref Status::Code::InvalidArgument for a segment size of
   ///         0, more than 2^30 - 1 segments, or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.
-  Status record_count(CommandBatch& batch, const ResidentBlocks& blocks,
-                      std::uint32_t segment_size,
-                      GpuStageScope* stage = nullptr);
+  core::Status record_count(core::CommandBatch& batch,
+                            const ResidentBlocks& blocks,
+                            std::uint32_t segment_size,
+                            core::GpuStageScope* stage = nullptr);
 
   /// @brief Code the frame @ref record_count counted, at the segment size it
   ///        counted with, and lay it out.
@@ -85,52 +86,51 @@ class VR_CODEC_API DeviceFrameWriter {
   ///         @ref assemble_intra_frame refuses; or a buffer or dispatch
   ///         failure. @ref Status::Code::IoError only if a kernel's
   ///         table refused a symbol it was counted from, which is a bug here.
-  Result<std::vector<std::uint8_t>> finish(const ResidentBlocks& blocks,
-                                           float voxel_size, float trunc_dist,
-                                           const CodecParams& params,
-                                           GpuStageScope* stage = nullptr);
+  core::Result<std::vector<std::uint8_t>> finish(
+      const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
+      const CodecParams& params, core::GpuStageScope* stage = nullptr);
 
   /// @brief Write @p frame from host arrays: upload them, then count and
   ///        finish. What tests compare against @ref write_intra_frame.
   /// @return As @ref write_intra_frame.
-  Result<std::vector<std::uint8_t>> write(const IntraFrame& frame,
-                                          const FrameWriteOptions& options);
+  core::Result<std::vector<std::uint8_t>> write(
+      const IntraFrame& frame, const FrameWriteOptions& options);
 
  private:
   DeviceFrameWriter() = default;
 
   // Borrowed (must outlive this).
-  Device* device_ = nullptr;
-  Allocator* allocator_ = nullptr;
+  core::Device* device_ = nullptr;
+  core::Allocator* allocator_ = nullptr;
   std::uint32_t max_workgroup_count_x_ = 0;
   VkDeviceSize max_storage_buffer_range_ = 0;
 
   // Declared before pool_, so the pool is destroyed first.
-  ComputeKernel count_kernel_;
-  ComputeKernel ops_kernel_;
-  ComputeKernel encode_kernel_;
-  ComputeKernel scan_kernel_;
-  ComputeKernel gather_kernel_;
-  DescriptorPool pool_;
+  core::ComputeKernel count_kernel_;
+  core::ComputeKernel ops_kernel_;
+  core::ComputeKernel encode_kernel_;
+  core::ComputeKernel scan_kernel_;
+  core::ComputeKernel gather_kernel_;
+  core::DescriptorPool pool_;
 
   // Device-local, retained and grown by ensure_device_scratch.
-  Buffer counts_;           // per model, per symbol
-  Buffer block_steps_;      // coder steps per block
-  Buffer tables_;           // per model, per symbol: cum | freq << 16
-  Buffer step_offsets_;     // each block's first step
-  Buffer steps_;            // every coder step: start | freq << 16
-  Buffer segment_steps_;    // each segment's first step, segment count + 1
-  Buffer slot_offsets_;     // 16-bit words, segment count + 1
-  Buffer slots_;            // each segment's stream, at its slot's top
-  Buffer lengths_;          // bytes per segment
-  Buffer payload_offsets_;  // bytes, segment count + 1
-  Buffer payload_;
-  Buffer gather_args_;  // the gather's dispatch, which the scan sizes
-  Buffer failed_;       // set when a table refuses a symbol
+  core::Buffer counts_;         // per model, per symbol
+  core::Buffer block_steps_;    // coder steps per block
+  core::Buffer tables_;         // per model, per symbol: cum | freq << 16
+  core::Buffer step_offsets_;   // each block's first step
+  core::Buffer steps_;          // every coder step: start | freq << 16
+  core::Buffer segment_steps_;  // each segment's first step, segment count + 1
+  core::Buffer slot_offsets_;   // 16-bit words, segment count + 1
+  core::Buffer slots_;          // each segment's stream, at its slot's top
+  core::Buffer lengths_;        // bytes per segment
+  core::Buffer payload_offsets_;  // bytes, segment count + 1
+  core::Buffer payload_;
+  core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
+  core::Buffer failed_;       // set when a table refuses a symbol
   // write()'s uploads of a host frame.
-  Buffer upload_list_;
-  Buffer upload_masks_;
-  Buffer upload_coefficients_;
+  core::Buffer upload_list_;
+  core::Buffer upload_masks_;
+  core::Buffer upload_coefficients_;
 
   // Each model's first symbol entry (rans_walk.glsl's model_base), and what
   // record_count reads back at the caller's submit.

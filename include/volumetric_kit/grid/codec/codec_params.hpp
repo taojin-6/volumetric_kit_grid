@@ -11,8 +11,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 
 namespace volumetric_kit::recon::codec {
 
@@ -159,7 +159,7 @@ struct VR_CODEC_API CodecParams {
   ///         scale or kept weight that is not positive and normal (zero,
   ///         subnormal, infinite or NaN), or a kept frequency's effective
   ///         step outside [@ref kMinStep, @ref kMaxStep].
-  Status validate() const;
+  core::Status validate() const;
 };
 
 }  // namespace volumetric_kit::recon::codec

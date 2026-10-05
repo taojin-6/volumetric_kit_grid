@@ -21,17 +21,19 @@
 #include <utility>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -64,7 +66,8 @@ void insert_cube(const vol::VoxelGridParams& grid, vr::Vec3i center,
 // Compact the map's active set into a coord set + assert each block drew a
 // distinct, valid heap slot. Returns 1 (fail) via CHECK on any mismatch.
 int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   CHECK(active.ok());
   std::set<int> ptrs;
   for (const vol::BlockIndex& block : active.value()) {
@@ -94,28 +97,28 @@ vr::Vec3i unproject_to_block(const vr::DepthCameraParams& cam,
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -134,7 +137,7 @@ int main() {
   grid.num_blocks = 8192;
   grid.max_chain = 128;
 
-  vr::Result<vol::VoxelHashMap> map_result =
+  vkc::Result<vol::VoxelHashMap> map_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
@@ -175,7 +178,7 @@ int main() {
   // Null input is rejected without touching the device.
   CHECK(!map.allocate_from_depth(nullptr, cam).ok());
 
-  vr::Result<std::uint32_t> depth_fail =
+  vkc::Result<std::uint32_t> depth_fail =
       map.allocate_from_depth(depth.data(), cam);
   CHECK(depth_fail.ok());
   CHECK(depth_fail.value() == 0);
@@ -196,7 +199,7 @@ int main() {
   CHECK(depth_got == depth_want);
 
   // Idempotent: re-running the same frame allocates nothing new.
-  vr::Result<std::uint32_t> depth_fail2 =
+  vkc::Result<std::uint32_t> depth_fail2 =
       map.allocate_from_depth(depth.data(), cam);
   CHECK(depth_fail2.ok() && depth_fail2.value() == 0);
   std::set<Coord> depth_got2;
@@ -215,14 +218,14 @@ int main() {
     one.num_buckets = 1;
     one.bucket_size = 64;
     one.num_blocks = 64;
-    vr::Result<vol::VoxelHashMap> made =
+    vkc::Result<vol::VoxelHashMap> made =
         vol::VoxelHashMap::create(device.value(), allocator.value(), one);
     CHECK(made.ok());
     std::uint32_t left = 1;
     int passes = 0;
     for (; passes < 8 && left != 0; ++passes) {
       vol::AllocFailures failures{};
-      vr::Result<std::uint32_t> r =
+      vkc::Result<std::uint32_t> r =
           made.value().allocate_from_depth(depth.data(), cam, &failures);
       CHECK(r.ok());
       CHECK(failures.lock == r.value() && failures.terminal == 0);
@@ -248,7 +251,7 @@ int main() {
     vol::VoxelGridParams tiled = grid;
     tiled.voxel_size = 1.0f / 128.0f;  // a block is 1/16 m
     tiled.trunc_dist = trunc;
-    vr::Result<vol::VoxelHashMap> tiled_map =
+    vkc::Result<vol::VoxelHashMap> tiled_map =
         vol::VoxelHashMap::create(device.value(), allocator.value(), tiled);
     CHECK(tiled_map.ok());
     vr::DepthCameraParams wide = cam;
@@ -277,7 +280,7 @@ int main() {
         }
       }
     }
-    vr::Result<std::uint32_t> tiled_fail =
+    vkc::Result<std::uint32_t> tiled_fail =
         tiled_map.value().allocate_from_depth(wide_depth.data(), wide);
     CHECK(tiled_fail.ok() && tiled_fail.value() == 0);
     std::set<Coord> tiled_got;
@@ -291,7 +294,7 @@ int main() {
   // Fresh table. clear() must actually empty it -- assert that directly, since
   // reusing the map below could otherwise let a no-op clear() slip through.
   CHECK(map.clear().ok());
-  vr::Result<std::vector<vol::BlockIndex>> after_clear =
+  vkc::Result<std::vector<vol::BlockIndex>> after_clear =
       map.compact_active_blocks();
   CHECK(after_clear.ok() && after_clear.value().empty());
 
@@ -305,11 +308,11 @@ int main() {
   // Null input rejected, zero count a no-op success -- both without touching
   // the set (the depth path checks null too; cover points symmetrically).
   CHECK(!map.allocate_from_points(nullptr, 1).ok());
-  vr::Result<std::uint32_t> points_zero =
+  vkc::Result<std::uint32_t> points_zero =
       map.allocate_from_points(points.data(), 0);
   CHECK(points_zero.ok() && points_zero.value() == 0);
 
-  vr::Result<std::uint32_t> points_fail = map.allocate_from_points(
+  vkc::Result<std::uint32_t> points_fail = map.allocate_from_points(
       points.data(), static_cast<std::uint32_t>(points.size()));
   CHECK(points_fail.ok());
   CHECK(points_fail.value() == 0);

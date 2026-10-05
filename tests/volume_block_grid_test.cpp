@@ -12,12 +12,13 @@
 #include <cstdio>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -26,6 +27,7 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -54,28 +56,28 @@ vol::VoxelGridParams small_grid() {
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -89,7 +91,7 @@ int main() {
   // Declare two independent float attributes (SoA): tsdf + weight.
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
-  vr::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), grid, attrs, 2);
   if (!grid_result) {
     std::fprintf(stderr, "VoxelBlockGrid::create failed: %s\n",
@@ -104,11 +106,11 @@ int main() {
   CHECK(vbg.has_attribute("weight"));
   CHECK(!vbg.has_attribute("color"));
 
-  vr::Result<vol::AttributeView> tsdf = vbg.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight = vbg.attribute("weight");
+  vkc::Result<vol::AttributeView> tsdf = vbg.attribute("tsdf");
+  vkc::Result<vol::AttributeView> weight = vbg.attribute("weight");
   CHECK(tsdf.ok() && weight.ok());
   CHECK(vbg.attribute("color").status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
 
   // Each attribute is its own buffer, sized to the whole voxel pool.
   CHECK(tsdf.value().element_size == sizeof(float));
@@ -134,8 +136,8 @@ int main() {
   // load_factor() reads a host copy of the heap counter, and diagnostics()
   // the device's own: the two agree after every call that moves it.
   const auto heap_agrees = [&]() {
-    vr::Result<float> lf = vbg.map().load_factor();
-    vr::Result<vol::HashDiagnostics> d = vbg.map().diagnostics();
+    vkc::Result<float> lf = vbg.map().load_factor();
+    vkc::Result<vol::HashDiagnostics> d = vbg.map().diagnostics();
     return lf.ok() && d.ok() &&
            lf.value() == 1.0f - static_cast<float>(d.value().heap_free_count) /
                                     static_cast<float>(d.value().total_blocks);
@@ -168,10 +170,10 @@ int main() {
       }
     }
   }
-  vr::Result<std::uint32_t> allocated =
+  vkc::Result<std::uint32_t> allocated =
       vbg.map().allocate(cube.data(), static_cast<std::uint32_t>(cube.size()));
   CHECK(allocated.ok() && allocated.value() == 0);
-  vr::Result<std::vector<vol::BlockIndex>> active =
+  vkc::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
   CHECK(active.ok() && active.value().size() == cube.size());
   CHECK(heap_agrees());
@@ -209,7 +211,7 @@ int main() {
   // attribute array AND rehashes the map preserving block indices, so the
   // per-voxel data written above survives at the SAME ptr. Snapshot the live
   // block count first.
-  vr::Result<std::vector<vol::BlockIndex>> before =
+  vkc::Result<std::vector<vol::BlockIndex>> before =
       vbg.map().compact_active_blocks();
   CHECK(before.ok());
   const std::size_t before_count = before.value().size();
@@ -225,8 +227,8 @@ int main() {
   // The attribute buffers grew to the new pool (a resize swaps them), so
   // re-fetch the views: element_count now tracks the grown grid, buffer-derived
   // as ever.
-  vr::Result<vol::AttributeView> tsdf_grown = vbg.attribute("tsdf");
-  vr::Result<vol::AttributeView> weight_grown = vbg.attribute("weight");
+  vkc::Result<vol::AttributeView> tsdf_grown = vbg.attribute("tsdf");
+  vkc::Result<vol::AttributeView> weight_grown = vbg.attribute("weight");
   CHECK(tsdf_grown.ok() && weight_grown.ok());
   CHECK(tsdf_grown.value().element_count == new_voxels);  // grew, not frozen
   CHECK(weight_grown.value().element_count == new_voxels);
@@ -246,9 +248,9 @@ int main() {
   const vr::Vec3i fresh_coord(40, 40, 40);
   vol::BlockIndex fresh{};
   fresh.coord = fresh_coord;
-  vr::Result<std::uint32_t> fresh_alloc = vbg.map().allocate(&fresh, 1);
+  vkc::Result<std::uint32_t> fresh_alloc = vbg.map().allocate(&fresh, 1);
   CHECK(fresh_alloc.ok() && fresh_alloc.value() == 0);
-  vr::Result<std::vector<vol::BlockIndex>> with_fresh =
+  vkc::Result<std::vector<vol::BlockIndex>> with_fresh =
       vbg.map().compact_active_blocks();
   CHECK(with_fresh.ok() && with_fresh.value().size() == before_count + 1);
   std::int32_t fresh_ptr = -1;
@@ -277,7 +279,7 @@ int main() {
     weight_grown_data[fresh_ptr] = 5.0f;
     CHECK(put("tsdf", tsdf_grown_data) && put("weight", weight_grown_data));
 
-    vr::Result<std::uint32_t> removed = vbg.remove(&fresh, 1);
+    vkc::Result<std::uint32_t> removed = vbg.remove(&fresh, 1);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
     tsdf_grown_data = get("tsdf");
@@ -292,9 +294,9 @@ int main() {
 
     // The reuse this protects against: re-allocating draws the same index back
     // (LIFO) and it reads as a fresh block rather than the removed one.
-    vr::Result<std::uint32_t> realloc = vbg.map().allocate(&fresh, 1);
+    vkc::Result<std::uint32_t> realloc = vbg.map().allocate(&fresh, 1);
     CHECK(realloc.ok() && realloc.value() == 0);
-    vr::Result<std::vector<vol::BlockIndex>> after_reuse =
+    vkc::Result<std::vector<vol::BlockIndex>> after_reuse =
         vbg.map().compact_active_blocks();
     CHECK(after_reuse.ok());
     std::int32_t reused_ptr = -1;
@@ -318,9 +320,9 @@ int main() {
     for (int i = 0; i < 4; ++i) {
       blocks[i].coord = quad[i];
     }
-    vr::Result<std::uint32_t> placed = vbg.map().allocate(blocks, 4);
+    vkc::Result<std::uint32_t> placed = vbg.map().allocate(blocks, 4);
     CHECK(placed.ok() && placed.value() == 0);
-    vr::Result<std::vector<vol::BlockIndex>> live =
+    vkc::Result<std::vector<vol::BlockIndex>> live =
         vbg.map().compact_active_blocks();
     CHECK(live.ok());
     std::int32_t ptrs[4] = {-1, -1, -1, -1};
@@ -336,7 +338,7 @@ int main() {
       tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
     }
     CHECK(put("tsdf", tsdf_grown_data));
-    vr::Result<std::uint32_t> removed = vbg.remove(blocks + 1, 2);
+    vkc::Result<std::uint32_t> removed = vbg.remove(blocks + 1, 2);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
     tsdf_grown_data = get("tsdf");
@@ -365,7 +367,7 @@ int main() {
     odd.voxels_per_block = 125;
     const vol::AttributeSpec odd_attrs[] = {{"tsdf", sizeof(float)},
                                             {"label", 1}};
-    vr::Result<vol::VoxelBlockGrid> og = vol::VoxelBlockGrid::create(
+    vkc::Result<vol::VoxelBlockGrid> og = vol::VoxelBlockGrid::create(
         device.value(), allocator.value(), odd, odd_attrs, 2);
     CHECK(og.ok());
     vol::VoxelBlockGrid labels = std::move(og).value();
@@ -374,7 +376,7 @@ int main() {
       row[i].coord = vr::Vec3i(i, 0, 0);
     }
     CHECK(labels.map().allocate(row, 3).ok());
-    vr::Result<std::vector<std::uint8_t>> bytes =
+    vkc::Result<std::vector<std::uint8_t>> bytes =
         vr_test::read_attribute<std::uint8_t>(device.value(), allocator.value(),
                                               labels, "label");
     CHECK(bytes.ok());
@@ -382,7 +384,7 @@ int main() {
     CHECK(vr_test::write_attribute(device.value(), allocator.value(), labels,
                                    "label", filled)
               .ok());
-    vr::Result<std::vector<vol::BlockIndex>> live =
+    vkc::Result<std::vector<vol::BlockIndex>> live =
         labels.map().compact_active_blocks();
     CHECK(live.ok());
     std::int32_t middle = -1;
@@ -390,7 +392,7 @@ int main() {
       if (blk.coord == row[1].coord) middle = blk.ptr;
     }
     CHECK(middle >= 0);
-    vr::Result<std::uint32_t> removed = labels.remove(row + 1, 1);
+    vkc::Result<std::uint32_t> removed = labels.remove(row + 1, 1);
     CHECK(removed.ok() && removed.value() == 0);
     bytes = vr_test::read_attribute<std::uint8_t>(
         device.value(), allocator.value(), labels, "label");
@@ -413,7 +415,7 @@ int main() {
     weight_grown_data = get("weight");
     CHECK(tsdf_grown_data[ptr_a] == 0.0f);
     CHECK(weight_grown_data[ptr_a] == 0.0f);
-    vr::Result<std::vector<vol::BlockIndex>> empty =
+    vkc::Result<std::vector<vol::BlockIndex>> empty =
         vbg.map().compact_active_blocks();
     CHECK(empty.ok() && empty.value().empty());
   }
@@ -438,16 +440,16 @@ int main() {
   // matters -- rejected, before allocating, with the grid untouched.
   {
     const std::int32_t before_buckets = vbg.map().grid().num_buckets;
-    vr::Result<vol::AttributeView> before_tsdf = vbg.attribute("tsdf");
+    vkc::Result<vol::AttributeView> before_tsdf = vbg.attribute("tsdf");
     CHECK(before_tsdf.ok());
     const std::uint64_t before_size = before_tsdf.value().buffer->size();
 
-    const vr::Status huge = vbg.resize(1 << 20);
+    const vkc::Status huge = vbg.resize(1 << 20);
     CHECK(!huge.ok());
-    CHECK(huge.domain() == vr::Status::Code::InvalidArgument);
+    CHECK(huge.domain() == vkc::Status::Code::InvalidArgument);
     // All-or-nothing: the live grid is exactly as it was.
     CHECK(vbg.map().grid().num_buckets == before_buckets);
-    vr::Result<vol::AttributeView> after_tsdf = vbg.attribute("tsdf");
+    vkc::Result<vol::AttributeView> after_tsdf = vbg.attribute("tsdf");
     CHECK(after_tsdf.ok());
     CHECK(after_tsdf.value().buffer->size() == before_size);
   }
@@ -463,9 +465,9 @@ int main() {
     const std::int32_t bigger = vbg.map().grid().num_buckets * 2;
     CHECK(vbg.map().resize(bigger).ok());  // the raw path, not vbg.resize
     CHECK(vbg.map().grid().num_buckets == bigger);
-    vr::Result<vol::AttributeView> stale = vbg.attribute("tsdf");
+    vkc::Result<vol::AttributeView> stale = vbg.attribute("tsdf");
     CHECK(!stale.ok());
-    CHECK(stale.status().domain() == vr::Status::Code::InvalidArgument);
+    CHECK(stale.status().domain() == vkc::Status::Code::InvalidArgument);
   }
 
   // Error paths: null list with a count, empty name, zero element size, and a
@@ -473,25 +475,25 @@ int main() {
   CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
                                     nullptr, 1)
             .status()
-            .domain() == vr::Status::Code::InvalidArgument);
+            .domain() == vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec empty_name[] = {{"", sizeof(float)}};
   CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
                                     empty_name, 1)
             .status()
-            .domain() == vr::Status::Code::InvalidArgument);
+            .domain() == vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec zero_size[] = {{"bad", 0}};
   CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
                                     zero_size, 1)
             .status()
-            .domain() == vr::Status::Code::InvalidArgument);
+            .domain() == vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec dup[] = {{"tsdf", 4}, {"tsdf", 4}};
   CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
                                     dup, 2)
             .status()
-            .domain() == vr::Status::Code::InvalidArgument);
+            .domain() == vkc::Status::Code::InvalidArgument);
 
   // A grid with no attributes is valid and costs no per-voxel memory.
-  vr::Result<vol::VoxelBlockGrid> bare = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> bare = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), grid, nullptr, 0);
   CHECK(bare.ok());
   CHECK(bare.value().valid() && !bare.value().has_attribute("tsdf"));

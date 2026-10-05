@@ -25,17 +25,19 @@
 #include <vector>
 
 #include "test_meshes.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -100,7 +102,8 @@ std::set<Coord> blocks_within_band(const vol::VoxelGridParams& grid,
 }
 
 int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   CHECK(active.ok());
   for (const vol::BlockIndex& block : active.value()) {
     CHECK(block.ptr >= 0);
@@ -112,28 +115,28 @@ int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -153,7 +156,7 @@ int main() {
   grid.num_blocks = 8192;
   grid.max_chain = 128;
 
-  vr::Result<vol::VoxelHashMap> map_result =
+  vkc::Result<vol::VoxelHashMap> map_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   CHECK(map_result.ok());
   vol::VoxelHashMap& map = map_result.value();
@@ -170,7 +173,7 @@ int main() {
   };
   const std::vector<std::uint32_t> quad_idx = {0, 1, 2, 0, 2, 3};
 
-  vr::Result<std::uint32_t> failed = map.allocate_from_triangles(
+  vkc::Result<std::uint32_t> failed = map.allocate_from_triangles(
       quad_verts.data(), static_cast<std::uint32_t>(quad_verts.size()),
       quad_idx.data(), static_cast<std::uint32_t>(quad_idx.size() / 3));
   CHECK(failed.ok());
@@ -194,7 +197,7 @@ int main() {
   CHECK(got.size() <= want.size() * 2);
 
   // ---- 2. Idempotent re-run ------------------------------------------------
-  vr::Result<std::uint32_t> again = map.allocate_from_triangles(
+  vkc::Result<std::uint32_t> again = map.allocate_from_triangles(
       quad_verts.data(), static_cast<std::uint32_t>(quad_verts.size()),
       quad_idx.data(), static_cast<std::uint32_t>(quad_idx.size() / 3));
   CHECK(again.ok());
@@ -216,7 +219,7 @@ int main() {
   const vr::Vec3i centre_block = vol::world_to_block(centroid, grid);
   const Coord centre_coord = {centre_block.x, centre_block.y, centre_block.z};
 
-  vr::Result<std::uint32_t> big =
+  vkc::Result<std::uint32_t> big =
       map.allocate_from_triangles(big_verts.data(), 3, big_idx.data(), 1);
   CHECK(big.ok());
   CHECK(big.value() == 0);
@@ -228,7 +231,8 @@ int main() {
   // and callers fall back to the point path: the same three vertices, dilated
   // as points, leave the centroid's block unallocated.
   CHECK(map.clear().ok());
-  vr::Result<std::uint32_t> pts = map.allocate_from_points(big_verts.data(), 3);
+  vkc::Result<std::uint32_t> pts =
+      map.allocate_from_points(big_verts.data(), 3);
   CHECK(pts.ok());
   std::set<Coord> pts_got;
   if (collect_active(map, pts_got) != 0) return 1;
@@ -242,7 +246,7 @@ int main() {
   const std::vector<vr::Vec3f> diag_verts = {
       {0.0f, 0.0f, 0.0f}, {0.6f, 0.6f, 0.0f}, {0.0f, 0.0f, 0.3f}};
   const std::vector<std::uint32_t> diag_idx = {0, 1, 2};
-  vr::Result<std::uint32_t> diag =
+  vkc::Result<std::uint32_t> diag =
       map.allocate_from_triangles(diag_verts.data(), 3, diag_idx.data(), 1);
   CHECK(diag.ok());
   CHECK(diag.value() == 0);
@@ -260,7 +264,7 @@ int main() {
   // ---- 5. Guards -----------------------------------------------------------
   CHECK(map.clear().ok());
   // Zero triangles: nothing to do, not an error.
-  vr::Result<std::uint32_t> none =
+  vkc::Result<std::uint32_t> none =
       map.allocate_from_triangles(quad_verts.data(), 4, quad_idx.data(), 0);
   CHECK(none.ok());
   CHECK(none.value() == 0);
@@ -283,7 +287,7 @@ int main() {
       {inf, 0.0f, 0.0f},   // 2: non-finite
   };
   const std::vector<std::uint32_t> odd_idx = {0, 0, 1, 0, 1, 2};
-  vr::Result<std::uint32_t> odd =
+  vkc::Result<std::uint32_t> odd =
       map.allocate_from_triangles(odd_verts.data(), 3, odd_idx.data(), 2);
   CHECK(odd.ok());
   CHECK(odd.value() == 0);

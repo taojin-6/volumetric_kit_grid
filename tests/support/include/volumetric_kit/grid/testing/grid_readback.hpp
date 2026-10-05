@@ -14,24 +14,26 @@
 
 namespace vr_test {
 
+namespace vkc = volumetric_kit::core;
+
 // The whole of attribute `name`, as elements of T.
 template <typename T>
-vr::Result<std::vector<T>> read_attribute(
-    const vr::Device& device, vr::Allocator& allocator,
+vkc::Result<std::vector<T>> read_attribute(
+    const vkc::Device& device, vkc::Allocator& allocator,
     const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name) {
-  VR_ASSIGN(const auto view, grid.attribute(name));
+  VKC_ASSIGN(const auto view, grid.attribute(name));
   return read_back<T>(device, allocator, *view.buffer,
                       view.buffer->size() / sizeof(T));
 }
 
 // Write `data` over the start of attribute `name`.
 template <typename T>
-vr::Status write_attribute(
-    const vr::Device& device, vr::Allocator& allocator,
+vkc::Status write_attribute(
+    const vkc::Device& device, vkc::Allocator& allocator,
     const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name, const std::vector<T>& data) {
-  VR_ASSIGN(const auto view, grid.attribute(name));
+  VKC_ASSIGN(const auto view, grid.attribute(name));
   return write_back(device, allocator, *view.buffer, data);
 }
 

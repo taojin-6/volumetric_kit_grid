@@ -18,17 +18,19 @@
 #include <vector>
 
 #include "buffer_readback.hpp"
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -76,28 +78,28 @@ std::vector<vol::BlockIndex> coords_in_bucket(int target_bucket,
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -116,7 +118,7 @@ int main() {
   grid.num_blocks = 8192;
   grid.max_chain = 128;
 
-  vr::Result<vol::VoxelHashMap> map_result =
+  vkc::Result<vol::VoxelHashMap> map_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
@@ -140,21 +142,22 @@ int main() {
   }
 
   // Allocate; every insert should succeed.
-  vr::Result<std::uint32_t> failures =
+  vkc::Result<std::uint32_t> failures =
       map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
   CHECK(failures.ok());
   CHECK(failures.value() == 0);
 
   // Idempotent: re-inserting the same coords allocates nothing new and fails
   // nothing (the block-exists fast path dedups).
-  vr::Result<std::uint32_t> failures2 =
+  vkc::Result<std::uint32_t> failures2 =
       map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
   CHECK(failures2.ok() && failures2.value() == 0);
 
   // Compact: exactly the input set comes back, each block drawing a DISTINCT
   // heap slot (a double-pop would hand two coords the same block -- both would
   // still look valid/aligned, so the distinctness check is what catches it).
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   CHECK(active.ok());
   CHECK(active.value().size() == want.size());
   std::set<Coord> got;
@@ -170,12 +173,12 @@ int main() {
   // The same set left on the device: the host list's entries, and refused
   // once another compaction has rewritten it.
   const auto n = static_cast<std::uint32_t>(coords.size());
-  vr::Result<vol::DeviceBlockList> on_device =
+  vkc::Result<vol::DeviceBlockList> on_device =
       map.compact_active_blocks_on_device();
   CHECK(on_device.ok() && on_device.value().count == want.size());
   CHECK(map.check_device_block_list(on_device.value(), "test").ok());
   {
-    vr::Result<std::vector<vol::BlockIndex>> listed =
+    vkc::Result<std::vector<vol::BlockIndex>> listed =
         vr_test::read_back<vol::BlockIndex>(device.value(), allocator.value(),
                                             *on_device.value().buffer,
                                             on_device.value().count);
@@ -197,7 +200,7 @@ int main() {
   // occupied, each pos is one of the inputs (proving `pos` lands at the host
   // offset the shader wrote), and each ptr is a whole block (a multiple of
   // voxels_per_block).
-  vr::Result<std::vector<vol::HashEntry>> entries = map.read_entries();
+  vkc::Result<std::vector<vol::HashEntry>> entries = map.read_entries();
   CHECK(entries.ok());
   int occupied = 0;
   for (const vol::HashEntry& entry : entries.value()) {
@@ -211,7 +214,7 @@ int main() {
 
   // clear() empties the table.
   CHECK(map.clear().ok());
-  vr::Result<std::vector<vol::BlockIndex>> after_clear =
+  vkc::Result<std::vector<vol::BlockIndex>> after_clear =
       map.compact_active_blocks();
   CHECK(after_clear.ok());
   CHECK(after_clear.value().empty());
@@ -219,39 +222,40 @@ int main() {
   // An empty device list names nothing, so it is accepted; a remove or a
   // resize since a compaction makes its list stale, and another map refuses
   // it.
-  vr::Result<vol::DeviceBlockList> none = map.compact_active_blocks_on_device();
+  vkc::Result<vol::DeviceBlockList> none =
+      map.compact_active_blocks_on_device();
   CHECK(none.ok() && none.value().count == 0);
   CHECK(map.check_device_block_list(none.value(), "test").ok());
   {
-    vr::Result<vol::VoxelHashMap> lmap_result =
+    vkc::Result<vol::VoxelHashMap> lmap_result =
         vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
     CHECK(lmap_result.ok());
     vol::VoxelHashMap lmap = std::move(lmap_result).value();
     CHECK(lmap.allocate(coords.data(), n).value() == 0);
-    vr::Result<vol::DeviceBlockList> before_remove =
+    vkc::Result<vol::DeviceBlockList> before_remove =
         lmap.compact_active_blocks_on_device();
     CHECK(before_remove.ok() && before_remove.value().count == want.size());
     CHECK(lmap.remove(coords.data(), 1).ok());
     CHECK(!lmap.check_device_block_list(before_remove.value(), "test").ok());
-    vr::Result<vol::DeviceBlockList> before_resize =
+    vkc::Result<vol::DeviceBlockList> before_resize =
         lmap.compact_active_blocks_on_device();
     CHECK(before_resize.ok());
     CHECK(lmap.check_device_block_list(before_resize.value(), "test").ok());
     CHECK(lmap.resize(grid.num_buckets * 2).ok());
     CHECK(!lmap.check_device_block_list(before_resize.value(), "test").ok());
-    vr::Result<vol::DeviceBlockList> fresh =
+    vkc::Result<vol::DeviceBlockList> fresh =
         lmap.compact_active_blocks_on_device();
     CHECK(fresh.ok() && fresh.value().count == want.size() - 1);
     CHECK(!map.check_device_block_list(fresh.value(), "test").ok());
     // Nothing has changed since, so the same list comes back undispatched. An
     // allocation that takes a block makes it stale; one that takes none, of
     // blocks already there, does not.
-    vr::Result<vol::DeviceBlockList> again =
+    vkc::Result<vol::DeviceBlockList> again =
         lmap.compact_active_blocks_on_device();
     CHECK(again.ok() && again.value().serial == fresh.value().serial);
     CHECK(lmap.allocate(coords.data(), n).value() == 0);
     CHECK(!lmap.check_device_block_list(fresh.value(), "test").ok());
-    vr::Result<vol::DeviceBlockList> regrown =
+    vkc::Result<vol::DeviceBlockList> regrown =
         lmap.compact_active_blocks_on_device();
     CHECK(regrown.ok() && regrown.value().count == want.size());
     CHECK(lmap.allocate(coords.data(), n).value() == 0);
@@ -276,7 +280,7 @@ int main() {
     cg.num_blocks = 32;  // bucket_size * num_buckets
     cg.max_chain = 16;
 
-    vr::Result<vol::VoxelHashMap> cmap_result =
+    vkc::Result<vol::VoxelHashMap> cmap_result =
         vol::VoxelHashMap::create(device.value(), allocator.value(), cg);
     CHECK(cmap_result.ok());
     vol::VoxelHashMap cmap = std::move(cmap_result).value();
@@ -298,12 +302,12 @@ int main() {
     // build the chain deterministically one coord at a time -- exactly the
     // cross-dispatch retry the host is expected to do.
     for (const vol::BlockIndex& block : cc) {
-      vr::Result<std::uint32_t> f = cmap.allocate(&block, 1);
+      vkc::Result<std::uint32_t> f = cmap.allocate(&block, 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
     // All seven come back, each with a distinct heap block.
-    vr::Result<std::vector<vol::BlockIndex>> cactive =
+    vkc::Result<std::vector<vol::BlockIndex>> cactive =
         cmap.compact_active_blocks();
     CHECK(cactive.ok());
     CHECK(cactive.value().size() == cwant.size());
@@ -320,7 +324,7 @@ int main() {
     // carry a non-zero offset -- i.e. the surplus coords were linked through
     // HashEntry.offset, proving that field round-trips at its scalar-layout
     // byte (the 3x3x3 test, all offsets kNoOffset, never checks it).
-    vr::Result<std::vector<vol::HashEntry>> centries = cmap.read_entries();
+    vkc::Result<std::vector<vol::HashEntry>> centries = cmap.read_entries();
     CHECK(centries.ok());
     const std::size_t anchor =
         static_cast<std::size_t>((0 + 1) * cg.bucket_size - 1);
@@ -329,10 +333,10 @@ int main() {
     // Idempotent under collisions: re-inserting the same coords must find the
     // chained ones by TRAVERSING `offset` and allocate nothing new -- if offset
     // were mis-read the chained coords would be re-inserted and the count grow.
-    vr::Result<std::uint32_t> cfail2 =
+    vkc::Result<std::uint32_t> cfail2 =
         cmap.allocate(cc.data(), static_cast<std::uint32_t>(cc.size()));
     CHECK(cfail2.ok() && cfail2.value() == 0);
-    vr::Result<std::vector<vol::BlockIndex>> cactive2 =
+    vkc::Result<std::vector<vol::BlockIndex>> cactive2 =
         cmap.compact_active_blocks();
     CHECK(cactive2.ok());
     CHECK(cactive2.value().size() == cwant.size());
@@ -366,7 +370,7 @@ int main() {
     pg.num_blocks = 2048;  // bucket_size * num_buckets
     pg.max_chain = 512;    // > kDeepChain, so the chain is never the limit
 
-    vr::Result<vol::VoxelHashMap> pmap_result =
+    vkc::Result<vol::VoxelHashMap> pmap_result =
         vol::VoxelHashMap::create(device.value(), allocator.value(), pg);
     CHECK(pmap_result.ok());
     vol::VoxelHashMap pmap = std::move(pmap_result).value();
@@ -386,12 +390,12 @@ int main() {
     // contends the spin lock and legitimately reports retryable failures, which
     // would muddle what this is measuring.
     for (const vol::BlockIndex& block : deep) {
-      vr::Result<std::uint32_t> f = pmap.allocate(&block, 1);
+      vkc::Result<std::uint32_t> f = pmap.allocate(&block, 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
     // All 300 landed, each on its own block.
-    vr::Result<std::vector<vol::BlockIndex>> pactive =
+    vkc::Result<std::vector<vol::BlockIndex>> pactive =
         pmap.compact_active_blocks();
     CHECK(pactive.ok());
     CHECK(pactive.value().size() == kDeepChain);
@@ -407,22 +411,22 @@ int main() {
     // in the active set and still counts 300. Re-allocating the whole set in
     // ONE dispatch has to find every one of them by hopping the chain, so a bad
     // link re-inserts instead and the count grows.
-    vr::Result<std::uint32_t> prefail =
+    vkc::Result<std::uint32_t> prefail =
         pmap.allocate(deep.data(), static_cast<std::uint32_t>(deep.size()));
     CHECK(prefail.ok() && prefail.value() == 0);
-    vr::Result<std::vector<vol::BlockIndex>> pactive2 =
+    vkc::Result<std::vector<vol::BlockIndex>> pactive2 =
         pmap.compact_active_blocks();
     CHECK(pactive2.ok());
     CHECK(pactive2.value().size() == kDeepChain);
 
-    vr::Result<std::vector<vol::HashEntry>> pentries = pmap.read_entries();
+    vkc::Result<std::vector<vol::HashEntry>> pentries = pmap.read_entries();
     CHECK(pentries.ok());
     const auto panchor = static_cast<std::size_t>(pg.bucket_size - 1);
     CHECK(pentries.value()[panchor].offset != vol::kNoOffset);
 
     // Occupancy is readable without the O(total slots) diagnostics scan -- the
     // cheap signal a caller needs to grow *before* it starts failing.
-    vr::Result<float> plf = pmap.load_factor();
+    vkc::Result<float> plf = pmap.load_factor();
     CHECK(plf.ok());
     CHECK(plf.value() > 0.14f && plf.value() < 0.15f);  // 300 / 2048
   }
@@ -442,7 +446,7 @@ int main() {
     tg.num_blocks = 4;  // bucket_size * num_buckets
     tg.max_chain = 8;
 
-    vr::Result<vol::VoxelHashMap> tmap_result =
+    vkc::Result<vol::VoxelHashMap> tmap_result =
         vol::VoxelHashMap::create(device.value(), allocator.value(), tg);
     CHECK(tmap_result.ok());
     vol::VoxelHashMap tmap = std::move(tmap_result).value();
@@ -455,7 +459,7 @@ int main() {
     // block is left on the heap and one slot is free, but that slot is bucket
     // 1's anchor.
     for (std::size_t i = 0; i < 3; ++i) {
-      vr::Result<std::uint32_t> f = tmap.allocate(&b0[i], 1);
+      vkc::Result<std::uint32_t> f = tmap.allocate(&b0[i], 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -464,10 +468,10 @@ int main() {
     // still on the heap, and load_factor proves it), and not a sweep that gave
     // up early -- a windowed probe reports the same code for "I stopped
     // looking", which is what makes the reason unusable for deciding to grow.
-    vr::Result<float> tlf = tmap.load_factor();
+    vkc::Result<float> tlf = tmap.load_factor();
     CHECK(tlf.ok() && tlf.value() < 1.0f);
     vol::AllocFailures tf{};
-    vr::Result<std::uint32_t> f4 = tmap.allocate(&b0[3], 1, &tf);
+    vkc::Result<std::uint32_t> f4 = tmap.allocate(&b0[3], 1, &tf);
     CHECK(f4.ok() && f4.value() > 0);
     CHECK(tf.table > 0);
     CHECK(tf.heap == 0);
@@ -476,9 +480,9 @@ int main() {
     // Fill that last anchor through bucket 1's primary path, emptying the heap.
     std::vector<vol::BlockIndex> b1 = coords_in_bucket(1, tg.num_buckets, 1);
     CHECK(b1.size() == 1);
-    vr::Result<std::uint32_t> f5 = tmap.allocate(&b1[0], 1);
+    vkc::Result<std::uint32_t> f5 = tmap.allocate(&b1[0], 1);
     CHECK(f5.ok() && f5.value() == 0);
-    vr::Result<float> tfull = tmap.load_factor();
+    vkc::Result<float> tfull = tmap.load_factor();
     CHECK(tfull.ok() && tfull.value() == 1.0f);
 
     // Now the identical insert must report kFailHeap instead. Nothing about the
@@ -489,7 +493,7 @@ int main() {
     // early-out the sweep runs to exhaustion and reports `table` here, failing
     // the pair.
     vol::AllocFailures hf{};
-    vr::Result<std::uint32_t> f6 = tmap.allocate(&b0[3], 1, &hf);
+    vkc::Result<std::uint32_t> f6 = tmap.allocate(&b0[3], 1, &hf);
     CHECK(f6.ok() && f6.value() > 0);
     CHECK(hf.heap > 0);
     CHECK(hf.table == 0);
@@ -500,7 +504,7 @@ int main() {
   // compacted before the move is refused by the map it moved into, and the
   // moved-from map compacts nothing.
   CHECK(map.allocate(coords.data(), n).value() == 0);
-  vr::Result<vol::DeviceBlockList> before_move =
+  vkc::Result<vol::DeviceBlockList> before_move =
       map.compact_active_blocks_on_device();
   CHECK(before_move.ok() && before_move.value().count == want.size());
   vol::VoxelHashMap moved = std::move(map);
@@ -524,7 +528,7 @@ int main() {
   // `moved`; the source empties and the destination stays live (its prior
   // buffers / pipelines are released by the move-assign -- ASan turns a
   // leak/double-free here into a failure).
-  vr::Result<vol::VoxelHashMap> other_result =
+  vkc::Result<vol::VoxelHashMap> other_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   CHECK(other_result.ok());
   vol::VoxelHashMap other = std::move(other_result).value();

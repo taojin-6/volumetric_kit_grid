@@ -36,14 +36,15 @@
 #include <utility>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
-#include "volumetric_kit/recon/core/command_batch.hpp"
-#include "volumetric_kit/recon/core/compute_util.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -53,6 +54,7 @@
 #include "grid_readback.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 namespace mesh = volumetric_kit::recon::mesh;
 
@@ -132,13 +134,14 @@ bool write_attributes(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
 // without fusing. Returns false on any device error.
 bool stamp_changed(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
                    const std::vector<std::uint32_t>& slots) {
-  vr::Result<std::vector<vol::BlockStamp>> stamps = g.map().read_block_stamps();
+  vkc::Result<std::vector<vol::BlockStamp>> stamps =
+      g.map().read_block_stamps();
   if (!stamps.ok()) return false;
   g.map().advance_tick();
   for (const std::uint32_t slot : slots) {
     stamps.value()[slot].changed = g.map().tick();
   }
-  vr::CommandBatch batch(ctx.device, ctx.allocator);
+  vkc::CommandBatch batch(ctx.device, ctx.allocator);
   return batch
              .upload(g.map().stamps_buffer(), 0, stamps.value().data(),
                      stamps.value().size() * sizeof(vol::BlockStamp))
@@ -165,12 +168,12 @@ bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
       }
     }
   }
-  vr::Result<std::uint32_t> failed = g.map().allocate(
+  vkc::Result<std::uint32_t> failed = g.map().allocate(
       blocks.data(), static_cast<std::uint32_t>(blocks.size()));
   if (!failed || failed.value() != 0) {
     return false;
   }
-  vr::Result<std::vector<vol::BlockIndex>> active =
+  vkc::Result<std::vector<vol::BlockIndex>> active =
       g.map().compact_active_blocks();
   if (!active || active.value().size() != blocks.size()) {
     return false;
@@ -185,7 +188,7 @@ bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
   }
   float* tptr = tsdf.value().data();
   float* wptr = weight.value().data();
-  vr::Result<std::vector<std::uint32_t>> color = std::vector<std::uint32_t>{};
+  vkc::Result<std::vector<std::uint32_t>> color = std::vector<std::uint32_t>{};
   std::uint32_t* cptr = nullptr;
   if (with_color) {
     color = vr_test::read_attribute<std::uint32_t>(ctx.device, ctx.allocator, g,
@@ -250,12 +253,12 @@ bool fill_dense_blocks(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
       }
     }
   }
-  vr::Result<std::uint32_t> failed = g.map().allocate(
+  vkc::Result<std::uint32_t> failed = g.map().allocate(
       blocks.data(), static_cast<std::uint32_t>(blocks.size()));
   if (!failed || failed.value() != 0) {
     return false;
   }
-  vr::Result<std::vector<vol::BlockIndex>> active =
+  vkc::Result<std::vector<vol::BlockIndex>> active =
       g.map().compact_active_blocks();
   if (!active || active.value().size() != blocks.size()) {
     return false;
@@ -665,28 +668,28 @@ int reused_slot_case(const vr_test::Gpu& ctx, bool share, bool empty_first) {
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -704,7 +707,7 @@ int main() {
   // suite exercises both sides of that.
   mesh::MarchingCubesConfig spans_config;
   spans_config.track_block_spans = true;
-  vr::Result<mesh::MarchingCubes> mc_result = mesh::MarchingCubes::create(
+  vkc::Result<mesh::MarchingCubes> mc_result = mesh::MarchingCubes::create(
       device.value(), allocator.value(), spans_config);
   if (!mc_result) {
     std::fprintf(stderr, "MarchingCubes::create failed: %s\n",
@@ -718,13 +721,13 @@ int main() {
                                       {"weight", sizeof(float)}};
 
   // --- Sparse extraction of a multi-block sphere -----------------------------
-  vr::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(grid_result.ok());
   vol::VoxelBlockGrid grid = std::move(grid_result).value();
   CHECK(fill_sphere_grid(ctx, grid, /*with_color=*/false));
 
-  vr::Result<mesh::Mesh> sparse_result = extractor.extract_host(grid, 0.0f);
+  vkc::Result<mesh::Mesh> sparse_result = extractor.extract_host(grid, 0.0f);
   CHECK(sparse_result.ok());
   mesh::Mesh sphere = std::move(sparse_result).value();
   CHECK(!sphere.empty());
@@ -786,7 +789,7 @@ int main() {
   // reservation computes, which is not derivable on the host because the atomic
   // hands spans out in workgroup arrival order rather than block order.
   {
-    vr::Result<std::vector<vol::BlockIndex>> active =
+    vkc::Result<std::vector<vol::BlockIndex>> active =
         grid.map().compact_active_blocks();
     CHECK(active.ok());
     CHECK(spans_describe(extractor, sphere, active.value(), kBlock, kH));
@@ -824,7 +827,7 @@ int main() {
     // that is never cleared and a table that is correctly rewritten look
     // identical.
     const std::uint64_t first_gen = extractor.block_spans_generation();
-    vr::Result<mesh::Mesh> again_result = extractor.extract_host(grid, 0.0f);
+    vkc::Result<mesh::Mesh> again_result = extractor.extract_host(grid, 0.0f);
     CHECK(again_result.ok());
     const mesh::Mesh again = std::move(again_result).value();
     CHECK(spans_describe(extractor, again, active.value(), kBlock, kH));
@@ -845,11 +848,12 @@ int main() {
     // makes deleting that clause visible here and nowhere else: without it a
     // caller reads a live slot beside a null block_spans() and indexes an
     // arena a later extract has entirely rewritten.
-    vr::Result<vol::VoxelBlockGrid> retire_result = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), gp, attrs, 2);
+    vkc::Result<vol::VoxelBlockGrid> retire_result =
+        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
+                                    attrs, 2);
     CHECK(retire_result.ok());
     vol::VoxelBlockGrid retire_grid = std::move(retire_result).value();
-    vr::Result<mesh::Mesh> retired = extractor.extract_host(retire_grid, 0.0f);
+    vkc::Result<mesh::Mesh> retired = extractor.extract_host(retire_grid, 0.0f);
     CHECK(retired.ok());
     CHECK(std::move(retired).value().empty());
     CHECK(extractor.block_spans() == nullptr);
@@ -859,7 +863,7 @@ int main() {
     // A second sparse extract republishes the table against its own geometry,
     // which is what keeps a stale span from outliving the extract that wrote
     // it -- and revives the slot the retiring extract above put out.
-    vr::Result<mesh::Mesh> revived = extractor.extract_host(grid, 0.0f);
+    vkc::Result<mesh::Mesh> revived = extractor.extract_host(grid, 0.0f);
     CHECK(revived.ok());
     CHECK(
         spans_describe(extractor, revived.value(), active.value(), kBlock, kH));
@@ -961,7 +965,7 @@ int main() {
   vol::VoxelGridParams chained_gp = sphere_grid_params();
   chained_gp.bucket_size = 2;
   chained_gp.num_buckets = 512;  // num_blocks unchanged at 1024
-  vr::Result<vol::VoxelBlockGrid> chained_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> chained_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), chained_gp, attrs, 2);
   CHECK(chained_result.ok());
   vol::VoxelBlockGrid chained_grid = std::move(chained_result).value();
@@ -970,13 +974,13 @@ int main() {
   // The fixture only tests what it exercises, so assert that it spills before
   // trusting what it proves -- otherwise a later change to the hash or to these
   // numbers turns this case vacuous without failing.
-  vr::Result<vol::HashDiagnostics> chained_diag =
+  vkc::Result<vol::HashDiagnostics> chained_diag =
       chained_grid.map().diagnostics();
   CHECK(chained_diag.ok());
   CHECK(chained_diag.value().overflow_count > 0);
   CHECK(chained_diag.value().max_chain_length > 0);
 
-  vr::Result<mesh::Mesh> chained_mesh_result =
+  vkc::Result<mesh::Mesh> chained_mesh_result =
       extractor.extract_host(chained_grid, 0.0f);
   CHECK(chained_mesh_result.ok());
   const mesh::Mesh chained_mesh = std::move(chained_mesh_result).value();
@@ -992,13 +996,13 @@ int main() {
   const vol::AttributeSpec cattrs[] = {{"tsdf", sizeof(float)},
                                        {"weight", sizeof(float)},
                                        {"color", sizeof(std::uint32_t)}};
-  vr::Result<vol::VoxelBlockGrid> cgrid_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> cgrid_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, cattrs, 3);
   CHECK(cgrid_result.ok());
   vol::VoxelBlockGrid cgrid = std::move(cgrid_result).value();
   CHECK(fill_sphere_grid(ctx, cgrid, /*with_color=*/true));
 
-  vr::Result<mesh::Mesh> colored_result = extractor.extract_host(cgrid, 0.0f);
+  vkc::Result<mesh::Mesh> colored_result = extractor.extract_host(cgrid, 0.0f);
   CHECK(colored_result.ok());
   const mesh::Mesh colored = std::move(colored_result).value();
   CHECK(!colored.empty());
@@ -1031,12 +1035,12 @@ int main() {
   // the mesh is empty. Proves the gate fires on-device (a dropped or mis-signed
   // gate would mesh the sphere here); the sphere fill above only ever exercises
   // the pass side.
-  vr::Result<vol::VoxelBlockGrid> zw_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> zw_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(zw_result.ok());
   vol::VoxelBlockGrid zw_grid = std::move(zw_result).value();
   CHECK(fill_sphere_grid(ctx, zw_grid, /*with_color=*/false, /*weight=*/0.0f));
-  vr::Result<mesh::Mesh> zw_mesh = extractor.extract_host(zw_grid, 0.0f);
+  vkc::Result<mesh::Mesh> zw_mesh = extractor.extract_host(zw_grid, 0.0f);
   CHECK(zw_mesh.ok());
   CHECK(std::move(zw_mesh).value().empty());
 
@@ -1048,13 +1052,13 @@ int main() {
   // white rather than be dragged toward black (which is what an unguarded
   // unpack of the 0 sentinel would produce). Geometry is unaffected, so the
   // triangle count still matches the colourless extract of the same field.
-  vr::Result<vol::VoxelBlockGrid> sgrid_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> sgrid_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, cattrs, 3);
   CHECK(sgrid_result.ok());
   vol::VoxelBlockGrid sgrid = std::move(sgrid_result).value();
   CHECK(
       fill_sphere_grid(ctx, sgrid, /*with_color=*/false));  // colour left at 0
-  vr::Result<mesh::Mesh> sentinel_result = extractor.extract_host(sgrid, 0.0f);
+  vkc::Result<mesh::Mesh> sentinel_result = extractor.extract_host(sgrid, 0.0f);
   CHECK(sentinel_result.ok());
   const mesh::Mesh sentinel = std::move(sentinel_result).value();
   CHECK(!sentinel.empty());
@@ -1066,11 +1070,11 @@ int main() {
 
   // --- Empty map -> empty mesh -----------------------------------------------
   // A grid with no allocated blocks has no active set, so nothing meshes.
-  vr::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(empty_result.ok());
   vol::VoxelBlockGrid empty_grid = std::move(empty_result).value();
-  vr::Result<mesh::Mesh> empty_mesh = extractor.extract_host(empty_grid, 0.0f);
+  vkc::Result<mesh::Mesh> empty_mesh = extractor.extract_host(empty_grid, 0.0f);
   CHECK(empty_mesh.ok());
   CHECK(std::move(empty_mesh).value().empty());
   // An empty extract publishes no table either. It returns before any dispatch,
@@ -1094,20 +1098,20 @@ int main() {
   {
     mesh::MarchingCubesConfig gated_config;
     gated_config.track_block_spans = true;
-    vr::Result<mesh::MarchingCubes> gated_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> gated_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), gated_config);
     CHECK(gated_result.ok());
     mesh::MarchingCubes gated = std::move(gated_result).value();
-    vr::Result<mesh::MarchingCubes> ungated_result =
+    vkc::Result<mesh::MarchingCubes> ungated_result =
         mesh::MarchingCubes::create(device.value(), allocator.value());
     CHECK(ungated_result.ok());
     mesh::MarchingCubes ungated = std::move(ungated_result).value();
 
     mesh::ExtractTimings gated_timings;
     mesh::ExtractTimings ungated_timings;
-    vr::Result<mesh::Mesh> gated_mesh =
+    vkc::Result<mesh::Mesh> gated_mesh =
         gated.extract_host(grid, 0.0f, &gated_timings);
-    vr::Result<mesh::Mesh> ungated_mesh =
+    vkc::Result<mesh::Mesh> ungated_mesh =
         ungated.extract_host(grid, 0.0f, &ungated_timings);
     CHECK(gated_mesh.ok());
     CHECK(ungated_mesh.ok());
@@ -1146,7 +1150,7 @@ int main() {
   // replacing it wholesale would discard every span on the one event the
   // volume tier guarantees they survive.
   {
-    vr::Result<vol::VoxelBlockGrid> grow_grid_result =
+    vkc::Result<vol::VoxelBlockGrid> grow_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
                                     attrs, 2);
     CHECK(grow_grid_result.ok());
@@ -1155,16 +1159,16 @@ int main() {
 
     mesh::MarchingCubesConfig grow_config;
     grow_config.track_block_spans = true;
-    vr::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), grow_config);
     CHECK(grow_result.ok());
     mesh::MarchingCubes grow_mc = std::move(grow_result).value();
 
-    vr::Result<mesh::Mesh> before = grow_mc.extract_host(grow_grid, 0.0f);
+    vkc::Result<mesh::Mesh> before = grow_mc.extract_host(grow_grid, 0.0f);
     CHECK(before.ok());
     CHECK(grow_mc.block_span_capacity() ==
           static_cast<std::uint32_t>(gp.num_blocks));
-    vr::Result<std::vector<vol::BlockIndex>> active_before =
+    vkc::Result<std::vector<vol::BlockIndex>> active_before =
         grow_grid.map().compact_active_blocks();
     CHECK(active_before.ok());
     CHECK(spans_describe(grow_mc, before.value(), active_before.value(), kBlock,
@@ -1180,12 +1184,12 @@ int main() {
     // Same blocks, same slots -- the resize preserves indices, so this is the
     // property that makes carrying the table forward meaningful rather than
     // merely harmless.
-    vr::Result<std::vector<vol::BlockIndex>> active_after =
+    vkc::Result<std::vector<vol::BlockIndex>> active_after =
         grow_grid.map().compact_active_blocks();
     CHECK(active_after.ok());
     CHECK(active_after.value().size() == active_before.value().size());
 
-    vr::Result<mesh::Mesh> after = grow_mc.extract_host(grow_grid, 0.0f);
+    vkc::Result<mesh::Mesh> after = grow_mc.extract_host(grow_grid, 0.0f);
     CHECK(after.ok());
     CHECK(grow_mc.block_span_capacity() ==
           static_cast<std::uint32_t>(gp.num_blocks) * 2);
@@ -1224,20 +1228,20 @@ int main() {
   // while a sphere emits a small fraction of that, so an undersized arena still
   // holds every emitted triangle and comparing meshes would NOT catch a broken
   // growth policy.
-  vr::Result<mesh::MarchingCubes> arena_result =
+  vkc::Result<mesh::MarchingCubes> arena_result =
       mesh::MarchingCubes::create(device.value(), allocator.value());
   CHECK(arena_result.ok());
   mesh::MarchingCubes arena_mc = std::move(arena_result).value();
 
   // One allocated block: the smallest non-empty active set. (An empty one
   // returns early without sizing anything, so it cannot anchor this.)
-  vr::Result<vol::VoxelBlockGrid> one_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> one_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, attrs, 2);
   CHECK(one_result.ok());
   vol::VoxelBlockGrid one_grid = std::move(one_result).value();
   vol::BlockIndex single_block{};
   single_block.coord = vr::Vec3i(0, 0, 0);
-  vr::Result<std::uint32_t> single_failed =
+  vkc::Result<std::uint32_t> single_failed =
       one_grid.map().allocate(&single_block, 1);
   CHECK(single_failed.ok());
   CHECK(single_failed.value() == 0);
@@ -1281,12 +1285,12 @@ int main() {
   // field emits ~1400 triangles where a first extract plans ~64 per block, so
   // the first call MUST refit and re-run. The second call over the same grid
   // then plans from the density the first one measured, so it must not.
-  vr::Result<mesh::MarchingCubes> refit_result =
+  vkc::Result<mesh::MarchingCubes> refit_result =
       mesh::MarchingCubes::create(device.value(), allocator.value());
   CHECK(refit_result.ok());
   mesh::MarchingCubes refit_mc = std::move(refit_result).value();
 
-  vr::Result<vol::VoxelBlockGrid> dense_block_result =
+  vkc::Result<vol::VoxelBlockGrid> dense_block_result =
       vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp, attrs,
                                   2);
   CHECK(dense_block_result.ok());
@@ -1294,7 +1298,7 @@ int main() {
   CHECK(fill_dense_blocks(ctx, dense_block, 1));
 
   mesh::ExtractTimings refit_timings;
-  vr::Result<mesh::Mesh> refit_mesh_result =
+  vkc::Result<mesh::Mesh> refit_mesh_result =
       refit_mc.extract_host(dense_block, 0.0f, &refit_timings);
   CHECK(refit_mesh_result.ok());
   const mesh::Mesh refit_mesh = std::move(refit_mesh_result).value();
@@ -1311,7 +1315,7 @@ int main() {
   // nothing and duplicated nothing, which a truncated or double-counted first
   // pass would both break.
   mesh::ExtractTimings settled_timings;
-  vr::Result<mesh::Mesh> settled_result =
+  vkc::Result<mesh::Mesh> settled_result =
       refit_mc.extract_host(dense_block, 0.0f, &settled_timings);
   CHECK(settled_result.ok());
   const mesh::Mesh settled_mesh = std::move(settled_result).value();
@@ -1333,20 +1337,20 @@ int main() {
   // The demand is what makes it deterministic: 27 blocks x ~1400 triangles
   // against the ~64 per block a first extract plans, so every one of those
   // three cases is occupied rather than hoped for.
-  vr::Result<vol::VoxelBlockGrid> dense_run_result =
+  vkc::Result<vol::VoxelBlockGrid> dense_run_result =
       vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp, attrs,
                                   2);
   CHECK(dense_run_result.ok());
   vol::VoxelBlockGrid dense_run = std::move(dense_run_result).value();
   CHECK(fill_dense_blocks(ctx, dense_run, 3));
 
-  vr::Result<mesh::MarchingCubes> run_result =
+  vkc::Result<mesh::MarchingCubes> run_result =
       mesh::MarchingCubes::create(device.value(), allocator.value());
   CHECK(run_result.ok());
   mesh::MarchingCubes run_mc = std::move(run_result).value();
 
   mesh::ExtractTimings run_timings;
-  vr::Result<mesh::Mesh> run_mesh_result =
+  vkc::Result<mesh::Mesh> run_mesh_result =
       run_mc.extract_host(dense_run, 0.0f, &run_timings);
   CHECK(run_mesh_result.ok());
   const mesh::Mesh run_mesh = std::move(run_mesh_result).value();
@@ -1363,7 +1367,7 @@ int main() {
   // surface triangle-for-triangle -- so a span dropped at the boundary was
   // dropped, not misplaced into a neighbouring block's.
   mesh::ExtractTimings run_settled_timings;
-  vr::Result<mesh::Mesh> run_settled_result =
+  vkc::Result<mesh::Mesh> run_settled_result =
       run_mc.extract_host(dense_run, 0.0f, &run_settled_timings);
   CHECK(run_settled_result.ok());
   const mesh::Mesh run_settled = std::move(run_settled_result).value();
@@ -1400,13 +1404,13 @@ int main() {
   mesh::MarchingCubesConfig share_config;
   share_config.share_vertices = true;
   share_config.track_block_spans = true;
-  vr::Result<mesh::MarchingCubes> share_result = mesh::MarchingCubes::create(
+  vkc::Result<mesh::MarchingCubes> share_result = mesh::MarchingCubes::create(
       device.value(), allocator.value(), share_config);
   CHECK(share_result.ok());
   mesh::MarchingCubes share_mc = std::move(share_result).value();
 
   mesh::ExtractTimings share_timings;
-  vr::Result<mesh::Mesh> share_mesh_result =
+  vkc::Result<mesh::Mesh> share_mesh_result =
       share_mc.extract_host(grid, 0.0f, &share_timings);
   CHECK(share_mesh_result.ok());
   const mesh::Mesh share_mesh = std::move(share_mesh_result).value();
@@ -1459,7 +1463,7 @@ int main() {
     // ... and its published table describes it, with vertex counts that are NOT
     // three per triangle -- the case the default path cannot exercise. The
     // ranges above are inferred from the mesh; this is what the kernel claims.
-    vr::Result<std::vector<vol::BlockIndex>> active =
+    vkc::Result<std::vector<vol::BlockIndex>> active =
         grid.map().compact_active_blocks();
     CHECK(active.ok());
     CHECK(spans_describe(share_mc, share_mesh, active.value(), kBlock, kH));
@@ -1493,14 +1497,14 @@ int main() {
   // `3 * triangle_count`. It is not an incompatibility: texture::
   // ProjectiveTexturer decides visibility per vertex and textures this mesh
   // like any other (see texture_device_mesh_test).
-  vr::Result<mesh::DeviceMesh> share_device =
+  vkc::Result<mesh::DeviceMesh> share_device =
       share_mc.extract_device(grid, 0.0f);
   CHECK(share_device.ok());
   CHECK(share_device.value().shares_vertices);
   CHECK(share_device.value().vertex_count == share_timings.emitted_vertices);
   CHECK(share_mc.download(share_device.value()).ok());
 
-  vr::Result<mesh::DeviceMesh> plain_device =
+  vkc::Result<mesh::DeviceMesh> plain_device =
       extractor.extract_device(grid, 0.0f);
   CHECK(plain_device.ok());
   CHECK(!plain_device.value().shares_vertices);
@@ -1519,13 +1523,13 @@ int main() {
   // to, and the arena is grow-only -- so re-claiming per reference reports
   // ~3 vertices per triangle instead of the true ~0.75 and pins an arena ~6x
   // the surface, which is more than not sharing at all.
-  vr::Result<mesh::MarchingCubes> share_refit_result =
+  vkc::Result<mesh::MarchingCubes> share_refit_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(),
                                   share_config);
   CHECK(share_refit_result.ok());
   mesh::MarchingCubes share_refit_mc = std::move(share_refit_result).value();
   mesh::ExtractTimings share_refit_timings;
-  vr::Result<mesh::Mesh> share_refit_result_mesh =
+  vkc::Result<mesh::Mesh> share_refit_result_mesh =
       share_refit_mc.extract_host(dense_block, 0.0f, &share_refit_timings);
   CHECK(share_refit_result_mesh.ok());
   const mesh::Mesh share_refit_mesh =
@@ -1562,14 +1566,14 @@ int main() {
   // next block to land in: unobservable there in principle, whichever way the
   // count is wrong. Twenty-seven of them, refitting, is where both ranges have
   // a neighbour to run into.
-  vr::Result<mesh::MarchingCubes> share_run_result =
+  vkc::Result<mesh::MarchingCubes> share_run_result =
       mesh::MarchingCubes::create(device.value(), allocator.value(),
                                   share_config);
   CHECK(share_run_result.ok());
   mesh::MarchingCubes share_run_mc = std::move(share_run_result).value();
 
   mesh::ExtractTimings share_run_timings;
-  vr::Result<mesh::Mesh> share_run_result_mesh =
+  vkc::Result<mesh::Mesh> share_run_result_mesh =
       share_run_mc.extract_host(dense_run, 0.0f, &share_run_timings);
   CHECK(share_run_result_mesh.ok());
   const mesh::Mesh share_run_mesh = std::move(share_run_result_mesh).value();
@@ -1595,7 +1599,7 @@ int main() {
   // Both ranges survive the refit: the same field planned in one dispatch is
   // the same surface, and still one range each per block.
   mesh::ExtractTimings share_run_settled_timings;
-  vr::Result<mesh::Mesh> share_run_settled_result =
+  vkc::Result<mesh::Mesh> share_run_settled_result =
       share_run_mc.extract_host(dense_run, 0.0f, &share_run_settled_timings);
   CHECK(share_run_settled_result.ok());
   const mesh::Mesh share_run_settled =
@@ -1631,7 +1635,7 @@ int main() {
   {
     mesh::MarchingCubesConfig grow_config;
     grow_config.share_vertices = true;
-    vr::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), grow_config);
     CHECK(grow_result.ok());
     mesh::MarchingCubes grow_mc = std::move(grow_result).value();
@@ -1645,7 +1649,7 @@ int main() {
     vol::VoxelGridParams grow_gp = sphere_grid_params();
     grow_gp.num_buckets = 32;
     grow_gp.num_blocks = 256;
-    vr::Result<vol::VoxelBlockGrid> grow_grid_result =
+    vkc::Result<vol::VoxelBlockGrid> grow_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), grow_gp,
                                     attrs, 2);
     CHECK(grow_grid_result.ok());
@@ -1653,7 +1657,7 @@ int main() {
     CHECK(fill_dense_blocks(ctx, grow_grid, 2));
 
     mesh::ExtractTimings after_grow;
-    vr::Result<mesh::Mesh> grown_result =
+    vkc::Result<mesh::Mesh> grown_result =
         grow_mc.extract_host(grow_grid, 0.0f, &after_grow);
     CHECK(grown_result.ok());
     const mesh::Mesh grown = std::move(grown_result).value();
@@ -1677,7 +1681,7 @@ int main() {
   big_block_gp.voxels_per_block = 16 * 16 * 16;  // 4096 > the kernel's 1024
   big_block_gp.num_buckets = 32;
   big_block_gp.num_blocks = 256;  // = bucket_size * num_buckets
-  vr::Result<vol::VoxelBlockGrid> big_block_result =
+  vkc::Result<vol::VoxelBlockGrid> big_block_result =
       vol::VoxelBlockGrid::create(device.value(), allocator.value(),
                                   big_block_gp, attrs, 2);
   CHECK(big_block_result.ok());
@@ -1695,7 +1699,7 @@ int main() {
   // The same grid is fine without sharing -- the refusal is the kernel's table,
   // not the block size.
   mesh::ExtractTimings big_timings_16;
-  vr::Result<mesh::Mesh> big_mesh_16_result =
+  vkc::Result<mesh::Mesh> big_mesh_16_result =
       arena_mc.extract_host(big_block_grid, 0.0f, &big_timings_16);
   CHECK(big_mesh_16_result.ok());
   const mesh::Mesh big_mesh_16 = std::move(big_mesh_16_result).value();
@@ -1714,14 +1718,14 @@ int main() {
   vol::VoxelGridParams split_gp = sphere_grid_params();
   split_gp.num_buckets = 32;
   split_gp.num_blocks = 256;
-  vr::Result<vol::VoxelBlockGrid> split_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> split_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), split_gp, attrs, 2);
   CHECK(split_result.ok());
   vol::VoxelBlockGrid split_grid = std::move(split_result).value();
   CHECK(fill_dense_blocks(ctx, split_grid,
                           2));  // 2x2x2 blocks of 8 = the same 16^3
   mesh::ExtractTimings split_timings;
-  vr::Result<mesh::Mesh> split_mesh_result =
+  vkc::Result<mesh::Mesh> split_mesh_result =
       arena_mc.extract_host(split_grid, 0.0f, &split_timings);
   CHECK(split_mesh_result.ok());
   const mesh::Mesh split_mesh = std::move(split_mesh_result).value();
@@ -1731,7 +1735,7 @@ int main() {
 
   // --- Argument validation ---------------------------------------------------
   // A grid missing the tsdf/weight attributes is rejected (a bare grid here).
-  vr::Result<vol::VoxelBlockGrid> bare_result = vol::VoxelBlockGrid::create(
+  vkc::Result<vol::VoxelBlockGrid> bare_result = vol::VoxelBlockGrid::create(
       device.value(), allocator.value(), gp, nullptr, 0);
   CHECK(bare_result.ok());
   vol::VoxelBlockGrid bare_grid = std::move(bare_result).value();
@@ -1760,7 +1764,7 @@ int main() {
   moved = std::move(*alias);  // self-move: intact
   CHECK(moved.valid());
   CHECK(moved.block_span_capacity() > 0);
-  vr::Result<mesh::Mesh> reextract = moved.extract_host(grid, 0.0f);
+  vkc::Result<mesh::Mesh> reextract = moved.extract_host(grid, 0.0f);
   CHECK(reextract.ok());
   CHECK(!std::move(reextract).value().empty());
 
@@ -1787,7 +1791,7 @@ int main() {
     // blocks removed, or been pointed at another grid by now -- and a span
     // table describing the last grid it saw is the anchor working, not a
     // wrinkle to route around.
-    vr::Result<vol::VoxelBlockGrid> anchor_grid_result =
+    vkc::Result<vol::VoxelBlockGrid> anchor_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
                                     attrs, 2);
     CHECK(anchor_grid_result.ok());
@@ -1796,14 +1800,14 @@ int main() {
 
     mesh::MarchingCubesConfig anchor_config;
     anchor_config.track_block_spans = true;
-    vr::Result<mesh::MarchingCubes> anchor_mc_result =
+    vkc::Result<mesh::MarchingCubes> anchor_mc_result =
         mesh::MarchingCubes::create(device.value(), allocator.value(),
                                     anchor_config);
     CHECK(anchor_mc_result.ok());
     mesh::MarchingCubes anchor_mc = std::move(anchor_mc_result).value();
     CHECK(anchor_mc.extract_host(anchor_grid, 0.0f).ok());
 
-    vr::Result<std::vector<vol::BlockIndex>> live =
+    vkc::Result<std::vector<vol::BlockIndex>> live =
         anchor_grid.map().compact_active_blocks();
     CHECK(live.ok());
     CHECK(!live.value().empty());
@@ -1816,7 +1820,7 @@ int main() {
     vol::BlockIndex victim = live.value().back();
     const std::uint32_t victim_slot =
         static_cast<std::uint32_t>(victim.ptr) / vpb;
-    vr::Result<std::uint32_t> removed = anchor_grid.remove(&victim, 1);
+    vkc::Result<std::uint32_t> removed = anchor_grid.remove(&victim, 1);
     CHECK(removed.ok());
     // The removal ACTUALLY happened. remove() moves the epoch unconditionally
     // -- a partial removal has still freed slots -- so without this the anchor
@@ -1834,7 +1838,7 @@ int main() {
     // that describes a different active set. Every one of them has to stop
     // counting -- and the freed slot in particular, whose span still names an
     // arena range this extract has handed to some other block.
-    vr::Result<std::vector<vol::BlockIndex>> after_remove =
+    vkc::Result<std::vector<vol::BlockIndex>> after_remove =
         anchor_grid.map().compact_active_blocks();
     CHECK(after_remove.ok());
     CHECK(after_remove.value().size() == live.value().size() - 1);
@@ -1854,7 +1858,7 @@ int main() {
     // state behind: the slot numbers coincide (both grids allocate the same
     // blocks from the same fresh LIFO heap), so nothing about a slot's VALUE
     // distinguishes the two tables. Only the token does.
-    vr::Result<vol::VoxelBlockGrid> other_result = vol::VoxelBlockGrid::create(
+    vkc::Result<vol::VoxelBlockGrid> other_result = vol::VoxelBlockGrid::create(
         device.value(), allocator.value(), gp, attrs, 2);
     CHECK(other_result.ok());
     vol::VoxelBlockGrid other_grid = std::move(other_result).value();
@@ -1866,7 +1870,7 @@ int main() {
     CHECK(other_grid.topology_epoch() != anchor_grid.topology_epoch());
 
     CHECK(anchor_mc.extract_host(other_grid, 0.0f).ok());
-    vr::Result<std::vector<vol::BlockIndex>> other_live =
+    vkc::Result<std::vector<vol::BlockIndex>> other_live =
         other_grid.map().compact_active_blocks();
     CHECK(other_live.ok());
     CHECK(count_valid_spans(anchor_mc, other_grid) ==
@@ -1912,7 +1916,7 @@ int main() {
   // for BOTH kernels: sharing is what the only device consumer uses, and it is
   // the one whose retire pass touches indices instead of vertices.
   for (int share_pass = 0; share_pass < 2; ++share_pass) {
-    vr::Result<vol::VoxelBlockGrid> inc_grid_result =
+    vkc::Result<vol::VoxelBlockGrid> inc_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
                                     attrs, 2);
     CHECK(inc_grid_result.ok());
@@ -1925,14 +1929,14 @@ int main() {
     // The point of the loop: pass 0 is the default emitter, pass 1 the sharing
     // one. Without this the two iterations are the same kernel run twice.
     inc_config.share_vertices = share_pass == 1;
-    vr::Result<mesh::MarchingCubes> inc_result = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> inc_result = mesh::MarchingCubes::create(
         device.value(), allocator.value(), inc_config);
     CHECK(inc_result.ok());
     mesh::MarchingCubes inc_mc = std::move(inc_result).value();
 
     // The first extract can only be full -- there is no watermark yet -- and it
     // is what establishes the spans and the arena the next one reuses.
-    vr::Result<mesh::Mesh> first = inc_mc.extract_host(inc_grid, 0.0f);
+    vkc::Result<mesh::Mesh> first = inc_mc.extract_host(inc_grid, 0.0f);
     CHECK(first.ok());
     const std::vector<std::array<float, 9>> old_surface =
         canonical_triangles(first.value());
@@ -1975,11 +1979,11 @@ int main() {
     std::uint32_t flag_slot = 0;
     bool have_flag_slot = false;
     {
-      vr::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
+      vkc::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
           device.value(), allocator.value(), inc_config);
       CHECK(ref_result.ok());
       mesh::MarchingCubes ref_mc = std::move(ref_result).value();
-      vr::Result<mesh::Mesh> grown = ref_mc.extract_host(inc_grid, 0.0f);
+      vkc::Result<mesh::Mesh> grown = ref_mc.extract_host(inc_grid, 0.0f);
       CHECK(grown.ok());
       new_surface = canonical_triangles(grown.value());
       CHECK(drop_degenerate(new_surface) == 0);  // a full extract retires none
@@ -2007,12 +2011,12 @@ int main() {
     for (std::uint32_t i = 0; i < all_slots.size(); ++i) all_slots[i] = i;
 
     mesh::ExtractTimings clean_rt{};
-    vr::Result<mesh::DeviceMesh> clean =
+    vkc::Result<mesh::DeviceMesh> clean =
         inc_mc.extract_device_incremental(inc_grid, 0.0f, &clean_rt);
     CHECK(clean.ok());
     CHECK(clean_rt.incremental);           // not the fallback
     CHECK(clean_rt.remeshed_blocks == 0);  // and nothing was re-meshed
-    vr::Result<mesh::Mesh> clean_host = inc_mc.download(clean.value());
+    vkc::Result<mesh::Mesh> clean_host = inc_mc.download(clean.value());
     CHECK(clean_host.ok());
     CHECK(canonical_triangles(clean_host.value()) == old_surface);
 
@@ -2025,7 +2029,7 @@ int main() {
     // configuration where keeping and re-meshing can disagree.
     CHECK(stamp_changed(ctx, inc_grid, {flag_slot}));
     mesh::ExtractTimings mixed_rt{};
-    vr::Result<mesh::DeviceMesh> mixed =
+    vkc::Result<mesh::DeviceMesh> mixed =
         inc_mc.extract_device_incremental(inc_grid, 0.0f, &mixed_rt);
     CHECK(mixed.ok());
     CHECK(mixed_rt.incremental);
@@ -2035,7 +2039,7 @@ int main() {
     // uniform pass by another name.
     CHECK(mixed_rt.remeshed_blocks > 0);
     CHECK(mixed_rt.remeshed_blocks < mixed_rt.active_blocks);
-    vr::Result<mesh::Mesh> mixed_host = inc_mc.download(mixed.value());
+    vkc::Result<mesh::Mesh> mixed_host = inc_mc.download(mixed.value());
     CHECK(mixed_host.ok());
     std::vector<std::array<float, 9>> mixed_tris =
         canonical_triangles(mixed_host.value());
@@ -2072,7 +2076,7 @@ int main() {
     // is not re-meshed again: nothing has been stamped since.
     {
       mesh::ExtractTimings again_rt{};
-      vr::Result<mesh::DeviceMesh> again =
+      vkc::Result<mesh::DeviceMesh> again =
           inc_mc.extract_device_incremental(inc_grid, 0.0f, &again_rt);
       CHECK(again.ok());
       CHECK(again_rt.incremental);
@@ -2082,13 +2086,13 @@ int main() {
     // --- And then all of it ----------------------------------------------
     CHECK(stamp_changed(ctx, inc_grid, all_slots));
     mesh::ExtractTimings dirty_rt{};
-    vr::Result<mesh::DeviceMesh> dirty =
+    vkc::Result<mesh::DeviceMesh> dirty =
         inc_mc.extract_device_incremental(inc_grid, 0.0f, &dirty_rt);
     CHECK(dirty.ok());
     CHECK(dirty_rt.incremental);
     // Every block, and the kernel's own count says so rather than the stamps.
     CHECK(dirty_rt.remeshed_blocks == dirty_rt.active_blocks);
-    vr::Result<mesh::Mesh> dirty_host = inc_mc.download(dirty.value());
+    vkc::Result<mesh::Mesh> dirty_host = inc_mc.download(dirty.value());
     CHECK(dirty_host.ok());
     std::vector<std::array<float, 9>> all_dirty =
         canonical_triangles(dirty_host.value());
@@ -2120,10 +2124,10 @@ int main() {
     CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false, 1.0f, kRadius));
     std::vector<std::array<float, 9>> shrunk_surface;
     {
-      vr::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
+      vkc::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
           device.value(), allocator.value(), inc_config);
       CHECK(ref_result.ok());
-      vr::Result<mesh::Mesh> shrunk =
+      vkc::Result<mesh::Mesh> shrunk =
           std::move(ref_result).value().extract_host(inc_grid, 0.0f);
       CHECK(shrunk.ok());
       shrunk_surface = canonical_triangles(shrunk.value());
@@ -2151,7 +2155,7 @@ int main() {
     //     two differ by the whole culled-away half, so this cannot pass by
     //     accident.
     {
-      vr::Result<std::vector<vol::BlockIndex>> live =
+      vkc::Result<std::vector<vol::BlockIndex>> live =
           inc_grid.map().compact_active_blocks();
       CHECK(live.ok());
       std::vector<vol::BlockIndex> visible;
@@ -2162,18 +2166,18 @@ int main() {
       CHECK(visible.size() < live.value().size());
 
       mesh::ExtractTimings cull_t{};
-      vr::Result<mesh::DeviceMesh> culled = inc_mc.extract_device(
+      vkc::Result<mesh::DeviceMesh> culled = inc_mc.extract_device(
           inc_grid, 0.0f, inc_grid.block_list(visible), &cull_t);
       CHECK(culled.ok());
       CHECK(cull_t.active_blocks == visible.size());
       CHECK(!cull_t.incremental);
 
       mesh::ExtractTimings rt{};
-      vr::Result<mesh::DeviceMesh> dm =
+      vkc::Result<mesh::DeviceMesh> dm =
           inc_mc.extract_device_incremental(inc_grid, 0.0f, &rt);
       CHECK(dm.ok());
       CHECK(!rt.incremental);
-      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
+      vkc::Result<mesh::Mesh> host = inc_mc.download(dm.value());
       CHECK(host.ok());
       CHECK(canonical_triangles(host.value()) == shrunk_surface);
     }
@@ -2182,10 +2186,10 @@ int main() {
     //     extract's surface, so with nothing stamped a pass that wrongly went
     //     incremental returns the sphere at iso 0 rather than the one at 0.1.
     {
-      vr::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
+      vkc::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
           device.value(), allocator.value(), inc_config);
       CHECK(ref_result.ok());
-      vr::Result<mesh::Mesh> wider =
+      vkc::Result<mesh::Mesh> wider =
           std::move(ref_result).value().extract_host(inc_grid, 0.1f);
       CHECK(wider.ok());
       const std::vector<std::array<float, 9>> wider_surface =
@@ -2193,11 +2197,11 @@ int main() {
       CHECK(wider_surface != shrunk_surface);
 
       mesh::ExtractTimings rt{};
-      vr::Result<mesh::DeviceMesh> dm =
+      vkc::Result<mesh::DeviceMesh> dm =
           inc_mc.extract_device_incremental(inc_grid, 0.1f, &rt);
       CHECK(dm.ok());
       CHECK(!rt.incremental);
-      vr::Result<mesh::Mesh> host = inc_mc.download(dm.value());
+      vkc::Result<mesh::Mesh> host = inc_mc.download(dm.value());
       CHECK(host.ok());
       CHECK(canonical_triangles(host.value()) == wider_surface);
     }
@@ -2211,11 +2215,11 @@ int main() {
     {
       vol::BlockIndex corner{};
       corner.coord = vr::Vec3i(0, 0, 0);
-      vr::Result<std::uint32_t> removed = inc_grid.remove(&corner, 1);
+      vkc::Result<std::uint32_t> removed = inc_grid.remove(&corner, 1);
       CHECK(removed.ok());
 
       mesh::ExtractTimings rt{};
-      vr::Result<mesh::DeviceMesh> dm =
+      vkc::Result<mesh::DeviceMesh> dm =
           inc_mc.extract_device_incremental(inc_grid, 0.0f, &rt);
       CHECK(dm.ok());
       CHECK(!rt.incremental);
@@ -2233,20 +2237,20 @@ int main() {
   // a duplicated one as a long merge. Meshing a subset and eyeballing that it
   // is "smaller" would catch neither.
   {
-    vr::Result<vol::VoxelBlockGrid> cull_grid_result =
+    vkc::Result<vol::VoxelBlockGrid> cull_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
                                     attrs, 2);
     CHECK(cull_grid_result.ok());
     vol::VoxelBlockGrid cull_grid = std::move(cull_grid_result).value();
     CHECK(fill_sphere_grid(ctx, cull_grid, /*with_color=*/false));
 
-    vr::Result<mesh::MarchingCubes> cull_result =
+    vkc::Result<mesh::MarchingCubes> cull_result =
         mesh::MarchingCubes::create(device.value(), allocator.value(), {});
     CHECK(cull_result.ok());
     mesh::MarchingCubes cull_mc = std::move(cull_result).value();
 
     mesh::ExtractTimings full_t{};
-    vr::Result<mesh::Mesh> full =
+    vkc::Result<mesh::Mesh> full =
         cull_mc.extract_host(cull_grid, 0.0f, &full_t);
     CHECK(full.ok());
     const std::vector<std::array<float, 9>> full_tris =
@@ -2258,7 +2262,7 @@ int main() {
     // Handing over the WHOLE active set must reproduce the internal compaction
     // bit for bit -- the list is the only thing that changed, so any difference
     // here is the new path taking a different route to the same dispatch.
-    vr::Result<std::vector<vol::BlockIndex>> all =
+    vkc::Result<std::vector<vol::BlockIndex>> all =
         cull_grid.map().compact_active_blocks();
     CHECK(all.ok());
     CHECK(all.value().size() == full_t.active_blocks);
@@ -2266,10 +2270,10 @@ int main() {
                                static_cast<std::uint32_t>(all.value().size()),
                                cull_grid.topology_epoch()};
     mesh::ExtractTimings whole_t{};
-    vr::Result<mesh::DeviceMesh> whole_dm =
+    vkc::Result<mesh::DeviceMesh> whole_dm =
         cull_mc.extract_device(cull_grid, 0.0f, whole, &whole_t);
     CHECK(whole_dm.ok());
-    vr::Result<mesh::Mesh> whole_mesh = cull_mc.download(whole_dm.value());
+    vkc::Result<mesh::Mesh> whole_mesh = cull_mc.download(whole_dm.value());
     CHECK(whole_mesh.ok());
     CHECK(canonical_triangles(whole_mesh.value()) == full_tris);
     CHECK(whole_t.active_blocks == full_t.active_blocks);
@@ -2294,20 +2298,20 @@ int main() {
                                  static_cast<std::uint32_t>(lo.size()),
                                  cull_grid.topology_epoch()};
     mesh::ExtractTimings lo_t{};
-    vr::Result<mesh::DeviceMesh> lo_dm =
+    vkc::Result<mesh::DeviceMesh> lo_dm =
         cull_mc.extract_device(cull_grid, 0.0f, lo_list, &lo_t);
     CHECK(lo_dm.ok());
-    vr::Result<mesh::Mesh> lo_mesh = cull_mc.download(lo_dm.value());
+    vkc::Result<mesh::Mesh> lo_mesh = cull_mc.download(lo_dm.value());
     CHECK(lo_mesh.ok());
 
     const vol::BlockList hi_list{hi.data(),
                                  static_cast<std::uint32_t>(hi.size()),
                                  cull_grid.topology_epoch()};
     mesh::ExtractTimings hi_t{};
-    vr::Result<mesh::DeviceMesh> hi_dm =
+    vkc::Result<mesh::DeviceMesh> hi_dm =
         cull_mc.extract_device(cull_grid, 0.0f, hi_list, &hi_t);
     CHECK(hi_dm.ok());
-    vr::Result<mesh::Mesh> hi_mesh = cull_mc.download(hi_dm.value());
+    vkc::Result<mesh::Mesh> hi_mesh = cull_mc.download(hi_dm.value());
     CHECK(hi_mesh.ok());
 
     CHECK(lo_t.active_blocks == lo.size());
@@ -2336,7 +2340,7 @@ int main() {
     // An empty set is a camera looking at nothing, not an error.
     const vol::BlockList none{nullptr, 0, cull_grid.topology_epoch()};
     mesh::ExtractTimings none_t{};
-    vr::Result<mesh::DeviceMesh> none_dm =
+    vkc::Result<mesh::DeviceMesh> none_dm =
         cull_mc.extract_device(cull_grid, 0.0f, none, &none_t);
     CHECK(none_dm.ok());
     CHECK(none_dm.value().empty());
@@ -2352,7 +2356,7 @@ int main() {
     const vol::BlockList defaulted{};
     CHECK(defaulted.epoch != cull_grid.topology_epoch());
     mesh::ExtractTimings def_t{};
-    vr::Result<mesh::DeviceMesh> def_dm =
+    vkc::Result<mesh::DeviceMesh> def_dm =
         cull_mc.extract_device(cull_grid, 0.0f, defaulted, &def_t);
     CHECK(def_dm.ok());
     CHECK(def_dm.value().empty());
@@ -2381,7 +2385,7 @@ int main() {
     // have to re-extract and redraw on each one.
     {
       mesh::ExtractTimings live_t{};
-      vr::Result<mesh::DeviceMesh> live_dm =
+      vkc::Result<mesh::DeviceMesh> live_dm =
           cull_mc.extract_device(cull_grid, 0.0f, lo_list, &live_t);
       CHECK(live_dm.ok());
       CHECK(cull_mc.download(live_dm.value()).ok());
@@ -2408,11 +2412,11 @@ int main() {
     // stale-list refusal -- the epoch refusal is the one a live consumer hits
     // most, on every frame until its cull catches up.
     {
-      vr::Result<std::vector<vol::BlockIndex>> now =
+      vkc::Result<std::vector<vol::BlockIndex>> now =
           cull_grid.map().compact_active_blocks();
       CHECK(now.ok());
       mesh::ExtractTimings pre_t{};
-      vr::Result<mesh::DeviceMesh> pre_dm = cull_mc.extract_device(
+      vkc::Result<mesh::DeviceMesh> pre_dm = cull_mc.extract_device(
           cull_grid, 0.0f, cull_grid.block_list(now.value()), &pre_t);
       CHECK(pre_dm.ok());
       CHECK(!cull_mc.extract_device(cull_grid, 0.0f, stale).ok());
@@ -2425,7 +2429,7 @@ int main() {
   // fuse's list still current after. An allocation since makes it compact
   // again rather than mesh the old list.
   {
-    vr::Result<vol::VoxelBlockGrid> list_grid_result =
+    vkc::Result<vol::VoxelBlockGrid> list_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
                                     attrs, 2);
     CHECK(list_grid_result.ok());
@@ -2433,26 +2437,27 @@ int main() {
     CHECK(fill_sphere_grid(ctx, list_grid, /*with_color=*/false));
     mesh::MarchingCubesConfig spans_config;
     spans_config.track_block_spans = true;  // the host list
-    vr::Result<mesh::MarchingCubes> host_mc = mesh::MarchingCubes::create(
+    vkc::Result<mesh::MarchingCubes> host_mc = mesh::MarchingCubes::create(
         device.value(), allocator.value(), spans_config);
     CHECK(host_mc.ok());
-    vr::Result<mesh::Mesh> full = host_mc.value().extract_host(list_grid, 0.0f);
+    vkc::Result<mesh::Mesh> full =
+        host_mc.value().extract_host(list_grid, 0.0f);
     CHECK(full.ok());
     const std::vector<std::array<float, 9>> full_tris =
         canonical_triangles(full.value());
     CHECK(!full_tris.empty());
 
-    vr::Result<mesh::MarchingCubes> list_mc =
+    vkc::Result<mesh::MarchingCubes> list_mc =
         mesh::MarchingCubes::create(device.value(), allocator.value(), {});
     CHECK(list_mc.ok());
-    vr::Result<vol::DeviceBlockList> fused =
+    vkc::Result<vol::DeviceBlockList> fused =
         list_grid.map().compact_active_blocks_on_device();
     CHECK(fused.ok() && fused.value().count > 0);
     mesh::ExtractTimings t{};
-    vr::Result<mesh::DeviceMesh> dm =
+    vkc::Result<mesh::DeviceMesh> dm =
         list_mc.value().extract_device(list_grid, 0.0f, &t);
     CHECK(dm.ok());
-    vr::Result<mesh::Mesh> listed = list_mc.value().download(dm.value());
+    vkc::Result<mesh::Mesh> listed = list_mc.value().download(dm.value());
     CHECK(listed.ok());
     CHECK(canonical_triangles(listed.value()) == full_tris);
     CHECK(t.active_blocks == fused.value().count);

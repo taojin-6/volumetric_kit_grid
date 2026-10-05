@@ -20,12 +20,12 @@
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/compute_kernel.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/buffer.hpp"
-#include "volumetric_kit/recon/core/compute_kernel.hpp"
-#include "volumetric_kit/recon/core/descriptor.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
@@ -44,8 +44,8 @@ class VR_CODEC_API DeviceFrameReader {
  public:
   /// @brief Build the two kernels.
   /// @return The reader, or a pipeline or pool failure.
-  static Result<std::unique_ptr<DeviceFrameReader>> create(
-      Device& device, Allocator& allocator);
+  static core::Result<std::unique_ptr<DeviceFrameReader>> create(
+      core::Device& device, core::Allocator& allocator);
 
   ~DeviceFrameReader() = default;
   DeviceFrameReader(const DeviceFrameReader&) = delete;
@@ -61,13 +61,13 @@ class VR_CODEC_API DeviceFrameReader {
   ///         grows, for a segment longer than
   ///         @ref kMaxDeviceDecodeSegmentSize or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.
-  Result<ResidentBlocks> record_decode(CommandBatch& batch,
-                                       const ParsedFrame& frame,
-                                       GpuStageScope* stage = nullptr);
+  core::Result<ResidentBlocks> record_decode(
+      core::CommandBatch& batch, const ParsedFrame& frame,
+      core::GpuStageScope* stage = nullptr);
 
   /// @return After the submit, the refusal @ref read_intra_frame makes for
   ///         the same frame's segments (@ref check_segment), or OK.
-  Status check() const;
+  core::Status check() const;
 
   /// @return The decoded coordinates, `ptr` 0, in frame order, as the last
   ///         submit read them back.
@@ -78,32 +78,32 @@ class VR_CODEC_API DeviceFrameReader {
   /// @brief Parse, decode and check a frame, and read everything back. What
   ///        tests compare against @ref read_intra_frame.
   /// @return As @ref read_intra_frame.
-  Result<IntraFrame> read(const std::uint8_t* data, std::size_t size,
-                          std::uint32_t max_blocks);
+  core::Result<IntraFrame> read(const std::uint8_t* data, std::size_t size,
+                                std::uint32_t max_blocks);
 
  private:
   DeviceFrameReader() = default;
 
   // Borrowed (must outlive this).
-  Device* device_ = nullptr;
-  Allocator* allocator_ = nullptr;
+  core::Device* device_ = nullptr;
+  core::Allocator* allocator_ = nullptr;
   std::uint32_t max_workgroup_count_x_ = 0;
   VkDeviceSize max_storage_buffer_range_ = 0;
 
   // Declared before pool_, so the pool is destroyed first.
-  ComputeKernel slots_kernel_;
-  ComputeKernel decode_kernel_;
-  DescriptorPool pool_;
+  core::ComputeKernel slots_kernel_;
+  core::ComputeKernel decode_kernel_;
+  core::DescriptorPool pool_;
 
   // Device-local, retained and grown by ensure_device_scratch.
-  Buffer tables_;         // per model, per symbol: cum | freq << 16
-  Buffer slots_;          // per model, per slot: rans_slots.comp's entry
-  Buffer payload_;        // the segment streams
-  Buffer segment_words_;  // each segment's first 16-bit word, count + 1
-  Buffer list_;           // volume::BlockIndex a block
-  Buffer masks_;
-  Buffer coefficients_;  // two int16 a word, (K + 1) / 2 words a block
-  Buffer faults_;        // a SegmentFault a segment
+  core::Buffer tables_;         // per model, per symbol: cum | freq << 16
+  core::Buffer slots_;          // per model, per slot: rans_slots.comp's entry
+  core::Buffer payload_;        // the segment streams
+  core::Buffer segment_words_;  // each segment's first 16-bit word, count + 1
+  core::Buffer list_;           // volume::BlockIndex a block
+  core::Buffer masks_;
+  core::Buffer coefficients_;  // two int16 a word, (K + 1) / 2 words a block
+  core::Buffer faults_;        // a SegmentFault a segment
 
   // What the last submit read back, which check() judges, and the segment
   // size of the frame recorded last.

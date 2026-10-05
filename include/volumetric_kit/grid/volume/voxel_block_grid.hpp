@@ -15,15 +15,15 @@
 #include <utility>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/buffer.hpp"
-#include "volumetric_kit/recon/core/compute_kernel.hpp"
-#include "volumetric_kit/recon/core/descriptor.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/compute_kernel.hpp"
+#include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
-#include "volumetric_kit/recon/core/gpu_timer.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
-#include "volumetric_kit/recon/core/stage_metrics.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
@@ -51,8 +51,8 @@ struct AttributeSpec {
 /// @ref VoxelBlockGrid::resize** of the owning grid -- resize replaces every
 /// attribute buffer, so a held view or handle dangles.
 struct AttributeView {
-  const Buffer* buffer = nullptr;   ///< The attribute's device buffer.
-  std::uint32_t element_size = 0;   ///< Bytes per voxel.
+  const core::Buffer* buffer = nullptr;  ///< The attribute's device buffer.
+  std::uint32_t element_size = 0;        ///< Bytes per voxel.
   std::uint64_t element_count = 0;  ///< Voxels (num_blocks * voxels_per_block).
 };
 
@@ -97,10 +97,11 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///         VoxelHashMap::create returns; @ref Status::Code::InvalidArgument
   ///         for a null list, an empty name, a zero element size, or a
   ///         duplicate name; or an allocation failure.
-  static Result<VoxelBlockGrid> create(Device& device, Allocator& allocator,
-                                       const VoxelGridParams& grid,
-                                       const AttributeSpec* attrs,
-                                       std::size_t attr_count);
+  static core::Result<VoxelBlockGrid> create(core::Device& device,
+                                             core::Allocator& allocator,
+                                             const VoxelGridParams& grid,
+                                             const AttributeSpec* attrs,
+                                             std::size_t attr_count);
 
   // Move construction only. The owned VoxelHashMap and each attribute Buffer
   // self-reset on move, so a moved-from grid is empty (valid() == false). A
@@ -201,7 +202,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @param blocks  The list.
   /// @param who     Prefixes the error message (the consumer's entry point).
   /// @return OK, or @ref Status::Code::InvalidArgument naming the refusal.
-  Status check_block_list(const BlockList& blocks, const char* who) const;
+  core::Status check_block_list(const BlockList& blocks, const char* who) const;
 
   /// @brief Look up an attribute's backing store by name.
   ///
@@ -219,7 +220,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return A view of the attribute, or @ref Status::Code::InvalidArgument if
   ///         no attribute of that name was declared (or the grid is
   ///         moved-from), or if the array no longer covers the live grid.
-  Result<AttributeView> attribute(std::string_view name) const;
+  core::Result<AttributeView> attribute(std::string_view name) const;
 
   /// @brief Remove voxel blocks at the given block coordinates, clearing the
   ///        per-voxel attribute data they held.
@@ -248,8 +249,9 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return What @ref VoxelHashMap::remove returns, or a non-OK @ref Status if
   ///         the grid is moved-from, @p coords is null, or the zeroing fails,
   ///         which comes before any index is freed.
-  Result<std::uint32_t> remove(const BlockIndex* coords, std::uint32_t count,
-                               AllocFailures* out_failures = nullptr);
+  core::Result<std::uint32_t> remove(const BlockIndex* coords,
+                                     std::uint32_t count,
+                                     AllocFailures* out_failures = nullptr);
 
   /// @brief Empty the grid: clear the block index and zero every attribute.
   ///
@@ -260,7 +262,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// an index over stale data.
   /// @return OK, or a non-OK @ref Status if the grid is moved-from, the
   ///         zeroing fails, or the underlying @ref VoxelHashMap::clear fails.
-  Status clear();
+  core::Status clear();
 
   /// @return `true` if an attribute of @p name was declared.
   bool has_attribute(std::string_view name) const noexcept;
@@ -287,7 +289,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///         non-growing count; an allocation failure; or whatever @ref
   ///         VoxelHashMap::resize returns (e.g. @ref Status::Code::OutOfMemory
   ///         on a rehash overflow).
-  Status resize(std::int32_t new_num_buckets);
+  core::Status resize(std::int32_t new_num_buckets);
 
   /// @return `true` if this owns a live grid (`false` when moved-from).
   bool valid() const noexcept { return map_.valid(); }
@@ -304,7 +306,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///                 over the compaction's `"  ..active set"`.
   /// @return OK; @ref Status::Code::InvalidArgument for a moved-from grid or
   ///         one without a `float` `weight` attribute; or a dispatch failure.
-  Status stamp_blocks(StageMetrics* metrics = nullptr);
+  core::Status stamp_blocks(core::StageMetrics* metrics = nullptr);
 
   /// @brief @ref stamp_blocks, then free every active block that has been
   ///        neither asked for by an allocation nor found holding weight for
@@ -325,15 +327,16 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///         @p max_age of 0 or an attribute whose block is not whole 4-byte
   ///         words (an odd block size with an element under 4 bytes), or what
   ///         @ref stamp_blocks and @ref VoxelHashMap::remove refuse.
-  Result<std::uint32_t> free_stale_blocks(std::uint32_t max_age,
-                                          StageMetrics* metrics = nullptr);
+  core::Result<std::uint32_t> free_stale_blocks(
+      std::uint32_t max_age, core::StageMetrics* metrics = nullptr);
 
  private:
   /// Construct from an already-built block index + the allocator its attribute
   /// buffers come from (borrowed; must outlive the grid). Attributes are added
   /// by @ref create. (VoxelHashMap has no public default ctor, so the grid is
   /// built map-first rather than default-then-assign.)
-  VoxelBlockGrid(VoxelHashMap map, Device* device, Allocator* allocator,
+  VoxelBlockGrid(VoxelHashMap map, core::Device* device,
+                 core::Allocator* allocator,
                  VkDeviceSize max_storage_buffer_range)
       : map_(std::move(map)),
         max_storage_buffer_range_(max_storage_buffer_range),
@@ -353,31 +356,34 @@ class VR_VOLUME_API VoxelBlockGrid {
   struct Attribute {
     std::string name;
     std::uint32_t element_size = 0;
-    Buffer buffer;
+    core::Buffer buffer;
   };
 
   // Build the block pass's kernels, timer and count on its first call, so a
   // grid that never runs one never pays for them; the pass also checks for a
   // float weight, which the zeroing alone does not need.
-  Status prepare_block_pass();
-  Status prepare_block_kernels();
+  core::Status prepare_block_pass();
+  core::Status prepare_block_kernels();
   // Whether every attribute's blocks are whole 4-byte words, so the zero
   // kernel can clear each block alone.
   bool whole_word_blocks() const noexcept;
   // Record the zero kernel over the first `count` entries of `list`, an
   // attribute a dispatch, each block found by its coord.
-  Status record_zero(CommandBatch& batch, const Buffer& list,
-                     std::uint32_t count, GpuStageScope* stage);
+  core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
+                           std::uint32_t count, core::GpuStageScope* stage);
   // Upload `coords` and zero their blocks, in one batch.
-  Status zero_listed_blocks(const BlockIndex* coords, std::uint32_t count);
+  core::Status zero_listed_blocks(const BlockIndex* coords,
+                                  std::uint32_t count);
   // The block pass: stamps, and with a max_age the stale blocks listed in
   // stale_list_. Returns how many.
-  Result<std::uint32_t> block_pass(std::uint32_t max_age, GpuStageScope& stage,
-                                   StageMetrics* metrics);
+  core::Result<std::uint32_t> block_pass(std::uint32_t max_age,
+                                         core::GpuStageScope& stage,
+                                         core::StageMetrics* metrics);
   // Find `coords`' blocks from a snapshot of the active set and zero every
   // attribute of them by fills, in one batch: for an attribute whose blocks
   // share words.
-  Status fill_listed_blocks(const BlockIndex* coords, std::uint32_t count);
+  core::Status fill_listed_blocks(const BlockIndex* coords,
+                                  std::uint32_t count);
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
@@ -385,13 +391,13 @@ class VR_VOLUME_API VoxelBlockGrid {
   // stamp pass, and the zeroing of the stale blocks, a set an attribute. Then
   // its device timer, and its stale list and count; the list grows to the
   // most active blocks a pass has seen.
-  DescriptorPool block_pool_;
-  ComputeKernel stamp_kernel_;
-  ComputeKernel zero_kernel_;
-  KernelSets zero_sets_;
-  GpuTimer gpu_timer_;
-  Buffer stale_list_;
-  Buffer stale_count_;
+  core::DescriptorPool block_pool_;
+  core::ComputeKernel stamp_kernel_;
+  core::ComputeKernel zero_kernel_;
+  core::KernelSets zero_sets_;
+  core::GpuTimer gpu_timer_;
+  core::Buffer stale_list_;
+  core::Buffer stale_count_;
   std::uint32_t max_workgroup_count_x_ = 0;
   // The device's maxStorageBufferRange, read once at create(). An attribute
   // array is the largest buffer this repo allocates and is bound whole, so it
@@ -402,11 +408,11 @@ class VR_VOLUME_API VoxelBlockGrid {
   // for a GPU capture -- the grid dispatches through map_, which carries its
   // own. Like allocator_, a moved-from grid keeps the pointer but reports
   // valid() == false through map_, so it is never dereferenced.
-  Device* device_ = nullptr;
+  core::Device* device_ = nullptr;
   // Borrowed (must outlive this): backs every attribute buffer, including those
   // grown by resize(). A moved-from grid keeps the pointer but reports
   // valid() == false through map_, so it is never dereferenced.
-  Allocator* allocator_ = nullptr;
+  core::Allocator* allocator_ = nullptr;
 };
 
 }  // namespace volumetric_kit::recon::volume

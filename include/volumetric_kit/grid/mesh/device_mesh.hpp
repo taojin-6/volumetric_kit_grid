@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-#include "volumetric_kit/recon/core/vulkan.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
 
 namespace volumetric_kit::recon::mesh {
 

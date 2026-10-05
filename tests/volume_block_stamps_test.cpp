@@ -17,17 +17,19 @@
 #include <tuple>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
-#include "volumetric_kit/recon/core/command_batch.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 #include "grid_readback.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -56,9 +58,9 @@ vol::VoxelGridParams params() {
 }
 
 // Each active block's slot, by coordinate.
-vr::Result<std::map<Coord, std::uint32_t>> slots(vol::VoxelBlockGrid& g) {
-  VR_ASSIGN(const std::vector<vol::BlockIndex> active,
-            g.map().compact_active_blocks());
+vkc::Result<std::map<Coord, std::uint32_t>> slots(vol::VoxelBlockGrid& g) {
+  VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
+             g.map().compact_active_blocks());
   std::map<Coord, std::uint32_t> out;
   for (const vol::BlockIndex& b : active) {
     out[Coord{b.coord.x, b.coord.y, b.coord.z}] =
@@ -75,10 +77,11 @@ vol::BlockIndex at(int x) {
 
 // Whether every block a call added since `before` is stamped requested at the
 // map's tick, and there is at least one: what each allocation path must do.
-vr::Result<bool> new_blocks_requested_now(
+vkc::Result<bool> new_blocks_requested_now(
     vol::VoxelBlockGrid& g, const std::map<Coord, std::uint32_t>& before) {
-  VR_ASSIGN(const auto after, slots(g));
-  VR_ASSIGN(const std::vector<vol::BlockStamp> st, g.map().read_block_stamps());
+  VKC_ASSIGN(const auto after, slots(g));
+  VKC_ASSIGN(const std::vector<vol::BlockStamp> st,
+             g.map().read_block_stamps());
   std::size_t added = 0;
   for (const auto& [coord, slot] : after) {
     if (before.count(coord) != 0) continue;
@@ -93,25 +96,25 @@ vr::Result<bool> new_blocks_requested_now(
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance; skipping\n");
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device; skipping\n");
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   CHECK(device.ok());
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   CHECK(allocator.ok());
-  vr::Device& dev = device.value();
-  vr::Allocator& alloc = allocator.value();
+  vkc::Device& dev = device.value();
+  vkc::Allocator& alloc = allocator.value();
 
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
@@ -174,7 +177,7 @@ int main() {
     auto all = map.read_block_stamps();
     CHECK(all.ok());
     all.value()[b].changed = 3;
-    vr::CommandBatch batch(dev, alloc);
+    vkc::CommandBatch batch(dev, alloc);
     CHECK(batch
               .upload(map.stamps_buffer(), 0, all.value().data(),
                       all.value().size() * sizeof(vol::BlockStamp))
@@ -213,7 +216,7 @@ int main() {
     CHECK(moved.stamp_blocks().ok());
     CHECK(moved.free_stale_blocks(1).ok());
     // NOLINTNEXTLINE(bugprone-use-after-move) -- asserting it is empty
-    CHECK(built->stamp_blocks().domain() == vr::Status::Code::InvalidArgument);
+    CHECK(built->stamp_blocks().domain() == vkc::Status::Code::InvalidArgument);
   }
 
   // Every allocation path stamps what it asks for, through a binding of its
@@ -296,12 +299,12 @@ int main() {
 
   // Refusals: a max_age of 0, and a grid with no weight.
   CHECK(grid.free_stale_blocks(0).status().domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec no_weight[] = {{"tsdf", sizeof(float)}};
   auto bare = vol::VoxelBlockGrid::create(dev, alloc, params(), no_weight, 1);
   CHECK(bare.ok());
   CHECK(bare->map().allocate(three, 1).ok());
-  CHECK(bare->stamp_blocks().domain() == vr::Status::Code::InvalidArgument);
+  CHECK(bare->stamp_blocks().domain() == vkc::Status::Code::InvalidArgument);
 
   std::puts("volume_block_stamps: OK");
   return 0;

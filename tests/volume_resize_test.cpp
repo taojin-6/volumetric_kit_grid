@@ -17,18 +17,20 @@
 #include <utility>
 #include <vector>
 
-#include "volumetric_kit/recon/core/allocator.hpp"
-#include "volumetric_kit/recon/core/device.hpp"
-#include "volumetric_kit/recon/core/instance.hpp"
+#include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/core/result.hpp"
-#include "volumetric_kit/recon/core/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
 
 #define CHECK(cond)                                                        \
@@ -74,8 +76,9 @@ std::vector<vol::BlockIndex> block_grid(int base, int side) {
   return out;
 }
 
-vr::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+vkc::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   if (!active) {
     return active.status();
   }
@@ -87,8 +90,9 @@ vr::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
 }
 
 // Each active block's coordinate -> its voxel-array pointer (BlockIndex::ptr).
-vr::Result<std::map<Coord, std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
-  vr::Result<std::vector<vol::BlockIndex>> active = map.compact_active_blocks();
+vkc::Result<std::map<Coord, std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      map.compact_active_blocks();
   if (!active) {
     return active.status();
   }
@@ -102,28 +106,28 @@ vr::Result<std::map<Coord, std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
 }  // namespace
 
 int main() {
-  vr::Result<vr::Instance> instance = vr::Instance::create({});
+  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
     std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
                  instance.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::PhysicalDeviceInfo> gpu =
+  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
     std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
                  gpu.status().message().c_str());
     return 0;
   }
-  vr::Result<vr::Device> device = vr::Device::create(
+  vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
   if (!device) {
     std::fprintf(stderr, "device create failed: %s\n",
                  device.status().message().c_str());
     return 1;
   }
-  vr::Result<vr::Allocator> allocator =
-      vr::Allocator::create(instance.value().handle(), device.value());
+  vkc::Result<vkc::Allocator> allocator =
+      vkc::Allocator::create(instance.value().handle(), device.value());
   if (!allocator) {
     std::fprintf(stderr, "allocator create failed: %s\n",
                  allocator.status().message().c_str());
@@ -141,7 +145,7 @@ int main() {
   grid.num_blocks = 256 * 8;
   grid.max_chain = 128;
 
-  vr::Result<vol::VoxelHashMap> map_result =
+  vkc::Result<vol::VoxelHashMap> map_result =
       vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
@@ -156,13 +160,13 @@ int main() {
   for (const vol::BlockIndex& b : a) {
     want.insert({b.coord.x, b.coord.y, b.coord.z});
   }
-  vr::Result<std::uint32_t> alloc_a =
+  vkc::Result<std::uint32_t> alloc_a =
       map.allocate(a.data(), static_cast<std::uint32_t>(a.size()));
   CHECK(alloc_a.ok() && alloc_a.value() == 0);
 
   // Snapshot each block's index before growing; the rehash must preserve it
   // (not reassign it) so per-voxel data keyed by the pointer survives.
-  vr::Result<std::map<Coord, std::int32_t>> ptrs_before = active_ptrs(map);
+  vkc::Result<std::map<Coord, std::int32_t>> ptrs_before = active_ptrs(map);
   CHECK(ptrs_before.ok() && ptrs_before.value().size() == a.size());
 
   CHECK(map.resize(1024).ok());
@@ -170,21 +174,21 @@ int main() {
   CHECK(map.grid().num_blocks == 1024 * 8);
 
   // The active set survived the growth.
-  vr::Result<std::set<Coord>> after = active_set(map);
+  vkc::Result<std::set<Coord>> after = active_set(map);
   CHECK(after.ok());
   CHECK(after.value() == want);
 
   // Block indices are PRESERVED, not reassigned: every coord keeps the exact
   // ptr it held before -- the rehash's core guarantee, and what keeps a
   // VoxelBlockGrid's attribute data (addressed by ptr) valid across the grow.
-  vr::Result<std::map<Coord, std::int32_t>> ptrs_after = active_ptrs(map);
+  vkc::Result<std::map<Coord, std::int32_t>> ptrs_after = active_ptrs(map);
   CHECK(ptrs_after.ok());
   CHECK(ptrs_after.value() == ptrs_before.value());
 
   // The heap was rebuilt to exclude the preserved indices: free blocks = the
   // new capacity minus the live set (so a later allocation never reuses a live
   // one).
-  vr::Result<vol::HashDiagnostics> diag = map.diagnostics();
+  vkc::Result<vol::HashDiagnostics> diag = map.diagnostics();
   CHECK(diag.ok());
   CHECK(diag.value().heap_free_count ==
         static_cast<std::int32_t>(1024 * 8 - a.size()));
@@ -194,10 +198,10 @@ int main() {
   for (const vol::BlockIndex& block : b) {
     want.insert({block.coord.x, block.coord.y, block.coord.z});
   }
-  vr::Result<std::uint32_t> alloc_b =
+  vkc::Result<std::uint32_t> alloc_b =
       map.allocate(b.data(), static_cast<std::uint32_t>(b.size()));
   CHECK(alloc_b.ok() && alloc_b.value() == 0);
-  vr::Result<std::set<Coord>> both = active_set(map);
+  vkc::Result<std::set<Coord>> both = active_set(map);
   CHECK(both.ok());
   CHECK(both.value() == want);
   CHECK(both.value().size() == 54);
@@ -215,20 +219,20 @@ int main() {
   }
   std::uint32_t big_failed = 1;
   for (int pass = 0; pass < 8 && big_failed != 0; ++pass) {
-    vr::Result<std::uint32_t> alloc_big =
+    vkc::Result<std::uint32_t> alloc_big =
         map.allocate(big.data(), static_cast<std::uint32_t>(big.size()));
     CHECK(alloc_big.ok());
     big_failed = alloc_big.value();
   }
   CHECK(big_failed == 0);
-  vr::Result<std::set<Coord>> grown = active_set(map);
+  vkc::Result<std::set<Coord>> grown = active_set(map);
   CHECK(grown.ok());
   CHECK(grown.value() == want);
   CHECK(grown.value().size() == 54 + 3375);
 
   // resize refuses a non-growing count.
-  CHECK(map.resize(1024).domain() == vr::Status::Code::InvalidArgument);
-  CHECK(map.resize(512).domain() == vr::Status::Code::InvalidArgument);
+  CHECK(map.resize(1024).domain() == vkc::Status::Code::InvalidArgument);
+  CHECK(map.resize(512).domain() == vkc::Status::Code::InvalidArgument);
 
   // resize refuses a grow whose num_blocks * voxels_per_block would overflow a
   // signed 32-bit block pointer: rejected up front (InvalidArgument), before
@@ -242,7 +246,7 @@ int main() {
   CHECK(overflow_buckets > map.grid().num_buckets &&
         overflow_buckets <= std::numeric_limits<std::int32_t>::max());
   CHECK(map.resize(static_cast<std::int32_t>(overflow_buckets)).domain() ==
-        vr::Status::Code::InvalidArgument);
+        vkc::Status::Code::InvalidArgument);
   CHECK(map.grid().num_buckets ==
         1024);  // rejected grow left the map untouched
 
@@ -256,7 +260,7 @@ int main() {
     tight.num_buckets = 8;
     tight.num_blocks = 16;
     tight.max_chain = 2;
-    vr::Result<vol::VoxelHashMap> made =
+    vkc::Result<vol::VoxelHashMap> made =
         vol::VoxelHashMap::create(device.value(), allocator.value(), tight);
     CHECK(made.ok());
     vol::VoxelHashMap small = std::move(made).value();
@@ -272,14 +276,14 @@ int main() {
       }
     }
     CHECK(clash.size() == 5);
-    vr::Result<std::uint32_t> placed = small.allocate(clash.data(), 5);
+    vkc::Result<std::uint32_t> placed = small.allocate(clash.data(), 5);
     CHECK(placed.ok() && placed.value() == 0);
-    const vr::Status grow = small.resize(9);
-    CHECK(grow.domain() == vr::Status::Code::OutOfMemory);
+    const vkc::Status grow = small.resize(9);
+    CHECK(grow.domain() == vkc::Status::Code::OutOfMemory);
     CHECK(small.grid().num_buckets == 8);
-    vr::Result<std::set<Coord>> kept = active_set(small);
+    vkc::Result<std::set<Coord>> kept = active_set(small);
     CHECK(kept.ok() && kept.value().size() == 5);
-    vr::Result<vol::HashDiagnostics> d = small.diagnostics();
+    vkc::Result<vol::HashDiagnostics> d = small.diagnostics();
     CHECK(d.ok() && d.value().heap_free_count == 16 - 5);
     CHECK(small.load_factor().value() == 5.0f / 16.0f);
   }

@@ -8,7 +8,7 @@
 
 #include <string>
 
-#include "volumetric_kit/recon/core/result.hpp"
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/io/export.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
@@ -32,6 +32,7 @@ namespace volumetric_kit::recon::io {
 /// @return OK after closing the file, or non-OK Status for invalid input,
 ///         failure to allocate the export buffers, an unsupported host byte
 ///         order, or write failure.
-VR_IO_API Status write_ply(const std::string& path, const mesh::Mesh& mesh);
+VR_IO_API core::Status write_ply(const std::string& path,
+                                 const mesh::Mesh& mesh);
 
 }  // namespace volumetric_kit::recon::io
