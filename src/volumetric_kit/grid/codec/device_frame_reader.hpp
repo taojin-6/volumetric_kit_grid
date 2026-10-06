@@ -75,12 +75,6 @@ class VR_CODEC_API DeviceFrameReader {
     return blocks_host_;
   }
 
-  /// @brief Parse, decode and check a frame, and read everything back. What
-  ///        tests compare against @ref read_intra_frame.
-  /// @return As @ref read_intra_frame.
-  core::Result<IntraFrame> read(const std::uint8_t* data, std::size_t size,
-                                std::uint32_t max_blocks);
-
  private:
   DeviceFrameReader() = default;
 

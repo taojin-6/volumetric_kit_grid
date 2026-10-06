@@ -90,12 +90,6 @@ class VR_CODEC_API DeviceFrameWriter {
       const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
       const CodecParams& params, core::GpuStageScope* stage = nullptr);
 
-  /// @brief Write @p frame from host arrays: upload them, then count and
-  ///        finish. What tests compare against @ref write_intra_frame.
-  /// @return As @ref write_intra_frame.
-  core::Result<std::vector<std::uint8_t>> write(
-      const IntraFrame& frame, const FrameWriteOptions& options);
-
  private:
   DeviceFrameWriter() = default;
 
@@ -127,10 +121,6 @@ class VR_CODEC_API DeviceFrameWriter {
   core::Buffer payload_;
   core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
   core::Buffer failed_;       // set when a table refuses a symbol
-  // write()'s uploads of a host frame.
-  core::Buffer upload_list_;
-  core::Buffer upload_masks_;
-  core::Buffer upload_coefficients_;
 
   // Each model's first symbol entry (rans_walk.glsl's model_base), and what
   // record_count reads back at the caller's submit.

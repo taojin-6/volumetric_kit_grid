@@ -187,9 +187,6 @@ class RansWriter {
     }
   }
 
-  /// @return How many coder steps have been appended.
-  std::size_t size() const noexcept { return ops_.size(); }
-
   /// @brief Encode everything appended onto the end of @p out.
   ///
   /// The stream is the final state as two 16-bit words (high first), then the

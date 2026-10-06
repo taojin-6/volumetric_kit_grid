@@ -516,8 +516,7 @@ const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
   return found[static_cast<std::size_t>(id) - 1];
 }
 
-}  // namespace
-
+// The checks write_intra_frame makes before coding anything.
 core::Status check_intra_frame(const IntraFrame& frame,
                                const FrameWriteOptions& options) {
   const DctBlocks& b = frame.blocks;
@@ -569,6 +568,8 @@ core::Status check_intra_frame(const IntraFrame& frame,
   }
   return {};
 }
+
+}  // namespace
 
 core::Result<std::vector<std::uint8_t>> write_intra_frame(
     const IntraFrame& frame, const FrameWriteOptions& options) {

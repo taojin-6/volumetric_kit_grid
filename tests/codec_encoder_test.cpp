@@ -50,7 +50,7 @@ int empty_grid_case(Gpu& gpu, codec::Encoder& enc) {
   CHECK(info.value().voxel_size == kVoxel);
   CHECK(info.value().trunc_dist == kTrunc);
   CHECK(info.value().params.coefficient_count ==
-        enc.config().params.coefficient_count);
+        codec::CodecParams{}.coefficient_count);
   return 0;
 }
 
@@ -278,15 +278,6 @@ int moves_case(Gpu& gpu) {
   codec::Encoder b(std::move(a));
   CHECK(b.valid());
   CHECK(!a.valid());  // NOLINT(bugprone-use-after-move): asserting the source
-  // Its configuration went with it: nothing a moved-from encoder reports
-  // looks like one that could encode.
-  CHECK(a.config().params.coefficient_count == 0);               // NOLINT
-  CHECK(a.config().params.quantization_scale == 0.0f);           // NOLINT
-  for (float weight : a.config().params.quantization_weights) {  // NOLINT
-    CHECK(weight == 0.0f);
-  }
-  CHECK(a.config().segment_size == 0);        // NOLINT
-  CHECK(!a.config().params.validate().ok());  // NOLINT
 
   codec::EncoderConfig other;
   other.params.coefficient_count = 8;
@@ -297,9 +288,6 @@ int moves_case(Gpu& gpu) {
   c = std::move(b);  // over a live encoder: takes b's config too
   CHECK(c.valid());
   CHECK(!b.valid());  // NOLINT(bugprone-use-after-move)
-  CHECK(c.config().params.coefficient_count ==
-        codec::CodecParams{}.coefficient_count);
-  CHECK(b.config().segment_size == 0);  // NOLINT(bugprone-use-after-move)
 
   codec::Encoder* alias = &c;
   c = std::move(*alias);  // self-move, laundered past -Wself-move
@@ -307,7 +295,13 @@ int moves_case(Gpu& gpu) {
 
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(gpu);
   CHECK(g.ok());
-  CHECK(c.encode(g.value()).ok());
+  vkc::Result<std::vector<std::uint8_t>> bytes = c.encode(g.value());
+  CHECK(bytes.ok());
+  // b's configuration, not the one c was made with.
+  vkc::Result<codec::FrameInfo> info =
+      codec::read_frame_info(bytes.value().data(), bytes.value().size());
+  CHECK(info.ok() && info.value().params.coefficient_count ==
+                         codec::CodecParams{}.coefficient_count);
   CHECK(!a.encode(g.value()).ok());  // a moved-from encoder refuses
   return 0;
 }

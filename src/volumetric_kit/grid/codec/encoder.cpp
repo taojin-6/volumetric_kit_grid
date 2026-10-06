@@ -23,43 +23,13 @@ namespace {
 static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
               "EncoderConfig's default segment size is the writer's");
 
-// What a moved-from encoder reports: no coefficients and no segments, a
-// configuration that fails validation just as the encoder fails valid().
-EncoderConfig empty_config() {
-  EncoderConfig c;
-  c.params.coefficient_count = 0;
-  c.params.quantization_scale = 0.0f;
-  c.params.quantization_weights.fill(0.0f);
-  c.segment_size = 0;
-  return c;
-}
-
 }  // namespace
 
 Encoder::Encoder() = default;
 Encoder::~Encoder() = default;
 
-Encoder::Encoder(Encoder&& other) noexcept
-    : config_(std::exchange(other.config_, empty_config())),
-      device_(std::exchange(other.device_, nullptr)),
-      allocator_(std::exchange(other.allocator_, nullptr)),
-      transform_(std::move(other.transform_)),
-      writer_(std::move(other.writer_)),
-      writer_failure_(std::exchange(other.writer_failure_, core::Status{})),
-      gpu_timer_(std::move(other.gpu_timer_)) {}
-
-Encoder& Encoder::operator=(Encoder&& other) noexcept {
-  if (this != &other) {
-    config_ = std::exchange(other.config_, empty_config());
-    device_ = std::exchange(other.device_, nullptr);
-    allocator_ = std::exchange(other.allocator_, nullptr);
-    transform_ = std::move(other.transform_);
-    writer_ = std::move(other.writer_);
-    writer_failure_ = std::exchange(other.writer_failure_, core::Status{});
-    gpu_timer_ = std::move(other.gpu_timer_);
-  }
-  return *this;
-}
+Encoder::Encoder(Encoder&& other) noexcept = default;
+Encoder& Encoder::operator=(Encoder&& other) noexcept = default;
 
 bool Encoder::valid() const noexcept { return transform_ != nullptr; }
 
