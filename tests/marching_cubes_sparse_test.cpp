@@ -752,9 +752,9 @@ int main() {
     const float r = vr::length(d);
     CHECK(std::fabs(r - kRadius) < 1.5f * kH);  // MC accuracy ~ one voxel
     CHECK(std::fabs(vr::length(v.normal) - 1.0f) < 1e-3f);
-    CHECK(vr::dot(vr::normalize(d), v.normal) > 0.5f);  // never inward
+    CHECK(vr::dot(glm::normalize(d), v.normal) > 0.5f);  // never inward
     radius_sum += r;
-    outward_sum += vr::dot(vr::normalize(d), v.normal);
+    outward_sum += vr::dot(glm::normalize(d), v.normal);
   }
   const auto nv = static_cast<double>(sphere.vertices.size());
   CHECK(std::fabs(radius_sum / nv - kRadius) < 0.25 * kH);  // no radial bias
@@ -886,7 +886,7 @@ int main() {
     const vr::Vec3f face =
         vr::cross(b.position - a.position, c.position - a.position);
     if (vr::length(face) > 1e-8f) {
-      if (vr::dot(vr::normalize(face), a.normal) > 0.0f) {
+      if (vr::dot(glm::normalize(face), a.normal) > 0.0f) {
         ++face_outward;
       }
       ++face_count;
@@ -951,8 +951,8 @@ int main() {
   // replacing the chain walk with `return -1;` left this whole suite green, and
   // every other suite too.
   //
-  // Production is the overflow case (VoxelGridParams::defaults() is 50x30000
-  // with max_chain 128, and HashDiagnostics::overflow_count exists precisely
+  // Production is the overflow case (a full 50-entry bucket chains, with
+  // max_chain 128, and HashDiagnostics::overflow_count exists precisely
   // because buckets fill), so mesh the SAME field through a table shaped to
   // spill: 2-entry buckets make the last slot of each bucket its chain anchor,
   // so a bucket holding two coords already pushes one into the chain. The block
@@ -1083,8 +1083,8 @@ int main() {
   CHECK(extractor.block_spans_generation() == 0);
 
   // --- track_block_spans is off by default -----------------------------------
-  // The table is sized by the GRID (num_blocks * 16, which is 24 MB at
-  // VoxelGridParams::defaults and doubles with every resize), so a caller who
+  // The table is sized by the GRID (num_blocks * 16, which is 24 MB for a heap
+  // of 1.5 M blocks and doubles with every resize), so a caller who
   // never reads it must not pay for it.
   // Asserted through arena_bytes, which is what makes "costs nothing" a
   // measurable claim rather than a comment: it counts the span table, so an

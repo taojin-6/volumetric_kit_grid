@@ -701,7 +701,7 @@ core::Status MarchingCubes::ensure_block_spans(
   //
   // The tail is ZEROED rather than left as VMA hands it over. Only the blocks
   // in an extract's active set are written, so on a first extract that is a few
-  // thousand of 1.5M entries at VoxelGridParams::defaults; the rest are what
+  // thousand of a 1.5M-block heap's entries; the rest are what
   // the accessor publishes as readable, and driver-garbage bases index the
   // arena anywhere. An empty span is a truthful "this block owns no geometry".
   //

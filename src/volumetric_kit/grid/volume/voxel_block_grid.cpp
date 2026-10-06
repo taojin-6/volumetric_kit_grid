@@ -89,6 +89,14 @@ core::Result<VoxelBlockGrid> VoxelBlockGrid::create(core::Device& device,
       return core::Status::invalid_argument(
           "VoxelBlockGrid::create: attribute element_size must be positive");
     }
+    // Whole words a block, so the zero kernel can clear one block alone.
+    if (static_cast<std::uint64_t>(grid.voxels_per_block) * spec.element_size %
+            4 !=
+        0) {
+      return core::Status::invalid_argument(
+          "VoxelBlockGrid::create: an attribute's block must fill whole 4-byte "
+          "words (voxels_per_block * element_size a multiple of 4)");
+    }
     for (std::size_t j = 0; j < i; ++j) {
       if (attrs[j].name == spec.name) {
         return core::Status::invalid_argument(
@@ -303,10 +311,8 @@ core::Result<std::uint32_t> VoxelBlockGrid::remove(
 
   if (!attributes_.empty()) {
     // The zero kernel finds each coord's block in the table itself, so this
-    // costs the count, not the grid -- unless an attribute's blocks share
-    // words, which only fills can zero apart.
-    VKC_TRY(whole_word_blocks() ? zero_listed_blocks(coords, count)
-                                : fill_listed_blocks(coords, count));
+    // costs the count, not the grid.
+    VKC_TRY(zero_listed_blocks(coords, count));
   }
 
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
@@ -330,15 +336,6 @@ core::Status VoxelBlockGrid::clear() {
   }
   VKC_TRY(batch.submit());
   return map_.clear();  // moves the topology epoch; see topology_epoch()
-}
-
-bool VoxelBlockGrid::whole_word_blocks() const noexcept {
-  const auto voxels_per_block =
-      static_cast<std::uint64_t>(map_.grid().voxels_per_block);
-  return std::all_of(attributes_.begin(), attributes_.end(),
-                     [&](const Attribute& attr) {
-                       return voxels_per_block * attr.element_size % 4 == 0;
-                     });
 }
 
 core::Status VoxelBlockGrid::prepare_block_pass() {
@@ -426,12 +423,6 @@ core::Result<std::uint32_t> VoxelBlockGrid::block_pass(
   return std::min(stale, active.count);
 }
 
-core::Status VoxelBlockGrid::stamp_blocks(core::StageMetrics* metrics) {
-  VKC_TRY(prepare_block_pass());
-  core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
-  return block_pass(0, stage, metrics).status();
-}
-
 core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
     std::uint32_t max_age, core::StageMetrics* metrics) {
   if (max_age == 0) {
@@ -439,11 +430,6 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
         "VoxelBlockGrid::free_stale_blocks: max_age must be at least 1");
   }
   VKC_TRY(prepare_block_pass());
-  if (!whole_word_blocks()) {
-    return core::Status::invalid_argument(
-        "VoxelBlockGrid::free_stale_blocks: an attribute does not fill whole "
-        "4-byte words a block");
-  }
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
   VKC_ASSIGN(const std::uint32_t stale, block_pass(max_age, stage, metrics));
   if (stale == 0) return std::uint32_t{0};
@@ -499,58 +485,6 @@ core::Status VoxelBlockGrid::zero_listed_blocks(const BlockIndex* coords,
   core::CommandBatch batch(*device_, *allocator_);
   VKC_TRY(batch.upload(list, 0, coords, list_bytes));
   VKC_TRY(record_zero(batch, list, count, nullptr));
-  return batch.submit();
-}
-
-core::Status VoxelBlockGrid::fill_listed_blocks(const BlockIndex* coords,
-                                                std::uint32_t count) {
-  // Each coord's block pointer, from a snapshot of the active set --
-  // quiescent between calls, so exact -- sorted once, so each coord is a
-  // binary search. Only for an attribute whose blocks share words, which
-  // block_zero.comp cannot zero apart; MoltenVK runs each fill as a dispatch
-  // of its own.
-  VKC_ASSIGN(std::vector<BlockIndex> active, map_.compact_active_blocks());
-  std::sort(active.begin(), active.end(),
-            [](const BlockIndex& a, const BlockIndex& b) {
-              return coord_less(a.coord, b.coord);
-            });
-  std::vector<std::uint64_t> firsts;  // each found block's first voxel
-  for (std::uint32_t i = 0; i < count; ++i) {
-    const auto block =
-        std::lower_bound(active.begin(), active.end(), coords[i].coord,
-                         [](const BlockIndex& b, const Vec3i& c) {
-                           return coord_less(b.coord, c);
-                         });
-    if (block != active.end() && block->coord == coords[i].coord) {
-      firsts.push_back(static_cast<std::uint64_t>(block->ptr));
-    }
-  }
-  // Zero each block's slice of every attribute on the device, in one batch.
-  // Sorted and merged, so blocks the LIFO heap handed out side by side cost
-  // one fill, not one each; and attribute by attribute, so each array's
-  // fills rise through it and share one barrier (see CommandBatch).
-  const auto voxels_per_block =
-      static_cast<std::uint64_t>(map_.grid().voxels_per_block);
-  std::sort(firsts.begin(), firsts.end());
-  firsts.erase(std::unique(firsts.begin(), firsts.end()), firsts.end());
-  core::CommandBatch batch(*device_, *allocator_);
-  for (const Attribute& attr : attributes_) {
-    for (std::size_t i = 0; i < firsts.size();) {
-      std::size_t j = i + 1;
-      while (j < firsts.size() &&
-             firsts[j] == firsts[j - 1] + voxels_per_block) {
-        ++j;
-      }
-      const std::uint64_t offset = firsts[i] * attr.element_size;
-      const std::uint64_t bytes =
-          (j - i) * voxels_per_block * attr.element_size;
-      i = j;
-      if (offset + bytes > attr.buffer.size()) {
-        continue;  // an out-of-lockstep array; attribute() reports it
-      }
-      VKC_TRY(batch.zero(attr.buffer, offset, bytes));
-    }
-  }
   return batch.submit();
 }
 

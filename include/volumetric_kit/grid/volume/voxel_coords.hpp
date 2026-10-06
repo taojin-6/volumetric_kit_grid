@@ -7,13 +7,11 @@
 /// @brief World <-> voxel <-> block coordinate transforms for the sparse grid.
 ///
 /// The conversions every voxel-hash stage shares (allocation, integration,
-/// meshing). Each takes the @ref VoxelGridParams explicitly and is
-/// `VR_DEVICE_HOST`, so the same definition serves host code and the CUDA
-/// accelerator; the GLSL compute mirror keeps identical arithmetic.
+/// meshing). Each takes the @ref VoxelGridParams explicitly; the GLSL compute
+/// mirror keeps identical arithmetic.
 
 #include <cmath>
 
-#include "volumetric_kit/recon/core/device_macros.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
@@ -33,7 +31,7 @@ namespace detail {
 /// host, CUDA, and GLSL byte-identical in any FP environment.
 /// @param x  The value to round.
 /// @return The nearest integer value to @p x; an exact half rounds to even.
-VR_DEVICE_HOST inline float round_half_even(float x) {
+inline float round_half_even(float x) {
   const float lower = std::floor(x);
   const float frac = x - lower;
   if (frac < 0.5f) return lower;
@@ -47,8 +45,7 @@ VR_DEVICE_HOST inline float round_half_even(float x) {
 /// @param world  World-space position, metres.
 /// @param grid   Grid parameters (uses @ref VoxelGridParams::voxel_size).
 /// @return The fractional voxel coordinate of @p world.
-VR_DEVICE_HOST inline Vec3f world_to_voxel_f(Vec3f world,
-                                             const VoxelGridParams& grid) {
+inline Vec3f world_to_voxel_f(Vec3f world, const VoxelGridParams& grid) {
   return world / grid.voxel_size;
 }
 
@@ -61,8 +58,7 @@ VR_DEVICE_HOST inline Vec3f world_to_voxel_f(Vec3f world,
 /// @param world  World-space position, metres.
 /// @param grid   Grid parameters (uses @ref VoxelGridParams::voxel_size).
 /// @return The nearest voxel coordinate to @p world.
-VR_DEVICE_HOST inline Vec3i world_to_voxel(Vec3f world,
-                                           const VoxelGridParams& grid) {
+inline Vec3i world_to_voxel(Vec3f world, const VoxelGridParams& grid) {
   const Vec3f v = world / grid.voxel_size;
   return Vec3i(static_cast<int>(detail::round_half_even(v.x)),
                static_cast<int>(detail::round_half_even(v.y)),
@@ -78,8 +74,7 @@ VR_DEVICE_HOST inline Vec3i world_to_voxel(Vec3f world,
 /// @param voxel  Voxel coordinate.
 /// @param grid   Grid parameters (uses @ref VoxelGridParams::block_size).
 /// @return The block coordinate containing @p voxel.
-VR_DEVICE_HOST inline Vec3i voxel_to_block(Vec3i voxel,
-                                           const VoxelGridParams& grid) {
+inline Vec3i voxel_to_block(Vec3i voxel, const VoxelGridParams& grid) {
   const int bs = grid.block_size;
   if (voxel.x < 0) voxel.x -= bs - 1;
   if (voxel.y < 0) voxel.y -= bs - 1;
@@ -91,8 +86,7 @@ VR_DEVICE_HOST inline Vec3i voxel_to_block(Vec3i voxel,
 /// @param block  Block coordinate.
 /// @param grid   Grid parameters (uses @ref VoxelGridParams::block_size).
 /// @return The coordinate of the block's minimum-index (origin) voxel.
-VR_DEVICE_HOST inline Vec3i block_to_voxel(Vec3i block,
-                                           const VoxelGridParams& grid) {
+inline Vec3i block_to_voxel(Vec3i block, const VoxelGridParams& grid) {
   return block * grid.block_size;
 }
 
@@ -103,8 +97,7 @@ VR_DEVICE_HOST inline Vec3i block_to_voxel(Vec3i block,
 /// @param voxel  Voxel coordinate.
 /// @param grid   Grid parameters (uses @ref VoxelGridParams::voxel_size).
 /// @return The world-space centre of @p voxel, metres.
-VR_DEVICE_HOST inline Vec3f voxel_to_world(Vec3i voxel,
-                                           const VoxelGridParams& grid) {
+inline Vec3f voxel_to_world(Vec3i voxel, const VoxelGridParams& grid) {
   return Vec3f(voxel) * grid.voxel_size;
 }
 
@@ -116,8 +109,7 @@ VR_DEVICE_HOST inline Vec3f voxel_to_world(Vec3i voxel,
 /// @param block  Block coordinate.
 /// @param grid   Grid parameters.
 /// @return The world-space centre of the block's origin voxel, metres.
-VR_DEVICE_HOST inline Vec3f block_to_world(Vec3i block,
-                                           const VoxelGridParams& grid) {
+inline Vec3f block_to_world(Vec3i block, const VoxelGridParams& grid) {
   return voxel_to_world(block_to_voxel(block, grid), grid);
 }
 
@@ -127,8 +119,7 @@ VR_DEVICE_HOST inline Vec3f block_to_world(Vec3i block,
 /// @param world  World-space position, metres.
 /// @param grid   Grid parameters.
 /// @return The block coordinate containing @p world.
-VR_DEVICE_HOST inline Vec3i world_to_block(Vec3f world,
-                                           const VoxelGridParams& grid) {
+inline Vec3i world_to_block(Vec3f world, const VoxelGridParams& grid) {
   return voxel_to_block(world_to_voxel(world, grid), grid);
 }
 
@@ -139,7 +130,7 @@ VR_DEVICE_HOST inline Vec3i world_to_block(Vec3f world,
 /// block into the surrounding band it will integrate into.
 /// @param grid  Grid parameters (uses block_size, voxel_size, trunc_dist).
 /// @return The truncation half-width in blocks, clamped to at least 1.
-VR_DEVICE_HOST inline int truncation_blocks(const VoxelGridParams& grid) {
+inline int truncation_blocks(const VoxelGridParams& grid) {
   const float block_extent =
       static_cast<float>(grid.block_size) * grid.voxel_size;
   const int blocks =

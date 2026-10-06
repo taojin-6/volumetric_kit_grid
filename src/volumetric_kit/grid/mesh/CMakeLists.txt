@@ -6,10 +6,8 @@
 # 256-case lookup tables (marching_cubes_tables.hpp), and the host MarchingCubes
 # that owns the compute pipeline and drives the GLSL kernel turning a dense SDF
 # grid into a triangle mesh. A compiled STATIC library carrying its embedded
-# shader. Links recon_volume for the shared voxel POD layouts (volume::Voxel),
-# per the strict left-to-right tier rule (tsdf slots between volume and mesh
-# once it lands; mesh depends only on tiers to its left, and today reads the
-# volume payload directly).
+# shader. Links recon_volume for the grid it meshes, per the strict
+# left-to-right tier rule.
 include(GenerateExportHeader)
 include(GNUInstallDirs)
 
@@ -45,9 +43,10 @@ endif()
 target_compile_features(recon_mesh PUBLIC cxx_std_17)
 
 # PUBLIC: the mesh public headers (marching_cubes.hpp) expose core types
-# (Result, Buffer, ComputePipeline, Vec3f) and the volume voxel payload
-# (volume::Voxel), so consumers compile against recon_volume too. recon_volume
-# carries recon_core (and its Vulkan/GLM include wiring) transitively.
+# (Result, Buffer, ComputePipeline, Vec3f) and the volume grid
+# (volume::VoxelBlockGrid), so consumers compile against recon_volume too.
+# recon_volume carries recon_core (and its Vulkan/GLM include wiring)
+# transitively.
 target_link_libraries(recon_mesh PUBLIC recon_volume)
 
 target_include_directories(

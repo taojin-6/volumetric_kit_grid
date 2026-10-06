@@ -34,7 +34,7 @@ namespace volumetric_kit::recon::volume {
 ///        byte size of its per-voxel element.
 ///
 /// The element size folds dtype and channel count into a single stride (a
-/// 32-bit float SDF is 4, an RGB @ref Vec3u8 colour is 3), so attributes of
+/// 32-bit float SDF is 4, an 8-bit RGB colour is 3), so attributes of
 /// different shapes are each allocated as their own device buffer
 /// (structure-of-arrays), not interleaved.
 struct AttributeSpec {
@@ -95,7 +95,9 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @param attr_count How many @p attrs.
   /// @return The grid, or a non-OK `Status`: whatever @ref
   ///         VoxelHashMap::create returns; `Status::Code::InvalidArgument`
-  ///         for a null list, an empty name, a zero element size, or a
+  ///         for a null list, an empty name, a zero element size, an
+  ///         attribute whose block is not whole 4-byte words
+  ///         (`voxels_per_block * element_size` not a multiple of 4), or a
   ///         duplicate name; or an allocation failure.
   static core::Result<VoxelBlockGrid> create(core::Device& device,
                                              core::Allocator& allocator,
@@ -237,9 +239,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// Each coord is found in the hash table on the device, by the kernel that
   /// zeroes its block, so the cost is the count's, not the grid's, and a
   /// coord that is not currently allocated costs nothing and clears nothing.
-  /// (An attribute whose blocks share 4-byte words, from an odd block size
-  /// and an element under 4 bytes, is resolved from a snapshot of the active
-  /// set instead, and zeroed by fills.) The blocks are zeroed before the
+  /// The blocks are zeroed before the
   /// map's remove runs, so a block that call leaves in the table
   /// (@ref AllocFailures::lock) is left zeroed, reading as a freshly
   /// allocated block until a later call removes it.
@@ -294,21 +294,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @return `true` if this owns a live grid (`false` when moved-from).
   bool valid() const noexcept { return map_.valid(); }
 
-  /// @brief The block pass: stamp `weighted` with the map's tick
-  ///        (@ref VoxelHashMap::tick) on every active block holding an
-  ///        observed voxel (`weight >= kObservedWeight`, as the mesher and
-  ///        the codec read it).
-  ///
-  /// One workgroup per active block, reading its `weight` attribute, so it is
-  /// meant for every few ticks rather than every fuse. Its kernels are built
-  /// on the first call.
-  /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
-  ///                 over the compaction's `"  ..active set"`.
-  /// @return OK; `Status::Code::InvalidArgument` for a moved-from grid or
-  ///         one without a `float` `weight` attribute; or a dispatch failure.
-  core::Status stamp_blocks(core::StageMetrics* metrics = nullptr);
-
-  /// @brief @ref stamp_blocks, then free every active block that has been
+  /// @brief Stamp `weighted` with the map's tick (@ref VoxelHashMap::tick) on
+  ///        every active block holding an observed voxel (`weight >=
+  ///        kObservedWeight`, as the mesher and the codec read it), then free
+  ///        every active block that has been
   ///        neither asked for by an allocation nor found holding weight for
   ///        more than @p max_age ticks (@ref remove).
   ///
@@ -322,11 +311,15 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @ref remove does.
   /// Ages are differences of ticks, so they hold across the clock's wrap.
   /// @param max_age  Ticks a block may be neither and stay; at least 1.
-  /// @param metrics  As @ref stamp_blocks, the row spanning the frees too.
+  /// The stamping is one workgroup per active block, reading its `weight`
+  /// attribute, so this is meant for every few ticks rather than every fuse.
+  /// Its kernels are built on the first call.
+  /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
+  ///                 spanning the frees too, over the compaction's
+  ///                 `"  ..active set"`.
   /// @return The blocks freed; `Status::Code::InvalidArgument` for a
-  ///         @p max_age of 0 or an attribute whose block is not whole 4-byte
-  ///         words (an odd block size with an element under 4 bytes), or what
-  ///         @ref stamp_blocks and @ref VoxelHashMap::remove refuse.
+  ///         @p max_age of 0, a moved-from grid or one without a `float`
+  ///         `weight` attribute; or what @ref VoxelHashMap::remove refuses.
   core::Result<std::uint32_t> free_stale_blocks(
       std::uint32_t max_age, core::StageMetrics* metrics = nullptr);
 
@@ -364,9 +357,6 @@ class VR_VOLUME_API VoxelBlockGrid {
   // float weight, which the zeroing alone does not need.
   core::Status prepare_block_pass();
   core::Status prepare_block_kernels();
-  // Whether every attribute's blocks are whole 4-byte words, so the zero
-  // kernel can clear each block alone.
-  bool whole_word_blocks() const noexcept;
   // Record the zero kernel over the first `count` entries of `list`, an
   // attribute a dispatch, each block found by its coord.
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
@@ -379,11 +369,6 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::Result<std::uint32_t> block_pass(std::uint32_t max_age,
                                          core::GpuStageScope& stage,
                                          core::StageMetrics* metrics);
-  // Find `coords`' blocks from a snapshot of the active set and zero every
-  // attribute of them by fills, in one batch: for an attribute whose blocks
-  // share words.
-  core::Status fill_listed_blocks(const BlockIndex* coords,
-                                  std::uint32_t count);
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;

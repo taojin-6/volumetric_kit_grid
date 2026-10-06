@@ -10,12 +10,13 @@
 // the host's prefix sum would diverge.
 //
 // Also covers what motivates the kernel existing at all (a triangle wider than
-// the truncation band leaves a hole under allocate_from_points, and does not
-// here), that the distance prune actually prunes (a far corner of a slanted
-// triangle's bounding box stays unallocated), idempotent re-run, and the
-// null / degenerate / out-of-range guards. Exits 0 (skip) where no device is
-// present.
+// the truncation band would leave a hole if its vertices were dilated as
+// points, and does not here), that the distance prune actually prunes (a far
+// corner of a slanted triangle's bounding box stays unallocated), idempotent
+// re-run, and the null / degenerate / out-of-range guards. Exits 0 (skip) where
+// no device is present.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -227,16 +228,14 @@ int main() {
   if (collect_active(map, big_got) != 0) return 1;
   CHECK(big_got.count(centre_coord) == 1);
 
-  // The contrast that makes the assertion above fail if this kernel is deleted
-  // and callers fall back to the point path: the same three vertices, dilated
-  // as points, leave the centroid's block unallocated.
-  CHECK(map.clear().ok());
-  vkc::Result<std::uint32_t> pts =
-      map.allocate_from_points(big_verts.data(), 3);
-  CHECK(pts.ok());
-  std::set<Coord> pts_got;
-  if (collect_active(map, pts_got) != 0) return 1;
-  CHECK(pts_got.count(centre_coord) == 0);
+  // The contrast that makes the assertion above mean something: the same
+  // three vertices, each dilated into the (2*tb+1)^3 cube as a point is, would
+  // leave the centroid's block out.
+  const int tb = vol::truncation_blocks(grid);
+  for (const vr::Vec3f& v : big_verts) {
+    const vr::Vec3i d = vol::world_to_block(v, grid) - centre_block;
+    CHECK(std::max({std::abs(d.x), std::abs(d.y), std::abs(d.z)}) > tb);
+  }
 
   // ---- 4. The distance prune prunes ---------------------------------------
   // A triangle in the x=y diagonal plane: its bounding box corners are ~0.42 m

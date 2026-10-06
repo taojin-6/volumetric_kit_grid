@@ -35,8 +35,13 @@ bool eq(const vr::Vec3i& a, int x, int y, int z) {
 }  // namespace
 
 int main() {
-  // Defaults: voxel_size 0.005 m, block_size 8, trunc_dist 0.04 m.
-  const vol::VoxelGridParams grid = vol::VoxelGridParams::defaults();
+  // 5 mm voxels, 8-voxel blocks, a 40 mm band and a 50 x 30000 table.
+  const vol::VoxelGridParams grid{
+      /*voxel_size=*/0.005f,    /*block_size=*/8,
+      /*voxels_per_block=*/512,
+      /*trunc_dist=*/0.04f,     /*bucket_size=*/50,
+      /*num_buckets=*/30000,
+      /*num_blocks=*/1500000,   /*max_chain=*/128};
 
   // --- voxel -> block, including the negative-coordinate bias. Block b spans
   // voxels [b*8, b*8+7], so voxel -1 is block -1, not block 0.
@@ -100,7 +105,7 @@ int main() {
   wide.trunc_dist = 0.0f;  // clamped to a minimum of 1.
   CHECK(vol::truncation_blocks(wide) == 1);
 
-  // --- VoxelGridParams::validate: the defaults are valid; a zero bucket count
+  // --- VoxelGridParams::validate: this set is valid; a zero bucket count
   // (which would make hash_bucket divide by zero) is rejected, as is a stale
   // precomputed field.
   CHECK(grid.validate().ok());

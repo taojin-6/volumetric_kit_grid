@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// GPU test for depth / point-cloud block allocation: unproject a posed depth
-// frame (off-centre principal point, a non-identity pose, every pixel valid)
-// and a small world-space point set, then verify that exactly the expected
+// GPU test for depth block allocation: unproject a posed depth frame
+// (off-centre principal point, a non-identity pose, every pixel valid), then
+// verify that exactly the expected
 // (2*tb+1)^3 truncation-band block cubes are allocated on the real driver
 // (MoltenVK on Apple, the NVIDIA ICD on the Linux CI box). The expected blocks
 // are derived by unprojecting each pixel on the HOST (unproject_to_block, the
@@ -290,46 +290,16 @@ int main() {
     CHECK(tiled_got == tiled_want);
   }
 
-  // --- allocate-from-points -------------------------------------------------
-  // Fresh table. clear() must actually empty it -- assert that directly, since
-  // reusing the map below could otherwise let a no-op clear() slip through.
+  // --- clear -----------------------------------------------------------------
+  // clear() must actually empty the table.
   CHECK(map.clear().ok());
   vkc::Result<std::vector<vol::BlockIndex>> after_clear =
       map.compact_active_blocks();
   CHECK(after_clear.ok() && after_clear.value().empty());
 
-  // World points, including a negative one so the points path also exercises
-  // the negative-bias voxel->block floor. Bands may overlap; the set union
-  // folds it.
-  std::vector<vr::Vec3f> points = {vr::Vec3f(0.0f, 0.0f, 1.0f),
-                                   vr::Vec3f(0.0f, 1.0f, 0.0f),
-                                   vr::Vec3f(-0.03f, -0.02f, 0.5f)};
-
-  // Null input rejected, zero count a no-op success -- both without touching
-  // the set (the depth path checks null too; cover points symmetrically).
-  CHECK(!map.allocate_from_points(nullptr, 1).ok());
-  vkc::Result<std::uint32_t> points_zero =
-      map.allocate_from_points(points.data(), 0);
-  CHECK(points_zero.ok() && points_zero.value() == 0);
-
-  vkc::Result<std::uint32_t> points_fail = map.allocate_from_points(
-      points.data(), static_cast<std::uint32_t>(points.size()));
-  CHECK(points_fail.ok());
-  CHECK(points_fail.value() == 0);
-
-  std::set<Coord> points_want;
-  for (const vr::Vec3f& p : points) {
-    insert_cube(grid, vol::world_to_block(p, grid), points_want);
-  }
-
-  std::set<Coord> points_got;
-  if (collect_active(map, points_got) != 0) return 1;
-  CHECK(points_got == points_want);
-
   std::printf(
-      "recon volume allocate test passed: depth band (%zu blocks) + "
-      "point-cloud "
-      "bands (%zu blocks) allocated + compacted on-device\n",
-      depth_want.size(), points_want.size());
+      "recon volume allocate test passed: depth band (%zu blocks) allocated + "
+      "compacted on-device\n",
+      depth_want.size());
   return 0;
 }
