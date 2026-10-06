@@ -124,8 +124,9 @@ struct DeviceBlockList {
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
 /// byte-for-byte. Covers init, allocate-from-coords / -depth / -triangles,
-/// remove, compact / compact-in-frustum, diagnostics, and an **index-preserving**
-/// @ref resize (the GPU rehash that keeps each block's `ptr`).
+/// remove, compact / compact-in-frustum, diagnostics, and an
+/// **index-preserving** @ref resize (the GPU rehash that keeps each block's
+/// `ptr`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
