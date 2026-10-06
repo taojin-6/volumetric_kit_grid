@@ -19,6 +19,8 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
 
+#include "no_device.hpp"
+
 namespace vkc = volumetric_kit::core;
 
 namespace codec = volumetric_kit::recon::codec;
@@ -315,16 +317,14 @@ int moves_case(Gpu& gpu) {
 int main() {
   vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
-    std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
-                 instance.status().message().c_str());
-    return 0;
+    return vr_test::no_device("no Vulkan instance",
+                              instance.status().message());
   }
   vkc::Result<vkc::PhysicalDeviceInfo> physical =
       instance.value().select_physical_device(vr::device_requirements());
   if (!physical) {
-    std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
-                 physical.status().message().c_str());
-    return 0;
+    return vr_test::no_device("no compute-capable device",
+                              physical.status().message());
   }
   vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), physical.value(), vr::device_requirements());

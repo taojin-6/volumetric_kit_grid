@@ -26,6 +26,8 @@
 #include "grid_readback.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
+#include "no_device.hpp"
+
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace vol = volumetric_kit::recon::volume;
@@ -58,16 +60,14 @@ vol::VoxelGridParams small_grid() {
 int main() {
   vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
   if (!instance) {
-    std::fprintf(stderr, "no Vulkan instance (%s); skipping\n",
-                 instance.status().message().c_str());
-    return 0;
+    return vr_test::no_device("no Vulkan instance",
+                              instance.status().message());
   }
   vkc::Result<vkc::PhysicalDeviceInfo> gpu =
       instance.value().select_physical_device(vr::device_requirements());
   if (!gpu) {
-    std::fprintf(stderr, "no compute-capable device (%s); skipping\n",
-                 gpu.status().message().c_str());
-    return 0;
+    return vr_test::no_device("no compute-capable device",
+                              gpu.status().message());
   }
   vkc::Result<vkc::Device> device = vkc::Device::create(
       instance.value(), gpu.value(), vr::device_requirements());
