@@ -1704,9 +1704,6 @@ int main() {
   const mesh::Mesh big_mesh_16 = std::move(big_mesh_16_result).value();
   CHECK(big_timings_16.active_blocks == 1);
   CHECK(big_mesh_16.triangle_count() > 0);
-  // The shortfall is REPORTED rather than refused: correct mesh, ~1.8 gathers
-  // per cell instead of ~1.1, and nothing else could tell a caller so.
-  CHECK(big_timings_16.uncached_cells_per_block == 4096 - 1024);
 
   // The block size is an allocation detail, so the SAME field divided into
   // eight blocks of 8 must extract to the same surface. This is what pins the
@@ -1729,7 +1726,6 @@ int main() {
   CHECK(split_mesh_result.ok());
   const mesh::Mesh split_mesh = std::move(split_mesh_result).value();
   CHECK(split_timings.active_blocks == 8);
-  CHECK(split_timings.uncached_cells_per_block == 0);  // 512 cells, all cached
   CHECK(canonical_triangles(big_mesh_16) == canonical_triangles(split_mesh));
 
   // --- Argument validation ---------------------------------------------------

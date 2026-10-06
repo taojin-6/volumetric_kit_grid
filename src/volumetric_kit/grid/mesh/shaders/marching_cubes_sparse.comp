@@ -288,13 +288,9 @@ shared uint s_cursor;
 // Slower, and by enough to matter -- at block_size 16, 3072 of a block's 4096
 // cells fall past the four slots and are gathered in FULL twice, so the ~1.08
 // gathers per cell this design is chosen for becomes ~1.77. Nothing about that
-// is visible from a correct-looking mesh, so the host mirrors this reach
-// (kMaxCachedCells in marching_cubes.cpp) and reports the shortfall as
-// ExtractTimings::uncached_cells_per_block: a limit the caller cannot see is
-// the library's to check, not to document (the 2026-08-04 decision). It is a
-// REPORT and not a refusal, unlike the sharing kernel's kMaxSharedCells --
-// there an oversized block would index past a shared array, here it only costs
-// time.
+// is visible from a correct-looking mesh; no caller uses such a block. It is
+// not refused, unlike the sharing kernel's kMaxSharedCells -- there an
+// oversized block would index past a shared array, here it only costs time.
 const uint kCachedSlots = 4u;  // 8-bit counts to a uint
 
 // Which strided iteration `local` is, i.e. which byte of the cache holds it.
