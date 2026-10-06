@@ -67,7 +67,7 @@ Vec3f closest_point_on_edges(Vec3f p, Vec3f a, Vec3f b, Vec3f c) {
 }
 
 // Everything MeshDistance::create refuses, in one pass that allocates nothing,
-// so compare_meshes can check both meshes before it indexes either.
+// before it indexes anything.
 core::Status check_surface(const mesh::Mesh& mesh, float reach) {
   if (!positive_finite(reach)) {
     return core::Status::invalid_argument(
@@ -350,25 +350,6 @@ DistanceStats summarize(std::vector<float> distances, float reach) {
   s.p95 = distances[(within * 95 + 99) / 100 - 1];
   s.max = distances[within - 1];
   return s;
-}
-
-core::Result<MeshComparison> compare_meshes(const mesh::Mesh& reference,
-                                            const mesh::Mesh& test,
-                                            const CompareOptions& options) {
-  VKC_TRY(check_options(options));
-  VKC_TRY(check_surface(reference, options.reach));
-  VKC_TRY(check_surface(test, options.reach));
-  std::vector<float> acc;
-  {
-    VKC_ASSIGN(const MeshDistance to_reference,
-               MeshDistance::create(reference, options.reach));
-    acc = distances_to(sample_points(test, options.stride), to_reference);
-  }
-  VKC_ASSIGN(const MeshDistance to_test,
-             MeshDistance::create(test, options.reach));
-  std::vector<float> cov =
-      distances_to(sample_points(reference, options.stride), to_test);
-  return combine(std::move(acc), std::move(cov), options);
 }
 
 ReferenceMesh::ReferenceMesh(const CompareOptions& options,

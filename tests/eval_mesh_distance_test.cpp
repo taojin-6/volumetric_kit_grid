@@ -41,6 +41,15 @@ namespace mesh = volumetric_kit::recon::mesh;
 
 namespace {
 
+// Both ways, as a sweep measures: the reference indexed, the test judged.
+vkc::Result<eval::MeshComparison> compare(
+    const mesh::Mesh& reference, const mesh::Mesh& test,
+    const eval::CompareOptions& options = {}) {
+  VKC_ASSIGN(const eval::ReferenceMesh indexed,
+             eval::ReferenceMesh::create(reference, options));
+  return indexed.compare(test);
+}
+
 bool near(vr::Vec3f a, vr::Vec3f b, float eps = 1e-6f) {
   return vr::length(a - b) <= eps;
 }
@@ -260,7 +269,6 @@ int distance_case() {
   CHECK(r.ok());
   // The mesh was a temporary: the index copied what it needs.
   const eval::MeshDistance& d = r.value();
-  CHECK(d.reach() == 0.05f);
   CHECK(near(double(d.distance({0.03f, 0.07f, 0.02f})), 0.02, 1e-6));
   CHECK(near(double(d.distance({0.1f, 0.1f, -0.013f})), 0.013, 1e-6));
   // Off the edge of the square: to the edge, not to the plane.
@@ -336,8 +344,7 @@ int compare_case() {
   const mesh::Mesh shifted = plane(40, 0.005f, 0.003f);
   eval::CompareOptions opt;
   opt.reach = 0.02f;
-  vkc::Result<eval::MeshComparison> c =
-      eval::compare_meshes(reference, shifted, opt);
+  vkc::Result<eval::MeshComparison> c = compare(reference, shifted, opt);
   CHECK(c.ok());
   for (const eval::DistanceStats& s :
        {c.value().accuracy, c.value().coverage}) {
@@ -349,8 +356,7 @@ int compare_case() {
   CHECK(c.value().fscore.threshold == 0.0f && c.value().fscore.f == 0.0);
 
   // Identical: zero everywhere.
-  vkc::Result<eval::MeshComparison> same =
-      eval::compare_meshes(reference, reference, opt);
+  vkc::Result<eval::MeshComparison> same = compare(reference, reference, opt);
   CHECK(same.ok());
   CHECK(same.value().accuracy.max == 0.0 && same.value().coverage.max == 0.0);
 
@@ -358,8 +364,7 @@ int compare_case() {
   // still exactly on the surface, but the reference past the cut plus the
   // reach is uncovered.
   const mesh::Mesh half = plane(40, 0.005f, 0.0f, 0.1f);
-  vkc::Result<eval::MeshComparison> h =
-      eval::compare_meshes(reference, half, opt);
+  vkc::Result<eval::MeshComparison> h = compare(reference, half, opt);
   CHECK(h.ok());
   CHECK(h.value().accuracy.max == 0.0);
   CHECK(h.value().coverage.beyond_reach > reference.vertices.size() / 3);
@@ -367,8 +372,7 @@ int compare_case() {
 
   // A stride measures about one vertex in seven...
   opt.stride = 7;
-  vkc::Result<eval::MeshComparison> sparse =
-      eval::compare_meshes(reference, shifted, opt);
+  vkc::Result<eval::MeshComparison> sparse = compare(reference, shifted, opt);
   CHECK(sparse.ok());
   const std::size_t n = reference.vertices.size();
   CHECK(sparse.value().accuracy.count > n / 10);
@@ -383,9 +387,8 @@ int compare_case() {
     bumpy.vertices[v].position.z = 1e-4f * float(v % 17);
   }
   vkc::Result<eval::MeshComparison> again =
-      eval::compare_meshes(reordered(reference), reordered(bumpy), opt);
-  vkc::Result<eval::MeshComparison> first =
-      eval::compare_meshes(reference, bumpy, opt);
+      compare(reordered(reference), reordered(bumpy), opt);
+  vkc::Result<eval::MeshComparison> first = compare(reference, bumpy, opt);
   CHECK(again.ok() && first.ok());
   CHECK(identical(again.value(), first.value()));
   return 0;
@@ -399,8 +402,7 @@ int surface_case() {
   eval::CompareOptions opt;
   opt.reach = 0.02f;
   opt.fscore_threshold = 0.001f;
-  vkc::Result<eval::MeshComparison> clean =
-      eval::compare_meshes(reference, reference, opt);
+  vkc::Result<eval::MeshComparison> clean = compare(reference, reference, opt);
   CHECK(clean.ok());
 
   mesh::Mesh stale = reference;
@@ -425,16 +427,15 @@ int surface_case() {
   const mesh::Mesh* const stale_mesh = &stale;
   for (const auto& [ref, test] :
        {std::pair{clean_mesh, stale_mesh}, std::pair{stale_mesh, clean_mesh}}) {
-    vkc::Result<eval::MeshComparison> c =
-        eval::compare_meshes(*ref, *test, opt);
+    vkc::Result<eval::MeshComparison> c = compare(*ref, *test, opt);
     CHECK(c.ok());
     CHECK(identical(c.value(), clean.value()));
   }
   return 0;
 }
 
-// A reference indexed once gives what compare_meshes gives, for each mesh
-// judged against it, and outlives the mesh it was built from.
+// A reference indexed once gives what a fresh one gives, for each mesh judged
+// against it, and outlives the mesh it was built from.
 int reference_case() {
   eval::CompareOptions opt;
   opt.reach = 0.02f;
@@ -448,12 +449,11 @@ int reference_case() {
   for (const mesh::Mesh& test :
        {plane(40, 0.005f, 0.003f), plane(40, 0.005f, 0.0f, 0.1f)}) {
     vkc::Result<eval::MeshComparison> once = ref.value().compare(test);
-    vkc::Result<eval::MeshComparison> each =
-        eval::compare_meshes(reference, test, opt);
+    vkc::Result<eval::MeshComparison> each = compare(reference, test, opt);
     CHECK(once.ok() && each.ok());
     CHECK(identical(once.value(), each.value()));
   }
-  // It refuses what compare_meshes refuses.
+  // It refuses a mesh MeshDistance refuses, either side, and bad options.
   mesh::Mesh wild = reference;
   wild.indices[4] = static_cast<std::uint32_t>(wild.vertices.size());
   CHECK(!ref.value().compare(wild).ok());
@@ -473,16 +473,14 @@ int fscore_case() {
   eval::CompareOptions opt;
   opt.reach = 0.02f;
   opt.fscore_threshold = 0.004f;
-  vkc::Result<eval::MeshComparison> above =
-      eval::compare_meshes(reference, shifted, opt);
+  vkc::Result<eval::MeshComparison> above = compare(reference, shifted, opt);
   CHECK(above.ok());
   CHECK(above.value().fscore.threshold == 0.004f);
   CHECK(above.value().fscore.precision == 1.0);
   CHECK(above.value().fscore.recall == 1.0);
   CHECK(above.value().fscore.f == 1.0);
   opt.fscore_threshold = 0.002f;
-  vkc::Result<eval::MeshComparison> below =
-      eval::compare_meshes(reference, shifted, opt);
+  vkc::Result<eval::MeshComparison> below = compare(reference, shifted, opt);
   CHECK(below.ok());
   CHECK(below.value().fscore.precision == 0.0);
   CHECK(below.value().fscore.recall == 0.0);
@@ -504,8 +502,7 @@ int fscore_case() {
   const double expected = double(covered) / double(reference.vertices.size());
   CHECK(expected > 0.5 && expected < 0.55);  // the premise: about half
   opt.fscore_threshold = 0.001f;
-  vkc::Result<eval::MeshComparison> h =
-      eval::compare_meshes(reference, half, opt);
+  vkc::Result<eval::MeshComparison> h = compare(reference, half, opt);
   CHECK(h.ok());
   CHECK(h.value().fscore.precision == 1.0);
   CHECK(h.value().fscore.recall == expected);
@@ -527,9 +524,9 @@ int refusals_case() {
   mesh::Mesh wild = good;
   wild.indices[4] = static_cast<std::uint32_t>(wild.vertices.size());
   CHECK(!eval::MeshDistance::create(wild, 0.02f).ok());
-  // compare_meshes refuses the same meshes, either side.
-  CHECK(!eval::compare_meshes(wild, good).ok());
-  CHECK(!eval::compare_meshes(good, wild).ok());
+  // A comparison refuses the same meshes, either side.
+  CHECK(!compare(wild, good).ok());
+  CHECK(!compare(good, wild).ok());
   // A corner that is not finite, or too far out for the cell keys: each once
   // left the cell loop unbounded.
   for (float bad : {std::numeric_limits<float>::infinity(),
@@ -538,7 +535,7 @@ int refusals_case() {
     mesh::Mesh off = good;
     off.vertices[off.indices[0]].position.z = bad;
     CHECK(!eval::MeshDistance::create(off, 0.02f).ok());
-    CHECK(!eval::compare_meshes(good, off).ok());
+    CHECK(!compare(good, off).ok());
   }
   // A reach too small for the triangles, refused before it is paid for: one
   // 1 cm triangle at a micron once took seconds and gigabytes.
@@ -557,25 +554,24 @@ int refusals_case() {
   // A bad reach is named as the reach, not as the threshold left at 0.
   eval::CompareOptions bad_reach;
   bad_reach.reach = -0.01f;
-  vkc::Result<eval::MeshComparison> r =
-      eval::compare_meshes(good, good, bad_reach);
+  vkc::Result<eval::MeshComparison> r = compare(good, good, bad_reach);
   CHECK(!r.ok());
   CHECK(r.status().message().find("reach must be") != std::string::npos);
   // A stride of 0, and an F-score threshold negative, not finite or past the
   // reach (where every distance reads as the reach).
   eval::CompareOptions opt;
   opt.stride = 0;
-  CHECK(!eval::compare_meshes(good, good, opt).ok());
+  CHECK(!compare(good, good, opt).ok());
   for (float tau : {-0.001f, 0.021f, std::numeric_limits<float>::quiet_NaN()}) {
     eval::CompareOptions o;
     o.reach = 0.02f;
     o.fscore_threshold = tau;
-    CHECK(!eval::compare_meshes(good, good, o).ok());
+    CHECK(!compare(good, good, o).ok());
   }
   eval::CompareOptions at_reach;
   at_reach.reach = 0.02f;
   at_reach.fscore_threshold = 0.02f;  // the reach itself is allowed
-  CHECK(eval::compare_meshes(good, good, at_reach).ok());
+  CHECK(compare(good, good, at_reach).ok());
   return 0;
 }
 

@@ -31,8 +31,8 @@
 ///
 /// Host-side and deterministic: the figures depend on the meshes' geometry,
 /// never on the order of their vertices or triangles, a `stride` subsample
-/// included. Not a tier the pipeline runs: the codec's tests and example
-/// measure with it (the 2026-09-27 `eval` decision).
+/// included. Not a tier the pipeline runs: the codec examples measure with it
+/// (the 2026-09-27 `eval` decision).
 
 #include <cstddef>
 #include <cstdint>
@@ -99,12 +99,9 @@ class VR_EVAL_API MeshDistance {
   /// @brief How far @p p is from the surface.
   /// @param p  The query point.
   /// @return The distance from @p p to the nearest point of the surface, or
-  ///         exactly @ref reach when nothing lies within it: an empty mesh,
-  ///         and a @p p that is not finite, included.
+  ///         exactly the reach it was built with when nothing lies within
+  ///         it: an empty mesh, and a @p p that is not finite, included.
   float distance(Vec3f p) const;
-
-  /// @return The reach this was built with.
-  float reach() const noexcept { return reach_; }
 
  private:
   MeshDistance() = default;
@@ -142,7 +139,7 @@ struct FScore {
   double f = 0.0;          ///< `2PR / (P + R)`; 0 when both are 0.
 };
 
-/// @brief How @ref compare_meshes measures.
+/// @brief How a @ref ReferenceMesh comparison measures.
 struct CompareOptions {
   /// Farthest distance measured, metres (finite, positive).
   float reach = 0.02f;
@@ -165,38 +162,23 @@ struct MeshComparison {
   FScore fscore;           ///< Zeros unless a threshold was asked for.
 };
 
-/// @brief Compare two meshes both ways.
-///
-/// Both meshes are checked before either is indexed, and each index is
-/// dropped before the next is built, so one comparison holds one index at a
-/// time. To judge many meshes against one reference, index it once with
-/// @ref ReferenceMesh.
-/// @param reference  The mesh taken as the truth.
-/// @param test       The mesh being judged.
-/// @param options    Reach, stride and F-score threshold.
-/// @return The comparison, or `Status::Code::InvalidArgument` for a mesh
-///         @ref MeshDistance::create refuses, a reach that is not finite and
-///         positive, a stride of 0, or an F-score threshold that is negative,
-///         not finite, or past the reach.
-VR_EVAL_API core::Result<MeshComparison> compare_meshes(
-    const mesh::Mesh& reference, const mesh::Mesh& test,
-    const CompareOptions& options = {});
-
 /// @brief A reference mesh indexed once, to judge many meshes against: a
 ///        sweep's configurations, say, each against the same source.
 ///
 /// Holds a copy of the reference's index and of the points measured from it,
 /// so the reference mesh need not outlive this. @ref compare then builds only
-/// the index of the mesh under test, and gives exactly what
-/// @ref compare_meshes gives for the same pair.
+/// the index of the mesh under test, and measures both ways: accuracy (test
+/// to reference) and coverage (reference to test).
 class VR_EVAL_API ReferenceMesh {
  public:
   /// @brief Index @p reference for comparisons measured as @p options says.
   /// @param reference  The mesh taken as the truth.
   /// @param options    Reach, stride and F-score threshold, for every
   ///                   comparison made against it.
-  /// @return The reference, or `Status::Code::InvalidArgument` for
-  ///         anything @ref compare_meshes refuses.
+  /// @return The reference, or `Status::Code::InvalidArgument` for a mesh
+  ///         @ref MeshDistance::create refuses, a reach that is not finite and
+  ///         positive, a stride of 0, or an F-score threshold that is
+  ///         negative, not finite, or past the reach.
   static core::Result<ReferenceMesh> create(const mesh::Mesh& reference,
                                             const CompareOptions& options = {});
 
