@@ -13,10 +13,6 @@
 #include "dct_tables.hpp"
 #include "rans.hpp"
 
-#if defined(_MSC_VER)
-#include <intrin.h>  // _BitScanReverse64
-#endif
-
 namespace volumetric_kit::recon::codec::detail {
 namespace {
 
@@ -85,12 +81,7 @@ std::uint32_t frame_model_alphabet(std::uint32_t model) {
 namespace {
 
 std::uint32_t bit_length(std::uint64_t v) {
-#if defined(_MSC_VER)
-  unsigned long top = 0;
-  return _BitScanReverse64(&top, v) ? std::uint32_t(top) + 1 : 0;
-#else
   return v == 0 ? 0 : 64 - std::uint32_t(__builtin_clzll(v));
-#endif
 }
 
 // A partial mask's line l = y + 8 z is byte l % 4 of word l / 4.
