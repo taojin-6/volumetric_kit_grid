@@ -1965,9 +1965,11 @@ int main() {
     // below can be checked against both surfaces. A separate extractor, so
     // taking it does not disturb the arena `inc_mc` is carrying across passes.
     std::vector<std::array<float, 9>> new_surface;
-    // The one block the mixed pass flags: one that carried surface before and
-    // emits a DIFFERENT number of triangles now, so re-meshing it is guaranteed
-    // to change the output.
+    // The one block the mixed pass flags: one that carries surface under both
+    // fields, in a DIFFERENT number of triangles, so re-meshing it must add
+    // triangles of the new surface. A block the growth empties need not: at
+    // (3,3,3), beside the centre, it and the seven neighbours re-meshed with it
+    // all fall inside the new sphere.
     //
     // Chosen by what moved, never by position in the slot list, and that is not
     // fussiness: a block's slot is handed out by the allocator's atomics, so
@@ -1994,6 +1996,7 @@ int main() {
       CHECK(new_spans != nullptr);
       for (std::uint32_t slot = 0; slot < old_counts.size(); ++slot) {
         if (old_counts[slot] > 0 && ref_mc.block_span_valid(inc_grid, slot) &&
+            new_spans[slot].triangle_count > 0 &&
             new_spans[slot].triangle_count != old_counts[slot]) {
           flag_slot = slot;
           have_flag_slot = true;
