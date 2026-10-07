@@ -224,7 +224,7 @@ vkc::Status run(const Options& opt) {
   const auto triangles = std::uint32_t(geometry.indices.size() / 3);
   // Grow only for a capacity limit. Lost bucket-lock races leave a residue
   // over a table with room, which a retry places (fuse_frame.hpp's
-  // allocate_band_with does the same).
+  // allocate_band does the same).
   for (int contended = 0;;) {
     vr::volume::AllocFailures failures;
     VKC_ASSIGN(const auto failed,
