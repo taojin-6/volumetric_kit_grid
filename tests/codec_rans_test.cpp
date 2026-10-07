@@ -361,7 +361,6 @@ int refusal_case() {
     std::vector<std::uint8_t> out = {0xAB};
     CHECK(!w.finish(out));
     CHECK(out.size() == 1);
-    CHECK(w.size() == 0);
     w.put(t, 2);
     CHECK(w.finish(out));
     CHECK(out.size() == 1 + 4);

@@ -158,7 +158,9 @@ int main() {
   }
   map.advance_tick();
   map.advance_tick();
-  CHECK(grid.stamp_blocks().ok());
+  // The block pass, freeing nothing at this age.
+  auto kept = grid.free_stale_blocks(1000);
+  CHECK(kept.ok() && kept.value() == 0);
   CHECK(map.allocate(&three[2], 1).ok());
   st = map.read_block_stamps();
   CHECK(st.ok());
@@ -212,32 +214,24 @@ int main() {
   // Move construction carries the block pass along and empties the source.
   {
     auto built = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
-    CHECK(built.ok() && built->stamp_blocks().ok());
+    CHECK(built.ok() && built->free_stale_blocks(1).ok());
     vol::VoxelBlockGrid moved = std::move(built).value();
-    CHECK(moved.stamp_blocks().ok());
     CHECK(moved.free_stale_blocks(1).ok());
     // NOLINTNEXTLINE(bugprone-use-after-move) -- asserting it is empty
-    CHECK(built->stamp_blocks().domain() == vkc::Status::Code::InvalidArgument);
+    CHECK(built->free_stale_blocks(1).status().domain() ==
+          vkc::Status::Code::InvalidArgument);
   }
 
   // Every allocation path stamps what it asks for, through a binding of its
-  // own: coords (above), points, triangles and depth.
+  // own: coords (above), triangles and depth.
   map.advance_tick();  // 5
   auto before = slots(grid);
-  CHECK(before.ok());
-  const vr::Vec3f point(1.0f, 1.0f, 1.0f);
-  CHECK(map.allocate_from_points(&point, 1).ok());
-  auto stamped = new_blocks_requested_now(grid, before.value());
-  CHECK(stamped.ok() && stamped.value());
-
-  map.advance_tick();  // 6
-  before = slots(grid);
   CHECK(before.ok());
   const vr::Vec3f tri[] = {
       {-1.0f, 1.0f, 0.0f}, {-0.9f, 1.0f, 0.0f}, {-1.0f, 1.1f, 0.0f}};
   const std::uint32_t idx[] = {0, 1, 2};
   CHECK(map.allocate_from_triangles(tri, 3, idx, 1).ok());
-  stamped = new_blocks_requested_now(grid, before.value());
+  auto stamped = new_blocks_requested_now(grid, before.value());
   CHECK(stamped.ok() && stamped.value());
 
   map.advance_tick();  // 7
@@ -305,7 +299,8 @@ int main() {
   auto bare = vol::VoxelBlockGrid::create(dev, alloc, params(), no_weight, 1);
   CHECK(bare.ok());
   CHECK(bare->map().allocate(three, 1).ok());
-  CHECK(bare->stamp_blocks().domain() == vkc::Status::Code::InvalidArgument);
+  CHECK(bare->free_stale_blocks(1).status().domain() ==
+        vkc::Status::Code::InvalidArgument);
 
   std::puts("volume_block_stamps: OK");
   return 0;

@@ -110,10 +110,6 @@ class VR_CODEC_API Encoder {
   core::Result<std::vector<std::uint8_t>> encode(
       volume::VoxelBlockGrid& grid, core::StageMetrics* metrics = nullptr);
 
-  /// @return The configuration frames are coded with; all zeros when
-  ///         moved-from, which no valid encoder has.
-  const EncoderConfig& config() const noexcept { return config_; }
-
   /// @return `true` if this owns a live transform (`false` when moved-from).
   bool valid() const noexcept;
 

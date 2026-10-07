@@ -23,8 +23,8 @@
 // trunc_dist is never rejected) and it is what keeps a big triangle from
 // allocating the solid interior of its bounding box.
 //
-// Deliberately NOT the (2*tb+1)^3 cube dilation that hash_allocate_depth and
-// hash_allocate_points apply. Those dilate a POINT, where the cube is both the
+// Deliberately NOT the (2*tb+1)^3 cube dilation that hash_allocate_depth
+// applies. That dilates a POINT, where the cube is both the
 // cheapest and tightest thing available; a triangle has a real extent, so the
 // band it needs is the one measured from the surface.
 

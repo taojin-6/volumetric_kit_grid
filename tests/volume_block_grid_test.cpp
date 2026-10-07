@@ -359,49 +359,18 @@ int main() {
   }
 
   // --- An attribute whose blocks share 4-byte words -- a block of 5^3 voxels
-  // of one byte each -- is zeroed by fills off a snapshot, block by block,
-  // and its neighbours' bytes are left alone.
+  // of one byte each -- is refused at create: the zero kernel clears a block
+  // by whole words.
   {
     vol::VoxelGridParams odd = small_grid();
     odd.block_size = 5;
     odd.voxels_per_block = 125;
     const vol::AttributeSpec odd_attrs[] = {{"tsdf", sizeof(float)},
                                             {"label", 1}};
-    vkc::Result<vol::VoxelBlockGrid> og = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), odd, odd_attrs, 2);
-    CHECK(og.ok());
-    vol::VoxelBlockGrid labels = std::move(og).value();
-    vol::BlockIndex row[3]{};
-    for (int i = 0; i < 3; ++i) {
-      row[i].coord = vr::Vec3i(i, 0, 0);
-    }
-    CHECK(labels.map().allocate(row, 3).ok());
-    vkc::Result<std::vector<std::uint8_t>> bytes =
-        vr_test::read_attribute<std::uint8_t>(device.value(), allocator.value(),
-                                              labels, "label");
-    CHECK(bytes.ok());
-    std::vector<std::uint8_t> filled(bytes.value().size(), 0xAB);
-    CHECK(vr_test::write_attribute(device.value(), allocator.value(), labels,
-                                   "label", filled)
-              .ok());
-    vkc::Result<std::vector<vol::BlockIndex>> live =
-        labels.map().compact_active_blocks();
-    CHECK(live.ok());
-    std::int32_t middle = -1;
-    for (const vol::BlockIndex& blk : live.value()) {
-      if (blk.coord == row[1].coord) middle = blk.ptr;
-    }
-    CHECK(middle >= 0);
-    vkc::Result<std::uint32_t> removed = labels.remove(row + 1, 1);
-    CHECK(removed.ok() && removed.value() == 0);
-    bytes = vr_test::read_attribute<std::uint8_t>(
-        device.value(), allocator.value(), labels, "label");
-    CHECK(bytes.ok());
-    for (std::size_t v = 0; v < bytes.value().size(); ++v) {
-      const bool in_middle =
-          v >= std::size_t(middle) && v < std::size_t(middle) + 125;
-      CHECK(bytes.value()[v] == (in_middle ? 0x00 : 0xAB));
-    }
+    CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), odd,
+                                      odd_attrs, 2)
+              .status()
+              .domain() == vkc::Status::Code::InvalidArgument);
   }
 
   // --- clear() zeroes every attribute, for the same reason: it returns every

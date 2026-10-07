@@ -123,9 +123,10 @@ struct DeviceBlockList {
 /// `ComputePipeline`, `Device::submit_single_time`). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
-/// byte-for-byte. Covers init, allocate-from-coords / -depth / -points, remove,
-/// compact / compact-in-frustum, diagnostics, and an **index-preserving**
-/// @ref resize (the GPU rehash that keeps each block's `ptr`).
+/// byte-for-byte. Covers init, allocate-from-coords / -depth / -triangles,
+/// remove, compact / compact-in-frustum, diagnostics, and an
+/// **index-preserving** @ref resize (the GPU rehash that keeps each block's
+/// `ptr`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -256,24 +257,6 @@ class VR_VOLUME_API VoxelHashMap {
       AllocFailures* out_failures = nullptr,
       core::StageMetrics* metrics = nullptr);
 
-  /// @brief Allocate voxel blocks from a world-space point cloud.
-  ///
-  /// One thread per point finds the block containing it and dilates that into
-  /// the `(2*tb+1)^3` truncation band, the band @ref allocate_from_depth
-  /// allocates around each block it finds. Points are in world space (no
-  /// unprojection);
-  /// non-finite points are skipped and already-present blocks are untouched.
-  /// @param points  World-space points, metres.
-  /// @param count   How many.
-  /// @return The number of block allocations that failed (0 = all succeeded),
-  ///         or a non-OK `Status` if a buffer or the dispatch fails, or the
-  ///         map is moved-from / @p points is null.
-  /// @param out_failures  Optional: receives the per-reason split (see
-  ///                      @ref AllocFailures). Untouched when null.
-  core::Result<std::uint32_t> allocate_from_points(
-      const Vec3f* points, std::uint32_t count,
-      AllocFailures* out_failures = nullptr);
-
   /// @brief Allocate the voxel blocks a triangle mesh's truncation band covers.
   ///
   /// A block is allocated when its centre lies within `trunc_dist` plus the
@@ -281,15 +264,15 @@ class VR_VOLUME_API VoxelHashMap {
   /// **any** voxel within `trunc_dist` of the surface is never missed, which is
   /// exactly the set a mesh-to-SDF pass then writes.
   ///
-  /// Not expressible as @ref allocate_from_points over the vertices: that
-  /// dilates each point into the `(2*tb+1)^3` band, so a triangle wider than
-  /// that band leaves an unallocated hole through its middle -- and the band is
-  /// one block (40 mm) at the defaults, which any mesh that is not a dense scan
-  /// exceeds routinely. Nor is it a per-triangle dispatch: triangle size is
-  /// unbounded, and one lane owning a large triangle's whole bounding box is
-  /// the dispatch shape that hangs a mobile GPU. The work is therefore split
-  /// per *candidate block*, which costs a host pass over the triangles to count
-  /// them (`StageMetrics` reports it in the row's CPU half).
+  /// Not expressible as dilating each vertex into the `(2*tb+1)^3` band, as
+  /// @ref allocate_from_depth dilates a point: a triangle wider than that band
+  /// would leave an unallocated hole through its middle -- and the band is
+  /// one block (40 mm) with 5 mm voxels and a 40 mm band, which any mesh that
+  /// is not a dense scan exceeds routinely. Nor is it a per-triangle dispatch:
+  /// triangle size is unbounded, and one lane owning a large triangle's whole
+  /// bounding box is the dispatch shape that hangs a mobile GPU. The work is
+  /// therefore split per *candidate block*, which costs a host pass over the
+  /// triangles to count them (`StageMetrics` reports it in the row's CPU half).
   ///
   /// A triangle is skipped, costing nothing, when it holds a non-finite vertex
   /// or has zero area; a zero-area triangle is dropped here rather than guarded
@@ -705,8 +688,8 @@ class VR_VOLUME_API VoxelHashMap {
                                                const void* data,
                                                VkDeviceSize bytes);
 
-  /// Shared body of the per-element allocate kernels (@ref allocate,
-  /// @ref remove, @ref allocate_from_points): stage or bind @p count elements
+  /// Shared body of the per-element kernels (@ref allocate, @ref remove):
+  /// stage or bind @p count elements
   /// of @p elem_size bytes at input binding (4) of @p kernel's set, then run
   /// @p kernel over them (one thread per element) via @ref dispatch_with_retry.
   /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
@@ -796,17 +779,14 @@ class VR_VOLUME_API VoxelHashMap {
   // KernelSetBuilder in create() builds all seven and sizes pool_ to them.
   // Every persistent-buffer binding is written once by
   // write_persistent_bindings(); only the genuinely per-call input (coords /
-  // points / depth+camera) is (re)written before a dispatch.
-  // allocate-from-coords and -from-points have the same 6-binding shape but
-  // each owns its kernel; depth adds the camera-params buffer at binding 6 (7
-  // bindings), and triangles adds indices at 6 + the prefix-sum offsets at 7
-  // (8 bindings).
+  // depth+camera / triangles) is (re)written before a dispatch. Depth adds the
+  // camera-params buffer at binding 6, and triangles adds indices at 6 + the
+  // prefix-sum offsets at 7.
   core::ComputeKernel init_;
   core::ComputeKernel allocate_;
   core::ComputeKernel compact_;
   core::ComputeKernel delete_;
   core::ComputeKernel depth_;
-  core::ComputeKernel points_;
   core::ComputeKernel triangles_;
   core::ComputeKernel compact_frustum_;
   // Re-inserts a snapshot of active blocks into the grown table preserving each

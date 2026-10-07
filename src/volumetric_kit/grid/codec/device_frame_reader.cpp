@@ -179,44 +179,4 @@ core::Status DeviceFrameReader::check() const {
   return {};
 }
 
-core::Result<IntraFrame> DeviceFrameReader::read(const std::uint8_t* data,
-                                                 std::size_t size,
-                                                 std::uint32_t max_blocks) {
-  VKC_ASSIGN(const ParsedFrame parsed,
-             parse_intra_frame(data, size, max_blocks));
-  const std::uint32_t n = parsed.header.block_count;
-  const std::uint32_t k = parsed.header.params.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
-  std::vector<std::uint32_t> packed(std::size_t(n) * words);
-  IntraFrame frame;
-  frame.voxel_size = parsed.header.voxel_size;
-  frame.blocks.trunc_dist = parsed.header.trunc_dist;
-  frame.blocks.params = parsed.header.params;
-  frame.blocks.masks.resize(std::size_t(n) * kMaskWordsPerBlock);
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_ASSIGN(const ResidentBlocks resident, record_decode(batch, parsed));
-  if (n != 0) {
-    VKC_TRY(batch.readback(*resident.masks, 0,
-                           frame.blocks.masks.size() * sizeof(std::uint32_t),
-                           frame.blocks.masks.data()));
-    VKC_TRY(batch.readback(*resident.coefficients, 0,
-                           packed.size() * sizeof(std::uint32_t),
-                           packed.data()));
-    VKC_TRY(batch.submit());
-  }
-  VKC_TRY(check());
-  frame.coords.reserve(n);
-  for (const volume::BlockIndex& b : blocks_host_) {
-    frame.coords.push_back(b.coord);
-  }
-  frame.blocks.coefficients.resize(std::size_t(n) * k);
-  for (std::size_t i = 0; i < n; ++i) {
-    for (std::uint32_t j = 0; j < k; ++j) {
-      frame.blocks.coefficients[i * k + j] = static_cast<std::int16_t>(
-          packed[i * words + j / 2] >> (16 * (j & 1)));
-    }
-  }
-  return frame;
-}
-
 }  // namespace volumetric_kit::recon::codec::detail

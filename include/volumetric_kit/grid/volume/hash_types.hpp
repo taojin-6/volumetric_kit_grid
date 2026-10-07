@@ -30,7 +30,6 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "volumetric_kit/recon/core/device_macros.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 
 namespace volumetric_kit::recon::volume {
@@ -76,8 +75,8 @@ struct BlockStamp {
   /// The last tick an allocation asked for the block, whether it inserted the
   /// block or found it there.
   std::uint32_t requested = 0;
-  /// The last tick a @ref VoxelBlockGrid::stamp_blocks pass found any of the
-  /// block's voxels holding weight; 0 until one does.
+  /// The last tick a @ref VoxelBlockGrid::free_stale_blocks pass found any of
+  /// the block's voxels holding weight; 0 until one does.
   std::uint32_t weighted = 0;
   /// The last tick a pass that writes voxels changed any of the block's:
   /// `tsdf::TsdfIntegrator` and the codec's decoder where a value changed,
@@ -136,45 +135,6 @@ struct BlockList {
   /// The @ref VoxelBlockGrid::topology_epoch the list was compacted at.
   /// Meaningless, and unchecked, when @ref count is 0.
   std::uint64_t epoch = 0;
-};
-
-/// Per-voxel signed-distance payload.
-struct Voxel {
-  float sdf;     ///< Signed distance (meters).
-  float weight;  ///< Integration weight (clamped to a configured maximum).
-
-  /// @return The stored signed distance.
-  VR_DEVICE_HOST float get_sdf() const { return sdf; }
-  /// Set the signed distance.
-  VR_DEVICE_HOST void set_sdf(float value) { sdf = value; }
-};
-static_assert(sizeof(Voxel) == 8, "Voxel must be 8 bytes");
-static_assert(offsetof(Voxel, sdf) == 0, "Voxel layout drift");
-static_assert(offsetof(Voxel, weight) == 4, "Voxel layout drift");
-
-/// Unified, layout-decoupled view of a hash table's per-voxel data.
-///
-/// Integrators and mesh extraction read SDF (and optional color) through this
-/// rather than reaching into @ref HashTable internals, so new per-voxel
-/// channels can be added without touching every consumer.
-struct VoxelData {
-  Voxel* sdf_blocks = nullptr;     ///< SDF + weight (non-null once allocated).
-  Vec3u8* color_blocks = nullptr;  ///< Optional per-voxel RGB (nullptr = off).
-};
-
-/// Device-side voxel hash table: the block index plus its backing storage.
-struct HashTable {
-  HashEntry* hash_entries = nullptr;      ///< Hash-table slots.
-  Voxel* sdf_blocks = nullptr;            ///< Voxel blocks (SDF + weight).
-  Vec3u8* color_blocks = nullptr;         ///< Optional per-voxel color.
-  std::uint32_t* heap = nullptr;          ///< Free-block allocation stack.
-  std::uint32_t* heap_counter = nullptr;  ///< Heap top (atomic on device).
-  std::int32_t* bucket_mutex = nullptr;   ///< Per-bucket spin locks.
-
-  /// @return A @ref VoxelData view of this table's voxel storage.
-  VR_DEVICE_HOST VoxelData voxel_data() const {
-    return VoxelData{sdf_blocks, color_blocks};
-  }
 };
 
 }  // namespace volumetric_kit::recon::volume

@@ -175,11 +175,6 @@ struct FrameWriteOptions {
   std::uint32_t segment_size = kDefaultSegmentSize;
 };
 
-/// @brief The checks @ref write_intra_frame makes before coding anything.
-/// @return OK, or the same refusals as @ref write_intra_frame.
-VR_CODEC_API core::Status check_intra_frame(const IntraFrame& frame,
-                                            const FrameWriteOptions& options);
-
 /// @brief Serialize an intra frame.
 /// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid

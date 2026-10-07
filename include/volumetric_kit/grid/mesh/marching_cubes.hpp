@@ -138,26 +138,6 @@ struct ExtractTimings {
   std::uint32_t triangle_capacity = 0;
   /// Triangles the kernel actually emitted.
   std::uint32_t emitted_triangles = 0;
-  /// Cells per block the sparse kernel could **not** cache a triangle count
-  /// for, so they were gathered twice instead of once -- correct, measurably
-  /// slower, and otherwise invisible.
-  ///
-  /// The sparse kernel visits a cell twice: once to count (signs only), once to
-  /// emit. Between them it caches each cell's triangle count in one byte of a
-  /// private register, so the ~92% of cells that emit nothing are rejected
-  /// without touching memory rather than by a second gather. That cache holds
-  /// four counts per invocation, which covers `block_size` 8 whole; a block
-  /// with more cells than it holds still meshes **correctly**, but every cell
-  /// past it pays a second full gather -- at `block_size` 16 that is 75% of the
-  /// block, roughly 1.8 gathers per cell against 1.1.
-  ///
-  /// Reported rather than refused, because nothing is wrong with the mesh --
-  /// but a limit the caller cannot see is this library's to surface (see the
-  /// 2026-08-04 decision). **0 for `block_size` 8**, the only shape any in-tree
-  /// caller uses, and 0 under @ref MarchingCubesConfig::share_vertices, which
-  /// does not use that cache (sharing is *refused* above its own limit
-  /// instead).
-  std::uint32_t uncached_cells_per_block = 0;
   /// Vertex capacity the dispatch ran with -- one slot's vertex arena, so
   /// `emitted_vertices / vertex_capacity` is that buffer's fill ratio.
   ///
@@ -404,7 +384,7 @@ struct MarchingCubesConfig {
   ///
   /// Off by default because it is not free and most callers never read it. The
   /// table is sized by the **grid**, not by the surface: `num_blocks` entries
-  /// of 16 bytes, which is 24 MB at @ref volume::VoxelGridParams::defaults and
+  /// of 16 bytes, which is 24 MB for a heap of 1.5 M blocks and
   /// doubles with every @ref volume::VoxelHashMap::resize, held for this
   /// object's lifetime. The host keeps a copy of it, another 16 bytes per
   /// block, and an array of the same length carries the per-slot stamp
@@ -1122,7 +1102,7 @@ class VR_MESH_API MarchingCubes {
   // beside it, so the length cannot outlive the buffer it parallels (a count
   // kept in a member survives a move that empties the buffer). Null unless
   // config_.track_block_spans is on: this is num_blocks * 8 bytes of HOST
-  // memory (12 MB at VoxelGridParams::defaults), so it falls under the same
+  // memory (12 MB for a heap of 1.5 M blocks), so it falls under the same
   // "nothing measured for a caller who did not ask" rule as the table it
   // describes.
   //
@@ -1356,8 +1336,8 @@ class VR_MESH_API MarchingCubes {
   // slot's size is a fraction of this object's cost, not its cost.
   //
   // The span table counts too, and it is not a rounding error: it is sized by
-  // the GRID rather than by the surface (num_blocks * 16, which is 24 MB at
-  // VoxelGridParams::defaults against room0's ~38 MB of triangles), it is held
+  // the GRID rather than by the surface (num_blocks * 16, which is 24 MB for a
+  // heap of 1.5 M blocks against room0's ~38 MB of triangles), it is held
   // for this object's lifetime, and this is the instrument the ring's runaway
   // growth was diagnosed with. Omitting a component of what stays resident is
   // the same defect that folding the index runs in here fixed.

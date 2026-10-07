@@ -38,18 +38,12 @@ struct VoxelGridParams {
   std::int32_t num_blocks;        ///< `bucket_size * num_buckets` (heap size).
   std::int32_t max_chain;         ///< Max collision linked-list length.
 
-  /// @brief The ported production defaults: 5 mm voxels, 8-voxel blocks, a 40
-  /// mm
-  ///        truncation band, and a 50 x 30000 hash table.
-  /// @return A fully-populated parameter set (passes @ref validate).
-  static constexpr VoxelGridParams defaults();
-
   /// @brief Check that every field is a usable value the helpers can trust.
   ///
   /// The coordinate and hash helpers treat these parameters as preconditions --
   /// e.g. @ref hash_bucket divides by `num_buckets`, so a zero bucket count is
   /// undefined. Validate a user-built set once here at configuration time
-  /// rather than per-call on the device hot path; @ref defaults always passes.
+  /// rather than per-call on the device hot path.
   /// The two precomputed fields (`voxels_per_block`, `num_blocks`) are checked
   /// against their defining products so a stale value cannot slip through.
   /// @return An OK `Status` when every field is valid, otherwise
@@ -78,22 +72,6 @@ static_assert(std::is_trivially_copyable_v<VoxelGridParams>,
               "VoxelGridParams must be trivially copyable");
 static_assert(std::is_standard_layout_v<VoxelGridParams>,
               "VoxelGridParams must be standard-layout");
-
-constexpr VoxelGridParams VoxelGridParams::defaults() {
-  constexpr std::int32_t kBlockSize = 8;
-  constexpr std::int32_t kBucketSize = 50;
-  constexpr std::int32_t kNumBuckets = 30000;
-  return VoxelGridParams{
-      /*voxel_size=*/0.005f,
-      /*block_size=*/kBlockSize,
-      /*voxels_per_block=*/kBlockSize * kBlockSize * kBlockSize,
-      /*trunc_dist=*/0.04f,
-      /*bucket_size=*/kBucketSize,
-      /*num_buckets=*/kNumBuckets,
-      /*num_blocks=*/kBucketSize * kNumBuckets,
-      /*max_chain=*/128,
-  };
-}
 
 inline core::Status VoxelGridParams::validate() const {
   // `!(x > 0)` rather than `x <= 0` so a NaN is rejected too: every comparison

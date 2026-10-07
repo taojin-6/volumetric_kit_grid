@@ -46,6 +46,105 @@ namespace {
 
 constexpr std::uint32_t kMaxBlocks = 1u << 20;
 
+// The device the writer and reader run on, for the helpers below.
+vkc::Device* g_device = nullptr;
+vkc::Allocator* g_allocator = nullptr;
+
+// `bytes` in a new device storage buffer.
+vkc::Result<std::unique_ptr<vkc::Buffer>> upload(const void* bytes,
+                                                 VkDeviceSize size) {
+  VKC_ASSIGN(vkc::Buffer buffer,
+             vkc::device_storage_buffer(*g_allocator, size));
+  vkc::CommandBatch batch(*g_device, *g_allocator);
+  VKC_TRY(batch.upload(buffer, 0, bytes, size));
+  VKC_TRY(batch.submit());
+  return std::make_unique<vkc::Buffer>(std::move(buffer));
+}
+
+// The device writer's bytes for a host frame: its blocks uploaded, counted
+// and finished, as the encoder does with the transform's output.
+vkc::Result<std::vector<std::uint8_t>> device_write(
+    d::DeviceFrameWriter& writer, const d::IntraFrame& frame,
+    const d::FrameWriteOptions& options) {
+  const auto n = static_cast<std::uint32_t>(frame.coords.size());
+  const std::uint32_t k = frame.blocks.params.coefficient_count;
+  const std::uint32_t words = (k + 1) / 2;
+  d::ResidentBlocks blocks;
+  blocks.count = n;
+  blocks.coefficient_count = k;
+  std::unique_ptr<vkc::Buffer> list, masks, coefficients;
+  if (n != 0) {
+    std::vector<vr::volume::BlockIndex> entries(n);
+    for (std::uint32_t i = 0; i < n; ++i) entries[i].coord = frame.coords[i];
+    // Two int16 a word, each entry starting a word of its own.
+    std::vector<std::uint32_t> packed(std::size_t(n) * words, 0);
+    for (std::uint32_t i = 0; i < n; ++i) {
+      for (std::uint32_t j = 0; j < k; ++j) {
+        const auto v = static_cast<std::uint16_t>(
+            frame.blocks.coefficients[std::size_t(i) * k + j]);
+        packed[std::size_t(i) * words + j / 2] |= std::uint32_t(v)
+                                                  << (16 * (j & 1));
+      }
+    }
+    VKC_ASSIGN(list, upload(entries.data(),
+                            entries.size() * sizeof(vr::volume::BlockIndex)));
+    VKC_ASSIGN(masks,
+               upload(frame.blocks.masks.data(),
+                      frame.blocks.masks.size() * sizeof(std::uint32_t)));
+    VKC_ASSIGN(coefficients,
+               upload(packed.data(), packed.size() * sizeof(std::uint32_t)));
+    blocks.list = list.get();
+    blocks.masks = masks.get();
+    blocks.coefficients = coefficients.get();
+  }
+  vkc::CommandBatch batch(*g_device, *g_allocator);
+  VKC_TRY(writer.record_count(batch, blocks, options.segment_size));
+  VKC_TRY(batch.submit());
+  return writer.finish(blocks, frame.voxel_size, frame.blocks.trunc_dist,
+                       frame.blocks.params);
+}
+
+// The device reader's decode of a frame, read back as the host's.
+vkc::Result<d::IntraFrame> device_read(d::DeviceFrameReader& reader,
+                                       const std::uint8_t* data,
+                                       std::size_t size) {
+  VKC_ASSIGN(const d::ParsedFrame parsed,
+             d::parse_intra_frame(data, size, kMaxBlocks));
+  const std::uint32_t n = parsed.header.block_count;
+  const std::uint32_t k = parsed.header.params.coefficient_count;
+  const std::uint32_t words = (k + 1) / 2;
+  std::vector<std::uint32_t> packed(std::size_t(n) * words);
+  d::IntraFrame frame;
+  frame.voxel_size = parsed.header.voxel_size;
+  frame.blocks.trunc_dist = parsed.header.trunc_dist;
+  frame.blocks.params = parsed.header.params;
+  frame.blocks.masks.resize(std::size_t(n) * codec::kMaskWordsPerBlock);
+  vkc::CommandBatch batch(*g_device, *g_allocator);
+  VKC_ASSIGN(const d::ResidentBlocks resident,
+             reader.record_decode(batch, parsed));
+  if (n != 0) {
+    VKC_TRY(batch.readback(*resident.masks, 0,
+                           frame.blocks.masks.size() * sizeof(std::uint32_t),
+                           frame.blocks.masks.data()));
+    VKC_TRY(batch.readback(*resident.coefficients, 0,
+                           packed.size() * sizeof(std::uint32_t),
+                           packed.data()));
+    VKC_TRY(batch.submit());
+  }
+  VKC_TRY(reader.check());
+  for (const vr::volume::BlockIndex& b : reader.blocks()) {
+    frame.coords.push_back(b.coord);
+  }
+  frame.blocks.coefficients.resize(std::size_t(n) * k);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::uint32_t j = 0; j < k; ++j) {
+      frame.blocks.coefficients[i * k + j] = static_cast<std::int16_t>(
+          packed[i * words + j / 2] >> (16 * (j & 1)));
+    }
+  }
+  return frame;
+}
+
 // The host's decode of a frame and the device's: the same blocks, or the same
 // refusal, which @p refusal receives.
 int same_read(d::DeviceFrameReader& reader,
@@ -54,7 +153,7 @@ int same_read(d::DeviceFrameReader& reader,
   const vkc::Result<d::IntraFrame> host =
       d::read_intra_frame(bytes.data(), bytes.size(), kMaxBlocks);
   const vkc::Result<d::IntraFrame> device =
-      reader.read(bytes.data(), bytes.size(), kMaxBlocks);
+      device_read(reader, bytes.data(), bytes.size());
   if (host.ok() != device.ok() ||
       (!host.ok() && host.status().message() != device.status().message())) {
     std::fprintf(stderr, "host: %s; device: %s\n",
@@ -86,7 +185,7 @@ int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
   const vkc::Result<std::vector<std::uint8_t>> host =
       d::write_intra_frame(frame, options);
   const vkc::Result<std::vector<std::uint8_t>> device =
-      writer.write(frame, options);
+      device_write(writer, frame, options);
   CHECK(host.ok());
   if (!device.ok()) {
     std::fprintf(stderr, "device write: %s\n",
@@ -228,7 +327,7 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
       d::read_intra_frame(long_segment.data(), long_segment.size(), kMaxBlocks)
           .ok());
   const vkc::Result<d::IntraFrame> refused =
-      reader.read(long_segment.data(), long_segment.size(), kMaxBlocks);
+      device_read(reader, long_segment.data(), long_segment.size());
   CHECK(!refused.ok());
   CHECK(refused.status().domain() == vkc::Status::Code::InvalidArgument);
   // The header's segment size alone does not count: this frame's one
@@ -239,14 +338,7 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   return 0;
 }
 
-int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
-                  d::DeviceFrameWriter& writer) {
-  d::IntraFrame f = make_frame(10, 8, 3);
-  std::swap(f.coords[3], f.coords[4]);
-  CHECK(!writer.write(f, {}).ok());
-  d::FrameWriteOptions zero;
-  zero.segment_size = 0;
-  CHECK(!writer.write(make_frame(10, 8, 3), zero).ok());
+int refusals_case(vkc::Device& device, vkc::Allocator& allocator) {
   // finish with nothing counted refuses rather than coding stale steps.
   vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
       d::DeviceFrameWriter::create(device, allocator);
@@ -288,13 +380,15 @@ int main() {
   CHECK(r.ok());
   d::DeviceFrameWriter& writer = *w.value();
   d::DeviceFrameReader& reader = *r.value();
+  g_device = &device.value();
+  g_allocator = &allocator.value();
   if (matches_host_case(writer, reader) != 0) return 1;
   if (corruption_case(reader) != 0) return 1;
   if (segment_limit_case(reader) != 0) return 1;
   if (out_of_range_case(device.value(), allocator.value(), writer) != 0) {
     return 1;
   }
-  if (refusals_case(device.value(), allocator.value(), writer) != 0) return 1;
+  if (refusals_case(device.value(), allocator.value()) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;
 }
