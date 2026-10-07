@@ -166,22 +166,23 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
-// The active set is the map's own list: a list a fuse left that still holds
-// is taken back, compacting nothing, and is still the map's for the extract
-// after -- and one the encoder compacts is left for it too.
+// The active set is the map's own list: the list the map last compacted (an
+// extract's, say) is taken back while it still holds, compacting nothing, and
+// is still the map's for the extract after -- and one the encoder compacts is
+// left for it too.
 int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> g =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.07f});
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<vol::DeviceBlockList> fused =
+  vkc::Result<vol::DeviceBlockList> last =
       grid.map().compact_active_blocks_on_device();
-  CHECK(fused.ok());
+  CHECK(last.ok());
   vkc::StageMetrics m;
   vkc::Result<std::vector<std::uint8_t>> a = enc.encode(grid, &m);
   CHECK(a.ok());
   CHECK(find_row(m, "  ..active set") == nullptr);
-  CHECK(grid.map().check_device_block_list(fused.value(), "test").ok());
+  CHECK(grid.map().check_device_block_list(last.value(), "test").ok());
 
   // A list the encoder compacted itself, after an allocation, holds for the
   // next caller, and the content -- one block more, never observed -- codes
@@ -195,7 +196,7 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::DeviceBlockList> next =
       grid.map().compact_active_blocks_on_device(&extract);
   CHECK(next.ok() && extract.rows().empty());
-  CHECK(next.value().serial != fused.value().serial);
+  CHECK(next.value().serial != last.value().serial);
   return 0;
 }
 

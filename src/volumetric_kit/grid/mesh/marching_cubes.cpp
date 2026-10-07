@@ -1038,7 +1038,7 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   if (blocks != nullptr) {
     num_active = blocks->count;
   } else {
-    // The fuse's own list when nothing has changed since it compacted.
+    // The map's last list when nothing has changed since it compacted.
     VKC_ASSIGN(on_device, grid.map().compact_active_blocks_on_device());
     num_active = on_device.count;
     // Only this path writes the row. A caller-supplied set did no compaction

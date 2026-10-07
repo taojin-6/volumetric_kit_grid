@@ -93,6 +93,7 @@ struct PersistentBuffers {
   core::Buffer bucket_mutex;
   core::Buffer fail_counts;
   core::Buffer compacted;
+  core::Buffer frustum_compacted;
   core::Buffer active_count;
   core::Buffer stamps;
 };
@@ -125,6 +126,9 @@ core::Result<PersistentBuffers> make_persistent_buffers(
              core::device_storage_buffer(allocator,
                                          kFailSlots * sizeof(std::uint32_t)));
   VKC_ASSIGN(bufs.compacted,
+             core::device_storage_buffer(
+                 allocator, VkDeviceSize(num_blocks) * sizeof(BlockIndex)));
+  VKC_ASSIGN(bufs.frustum_compacted,
              core::device_storage_buffer(
                  allocator, VkDeviceSize(num_blocks) * sizeof(BlockIndex)));
   VKC_ASSIGN(bufs.active_count,
@@ -168,6 +172,7 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   map.bucket_mutex_ = std::move(bufs.bucket_mutex);
   map.fail_counts_ = std::move(bufs.fail_counts);
   map.compacted_ = std::move(bufs.compacted);
+  map.frustum_compacted_ = std::move(bufs.frustum_compacted);
   map.active_count_ = std::move(bufs.active_count);
   map.stamps_ = std::move(bufs.stamps);
 
@@ -177,10 +182,12 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   // resized bundle.
   VKC_ASSIGN(map.camera_params_,
              core::device_storage_buffer(allocator, sizeof(DepthCameraParams)));
-  // Frustum planes for compact_active_blocks_in_frustum: likewise a small
-  // (96 B), fixed-size buffer, persisted at binding 3 of compact_frustum_.set.
+  // Frusta for the frustum compactions: likewise small -- one frustum's count
+  // and planes to start with, grown by upload_frusta for more -- and persisted
+  // at binding 3 of compact_frustum_.set.
   VKC_ASSIGN(map.frustum_planes_,
-             core::device_storage_buffer(allocator, sizeof(FrustumPlanes)));
+             core::device_storage_buffer(
+                 allocator, sizeof(std::uint32_t) + sizeof(FrustumPlanes)));
 
   // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
   // 65535 guaranteed); cache it so every dispatch can reject an over-large
@@ -278,10 +285,11 @@ void VoxelHashMap::write_persistent_bindings() {
   compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(2, active_count_.handle(), 0,
                                     VK_WHOLE_SIZE);
-  // Frustum compaction shares the compaction output + counter with plain
-  // compact; its planes buffer (binding 3) is persistent, rewritten per call.
+  // Frustum compaction shares the counter with plain compact but writes an
+  // output of its own; its frusta buffer (binding 3) is persistent, rewritten
+  // per call.
   compact_frustum_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
-  compact_frustum_.set.write_storage_buffer(1, compacted_.handle(), 0,
+  compact_frustum_.set.write_storage_buffer(1, frustum_compacted_.handle(), 0,
                                             VK_WHOLE_SIZE);
   compact_frustum_.set.write_storage_buffer(2, active_count_.handle(), 0,
                                             VK_WHOLE_SIZE);
@@ -303,6 +311,7 @@ void VoxelHashMap::write_persistent_bindings() {
         {mutex, "hash.bucket_mutex"},
         {fail, "hash.fail_counts"},
         {compacted_.handle(), "hash.compacted"},
+        {frustum_compacted_.handle(), "hash.frustum_compacted"},
         {active_count_.handle(), "hash.active_count"},
         {stamps, "hash.stamps"},
         {camera_params_.handle(), "hash.camera_params"},
@@ -711,14 +720,17 @@ core::Result<std::uint32_t> VoxelHashMap::remove(const core::Buffer& coords,
 }
 
 core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
-    const core::ComputeKernel& kernel, core::GpuStageScope* stage,
+    const core::ComputeKernel& kernel, const core::Buffer& out,
+    core::GpuStageScope* stage,
     const std::function<core::Status(core::CommandBatch&)>& prepare,
     BlockIndex* head, std::uint32_t head_count) {
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   const PushConstants push{grid_, capacity, tick_};
-  ++compaction_serial_;  // before the submit, which may have run in part
+  if (&out == &compacted_) {
+    ++compaction_serial_;  // before the submit, which may have run in part
+  }
   std::uint32_t count = 0;
   core::CommandBatch batch(*device_, *allocator_);
   if (prepare) {
@@ -729,15 +741,15 @@ core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
                          group_count(total_entries()), max_workgroup_count_x_,
                          stage));
   VKC_TRY(batch.readback(active_count_, 0, sizeof(count), &count));
-  VKC_TRY(batch.readback(compacted_, 0,
-                         VkDeviceSize(head_count) * sizeof(BlockIndex), head));
+  VKC_TRY(batch.readback(out, 0, VkDeviceSize(head_count) * sizeof(BlockIndex),
+                         head));
   VKC_TRY(batch.submit());
   return std::min(count, capacity);
 }
 
 core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
-    const core::ComputeKernel& kernel, std::uint32_t& last_count,
-    core::GpuStageScope* stage,
+    const core::ComputeKernel& kernel, const core::Buffer& out,
+    std::uint32_t& last_count, core::GpuStageScope* stage,
     const std::function<core::Status(core::CommandBatch&)>& prepare) {
   // The list comes back beside its count, as far as a guess a quarter past
   // this kernel's last count, so a set that has not outgrown it costs one
@@ -748,15 +760,15 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
           grid_.num_blocks, std::uint64_t(last_count) + last_count / 4));
   std::vector<BlockIndex> active(guess);
-  VKC_ASSIGN(
-      const std::uint32_t count,
-      compact_into_device_list(kernel, stage, prepare, active.data(), guess));
+  VKC_ASSIGN(const std::uint32_t count,
+             compact_into_device_list(kernel, out, stage, prepare,
+                                      active.data(), guess));
   last_count = count;
   active.resize(count);
   if (count > guess) {
     // It outgrew the guess: the rest in a second submit.
     core::CommandBatch batch(*device_, *allocator_);
-    VKC_TRY(batch.readback(compacted_, VkDeviceSize(guess) * sizeof(BlockIndex),
+    VKC_TRY(batch.readback(out, VkDeviceSize(guess) * sizeof(BlockIndex),
                            VkDeviceSize(count - guess) * sizeof(BlockIndex),
                            active.data() + guess));
     VKC_TRY(batch.submit());
@@ -787,7 +799,7 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
     return core::Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
-  return collect_compacted(compact_, last_active_count_, &stage);
+  return collect_compacted(compact_, compacted_, last_active_count_, &stage);
 }
 
 core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
@@ -801,15 +813,15 @@ core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
         "VoxelHashMap::compact_active_blocks_on_device: moved-from map");
   }
   VKC_ASSIGN(const std::uint32_t count,
-             compact_into_device_list(compact_, &stage));
+             compact_into_device_list(compact_, compacted_, &stage));
   last_device_list_ = DeviceBlockList{&compacted_, count, topology_epoch_,
                                       compaction_serial_, heap_free_};
   return last_device_list_;
 }
 
-// The epoch moves on a remove or clear, the serial on any compaction or
-// resize, and the heap's free count on an allocation: within one epoch it only
-// falls.
+// The epoch moves on a remove or clear, the serial on any compaction into
+// compacted_ or resize, and the heap's free count on an allocation: within one
+// epoch it only falls.
 bool VoxelHashMap::holds(const DeviceBlockList& list) const noexcept {
   return list.buffer == &compacted_ && list.epoch == topology_epoch_ &&
          list.serial == compaction_serial_ && list.heap_free == heap_free_;
@@ -821,6 +833,11 @@ core::Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
   if (!valid()) {
     return core::Status::invalid_argument(std::string(who) +
                                           ": moved-from map");
+  }
+  if (list.buffer == &frustum_compacted_) {
+    return core::Status::invalid_argument(
+        std::string(who) +
+        ": the device block list is frustum-culled, not the map's active set");
   }
   if (list.buffer != &compacted_) {
     return core::Status::invalid_argument(
@@ -845,13 +862,12 @@ VoxelHashMap::compact_active_blocks_in_frustum(const FrustumPlanes& planes,
     return core::Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks_in_frustum: moved-from map");
   }
-  // The six planes are per-call; they go inline into the persistent buffer
-  // bound once at binding 3 of the frustum set (like camera_params_).
-  return collect_compacted(compact_frustum_, last_frustum_count_, &stage,
+  // The planes are per-call; they go inline into the persistent buffer bound
+  // at binding 3 of the frustum set (like camera_params_), as one frustum.
+  return collect_compacted(compact_frustum_, frustum_compacted_,
+                           last_frustum_count_, &stage,
                            [&](core::CommandBatch& batch) {
-                             return batch.upload(frustum_planes_, 0,
-                                                 planes.data(),
-                                                 sizeof(FrustumPlanes));
+                             return upload_frusta(batch, &planes, 1);
                            });
 }
 
@@ -863,6 +879,52 @@ VoxelHashMap::compact_active_blocks_in_frustum(const DepthCameraParams& camera,
                           camera.width, camera.height, camera.min_depth,
                           camera.max_depth, camera.cam_to_world),
       metrics);
+}
+
+core::Result<DeviceBlockList>
+VoxelHashMap::compact_active_blocks_in_frusta_on_device(
+    const std::vector<FrustumPlanes>& frusta, core::StageMetrics* metrics) {
+  core::GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        "VoxelHashMap::compact_active_blocks_in_frusta_on_device: moved-from "
+        "map");
+  }
+  VKC_TRY(core::check_storage_buffer_range(
+      "VoxelHashMap::compact_active_blocks_in_frusta_on_device: the frusta",
+      sizeof(std::uint32_t) +
+          VkDeviceSize(frusta.size()) * sizeof(FrustumPlanes),
+      max_storage_buffer_range_));
+  const auto count = static_cast<std::uint32_t>(frusta.size());
+  VKC_ASSIGN(const std::uint32_t kept,
+             compact_into_device_list(compact_frustum_, frustum_compacted_,
+                                      &stage, [&](core::CommandBatch& batch) {
+                                        return upload_frusta(
+                                            batch, frusta.data(), count);
+                                      }));
+  return DeviceBlockList{&frustum_compacted_, kept, topology_epoch_,
+                         compaction_serial_, heap_free_};
+}
+
+core::Status VoxelHashMap::upload_frusta(core::CommandBatch& batch,
+                                         const FrustumPlanes* frusta,
+                                         std::uint32_t count) {
+  const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(FrustumPlanes);
+  if (frustum_planes_.size() < sizeof(count) + bytes) {
+    // Every earlier submit has waited, so nothing still reads the old buffer,
+    // and this batch has not yet recorded the dispatch that binds the new one.
+    VKC_ASSIGN(frustum_planes_,
+               core::device_storage_buffer(*allocator_, sizeof(count) + bytes));
+    compact_frustum_.set.write_storage_buffer(3, frustum_planes_.handle(), 0,
+                                              VK_WHOLE_SIZE);
+    device_->set_object_name(
+        VK_OBJECT_TYPE_BUFFER,
+        core::debug_object_handle(frustum_planes_.handle()),
+        "hash.frustum_planes");
+  }
+  VKC_TRY(batch.upload(frustum_planes_, 0, &count, sizeof(count)));
+  if (count == 0) return {};
+  return batch.upload(frustum_planes_, sizeof(count), frusta, bytes);
 }
 
 core::Status VoxelHashMap::clear() {
@@ -938,10 +1000,15 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   // allocation above: a half-swapped map (a grown grid_ over a partial or
   // uninitialised table, or a heap still listing the preserved live indices)
   // would corrupt later allocations while valid() reported true.
-  PersistentBuffers old{std::move(entries_),      std::move(heap_),
-                        std::move(heap_counter_), std::move(bucket_mutex_),
-                        std::move(fail_counts_),  std::move(compacted_),
-                        std::move(active_count_), std::move(stamps_)};
+  PersistentBuffers old{std::move(entries_),
+                        std::move(heap_),
+                        std::move(heap_counter_),
+                        std::move(bucket_mutex_),
+                        std::move(fail_counts_),
+                        std::move(compacted_),
+                        std::move(frustum_compacted_),
+                        std::move(active_count_),
+                        std::move(stamps_)};
   const VoxelGridParams old_grid = grid_;
   const std::uint32_t old_heap_free = heap_free_;
   auto commit = [this](PersistentBuffers& b, const VoxelGridParams& g) {
@@ -952,6 +1019,7 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     fail_counts_ = std::move(b.fail_counts);
     compacted_ = std::move(b.compacted);
     ++compaction_serial_;
+    frustum_compacted_ = std::move(b.frustum_compacted);
     active_count_ = std::move(b.active_count);
     stamps_ = std::move(b.stamps);
     grid_ = g;
