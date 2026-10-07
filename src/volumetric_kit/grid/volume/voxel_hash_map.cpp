@@ -728,9 +728,8 @@ core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   const PushConstants push{grid_, capacity, tick_};
-  if (&out == &compacted_) {
-    ++compaction_serial_;  // before the submit, which may have run in part
-  }
+  // Before the submit, which may have run in part.
+  ++(&out == &compacted_ ? compaction_serial_ : frustum_serial_);
   std::uint32_t count = 0;
   core::CommandBatch batch(*device_, *allocator_);
   if (prepare) {
@@ -748,9 +747,7 @@ core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
 }
 
 core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
-    const core::ComputeKernel& kernel, const core::Buffer& out,
-    std::uint32_t& last_count, core::GpuStageScope* stage,
-    const std::function<core::Status(core::CommandBatch&)>& prepare) {
+    core::GpuStageScope* stage) {
   // The list comes back beside its count, as far as a guess a quarter past
   // this kernel's last count, so a set that has not outgrown it costs one
   // submit rather than two (0.38 ms each on an RTX 5090).
@@ -758,17 +755,18 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
   // so no count reaches the host either.
   const std::uint32_t guess =
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
-          grid_.num_blocks, std::uint64_t(last_count) + last_count / 4));
+          grid_.num_blocks,
+          std::uint64_t(last_active_count_) + last_active_count_ / 4));
   std::vector<BlockIndex> active(guess);
   VKC_ASSIGN(const std::uint32_t count,
-             compact_into_device_list(kernel, out, stage, prepare,
+             compact_into_device_list(compact_, compacted_, stage, {},
                                       active.data(), guess));
-  last_count = count;
+  last_active_count_ = count;
   active.resize(count);
   if (count > guess) {
     // It outgrew the guess: the rest in a second submit.
     core::CommandBatch batch(*device_, *allocator_);
-    VKC_TRY(batch.readback(out, VkDeviceSize(guess) * sizeof(BlockIndex),
+    VKC_TRY(batch.readback(compacted_, VkDeviceSize(guess) * sizeof(BlockIndex),
                            VkDeviceSize(count - guess) * sizeof(BlockIndex),
                            active.data() + guess));
     VKC_TRY(batch.submit());
@@ -799,7 +797,7 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
     return core::Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks: moved-from map");
   }
-  return collect_compacted(compact_, compacted_, last_active_count_, &stage);
+  return collect_compacted(&stage);
 }
 
 core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
@@ -819,27 +817,35 @@ core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
   return last_device_list_;
 }
 
-// The epoch moves on a remove or clear, the serial on any compaction into
-// compacted_ or resize, and the heap's free count on an allocation: within one
-// epoch it only falls.
+// The epoch moves on a remove or clear, the serial on any compaction into the
+// list's buffer or a resize, and the heap's free count on an allocation: within
+// one epoch it only falls.
 bool VoxelHashMap::holds(const DeviceBlockList& list) const noexcept {
-  return list.buffer == &compacted_ && list.epoch == topology_epoch_ &&
-         list.serial == compaction_serial_ && list.heap_free == heap_free_;
+  const bool active = list.buffer == &compacted_;
+  if (!active && list.buffer != &frustum_compacted_) return false;
+  return list.epoch == topology_epoch_ &&
+         list.serial == (active ? compaction_serial_ : frustum_serial_) &&
+         list.heap_free == heap_free_;
 }
 
 core::Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
                                                    const char* who) const {
+  if (list.count != 0 && valid() && list.buffer == &frustum_compacted_) {
+    return core::Status::invalid_argument(
+        std::string(who) +
+        ": the device block list is frustum-culled, not the map's active set");
+  }
+  return check_device_block_subset(list, who);
+}
+
+core::Status VoxelHashMap::check_device_block_subset(
+    const DeviceBlockList& list, const char* who) const {
   if (list.count == 0) return {};
   if (!valid()) {
     return core::Status::invalid_argument(std::string(who) +
                                           ": moved-from map");
   }
-  if (list.buffer == &frustum_compacted_) {
-    return core::Status::invalid_argument(
-        std::string(who) +
-        ": the device block list is frustum-culled, not the map's active set");
-  }
-  if (list.buffer != &compacted_) {
+  if (list.buffer != &compacted_ && list.buffer != &frustum_compacted_) {
     return core::Status::invalid_argument(
         std::string(who) +
         ": the device block list is not this map's, or the map has moved "
@@ -852,33 +858,6 @@ core::Status VoxelHashMap::check_device_block_list(const DeviceBlockList& list,
         "resized, removed or cleared since");
   }
   return {};
-}
-
-core::Result<std::vector<BlockIndex>>
-VoxelHashMap::compact_active_blocks_in_frustum(const FrustumPlanes& planes,
-                                               core::StageMetrics* metrics) {
-  core::GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelHashMap::compact_active_blocks_in_frustum: moved-from map");
-  }
-  // The planes are per-call; they go inline into the persistent buffer bound
-  // at binding 3 of the frustum set (like camera_params_), as one frustum.
-  return collect_compacted(compact_frustum_, frustum_compacted_,
-                           last_frustum_count_, &stage,
-                           [&](core::CommandBatch& batch) {
-                             return upload_frusta(batch, &planes, 1);
-                           });
-}
-
-core::Result<std::vector<BlockIndex>>
-VoxelHashMap::compact_active_blocks_in_frustum(const DepthCameraParams& camera,
-                                               core::StageMetrics* metrics) {
-  return compact_active_blocks_in_frustum(
-      make_frustum_planes(camera.fx, camera.fy, camera.cx, camera.cy,
-                          camera.width, camera.height, camera.min_depth,
-                          camera.max_depth, camera.cam_to_world),
-      metrics);
 }
 
 core::Result<DeviceBlockList>
@@ -903,7 +882,7 @@ VoxelHashMap::compact_active_blocks_in_frusta_on_device(
                                             batch, frusta.data(), count);
                                       }));
   return DeviceBlockList{&frustum_compacted_, kept, topology_epoch_,
-                         compaction_serial_, heap_free_};
+                         frustum_serial_, heap_free_};
 }
 
 core::Status VoxelHashMap::upload_frusta(core::CommandBatch& batch,
@@ -1020,6 +999,7 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     compacted_ = std::move(b.compacted);
     ++compaction_serial_;
     frustum_compacted_ = std::move(b.frustum_compacted);
+    ++frustum_serial_;
     active_count_ = std::move(b.active_count);
     stamps_ = std::move(b.stamps);
     grid_ = g;

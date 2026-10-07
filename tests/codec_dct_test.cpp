@@ -922,6 +922,10 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   // Null with a count.
   vol::BlockList null_list{nullptr, 3, grid.topology_epoch()};
   CHECK(!t.forward(grid, null_list, params, out).ok());
+  // More blocks than the heap, which the epoch cannot see.
+  const std::vector<vol::BlockIndex> too_many(
+      std::size_t(grid.grid().num_blocks) + 1, blocks[0]);
+  CHECK(!t.forward(grid, grid.block_list(too_many), params, out).ok());
 
   // Every entry is found by its coord and its ptr never read, so a ptr
   // outside the heap, negative, off a block boundary, a free slot, or another
