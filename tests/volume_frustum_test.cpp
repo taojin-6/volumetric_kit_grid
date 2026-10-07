@@ -10,6 +10,8 @@
 // (inverseTranspose(cam_to_world)) is actually exercised, not a no-op. Expected
 // sets are derived from the camera geometry, independent of
 // make_frustum_planes, and each result is pinned by count + distinct heap ptrs.
+// The device-list form takes several frusta and keeps their union, in a list
+// of its own that leaves the active-set list holding.
 // Runs on the real driver (MoltenVK on Apple, the NVIDIA ICD on Linux CI).
 // Exits 0 (skip) where no device is present.
 
@@ -35,6 +37,7 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
+#include "buffer_readback.hpp"
 #include "no_device.hpp"
 
 namespace vr = volumetric_kit::recon;
@@ -181,6 +184,39 @@ int main() {
       map.compact_active_blocks_in_frustum(cam);
   CHECK(visible_cam.ok());
   if (check_result(visible_cam.value(), want) != 0) return 1;
+
+  // --- Several frusta, on the device ----------------------------------------
+  // Their union, each block once: the camera above and one seeing only 6 to
+  // 10 m, which holds kFar alone, so the union is neither frustum's set. Two
+  // frusta grow the planes buffer past its first size, so the one-frustum call
+  // after it reads the regrown binding.
+  vkc::Result<vol::DeviceBlockList> full =
+      map.compact_active_blocks_on_device();
+  CHECK(full.ok() && full.value().count == 6);
+  const vol::FrustumPlanes beyond = vol::make_frustum_planes(
+      100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 6.0f, 10.0f, vr::Mat4f(1.0f));
+  vkc::Result<vol::DeviceBlockList> both =
+      map.compact_active_blocks_in_frusta_on_device({planes, beyond});
+  CHECK(both.ok());
+  vkc::Result<std::vector<vol::BlockIndex>> both_blocks =
+      vr_test::read_back<vol::BlockIndex>(device.value(), allocator.value(),
+                                          *both.value().buffer,
+                                          both.value().count);
+  CHECK(both_blocks.ok());
+  std::set<Coord> union_want = want;
+  union_want.insert({0, 0, 200});
+  if (check_result(both_blocks.value(), union_want) != 0) return 1;
+  // A subset, so never the active set; and it left that list holding, as the
+  // host form does.
+  CHECK(!map.check_device_block_list(both.value(), "test").ok());
+  CHECK(map.compact_active_blocks_in_frustum(planes).ok());
+  CHECK(map.check_device_block_list(full.value(), "test").ok());
+  vkc::Result<vol::DeviceBlockList> one =
+      map.compact_active_blocks_in_frusta_on_device({planes});
+  CHECK(one.ok() && one.value().count == want.size());
+  vkc::Result<vol::DeviceBlockList> none =
+      map.compact_active_blocks_in_frusta_on_device({});
+  CHECK(none.ok() && none.value().count == 0);
 
   // --- Posed camera ---------------------------------------------------------
   // Repeat with a NON-identity pose so the plane->world transform
@@ -360,8 +396,9 @@ int main() {
       "near-far edges), posed view kept %zu/4 (pose transform exercised), "
       "view_proj kept %zu/8 exact, %zu/8 under a GL [-1,1] projection and "
       "%zu/8 at a 0.1 m margin; a 0.5 m margin kept the camera outside the "
-      "frustum and a degenerate matrix culled nothing\n",
+      "frustum and a degenerate matrix culled nothing; two frusta kept their "
+      "union of %zu/6 on the device\n",
       want.size(), pwant.size(), vp_want.size(), gl_want.size(),
-      margin_want.size());
+      margin_want.size(), union_want.size());
   return 0;
 }

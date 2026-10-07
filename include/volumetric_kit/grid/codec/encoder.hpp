@@ -87,8 +87,7 @@ class VR_CODEC_API Encoder {
   ///                 the active set is the map's own list
   ///                 (@ref
   ///                 volume::VoxelHashMap::compact_active_blocks_on_device),
-  ///                 which an extract after this takes back from it as it
-  ///                 would a fuse's.
+  ///                 which an extract after this takes back from it.
   /// @param metrics  Optional `StageMetrics` collecting a `"codec encode"`
   ///                 row with both halves -- its device half is the transform
   ///                 and, coded on the device, the rANS kernels -- over the

@@ -22,15 +22,16 @@ namespace volumetric_kit::recon::volume {
 /// Each plane is `(nx, ny, nz, d)` in **Hessian normal form** with an
 /// inward-pointing unit normal: a world point `p` is inside when
 /// `dot(n, p) + d >= 0` for all six. Order is left, right, top, bottom, near,
-/// far. This is exactly what the `hash_compact_frustum` kernel reads (a
-/// `vec4[6]` under scalar block layout), so the array uploads verbatim.
+/// far. This is exactly what the `hash_compact_frustum` kernel reads, six
+/// `vec4` a frustum after the frusta's count under scalar block layout, so
+/// the array uploads verbatim.
 using FrustumPlanes = std::array<Vec4f, 6>;
 // Pin the upload size the way every other shader-fed POD does (2026-07-05 ABI):
 // the `vr::` backing type is swappable, so a Vec4f layout change is a compile
 // error here, not a silent frustum misprojection.
 static_assert(sizeof(FrustumPlanes) == 96,
               "FrustumPlanes must be 96 bytes (6 x vec4) to match the shader's "
-              "scalar-layout vec4[6]");
+              "scalar-layout planes, six a frustum");
 
 /// @brief Build the world-space frustum planes for a pinhole camera.
 ///
@@ -39,8 +40,10 @@ static_assert(sizeof(FrustumPlanes) == 96,
 /// in @ref VoxelHashMap::allocate_from_depth); near/far clip in depth. The side
 /// planes are widened ~10% (focal lengths scaled by 0.9) so a block straddling
 /// the image edge is kept rather than clipped -- the cull is deliberately
-/// conservative. Each camera-space plane is carried to world space by the
-/// inverse-transpose of @p cam_to_world and renormalized to unit normal.
+/// conservative, while the principal point lies inside the image: outside
+/// it, scaling the focal length moves that side's plane inward. Each
+/// camera-space plane is carried to world space by the inverse-transpose
+/// of @p cam_to_world and renormalized to unit normal.
 /// @param fx,fy          Focal lengths (pixels).
 /// @param cx,cy          Principal point (pixels).
 /// @param width,height   Image dimensions (pixels).

@@ -1444,10 +1444,10 @@ int main() {
     }
   }
 
-  // A full extract binds the map's device list, reusing the compaction a fuse
-  // just made: the same triangles as a host list, and the fuse's list still
-  // current after. An allocation since makes it compact again rather than mesh
-  // the old list.
+  // A full extract binds the map's device list, reusing the compaction the
+  // map last made (another extract's, say): the same triangles as a host list,
+  // and that list still current after. An allocation since makes it compact
+  // again rather than mesh the old list.
   {
     vkc::Result<vol::VoxelBlockGrid> list_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
@@ -1473,9 +1473,9 @@ int main() {
     vkc::Result<mesh::MarchingCubes> list_mc =
         mesh::MarchingCubes::create(device.value(), allocator.value(), {});
     CHECK(list_mc.ok());
-    vkc::Result<vol::DeviceBlockList> fused =
+    vkc::Result<vol::DeviceBlockList> last =
         list_grid.map().compact_active_blocks_on_device();
-    CHECK(fused.ok() && fused.value().count > 0);
+    CHECK(last.ok() && last.value().count > 0);
     mesh::ExtractTimings t{};
     vkc::Result<mesh::DeviceMesh> dm =
         list_mc.value().extract_device(list_grid, 0.0f, &t);
@@ -1483,15 +1483,15 @@ int main() {
     vkc::Result<mesh::Mesh> listed = list_mc.value().download(dm.value());
     CHECK(listed.ok());
     CHECK(canonical_triangles(listed.value()) == full_tris);
-    CHECK(t.active_blocks == fused.value().count);
-    CHECK(list_grid.map().check_device_block_list(fused.value(), "test").ok());
+    CHECK(t.active_blocks == last.value().count);
+    CHECK(list_grid.map().check_device_block_list(last.value(), "test").ok());
 
     // One block past the cube, never observed, so it adds no surface.
     vol::BlockIndex extra{};
     extra.coord = vr::Vec3i(kBlocks, 0, 0);
     CHECK(list_grid.map().allocate(&extra, 1).value() == 0);
     CHECK(list_mc.value().extract_device(list_grid, 0.0f, &t).ok());
-    CHECK(t.active_blocks == fused.value().count + 1);
+    CHECK(t.active_blocks == last.value().count + 1);
   }
 
   std::printf(
