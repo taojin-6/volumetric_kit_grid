@@ -216,8 +216,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// than a kernel indexing past the end of a buffer bound `VK_WHOLE_SIZE`.
   ///
   /// A write through the view stamps no block `changed` (@ref BlockStamp),
-  /// as the library's own writers do, so an incremental mesh extract after it
-  /// keeps the old triangles: mesh such a grid in full next.
+  /// unlike the library's own writers, so a consumer of the stamps does not
+  /// see it.
   /// @param name  The attribute name (as declared at @ref create).
   /// @return A view of the attribute, or `Status::Code::InvalidArgument` if
   ///         no attribute of that name was declared (or the grid is

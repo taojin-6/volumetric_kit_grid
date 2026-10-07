@@ -99,7 +99,7 @@ void mcResolveNeighbourhood(BlockIndex block, uint tid) {
 //
 // THE cross-block addressing, and one copy of it: both gathers below resolve a
 // corner through here, so the sign-only count and the full gather cannot land on
-// different voxels. They must not, because the count reserves the span the
+// different voxels. They must not, because the count reserves the range the
 // gather writes into.
 bool mcCornerStorage(int bs, ivec3 c, out uint si) {
   si = 0u;
@@ -166,10 +166,10 @@ bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
 //
 // The sign test below is the one line this shares with mcGather by convention
 // rather than by construction, and the two must agree exactly: the count taken
-// here reserves the span mcGather's caller then writes into. Both read
+// here reserves the range mcGather's caller then writes into. Both read
 // `tsdf[si] < pc.iso` over the same quiescent buffer through the same
 // mcCornerStorage, so they can only diverge if the two lines are edited apart --
-// and the emitter bounds its writes to the reserved span, so even that drops
+// and the emitter bounds its writes to the reserved range, so even that drops
 // triangles rather than writing over the next block's.
 int mcCellSigns(int bs, ivec3 base) {
   int cube_index = 0;

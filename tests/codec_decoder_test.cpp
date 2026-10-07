@@ -148,8 +148,7 @@ int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
       CHECK(st.value()[static_cast<std::uint32_t>(b.ptr) / 512u].changed ==
             out.map().tick());
     }
-    // The same frame again leaves every block as it was, and so stamps none:
-    // what lets an incremental extract follow a decoded stream.
+    // The same frame again leaves every block as it was, and so stamps none.
     const std::uint32_t first = out.map().tick();
     CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
     CHECK(out.map().tick() != first);

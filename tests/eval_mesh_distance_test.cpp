@@ -295,8 +295,7 @@ int distance_case() {
   CHECK(s.ok());
   CHECK(near(double(s.value().distance({0.001f, 0.005f, 0.0f})), 0.001, 1e-6));
 
-  // A triangle collapsed to one point is not surface: it is what an
-  // incremental extract retires a triangle to.
+  // A triangle collapsed to one point is not surface.
   sliver.indices = {2, 2, 2};
   vkc::Result<eval::MeshDistance> point =
       eval::MeshDistance::create(sliver, 0.02f);
@@ -395,8 +394,7 @@ int compare_case() {
 }
 
 // Only the surface is measured: vertices no triangle uses, and triangles
-// collapsed to a point, are what an incremental extract leaves behind, and
-// neither is surface.
+// collapsed to a point, are not surface.
 int surface_case() {
   const mesh::Mesh reference = plane(20, 0.005f, 0.0f);
   eval::CompareOptions opt;
