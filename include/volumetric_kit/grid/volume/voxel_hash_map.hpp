@@ -412,9 +412,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief Compact the active blocks inside **any** of @p frusta, leaving the
   ///        list on the device; only its count reaches the host.
   ///
-  /// One scan of the table: each block's world AABB is tested against each
-  /// frustum's six planes and kept unless fully outside one of them (a
-  /// conservative p-vertex test; see @ref make_frustum_planes), so a block
+  /// One scan of the table: each block's world AABB -- its voxels and the
+  /// marching-cubes cells it meshes, which reach a half-voxel past them -- is
+  /// tested against each frustum's six planes and kept unless fully outside
+  /// one of them (a conservative p-vertex test; see @ref make_frustum_planes),
+  /// so a block
   /// several frusta keep is listed once. `tsdf::TsdfIntegrator` fuses the
   /// blocks its cameras reach this way, and `mesh::MarchingCubes` meshes the
   /// blocks a viewing camera sees.

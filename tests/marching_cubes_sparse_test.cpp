@@ -38,6 +38,9 @@
 #include <utility>
 #include <vector>
 
+#include <glm/ext/matrix_clip_space.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -1423,6 +1426,76 @@ int main() {
               .ok());
     CHECK(second.dispatches == 1);
     CHECK(second.emitted_triangles == first.emitted_triangles);
+  }
+
+  // A block's cells reach its neighbour's first voxel, half a voxel past its
+  // own voxels: the view cull keeps a block whose voxels lie behind the near
+  // plane but whose boundary cells do not. A plane at z = 7.75 cm meshes only
+  // in the cells between voxel rows z = 7 and 8 cm, which block z = 0 owns;
+  // its voxels end at 7.5 cm, behind the 7.6 cm near plane, its cells at 8.
+  for (const bool shared : {false, true}) {
+    vol::VoxelGridParams near_gp = gp;
+    near_gp.voxel_size = 0.01f;
+    vkc::Result<vol::VoxelBlockGrid> made = vol::VoxelBlockGrid::create(
+        device.value(), allocator.value(), near_gp, attrs, 2);
+    CHECK(made.ok());
+    vol::VoxelBlockGrid near_grid = std::move(made).value();
+    std::vector<vol::BlockIndex> coords;
+    for (int z = 0; z < 2; ++z) {
+      for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+          vol::BlockIndex b{};
+          b.coord = vr::Vec3i(x, y, z);
+          coords.push_back(b);
+        }
+      }
+    }
+    CHECK(
+        near_grid.map()
+            .allocate(coords.data(), static_cast<std::uint32_t>(coords.size()))
+            .value() == 0);
+    vkc::Result<std::vector<vol::BlockIndex>> live =
+        near_grid.map().compact_active_blocks();
+    CHECK(live.ok());
+    const int bs = near_gp.block_size;
+    std::vector<float> tsdf(
+        static_cast<std::size_t>(near_gp.num_blocks) * near_gp.voxels_per_block,
+        0.0f);
+    std::vector<float> weights = tsdf;
+    for (const vol::BlockIndex& b : live.value()) {
+      for (int z = 0; z < bs; ++z) {
+        for (int y = 0; y < bs; ++y) {
+          for (int x = 0; x < bs; ++x) {
+            const auto i = static_cast<std::size_t>(b.ptr) +
+                           static_cast<std::size_t>(x + bs * (y + bs * z));
+            tsdf[i] = 0.0775f - static_cast<float>(b.coord.z * bs + z) *
+                                    near_gp.voxel_size;
+            weights[i] = 1.0f;
+          }
+        }
+      }
+    }
+    CHECK(write_attributes(ctx, near_grid, tsdf, weights));
+    // gfx's convention, depth in [0, 1]; the eye at z = 2.6 cm, near 5 cm.
+    const vr::Mat4f view_proj =
+        glm::perspectiveLH_ZO(glm::radians(90.0f), 1.0f, 0.05f, 2.0f) *
+        glm::translate(vr::Mat4f(1.0f), vr::Vec3f(-0.04f, -0.04f, -0.026f));
+    mesh::MarchingCubesConfig config;
+    config.share_vertices = shared;
+    vkc::Result<mesh::MarchingCubes> near_mc =
+        mesh::MarchingCubes::create(device.value(), allocator.value(), config);
+    CHECK(near_mc.ok());
+    vkc::Result<mesh::Mesh> whole =
+        near_mc.value().extract_host(near_grid, 0.0f);
+    CHECK(whole.ok() && whole.value().triangle_count() > 0);
+    vkc::Result<vol::DeviceBlockList> in_view =
+        near_grid.map().compact_active_blocks_in_frusta_on_device(
+            {vol::make_frustum_planes(view_proj, 0.25f)});
+    CHECK(in_view.ok());
+    vkc::Result<mesh::DeviceMesh> culled =
+        near_mc.value().extract_device(near_grid, 0.0f, in_view.value());
+    CHECK(culled.ok());
+    CHECK(culled.value().triangle_count == whole.value().triangle_count());
   }
 
   // A full extract binds the map's device list, reusing the compaction the
