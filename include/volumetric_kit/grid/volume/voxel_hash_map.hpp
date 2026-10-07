@@ -677,8 +677,9 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// Record what @p dispatches records each round, re-dispatching while the
   /// shared `fail_counts_[kFailTotal]` tally is
-  /// non-zero, to converge past transient same-bucket lock contention, until a
-  /// capacity limit stops progress or the rounds run out. Re-zeroes the tally
+  /// non-zero, to converge past transient same-bucket lock contention, until
+  /// only capacity failures are left, a capacity limit stops progress, or the
+  /// rounds run out. Re-zeroes the tally
   /// each round. The shared tail of every allocate/remove kernel.
   /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
   /// added to the returned count; @p out_failures, when non-null, receives the
