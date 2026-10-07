@@ -398,9 +398,11 @@ core::Status VoxelHashMap::rebuild_heap_excluding(
 // many new blocks, as depth's first frame does. Already-processed elements
 // take the lock-free fast path on the next round (allocate / depth / points)
 // or are skipped by their done flag (remove), so contention falls and the set
-// converges. Only a genuine capacity limit (chain full / heap empty / table
-// full) that stops progress for kStallLimit rounds ends the loop early;
-// contention alone never does, since another round is what resolves it.
+// converges. A round that failed only on capacity (chain full / heap empty /
+// table full) ends the loop, as insert_block ends its attempts; one with
+// contention as well ends it once the capacity limit stops progress for
+// kStallLimit rounds. Contention alone never does, since another round is
+// what resolves it.
 // Mirrors the prior engine's launchWithRetry.
 //
 // fail_counts_[kFailTotal] is the shared *retryable* tally, split by reason
@@ -452,7 +454,9 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     if (out_failures != nullptr) {
       *out_failures = reported;
     }
-    if (failures == 0) {
+    // Done, or only capacity failures are left: nothing frees a block or a
+    // slot between rounds, so the next would fail them again.
+    if (failures == 0 || reported.lock == 0) {
       break;
     }
     if (failures < prev_failures) {
