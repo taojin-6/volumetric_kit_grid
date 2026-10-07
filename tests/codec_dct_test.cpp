@@ -1217,8 +1217,8 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
 }
 
 // The inverse stamps changed only on a block it leaves different, as the
-// integrator does, so decoding a block's last frame again leaves it to an
-// incremental extract.
+// integrator does, so decoding a block's last frame again leaves it
+// unstamped.
 int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
                         DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};

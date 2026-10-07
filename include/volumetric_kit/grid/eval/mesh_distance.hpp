@@ -23,11 +23,9 @@
 /// points within it of the test, and F their harmonic mean.
 ///
 /// **What counts as surface:** every triangle but one whose three corners are
-/// a single point. That has no extent, and it is what
-/// `mesh::MarchingCubes::extract_device_incremental` retires a triangle to.
-/// The points measured are the vertices the surface's triangles use, so a
-/// vertex no triangle references -- one an incremental extract left
-/// unreachable -- is not measured either.
+/// a single point, which has no extent. The points measured are the vertices
+/// the surface's triangles use, so a vertex no triangle references is not
+/// measured either.
 ///
 /// Host-side and deterministic: the figures depend on the meshes' geometry,
 /// never on the order of their vertices or triangles, a `stride` subsample

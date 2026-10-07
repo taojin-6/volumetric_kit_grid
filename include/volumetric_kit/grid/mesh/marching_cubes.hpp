@@ -10,8 +10,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <type_traits>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -64,13 +62,12 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 /// had to refit and re-run, and @ref arena_bytes is what the extractor is
 /// holding across the whole ring.
 struct ExtractTimings {
-  /// Compacting the hash map's active block list (a dispatch + readback), near
-  /// zero when the map's last device list still holds (spans off).
+  /// Compacting the hash map's active block list on the device, near zero
+  /// when the map's last device list still holds.
   double compact_ms = 0.0;
-  /// With a host list (the spans on, or a caller's subset), allocating the
-  /// active-block input buffer and staging the list, whose copy runs in
-  /// @ref dispatch_ms's submit. Near zero otherwise: the device list is bound
-  /// in place.
+  /// With a caller's subset, allocating the active-block input buffer and
+  /// staging the list, whose copy runs in @ref dispatch_ms's submit. Near zero
+  /// otherwise: the device list is bound in place.
   double input_upload_ms = 0.0;
   /// Sizing the vertex arena + recording the draw command's reset, which runs
   /// in @ref dispatch_ms's submit, including a refit after an undersized guess
@@ -78,21 +75,13 @@ struct ExtractTimings {
   /// identity here, on its own. Near zero once the
   /// retained arena already fits the call -- the steady state, since the arena
   /// is reused across extracts (see @ref MarchingCubes).
-  ///
-  /// Also carries the per-block span table's upkeep when
-  /// @ref MarchingCubesConfig::track_block_spans is on: growing it *and*
-  /// stamping the active set at the end of a successful extract. The stamping
-  /// is O(active blocks) of host work with no dispatch of its own, so it
-  /// belongs to a phase or it belongs to no row at all -- and @ref total_ms
-  /// sums these six rather than measuring the call, so a row it is outside of
-  /// is time nothing reports.
   double arena_alloc_ms = 0.0;
   /// Writing the kernel's descriptor bindings.
   double descriptor_ms = 0.0;
   /// Each attempt's submit, including the blocking fence wait: a host active
   /// list's copy and the command reset, the marching-cubes dispatch, and the
-  /// command's readback, with the span table's when it is tracked -- summed
-  /// over both when a refit forced a second one (@ref dispatches).
+  /// command's readback -- summed over both when a refit forced a second one
+  /// (@ref dispatches).
   double dispatch_ms = 0.0;
   /// Getting the result back to the caller: the vertex copy into the host mesh
   /// when one is made. @ref MarchingCubes::extract_host makes one; @ref
@@ -103,30 +92,6 @@ struct ExtractTimings {
   /// Active blocks meshed -- the dispatch's real size (occupancy, not the
   /// map's capacity).
   std::uint32_t active_blocks = 0;
-  /// Whether this call re-meshed only the changed blocks, or fell back to a
-  /// full extract.
-  ///
-  /// `false` for every @ref MarchingCubes::extract_device call, and for an
-  /// @ref MarchingCubes::extract_device_incremental one that could not make
-  /// the trade soundly -- the first extract against a grid, a topology change,
-  /// a preceding culled extract, a
-  /// @ref MarchingCubesConfig::slot_count above one, an arena that had to
-  /// grow, or an iso other than the last extract's. Each of those is
-  /// invisible to the caller and each turns the feature off *permanently*
-  /// (a config flag) or *silently* (a fallback), so the answer is reported
-  /// rather than left to be inferred: @ref dispatches counts refit rounds and
-  /// reads 1 on both paths, so it cannot be read as this.
-  bool incremental = false;
-  /// Blocks this call actually re-meshed, counted on-device.
-  ///
-  /// Meaningful only while @ref incremental is `true`; a full pass re-meshes
-  /// its whole @ref active_blocks and reports 0 here rather than paying an
-  /// atomic per workgroup to restate that. `remeshed_blocks / active_blocks`
-  /// is the fraction of the surface the fuse actually moved, dilated into the
-  /// `+{0,1}^3` neighbourhood the kernel has to redo -- which is the number
-  /// the whole feature trades against, and one no caller can compute (the
-  /// dilation happens on-device, off shared memory the host never sees).
-  std::uint32_t remeshed_blocks = 0;
   /// Marching-cubes dispatches this call ran: 1 in the steady state, 2 when
   /// the planned capacity was under what the field emitted, so the arena was
   /// refitted to the measured count and the surface re-run. A run that keeps
@@ -167,13 +132,6 @@ struct ExtractTimings {
   /// ~48 B/triangle against the run's 12 B, so leaving the run out would
   /// under-report resident output memory by ~20% -- on the instrument the
   /// ring's runaway growth was diagnosed with.
-  ///
-  /// Under @ref MarchingCubesConfig::track_block_spans it also includes
-  /// **every** part of the span table -- the device-side spans, and the
-  /// host-side copy and stamps beside them, 40 bytes per block between them,
-  /// sized by the grid rather than the surface. Counting one and not the
-  /// others under-reports that feature, which is the same defect as leaving
-  /// the index runs out.
   std::uint64_t arena_bytes = 0;
 
   /// @return The sum of every phase, in milliseconds.
@@ -237,7 +195,7 @@ struct ExtractTimings {
 // Placement: every buffer this tier hands out -- arena, index run and draw
 // command -- is device-local, as a renderer binding them wants, and the host
 // reaches them only through a CommandBatch (the 2026-09-28 residency
-// decision). The span table is the exception: its reader is the host.
+// decision).
 struct MarchingCubesConfig {
   /// Added to the vertex arena's usage, beyond `STORAGE_BUFFER` and the
   /// transfer bits every buffer here carries.
@@ -359,76 +317,13 @@ struct MarchingCubesConfig {
   ///       `Device`Mesh, the other being a consumer that needs to know
   ///       whether `v = 3t` when it sizes an arena.
   ///
-  /// @note @ref MarchingCubes::extract_device_incremental runs under this. It
-  ///       used to fall back to a full extract, on the grounds that a relocated
-  ///       block can only retire what it leaves behind while it owns its
-  ///       vertices three-per-triangle. That reads the cost backwards: this
-  ///       kernel owns its index run, so it retires a dead triangle in 12 bytes
-  ///       against the default kernel's 192, and the dead vertices need no
-  ///       retiring at all because in-block sharing leaves them unreachable
-  ///       once no triangle names them. What it does need is both counts
-  ///       fitting before a block reuses its ranges in place, since the two are
-  ///       reserved independently and a triangle indexes into the vertex range
-  ///       beside it.
-  ///
   /// @note Refused per *extract*, not at @ref MarchingCubes::create, for a grid
   ///       whose `voxels_per_block` exceeds 512 -- the sharing kernel's shared
   ///       per-cell table is sized for `block_size` 8, the only shape any
   ///       in-tree caller uses, and the block size arrives with the grid rather
   ///       than with this config. Every extract entry point reports it.
   bool share_vertices = false;
-
-  /// @brief Publish @ref MarchingCubes::block_spans -- where each block's
-  ///        geometry landed -- for every @ref MarchingCubes::extract_device
-  ///        entry point.
-  ///
-  /// Off by default because it is not free and most callers never read it. The
-  /// table is sized by the **grid**, not by the surface: `num_blocks` entries
-  /// of 16 bytes, which is 24 MB for a heap of 1.5 M blocks and
-  /// doubles with every @ref volume::VoxelHashMap::resize, held for this
-  /// object's lifetime. The host keeps a copy of it, another 16 bytes per
-  /// block, and an array of the same length carries the per-slot stamp
-  /// @ref MarchingCubes::block_span_valid answers from, for another 8; all
-  /// three are counted in
-  /// @ref ExtractTimings::arena_bytes, so the figure there is what the feature
-  /// actually costs rather than the visible half of it. With this off the
-  /// kernel is told not to write the table, nothing is allocated, and the
-  /// per-block stamping loop does not run, so a caller who did not ask measures
-  /// nothing.
-  ///
-  bool track_block_spans = false;
 };
-
-/// @brief Where one block's geometry landed in the extract that meshed it.
-///
-/// Counted in vertices and in TRIANGLES -- not indices -- because a triangle is
-/// what a block owns and what a re-mesh replaces; multiply by
-/// @ref kIndicesPerTriangle for the index run. The four numbers are independent
-/// under @ref MarchingCubesConfig::share_vertices and locked at `v = 3t`
-/// without it, which is exactly the ratio sharing breaks.
-///
-/// Mirrored field-for-field by the `BlockSpan` of
-/// `shaders/marching_cubes_block_span.glsl`, which both sparse kernels write
-/// **by field name**. The offsets below pin that ABI: four same-typed members
-/// make every permutation the same size, so `sizeof` alone cannot see a
-/// transposition (see the 2026-07-05 scalar-block-layout decision).
-struct BlockSpan {
-  std::uint32_t vertex_base = 0;     ///< First vertex the block owns.
-  std::uint32_t vertex_count = 0;    ///< Vertices it owns from there.
-  std::uint32_t triangle_base = 0;   ///< First **triangle**, not index.
-  std::uint32_t triangle_count = 0;  ///< Triangles it owns from there.
-};
-static_assert(sizeof(BlockSpan) == 16, "BlockSpan must be 16 bytes");
-static_assert(offsetof(BlockSpan, vertex_base) == 0, "BlockSpan ABI");
-static_assert(offsetof(BlockSpan, vertex_count) == 4, "BlockSpan ABI");
-static_assert(offsetof(BlockSpan, triangle_base) == 8, "BlockSpan ABI");
-static_assert(offsetof(BlockSpan, triangle_count) == 12, "BlockSpan ABI");
-// Each extract reads the kernel's table back into an array of these byte for
-// byte, which is defined only for a trivially copyable standard-layout type.
-static_assert(std::is_standard_layout_v<BlockSpan>,
-              "BlockSpan must be standard layout");
-static_assert(std::is_trivially_copyable_v<BlockSpan>,
-              "BlockSpan must be trivially copyable");
 
 /// @brief Owns the marching-cubes compute pipelines and extracts an iso-surface
 ///        straight off a sparse @ref volume::VoxelBlockGrid -- into a host
@@ -445,9 +340,9 @@ static_assert(std::is_trivially_copyable_v<BlockSpan>,
 /// - **Live** -- @ref extract_device returns a borrowed `Device`Mesh the
 ///   renderer draws straight out of, with no host round trip, and the caller
 ///   releases slots by generation through @ref release_through as its frames
-///   retire. @ref extract_device_incremental and the
-///   @ref volume::BlockList overload are modes of this one, not separate
-///   workflows. @ref download bridges the two for a caller that wants both.
+///   retire. The @ref volume::BlockList overload is a mode of this one, not
+///   a separate workflow. @ref download bridges the two for a caller that
+///   wants both.
 ///
 /// The split is the destination, which is why the return types differ:
 /// @ref Mesh owns its vertices, `Device`Mesh names buffers this extractor
@@ -461,18 +356,10 @@ static_assert(std::is_trivially_copyable_v<BlockSpan>,
 ///
 /// - The kernel runs one workgroup per active block, which
 ///   counts the block's output, reserves one range for all of it with a single
-///   atomic, and only then writes. A block's triangles therefore land
-///   **contiguously** in the arena rather than interleaved with every other
-///   block's in flight. That is the precondition for meshing only the blocks a
-///   fuse changed -- with an interleaved arena there is no range to leave in
-///   place -- and it costs ~10% on the dispatch, taken deliberately (see the
-///   2026-08-09 incremental-extraction decision). **Both** sparse kernels do
-///   it: @ref MarchingCubesConfig::share_vertices selects one that reserves two
-///   ranges rather than one, since a shared vertex breaks `v = 3t`, and it
-///   measured no cost there. Either range is published as
-///   @ref block_spans when @ref MarchingCubesConfig::track_block_spans asks for
-///   it, which is how a caller outside the extractor indexes a block's
-///   geometry.
+///   atomic, and only then writes, so a block's triangles land
+///   **contiguously** in the arena. @ref MarchingCubesConfig::share_vertices
+///   selects a kernel that reserves two ranges rather than one, since a shared
+///   vertex breaks `v = 3t`.
 ///
 /// Normals come from the SDF gradient -- one
 /// central difference over the cell's eight corners, shared by that cell's
@@ -500,16 +387,6 @@ static_assert(std::is_trivially_copyable_v<BlockSpan>,
 //
 // TODO(mesh): shared-edge vertex dedup, so the index buffer stops being the
 // identity run and the arena shrinks toward the unique-vertex count.
-// TODO(mesh): extend incremental extraction past
-// MarchingCubesConfig::slot_count
-// == 1. @ref extract_device_incremental refuses a ring, because a re-meshed
-// block writes into the arena the LAST extract filled and a ring hands this one
-// a different slot -- so the clean blocks' triangles are in the wrong buffer.
-// The two ways out are to reuse a block's range only for slots the consumer has
-// released through @ref release_through, or to copy the retained run forward
-// into the newly claimed slot (a vkCmdCopyBuffer of `watermark * 3` vertices).
-// Until then the feature is off in exactly the configuration seam B uses, which
-// is why @ref ExtractTimings::incremental exists to say so.
 
 class VR_MESH_API MarchingCubes {
  public:
@@ -527,121 +404,6 @@ class VR_MESH_API MarchingCubes {
   static core::Result<MarchingCubes> create(
       core::Device& device, core::Allocator& allocator,
       const MarchingCubesConfig& config = {});
-
-  /// @brief Where the last successful sparse extract put each block's geometry.
-  ///
-  /// Indexed by **block slot** -- `volume::BlockIndex::ptr / voxels_per_block`
-  /// -- and meaningful only for the blocks in the active set of the extract
-  /// that wrote it. A slot means nothing against a different grid, and nothing
-  /// after a `remove()` or `clear()`: the block heap is LIFO, so a reused slot
-  /// names a different block.
-  ///
-  /// A host copy of the kernel's device-only table, read back by each extract.
-  ///
-  /// @warning **Every entry reads as a well-formed span, including the ones
-  ///          this extract did not write.** Nothing is cleared on the way past:
-  ///          a grow copies the whole existing table forward (a
-  ///          `volume::VoxelHashMap::resize` preserves block indices, so those
-  ///          spans are still true) and zeroes only the tail it added, so a
-  ///          slot the last extract did not mesh holds whatever an *earlier*
-  ///          one left there -- bases into an arena that has since been
-  ///          rewritten, and possibly reallocated. There is no value here that
-  ///          means "not mine", and an empty span does not: that is what a
-  ///          block which meshed and emitted nothing writes.
-  ///
-  /// So this array is not something to iterate and interpret. Read it only at
-  /// slots @ref block_span_valid has answered `true` for, having first checked
-  /// @ref block_spans_generation against the `Device`Mesh::generation whose
-  /// arena you are about to index. Those two questions are the contract; this
-  /// pointer is only how the answer is fetched.
-  ///
-  /// @warning **Borrowed, and invalidated by the next @ref extract_host or
-  ///          @ref extract_device on this object** -- exactly like a
-  ///          `Device`Mesh, and for the same reason: a grid whose
-  ///          `num_blocks` grew reallocates this table, which frees the pages
-  ///          this points at. Do not cache the pointer across a call. Compare
-  ///          @ref block_spans_generation against the
-  ///          `Device`Mesh::generation you hold to know whether the table
-  ///          still describes *your* mesh -- above one
-  ///          @ref MarchingCubesConfig::slot_count it will not, because the
-  ///          arena is per slot and this table is not.
-  ///
-  /// @return `block_span_capacity()` entries, or `nullptr` when
-  ///         @ref MarchingCubesConfig::track_block_spans is off, on a
-  ///         moved-from extractor, before the first extract, or when the
-  ///         last extract did not leave a table describing it
-  ///         -- a failed one, or one that meshed nothing.
-  const BlockSpan* block_spans() const noexcept;
-
-  /// @brief Entries @ref block_spans addresses.
-  ///
-  /// Derived from the buffer rather than tracked beside it, so the count and
-  /// the pointer cannot disagree -- including on a moved-from extractor, where
-  /// the defaulted move leaves both empty.
-  std::uint32_t block_span_capacity() const noexcept {
-    return static_cast<std::uint32_t>(block_spans_.size() / sizeof(BlockSpan));
-  }
-
-  /// @brief The generation @ref block_spans describes, or 0 if it describes
-  ///        nothing.
-  ///
-  /// The same counter `Device`Mesh::generation carries, so the two are
-  /// directly comparable: a consumer holding generation `g` learns that the
-  /// table is about some *other* extract the moment this stops equalling `g`.
-  /// There is one table for the whole ring -- it is one dispatch's worth of
-  /// state, not a mesh a consumer still holds -- so at
-  /// @ref MarchingCubesConfig::slot_count above one this is the check that
-  /// keeps a span from being read against the wrong slot's arena.
-  std::uint64_t block_spans_generation() const noexcept {
-    return block_spans_generation_;
-  }
-
-  /// @brief Does slot @p slot carry a span **the extract that wrote the current
-  ///        table** put there?
-  ///
-  /// Not "has this slot ever been meshed". A block that drops out of the active
-  /// set keeps the stamp its last extract wrote, and the span under it goes on
-  /// naming an arena range later extracts have handed to other blocks, so the
-  /// question has to be about the *published* table or the answer is worse than
-  /// useless. False for such a slot, false for one no extract has meshed, and
-  /// false for **every** slot once the anchor breaks -- a different grid, or a
-  /// `remove()` / `clear()` that moved @ref
-  /// volume::VoxelBlockGrid::topology_epoch. The heap is LIFO, so a reused slot
-  /// names a different block and its span would otherwise be read as that
-  /// block's geometry, under `Status::ok`.
-  ///
-  /// A `resize()` does **not** break it: resizing preserves block indices, so
-  /// the spans stay true and the table simply grows.
-  ///
-  /// Takes the grid rather than trusting the caller to re-extract after a
-  /// topology change: between a `remove()` and the next extract the stamps are
-  /// still set, so a query that did not re-check the anchor would report a
-  /// stale span as live. That is a staleness the caller cannot see, which makes
-  /// it this tier's to check (the 2026-08-04 rule). It holds however the
-  /// topology moved -- @ref volume::VoxelBlockGrid::remove and the raw @ref
-  /// volume::VoxelHashMap::remove reached through @ref
-  /// volume::VoxelBlockGrid::map both move the token, since it belongs to the
-  /// table that frees the index.
-  ///
-  /// @warning This is the per-*slot* half of the question and **not the whole
-  ///          of it.** It answers false whenever @ref block_spans_generation is
-  ///          0, so it can never report a slot live while @ref block_spans
-  ///          returns `nullptr` -- but it does not know which
-  ///          `Device`Mesh *you* hold. There is one table for the whole
-  ///          ring, so above one @ref MarchingCubesConfig::slot_count a
-  ///          consumer still drawing generation `g` will find this `true` for a
-  ///          table describing `g+1`'s arena. Check `block_spans_generation()
-  ///          == your_mesh.generation` first; only then does a per-slot answer
-  ///          mean anything.
-  ///
-  /// Always false when @ref MarchingCubesConfig::track_block_spans is off, on a
-  /// moved-from extractor, and for a moved-from @p grid -- which owns no blocks
-  /// however the token reads.
-  ///
-  /// @param grid The grid the spans are expected to describe.
-  /// @param slot `volume::BlockIndex::ptr / voxels_per_block`.
-  bool block_span_valid(const volume::VoxelBlockGrid& grid,
-                        std::uint32_t slot) const noexcept;
 
   /// @brief Report that every mesh up to and including @p generation has been
   ///        read, so its slot may be written again.
@@ -764,91 +526,6 @@ class VR_MESH_API MarchingCubes {
                                   float iso = 0.0f,
                                   ExtractTimings* timings = nullptr);
 
-  /// @brief Extract, re-meshing only the blocks changed since this
-  ///        extractor's last extract.
-  ///
-  /// "Changed" is the block's `changed` stamp (@ref volume::BlockStamp), which
-  /// every pass that writes voxels stamps with the map's tick after advancing
-  /// it. This extractor keeps the tick its last publishing extract ran at, so
-  /// it re-meshes exactly what was written since, however many fuses ran
-  /// between, and nothing has to be reset. A caller writing voxels any other
-  /// way, through @ref volume::VoxelBlockGrid::attribute, stamps nothing, so
-  /// its next extract after such a write must be a full @ref extract_device.
-  ///
-  /// The blocks whose `+{0,1}^3` neighbourhood carries no change keep the
-  /// triangles they already have, at the offsets @ref block_spans already
-  /// names, and cost one workgroup that returns before gathering a single
-  /// corner. A changed block re-meshes into the range it already owns when the
-  /// new count fits, and appends past the watermark when it does not.
-  ///
-  /// **Falls back to a full extract**, silently and by design, whenever an
-  /// incremental one would be wrong rather than merely slower. Falling back
-  /// rather than refusing is the point: a caller fusing a live scan cannot
-  /// predict a topology change, and the correct response to one is to re-mesh
-  /// everything, not to fail. The full list, every entry of which is something
-  /// the caller cannot see:
-  ///
-  /// - the first extract against a grid, which is what *establishes* the
-  ///   arena and spans an incremental pass reads;
-  /// - an @p iso other than the last extract's, whose surface every kept
-  ///   block's triangles lie on;
-  /// - a `remove()`/`clear()` since then, which hands a block slot to a
-  ///   different block, so the span table's anchor no longer matches the
-  ///   grid;
-  /// - an arena that has to grow for this call, since a grow reallocates and
-  ///   nothing copies the clean blocks' triangles forward;
-  /// - an overflow refit, whose retry has already lost the pre-call spans;
-  /// - an arena whose occupancy has drifted too far past its live surface,
-  ///   where a full pass is what compacts the retired triangles away;
-  /// - @ref MarchingCubesConfig::slot_count above one (see the `TODO(mesh)`
-  ///   above this class), since the retained triangles are in the slot the
-  ///   *last* extract filled and a ring hands this one a different slot;
-  /// - a **preceding culled extract** -- the
-  ///   @ref extract_device(volume::VoxelBlockGrid&, float,
-  ///   const volume::BlockList&, ExtractTimings*) overload -- which rebuilt the
-  ///   arena from the blocks the caller named and so wrote spans for only
-  ///   those. Every other block still holds a range describing the arena that
-  ///   pass replaced, which is exactly what an incremental one would re-mesh
-  ///   against, so a culled pass publishes no state for the next call to trust.
-  ///   Alternating the two entry points is therefore *safe* and costs one full
-  ///   extract per switch; it is not a combination to avoid.
-  ///
-  /// Which one it got is reported as @ref ExtractTimings::incremental, beside
-  /// the @ref ExtractTimings::remeshed_blocks that says how much it saved.
-  ///
-  /// @warning An in-place re-mesh writes bytes an outstanding generation may
-  ///          still be drawing. Every index stays in range and every vertex
-  ///          stays a real vertex, so this is not a memory error -- but a
-  ///          consumer holding a `Device`Mesh across the call can catch one
-  ///          block mid-update. That is the trade this overload exists to make
-  ///          measurable; @ref extract_device is unchanged and does not make
-  ///          it.
-  ///
-  /// Runs under @ref MarchingCubesConfig::share_vertices, which reuses **two**
-  /// ranges rather than one: a triangle indexes into the vertex range beside
-  /// it, so a block reuses in place only when *both* counts fit and relocates
-  /// both when either does not. Retirement is cheaper there, not dearer -- that
-  /// kernel owns its index run, so a dead triangle is retired by pointing its
-  /// three indices at one vertex (12 bytes, zero area, culled before
-  /// rasterisation), where the default kernel's run is the identity it cannot
-  /// touch and it must overwrite 192 bytes of vertices to say the same thing.
-  /// The dead *vertices* need no writing at all: sharing is in-block, so once
-  /// no triangle references them they are unreachable rather than merely
-  /// unused.
-  ///
-  /// @param grid     The sparse volume to mesh, as @ref extract_device takes
-  ///                 it.
-  /// @param iso      The iso-value to extract at (0 for a TSDF surface).
-  /// @param timings  Optional; filled as @ref extract_device fills it, plus
-  ///                 @ref ExtractTimings::incremental and
-  ///                 @ref ExtractTimings::remeshed_blocks.
-  /// @return The mesh in this extractor's device buffers, borrowed exactly as
-  ///         @ref extract_device's is, or that overload's `Status` on any
-  ///         of the failures it can report.
-  core::Result<DeviceMesh> extract_device_incremental(
-      volume::VoxelBlockGrid& grid, float iso = 0.0f,
-      ExtractTimings* timings = nullptr);
-
   /// @brief Extract as @ref extract_host does, but leave the result in this
   ///        extractor's device buffers instead of copying it to the host.
   ///
@@ -899,11 +576,10 @@ class VR_MESH_API MarchingCubes {
   /// @note "No live bytes", not "no bytes". The arena is retained and
   ///       grow-only (see the @ref MarchingCubes note on the ring), so culling
   ///       lowers what the arena *holds*, never what it has already reserved:
-  ///       one full extract -- a warm-up frame, a pose that is not ready yet,
-  ///       or any of the documented fallbacks above -- sizes it for the whole
-  ///       active set and it stays that size. Cull from the first extract to
-  ///       get the resident figure, and read @ref ExtractTimings::arena_bytes
-  ///       rather than assuming it.
+  ///       one full extract -- a warm-up frame, or a pose that is not ready
+  ///       yet -- sizes it for the whole active set and it stays that size.
+  ///       Cull from the first extract to get the resident figure, and read
+  ///       @ref ExtractTimings::arena_bytes rather than assuming it.
   ///
   /// @note Two @ref ExtractTimings rows do **not** shrink with the set, so the
   ///       cull will look partly ineffective if they are read as if they did:
@@ -925,28 +601,14 @@ class VR_MESH_API MarchingCubes {
   ///       upload, this dispatch, the arena, and whatever draws or textures the
   ///       result.
   ///
-  /// @warning Deliberately **not** offered on @ref
-  ///          extract_device_incremental, and the two do not compose today: an
-  ///          incremental pass keeps the triangles of every block it does not
-  ///          re-mesh, and a block outside @p blocks is simply not dispatched,
-  ///          so it would keep its geometry below the watermark and go on being
-  ///          drawn. That is not wrong, but it gives back the arena and draw
-  ///          savings and leaves only the dispatch one -- so the two are kept
-  ///          as separate answers to the same cost rather than stacked.
-  ///          *Alternating* them across calls is safe: this overload publishes
-  ///          no arena state, so the next incremental request falls back to a
-  ///          full extract and says so (see @ref extract_device_incremental's
-  ///          fallback list).
-  ///
   /// @warning @p blocks must not name the same block twice. Nothing checks it
   ///          -- a duplicate is something the caller can see and a set-wise
   ///          test is O(count) of host work per frame -- and the consequence is
   ///          silent: one workgroup is dispatched per entry, each reserves its
   ///          own arena range, so the block's surface is emitted twice
-  ///          (coincident geometry, z-fighting, double the arena) and the two
-  ///          race to write its span, leaving the loser's range live but
-  ///          undescribed. The internal producers cannot emit one; a caller
-  ///          unioning two cameras' compactions must merge them first.
+  ///          (coincident geometry, z-fighting, double the arena). The
+  ///          internal producers cannot emit one; a caller unioning two
+  ///          cameras' compactions must merge them first.
   ///
   /// @param grid     The sparse volume to mesh, as @ref extract_device takes
   ///                 it.
@@ -987,10 +649,6 @@ class VR_MESH_API MarchingCubes {
   // unquantified. fuse_viewer is the natural one and needs its render camera
   // published across the fusion-thread boundary; the scanner that motivates it
   // lives in volumetric_kit_ios.
-  // TODO(mesh): does not compose with extract_device_incremental. Alternating
-  // them is safe (a culled pass publishes no arena state, so the next
-  // incremental one falls back), but a pass that is both culled AND incremental
-  // would need the retained triangles of the blocks it did not dispatch.
   core::Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid,
                                           float iso,
                                           const volume::BlockList& blocks,
@@ -1045,120 +703,6 @@ class VR_MESH_API MarchingCubes {
   // push flag tells the kernel to ignore it). Mirrors the tsdf integrator's
   // color dummy.
   core::Buffer color_dummy_;
-  // Per-block spans, indexed by block slot (`BlockIndex::ptr /
-  // voxels_per_block`) and sized to the grid's `num_blocks`. Grown on demand,
-  // never shrunk, and NOT per slot: it describes where the *current* extract
-  // put each block, which is one dispatch's worth of state rather than a mesh a
-  // consumer still holds. Allocated only when config_.track_block_spans is on;
-  // otherwise the kernel is told not to write it and block_spans_dummy_ keeps
-  // the binding valid. Device-only, as every kernel buffer is.
-  core::Buffer block_spans_;
-  // The host's copy of block_spans_, block_span_capacity() entries, allocated
-  // with it: each dispatch reads back every slot it can write, and an
-  // incremental extract uploads the entries it clears. What block_spans()
-  // returns and the live sum walks. A unique_ptr for the reason span_stamp_
-  // below is one.
-  std::unique_ptr<BlockSpan[]> span_host_;
-  // A 1-element stand-in bound at the span binding when tracking is off, so
-  // that descriptor stays valid without paying num_blocks * 16 bytes for a
-  // table nobody asked for. Mirrors color_dummy_ above, and the `write_spans`
-  // push flag is what keeps the kernel off it.
-  core::Buffer block_spans_dummy_;
-  // The generation block_spans_ describes; 0 when it describes nothing. Set
-  // only once an extract has succeeded, and cleared by anything that leaves the
-  // table not describing the mesh this object last handed out -- a failed
-  // extract, or one that meshed nothing. Comparable against
-  // DeviceMesh::generation, which is the point: it is what makes the one table
-  // safe to read beside a ring of arenas.
-  std::uint64_t block_spans_generation_ = 0;
-  // What `block_spans_` is anchored to: the
-  // volume::VoxelHashMap::topology_epoch token of the map whose slots the spans
-  // are keyed by. A slot only names a block against one table at one topology,
-  // and the block heap is LIFO, so after a remove() a reused slot names a
-  // DIFFERENT block and every span keyed by it is a lie that still typechecks.
-  //
-  // ONE token and no grid pointer beside it, because the token is drawn from a
-  // process-wide counter: no two grids, and no two topologies of one grid, ever
-  // share one, so equality here already means "the same grid, unchanged". A
-  // pointer would be strictly worse than redundant -- this class hands out no
-  // way to un-anchor and must never dereference a borrowed grid, so a grid
-  // destroyed after an extract leaves a dangling address that the next grid
-  // built in that storage matches exactly.
-  //
-  // Where block_spans_generation_ retires the WHOLE table when it stops
-  // describing the mesh this object handed out, this retires individual slots
-  // that no longer name the block their span was written for. Both are needed:
-  // the first is about which extract the table belongs to, the second about
-  // which block a slot means.
-  std::uint64_t span_epoch_ = 0;
-  // Which extract wrote each slot's span, as a value of `span_serial_`, which
-  // is bumped once per sparse extract that reaches ensure_block_spans. A stamp
-  // is live only while it EQUALS the current serial: nothing clears a stamp, so
-  // "non-zero" would mean "ever meshed" and report a block dropped from the
-  // active set as still described by a table rewritten since. Zero is "never
-  // written", which no serial equals.
-  //
-  // block_span_capacity() entries -- read off `block_spans_` rather than stored
-  // beside it, so the length cannot outlive the buffer it parallels (a count
-  // kept in a member survives a move that empties the buffer). Null unless
-  // config_.track_block_spans is on: this is num_blocks * 8 bytes of HOST
-  // memory (12 MB for a heap of 1.5 M blocks), so it falls under the same
-  // "nothing measured for a caller who did not ask" rule as the table it
-  // describes.
-  //
-  // A unique_ptr and deliberately not a std::vector: the defaulted moves below
-  // promise a self-move leaves this object intact, and vector's self-move-
-  // assignment is unspecified (libc++ empties it), which would leave valid()
-  // true beside a stamp array that reports every slot dead. unique_ptr's
-  // assignment is specified as release-then-reset, which is self-safe.
-  std::unique_ptr<std::uint64_t[]> span_stamp_;
-  std::uint64_t span_serial_ = 0;
-  // What the retained arena holds, from the extract that last published a mesh
-  // out of it -- and the ONLY thing an incremental extract is allowed to trust
-  // about the arena's existing contents.
-  //
-  // One struct rather than three members because the three are only ever
-  // meaningful together, and every path that invalidates one invalidates all
-  // three: a default-constructed value is "no incremental state", which is what
-  // makes the next extract a full one. It is cleared at the top of
-  // extract_device_impl -- which every entry point funnels through, so there
-  // is one clear site and a new entry point that bypasses it would need its
-  // own -- beside block_spans_generation_ and for the same reason: every
-  // extract claims the same slot, and there are several ways down from there
-  // that publish nothing -- and re-established only on the publishing return,
-  // so no failure can leave it describing geometry the failed call destroyed.
-  //
-  // Scalars throughout, so they survive a self-move like every other member.
-  struct ArenaState {
-    // Triangles the arena holds, so the next incremental pass appends past
-    // them instead of restarting at zero. This is OCCUPANCY, not the live
-    // surface: it includes the ranges relocating blocks retired to
-    // zero-area triangles. Zero means there is no state to trust.
-    std::uint32_t watermark = 0;
-    // The grid topology `watermark` and the spans were written against. A
-    // remove()/clear() moves the token and hands block slots to different
-    // blocks, which invalidates both at once.
-    std::uint64_t epoch = 0;
-    // span_serial_ of the extract that wrote them, so a table re-anchored
-    // since cannot be read as this
-    // arena's. The epoch alone does not catch that: a resize deliberately
-    // does not move it.
-    std::uint64_t serial = 0;
-    // Vertices the arena holds, the counterpart of `watermark` for the buffer
-    // sharing actually binds on. Its own number rather than one derived from
-    // the triangle count, because share_vertices breaks v = 3t -- which is the
-    // whole reason that kernel allocates vertices through a counter of its
-    // own. Without sharing it tracks 3 * watermark and nothing reads it: that
-    // kernel writes each triangle's three vertices at `tri * 3` and never
-    // touches the counter.
-    std::uint32_t vertex_watermark = 0;
-    // The map's tick when the extract that wrote all this ran, so the next
-    // incremental pass re-meshes the blocks stamped changed after it.
-    std::uint32_t tick = 0;
-    // The iso it meshed at, which every triangle a block keeps lies on.
-    float iso = 0.0f;
-  };
-  ArenaState arena_state_{};
 
   // The vertex arena + the draw command the kernels append through, kept ACROSS
   // extract calls and grown only when a call needs more than the last one.
@@ -1210,13 +754,12 @@ class VR_MESH_API MarchingCubes {
   // A fixed array, not a vector, and that is load-bearing rather than a
   // micro-optimisation. This class promises that a *self*-move leaves it
   // intact -- `mc = std::move(mc)` is exercised directly -- and every other
-  // member keeps that promise, because Buffer, unique_ptr and the pipeline
-  // wrappers all survive self-assignment. std::vector does not:
-  // self-move-assignment leaves it valid but unspecified, and libc++ empties
-  // it, so the extractor would pass valid() and then index nothing. An array of
-  // members that each survive makes the aggregate survive too -- which is the
-  // rule every member added here has to be checked against (span_stamp_ is a
-  // unique_ptr for exactly this reason).
+  // member keeps that promise, because Buffer and the pipeline wrappers all
+  // survive self-assignment. std::vector does not: self-move-assignment leaves
+  // it valid but unspecified, and libc++ empties it, so the extractor would
+  // pass valid() and then index nothing. An array of members that each
+  // survive makes the aggregate survive too -- which is the rule every member
+  // added here has to be checked against.
   //
   // All kMaxSlots are constructed regardless of slot_count_, which costs a
   // little over a kilobyte of null Buffer handles on an extractor using one --
@@ -1334,53 +877,28 @@ class VR_MESH_API MarchingCubes {
   // Output bytes the whole ring is holding -- what ExtractTimings::arena_bytes
   // reports. Every slot carries its own arena AND index run, so the current
   // slot's size is a fraction of this object's cost, not its cost.
-  //
-  // The span table counts too, and it is not a rounding error: it is sized by
-  // the GRID rather than by the surface (num_blocks * 16, which is 24 MB for a
-  // heap of 1.5 M blocks against room0's ~38 MB of triangles), it is held
-  // for this object's lifetime, and this is the instrument the ring's runaway
-  // growth was diagnosed with. Omitting a component of what stays resident is
-  // the same defect that folding the index runs in here fixed.
-  //
-  // ...and so do the host-side copy and stamp array that parallel it, another
-  // num_blocks * (16 + 8) (36 MB at the same defaults), for the same reason and
-  // by the same argument. They are derived from the table's own capacity rather
-  // than measured, because the three are allocated in lockstep by
-  // ensure_block_spans.
   std::uint64_t resident_output_bytes() const noexcept {
-    std::uint64_t total = 2 * block_spans_.size() +
-                          static_cast<std::uint64_t>(block_span_capacity()) *
-                              sizeof(std::uint64_t);
+    std::uint64_t total = 0;
     for (std::size_t i = 0; i < slot_count_; ++i)
       total += slots_[i].arena.size() + slots_[i].index_run.size();
     return total;
   }
 
-  // The one sparse extract, with the three public entry points differing only
-  // in what they ask of it: an incremental pass, a caller's active set, or
-  // neither.
+  // The one sparse extract, with the public entry points differing only in
+  // whether they hand it a caller's active set.
   //
-  // @p incremental asks for an incremental pass, which
-  // extract_device_incremental alone does; a parameter rather than a member the
-  // wrapper arms and disarms, so no exception unwinding out of here can leave
-  // the plain extract_device asking for one.
-  //
-  // @p blocks is null when this call compacts the whole active set itself (onto
-  // the device with the spans off, else to the host), and points at the
-  // caller's subset otherwise -- borrowed for this call alone, and a parameter
-  // for the same reason: it is a bare host pointer into a std::vector the
-  // caller owns, so latching it on the extractor would leave a dangling read
-  // for the NEXT extract rather than a stale one for this.
-  //
-  // Whether the pass is actually incremental is decided HERE, not by which
-  // entry point was called: every clause is something the caller cannot see.
+  // @p blocks is null when this call compacts the whole active set itself (on
+  // the device), and points at the caller's subset otherwise -- borrowed for
+  // this call alone, and a parameter rather than a member: it is a bare host
+  // pointer into a std::vector the caller owns, so latching it on the
+  // extractor would leave a dangling read for the NEXT extract.
   //
   // @p entry is the public name to report failures under -- the only thing
   // about the caller this function keeps, and it keeps it because a diagnostic
   // that names a method the header does not declare leaves a user with nothing
   // to grep. See kEntryHost in the .cpp.
   core::Result<DeviceMesh> extract_device_impl(volume::VoxelBlockGrid& grid,
-                                               float iso, bool incremental,
+                                               float iso,
                                                const volume::BlockList* blocks,
                                                ExtractTimings* timings,
                                                const char* entry);
@@ -1435,34 +953,13 @@ class VR_MESH_API MarchingCubes {
   // publishing return builds, so a call that fails here or after leaves the
   // slot exactly as claimable as it found it.
   //
-  // @p seed_triangles and @p seed_vertices are forwarded to
-  // ensure_indirect_command; every caller but the incremental one passes 0.
-  //
   // The reset is recorded into @p batch, ahead of the dispatch that batch will
   // run. The identity index run a grow fills is submitted on its own, before
   // the run is committed.
   core::Status ensure_output_buffers(core::CommandBatch& batch,
                                      std::uint32_t triangle_capacity,
                                      std::uint32_t vertex_capacity,
-                                     std::uint32_t seed_triangles,
-                                     std::uint32_t seed_vertices,
                                      const char* entry);
-
-  // Re-anchor the span table on @p grid and grow it to that grid's num_blocks,
-  // carrying the existing spans forward and zeroing only the new tail. A no-op
-  // unless config_.track_block_spans is on, and never shrinks: num_blocks only
-  // rises, because a VoxelHashMap::resize preserves block indices.
-  //
-  // Takes the grid rather than a block count because the anchor and the size
-  // both come from it, and they have to move together: a table grown for one
-  // grid while still stamped for another would report another grid's slots as
-  // live.
-  //
-  // Separate from ensure_output_buffers because the two are sized by different
-  // things -- that one by the surface this call measured, this one by the grid
-  // it is meshing -- but called beside it, so both allocations land in the same
-  // ExtractTimings row.
-  core::Status ensure_block_spans(const volume::VoxelBlockGrid& grid);
 
   // Vertices to budget for a dispatch planned at @p triangle_capacity
   // triangles: the last extract's measured density, seeded when there is none.
@@ -1482,27 +979,8 @@ class VR_MESH_API MarchingCubes {
   // host has to build one from. Split out of ensure_output_buffers because the
   // empty-active-set path needs the command without needing an arena.
   //
-  // @p seed_triangles starts indexCount above zero, which is what makes an
-  // incremental dispatch APPEND: the arena still holds that many triangles from
-  // the last extract, and the kernel's atomic hands out slots past them. A
-  // PARAMETER rather than a member the reset consumes: as a member it survived
-  // every path that returned before the reset -- both of ensure_output_buffers'
-  // range guards sit above it -- and a later empty extract then
-  // inherited a live indexCount over an arena it had rewritten, which is the
-  // exact staleness the reset exists to prevent. Passed explicitly, there is
-  // nothing to strand.
-  //
-  // @p seed_vertices does the same for the vertex counter in the scratch word
-  // past the command, and is a separate number for the same reason
-  // ArenaState::vertex_watermark is: sharing breaks v = 3t, so the vertices an
-  // incremental pass appends past cannot be derived from the triangles. Only
-  // the sharing kernel allocates through that counter, so every other caller
-  // passes 0 and the word stays the plain zero it has always been.
-  //
   // The reset is recorded into @p batch rather than written.
-  core::Status ensure_indirect_command(core::CommandBatch& batch,
-                                       std::uint32_t seed_triangles,
-                                       std::uint32_t seed_vertices);
+  core::Status ensure_indirect_command(core::CommandBatch& batch);
 
   // Bound the command's indexCount by what the arena can actually hold.
   //

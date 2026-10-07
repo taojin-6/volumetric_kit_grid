@@ -32,7 +32,7 @@
 // guess -- a total that stopped at the capacity would make the refit undershoot
 // and the retry overflow again. Both kernels take a whole block's count, and
 // add it to `index_count`, before any slot in it is claimed, which is what
-// makes that hold through a span the arena cannot hold.
+// makes that hold through a range the arena cannot hold.
 const uint kIndicesPerTriangle = 3u;
 
 // Corner c's step (0/1 per axis) from the cell base.
@@ -161,7 +161,7 @@ void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8],
 //
 // Separable from the emission because the count is a property of the cube index
 // ALONE -- it needs no interpolation and no world position -- which is what lets
-// the sparse kernel count a whole block, reserve one span for it, and only then
+// the sparse kernel count a whole block, reserve one range for it, and only then
 // write. `tri_table` rows are -1-terminated in groups of three.
 //
 // The all-inside / all-outside reject stays a comparison on two registers, and
@@ -179,9 +179,9 @@ void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8],
 // not belt-and-braces. `tri_table` is an SSBO the host uploads, so the -1 that
 // stops this loop is DATA; the 0..5 range is what the sparse kernel packs into
 // an 8-bit cache field and, since it reserves per block, what sizes a whole
-// block's arena span. A row that lost its terminator would not merely spin --
+// block's arena range. A row that lost its terminator would not merely spin --
 // it would walk into `corner_offset` (no robustBufferAccess anywhere in this
-// tier) and hand out a span the block then overruns. Five is a property of
+// tier) and hand out a range the block then overruns. Five is a property of
 // marching cubes, not of the upload: 15 of a row's 16 entries, the sixteenth
 // always -1.
 const int kMaxTrianglesPerCell = 5;
@@ -209,11 +209,7 @@ int mcCellTriangleCount(int cube_index) {
 // duplicated emitter is what let two paths drift once already, and here a
 // drift would separate the two while every triangle count still matched.
 //
-// The caller reserves the run and passes the slot; this never claims one. That
-// is what keeps a block's triangles CONTIGUOUS in the arena -- the property
-// `block_spans` publishes and the incremental path rests on -- so a third
-// emitter added later must reserve the same way and come through here, not
-// append through `index_count` per triangle.
+// The caller reserves the run and passes the slot; this never claims one.
 //
 // THE PRECONDITIONS, stated here because this is the entry point a third
 // caller would reach for and neither is checkable from inside:

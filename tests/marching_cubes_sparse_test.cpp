@@ -21,7 +21,7 @@
 // cross-block colour interpolation, the vertex-arena growth policy and that
 // the two output buffers grow independently, the refit-and-re-run path an
 // undersized arena takes -- over one block and over a run of 27, where the
-// arena boundary falls inside one block's span and past others entirely --
+// arena boundary falls inside one block's range and past others entirely --
 // that a block's triangles land CONTIGUOUSLY in the arena on both paths, and
 // the empty / argument-validation / moved-from paths. Exits 0 (skip) where no
 // device is present.
@@ -37,7 +37,6 @@
 #include <vector>
 
 #include "volumetric_kit/core/vulkan/allocator.hpp"
-#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
@@ -130,26 +129,6 @@ bool write_attributes(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
              .ok();
 }
 
-// Stamp `changed` with the map's next tick on `slots` of `g`, as a pass that
-// writes voxels does, so the extractor's test of what to re-mesh is driven
-// without fusing. Returns false on any device error.
-bool stamp_changed(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
-                   const std::vector<std::uint32_t>& slots) {
-  vkc::Result<std::vector<vol::BlockStamp>> stamps =
-      g.map().read_block_stamps();
-  if (!stamps.ok()) return false;
-  g.map().advance_tick();
-  for (const std::uint32_t slot : slots) {
-    stamps.value()[slot].changed = g.map().tick();
-  }
-  vkc::CommandBatch batch(ctx.device, ctx.allocator);
-  return batch
-             .upload(g.map().stamps_buffer(), 0, stamps.value().data(),
-                     stamps.value().size() * sizeof(vol::BlockStamp))
-             .ok() &&
-         batch.submit().ok();
-}
-
 // Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (at the
 // given @p weight) and, when requested, the gradient colour into every voxel of
 // every allocated block, addressed by the compacted BlockIndex::ptr + local. A
@@ -157,8 +136,7 @@ bool stamp_changed(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
 // one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
 // false on any device error.
 bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
-                      bool with_color, float weight_value = 1.0f,
-                      float radius = kRadius) {
+                      bool with_color, float weight_value = 1.0f) {
   std::vector<vol::BlockIndex> blocks;
   for (int cz = 0; cz < kBlocks; ++cz) {
     for (int cy = 0; cy < kBlocks; ++cy) {
@@ -208,7 +186,7 @@ bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
           const vr::Vec3i voxel = b.coord * kBlock + vr::Vec3i(lx, ly, lz);
           const vr::Vec3f world = vr::Vec3f(voxel) * kH;
           const auto idx = static_cast<std::size_t>(b.ptr) + local;
-          tptr[idx] = vr::length(world - sphere_center()) - radius;
+          tptr[idx] = vr::length(world - sphere_center()) - kRadius;
           wptr[idx] = weight_value;
           if (cptr != nullptr) {
             cptr[idx] = pack_rgb(grad_color(world));
@@ -293,8 +271,8 @@ bool fill_dense_blocks(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
 // How a mesh's triangles are laid out in the arena relative to the blocks that
 // produced them: how many distinct blocks it spans, and how many times the
 // owning block CHANGES walking the index buffer in order. Per-block grouping
-// gives EXACTLY `distinct - 1` transitions -- spans are contiguous and
-// disjoint, so the owner changes once per span boundary and nowhere else --
+// gives EXACTLY `distinct - 1` transitions -- ranges are contiguous and
+// disjoint, so the owner changes once per range boundary and nowhere else --
 // while full interleaving gives nearly one per triangle.
 //
 // Exactly, not approximately, because attributing a triangle by its CENTROID is
@@ -318,135 +296,9 @@ struct BlockLayout {
   std::size_t transitions = 0;
 };
 
-// Does the published span table exactly describe @p m?
-//
-// This is what makes the table verifiable at all rather than state nothing
-// reads. Four properties, and the last two are the ones with teeth:
-//   1. the counts sum to the mesh,
-//   2. the triangle ranges PARTITION it -- disjoint, and covering [0, total)
-//      with no gap,
-//   3. every triangle inside a block's range actually belongs to that block,
-//      by the same centroid attribution block_layout uses,
-//   4. every vertex those triangles reference lies in the same span's VERTEX
-//      range.
-// (1) and (2) would both hold if the kernel published plausible arithmetic that
-// pointed at the wrong geometry; (3) is what ties a span to its block, and (4)
-// is the only thing anywhere that reads BlockSpan::vertex_base.
-bool spans_describe(const mesh::MarchingCubes& mc, const mesh::Mesh& m,
-                    const std::vector<vol::BlockIndex>& active, int block_size,
-                    float voxel_size) {
-  const auto vpb =
-      static_cast<std::uint32_t>(block_size * block_size * block_size);
-  const mesh::BlockSpan* spans = mc.block_spans();
-  if (spans == nullptr || m.indices.empty()) {
-    return false;  // nothing published, or nothing to describe
-  }
-  const float block_span = static_cast<float>(block_size) * voxel_size;
-
-  std::vector<bool> tri_seen(m.indices.size() / 3, false);
-  std::uint64_t tri_total = 0;
-  std::uint64_t vert_total = 0;
-  for (const vol::BlockIndex& b : active) {
-    const std::uint32_t slot = static_cast<std::uint32_t>(b.ptr) / vpb;
-    if (slot >= mc.block_span_capacity()) {
-      return false;
-    }
-    const mesh::BlockSpan sp = spans[slot];
-    tri_total += sp.triangle_count;
-    vert_total += sp.vertex_count;
-    for (std::uint32_t i = 0; i < sp.triangle_count; ++i) {
-      // Widened BEFORE the addition, not after. Both operands are uint32, so
-      // `sp.triangle_base + i` is evaluated at unsigned int rank and converted
-      // only then: a base near UINT32_MAX would wrap to a small `t` and pass
-      // the range test below, turning a corrupt span into a mis-attribution
-      // report that reads like a kernel bug.
-      const std::size_t t = static_cast<std::size_t>(sp.triangle_base) + i;
-      if (t >= tri_seen.size() || tri_seen[t]) {
-        return false;  // out of range, or two blocks claim the same triangle
-      }
-      tri_seen[t] = true;
-      vr::Vec3f c(0.0f, 0.0f, 0.0f);
-      for (int k = 0; k < 3; ++k) {
-        // The index values are device output too, and under share_vertices they
-        // are written by the kernel rather than being the host's identity run
-        // -- so they are checked here rather than trusted. Without this the
-        // dereference below is the first thing an out-of-range index touches,
-        // and it aborts inside this helper under ASan, pointing the reader at
-        // the span table instead of at the index run.
-        const std::uint32_t vi = m.indices[t * 3 + static_cast<std::size_t>(k)];
-        if (vi >= m.vertices.size()) {
-          return false;
-        }
-        // ... and it lies in the VERTEX range the same span claims. This is the
-        // only thing that reads vertex_base at all: the counts summing and the
-        // triangle ranges tiling both hold with vertex_base left at 0 for every
-        // block, and under share_vertices the vertex range is independently
-        // reserved, so it is exactly where a second atomic can drift from the
-        // first. A block's own cells are the only ones that can reference the
-        // vertices it created -- an in-block edge resolves in this block's
-        // table, one owned outside is duplicated locally.
-        if (vi < sp.vertex_base || vi - sp.vertex_base >= sp.vertex_count) {
-          return false;
-        }
-        c = c + m.vertices[vi].position;
-      }
-      c = c / 3.0f;
-      if (static_cast<long long>(std::floor(c.x / block_span)) != b.coord.x ||
-          static_cast<long long>(std::floor(c.y / block_span)) != b.coord.y ||
-          static_cast<long long>(std::floor(c.z / block_span)) != b.coord.z) {
-        return false;  // the span points at another block's geometry
-      }
-    }
-  }
-  // Every triangle is claimed exactly once: `tri_seen` refuses a second claim
-  // above, so a count equal to the total means the ranges tile it. A separate
-  // sweep for unseen entries would be dead code -- N distinct claims over N
-  // slots leaves none.
-  return tri_total == tri_seen.size() && vert_total == m.vertices.size();
-}
-
-// Slots block_span_valid() reports live for @p g -- what the "exactly the
-// active set, and nothing else" assertions are made against. Swept over the
-// whole capacity rather than over the active set, because the interesting
-// failure is a slot OUTSIDE it answering true.
-std::size_t count_valid_spans(const mesh::MarchingCubes& mc,
-                              const vol::VoxelBlockGrid& g) {
-  std::size_t n = 0;
-  for (std::uint32_t i = 0; i < mc.block_span_capacity(); ++i) {
-    if (mc.block_span_valid(g, i)) {
-      ++n;
-    }
-  }
-  return n;
-}
-
-// Drop the zero-area triangles an incremental extract leaves behind.
-//
-// Retiring a range writes three identical vertices rather than compacting the
-// index run -- see the kernel's phase four -- so a block that shrank or
-// relocated leaves degenerate triangles in the arena. They are culled before
-// rasterisation and they are not geometry, but `download` copies the arena, so
-// a comparison against a full extract has to ignore them. Returns the count
-// dropped, because "none were left" is itself worth asserting: it says the
-// retire pass never ran.
-std::size_t drop_degenerate(std::vector<std::array<float, 9>>& tris) {
-  const std::size_t before = tris.size();
-  tris.erase(std::remove_if(tris.begin(), tris.end(),
-                            [](const std::array<float, 9>& t) {
-                              for (int i = 0; i < 3; ++i) {
-                                if (t[i] != t[3 + i] || t[i] != t[6 + i]) {
-                                  return false;
-                                }
-                              }
-                              return true;
-                            }),
-             tris.end());
-  return before - tris.size();
-}
-
 BlockLayout block_layout(const mesh::Mesh& m, int block_size,
                          float voxel_size) {
-  const float block_span = static_cast<float>(block_size) * voxel_size;
+  const float block_extent = static_cast<float>(block_size) * voxel_size;
   std::vector<std::array<long long, 3>> owner;
   owner.reserve(m.indices.size() / 3);
   for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
@@ -455,9 +307,9 @@ BlockLayout block_layout(const mesh::Mesh& m, int block_size,
       c = c + m.vertices[m.indices[t + k]].position;
     }
     c = c / 3.0f;
-    owner.push_back({static_cast<long long>(std::floor(c.x / block_span)),
-                     static_cast<long long>(std::floor(c.y / block_span)),
-                     static_cast<long long>(std::floor(c.z / block_span))});
+    owner.push_back({static_cast<long long>(std::floor(c.x / block_extent)),
+                     static_cast<long long>(std::floor(c.y / block_extent)),
+                     static_cast<long long>(std::floor(c.z / block_extent))});
   }
   BlockLayout out;
   out.triangles = owner.size();
@@ -477,7 +329,7 @@ BlockLayout block_layout(const mesh::Mesh& m, int block_size,
 // Needed because BlockLayout walks the index run and is therefore blind to
 // where the vertices went. The sharing kernel reserves TWO ranges per block,
 // and putting its vertex claims back on the global counter -- leaving the
-// triangle span exactly as it is -- interleaves the arena again while every
+// triangle range exactly as it is -- interleaves the arena again while every
 // transition count above still passes.
 //
 // A block's own cells are the only ones that can reference the vertices it
@@ -486,16 +338,16 @@ BlockLayout block_layout(const mesh::Mesh& m, int block_size,
 // edge in its own cell's triangle row, so every vertex a block creates is
 // referenced by a triangle of that block, and the set below is exactly the
 // range the block reserved.
-struct VertexSpans {
+struct VertexRanges {
   std::size_t blocks = 0;
   std::size_t gaps = 0;      // blocks whose indices are not one dense range
   std::size_t overlaps = 0;  // ranges intersecting the one before them
   std::size_t covered = 0;   // vertices lying inside some block's range
 };
 
-VertexSpans vertex_spans(const mesh::Mesh& m, int block_size,
-                         float voxel_size) {
-  const float block_span = static_cast<float>(block_size) * voxel_size;
+VertexRanges vertex_ranges(const mesh::Mesh& m, int block_size,
+                           float voxel_size) {
+  const float block_extent = static_cast<float>(block_size) * voxel_size;
   std::map<std::array<long long, 3>, std::set<std::uint32_t>> used;
   for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
     vr::Vec3f c(0.0f, 0.0f, 0.0f);
@@ -504,15 +356,15 @@ VertexSpans vertex_spans(const mesh::Mesh& m, int block_size,
     }
     c = c / 3.0f;
     std::set<std::uint32_t>& block =
-        used[{static_cast<long long>(std::floor(c.x / block_span)),
-              static_cast<long long>(std::floor(c.y / block_span)),
-              static_cast<long long>(std::floor(c.z / block_span))}];
+        used[{static_cast<long long>(std::floor(c.x / block_extent)),
+              static_cast<long long>(std::floor(c.y / block_extent)),
+              static_cast<long long>(std::floor(c.z / block_extent))}];
     for (int k = 0; k < 3; ++k) {
       block.insert(m.indices[t + k]);
     }
   }
 
-  VertexSpans out;
+  VertexRanges out;
   out.blocks = used.size();
   std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
   ranges.reserve(used.size());
@@ -560,112 +412,6 @@ std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
   return tris;
 }
 
-// Removal, a full fallback, and later slot reuse must keep the survivor.
-int reused_slot_case(const vr_test::Gpu& ctx, bool share, bool empty_first) {
-  auto gp = sphere_grid_params();
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
-  auto made =
-      vol::VoxelBlockGrid::create(ctx.device, ctx.allocator, gp, attrs, 2);
-  CHECK(made.ok());
-  auto grid = std::move(made).value();
-  vol::BlockIndex coords[2]{};
-  coords[0].coord = vr::Vec3i(0, 0, 0);
-  coords[1].coord = vr::Vec3i(3, 0, 0);
-  CHECK(grid.map().allocate(coords, 2).value() == 0);
-  auto active = grid.map().compact_active_blocks();
-  CHECK(active.ok() && active->size() == 2);
-  std::vector<float> field(gp.num_blocks * 512, 0),
-      weights(gp.num_blocks * 512, 0);
-  std::vector<std::uint32_t> slots;
-  for (const auto& b : active.value()) {
-    slots.push_back(b.ptr / 512);
-    for (int i = 0; i < 512; ++i) {
-      field[b.ptr + i] = (float(i / 64) - 3.5f) * gp.voxel_size;
-      weights[b.ptr + i] = 1.0f;
-    }
-  }
-  CHECK(write_attributes(ctx, grid, field, weights));
-  CHECK(stamp_changed(ctx, grid, slots));
-  mesh::MarchingCubesConfig cfg;
-  cfg.track_block_spans = true;
-  cfg.share_vertices = share;
-  auto mc_result = mesh::MarchingCubes::create(ctx.device, ctx.allocator, cfg);
-  CHECK(mc_result.ok());
-  auto mc = std::move(mc_result).value();
-  auto first = mc.extract_device(grid);
-  CHECK(first.ok());
-  auto initial = mc.download(first.value());
-  CHECK(initial.ok() && initial->indices.size() / 3 == 196);
-  vol::BlockIndex removed{}, survivor{};
-  for (const auto& b : active.value()) {
-    if (mc.block_spans()[b.ptr / 512].triangle_base == 0)
-      removed = b;
-    else
-      survivor = b;
-  }
-  CHECK(removed.ptr != survivor.ptr);
-  CHECK(grid.remove(&removed, 1).value() == 0);
-  mesh::ExtractTimings fallback_time;
-  auto fallback = mc.extract_device_incremental(grid, 0.0f, &fallback_time);
-  CHECK(fallback.ok() && !fallback_time.incremental);
-  auto fallback_mesh = mc.download(fallback.value());
-  CHECK(fallback_mesh.ok() && fallback_mesh->indices.size() / 3 == 98);
-  CHECK(!mc.block_span_valid(grid, removed.ptr / 512));
-  vol::BlockIndex replacement{};
-  replacement.coord = vr::Vec3i(6, 0, 0);
-  CHECK(grid.map().allocate(&replacement, 1).value() == 0);
-  auto now = grid.map().compact_active_blocks();
-  CHECK(now.ok() && now->size() == 2);
-  for (const auto& b : now.value())
-    if (b.coord == replacement.coord) replacement = b;
-  CHECK(replacement.ptr == removed.ptr);
-  if (empty_first) {
-    // A newly allocated block without observations is clean. It must not
-    // inherit geometry before its first voxel write either.
-    mesh::ExtractTimings clean_time;
-    auto clean = mc.extract_device_incremental(grid, 0.0f, &clean_time);
-    CHECK(clean.ok() && clean_time.incremental);
-    CHECK(mc.block_spans()[replacement.ptr / 512].triangle_count == 0);
-    auto clean_mesh = mc.download(clean.value());
-    CHECK(clean_mesh.ok() && clean_mesh->indices.size() / 3 == 98);
-  }
-  auto field_now =
-      vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, "tsdf");
-  auto weight_now =
-      vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, "weight");
-  CHECK(field_now.ok() && weight_now.ok());
-  for (int i = 0; i < 512; ++i) {
-    (field_now.value())[replacement.ptr + i] =
-        (float(i / 64) - 3.5f) * gp.voxel_size;
-    (weight_now.value())[replacement.ptr + i] = 1.0f;
-  }
-  CHECK(write_attributes(ctx, grid, field_now.value(), weight_now.value()));
-  CHECK(stamp_changed(ctx, grid, {std::uint32_t(replacement.ptr / 512)}));
-  mesh::ExtractTimings inc_time;
-  auto incremental = mc.extract_device_incremental(grid, 0.0f, &inc_time);
-  CHECK(incremental.ok());
-  auto got = mc.download(incremental.value());
-  CHECK(got.ok());
-  auto full_made = mesh::MarchingCubes::create(ctx.device, ctx.allocator, cfg);
-  CHECK(full_made.ok());
-  auto full = full_made->extract_host(grid);
-  CHECK(full.ok());
-  std::size_t surviving = 0;
-  const float xmin = survivor.coord.x * 8 * gp.voxel_size;
-  const float xmax = xmin + 7 * gp.voxel_size;
-  for (std::size_t i = 0; i < got->indices.size(); i += 3) {
-    float x = got->vertices[got->indices[i]].position.x;
-    if (x >= xmin && x <= xmax) ++surviving;
-  }
-  CHECK(inc_time.incremental && inc_time.remeshed_blocks == 1);
-  CHECK(full->indices.size() / 3 == 196 && surviving == 98);
-  CHECK(canonical_triangles(got.value()) == canonical_triangles(full.value()));
-  CHECK(spans_describe(mc, got.value(), now.value(), gp.block_size,
-                       gp.voxel_size));
-  return 0;
-}
-
 }  // namespace
 
 int main() {
@@ -695,19 +441,9 @@ int main() {
     return 1;
   }
   const vr_test::Gpu ctx{device.value(), allocator.value()};
-  for (bool share : {false, true}) {
-    for (bool empty_first : {false, true}) {
-      CHECK(reused_slot_case(ctx, share, empty_first) == 0);
-    }
-  }
 
-  // The main extractor asks for the span table; most of the fixtures below do
-  // not, which is the point -- track_block_spans is off by default and the
-  // suite exercises both sides of that.
-  mesh::MarchingCubesConfig spans_config;
-  spans_config.track_block_spans = true;
-  vkc::Result<mesh::MarchingCubes> mc_result = mesh::MarchingCubes::create(
-      device.value(), allocator.value(), spans_config);
+  vkc::Result<mesh::MarchingCubes> mc_result =
+      mesh::MarchingCubes::create(device.value(), allocator.value());
   if (!mc_result) {
     std::fprintf(stderr, "MarchingCubes::create failed: %s\n",
                  mc_result.status().message().c_str());
@@ -762,18 +498,15 @@ int main() {
 
   // --- A block's triangles are CONTIGUOUS in the arena -----------------------
   //
-  // Stage 2's actual deliverable, and nothing else here can see it: every
-  // other check in this file compares triangles as a SET (canonical_triangles)
-  // or in aggregate (area, radius), so all of them pass identically whether a
-  // block's triangles are grouped or scattered the length of the arena. Under
-  // the per-triangle append they interleaved with every other block in flight,
-  // and per-block ranges are the precondition for meshing only the blocks a
-  // fuse changed.
+  // Nothing else here can see it: every other check in this file compares
+  // triangles as a SET (canonical_triangles) or in aggregate (area, radius), so
+  // all of them pass identically whether a block's triangles are grouped or
+  // scattered the length of the arena.
   //
   // Asserted EXACTLY -- see block_layout for why centroid attribution admits no
   // slack here, and why a loose bound would be the wrong instrument: the
-  // failure this guards against (a span overrun, or a block emitting through
-  // two spans) moves the count by one, not by an order of magnitude.
+  // failure this guards against (a range overrun, or a block emitting through
+  // two ranges) moves the count by one, not by an order of magnitude.
   {
     const BlockLayout layout = block_layout(sphere, kBlock, kH);
     // The sphere must actually straddle many blocks, or "grouped" is vacuous.
@@ -782,91 +515,6 @@ int main() {
     // below is satisfied by arithmetic rather than by grouping.
     CHECK(layout.triangles > 4 * layout.distinct);
     CHECK(layout.transitions == layout.distinct - 1);
-  }
-
-  // The published span table describes that layout exactly -- the mapping the
-  // reservation computes, which is not derivable on the host because the atomic
-  // hands spans out in workgroup arrival order rather than block order.
-  {
-    vkc::Result<std::vector<vol::BlockIndex>> active =
-        grid.map().compact_active_blocks();
-    CHECK(active.ok());
-    CHECK(spans_describe(extractor, sphere, active.value(), kBlock, kH));
-    // The table describes the extract that wrote it, and says which one that
-    // was. A consumer holding a DeviceMesh compares this against its own
-    // generation -- there is one table for the whole ring, so above one slot
-    // this is what keeps a span from being read against another slot's arena.
-    CHECK(extractor.block_spans_generation() != 0);
-    CHECK(extractor.block_span_capacity() >=
-          static_cast<std::uint32_t>(active.value().size()));
-
-    // The anchor. A span is keyed by block SLOT, which names a block only
-    // against a particular grid and topology epoch -- the heap is LIFO, so
-    // after a remove() a reused slot names a DIFFERENT block and its span would
-    // read as that block's geometry under Status::ok.
-    const auto vpb = static_cast<std::uint32_t>(kBlock * kBlock * kBlock);
-    const std::uint32_t some_slot =
-        static_cast<std::uint32_t>(active.value().front().ptr) / vpb;
-    CHECK(extractor.block_span_valid(grid, some_slot));
-    // EXACTLY the active blocks are valid -- no slot the extract never meshed
-    // reports a span, and none it did meshed is missing one. (Which slots those
-    // are is not guessable: the block heap is LIFO, so `ptr` is handed out from
-    // the top and the last slot is an allocated block, not a free one.)
-    //
-    // On a first extract this is a sanity check and not much more: the stamps
-    // start empty, so it holds for any implementation that stamps the active
-    // set at all. The version of it that constrains anything is below, and the
-    // one that constrains the most is in the anchor block at the end of this
-    // file, where the table already carries a stamp for a slot the current
-    // extract did not mesh.
-    CHECK(count_valid_spans(extractor, grid) == active.value().size());
-
-    // A SECOND extract republishes it. Everything above ran against an
-    // extractor's first and only extract, which is the one call where a table
-    // that is never cleared and a table that is correctly rewritten look
-    // identical.
-    const std::uint64_t first_gen = extractor.block_spans_generation();
-    vkc::Result<mesh::Mesh> again_result = extractor.extract_host(grid, 0.0f);
-    CHECK(again_result.ok());
-    const mesh::Mesh again = std::move(again_result).value();
-    CHECK(spans_describe(extractor, again, active.value(), kBlock, kH));
-    CHECK(extractor.block_spans_generation() > first_gen);
-    // ... and the count again, now that the stamps are non-empty going in. A
-    // stamp is keyed to the extract that wrote it, so the previous call's
-    // stamps have to stop counting as this call's -- the property the check
-    // above could not see.
-    CHECK(count_valid_spans(extractor, grid) == active.value().size());
-
-    // A RETIRING extract takes every slot with it, and only the whole-table
-    // gate can say so. An extract that publishes nothing -- here an empty
-    // active set, which the culled overload's own comment calls a routine
-    // per-frame outcome -- zeroes block_spans_generation_ at the top and then
-    // returns BEFORE it re-anchors span_epoch_ or bumps span_serial_, so the
-    // anchor still names this grid and every per-slot stamp still matches.
-    // Nothing but the generation clause is left to answer with, which is what
-    // makes deleting that clause visible here and nowhere else: without it a
-    // caller reads a live slot beside a null block_spans() and indexes an
-    // arena a later extract has entirely rewritten.
-    vkc::Result<vol::VoxelBlockGrid> retire_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
-                                    attrs, 2);
-    CHECK(retire_result.ok());
-    vol::VoxelBlockGrid retire_grid = std::move(retire_result).value();
-    vkc::Result<mesh::Mesh> retired = extractor.extract_host(retire_grid, 0.0f);
-    CHECK(retired.ok());
-    CHECK(std::move(retired).value().empty());
-    CHECK(extractor.block_spans() == nullptr);
-    CHECK(extractor.block_spans_generation() == 0);
-    CHECK(!extractor.block_span_valid(grid, some_slot));
-
-    // A second sparse extract republishes the table against its own geometry,
-    // which is what keeps a stale span from outliving the extract that wrote
-    // it -- and revives the slot the retiring extract above put out.
-    vkc::Result<mesh::Mesh> revived = extractor.extract_host(grid, 0.0f);
-    CHECK(revived.ok());
-    CHECK(
-        spans_describe(extractor, revived.value(), active.value(), kBlock, kH));
-    CHECK(extractor.block_span_valid(grid, some_slot));
   }
 
   // Winding agrees with the gradient normal, per face (a boundary seam or a
@@ -1076,142 +724,6 @@ int main() {
   vkc::Result<mesh::Mesh> empty_mesh = extractor.extract_host(empty_grid, 0.0f);
   CHECK(empty_mesh.ok());
   CHECK(std::move(empty_mesh).value().empty());
-  // An empty extract publishes no table either. It returns before any dispatch,
-  // so the spans still standing are the previous extract's -- describing a mesh
-  // this call did not hand out, against a slot it has already claimed.
-  CHECK(extractor.block_spans() == nullptr);
-  CHECK(extractor.block_spans_generation() == 0);
-
-  // --- track_block_spans is off by default -----------------------------------
-  // The table is sized by the GRID (num_blocks * 16, which is 24 MB for a heap
-  // of 1.5 M blocks and doubles with every resize), so a caller who
-  // never reads it must not pay for it.
-  // Asserted through arena_bytes, which is what makes "costs nothing" a
-  // measurable claim rather than a comment: it counts the span table, so an
-  // ungated allocation would show up here.
-  // Two FRESH extractors differing in nothing but the flag, each run once over
-  // the same grid. Comparing `extractor` against a new one would compare two
-  // different extract histories -- the arenas are grow-only, so the one that
-  // has meshed more is larger for reasons that have nothing to do with the
-  // table -- and the difference here has to be attributable to the flag alone.
-  {
-    mesh::MarchingCubesConfig gated_config;
-    gated_config.track_block_spans = true;
-    vkc::Result<mesh::MarchingCubes> gated_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), gated_config);
-    CHECK(gated_result.ok());
-    mesh::MarchingCubes gated = std::move(gated_result).value();
-    vkc::Result<mesh::MarchingCubes> ungated_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value());
-    CHECK(ungated_result.ok());
-    mesh::MarchingCubes ungated = std::move(ungated_result).value();
-
-    mesh::ExtractTimings gated_timings;
-    mesh::ExtractTimings ungated_timings;
-    vkc::Result<mesh::Mesh> gated_mesh =
-        gated.extract_host(grid, 0.0f, &gated_timings);
-    vkc::Result<mesh::Mesh> ungated_mesh =
-        ungated.extract_host(grid, 0.0f, &ungated_timings);
-    CHECK(gated_mesh.ok());
-    CHECK(ungated_mesh.ok());
-    // The same surface either way: the kernel skipping the store changes
-    // nothing it emits, which is what makes the flag a pure opt-out.
-    CHECK(ungated_mesh.value().triangle_count() == sphere.triangle_count());
-    CHECK(canonical_triangles(ungated_mesh.value()) ==
-          canonical_triangles(gated_mesh.value()));
-
-    CHECK(ungated.block_spans() == nullptr);
-    CHECK(ungated.block_span_capacity() == 0);
-    CHECK(ungated.block_spans_generation() == 0);
-    CHECK(gated.block_span_capacity() ==
-          static_cast<std::uint32_t>(gp.num_blocks));
-
-    // EXACTLY the table AND the host-side copy and stamps beside it, and no
-    // more: same grid, same surface, same plan, so every other resident byte is
-    // identical and the whole difference is what the flag allocates. An
-    // equality rather than a bound, because that is the claim -- and because
-    // arena_bytes silently omitting a component (it counted only the arenas and
-    // index runs, and later the table but not the stamps) is the defect this
-    // figure keeps attracting. Every term, so leaving one out fails here rather
-    // than under-reporting the feature in a caller's profile.
-    CHECK(gated_timings.arena_bytes ==
-          ungated_timings.arena_bytes +
-              static_cast<std::uint64_t>(gp.num_blocks) *
-                  (2 * sizeof(mesh::BlockSpan) + sizeof(std::uint64_t)));
-  }
-
-  // --- The span table survives a grid GROW -----------------------------------
-  // A VoxelHashMap::resize raises num_blocks, so the table has to grow with it;
-  // and because resize PRESERVES each block's index (which is why
-  // topology_epoch deliberately does not move across one), a slot means the
-  // same block on both sides. The grow therefore carries the old spans forward
-  // and zeroes only the new tail, exactly as the map does its block stamps --
-  // replacing it wholesale would discard every span on the one event the
-  // volume tier guarantees they survive.
-  {
-    vkc::Result<vol::VoxelBlockGrid> grow_grid_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
-                                    attrs, 2);
-    CHECK(grow_grid_result.ok());
-    vol::VoxelBlockGrid grow_grid = std::move(grow_grid_result).value();
-    CHECK(fill_sphere_grid(ctx, grow_grid, /*with_color=*/false));
-
-    mesh::MarchingCubesConfig grow_config;
-    grow_config.track_block_spans = true;
-    vkc::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), grow_config);
-    CHECK(grow_result.ok());
-    mesh::MarchingCubes grow_mc = std::move(grow_result).value();
-
-    vkc::Result<mesh::Mesh> before = grow_mc.extract_host(grow_grid, 0.0f);
-    CHECK(before.ok());
-    CHECK(grow_mc.block_span_capacity() ==
-          static_cast<std::uint32_t>(gp.num_blocks));
-    vkc::Result<std::vector<vol::BlockIndex>> active_before =
-        grow_grid.map().compact_active_blocks();
-    CHECK(active_before.ok());
-    CHECK(spans_describe(grow_mc, before.value(), active_before.value(), kBlock,
-                         kH));
-
-    const std::uint64_t epoch_before_grow = grow_grid.topology_epoch();
-    CHECK(grow_grid.resize(gp.num_buckets * 2).ok());
-    // The anchor must NOT break here, and that is the one mutation for which
-    // that is true: a resize frees no index, so the token holds and the spans
-    // carried forward keep describing the blocks they were written for. If this
-    // moved, the grow path below would be dead code.
-    CHECK(grow_grid.topology_epoch() == epoch_before_grow);
-    // Same blocks, same slots -- the resize preserves indices, so this is the
-    // property that makes carrying the table forward meaningful rather than
-    // merely harmless.
-    vkc::Result<std::vector<vol::BlockIndex>> active_after =
-        grow_grid.map().compact_active_blocks();
-    CHECK(active_after.ok());
-    CHECK(active_after.value().size() == active_before.value().size());
-
-    vkc::Result<mesh::Mesh> after = grow_mc.extract_host(grow_grid, 0.0f);
-    CHECK(after.ok());
-    CHECK(grow_mc.block_span_capacity() ==
-          static_cast<std::uint32_t>(gp.num_blocks) * 2);
-    CHECK(spans_describe(grow_mc, after.value(), active_after.value(), kBlock,
-                         kH));
-    // The grown tail is ZEROED, not whatever VMA handed over: only blocks in an
-    // extract's active set are written, and every other entry is published as
-    // readable. An empty span is a truthful "this block owns no geometry"; a
-    // driver-garbage base indexes the arena anywhere.
-    const mesh::BlockSpan* grown = grow_mc.block_spans();
-    CHECK(grown != nullptr);
-    std::size_t nonempty = 0;
-    for (std::uint32_t i = 0; i < grow_mc.block_span_capacity(); ++i) {
-      if (grown[i].triangle_count != 0 || grown[i].vertex_count != 0 ||
-          grown[i].triangle_base != 0 || grown[i].vertex_base != 0) {
-        ++nonempty;
-      }
-    }
-    // Every non-empty entry is an active block's; the whole tail past them is
-    // zero. (One active block can legitimately mesh to nothing and record an
-    // empty span, so this is a bound rather than an equality.)
-    CHECK(nonempty <= active_after.value().size());
-  }
 
   // --- Vertex-arena growth policy --------------------------------------------
   // The arena is retained between extracts and only ever grown, so its size is
@@ -1324,14 +836,14 @@ int main() {
 
   // --- ...and the same overflow across MANY blocks ---------------------------
   //
-  // A distinct path since the kernel began reserving one span per block, and
+  // A distinct path since the kernel began reserving one range per block, and
   // the single-block fixture above cannot reach it. With one block every drop
-  // is a suffix of one span, which is what the per-triangle append did
+  // is a suffix of one range, which is what the per-triangle append did
   // everywhere. With 27 blocks the arena boundary falls in three different
-  // places at once: blocks whose span fits entirely, ONE whose span straddles
-  // `capacity` (its first triangles written, its last dropped), and blocks
-  // whose span begins wholly past it -- the case the kernel now rejects up
-  // front rather than one triangle at a time.
+  // places at once: blocks whose range fits entirely, ONE whose range
+  // straddles `capacity` (its first triangles written, its last dropped), and
+  // blocks whose range begins wholly past it -- the case the kernel now rejects
+  // up front rather than one triangle at a time.
   //
   // The demand is what makes it deterministic: 27 blocks x ~1400 triangles
   // against the ~64 per block a first extract plans, so every one of those
@@ -1363,7 +875,7 @@ int main() {
   CHECK(run_timings.triangle_capacity >= run_timings.emitted_triangles);
 
   // The same field again, now planned in one dispatch, must be the same
-  // surface triangle-for-triangle -- so a span dropped at the boundary was
+  // surface triangle-for-triangle -- so a range dropped at the boundary was
   // dropped, not misplaced into a neighbouring block's.
   mesh::ExtractTimings run_settled_timings;
   vkc::Result<mesh::Mesh> run_settled_result =
@@ -1374,9 +886,9 @@ int main() {
   CHECK(canonical_triangles(run_mesh) == canonical_triangles(run_settled));
 
   // And contiguity survives a refit: the assertion above runs only on a clean
-  // first extract, where no span was ever truncated. Same exact figure here --
-  // `distinct - 1`, against the ~48 000 transitions full interleaving would
-  // give at this triangle count -- because truncating a span at the arena
+  // first extract, where no range was ever truncated. Same exact figure here
+  // -- `distinct - 1`, against the ~48 000 transitions full interleaving would
+  // give at this triangle count -- because truncating a range at the arena
   // boundary shortens it without splitting it.
   {
     const BlockLayout layout = block_layout(run_settled, kBlock, kH);
@@ -1386,7 +898,7 @@ int main() {
   }
 
   // Reusing one ExtractTimings across calls must not accumulate: every field is
-  // overwritten, so the second call's spans are its own. (dispatch_ms and
+  // overwritten, so the second call's timings are its own. (dispatch_ms and
   // readback_ms sum over a call's attempts internally, which is exactly why
   // they have to start from zero.)
   mesh::ExtractTimings reused_stats = refit_timings;
@@ -1402,7 +914,6 @@ int main() {
   // `bool sharing = false;` left every suite green.
   mesh::MarchingCubesConfig share_config;
   share_config.share_vertices = true;
-  share_config.track_block_spans = true;
   vkc::Result<mesh::MarchingCubes> share_result = mesh::MarchingCubes::create(
       device.value(), allocator.value(), share_config);
   CHECK(share_result.ok());
@@ -1434,15 +945,10 @@ int main() {
   CHECK(sphere.vertices.size() == sphere.indices.size());  // 3 per triangle
   CHECK(share_mesh.vertices.size() * 2 < sphere.vertices.size());
 
-  // ... and this kernel's triangles are per-block contiguous too, which is what
-  // lets a dirty-only dispatch describe a block's output as a range. It was NOT
-  // true here until now: the default kernel reserved a span per block while
-  // this one still appended per triangle through the global counter, so
-  // `share_vertices` was the one path incremental extraction could not use.
-  //
-  // Exactly `distinct - 1` transitions, the same bound the unshared path is
-  // held to -- spans are contiguous and disjoint, so the owner changes once per
-  // boundary and nowhere else.
+  // ... and this kernel's triangles are per-block contiguous too: exactly
+  // `distinct - 1` transitions, the same bound the unshared path is held to --
+  // ranges are contiguous and disjoint, so the owner changes once per boundary
+  // and nowhere else.
   //
   // And the arena the same way, which the transition count above cannot see:
   // each block's vertices are one dense range, the ranges do not overlap, and
@@ -1453,20 +959,11 @@ int main() {
     CHECK(layout.triangles > 4 * layout.distinct);
     CHECK(layout.transitions == layout.distinct - 1);
 
-    const VertexSpans spans = vertex_spans(share_mesh, kBlock, kH);
-    CHECK(spans.blocks == layout.distinct);
-    CHECK(spans.gaps == 0);
-    CHECK(spans.overlaps == 0);
-    CHECK(spans.covered == share_mesh.vertices.size());
-
-    // ... and its published table describes it, with vertex counts that are NOT
-    // three per triangle -- the case the default path cannot exercise. The
-    // ranges above are inferred from the mesh; this is what the kernel claims.
-    vkc::Result<std::vector<vol::BlockIndex>> active =
-        grid.map().compact_active_blocks();
-    CHECK(active.ok());
-    CHECK(spans_describe(share_mc, share_mesh, active.value(), kBlock, kH));
-    CHECK(share_mesh.vertices.size() != share_mesh.indices.size());
+    const VertexRanges ranges = vertex_ranges(share_mesh, kBlock, kH);
+    CHECK(ranges.blocks == layout.distinct);
+    CHECK(ranges.gaps == 0);
+    CHECK(ranges.overlaps == 0);
+    CHECK(ranges.covered == share_mesh.vertices.size());
   }
   CHECK(share_timings.emitted_vertices == share_mesh.vertices.size());
   CHECK(share_timings.emitted_triangles == share_mesh.triangle_count());
@@ -1588,11 +1085,11 @@ int main() {
     CHECK(layout.distinct >= 20);
     CHECK(layout.transitions == layout.distinct - 1);
 
-    const VertexSpans spans = vertex_spans(share_run_mesh, kBlock, kH);
-    CHECK(spans.blocks == layout.distinct);
-    CHECK(spans.gaps == 0);
-    CHECK(spans.overlaps == 0);
-    CHECK(spans.covered == share_run_mesh.vertices.size());
+    const VertexRanges ranges = vertex_ranges(share_run_mesh, kBlock, kH);
+    CHECK(ranges.blocks == layout.distinct);
+    CHECK(ranges.gaps == 0);
+    CHECK(ranges.overlaps == 0);
+    CHECK(ranges.covered == share_run_mesh.vertices.size());
   }
 
   // Both ranges survive the refit: the same field planned in one dispatch is
@@ -1607,10 +1104,10 @@ int main() {
   CHECK(canonical_triangles(share_run_settled) ==
         canonical_triangles(share_run_mesh));
   {
-    const VertexSpans spans = vertex_spans(share_run_settled, kBlock, kH);
-    CHECK(spans.gaps == 0);
-    CHECK(spans.overlaps == 0);
-    CHECK(spans.covered == share_run_settled.vertices.size());
+    const VertexRanges ranges = vertex_ranges(share_run_settled, kBlock, kH);
+    CHECK(ranges.gaps == 0);
+    CHECK(ranges.overlaps == 0);
+    CHECK(ranges.covered == share_run_settled.vertices.size());
   }
 
   // Growing one output buffer must not resize the other. They used to be
@@ -1741,488 +1238,16 @@ int main() {
   CHECK(!extractor.extract_host(empty_grid, 0.0f).ok());
 
   // --- Move-only extractor ---------------------------------------------------
-  // The source must be left EMPTY, not merely invalid: this class's
-  // rule-of-zero moves are correct only while nothing caches a copy of an owned
-  // member's state, and the span table is the newest place that could go wrong.
-  // A block_span_capacity() tracked in a uint32 beside the buffer would survive
-  // the move and report a live capacity next to the null pointer below -- the
-  // exact shape a caller sizing its loop from the capacity walks off the end
-  // of.
-  CHECK(extractor.block_span_capacity() > 0);
   mesh::MarchingCubes moved = std::move(extractor);
   CHECK(!extractor.valid());
-  CHECK(extractor.block_spans() == nullptr);
-  CHECK(extractor.block_span_capacity() == 0);
+  CHECK(!extractor.extract_host(grid, 0.0f).ok());
   CHECK(moved.valid());
-  CHECK(moved.block_span_capacity() > 0);
   mesh::MarchingCubes* alias = &moved;
   moved = std::move(*alias);  // self-move: intact
   CHECK(moved.valid());
-  CHECK(moved.block_span_capacity() > 0);
   vkc::Result<mesh::Mesh> reextract = moved.extract_host(grid, 0.0f);
   CHECK(reextract.ok());
   CHECK(!std::move(reextract).value().empty());
-
-  // --- The span anchor breaks on a topology change ---------------------------
-  //
-  // LAST, because it mutates the shared grid: remove() takes a block out of the
-  // active set, so every extract after it meshes a different surface. Placed
-  // earlier, this failed the sharing path's triangle-count equivalence -- but
-  // only SOMETIMES, because the victim is whichever block compaction happened
-  // to put last and removing one that carries no surface changes nothing. A
-  // test that fails on some runs is worse than one that fails on all of them.
-  //
-  // Checked against the GRID rather than against the last extract: between a
-  // remove() and the next extract the stamps are still set, so a query trusting
-  // them alone would call a stale span live.
-  //
-  // Through EITHER remove: the token lives on VoxelHashMap, which is where an
-  // index is actually freed, so the raw map() path moves it exactly as the
-  // grid's wrapper does. It used to live one tier up and be bumped only by the
-  // wrapper, which left the raw path defeating this anchor in silence; both are
-  // exercised below.
-  {
-    // Its OWN grid and extractor. Everything above has been moved from, had
-    // blocks removed, or been pointed at another grid by now -- and a span
-    // table describing the last grid it saw is the anchor working, not a
-    // wrinkle to route around.
-    vkc::Result<vol::VoxelBlockGrid> anchor_grid_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
-                                    attrs, 2);
-    CHECK(anchor_grid_result.ok());
-    vol::VoxelBlockGrid anchor_grid = std::move(anchor_grid_result).value();
-    CHECK(fill_sphere_grid(ctx, anchor_grid, /*with_color=*/false));
-
-    mesh::MarchingCubesConfig anchor_config;
-    anchor_config.track_block_spans = true;
-    vkc::Result<mesh::MarchingCubes> anchor_mc_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                    anchor_config);
-    CHECK(anchor_mc_result.ok());
-    mesh::MarchingCubes anchor_mc = std::move(anchor_mc_result).value();
-    CHECK(anchor_mc.extract_host(anchor_grid, 0.0f).ok());
-
-    vkc::Result<std::vector<vol::BlockIndex>> live =
-        anchor_grid.map().compact_active_blocks();
-    CHECK(live.ok());
-    CHECK(!live.value().empty());
-    const auto vpb = static_cast<std::uint32_t>(kBlock * kBlock * kBlock);
-    const std::uint32_t slot =
-        static_cast<std::uint32_t>(live.value().front().ptr) / vpb;
-    CHECK(anchor_mc.block_span_valid(anchor_grid, slot));
-    CHECK(count_valid_spans(anchor_mc, anchor_grid) == live.value().size());
-
-    vol::BlockIndex victim = live.value().back();
-    const std::uint32_t victim_slot =
-        static_cast<std::uint32_t>(victim.ptr) / vpb;
-    vkc::Result<std::uint32_t> removed = anchor_grid.remove(&victim, 1);
-    CHECK(removed.ok());
-    // The removal ACTUALLY happened. remove() moves the epoch unconditionally
-    // -- a partial removal has still freed slots -- so without this the anchor
-    // check below would pass over a no-op, and the whole block would be
-    // asserting that a token moves rather than that a stale span goes dead.
-    CHECK(removed.value() == 0);
-    CHECK(!anchor_mc.block_span_valid(anchor_grid, slot));
-    CHECK(count_valid_spans(anchor_mc, anchor_grid) == 0);
-
-    // --- Re-extract on the changed topology ---------------------------------
-    //
-    // The path that matters, and the one a query before the next extract cannot
-    // reach: the table is re-anchored to the new topology and republished, so
-    // the stamps standing from the FIRST extract are now sitting under a table
-    // that describes a different active set. Every one of them has to stop
-    // counting -- and the freed slot in particular, whose span still names an
-    // arena range this extract has handed to some other block.
-    vkc::Result<std::vector<vol::BlockIndex>> after_remove =
-        anchor_grid.map().compact_active_blocks();
-    CHECK(after_remove.ok());
-    CHECK(after_remove.value().size() == live.value().size() - 1);
-    CHECK(anchor_mc.extract_host(anchor_grid, 0.0f).ok());
-    CHECK(anchor_mc.block_span_valid(anchor_grid, slot));  // re-meshed
-    CHECK(!anchor_mc.block_span_valid(anchor_grid, victim_slot));
-    // Exactly the surviving blocks, counted over the WHOLE capacity: a stamp
-    // that survives its extract shows up here as one too many, which is what a
-    // "has this slot ever been meshed" test reports and what a table nothing
-    // retires would report for the rest of the run.
-    CHECK(count_valid_spans(anchor_mc, anchor_grid) ==
-          after_remove.value().size());
-
-    // --- The same extractor, pointed at a SECOND grid ------------------------
-    //
-    // The other way the anchor re-arms, and the one that leaves the most stale
-    // state behind: the slot numbers coincide (both grids allocate the same
-    // blocks from the same fresh LIFO heap), so nothing about a slot's VALUE
-    // distinguishes the two tables. Only the token does.
-    vkc::Result<vol::VoxelBlockGrid> other_result = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), gp, attrs, 2);
-    CHECK(other_result.ok());
-    vol::VoxelBlockGrid other_grid = std::move(other_result).value();
-    CHECK(fill_sphere_grid(ctx, other_grid, /*with_color=*/false));
-    // Two fresh grids never share a token, even at the same topology and even
-    // if one is built in storage the other has vacated -- it is drawn from a
-    // process-wide counter, which is what closes the ABA a grid pointer cannot
-    // see.
-    CHECK(other_grid.topology_epoch() != anchor_grid.topology_epoch());
-
-    CHECK(anchor_mc.extract_host(other_grid, 0.0f).ok());
-    vkc::Result<std::vector<vol::BlockIndex>> other_live =
-        other_grid.map().compact_active_blocks();
-    CHECK(other_live.ok());
-    CHECK(count_valid_spans(anchor_mc, other_grid) ==
-          other_live.value().size());
-    // ... and the first grid is now wholly unrepresented, including the slot it
-    // had just re-meshed. The table is about one grid at a time.
-    CHECK(count_valid_spans(anchor_mc, anchor_grid) == 0);
-
-    // --- A moved-from grid is not the grid ----------------------------------
-    //
-    // The token rides with the map into the destination, so both objects answer
-    // topology_epoch() the same -- and the corpse owns no blocks. Without a
-    // valid() check the answer inverts: the moved-from grid reports its slots
-    // live and the object holding them reports nothing.
-    vol::VoxelBlockGrid taken = std::move(other_grid);
-    CHECK(count_valid_spans(anchor_mc, other_grid) == 0);
-    CHECK(count_valid_spans(anchor_mc, taken) == other_live.value().size());
-  }
-
-  // --- Incremental extraction: the skip is observable, not inferred ----------
-  //
-  // Comparing an incremental extract against a full one over the SAME field
-  // proves nothing: a pass that silently fell back to full returns the
-  // identical mesh, and so does one that skipped correctly. So the field is
-  // CHANGED under the extractor between passes, written straight into the
-  // attributes -- which stamps nothing -- and the `changed` stamps are set by
-  // hand (stamp_changed) to say which blocks moved.
-  //
-  //   nothing stamped, field changed -> every block takes the early return, so
-  //     the mesh must still be the OLD surface. A fallback to full, or a stamp
-  //     test that reads the wrong way, returns the new one and fails here.
-  //   one block stamped, same field  -> the case the feature actually runs in,
-  //     and the only one where the two halves can disagree: a clean block has
-  //     to keep its range while a changed neighbour relocates past it. When
-  //     every block is stamped every old range is being rewritten anyway, so a
-  //     kernel that ignored `s_neighbour` entirely -- or retired the wrong
-  //     range -- passes both of the other two unchanged.
-  //   all stamped, same new field    -> every block re-meshes into the range it
-  //     already owns, so in-place reuse, the span read and the retire pass all
-  //     run, and the mesh must now be the NEW surface.
-  //
-  // Compared as triangle sets, since a re-mesh may reorder within a block. Run
-  // for BOTH kernels: sharing is what the only device consumer uses, and it is
-  // the one whose retire pass touches indices instead of vertices.
-  for (int share_pass = 0; share_pass < 2; ++share_pass) {
-    vkc::Result<vol::VoxelBlockGrid> inc_grid_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
-                                    attrs, 2);
-    CHECK(inc_grid_result.ok());
-    vol::VoxelBlockGrid inc_grid = std::move(inc_grid_result).value();
-    CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false));
-
-    mesh::MarchingCubesConfig inc_config;
-    inc_config.track_block_spans =
-        true;  // what an incremental pass re-meshes against
-    // The point of the loop: pass 0 is the default emitter, pass 1 the sharing
-    // one. Without this the two iterations are the same kernel run twice.
-    inc_config.share_vertices = share_pass == 1;
-    vkc::Result<mesh::MarchingCubes> inc_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), inc_config);
-    CHECK(inc_result.ok());
-    mesh::MarchingCubes inc_mc = std::move(inc_result).value();
-
-    // The first extract can only be full -- there is no watermark yet -- and it
-    // is what establishes the spans and the arena the next one reuses.
-    vkc::Result<mesh::Mesh> first = inc_mc.extract_host(inc_grid, 0.0f);
-    CHECK(first.ok());
-    const std::vector<std::array<float, 9>> old_surface =
-        canonical_triangles(first.value());
-    CHECK(!old_surface.empty());
-
-    // Each block's triangle count under the OLD field, off the table that first
-    // extract published. Kept so the mixed pass below can flag a block whose
-    // geometry demonstrably MOVED rather than one that merely has some.
-    std::vector<std::uint32_t> old_counts(inc_mc.block_span_capacity(), 0);
-    {
-      const mesh::BlockSpan* spans = inc_mc.block_spans();
-      CHECK(spans != nullptr);
-      for (std::uint32_t slot = 0; slot < inc_mc.block_span_capacity();
-           ++slot) {
-        if (inc_mc.block_span_valid(inc_grid, slot)) {
-          old_counts[slot] = spans[slot].triangle_count;
-        }
-      }
-    }
-
-    // A visibly different sphere, written straight into the same blocks.
-    const float kGrown = kRadius * 1.15f;
-    CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false, 1.0f, kGrown));
-
-    // What a full extract of the NEW field gives, taken now so the mixed pass
-    // below can be checked against both surfaces. A separate extractor, so
-    // taking it does not disturb the arena `inc_mc` is carrying across passes.
-    std::vector<std::array<float, 9>> new_surface;
-    // The one block the mixed pass flags: one that carries surface under both
-    // fields, in a DIFFERENT number of triangles, so re-meshing it must add
-    // triangles of the new surface. A block the growth empties need not: at
-    // (3,3,3), beside the centre, it and the seven neighbours re-meshed with it
-    // all fall inside the new sphere.
-    //
-    // Chosen by what moved, never by position in the slot list, and that is not
-    // fussiness: a block's slot is handed out by the allocator's atomics, so
-    // coord -> slot varies run to run, and "the middle slot with any surface"
-    // picks a different BLOCK each time -- sometimes one the growth barely
-    // touches, whose re-mesh then produces nothing the old surface did not
-    // already contain. That is an 8%-flaky assertion, and it fails for a reason
-    // that has nothing to do with what it is testing.
-    std::uint32_t flag_slot = 0;
-    bool have_flag_slot = false;
-    {
-      vkc::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
-          device.value(), allocator.value(), inc_config);
-      CHECK(ref_result.ok());
-      mesh::MarchingCubes ref_mc = std::move(ref_result).value();
-      vkc::Result<mesh::Mesh> grown = ref_mc.extract_host(inc_grid, 0.0f);
-      CHECK(grown.ok());
-      new_surface = canonical_triangles(grown.value());
-      CHECK(drop_degenerate(new_surface) == 0);  // a full extract retires none
-      CHECK(new_surface != old_surface);         // the field really did change
-
-      // Same grid, so the same slots: a slot names a block, not an extractor.
-      const mesh::BlockSpan* new_spans = ref_mc.block_spans();
-      CHECK(new_spans != nullptr);
-      for (std::uint32_t slot = 0; slot < old_counts.size(); ++slot) {
-        if (old_counts[slot] > 0 && ref_mc.block_span_valid(inc_grid, slot) &&
-            new_spans[slot].triangle_count > 0 &&
-            new_spans[slot].triangle_count != old_counts[slot]) {
-          flag_slot = slot;
-          have_flag_slot = true;
-          break;
-        }
-      }
-    }
-    CHECK(have_flag_slot);
-
-    // Every block slot, for the pass that stamps them all. A pass that falls
-    // back to a full extract would make every assertion about skipping stop
-    // testing anything, hence the ExtractTimings::incremental check on each.
-    std::vector<std::uint32_t> all_slots(
-        static_cast<std::uint32_t>(gp.num_blocks));
-    for (std::uint32_t i = 0; i < all_slots.size(); ++i) all_slots[i] = i;
-
-    mesh::ExtractTimings clean_rt{};
-    vkc::Result<mesh::DeviceMesh> clean =
-        inc_mc.extract_device_incremental(inc_grid, 0.0f, &clean_rt);
-    CHECK(clean.ok());
-    CHECK(clean_rt.incremental);           // not the fallback
-    CHECK(clean_rt.remeshed_blocks == 0);  // and nothing was re-meshed
-    vkc::Result<mesh::Mesh> clean_host = inc_mc.download(clean.value());
-    CHECK(clean_host.ok());
-    CHECK(canonical_triangles(clean_host.value()) == old_surface);
-
-    // --- The mixed pass -------------------------------------------------
-    //
-    // One stamped block, dilated on-device into the up-to-eight blocks whose
-    // `+{0,1}^3` neighbourhood contains it. So a handful of blocks relocate or
-    // shrink while every other block keeps the range it already owns, in an
-    // arena being appended to at the same time -- which is the only
-    // configuration where keeping and re-meshing can disagree.
-    CHECK(stamp_changed(ctx, inc_grid, {flag_slot}));
-    mesh::ExtractTimings mixed_rt{};
-    vkc::Result<mesh::DeviceMesh> mixed =
-        inc_mc.extract_device_incremental(inc_grid, 0.0f, &mixed_rt);
-    CHECK(mixed.ok());
-    CHECK(mixed_rt.incremental);
-    // Genuinely mixed, on the kernel's own count: some blocks re-meshed, and
-    // not all of them. Without this the stamps could dilate to everything
-    // (or to nothing) and the assertions below would still pass, describing a
-    // uniform pass by another name.
-    CHECK(mixed_rt.remeshed_blocks > 0);
-    CHECK(mixed_rt.remeshed_blocks < mixed_rt.active_blocks);
-    vkc::Result<mesh::Mesh> mixed_host = inc_mc.download(mixed.value());
-    CHECK(mixed_host.ok());
-    std::vector<std::array<float, 9>> mixed_tris =
-        canonical_triangles(mixed_host.value());
-    // Retirement runs on this pass too: the re-meshed blocks relocate or shrink
-    // and give their old ranges back, in the middle of an arena whose other
-    // blocks must be untouched.
-    CHECK(drop_degenerate(mixed_tris) > 0);
-    {
-      // Every surviving triangle came from one of the two surfaces, and BOTH
-      // are represented. A pass that quietly re-meshed everything would be all
-      // new; one that skipped everything would be all old; one that corrupted a
-      // clean block's range while a neighbour relocated past it would hold a
-      // triangle from neither.
-      const std::set<std::array<float, 9>> old_set(old_surface.begin(),
-                                                   old_surface.end());
-      const std::set<std::array<float, 9>> new_set(new_surface.begin(),
-                                                   new_surface.end());
-      std::size_t kept = 0;
-      std::size_t remeshed = 0;
-      for (const std::array<float, 9>& t : mixed_tris) {
-        const bool in_old = old_set.count(t) != 0;
-        const bool in_new = new_set.count(t) != 0;
-        CHECK(in_old || in_new);  // invented nothing
-        if (in_old && !in_new) ++kept;
-        if (in_new && !in_old) ++remeshed;
-      }
-      CHECK(kept > 0);      // clean blocks really did keep their triangles
-      CHECK(remeshed > 0);  // and the stamped neighbourhood really did redo its
-    }
-
-    // --- A stamp at or before the extract's tick is already meshed --------
-    //
-    // The mixed pass recorded the tick it ran at, so the block it re-meshed
-    // is not re-meshed again: nothing has been stamped since.
-    {
-      mesh::ExtractTimings again_rt{};
-      vkc::Result<mesh::DeviceMesh> again =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, &again_rt);
-      CHECK(again.ok());
-      CHECK(again_rt.incremental);
-      CHECK(again_rt.remeshed_blocks == 0);
-    }
-
-    // --- And then all of it ----------------------------------------------
-    CHECK(stamp_changed(ctx, inc_grid, all_slots));
-    mesh::ExtractTimings dirty_rt{};
-    vkc::Result<mesh::DeviceMesh> dirty =
-        inc_mc.extract_device_incremental(inc_grid, 0.0f, &dirty_rt);
-    CHECK(dirty.ok());
-    CHECK(dirty_rt.incremental);
-    // Every block, and the kernel's own count says so rather than the stamps.
-    CHECK(dirty_rt.remeshed_blocks == dirty_rt.active_blocks);
-    vkc::Result<mesh::Mesh> dirty_host = inc_mc.download(dirty.value());
-    CHECK(dirty_host.ok());
-    std::vector<std::array<float, 9>> all_dirty =
-        canonical_triangles(dirty_host.value());
-    // The grown sphere makes some blocks outgrow the range they held and others
-    // shrink inside it, so both halves of the retire pass run -- and leave the
-    // degenerates this drops. Asserting some were dropped is what keeps that
-    // pass covered rather than merely compiled.
-    CHECK(drop_degenerate(all_dirty) > 0);
-    CHECK(!all_dirty.empty());
-
-    // Exactly the surface a full extract of the new field gives -- so
-    // relocation, in-place reuse and retirement together lose and invent
-    // nothing, and the mixed pass before it left an arena the next pass could
-    // build on. That last part is what the mixed case adds: a corrupted clean
-    // range survives into here.
-    CHECK(all_dirty == new_surface);
-
-    // --- The fallbacks, each proved by a field the skip would hide ---------
-    //
-    // Every one of these is checked by asserting BOTH halves: that the pass
-    // reported itself full, and that the mesh is the CURRENT field rather than
-    // the arena's previous contents. The second half is what makes the first
-    // mean anything -- a clause that silently stopped holding would leave a
-    // pass calling itself incremental while publishing a stale surface, which
-    // is exactly the shape of the defects this covers.
-    //
-    // The field is changed once more, back toward the original radius, so a
-    // pass that wrongly skipped would return the grown sphere and be caught.
-    CHECK(fill_sphere_grid(ctx, inc_grid, /*with_color=*/false, 1.0f, kRadius));
-    std::vector<std::array<float, 9>> shrunk_surface;
-    {
-      vkc::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
-          device.value(), allocator.value(), inc_config);
-      CHECK(ref_result.ok());
-      vkc::Result<mesh::Mesh> shrunk =
-          std::move(ref_result).value().extract_host(inc_grid, 0.0f);
-      CHECK(shrunk.ok());
-      shrunk_surface = canonical_triangles(shrunk.value());
-      CHECK(shrunk_surface != new_surface);
-    }
-    // Nothing is stamped from here on, so an incremental pass returns the
-    // arena's previous contents and a full one returns the shrunk sphere. The
-    // two are distinguishable, which is the whole point.
-
-    // (a) A CULLED extract in between, and the one the first cut of the
-    //     caller-supplied set missed. A culled pass rebuilds
-    //     the arena from the blocks it was handed and so stamps spans for only
-    //     those; every other block keeps a range naming the arena that pass
-    //     replaced. Left publishing arena state, the next incremental call
-    //     passed every clause of the predicate -- watermark live, epoch
-    //     unmoved, serial equal, since the serial it compares is the culled
-    //     call's own -- and re-meshed against a table describing an arena that
-    //     was gone: half the sphere returned with Status::ok and
-    //     `incremental == 1`, and a changed block outside the cull wrote over
-    //     live triangles belonging to blocks the pass had promised to keep.
-    //
-    //     Run with nothing stamped: a correct fallback
-    //     re-meshes everything and returns the shrunk sphere, while a pass that
-    //     wrongly went incremental keeps whatever the culled arena holds. The
-    //     two differ by the whole culled-away half, so this cannot pass by
-    //     accident.
-    {
-      vkc::Result<std::vector<vol::BlockIndex>> live =
-          inc_grid.map().compact_active_blocks();
-      CHECK(live.ok());
-      std::vector<vol::BlockIndex> visible;
-      for (const vol::BlockIndex& b : live.value()) {
-        if (b.coord.x < kBlocks / 2) visible.push_back(b);
-      }
-      CHECK(!visible.empty());
-      CHECK(visible.size() < live.value().size());
-
-      mesh::ExtractTimings cull_t{};
-      vkc::Result<mesh::DeviceMesh> culled = inc_mc.extract_device(
-          inc_grid, 0.0f, inc_grid.block_list(visible), &cull_t);
-      CHECK(culled.ok());
-      CHECK(cull_t.active_blocks == visible.size());
-      CHECK(!cull_t.incremental);
-
-      mesh::ExtractTimings rt{};
-      vkc::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, &rt);
-      CHECK(dm.ok());
-      CHECK(!rt.incremental);
-      vkc::Result<mesh::Mesh> host = inc_mc.download(dm.value());
-      CHECK(host.ok());
-      CHECK(canonical_triangles(host.value()) == shrunk_surface);
-    }
-
-    // (b) Another iso. Every triangle a block keeps lies on the last
-    //     extract's surface, so with nothing stamped a pass that wrongly went
-    //     incremental returns the sphere at iso 0 rather than the one at 0.1.
-    {
-      vkc::Result<mesh::MarchingCubes> ref_result = mesh::MarchingCubes::create(
-          device.value(), allocator.value(), inc_config);
-      CHECK(ref_result.ok());
-      vkc::Result<mesh::Mesh> wider =
-          std::move(ref_result).value().extract_host(inc_grid, 0.1f);
-      CHECK(wider.ok());
-      const std::vector<std::array<float, 9>> wider_surface =
-          canonical_triangles(wider.value());
-      CHECK(wider_surface != shrunk_surface);
-
-      mesh::ExtractTimings rt{};
-      vkc::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.1f, &rt);
-      CHECK(dm.ok());
-      CHECK(!rt.incremental);
-      vkc::Result<mesh::Mesh> host = inc_mc.download(dm.value());
-      CHECK(host.ok());
-      CHECK(canonical_triangles(host.value()) == wider_surface);
-    }
-
-    // (c) A topology change. remove() re-draws the grid's epoch and puts the
-    //     freed indices back on the LIFO list, so a slot now names a different
-    //     block and the spans describe geometry that is gone. The re-anchor
-    //     that ensure_block_spans does on the way past is what made this look
-    //     sound: comparing the table's anchor to the grid AFTER re-anchoring it
-    //     compares a value with itself.
-    {
-      vol::BlockIndex corner{};
-      corner.coord = vr::Vec3i(0, 0, 0);
-      vkc::Result<std::uint32_t> removed = inc_grid.remove(&corner, 1);
-      CHECK(removed.ok());
-
-      mesh::ExtractTimings rt{};
-      vkc::Result<mesh::DeviceMesh> dm =
-          inc_mc.extract_device_incremental(inc_grid, 0.0f, &rt);
-      CHECK(dm.ok());
-      CHECK(!rt.incremental);
-    }
-  }
 
   // --- Caller-supplied active set (the mesh half of frustum culling) ---------
   // extract_device over a BlockList the caller compacted, instead of the whole
@@ -2278,9 +1303,6 @@ int main() {
     // No compaction happened here, so the row must read 0 rather than carrying
     // the previous call's figure or timing the caller's own compaction.
     CHECK(whole_t.compact_ms == 0.0);
-    // A caller-supplied set never turns an extract incremental, whatever else
-    // is true of the extractor.
-    CHECK(!whole_t.incremental);
 
     // Two complementary halves, split on the block coordinate the way a frustum
     // would split on visibility.
@@ -2422,10 +1444,10 @@ int main() {
     }
   }
 
-  // With the spans off the extract binds the map's device list, reusing the
-  // compaction a fuse just made: the same triangles as a host list, and the
-  // fuse's list still current after. An allocation since makes it compact
-  // again rather than mesh the old list.
+  // A full extract binds the map's device list, reusing the compaction a fuse
+  // just made: the same triangles as a host list, and the fuse's list still
+  // current after. An allocation since makes it compact again rather than mesh
+  // the old list.
   {
     vkc::Result<vol::VoxelBlockGrid> list_grid_result =
         vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
@@ -2433,13 +1455,16 @@ int main() {
     CHECK(list_grid_result.ok());
     vol::VoxelBlockGrid list_grid = std::move(list_grid_result).value();
     CHECK(fill_sphere_grid(ctx, list_grid, /*with_color=*/false));
-    mesh::MarchingCubesConfig spans_config;
-    spans_config.track_block_spans = true;  // the host list
-    vkc::Result<mesh::MarchingCubes> host_mc = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), spans_config);
+    vkc::Result<mesh::MarchingCubes> host_mc =
+        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
     CHECK(host_mc.ok());
-    vkc::Result<mesh::Mesh> full =
-        host_mc.value().extract_host(list_grid, 0.0f);
+    vkc::Result<std::vector<vol::BlockIndex>> host_list =
+        list_grid.map().compact_active_blocks();
+    CHECK(host_list.ok());
+    vkc::Result<mesh::DeviceMesh> host_dm = host_mc.value().extract_device(
+        list_grid, 0.0f, list_grid.block_list(host_list.value()));
+    CHECK(host_dm.ok());
+    vkc::Result<mesh::Mesh> full = host_mc.value().download(host_dm.value());
     CHECK(full.ok());
     const std::vector<std::array<float, 9>> full_tris =
         canonical_triangles(full.value());

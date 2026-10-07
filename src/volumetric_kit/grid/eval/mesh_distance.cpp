@@ -41,7 +41,7 @@ bool within(Vec3f c, float limit) {
 
 bool positive_finite(float f) { return std::isfinite(f) && f > 0.0f; }
 
-// A triangle with no extent, and what an incremental extract retires one to.
+// A triangle with no extent.
 bool is_point(Vec3f a, Vec3f b, Vec3f c) { return a == b && b == c; }
 
 Vec3f closest_point_on_segment(Vec3f p, Vec3f a, Vec3f b) {

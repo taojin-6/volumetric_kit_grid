@@ -12,7 +12,7 @@
 // what a freshly allocated block holds, so the mesher skips it as it skipped
 // the original. A block whose tsdf or weight this leaves different is stamped
 // changed with the map's tick, as the integrator stamps one, so a frame that
-// repeats a block's last one leaves it to an incremental extract. An entry
+// repeats a block's last one leaves it unstamped. An entry
 // whose coord the table does not hold (see block_ptr) is written nothing.
 //
 // Re-implements the prior engine's computeIDCTKernel (compute_dct.cu), which

@@ -89,7 +89,6 @@ static_assert(offsetof(BlockStamp, changed) == 8, "BlockStamp layout drift");
 
 /// @brief Whether tick @p a is later than tick @p b, modulo 2^32: right while
 ///        the two are under 2^31 ticks apart, across the clock's wrap too.
-///        `tick_after` in `volume/shaders/block_stamp.glsl` is its twin.
 constexpr bool tick_after(std::uint32_t a, std::uint32_t b) noexcept {
   return static_cast<std::int32_t>(a - b) > 0;
 }

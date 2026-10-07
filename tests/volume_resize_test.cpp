@@ -169,7 +169,9 @@ int main() {
   vkc::Result<std::map<Coord, std::int32_t>> ptrs_before = active_ptrs(map);
   CHECK(ptrs_before.ok() && ptrs_before.value().size() == a.size());
 
+  const std::uint64_t epoch = map.topology_epoch();
   CHECK(map.resize(1024).ok());
+  CHECK(map.topology_epoch() == epoch);  // resize keeps every block index
   CHECK(map.grid().num_buckets == 1024);
   CHECK(map.grid().num_blocks == 1024 * 8);
 
@@ -264,6 +266,7 @@ int main() {
         vol::VoxelHashMap::create(device.value(), allocator.value(), tight);
     CHECK(made.ok());
     vol::VoxelHashMap small = std::move(made).value();
+    CHECK(small.topology_epoch() != map.topology_epoch());  // distinct maps
     std::vector<vol::BlockIndex> clash;
     std::set<std::uint32_t> old_buckets;
     for (int i = 0; i < 4096 && clash.size() < 5; ++i) {

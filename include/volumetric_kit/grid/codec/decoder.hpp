@@ -77,8 +77,8 @@ struct DecoderConfig {
 /// it. So a player decodes frame after frame into one grid and meshes it after
 /// each; nothing is cleared between frames, and a block present in both costs
 /// no allocation. A block the decode leaves different is stamped `changed`
-/// (@ref volume::BlockStamp) and one it leaves as it was is not, so an
-/// incremental extract re-meshes only what the stream changed.
+/// (@ref volume::BlockStamp) and one it leaves as it was is not, so a
+/// consumer of the stamps sees only what the stream changed.
 ///
 /// Only `tsdf` and `weight` are written, so a grid that declares any other
 /// attribute is refused: a block kept across frames would carry that
