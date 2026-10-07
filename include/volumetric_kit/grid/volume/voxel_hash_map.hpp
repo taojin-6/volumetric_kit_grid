@@ -103,8 +103,8 @@ struct DepthInput {
 ///        bound by their exact range.
 ///
 /// Borrowed from the map that compacted it, and stamped so that map can say
-/// whether it still holds the active set:
-/// @ref VoxelHashMap::check_device_block_list.
+/// whether it still holds: @ref VoxelHashMap::check_device_block_list for the
+/// active set, @ref VoxelHashMap::check_device_block_subset for either kind.
 struct DeviceBlockList {
   const core::Buffer* buffer = nullptr;  ///< The map's own list; borrowed.
   std::uint32_t count = 0;               ///< Entries in it.
@@ -126,7 +126,7 @@ struct DeviceBlockList {
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
 /// byte-for-byte. Covers init, allocate-from-coords / -depth / -triangles,
-/// remove, compact / compact-in-frustum, diagnostics, and an
+/// remove, compact / compact-in-frusta, diagnostics, and an
 /// **index-preserving** @ref resize (the GPU rehash that keeps each block's
 /// `ptr`).
 ///
@@ -383,61 +383,50 @@ class VR_VOLUME_API VoxelHashMap {
   core::Result<DeviceBlockList> compact_active_blocks_on_device(
       core::StageMetrics* metrics = nullptr);
 
-  /// @brief Whether @p list still names this map's blocks, for a consumer to
-  ///        ask before it binds the list.
+  /// @brief Whether @p list is still this map's active set, for a consumer
+  ///        that needs every block to ask before it binds the list.
   /// @param list  From @ref compact_active_blocks_on_device. An empty one is
   ///              always accepted: it names no block.
   /// @param who   The caller, for the message.
-  /// @return OK; or `Status::Code::InvalidArgument` when this map is
-  ///         moved-from, did not compact @p list, has moved since, or has
-  ///         compacted another list, allocated, resized, removed or cleared
-  ///         since; and for a list from
+  /// @return OK; or `Status::Code::InvalidArgument` as
+  ///         @ref check_device_block_subset refuses, and for a list from
   ///         @ref compact_active_blocks_in_frusta_on_device, which is a subset
   ///         and never the active set.
   core::Status check_device_block_list(const DeviceBlockList& list,
                                        const char* who) const;
 
-  /// @brief Compact only the active blocks intersecting @p planes -- the
-  ///        per-frame streamed working set for a camera view.
-  ///
-  /// Like @ref compact_active_blocks, but each block's world AABB is tested
-  /// against the six frustum planes and dropped if fully outside any of them
-  /// (a conservative p-vertex test; the planes are ~10% widened, see
-  /// @ref make_frustum_planes). A caller meshing only what a view sees
-  /// passes the result to `mesh::MarchingCubes`' block-list extract; TSDF
-  /// integration culls on the device instead, through
-  /// @ref compact_active_blocks_in_frusta_on_device.
-  /// @param planes  Six inward-normal frustum planes (@ref
-  /// make_frustum_planes).
-  /// @param metrics  As @ref compact_active_blocks, under the same row name:
-  ///                 this is the same round trip against a smaller set, so a
-  ///                 caller that switches to it to make the trip cheaper must
-  ///                 be able to read what that bought rather than watch the row
-  ///                 disappear.
-  /// @return The visible active blocks (order unspecified), or a non-OK
-  ///         `Status` if a buffer or the dispatch fails / the map is
-  ///         moved-from.
-  core::Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
-      const FrustumPlanes& planes, core::StageMetrics* metrics = nullptr);
-
-  /// @brief @ref compact_active_blocks_in_frustum for a depth camera: derives
-  ///        the frustum from @p camera's intrinsics, `[min_depth, max_depth]`
-  ///        range, and pose, then culls.
-  /// @param camera  The same camera passed to @ref allocate_from_depth.
-  /// @param metrics  As @ref compact_active_blocks.
-  /// @return The visible active blocks, or a non-OK `Status`.
-  core::Result<std::vector<BlockIndex>> compact_active_blocks_in_frustum(
-      const DepthCameraParams& camera, core::StageMetrics* metrics = nullptr);
+  /// @brief Whether @p list still names blocks of this map -- its active set
+  ///        or a frustum-culled subset of it -- for a consumer that meshes or
+  ///        reads only the blocks listed.
+  /// @param list  From @ref compact_active_blocks_on_device or
+  ///              @ref compact_active_blocks_in_frusta_on_device. An empty one
+  ///              is always accepted: it names no block.
+  /// @param who   The caller, for the message.
+  /// @return OK; or `Status::Code::InvalidArgument` when this map is
+  ///         moved-from, did not compact @p list, has moved since, or has
+  ///         since rewritten the list (another compaction of the same kind, or
+  ///         a resize), allocated, removed or cleared.
+  core::Status check_device_block_subset(const DeviceBlockList& list,
+                                         const char* who) const;
 
   /// @brief Compact the active blocks inside **any** of @p frusta, leaving the
   ///        list on the device; only its count reaches the host.
   ///
-  /// One scan of the table, with the per-frustum test of
-  /// @ref compact_active_blocks_in_frustum, so a block several frusta keep is
-  /// listed once. The list has a buffer of its own: it leaves
+  /// One scan of the table: each block's world AABB -- its voxels and the
+  /// marching-cubes cells it meshes, which reach a half-voxel past them -- is
+  /// tested against each frustum's six planes and kept unless fully outside
+  /// one of them (a conservative p-vertex test; see @ref make_frustum_planes),
+  /// so a block
+  /// several frusta keep is listed once. `tsdf::TsdfIntegrator` fuses the
+  /// blocks its cameras reach this way, and `mesh::MarchingCubes` meshes the
+  /// blocks a viewing camera sees.
+  ///
+  /// The list has a buffer of its own: it leaves
   /// @ref compact_active_blocks_on_device's list holding, and
   /// @ref check_device_block_list refuses it, since it is not the active set.
-  /// It is rewritten by the next frustum compaction, and nothing is cached.
+  /// @ref check_device_block_subset accepts it until the next frustum
+  /// compaction rewrites it, or the map allocates, resizes, removes, clears or
+  /// moves. Nothing is cached.
   /// @param frusta   The frusta; none keeps no block.
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
   /// @return The list, or a non-OK `Status`: `Status::Code::InvalidArgument`
@@ -655,19 +644,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The hash-table slot count, `num_buckets * bucket_size`.
   std::uint32_t total_entries() const noexcept;
 
-  /// Shared body of the compaction kernels: zero the counter, run @p kernel
-  /// over every hash slot, then read back the appended @ref BlockIndex list
-  /// from @p out, the buffer @p kernel writes. Used by
-  /// @ref compact_active_blocks (plain) and
-  /// @ref compact_active_blocks_in_frustum (whose set also carries the planes,
-  /// which @p prepare uploads in the dispatch's batch). @p last_count is that
-  /// kernel's previous count, which sizes the list read back in the same
-  /// batch, and is updated. @p stage, when non-null, collects the dispatch's
-  /// device span.
+  /// The body of @ref compact_active_blocks: zero the counter, run the
+  /// compaction over every hash slot, then read back the appended
+  /// @ref BlockIndex list. @ref last_active_count_ is the previous count, which
+  /// sizes the list read back in the same batch, and is updated. @p stage,
+  /// when non-null, collects the dispatch's device span.
   core::Result<std::vector<BlockIndex>> collect_compacted(
-      const core::ComputeKernel& kernel, const core::Buffer& out,
-      std::uint32_t& last_count, core::GpuStageScope* stage,
-      const std::function<core::Status(core::CommandBatch&)>& prepare = {});
+      core::GpuStageScope* stage);
   /// The compaction into @p out, the buffer @p kernel writes, in one submit,
   /// returning the count and reading the list's first @p head_count entries
   /// back into @p head.
@@ -688,8 +671,8 @@ class VR_VOLUME_API VoxelHashMap {
   /// already has a stage open.
   static const char* active_set_row(const core::StageMetrics* metrics) noexcept;
 
-  /// Whether @p list is still this map's active set: compacted here, and
-  /// nothing since has rewritten the list, freed a block or allocated one.
+  /// Whether @p list still names this map's blocks: compacted here, and
+  /// nothing since has rewritten its buffer, freed a block or allocated one.
   bool holds(const DeviceBlockList& list) const noexcept;
 
   /// Record what @p dispatches records each round, re-dispatching while the
@@ -789,13 +772,14 @@ class VR_VOLUME_API VoxelHashMap {
   // only dispatches that move the counter. Copied by the defaulted move, and
   // harmlessly left on a moved-from map, whose load_factor() is refused.
   std::uint32_t heap_free_ = 0;
-  // Each compaction kernel's last count, from which collect_compacted guesses
-  // how much of the list to read back beside the next count.
+  // The last compact_active_blocks count, from which collect_compacted
+  // guesses how much of the list to read back beside the next count.
   std::uint32_t last_active_count_ = 0;
-  std::uint32_t last_frustum_count_ = 0;
   // Bumped by every write to compacted_ (a compaction) and every swap of it (a
-  // resize), so a DeviceBlockList can be checked against it.
+  // resize), so a DeviceBlockList can be checked against it; frustum_serial_
+  // likewise for frustum_compacted_.
   std::uint64_t compaction_serial_ = 0;
+  std::uint64_t frustum_serial_ = 0;
   // The last compact_active_blocks_on_device list, returned again while
   // holds() says it is still the active set.
   DeviceBlockList last_device_list_{};

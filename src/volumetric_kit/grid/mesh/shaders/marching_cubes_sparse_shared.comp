@@ -146,8 +146,8 @@ layout(push_constant, scalar) uniform PushConstants {
   int num_buckets;
   int bucket_size;
   int max_chain;
-  // Block slots the grid's heap holds, so a BlockIndex::ptr this kernel did not
-  // produce can be bounded in one comparison.
+  // Block slots the grid's heap holds, to bound each block's ptr in one
+  // comparison.
   uint num_block_slots;
 } pc;
 
@@ -544,11 +544,9 @@ void main() {
   }
   BlockIndex block = active_blocks[block_i];
 
-  // A caller-supplied active set can name a block slot this grid never handed
-  // out: the host bounds the LIST LENGTH in O(1), but bounding every ptr is
-  // O(count) of host work per frame, which the extract deliberately does not
-  // spend. Left unbounded, a fabricated or misaligned ptr reads past the
-  // attribute arrays -- and robustBufferAccess is enabled nowhere in this repo.
+  // Defensive: the host binds only a list this grid's map compacted, so every
+  // ptr is in range; this keeps a corrupted one from reading past the
+  // attribute arrays (robustBufferAccess is enabled nowhere).
   // The condition is uniform across the workgroup (every thread reads the same
   // `block`), so this returns as a whole group and reaches no barrier
   // divergently.

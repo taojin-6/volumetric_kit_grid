@@ -2,16 +2,16 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for frustum-culled compaction: allocate blocks at known world
-// positions and verify compact_active_blocks_in_frustum keeps exactly the
-// in-view ones while plain compact_active_blocks keeps all. Two scenarios:
+// positions and verify compact_active_blocks_in_frusta_on_device keeps exactly
+// the in-view ones while plain compact_active_blocks keeps all. Two scenarios:
 // (1) an identity-pose camera with edge cases -- an edge-straddling block kept
 // only by the ~10% side-plane widening, and one just inside the far plane;
 // (2) a NON-identity pose (rotated + translated) so the plane->world transform
 // (inverseTranspose(cam_to_world)) is actually exercised, not a no-op. Expected
 // sets are derived from the camera geometry, independent of
 // make_frustum_planes, and each result is pinned by count + distinct heap ptrs.
-// The device-list form takes several frusta and keeps their union, in a list
-// of its own that leaves the active-set list holding.
+// Several frusta keep their union, in a list of its own that leaves the
+// active-set list holding and goes stale on the next frustum compaction.
 // Runs on the real driver (MoltenVK on Apple, the NVIDIA ICD on Linux CI).
 // Exits 0 (skip) where no device is present.
 
@@ -80,6 +80,16 @@ int check_result(const std::vector<vol::BlockIndex>& blocks,
   CHECK(ptrs.size() == blocks.size());
   CHECK(to_set(blocks) == want);
   return 0;
+}
+
+// The blocks `planes` keeps, compacted on the device and read back.
+vkc::Result<std::vector<vol::BlockIndex>> cull(
+    const vkc::Device& device, vkc::Allocator& allocator,
+    vol::VoxelHashMap& map, const vol::FrustumPlanes& planes) {
+  VKC_ASSIGN(const vol::DeviceBlockList list,
+             map.compact_active_blocks_in_frusta_on_device({planes}));
+  return vr_test::read_back<vol::BlockIndex>(device, allocator, *list.buffer,
+                                             list.count);
 }
 
 }  // namespace
@@ -163,27 +173,12 @@ int main() {
   const std::set<Coord> want = {{0, 0, 25}, {14, 0, 25}, {0, 0, 120}};
   const vol::FrustumPlanes planes = vol::make_frustum_planes(
       100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 0.1f, 5.0f, vr::Mat4f(1.0f));
+  vkc::Device& dev = device.value();
+  vkc::Allocator& alloc = allocator.value();
   vkc::Result<std::vector<vol::BlockIndex>> visible =
-      map.compact_active_blocks_in_frustum(planes);
+      cull(dev, alloc, map, planes);
   CHECK(visible.ok());
   if (check_result(visible.value(), want) != 0) return 1;
-
-  // The DepthCameraParams convenience derives the same frustum (min/max_depth
-  // as near/far) and culls identically.
-  vr::DepthCameraParams cam{};
-  cam.fx = 100.0f;
-  cam.fy = 100.0f;
-  cam.cx = 50.0f;
-  cam.cy = 50.0f;
-  cam.min_depth = 0.1f;
-  cam.max_depth = 5.0f;
-  cam.width = 100;
-  cam.height = 100;
-  cam.cam_to_world = vr::Mat4f(1.0f);
-  vkc::Result<std::vector<vol::BlockIndex>> visible_cam =
-      map.compact_active_blocks_in_frustum(cam);
-  CHECK(visible_cam.ok());
-  if (check_result(visible_cam.value(), want) != 0) return 1;
 
   // --- Several frusta, on the device ----------------------------------------
   // Their union, each block once: the camera above and one seeing only 6 to
@@ -206,14 +201,18 @@ int main() {
   std::set<Coord> union_want = want;
   union_want.insert({0, 0, 200});
   if (check_result(both_blocks.value(), union_want) != 0) return 1;
-  // A subset, so never the active set; and it left that list holding, as the
-  // host form does.
+  // A subset, so never the active set, though still one of this map's
+  // blocks; and it left the active-set list holding. The next frustum
+  // compaction rewrites it, which makes it stale.
   CHECK(!map.check_device_block_list(both.value(), "test").ok());
-  CHECK(map.compact_active_blocks_in_frustum(planes).ok());
-  CHECK(map.check_device_block_list(full.value(), "test").ok());
+  CHECK(map.check_device_block_subset(both.value(), "test").ok());
+  CHECK(map.check_device_block_subset(full.value(), "test").ok());
   vkc::Result<vol::DeviceBlockList> one =
       map.compact_active_blocks_in_frusta_on_device({planes});
   CHECK(one.ok() && one.value().count == want.size());
+  CHECK(map.check_device_block_list(full.value(), "test").ok());
+  CHECK(!map.check_device_block_subset(both.value(), "test").ok());
+  CHECK(map.check_device_block_subset(one.value(), "test").ok());
   vkc::Result<vol::DeviceBlockList> none =
       map.compact_active_blocks_in_frusta_on_device({});
   CHECK(none.ok() && none.value().count == 0);
@@ -248,10 +247,10 @@ int main() {
       map.allocate(pcoords.data(), static_cast<std::uint32_t>(pcoords.size()));
   CHECK(pfail.ok() && pfail.value() == 0);
 
-  vr::DepthCameraParams pcam = cam;
-  pcam.cam_to_world = pose;
   vkc::Result<std::vector<vol::BlockIndex>> pvisible =
-      map.compact_active_blocks_in_frustum(pcam);
+      cull(dev, alloc, map,
+           vol::make_frustum_planes(100.0f, 100.0f, 50.0f, 50.0f, 100, 100,
+                                    0.1f, 5.0f, pose));
   CHECK(pvisible.ok());
   const std::set<Coord> pwant = {{75, 50, 75}};
   if (check_result(pvisible.value(), pwant) != 0) return 1;
@@ -313,7 +312,7 @@ int main() {
   // difference. kNearBand is kept: it is in front of the [0,1] near plane.
   const std::set<Coord> vp_want = {{0, 0, 25}, {0, 0, 120}, {0, 0, 3}};
   vkc::Result<std::vector<vol::BlockIndex>> vp_visible =
-      map.compact_active_blocks_in_frustum(vol::make_frustum_planes(view_proj));
+      cull(dev, alloc, map, vol::make_frustum_planes(view_proj));
   CHECK(vp_visible.ok());
   if (check_result(vp_visible.value(), vp_want) != 0) return 1;
 
@@ -328,8 +327,7 @@ int main() {
   std::set<Coord> gl_want = vp_want;
   gl_want.erase({0, 0, 3});
   vkc::Result<std::vector<vol::BlockIndex>> vp_gl =
-      map.compact_active_blocks_in_frustum(
-          vol::make_frustum_planes(view_proj_gl));
+      cull(dev, alloc, map, vol::make_frustum_planes(view_proj_gl));
   CHECK(vp_gl.ok());
   if (check_result(vp_gl.value(), gl_want) != 0) return 1;
 
@@ -341,8 +339,7 @@ int main() {
   const std::set<Coord> margin_want = {
       {0, 0, 25}, {14, 0, 25}, {0, 0, 120}, {0, 0, 3}};
   vkc::Result<std::vector<vol::BlockIndex>> vp_margin =
-      map.compact_active_blocks_in_frustum(
-          vol::make_frustum_planes(view_proj, 0.1f));
+      cull(dev, alloc, map, vol::make_frustum_planes(view_proj, 0.1f));
   CHECK(vp_margin.ok());
   if (check_result(vp_margin.value(), margin_want) != 0) return 1;
 
@@ -353,8 +350,7 @@ int main() {
   // and only if the near plane moved back with the rest. kBehind, 0.96 m back,
   // is outside the widening either way and cannot witness this.
   vkc::Result<std::vector<vol::BlockIndex>> vp_wide =
-      map.compact_active_blocks_in_frustum(
-          vol::make_frustum_planes(view_proj, 0.5f));
+      cull(dev, alloc, map, vol::make_frustum_planes(view_proj, 0.5f));
   CHECK(vp_wide.ok());
   if (check_result(vp_wide.value(), margin_want) != 0) return 1;
 
@@ -386,8 +382,7 @@ int main() {
   // degenerate branch adds no margin, so this keeps every block instead --
   // conservative, and the direction a cull should fail in.
   vkc::Result<std::vector<vol::BlockIndex>> vp_degenerate =
-      map.compact_active_blocks_in_frustum(
-          vol::make_frustum_planes(vr::Mat4f(0.0f), -1e-7f));
+      cull(dev, alloc, map, vol::make_frustum_planes(vr::Mat4f(0.0f), -1e-7f));
   CHECK(vp_degenerate.ok());
   CHECK(vp_degenerate.value().size() == vp_coords.size());
 

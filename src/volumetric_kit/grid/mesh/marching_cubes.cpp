@@ -141,13 +141,12 @@ struct SparsePushConstants {
   std::int32_t num_buckets = 0;
   std::int32_t bucket_size = 0;
   std::int32_t max_chain = 0;
-  // Block slots this grid's heap holds (VoxelGridParams::num_blocks), so the
-  // kernel can bound a BlockIndex::ptr it did not produce. The host bounds the
-  // caller's COUNT in O(1), but bounding every ptr is O(count) of host work per
-  // frame, which the extract deliberately does not spend -- and an unbounded
-  // ptr is an out-of-bounds read of the attribute arrays with
-  // robustBufferAccess enabled nowhere. One comparison per workgroup buys the
-  // other half. Assigned by name, like the four above.
+  // Block slots this grid's heap holds (VoxelGridParams::num_blocks). The
+  // extract binds only a list this grid's map compacted
+  // (check_device_block_subset), so every ptr is one the heap handed out;
+  // this is a one-comparison-per-workgroup guard against a corrupted list,
+  // since robustBufferAccess is enabled nowhere. Assigned by name, like the
+  // four above.
   std::uint32_t num_block_slots = 0;
 };
 // Pin every field offset (all 4-byte scalars): a same-size reorder would keep
@@ -945,14 +944,15 @@ core::Result<DeviceMesh> MarchingCubes::extract_device(
 }
 
 core::Result<DeviceMesh> MarchingCubes::extract_device(
-    volume::VoxelBlockGrid& grid, float iso, const volume::BlockList& blocks,
-    ExtractTimings* timings) {
+    volume::VoxelBlockGrid& grid, float iso,
+    const volume::DeviceBlockList& blocks, ExtractTimings* timings) {
   return extract_device_impl(grid, iso, &blocks, timings, kEntryDevice);
 }
 
 core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
-    volume::VoxelBlockGrid& grid, float iso, const volume::BlockList* blocks,
-    ExtractTimings* timings, const char* entry) {
+    volume::VoxelBlockGrid& grid, float iso,
+    const volume::DeviceBlockList* blocks, ExtractTimings* timings,
+    const char* entry) {
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
   // failed call then reports zeros rather than a previous call's numbers.
@@ -964,29 +964,15 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     return core::Status::invalid_argument(std::string(entry) +
                                           ": grid is moved-from");
   }
-  // A caller-supplied active set is checked here, above everything this call
-  // allocates and before it claims an output slot -- a refusal must leave every
-  // outstanding DeviceMesh as valid as it found it, which is the same reason
-  // claim_output_slot sits where it does.
-  //
-  // The epoch is the whole of the check that matters. A BlockIndex::ptr indexes
-  // the attribute arrays directly and the block heap is LIFO, so a remove() or
-  // clear() between the caller's compaction and this call has handed those
-  // pointers to DIFFERENT blocks: every one of them is still in range, so the
-  // extract would mesh whatever voxels now live there and report Status::ok.
-  //
-  // Not checked HERE: that each ptr is one this grid actually handed out. It is
-  // O(count) of host work per frame -- ~107k entries on room0 -- to catch a
-  // caller who fabricated a list rather than compacting one, and the epoch
-  // already catches every way a list obtained honestly can go stale. What the
-  // epoch does NOT catch is a count that outran its array, so the O(1) half of
-  // that bound -- the count against the heap, which collect_compacted used to
-  // guarantee by clamping its own -- is taken by check_block_list with the
-  // epoch, and the kernel takes the per-block half in the one comparison it can
-  // afford (see `num_block_slots`). An empty list passes, so a
-  // default-constructed BlockList stays the spelling of "nothing is visible".
+  // A caller's list is checked here, above everything this call allocates and
+  // before it claims an output slot -- a refusal must leave every outstanding
+  // DeviceMesh as valid as it found it, which is the same reason
+  // claim_output_slot sits where it does. A stale list is the one that
+  // matters: the block heap is LIFO, so after a remove() its in-range ptrs name
+  // different blocks, and the extract would mesh whatever voxels now live
+  // there and report Status::ok.
   if (blocks != nullptr) {
-    VKC_TRY(grid.check_block_list(*blocks, entry));
+    VKC_TRY(grid.map().check_device_block_subset(*blocks, entry));
   }
   // The grid must carry the float tsdf + weight the sparse kernel samples; the
   // uint32 color attribute is optional (its absence -> opaque-white vertices).
@@ -1034,20 +1020,16 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // the host reads it. `num_active` counts the blocks either way.
   PhaseClock phase_clock(timings != nullptr);
   volume::DeviceBlockList on_device{};
-  std::uint32_t num_active = 0;
   if (blocks != nullptr) {
-    num_active = blocks->count;
+    on_device = *blocks;
   } else {
     // The map's last list when nothing has changed since it compacted.
     VKC_ASSIGN(on_device, grid.map().compact_active_blocks_on_device());
-    num_active = on_device.count;
-    // Only this path writes the row. A caller-supplied set did no compaction
-    // here, and charging it for the one the CALLER made -- on its own thread,
-    // possibly for several consumers -- would be reporting work this call did
-    // not do. The clock is restarted before the upload either way, so the
-    // unmeasured span leaks into no other row.
+    // Only this path writes the row: a caller's list was compacted by the
+    // caller, not here.
     if (timings != nullptr) timings->compact_ms = phase_clock.lap();
   }
+  const std::uint32_t num_active = on_device.count;
 
   const volume::VoxelGridParams& gp = grid.grid();
   const std::int32_t bs = gp.block_size;
@@ -1198,17 +1180,13 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
       (std::string(entry) + ": hash entries").c_str(), entries_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
 
-  // Per-extract inputs: the active blocks -- the device list, or the caller's
-  // list staged in the first attempt's batch with the command reset -- and the
-  // vertex arena + atomic counter out. The hash entries and attribute buffers
-  // bind straight from the grid (no copy).
+  // Per-extract inputs: the active blocks -- the map's device list or the
+  // caller's, bound in place -- and the vertex arena + atomic counter out. The
+  // hash entries and attribute buffers bind straight from the grid (no copy).
   phase_clock.restart();
   const VkDeviceSize active_bytes =
       static_cast<VkDeviceSize>(num_active) * sizeof(volume::BlockIndex);
-  // Range-checked like the two other bindings in this function whose size a
-  // caller supplies (the hash entries above). This one
-  // used to be exempt because its size came from a compaction this call made;
-  // a caller-supplied set makes num_active an input, so it gets the same guard.
+  // Range-checked like the hash entries above, whose size another tier sets.
   VKC_TRY(core::check_storage_buffer_range(
       (std::string(entry) + ": active blocks").c_str(), active_bytes,
       static_cast<VkDeviceSize>(max_storage_buffer_range_)));
@@ -1217,18 +1195,8 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   core::CommandBatch first(*device_, *allocator_);
   std::optional<core::CommandBatch> retry;
   core::CommandBatch* batch = &first;
-  core::Buffer active_buf;
-  VkBuffer active_handle = VK_NULL_HANDLE;
-  if (blocks == nullptr) {
-    active_handle = on_device.buffer->handle();
-  } else {
-    VKC_ASSIGN(active_buf,
-               core::device_storage_buffer(*allocator_, active_bytes));
-    VKC_TRY(first.upload(active_buf, 0, blocks->blocks, active_bytes));
-    active_handle = active_buf.handle();
-  }
+  const VkBuffer active_handle = on_device.buffer->handle();
 
-  if (timings != nullptr) timings->input_upload_ms = phase_clock.lap();
   const std::uint32_t planned_verts = plan_vertex_capacity(capacity);
   // The reset is only recorded, so a failure here disarms what the last
   // extract left in the command -- a grow may already have freed its arena.
@@ -1457,32 +1425,21 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // triangle per block; a surface that emitted nothing records 0, and the next
   // plan falls back to the seed.
   //
-  // From a FULL active set only. The number is a density -- triangles per
-  // block -- and the next call multiplies it by ITS active set, so it is sound
-  // only while the set it was measured over is the same population the set it
-  // will be scaled by is drawn from. A caller-supplied subset breaks exactly
-  // that: a frustum cull keeps camera-facing surface blocks and drops the far,
-  // back-side and empty truncation-band ones, so it is systematically denser
-  // per block than the whole map. Measured on a sphere grid, one culled extract
-  // over a single dense block took the next full extract's plan from 20 736
-  // triangles to 74 196 and its arena from 4.2 MB to 15.1 MB -- and the arena
-  // is grow-only, so that 3.6x is held for the extractor's lifetime, on a
-  // feature whose whole justification is memory. A culled pass therefore
-  // measures nothing and leaves the last full pass's figures standing.
-  if (blocks == nullptr) {
-    tris_per_block_ = static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
-    // The vertex density this surface actually had, for the next call's arena
-    // budget. Recorded only for a non-empty surface, so a frame that meshed
-    // nothing cannot drive the next plan to zero. Under the same full-set
-    // guard: it is a ratio rather than a per-block density and so drifts far
-    // less, but it is fed by the same subset and there is no reason to trust
-    // half of a measurement.
-    if (emitted > 0) {
-      verts_per_1000_tris_ = static_cast<std::uint32_t>(
-          (static_cast<std::uint64_t>(produced_verts) * 1000 + emitted - 1) /
-          emitted);
-    }
+  // A culled pass records too (2026-10-06). Its set is denser per block than
+  // the whole map -- a frustum keeps the surface it looks at -- so a full
+  // extract after one plans high once, and its grow-only arena keeps that.
+  // But the viewers only ever cull, and a culled pass that measured nothing
+  // left the plan on the seed for good: a refit (dispatches == 2) on every
+  // call.
+  tris_per_block_ = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(emitted) + num_active - 1) / num_active);
+  // The vertex density this surface actually had, for the next call's arena
+  // budget. Recorded only for a non-empty surface, so a frame that meshed
+  // nothing cannot drive the next plan to zero.
+  if (emitted > 0) {
+    verts_per_1000_tris_ = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(produced_verts) * 1000 + emitted - 1) /
+        emitted);
   }
 
   DeviceMesh device_mesh;
