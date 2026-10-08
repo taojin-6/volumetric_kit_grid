@@ -25,7 +25,7 @@
 // that a block's triangles land CONTIGUOUSLY in the arena on both paths, and
 // the empty / argument-validation / moved-from paths. A frustum-culled device
 // list meshes exactly its blocks -- two halves merge back into the whole --
-// is refused when stale or foreign, and records its density. Exits 0 (skip)
+// is refused when stale or foreign, and records its density. Skips
 // where no device is present.
 
 #include <algorithm>
@@ -44,10 +44,8 @@
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
@@ -57,8 +55,8 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
+#include "gpu_test.hpp"
 #include "grid_readback.hpp"
-#include "no_device.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -428,38 +426,9 @@ std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
   return tris;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-  const vr_test::Gpu ctx{device.value(), allocator.value()};
-
+int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<mesh::MarchingCubes> mc_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value());
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator);
   if (!mc_result) {
     std::fprintf(stderr, "MarchingCubes::create failed: %s\n",
                  mc_result.status().message().c_str());
@@ -472,11 +441,11 @@ int main() {
                                       {"weight", sizeof(float)}};
 
   // --- Sparse extraction of a multi-block sphere -----------------------------
-  vkc::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> grid_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(grid_result.ok());
   vol::VoxelBlockGrid grid = std::move(grid_result).value();
-  CHECK(fill_sphere_grid(ctx, grid, /*with_color=*/false));
+  CHECK(fill_sphere_grid(gpu, grid, /*with_color=*/false));
 
   vkc::Result<mesh::Mesh> sparse_result = extractor.extract_host(grid, 0.0f);
   CHECK(sparse_result.ok());
@@ -629,10 +598,10 @@ int main() {
   chained_gp.bucket_size = 2;
   chained_gp.num_buckets = 512;  // num_blocks unchanged at 1024
   vkc::Result<vol::VoxelBlockGrid> chained_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), chained_gp, attrs, 2);
+      gpu.device, gpu.allocator, chained_gp, attrs, 2);
   CHECK(chained_result.ok());
   vol::VoxelBlockGrid chained_grid = std::move(chained_result).value();
-  CHECK(fill_sphere_grid(ctx, chained_grid, /*with_color=*/false));
+  CHECK(fill_sphere_grid(gpu, chained_grid, /*with_color=*/false));
 
   // The fixture only tests what it exercises, so assert that it spills before
   // trusting what it proves -- otherwise a later change to the hash or to these
@@ -659,11 +628,11 @@ int main() {
   const vol::AttributeSpec cattrs[] = {{"tsdf", sizeof(float)},
                                        {"weight", sizeof(float)},
                                        {"color", sizeof(std::uint32_t)}};
-  vkc::Result<vol::VoxelBlockGrid> cgrid_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, cattrs, 3);
+  vkc::Result<vol::VoxelBlockGrid> cgrid_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, cattrs, 3);
   CHECK(cgrid_result.ok());
   vol::VoxelBlockGrid cgrid = std::move(cgrid_result).value();
-  CHECK(fill_sphere_grid(ctx, cgrid, /*with_color=*/true));
+  CHECK(fill_sphere_grid(gpu, cgrid, /*with_color=*/true));
 
   vkc::Result<mesh::Mesh> colored_result = extractor.extract_host(cgrid, 0.0f);
   CHECK(colored_result.ok());
@@ -698,11 +667,11 @@ int main() {
   // the mesh is empty. Proves the gate fires on-device (a dropped or mis-signed
   // gate would mesh the sphere here); the sphere fill above only ever exercises
   // the pass side.
-  vkc::Result<vol::VoxelBlockGrid> zw_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> zw_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(zw_result.ok());
   vol::VoxelBlockGrid zw_grid = std::move(zw_result).value();
-  CHECK(fill_sphere_grid(ctx, zw_grid, /*with_color=*/false, /*weight=*/0.0f));
+  CHECK(fill_sphere_grid(gpu, zw_grid, /*with_color=*/false, /*weight=*/0.0f));
   vkc::Result<mesh::Mesh> zw_mesh = extractor.extract_host(zw_grid, 0.0f);
   CHECK(zw_mesh.ok());
   CHECK(std::move(zw_mesh).value().empty());
@@ -715,12 +684,12 @@ int main() {
   // white rather than be dragged toward black (which is what an unguarded
   // unpack of the 0 sentinel would produce). Geometry is unaffected, so the
   // triangle count still matches the colourless extract of the same field.
-  vkc::Result<vol::VoxelBlockGrid> sgrid_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, cattrs, 3);
+  vkc::Result<vol::VoxelBlockGrid> sgrid_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, cattrs, 3);
   CHECK(sgrid_result.ok());
   vol::VoxelBlockGrid sgrid = std::move(sgrid_result).value();
   CHECK(
-      fill_sphere_grid(ctx, sgrid, /*with_color=*/false));  // colour left at 0
+      fill_sphere_grid(gpu, sgrid, /*with_color=*/false));  // colour left at 0
   vkc::Result<mesh::Mesh> sentinel_result = extractor.extract_host(sgrid, 0.0f);
   CHECK(sentinel_result.ok());
   const mesh::Mesh sentinel = std::move(sentinel_result).value();
@@ -733,8 +702,8 @@ int main() {
 
   // --- Empty map -> empty mesh -----------------------------------------------
   // A grid with no allocated blocks has no active set, so nothing meshes.
-  vkc::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> empty_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(empty_result.ok());
   vol::VoxelBlockGrid empty_grid = std::move(empty_result).value();
   vkc::Result<mesh::Mesh> empty_mesh = extractor.extract_host(empty_grid, 0.0f);
@@ -756,14 +725,14 @@ int main() {
   // holds every emitted triangle and comparing meshes would NOT catch a broken
   // growth policy.
   vkc::Result<mesh::MarchingCubes> arena_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value());
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator);
   CHECK(arena_result.ok());
   mesh::MarchingCubes arena_mc = std::move(arena_result).value();
 
   // One allocated block: the smallest non-empty active set. (An empty one
   // returns early without sizing anything, so it cannot anchor this.)
-  vkc::Result<vol::VoxelBlockGrid> one_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> one_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(one_result.ok());
   vol::VoxelBlockGrid one_grid = std::move(one_result).value();
   vol::BlockIndex single_block{};
@@ -813,16 +782,15 @@ int main() {
   // the first call MUST refit and re-run. The second call over the same grid
   // then plans from the density the first one measured, so it must not.
   vkc::Result<mesh::MarchingCubes> refit_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value());
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator);
   CHECK(refit_result.ok());
   mesh::MarchingCubes refit_mc = std::move(refit_result).value();
 
   vkc::Result<vol::VoxelBlockGrid> dense_block_result =
-      vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp, attrs,
-                                  2);
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(dense_block_result.ok());
   vol::VoxelBlockGrid dense_block = std::move(dense_block_result).value();
-  CHECK(fill_dense_blocks(ctx, dense_block, 1));
+  CHECK(fill_dense_blocks(gpu, dense_block, 1));
 
   mesh::ExtractTimings refit_timings;
   vkc::Result<mesh::Mesh> refit_mesh_result =
@@ -865,14 +833,13 @@ int main() {
   // against the ~64 per block a first extract plans, so every one of those
   // three cases is occupied rather than hoped for.
   vkc::Result<vol::VoxelBlockGrid> dense_run_result =
-      vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp, attrs,
-                                  2);
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(dense_run_result.ok());
   vol::VoxelBlockGrid dense_run = std::move(dense_run_result).value();
-  CHECK(fill_dense_blocks(ctx, dense_run, 3));
+  CHECK(fill_dense_blocks(gpu, dense_run, 3));
 
   vkc::Result<mesh::MarchingCubes> run_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value());
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator);
   CHECK(run_result.ok());
   mesh::MarchingCubes run_mc = std::move(run_result).value();
 
@@ -930,8 +897,8 @@ int main() {
   // `bool sharing = false;` left every suite green.
   mesh::MarchingCubesConfig share_config;
   share_config.share_vertices = true;
-  vkc::Result<mesh::MarchingCubes> share_result = mesh::MarchingCubes::create(
-      device.value(), allocator.value(), share_config);
+  vkc::Result<mesh::MarchingCubes> share_result =
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, share_config);
   CHECK(share_result.ok());
   mesh::MarchingCubes share_mc = std::move(share_result).value();
 
@@ -1036,8 +1003,7 @@ int main() {
   // ~3 vertices per triangle instead of the true ~0.75 and pins an arena ~6x
   // the surface, which is more than not sharing at all.
   vkc::Result<mesh::MarchingCubes> share_refit_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                  share_config);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, share_config);
   CHECK(share_refit_result.ok());
   mesh::MarchingCubes share_refit_mc = std::move(share_refit_result).value();
   mesh::ExtractTimings share_refit_timings;
@@ -1079,8 +1045,7 @@ int main() {
   // count is wrong. Twenty-seven of them, refitting, is where both ranges have
   // a neighbour to run into.
   vkc::Result<mesh::MarchingCubes> share_run_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                  share_config);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, share_config);
   CHECK(share_run_result.ok());
   mesh::MarchingCubes share_run_mc = std::move(share_run_result).value();
 
@@ -1147,8 +1112,8 @@ int main() {
   {
     mesh::MarchingCubesConfig grow_config;
     grow_config.share_vertices = true;
-    vkc::Result<mesh::MarchingCubes> grow_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), grow_config);
+    vkc::Result<mesh::MarchingCubes> grow_result =
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, grow_config);
     CHECK(grow_result.ok());
     mesh::MarchingCubes grow_mc = std::move(grow_result).value();
 
@@ -1162,11 +1127,11 @@ int main() {
     grow_gp.num_buckets = 32;
     grow_gp.num_blocks = 256;
     vkc::Result<vol::VoxelBlockGrid> grow_grid_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), grow_gp,
-                                    attrs, 2);
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grow_gp, attrs,
+                                    2);
     CHECK(grow_grid_result.ok());
     vol::VoxelBlockGrid grow_grid = std::move(grow_grid_result).value();
-    CHECK(fill_dense_blocks(ctx, grow_grid, 2));
+    CHECK(fill_dense_blocks(gpu, grow_grid, 2));
 
     mesh::ExtractTimings after_grow;
     vkc::Result<mesh::Mesh> grown_result =
@@ -1194,8 +1159,8 @@ int main() {
   big_block_gp.num_buckets = 32;
   big_block_gp.num_blocks = 256;  // = bucket_size * num_buckets
   vkc::Result<vol::VoxelBlockGrid> big_block_result =
-      vol::VoxelBlockGrid::create(device.value(), allocator.value(),
-                                  big_block_gp, attrs, 2);
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, big_block_gp,
+                                  attrs, 2);
   CHECK(big_block_result.ok());
   vol::VoxelBlockGrid big_block_grid = std::move(big_block_result).value();
   // FILLED, not merely allocated. An allocated-but-unintegrated block has
@@ -1206,7 +1171,7 @@ int main() {
   // slots the kernel's per-cell cache holds and take the second full gather
   // instead of the cheap register rejection, and only then is the uncached
   // branch exercised at all.
-  CHECK(fill_dense_blocks(ctx, big_block_grid, 1));
+  CHECK(fill_dense_blocks(gpu, big_block_grid, 1));
   CHECK(!share_mc.extract_host(big_block_grid, 0.0f).ok());
   // The same grid is fine without sharing -- the refusal is the kernel's table,
   // not the block size.
@@ -1228,10 +1193,10 @@ int main() {
   split_gp.num_buckets = 32;
   split_gp.num_blocks = 256;
   vkc::Result<vol::VoxelBlockGrid> split_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), split_gp, attrs, 2);
+      gpu.device, gpu.allocator, split_gp, attrs, 2);
   CHECK(split_result.ok());
   vol::VoxelBlockGrid split_grid = std::move(split_result).value();
-  CHECK(fill_dense_blocks(ctx, split_grid,
+  CHECK(fill_dense_blocks(gpu, split_grid,
                           2));  // 2x2x2 blocks of 8 = the same 16^3
   mesh::ExtractTimings split_timings;
   vkc::Result<mesh::Mesh> split_mesh_result =
@@ -1243,8 +1208,8 @@ int main() {
 
   // --- Argument validation ---------------------------------------------------
   // A grid missing the tsdf/weight attributes is rejected (a bare grid here).
-  vkc::Result<vol::VoxelBlockGrid> bare_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, nullptr, 0);
+  vkc::Result<vol::VoxelBlockGrid> bare_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, nullptr, 0);
   CHECK(bare_result.ok());
   vol::VoxelBlockGrid bare_grid = std::move(bare_result).value();
   CHECK(!extractor.extract_host(bare_grid, 0.0f).ok());
@@ -1275,15 +1240,14 @@ int main() {
   // short merge, and a duplicated one as a long merge.
   {
     vkc::Result<vol::VoxelBlockGrid> cull_grid_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
-                                    attrs, 2);
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
     CHECK(cull_grid_result.ok());
     vol::VoxelBlockGrid cull_grid = std::move(cull_grid_result).value();
-    CHECK(fill_sphere_grid(ctx, cull_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(gpu, cull_grid, /*with_color=*/false));
     vol::VoxelHashMap& cull_map = cull_grid.map();
 
     vkc::Result<mesh::MarchingCubes> cull_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, {});
     CHECK(cull_result.ok());
     mesh::MarchingCubes cull_mc = std::move(cull_result).value();
 
@@ -1373,8 +1337,8 @@ int main() {
     CHECK(cull_mc.download(live.value()).ok());
 
     // A list from another grid is not this grid's.
-    vkc::Result<vol::VoxelBlockGrid> other_result = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), gp, attrs, 2);
+    vkc::Result<vol::VoxelBlockGrid> other_result =
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
     CHECK(other_result.ok());
     vol::VoxelBlockGrid other = std::move(other_result).value();
     vol::BlockIndex inside{};
@@ -1401,14 +1365,14 @@ int main() {
   {
     mesh::MarchingCubesConfig two_slots;
     two_slots.slot_count = 2;
-    vkc::Result<mesh::MarchingCubes> density_mc = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), two_slots);
+    vkc::Result<mesh::MarchingCubes> density_mc =
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, two_slots);
     CHECK(density_mc.ok());
-    vkc::Result<vol::VoxelBlockGrid> dense_result = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), gp, attrs, 2);
+    vkc::Result<vol::VoxelBlockGrid> dense_result =
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
     CHECK(dense_result.ok());
     vol::VoxelBlockGrid dense = std::move(dense_result).value();
-    CHECK(fill_dense_blocks(ctx, dense, 2));
+    CHECK(fill_dense_blocks(gpu, dense, 2));
     // Block (0,0,0) alone: its box ends at 0.375 m, its neighbours' start
     // there.
     vkc::Result<vol::DeviceBlockList> one =
@@ -1437,7 +1401,7 @@ int main() {
     vol::VoxelGridParams near_gp = gp;
     near_gp.voxel_size = 0.01f;
     vkc::Result<vol::VoxelBlockGrid> made = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), near_gp, attrs, 2);
+        gpu.device, gpu.allocator, near_gp, attrs, 2);
     CHECK(made.ok());
     vol::VoxelBlockGrid near_grid = std::move(made).value();
     std::vector<vol::BlockIndex> coords;
@@ -1475,7 +1439,7 @@ int main() {
         }
       }
     }
-    CHECK(write_attributes(ctx, near_grid, tsdf, weights));
+    CHECK(write_attributes(gpu, near_grid, tsdf, weights));
     // gfx's convention, depth in [0, 1]; the eye at z = 2.6 cm, near 5 cm.
     const vr::Mat4f view_proj =
         glm::perspectiveLH_ZO(glm::radians(90.0f), 1.0f, 0.05f, 2.0f) *
@@ -1483,7 +1447,7 @@ int main() {
     mesh::MarchingCubesConfig config;
     config.share_vertices = shared;
     vkc::Result<mesh::MarchingCubes> near_mc =
-        mesh::MarchingCubes::create(device.value(), allocator.value(), config);
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, config);
     CHECK(near_mc.ok());
     vkc::Result<mesh::Mesh> whole =
         near_mc.value().extract_host(near_grid, 0.0f);
@@ -1504,13 +1468,12 @@ int main() {
   // it compact again rather than mesh the old list.
   {
     vkc::Result<vol::VoxelBlockGrid> list_grid_result =
-        vol::VoxelBlockGrid::create(device.value(), allocator.value(), gp,
-                                    attrs, 2);
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
     CHECK(list_grid_result.ok());
     vol::VoxelBlockGrid list_grid = std::move(list_grid_result).value();
-    CHECK(fill_sphere_grid(ctx, list_grid, /*with_color=*/false));
+    CHECK(fill_sphere_grid(gpu, list_grid, /*with_color=*/false));
     vkc::Result<mesh::MarchingCubes> host_mc =
-        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, {});
     CHECK(host_mc.ok());
     vkc::Result<mesh::Mesh> full =
         host_mc.value().extract_host(list_grid, 0.0f);
@@ -1520,7 +1483,7 @@ int main() {
     CHECK(!full_tris.empty());
 
     vkc::Result<mesh::MarchingCubes> list_mc =
-        mesh::MarchingCubes::create(device.value(), allocator.value(), {});
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, {});
     CHECK(list_mc.ok());
     vkc::Result<vol::DeviceBlockList> last =
         list_grid.map().compact_active_blocks_on_device();
@@ -1552,3 +1515,7 @@ int main() {
       kBlocks, sphere.triangle_count());
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

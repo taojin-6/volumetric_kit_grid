@@ -21,10 +21,8 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -357,44 +355,29 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator) {
   return 0;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  CHECK(device.ok());
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  CHECK(allocator.ok());
+int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> w =
-      d::DeviceFrameWriter::create(device.value(), allocator.value());
+      d::DeviceFrameWriter::create(gpu.device, gpu.allocator);
   CHECK(w.ok());
   vkc::Result<std::unique_ptr<d::DeviceFrameReader>> r =
-      d::DeviceFrameReader::create(device.value(), allocator.value());
+      d::DeviceFrameReader::create(gpu.device, gpu.allocator);
   CHECK(r.ok());
   d::DeviceFrameWriter& writer = *w.value();
   d::DeviceFrameReader& reader = *r.value();
-  g_device = &device.value();
-  g_allocator = &allocator.value();
+  g_device = &gpu.device;
+  g_allocator = &gpu.allocator;
   if (matches_host_case(writer, reader) != 0) return 1;
   if (golden_case(writer, reader) != 0) return 1;
   if (corruption_case(reader) != 0) return 1;
   if (segment_limit_case(reader) != 0) return 1;
-  if (out_of_range_case(device.value(), allocator.value(), writer) != 0) {
+  if (out_of_range_case(gpu.device, gpu.allocator, writer) != 0) {
     return 1;
   }
-  if (refusals_case(device.value(), allocator.value()) != 0) return 1;
+  if (refusals_case(gpu.device, gpu.allocator) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

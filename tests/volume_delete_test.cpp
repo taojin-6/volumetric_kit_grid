@@ -17,15 +17,13 @@
 #include "buffer_readback.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -72,35 +70,7 @@ vkc::Result<std::set<std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
   return out;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-
+int gpu_main(vr_test::GpuContext& gpu) {
   vol::VoxelGridParams grid{};
   grid.voxel_size = 0.005f;
   grid.block_size = 8;
@@ -120,7 +90,7 @@ int main() {
   grid.max_chain = 128;
 
   vkc::Result<vol::VoxelHashMap> map_result =
-      vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
                  map_result.status().message().c_str());
@@ -217,7 +187,7 @@ int main() {
   const auto device_count = static_cast<std::uint32_t>(device_coords.size());
   device_coords.push_back(vol::BlockIndex{});  // centre (0,0,0): must survive
   auto device_list = vr_test::upload_device_buffer(
-      device.value(), allocator.value(), device_coords.data(),
+      gpu.device, gpu.allocator, device_coords.data(),
       device_coords.size() * sizeof(vol::BlockIndex));
   CHECK(device_list.ok() && device_list->mapped() == nullptr);
   auto cached = map.compact_active_blocks_on_device();
@@ -253,7 +223,7 @@ int main() {
   transfer_desc.size = sizeof(vol::BlockIndex);
   transfer_desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   transfer_desc.memory = vkc::MemoryUsage::DeviceOnly;
-  auto transfer_only = allocator.value().create_buffer(transfer_desc);
+  auto transfer_only = gpu.allocator.create_buffer(transfer_desc);
   CHECK(transfer_only.ok());
   CHECK(map.remove(transfer_only.value(), 1).status().domain() ==
         vkc::Status::Code::InvalidArgument);
@@ -269,7 +239,7 @@ int main() {
     wide.num_buckets = 4096;
     wide.num_blocks = 8 * 4096;
     vkc::Result<vol::VoxelHashMap> made =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), wide);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, wide);
     CHECK(made.ok());
     vol::VoxelHashMap big = std::move(made).value();
     std::vector<vol::BlockIndex> slab;
@@ -298,9 +268,9 @@ int main() {
       return occupancy.ok() && occupancy.value() == want;
     };
     CHECK(place(slab));
-    auto half_on_device = vr_test::upload_device_buffer(
-        device.value(), allocator.value(), half.data(),
-        half.size() * sizeof(vol::BlockIndex));
+    auto half_on_device =
+        vr_test::upload_device_buffer(gpu.device, gpu.allocator, half.data(),
+                                      half.size() * sizeof(vol::BlockIndex));
     CHECK(half_on_device.ok());
     vkc::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
@@ -338,7 +308,7 @@ int main() {
     one.num_buckets = 1;
     one.num_blocks = 8;
     vkc::Result<vol::VoxelHashMap> made =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), one);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, one);
     CHECK(made.ok());
     vol::VoxelHashMap tight = std::move(made).value();
     std::vector<vol::BlockIndex> coords(1024);
@@ -376,3 +346,7 @@ int main() {
       want_corners.size(), want_all.size());
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

@@ -23,7 +23,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -82,23 +82,9 @@ vkc::Result<vol::VoxelBlockGrid> filled(vkc::Device& device,
 
 }  // namespace
 
-int main() {
-  auto instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  auto gpu = instance->select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  auto device = vkc::Device::create(*instance, *gpu, vr::device_requirements());
-  CHECK(device.ok());
-  auto allocator = vkc::Allocator::create(instance->handle(), *device);
-  CHECK(allocator.ok());
-  vkc::Device& dev = *device;
-  vkc::Allocator& alloc = *allocator;
+int gpu_main(vr_test::GpuContext& gpu) {
+  vkc::Device& dev = gpu.device;
+  vkc::Allocator& alloc = gpu.allocator;
 
   // The layout the grid reports: three 4-byte attributes a voxel, and the
   // table's entry, heap slot, two compacted lists and stamps a block, and a
@@ -153,3 +139,5 @@ int main() {
   std::puts("volume_grid_growth: OK");
   return 0;
 }
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

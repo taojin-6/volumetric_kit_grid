@@ -12,7 +12,7 @@
 // intrinsic or a transposed pose would diverge. Also covers a frame of several
 // ragged tiles at two band widths, lock contention + retry on a one-bucket
 // table, negative-bias blocks, idempotent re-run, clear(), and null/zero-count
-// guards. Exits 0 (skip) where no device is present.
+// guards. Skips where no device is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -23,16 +23,14 @@
 
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -96,35 +94,7 @@ vr::Vec3i unproject_to_block(const vr::DepthCameraParams& cam,
   return vol::world_to_block(world, grid);
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-
+int gpu_main(vr_test::GpuContext& gpu) {
   // A small grid: 1024 buckets x 8, 8192-block heap -- ample for a couple of
   // 27-block bands, and cheap to init.
   vol::VoxelGridParams grid{};
@@ -138,7 +108,7 @@ int main() {
   grid.max_chain = 128;
 
   vkc::Result<vol::VoxelHashMap> map_result =
-      vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
                  map_result.status().message().c_str());
@@ -219,7 +189,7 @@ int main() {
     one.bucket_size = 64;
     one.num_blocks = 64;
     vkc::Result<vol::VoxelHashMap> made =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), one);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, one);
     CHECK(made.ok());
     std::uint32_t left = 1;
     int passes = 0;
@@ -252,7 +222,7 @@ int main() {
     tiled.voxel_size = 1.0f / 128.0f;  // a block is 1/16 m
     tiled.trunc_dist = trunc;
     vkc::Result<vol::VoxelHashMap> tiled_map =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), tiled);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, tiled);
     CHECK(tiled_map.ok());
     vr::DepthCameraParams wide = cam;
     wide.fx = 128.0f;
@@ -303,3 +273,7 @@ int main() {
       depth_want.size());
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }
