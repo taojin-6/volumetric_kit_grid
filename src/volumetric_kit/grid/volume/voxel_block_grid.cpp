@@ -14,6 +14,8 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 
+#include "table_sizes.hpp"
+
 #include "block_stamp_comp.spv.hpp"
 #include "block_zero_comp.spv.hpp"
 
@@ -292,6 +294,37 @@ core::Status VoxelBlockGrid::resize(std::int32_t new_num_buckets) {
   // exactly the arrays a bandwidth question is about as unnamed.
   name_attribute_buffers();
   return {};
+}
+
+std::int32_t VoxelBlockGrid::max_num_buckets() const noexcept {
+  if (!valid()) return 0;
+  const VoxelGridParams& grid = map_.grid();
+  // validate(): num_blocks, and num_blocks * voxels_per_block (a block
+  // pointer), each within int32.
+  constexpr std::uint64_t kInt32Max = std::numeric_limits<std::int32_t>::max();
+  std::uint64_t blocks = kInt32Max / std::uint64_t(grid.voxels_per_block);
+  // resize(): every attribute array within one binding.
+  for (const Attribute& attr : attributes_) {
+    blocks = std::min<std::uint64_t>(
+        blocks, max_storage_buffer_range_ /
+                    (std::uint64_t(grid.voxels_per_block) * attr.element_size));
+  }
+  return static_cast<std::int32_t>(blocks / std::uint64_t(grid.bucket_size));
+}
+
+std::uint64_t VoxelBlockGrid::bytes_at(
+    std::int32_t num_buckets) const noexcept {
+  if (!valid() || num_buckets <= 0) return 0;
+  const VoxelGridParams& grid = map_.grid();
+  const auto buckets = std::uint64_t(num_buckets);
+  const auto bucket_size = std::uint64_t(grid.bucket_size);
+  const std::uint64_t voxels =
+      buckets * bucket_size * std::uint64_t(grid.voxels_per_block);
+  std::uint64_t bytes = table_sizes(buckets, bucket_size).total();
+  for (const Attribute& attr : attributes_) {
+    bytes += voxels * attr.element_size;
+  }
+  return bytes;
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::remove(
