@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <limits>
 #include <sstream>
 #include <string>
 
@@ -26,6 +25,7 @@
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
+#include "volumetric_kit/recon/volume/grid_growth.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -223,8 +223,9 @@ vkc::Status run(const Options& opt) {
   const auto vertices = std::uint32_t(geometry.positions.size());
   const auto triangles = std::uint32_t(geometry.indices.size() / 3);
   // Grow only for a capacity limit. Lost bucket-lock races leave a residue
-  // over a table with room, which a retry places (fuse_frame.hpp's
-  // allocate_band does the same).
+  // over a table with room, which a retry places: the mesh integrator refuses
+  // a band with a block missing.
+  vr::volume::GridGrowth growth;
   for (int contended = 0;;) {
     vr::volume::AllocFailures failures;
     VKC_ASSIGN(const auto failed,
@@ -239,13 +240,14 @@ vkc::Status run(const Options& opt) {
       }
       continue;
     }
-    const std::int64_t buckets = 2 * std::int64_t(volume.grid().num_buckets);
-    if (buckets * vr_example::kExampleBucketSize >
-        std::numeric_limits<std::int32_t>::max()) {
+    VKC_ASSIGN(const vr::volume::GrowthEvent grown, growth.grow(volume));
+    if (grown.outcome == vr::volume::GrowthOutcome::ResizeFailed) {
+      return grown.error;
+    }
+    if (!grown.grew()) {
       return vkc::Status::out_of_memory(
           "mesh allocation exceeds grid capacity");
     }
-    VKC_TRY(volume.resize(std::int32_t(buckets)));
   }
   VKC_ASSIGN(vr::tsdf::MeshIntegrator integrator,
              vr::tsdf::MeshIntegrator::create(device, allocator));
