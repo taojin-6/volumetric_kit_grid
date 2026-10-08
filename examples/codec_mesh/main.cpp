@@ -6,7 +6,6 @@
 // choices applied after the IO tier imports geometry in source coordinates.
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <sstream>
 #include <string>
@@ -40,7 +39,6 @@ struct Options {
   std::string out_prefix;
   double height = 0.0;
   vr_example::Point3d up{};
-  bool have_up = false;
   float voxel = 0.01f;
   vr::tsdf::MeshSdfParams sdf;
   vr_example::CodecFlags codec;
@@ -83,21 +81,19 @@ vkc::Status parse_up_vector(const std::string& flag, std::string value,
 vkc::Result<Options> parse_args(int argc, char** argv) {
   Options o;
   vr_example::Cli cli("codec_mesh");
-  // Head-up, by axis or by vector, once.
-  const auto up = [&o](auto parse) {
-    return [&o, parse](const std::string& flag, const char* value) {
-      if (o.have_up) {
-        return vkc::Status::invalid_argument("specify head-up only once");
-      }
-      o.have_up = true;
-      return parse(flag, value, o.up);
-    };
-  };
   cli.positional("mesh-file", o.input)
       .option("--height", "metres", o.height)
       .require("--height")
-      .on("--up-axis", "[-]x|y|z", up(parse_up_axis))
-      .on("--up-vector", "x,y,z", up(parse_up_vector))
+      .on("--up-axis", "[-]x|y|z",
+          [&o](const std::string& flag, const char* value) {
+            return parse_up_axis(flag, value, o.up);
+          })
+      .on("--up-vector", "x,y,z",
+          [&o](const std::string& flag, const char* value) {
+            return parse_up_vector(flag, value, o.up);
+          })
+      .one_of({"--up-axis", "--up-vector"})  // head-up, by axis or vector
+      .require("--up-axis")
       .option("--voxel", "metres", o.voxel)
       .on("--mode", "signed|shell",
           [&o](const std::string& flag, const char* value) {
@@ -121,15 +117,7 @@ vkc::Result<Options> parse_args(int argc, char** argv) {
         if (!(o.height > 0.0)) {
           return vkc::Status::invalid_argument("--height must be > 0");
         }
-        if (!o.have_up) {
-          return vkc::Status::invalid_argument(
-              "needs --up-axis or --up-vector");
-        }
-        if (!(o.voxel > 0.0f) ||
-            !std::isfinite(vr_example::default_trunc(o.voxel))) {
-          return vkc::Status::invalid_argument(
-              "--voxel must be finite and positive");
-        }
+        VKC_TRY(vr_example::check_voxel(o.voxel));
         if (o.sdf.shell_voxels < 0.8660254f || o.sdf.shell_voxels >= 4.0f) {
           return vkc::Status::invalid_argument(
               "--shell-voxels must be in [sqrt(3)/2, 4)");
