@@ -11,11 +11,13 @@
 #include <sstream>
 #include <string>
 
-#include "codec_quantization.hpp"
+#include "cli.hpp"
+#include "codec_flags.hpp"
 #include "codec_stream.hpp"
 #include "codec_sweep.hpp"
+#include "grid_layout.hpp"
 #include "mesh_normalization.hpp"
-#include "parse_number.hpp"
+#include "stage_table.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
@@ -36,122 +38,105 @@ namespace {
 struct Options {
   std::string input;
   std::string out_prefix;
-  std::string quant_table = "uniform";
   double height = 0.0;
   vr_example::Point3d up{};
+  bool have_up = false;
   float voxel = 0.01f;
   vr::tsdf::MeshSdfParams sdf;
-  vr::codec::EncoderConfig codec;
+  vr_example::CodecFlags codec;
   bool sweep = false;
   bool inspect_only = false;
 };
 
+// --up-axis: x, y, z, -x, -y or -z.
+vkc::Status parse_up_axis(const std::string& flag, std::string value,
+                          vr_example::Point3d& up) {
+  double sign = 1.0;
+  if (!value.empty() && value[0] == '-') {
+    sign = -1.0;
+    value.erase(0, 1);
+  }
+  if (value == "x") {
+    up = {sign, 0.0, 0.0};
+  } else if (value == "y") {
+    up = {0.0, sign, 0.0};
+  } else if (value == "z") {
+    up = {0.0, 0.0, sign};
+  } else {
+    return vkc::Status::invalid_argument(flag + " needs x, y, z, -x, -y or -z");
+  }
+  return {};
+}
+
+// --up-vector: x,y,z.
+vkc::Status parse_up_vector(const std::string& flag, std::string value,
+                            vr_example::Point3d& up) {
+  std::replace(value.begin(), value.end(), ',', ' ');
+  std::istringstream values(value);
+  std::string extra;
+  if (!(values >> up[0] >> up[1] >> up[2]) || values >> extra) {
+    return vkc::Status::invalid_argument(flag + " needs x,y,z");
+  }
+  return {};
+}
+
 vkc::Result<Options> parse_args(int argc, char** argv) {
   Options o;
-  bool have_up = false;
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    const bool takes_value =
-        a == "--height" || a == "--up-axis" || a == "--up-vector" ||
-        a == "--voxel" || a == "--mode" || a == "--shell-voxels" ||
-        a == "--step" || a == "--k" || a == "-o" || a == "--quant-table" ||
-        a == "--entropy" || a == "--segment-size";
-    if (takes_value && i + 1 == argc) {
-      return vkc::Status::invalid_argument(a + " needs a value");
-    }
-    const char* v = takes_value ? argv[++i] : nullptr;
-    if (a == "--height") {
-      VKC_TRY(vr_example::parse_number(a, v, o.height));
-    } else if (a == "--up-axis" || a == "--up-vector") {
-      if (have_up)
+  vr_example::Cli cli("codec_mesh");
+  // Head-up, by axis or by vector, once.
+  const auto up = [&o](auto parse) {
+    return [&o, parse](const std::string& flag, const char* value) {
+      if (o.have_up) {
         return vkc::Status::invalid_argument("specify head-up only once");
-      have_up = true;
-      std::string value = v;
-      if (a == "--up-axis") {
-        double sign = 1.0;
-        if (!value.empty() && value[0] == '-') {
-          sign = -1.0;
-          value.erase(0, 1);
+      }
+      o.have_up = true;
+      return parse(flag, value, o.up);
+    };
+  };
+  cli.positional("mesh-file", o.input)
+      .option("--height", "metres", o.height)
+      .require("--height")
+      .on("--up-axis", "[-]x|y|z", up(parse_up_axis))
+      .on("--up-vector", "x,y,z", up(parse_up_vector))
+      .option("--voxel", "metres", o.voxel)
+      .on("--mode", "signed|shell",
+          [&o](const std::string& flag, const char* value) {
+            const std::string mode = value;
+            if (mode == "signed") {
+              o.sdf.mode = vr::tsdf::MeshSdfMode::Signed;
+            } else if (mode == "shell") {
+              o.sdf.mode = vr::tsdf::MeshSdfMode::Shell;
+            } else {
+              return vkc::Status::invalid_argument(flag +
+                                                   " needs signed or shell");
+            }
+            return vkc::Status{};
+          })
+      .option("--shell-voxels", "1.5", o.sdf.shell_voxels);
+  o.codec.add_to(cli);
+  cli.flag("--sweep", o.sweep)
+      .flag("--inspect-only", o.inspect_only)
+      .option("-o", "prefix", o.out_prefix)
+      .check([&o]() -> vkc::Status {
+        if (!(o.height > 0.0)) {
+          return vkc::Status::invalid_argument("--height must be > 0");
         }
-        if (value == "x")
-          o.up = {sign, 0.0, 0.0};
-        else if (value == "y")
-          o.up = {0.0, sign, 0.0};
-        else if (value == "z")
-          o.up = {0.0, 0.0, sign};
-        else
+        if (!o.have_up) {
           return vkc::Status::invalid_argument(
-              "--up-axis needs x, y, z, -x, -y or -z");
-      } else {
-        std::replace(value.begin(), value.end(), ',', ' ');
-        std::istringstream values(value);
-        std::string extra;
-        if (!(values >> o.up[0] >> o.up[1] >> o.up[2]) || values >> extra) {
-          return vkc::Status::invalid_argument("--up-vector needs x,y,z");
+              "needs --up-axis or --up-vector");
         }
-      }
-    } else if (a == "--voxel") {
-      VKC_TRY(vr_example::parse_number(a, v, o.voxel));
-    } else if (a == "--shell-voxels") {
-      VKC_TRY(vr_example::parse_number(a, v, o.sdf.shell_voxels));
-    } else if (a == "--step") {
-      VKC_TRY(
-          vr_example::parse_number(a, v, o.codec.params.quantization_scale));
-    } else if (a == "--quant-table") {
-      o.quant_table = v;
-    } else if (a == "--entropy") {
-      VKC_TRY(vr_example::parse_entropy(a, v, o.codec.entropy));
-    } else if (a == "--segment-size") {
-      int r = 0;
-      VKC_TRY(vr_example::parse_number(a, v, r));
-      if (r < 1) return vkc::Status::invalid_argument(a + " must be >= 1");
-      o.codec.segment_size = std::uint32_t(r);
-    } else if (a == "--k") {
-      int k = 0;
-      VKC_TRY(vr_example::parse_number(a, v, k));
-      if (k < 1 || k > 512) {
-        return vkc::Status::invalid_argument("--k must be in [1, 512]");
-      }
-      o.codec.params.coefficient_count = std::uint32_t(k);
-    } else if (a == "--mode") {
-      const std::string mode = v;
-      if (mode == "signed")
-        o.sdf.mode = vr::tsdf::MeshSdfMode::Signed;
-      else if (mode == "shell")
-        o.sdf.mode = vr::tsdf::MeshSdfMode::Shell;
-      else
-        return vkc::Status::invalid_argument("--mode needs signed or shell");
-    } else if (a == "-o") {
-      o.out_prefix = v;
-    } else if (a == "--sweep") {
-      o.sweep = true;
-    } else if (a == "--inspect-only") {
-      o.inspect_only = true;
-    } else if (a.empty() || a[0] == '-' || !o.input.empty()) {
-      return vkc::Status::invalid_argument("unexpected argument: " + a);
-    } else {
-      o.input = a;
-    }
-  }
-  if (o.input.empty() || !(o.height > 0.0) || !have_up) {
-    return vkc::Status::invalid_argument(
-        "usage: codec_mesh mesh-file --height metres "
-        "(--up-axis y | --up-vector x,y,z) [--voxel metres] "
-        "[--mode signed|shell] [--shell-voxels 1.5] [--k 64] [--step 0.2] "
-        "[--quant-table uniform|band|radial] [--entropy auto|host|device] "
-        "[--segment-size n] [--sweep] [--inspect-only] "
-        "[-o prefix]");
-  }
-  if (!(o.voxel > 0.0f) || !std::isfinite(4.0f * o.voxel)) {
-    return vkc::Status::invalid_argument("--voxel must be finite and positive");
-  }
-  if (!std::isfinite(o.sdf.shell_voxels) || o.sdf.shell_voxels < 0.8660254f ||
-      o.sdf.shell_voxels >= 4.0f) {
-    return vkc::Status::invalid_argument(
-        "--shell-voxels must be in [sqrt(3)/2, 4)");
-  }
-  VKC_TRY(vr_example::apply_quantization_table(o.codec.params, o.quant_table));
-  VKC_TRY(o.codec.params.validate());
+        if (!(o.voxel > 0.0f) ||
+            !std::isfinite(vr_example::default_trunc(o.voxel))) {
+          return vkc::Status::invalid_argument(
+              "--voxel must be finite and positive");
+        }
+        if (o.sdf.shell_voxels < 0.8660254f || o.sdf.shell_voxels >= 4.0f) {
+          return vkc::Status::invalid_argument(
+              "--shell-voxels must be in [sqrt(3)/2, 4)");
+        }
+        return {};
+      });
+  VKC_TRY(cli.parse(argc, argv));
   return o;
 }
 
@@ -211,7 +196,7 @@ vkc::Status run(const Options& opt) {
              vkc::Device::create(instance, gpu, vr::device_requirements()));
   VKC_ASSIGN(vkc::Allocator allocator,
              vkc::Allocator::create(instance.handle(), device));
-  const float trunc = 4.0f * opt.voxel;
+  const float trunc = vr_example::default_trunc(opt.voxel);
   const vr::volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                              {"weight", sizeof(float)}};
   VKC_ASSIGN(
@@ -261,14 +246,15 @@ vkc::Status run(const Options& opt) {
         "shell offset\n",
         double(opt.sdf.shell_voxels * opt.voxel));
   }
-  vr_example::print_stage_rows("mesh conversion", conversion, 1);
+  vr_example::print_stage_rows("mesh conversion", conversion, 1, 2);
   VKC_ASSIGN(mesh::MarchingCubes extractor,
              mesh::MarchingCubes::create(device, allocator));
+  const vr::codec::EncoderConfig& config = opt.codec.config;
   VKC_ASSIGN(vr_example::CodecStream stream,
-             vr_example::CodecStream::create(device, allocator, opt.codec));
+             vr_example::CodecStream::create(device, allocator, config));
   std::printf("codec: K %u, table %s, quantization scale %.6g\n",
-              opt.codec.params.coefficient_count, opt.quant_table.c_str(),
-              double(opt.codec.params.quantization_scale));
+              config.params.coefficient_count, opt.codec.quant_table.c_str(),
+              double(config.params.quantization_scale));
   VKC_TRY(stream.code(volume, opt.out_prefix.empty()
                                   ? std::string{}
                                   : opt.out_prefix + ".vrtc"));
@@ -305,7 +291,7 @@ vkc::Status run(const Options& opt) {
   vr_example::print_comparison(total_error, opt.voxel);
   if (opt.sweep) {
     VKC_TRY(vr_example::run_codec_sweep(device, allocator, volume,
-                                        source_reference, extractor, opt.codec,
+                                        source_reference, extractor, config,
                                         stream.player()));
   }
   return {};
