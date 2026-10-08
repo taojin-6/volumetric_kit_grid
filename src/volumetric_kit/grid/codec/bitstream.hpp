@@ -39,13 +39,10 @@
 /// sets one, since a later version may define a flag that changes how the
 /// body reads.
 ///
-/// Inside a segment each block is, in order: its coordinate (the segment's
-/// first in full, the rest as deltas from the block before), its mask class,
-/// then its K coefficients. A partial mask follows its class a z plane at a
-/// time: each plane the same as the one before, empty, full, or coded line by
-/// line, each line (one byte, eight voxels along x) against the line before
-/// it. Every integer is a *class* -- its bit length -- through a table, plus
-/// one raw field of the bits below its leading one, and below those its sign.
+/// Inside a segment the blocks follow the block grammar of
+/// `shaders/frame_grammar.glsl`, through the models of
+/// `shaders/frame_models.glsl`: the one text both the host and the device
+/// code a frame with.
 ///
 /// Version 3 replaces DC/AC steps with a global scale and a weight for each of
 /// the K kept bases, 256 bytes at the default K = 64; weights beyond K never
@@ -193,6 +190,10 @@ VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_intra_frame(
 VR_CODEC_API std::uint32_t frame_model_count(std::uint32_t k);
 /// @return The alphabet size of frequency table @p model.
 VR_CODEC_API std::uint32_t frame_model_alphabet(std::uint32_t model);
+/// @return The first entry of table @p model in the kernels' per-symbol
+///         arrays, every table's symbols back to back in TABLES order; for
+///         @ref frame_model_count, the arrays' size.
+VR_CODEC_API std::uint32_t frame_model_base(std::uint32_t model);
 
 /// @brief Normalize a frame's per-model symbol counts into its tables, the
 ///        one way every writer builds them.

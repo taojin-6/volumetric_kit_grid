@@ -193,6 +193,22 @@ int write_refusals_case() {
   return 0;
 }
 
+// The models' layout, which the kernels index their counts and tables by:
+// each model's first entry is every earlier model's alphabet summed, and one
+// past the last model is the arrays' size.
+int model_layout_case() {
+  for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
+    CHECK(d::frame_model_base(0) == 0);
+    std::uint32_t sum = 0;
+    for (std::uint32_t m = 0; m < d::frame_model_count(k); ++m) {
+      CHECK(d::frame_model_base(m) == sum);
+      sum += d::frame_model_alphabet(m);
+    }
+    CHECK(d::frame_model_base(d::frame_model_count(k)) == sum);
+  }
+  return 0;
+}
+
 // The container check the device writer relies on: assemble_intra_frame
 // refuses a coded frame whose header fields or sections disagree.
 int assemble_refusals_case() {
@@ -663,6 +679,7 @@ int main() {
   if (extreme_coords_case() != 0) return 1;
   if (golden_case() != 0) return 1;
   if (write_refusals_case() != 0) return 1;
+  if (model_layout_case() != 0) return 1;
   if (assemble_refusals_case() != 0) return 1;
   if (header_refusals_case() != 0) return 1;
   if (section_rules_case() != 0) return 1;

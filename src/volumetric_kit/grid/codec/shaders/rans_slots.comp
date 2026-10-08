@@ -12,7 +12,7 @@
 
 layout(local_size_x = 256) in;
 
-#include "rans_models.glsl"
+#include "frame_models.glsl"
 #include "rans_push.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer Tables {

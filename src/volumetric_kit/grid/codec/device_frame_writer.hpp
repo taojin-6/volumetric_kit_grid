@@ -111,7 +111,7 @@ class VR_CODEC_API DeviceFrameWriter {
   core::Buffer counts_;         // per model, per symbol
   core::Buffer block_steps_;    // coder steps per block
   core::Buffer tables_;         // per model, per symbol: cum | freq << 16
-  core::Buffer step_offsets_;   // each block's first step
+  core::Buffer step_ends_;      // one past each block's last step
   core::Buffer steps_;          // every coder step: start | freq << 16
   core::Buffer segment_steps_;  // each segment's first step, segment count + 1
   core::Buffer slot_offsets_;   // 16-bit words, segment count + 1
@@ -122,9 +122,8 @@ class VR_CODEC_API DeviceFrameWriter {
   core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
   core::Buffer failed_;       // set when a table refuses a symbol
 
-  // Each model's first symbol entry (rans_walk.glsl's model_base), and what
-  // record_count reads back at the caller's submit.
-  std::vector<std::uint32_t> bases_host_;
+  // What record_count reads back at the caller's submit: the counts, at
+  // frame_model_base, and each block's steps.
   std::vector<std::uint32_t> counts_host_;
   std::vector<std::uint32_t> steps_host_;
   // The segment size record_count counted with (0 before any), and the last

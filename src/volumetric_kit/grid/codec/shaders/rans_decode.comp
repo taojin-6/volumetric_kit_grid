@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Tao Jin
 
 // The device frame's decode: one invocation per segment runs rans.hpp's
-// RansReader and bitstream.cpp's read_block over the segment's stream, with
-// the same 32-bit integer arithmetic, and writes each block's coordinate,
-// mask and coefficients where the inverse transform reads them. The host
-// reader is the reference: the same frame decodes to the same blocks, and a
-// segment fails here exactly when it fails there, which the device frame test
-// checks.
+// RansReader, with the same 32-bit integer arithmetic, under
+// frame_grammar.glsl's reader half over the segment's stream, and writes each
+// block's coordinate, mask and coefficients where the inverse transform reads
+// them. The host reader is the reference: the same frame decodes to the same
+// blocks, and a segment fails here exactly when it fails there, which the
+// device frame test checks.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -18,8 +18,10 @@ layout(local_size_x = 1) in;
 #define VR_HASH_COMMON_NO_PUSH_CONSTANTS
 #include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
 
-#include "rans_models.glsl"
 #include "rans_push.glsl"
+
+#define VR_FRAME_READER
+#include "frame_grammar.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer Slots {
   uint slots[];  // rans_slots.comp's, 4096 a model
@@ -99,120 +101,19 @@ uint get_bits(uint bits) {
   return g_failed ? 0u : value;
 }
 
-// get_unsigned: classes reach 32, so the value fits 32 bits.
-uint get_unsigned(uint model) {
-  const uint c = get(model);
-  if (c <= 1u) return c;
-  return (1u << (c - 1u)) + get_bits(c - 1u);
-}
+bool coder_failed() { return g_failed; }
 
-// get_signed, as a magnitude of at most 2^32 - 1 and its sign.
-uint get_signed(uint model, out bool negative) {
-  negative = false;
-  const uint c = get(model);
-  if (c == 0u) return 0u;
-  const uint field = get_bits(c);
-  negative = (field & 1u) != 0u;
-  return (1u << (c - 1u)) + (field >> 1u);
-}
+uint g_coefficients = 0u;  // the block's first word
+uint g_low = 0u;           // an even coefficient, waiting for the odd one
 
-// prev + or - m, or false where it leaves int32 (to_coord).
-bool step(int prev, uint m, bool negative, inout int result) {
-  const uint room =
-      negative ? uint(prev) - 0x80000000u : 0x7FFFFFFFu - uint(prev);
-  if (m > room) return false;
-  result = int(negative ? uint(prev) - m : uint(prev) + m);
-  return true;
-}
-
-void read_partial_mask() {
-  for (uint w = 0u; w < kMaskWords; ++w) g_mask[w] = 0u;
-  for (uint z = 0u; z < 8u; ++z) {
-    const uint plane = get(kPlane);
-    for (uint y = 0u; y < 8u; ++y) {
-      uint line = 0u;
-      if (plane == kOther) {
-        const uint predictor = line_predictor(z, y);
-        const uint context = line_context(predictor);
-        const uint s = get(kLine + context);
-        line = s == kSame       ? predictor
-               : s == kAllEmpty ? 0x00u
-               : s == kAllFull  ? 0xFFu
-                                : get(kByte + context);
-      } else if (plane == kSame) {
-        line = z > 0u ? mask_line(8u * (z - 1u) + y) : 0x00u;
-      } else {
-        line = plane == kAllFull ? 0xFFu : 0x00u;
-      }
-      const uint l = 8u * z + y;
-      g_mask[l / 4u] |= line << (8u * (l % 4u));
-    }
-  }
-}
-
-// read_block: false for a coordinate outside int32.
-bool read_block(uint i, bool first, inout ivec3 cur) {
-  if (first) {
-    cur.x = int(get_bits(32u));
-    cur.y = int(get_bits(32u));
-    cur.z = int(get_bits(32u));
+// Two coefficients a word, low first.
+void store_coefficient(uint j, int value) {
+  const uint v = uint(value) & 0xFFFFu;
+  if ((j & 1u) == 0u) {
+    g_low = v;
   } else {
-    const ivec3 prev = cur;
-    const uint dz = get_unsigned(kDz);
-    uint dy = 0u;
-    uint dx = 0u;
-    bool y_negative = false;
-    bool x_negative = false;
-    bool run_past = false;  // a run step of 2^32
-    if (dz == 0u) {
-      dy = get_unsigned(kDySame);
-      if (dy == 0u) {
-        dx = get_unsigned(kDxRun);
-        run_past = dx == 0xFFFFFFFFu;
-        dx += 1u;
-      } else {
-        dx = get_signed(kDxFree, x_negative);
-      }
-    } else {
-      dy = get_signed(kDyFree, y_negative);
-      dx = get_signed(kDxFree, x_negative);
-    }
-    if (g_failed) return true;  // the segment's end check reports it
-    if (run_past || !step(prev.x, dx, x_negative, cur.x) ||
-        !step(prev.y, dy, y_negative, cur.y) ||
-        !step(prev.z, dz, false, cur.z)) {
-      return false;
-    }
+    coefficients[g_coefficients + j / 2u] = g_low | (v << 16u);
   }
-  blocks[i].coord = cur;
-  blocks[i].ptr = 0;
-
-  const uint cls = get(kMaskClass);
-  if (cls == kMaskPartial) {
-    read_partial_mask();
-  } else {
-    for (uint w = 0u; w < kMaskWords; ++w) {
-      g_mask[w] = cls == kMaskFull ? ~0u : 0u;
-    }
-  }
-  for (uint w = 0u; w < kMaskWords; ++w) masks[i * kMaskWords + w] = g_mask[w];
-
-  // Two coefficients a word, low first, an odd K's pad zero.
-  const uint k = pc.coefficient_count;
-  const uint base = i * ((k + 1u) / 2u);
-  uint low = 0u;
-  for (uint j = 0u; j < k; ++j) {
-    bool negative;
-    const uint m = get_signed(kFirstCoef + j, negative);  // class < 16
-    const uint v = (negative ? 0u - m : m) & 0xFFFFu;
-    if ((j & 1u) == 0u) {
-      low = v;
-    } else {
-      coefficients[base + j / 2u] = low | (v << 16u);
-    }
-  }
-  if ((k & 1u) != 0u) coefficients[base + k / 2u] = low;
-  return true;
 }
 
 void main() {
@@ -229,13 +130,22 @@ void main() {
   const uint end = pc.num_blocks - first > pc.segment_size
                        ? first + pc.segment_size
                        : pc.num_blocks;
+  const uint k = pc.coefficient_count;
   uint fault = kFaultNone;
-  ivec3 cur = ivec3(0);
+  g_coord = ivec3(0);
   for (uint i = first; i < end && !g_failed; ++i) {
-    if (!read_block(i, i == first, cur)) {
+    g_coefficients = i * ((k + 1u) / 2u);
+    if (!read_block(i == first, k)) {
       fault = kFaultCoordOverflow;
       break;
     }
+    blocks[i].coord = g_coord;
+    blocks[i].ptr = 0;
+    for (uint w = 0u; w < kMaskWords; ++w) {
+      masks[i * kMaskWords + w] = g_mask[w];
+    }
+    // An odd K's last word, its pad zero.
+    if ((k & 1u) != 0u) coefficients[g_coefficients + k / 2u] = g_low;
   }
   if (fault == kFaultNone &&
       (g_failed || g_pos != g_end || g_x != kRansLower)) {
