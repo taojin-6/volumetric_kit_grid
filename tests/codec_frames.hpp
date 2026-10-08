@@ -4,13 +4,17 @@
 #pragma once
 
 // Synthetic intra frames for the codec's frame tests: the host writer's
-// round trips and the device writer's byte comparison draw the same frames.
+// round trips and the device writer's byte comparison draw the same frames,
+// and both writers must write the golden frames' pinned bytes.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
+#include <vector>
 
 #include "bitstream.hpp"
+#include "fnv1a.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace codec_frames {
@@ -102,6 +106,70 @@ inline d::IntraFrame make_frame(std::size_t n, std::uint32_t k,
     }
   }
   return f;
+}
+
+// Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
+inline d::IntraFrame extreme_frame() {
+  constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
+  constexpr std::int32_t kMin = std::numeric_limits<std::int32_t>::min();
+  d::IntraFrame f = make_frame(0, 4, 1);
+  f.coords = {
+      {kMin, kMin, kMin}, {kMax, kMin, kMin},  // dx = 2^32 - 1
+      {kMin, kMax, kMin},                      // dy, dx back
+      {0, 0, kMax},                            // dz
+      {1, 0, kMax},       {kMax, kMax, kMax},
+  };
+  f.blocks.masks.assign(f.coords.size() * codec::kMaskWordsPerBlock, ~0u);
+  f.blocks.coefficients.assign(f.coords.size() * 4, 0);
+  return f;
+}
+
+// What a frame holds, hashed: coordinates, masks and coefficients.
+inline std::uint32_t content_hash(const d::IntraFrame& f) {
+  std::vector<std::uint32_t> words;
+  for (const vr::Vec3i& c : f.coords) {
+    words.insert(words.end(), {static_cast<std::uint32_t>(c.x),
+                               static_cast<std::uint32_t>(c.y),
+                               static_cast<std::uint32_t>(c.z)});
+  }
+  words.insert(words.end(), f.blocks.masks.begin(), f.blocks.masks.end());
+  for (std::int16_t c : f.blocks.coefficients) {
+    words.push_back(static_cast<std::uint16_t>(c));
+  }
+  return vr_test::fnv1a(words);
+}
+
+// --- Golden frames. ---------------------------------------------------------
+//
+// The v3 bytes every writer, host or device, writes for these frames on every
+// machine: what pins the format, where a round trip would pass a writer and a
+// reader changed together. `content` pins the fixture, so a failure says which
+// changed. A new kFrameVersion brings new values; nothing else may.
+static_assert(d::kFrameVersion == 3, "the golden frames are v3's");
+
+struct GoldenFrame {
+  bool extreme;  // extreme_frame(), else make_frame(blocks, k, seed)
+  std::size_t blocks;
+  std::uint32_t k;
+  std::uint64_t seed;
+  std::uint32_t segment_size;
+  std::uint32_t content;  // content_hash of the frame
+  std::size_t size;       // its bytes
+  std::uint32_t hash;     // vr_test::fnv1a of them
+};
+
+// The default K and segment size over many segments, every K with segments
+// of 16, an odd K with odd segments, and coordinates at the ends of int32,
+// each coordinate in full.
+inline constexpr GoldenFrame kGoldenFrames[] = {
+    {false, 700, 64, 7, 64, 0x3f9773d8u, 17582, 0x411a37d6u},
+    {false, 40, codec::kVoxelsPerBlock, 5, 16, 0xebbf784au, 6520, 0x8e023b27u},
+    {false, 65, 21, 3, 7, 0x4fb1073du, 1907, 0x29533280u},
+    {true, 6, 4, 0, 1, 0x11b607ddu, 236, 0x92cc1c51u},
+};
+
+inline d::IntraFrame golden_frame(const GoldenFrame& g) {
+  return g.extreme ? extreme_frame() : make_frame(g.blocks, g.k, g.seed);
 }
 
 }  // namespace codec_frames
