@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // mesh::MeshExchange against a host model of the MarchingCubes ring: the
-// newest mesh is taken, after the frame's release mark; a generation is
+// newest mesh is taken, after the frame's release mark; the commit runs
+// beside the producer and sees only its own mesh's payload; a generation is
 // released once no frame in flight or live mesh holds it; a parked take is
 // never released, so no extract reclaims its slot; an empty mesh with null
 // buffers is committed as "draw nothing" and the exchange keeps going; an
@@ -210,6 +211,58 @@ int test_publish_take_order() {
   CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kNone);
   CHECK(exchange.live().generation == g3->generation);
   CHECK(commits == 2);
+  return 0;
+}
+
+// The commit runs outside the lock, after the take has freed the producer: a
+// mesh published while it runs does not change the payload it sees, and is
+// the next take. This is how a consumer pairs what it shows with the mesh it
+// draws, rather than reading the producer's newest state after the commit.
+int test_commit_runs_beside_the_producer() {
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(3);
+  const auto g1 = ring.extract(4);
+  exchange.publish(*g1, tag(*g1));
+
+  std::thread producer;
+  std::atomic<bool> published{false};
+  std::optional<rmesh::DeviceMesh> g2;
+  bool published_during_commit = false;
+  bool paired = false;
+  auto commit_g1 = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    producer = std::thread([&] {
+      if (exchange.release_and_may_publish(ring)) {
+        g2 = ring.extract(5);
+        exchange.publish(*g2, tag(*g2));
+        published.store(true);
+      }
+    });
+    // Bounded, so a commit run under the lock fails here instead of hanging:
+    // the producer then waits for begin_frame to return.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!published.load() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    published_during_commit = published.load();
+    paired = tag_matches(mesh, payload);
+    return true;
+  };
+  CHECK(exchange.begin_frame(0, commit_g1) == ExchangeOutcome::kCommitted);
+  producer.join();
+  CHECK(published_during_commit);
+  CHECK(paired);
+  CHECK(exchange.live().generation == g1->generation);
+
+  CHECK(g2.has_value());
+  std::uint64_t committed = 0;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    committed = tag_matches(mesh, payload) ? *payload : 0;
+    return true;
+  };
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kCommitted);
+  CHECK(committed == g2->generation);
+  CHECK(exchange.live().generation == g2->generation);
   return 0;
 }
 
@@ -490,6 +543,7 @@ int test_seeded_run() {
 int main() {
   if (const int rc = test_unbindable_reason()) return rc;
   if (const int rc = test_publish_take_order()) return rc;
+  if (const int rc = test_commit_runs_beside_the_producer()) return rc;
   if (const int rc = test_release_mark()) return rc;
   if (const int rc = test_parked_take_is_never_released()) return rc;
   if (const int rc = test_empty_mesh_draws_nothing()) return rc;

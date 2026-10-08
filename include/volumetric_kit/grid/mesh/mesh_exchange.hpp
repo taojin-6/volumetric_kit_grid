@@ -110,10 +110,10 @@ enum class ExchangeOutcome {
 /// - **The producer publishes every extract** and does not publish over a
 ///   mesh not yet taken, except to supersede it.
 ///
-/// The payload is what the mesh's `Vertex::uv0` index into, such as the
-/// pixels of the camera that textured it: it is published, taken, parked and
-/// committed with the mesh, so a mesh is never drawn against another mesh's
-/// atlas.
+/// The payload is whatever must stay with the mesh, such as the pixels of the
+/// camera that textured it, which its `Vertex::uv0` index into: it is
+/// published, taken, parked and committed with the mesh, so a mesh is never
+/// drawn against another mesh's atlas.
 ///
 /// The producer half (@ref release_and_may_publish, @ref publish,
 /// @ref wait_collected) belongs to one thread, the consumer half
@@ -199,6 +199,10 @@ class MeshExchange {
   /// A mesh taken now or parked earlier is committed as follows: an empty one
   /// at once; one that cannot be bound is refused, which latches; any other
   /// once @p commit accepts it, and parked when it does not.
+  ///
+  /// @p commit runs after the take, outside the exchange's lock, so the
+  /// producer may be extracting and publishing the next mesh meanwhile.
+  /// Whatever must describe the committed mesh comes through its payload.
   ///
   /// @param slot    The frame-in-flight slot, below `frames_in_flight`.
   /// @param commit  `bool(const DeviceMesh&, Payload&)`: make what the mesh
