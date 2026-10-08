@@ -160,11 +160,12 @@ struct GoldenFrame {
 
 // The default K and segment size over many segments, every K with segments
 // of 16, an odd K with odd segments, and coordinates at the ends of int32,
-// each coordinate in full.
+// as steps of up to 2^32 - 1 and each in full.
 inline constexpr GoldenFrame kGoldenFrames[] = {
     {false, 700, 64, 7, 64, 0x3f9773d8u, 17582, 0x411a37d6u},
     {false, 40, codec::kVoxelsPerBlock, 5, 16, 0xebbf784au, 6520, 0x8e023b27u},
     {false, 65, 21, 3, 7, 0x4fb1073du, 1907, 0x29533280u},
+    {true, 6, 4, 0, 64, 0x11b607ddu, 198, 0xe081c9b3u},
     {true, 6, 4, 0, 1, 0x11b607ddu, 236, 0x92cc1c51u},
 };
 
