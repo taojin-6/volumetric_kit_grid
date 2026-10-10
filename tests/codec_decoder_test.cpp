@@ -8,7 +8,7 @@
 // last frame; every refusal before the grid is touched leaves it untouched;
 // a grid whose hash table cannot place the frame says so and recovers after a
 // resize; read_frame_info; the stage rows; the moves. Links recon_mesh, which
-// the codec tier itself may not. Exits 0 (skip) with no device.
+// the codec tier itself may not. Skips with no device.
 
 #include <algorithm>
 #include <cmath>
@@ -23,11 +23,10 @@
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vkc = volumetric_kit::core;
 
@@ -745,26 +744,7 @@ int device_matches_host_case(Gpu& gpu) {
   return 0;
 }
 
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> physical =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!physical) {
-    return vr_test::no_device("no compute-capable device",
-                              physical.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), physical.value(), vr::device_requirements());
-  CHECK(device.ok());
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  CHECK(allocator.ok());
-  Gpu gpu{device.value(), allocator.value()};
-
+int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<codec::Decoder> d =
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(d.ok());
@@ -803,3 +783,5 @@ int main() {
   std::printf("codec Decoder: OK\n");
   return 0;
 }
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

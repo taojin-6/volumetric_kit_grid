@@ -4,7 +4,7 @@
 // GPU test for codec::Encoder: an empty grid is a valid frame; the bytes are
 // independent of the order the hash table holds the blocks in; blocks with no
 // observed voxel are left out; its stage rows; its refusals and its moves.
-// Decoding is codec_decoder_test's. Exits 0 (skip) with no device.
+// Decoding is codec_decoder_test's. Skips with no device.
 
 #include <cstdint>
 #include <cstdio>
@@ -17,9 +17,8 @@
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vkc = volumetric_kit::core;
 
@@ -307,28 +306,7 @@ int moves_case(Gpu& gpu) {
   return 0;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> physical =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!physical) {
-    return vr_test::no_device("no compute-capable device",
-                              physical.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), physical.value(), vr::device_requirements());
-  CHECK(device.ok());
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  CHECK(allocator.ok());
-  Gpu gpu{device.value(), allocator.value()};
-
+int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<codec::Encoder> e =
       codec::Encoder::create(gpu.device, gpu.allocator);
   CHECK(e.ok());
@@ -357,3 +335,7 @@ int main() {
   std::printf("codec Encoder: OK\n");
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

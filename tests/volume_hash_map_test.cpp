@@ -20,16 +20,14 @@
 #include "buffer_readback.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -77,35 +75,7 @@ std::vector<vol::BlockIndex> coords_in_bucket(int target_bucket,
   return out;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-
+int gpu_main(vr_test::GpuContext& gpu) {
   // A small grid: 1024 buckets x 8, 8192-block heap -- plenty for the test set,
   // and cheap to init.
   vol::VoxelGridParams grid{};
@@ -119,7 +89,7 @@ int main() {
   grid.max_chain = 128;
 
   vkc::Result<vol::VoxelHashMap> map_result =
-      vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
   if (!map_result) {
     std::fprintf(stderr, "VoxelHashMap::create failed: %s\n",
                  map_result.status().message().c_str());
@@ -179,7 +149,7 @@ int main() {
   CHECK(map.check_device_block_list(on_device.value(), "test").ok());
   {
     vkc::Result<std::vector<vol::BlockIndex>> listed =
-        vr_test::read_back<vol::BlockIndex>(device.value(), allocator.value(),
+        vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
                                             *on_device.value().buffer,
                                             on_device.value().count);
     CHECK(listed.ok());
@@ -228,7 +198,7 @@ int main() {
   CHECK(map.check_device_block_list(none.value(), "test").ok());
   {
     vkc::Result<vol::VoxelHashMap> lmap_result =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
     CHECK(lmap_result.ok());
     vol::VoxelHashMap lmap = std::move(lmap_result).value();
     CHECK(lmap.allocate(coords.data(), n).value() == 0);
@@ -281,7 +251,7 @@ int main() {
     cg.max_chain = 16;
 
     vkc::Result<vol::VoxelHashMap> cmap_result =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), cg);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, cg);
     CHECK(cmap_result.ok());
     vol::VoxelHashMap cmap = std::move(cmap_result).value();
 
@@ -371,7 +341,7 @@ int main() {
     pg.max_chain = 512;    // > kDeepChain, so the chain is never the limit
 
     vkc::Result<vol::VoxelHashMap> pmap_result =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), pg);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, pg);
     CHECK(pmap_result.ok());
     vol::VoxelHashMap pmap = std::move(pmap_result).value();
 
@@ -447,7 +417,7 @@ int main() {
     tg.max_chain = 8;
 
     vkc::Result<vol::VoxelHashMap> tmap_result =
-        vol::VoxelHashMap::create(device.value(), allocator.value(), tg);
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, tg);
     CHECK(tmap_result.ok());
     vol::VoxelHashMap tmap = std::move(tmap_result).value();
 
@@ -529,7 +499,7 @@ int main() {
   // buffers / pipelines are released by the move-assign -- ASan turns a
   // leak/double-free here into a failure).
   vkc::Result<vol::VoxelHashMap> other_result =
-      vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
   CHECK(other_result.ok());
   vol::VoxelHashMap other = std::move(other_result).value();
   moved = std::move(other);
@@ -549,3 +519,7 @@ int main() {
       want.size());
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

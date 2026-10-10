@@ -15,9 +15,7 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -26,7 +24,7 @@
 #include "grid_readback.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -55,35 +53,7 @@ vol::VoxelGridParams small_grid() {
   return grid;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-
+int gpu_main(vr_test::GpuContext& gpu) {
   const vol::VoxelGridParams grid = small_grid();
   const std::uint64_t voxels =
       static_cast<std::uint64_t>(grid.num_blocks) * grid.voxels_per_block;
@@ -91,8 +61,8 @@ int main() {
   // Declare two independent float attributes (SoA): tsdf + weight.
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
-  vkc::Result<vol::VoxelBlockGrid> grid_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), grid, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> grid_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, attrs, 2);
   if (!grid_result) {
     std::fprintf(stderr, "VoxelBlockGrid::create failed: %s\n",
                  grid_result.status().message().c_str());
@@ -124,13 +94,11 @@ int main() {
   // after the grid changes them, written back before the grid reads them.
   CHECK(tsdf.value().buffer->mapped() == nullptr);
   const auto get = [&](const char* name) {
-    return vr_test::read_attribute<float>(device.value(), allocator.value(),
-                                          vbg, name)
+    return vr_test::read_attribute<float>(gpu.device, gpu.allocator, vbg, name)
         .value();
   };
   const auto put = [&](const char* name, const std::vector<float>& data) {
-    return vr_test::write_attribute(device.value(), allocator.value(), vbg,
-                                    name, data)
+    return vr_test::write_attribute(gpu.device, gpu.allocator, vbg, name, data)
         .ok();
   };
   // load_factor() reads a host copy of the heap counter, and diagnostics()
@@ -367,8 +335,8 @@ int main() {
     odd.voxels_per_block = 125;
     const vol::AttributeSpec odd_attrs[] = {{"tsdf", sizeof(float)},
                                             {"label", 1}};
-    CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), odd,
-                                      odd_attrs, 2)
+    CHECK(vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, odd, odd_attrs,
+                                      2)
               .status()
               .domain() == vkc::Status::Code::InvalidArgument);
   }
@@ -441,29 +409,27 @@ int main() {
 
   // Error paths: null list with a count, empty name, zero element size, and a
   // duplicate name are each rejected before any buffer is allocated.
-  CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
-                                    nullptr, 1)
+  CHECK(vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, nullptr, 1)
             .status()
             .domain() == vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec empty_name[] = {{"", sizeof(float)}};
-  CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
-                                    empty_name, 1)
+  CHECK(vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, empty_name,
+                                    1)
             .status()
             .domain() == vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec zero_size[] = {{"bad", 0}};
-  CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
-                                    zero_size, 1)
-            .status()
-            .domain() == vkc::Status::Code::InvalidArgument);
+  CHECK(
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, zero_size, 1)
+          .status()
+          .domain() == vkc::Status::Code::InvalidArgument);
   const vol::AttributeSpec dup[] = {{"tsdf", 4}, {"tsdf", 4}};
-  CHECK(vol::VoxelBlockGrid::create(device.value(), allocator.value(), grid,
-                                    dup, 2)
+  CHECK(vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, dup, 2)
             .status()
             .domain() == vkc::Status::Code::InvalidArgument);
 
   // A grid with no attributes is valid and costs no per-voxel memory.
-  vkc::Result<vol::VoxelBlockGrid> bare = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), grid, nullptr, 0);
+  vkc::Result<vol::VoxelBlockGrid> bare =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, nullptr, 0);
   CHECK(bare.ok());
   CHECK(bare.value().valid() && !bare.value().has_attribute("tsdf"));
 
@@ -480,3 +446,7 @@ int main() {
       static_cast<unsigned long long>(new_voxels));
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

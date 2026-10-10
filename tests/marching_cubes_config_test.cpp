@@ -18,7 +18,7 @@
 // property config_ claims: a reallocated arena carries the same usage. The test
 // forces a real grow (a small grid, then a much larger one) and asserts the
 // arena actually grew, so the case cannot pass vacuously by never reallocating.
-// Exits 0 (skip) where no device is present.
+// Skips where no device is present.
 
 #include <cmath>
 #include <cstddef>
@@ -35,15 +35,14 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+#include "gpu_test.hpp"
 #include "grid_readback.hpp"
-#include "no_device.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -162,35 +161,7 @@ std::vector<T> copy_out(const vkc::Device& dev, vkc::Allocator& alloc,
   return out;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-
+int gpu_main(vr_test::GpuContext& gpu) {
   const vol::VoxelGridParams gp = grid_params();
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
@@ -201,15 +172,15 @@ int main() {
   config.extra_index_usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
   vkc::Result<mesh::MarchingCubes> mc_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(), config);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, config);
   CHECK(mc_result.ok());
   mesh::MarchingCubes extractor = std::move(mc_result).value();
 
-  vkc::Result<vol::VoxelBlockGrid> small_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> small_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(small_result.ok());
   vol::VoxelBlockGrid small = std::move(small_result).value();
-  CHECK(fill_sphere(device.value(), allocator.value(), small, 2));
+  CHECK(fill_sphere(gpu.device, gpu.allocator, small, 2));
 
   mesh::ExtractTimings first{};
   vkc::Result<mesh::DeviceMesh> small_mesh =
@@ -237,11 +208,11 @@ int main() {
   // --- ...and keeps them across an arena grow --------------------------------
   // The arena is destroyed and rebuilt here, so the flags have to be reapplied
   // rather than surviving in the old allocation.
-  vkc::Result<vol::VoxelBlockGrid> big_result = vol::VoxelBlockGrid::create(
-      device.value(), allocator.value(), gp, attrs, 2);
+  vkc::Result<vol::VoxelBlockGrid> big_result =
+      vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(big_result.ok());
   vol::VoxelBlockGrid big = std::move(big_result).value();
-  CHECK(fill_sphere(device.value(), allocator.value(), big, 6));
+  CHECK(fill_sphere(gpu.device, gpu.allocator, big, 6));
 
   mesh::ExtractTimings second{};
   vkc::Result<mesh::DeviceMesh> big_mesh =
@@ -260,9 +231,8 @@ int main() {
   {
     const std::size_t index_count =
         std::size_t(big_mesh.value().triangle_count) * 3;
-    const std::vector<std::uint32_t> run =
-        copy_out<std::uint32_t>(device.value(), allocator.value(),
-                                big_mesh.value().indices, index_count);
+    const std::vector<std::uint32_t> run = copy_out<std::uint32_t>(
+        gpu.device, gpu.allocator, big_mesh.value().indices, index_count);
     CHECK(run.size() == index_count);
     for (std::size_t i = 0; i < run.size(); ++i) {
       CHECK(run[i] == static_cast<std::uint32_t>(i));
@@ -276,7 +246,7 @@ int main() {
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   vkc::Result<mesh::MarchingCubes> plain_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value());
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator);
   CHECK(plain_result.ok());
   mesh::MarchingCubes plain = std::move(plain_result).value();
 
@@ -303,8 +273,7 @@ int main() {
   mesh::MarchingCubesConfig bad_vertex;
   bad_vertex.extra_vertex_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   vkc::Result<mesh::MarchingCubes> bad_vertex_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                  bad_vertex);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, bad_vertex);
   CHECK(!bad_vertex_result.ok());
   CHECK(bad_vertex_result.status().domain() ==
         vkc::Status::Code::InvalidArgument);
@@ -313,7 +282,7 @@ int main() {
   mesh::MarchingCubesConfig bad_index;
   bad_index.extra_index_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   vkc::Result<mesh::MarchingCubes> bad_index_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(), bad_index);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, bad_index);
   CHECK(!bad_index_result.ok());
   CHECK(bad_index_result.status().domain() ==
         vkc::Status::Code::InvalidArgument);
@@ -324,8 +293,7 @@ int main() {
   mesh::MarchingCubesConfig bad_indirect;
   bad_indirect.extra_indirect_usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   vkc::Result<mesh::MarchingCubes> bad_indirect_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                  bad_indirect);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, bad_indirect);
   CHECK(!bad_indirect_result.ok());
   CHECK(bad_indirect_result.status().domain() ==
         vkc::Status::Code::InvalidArgument);
@@ -335,8 +303,7 @@ int main() {
   mesh::MarchingCubesConfig bad_families;
   bad_families.queue_family_count = vkc::BufferDesc::kMaxQueueFamilies + 1;
   vkc::Result<mesh::MarchingCubes> bad_families_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                  bad_families);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, bad_families);
   CHECK(!bad_families_result.ok());
   CHECK(bad_families_result.status().domain() ==
         vkc::Status::Code::InvalidArgument);
@@ -349,15 +316,14 @@ int main() {
   // EXCLUSIVE is the correct answer, which is asserted instead.
   {
     std::uint32_t family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(device.value().physical_device(),
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu.device.physical_device(),
                                              &family_count, nullptr);
     mesh::MarchingCubesConfig shared_config;
     shared_config.queue_families[0] = 0;
     shared_config.queue_families[1] = family_count > 1 ? 1 : 0;
     shared_config.queue_family_count = 2;
     vkc::Result<mesh::MarchingCubes> shared_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                    shared_config);
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, shared_config);
     CHECK(shared_result.ok());
     mesh::MarchingCubes shared = std::move(shared_result).value();
     vkc::Result<mesh::DeviceMesh> shared_mesh =
@@ -400,8 +366,8 @@ int main() {
   {
     mesh::MarchingCubesConfig cmd_config;
     cmd_config.extra_indirect_usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    vkc::Result<mesh::MarchingCubes> cmd_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), cmd_config);
+    vkc::Result<mesh::MarchingCubes> cmd_result =
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, cmd_config);
     CHECK(cmd_result.ok());
     mesh::MarchingCubes cmd_extractor = std::move(cmd_result).value();
 
@@ -413,8 +379,8 @@ int main() {
            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) != 0);
 
     const std::vector<VkDrawIndexedIndirectCommand> copied =
-        copy_out<VkDrawIndexedIndirectCommand>(
-            device.value(), allocator.value(), cmd_mesh.value().indirect, 1);
+        copy_out<VkDrawIndexedIndirectCommand>(gpu.device, gpu.allocator,
+                                               cmd_mesh.value().indirect, 1);
     CHECK(copied.size() == 1);
     const VkDrawIndexedIndirectCommand cmd = copied[0];
     // The units: three indices per triangle, which is what makes the kernel's
@@ -437,8 +403,7 @@ int main() {
     mesh::MarchingCubesConfig bad_slots;
     bad_slots.slot_count = bad_count;
     vkc::Result<mesh::MarchingCubes> bad_slots_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                    bad_slots);
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, bad_slots);
     CHECK(!bad_slots_result.ok());
     CHECK(bad_slots_result.status().domain() ==
           vkc::Status::Code::InvalidArgument);
@@ -452,7 +417,7 @@ int main() {
   mesh::MarchingCubesConfig ringed;
   ringed.slot_count = 2;
   vkc::Result<mesh::MarchingCubes> ring_result =
-      mesh::MarchingCubes::create(device.value(), allocator.value(), ringed);
+      mesh::MarchingCubes::create(gpu.device, gpu.allocator, ringed);
   CHECK(ring_result.ok());
   mesh::MarchingCubes ring = std::move(ring_result).value();
 
@@ -544,8 +509,7 @@ int main() {
     mesh::MarchingCubesConfig ratchet_config;
     ratchet_config.slot_count = kRatchetSlots;
     vkc::Result<mesh::MarchingCubes> ratchet_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value(),
-                                    ratchet_config);
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, ratchet_config);
     CHECK(ratchet_result.ok());
     mesh::MarchingCubes ratchet = std::move(ratchet_result).value();
 
@@ -624,8 +588,8 @@ int main() {
   {
     mesh::MarchingCubesConfig host_ring;
     host_ring.slot_count = 2;
-    vkc::Result<mesh::MarchingCubes> host_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), host_ring);
+    vkc::Result<mesh::MarchingCubes> host_result =
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, host_ring);
     CHECK(host_result.ok());
     mesh::MarchingCubes host = std::move(host_result).value();
 
@@ -651,8 +615,8 @@ int main() {
   {
     mesh::MarchingCubesConfig mixed_config;
     mixed_config.slot_count = 2;
-    vkc::Result<mesh::MarchingCubes> mixed_result = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), mixed_config);
+    vkc::Result<mesh::MarchingCubes> mixed_result =
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, mixed_config);
     CHECK(mixed_result.ok());
     mesh::MarchingCubes mixed = std::move(mixed_result).value();
 
@@ -686,16 +650,16 @@ int main() {
   // name its command, claim its own slot, and leave a consumer able to draw
   // (nothing) without special-casing.
   {
-    vkc::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), gp, attrs, 2);
+    vkc::Result<vol::VoxelBlockGrid> empty_result =
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
     CHECK(empty_result.ok());
     vol::VoxelBlockGrid empty_grid =
         std::move(empty_result).value();  // unfilled
 
     mesh::MarchingCubesConfig empty_config;
     empty_config.slot_count = 2;
-    vkc::Result<mesh::MarchingCubes> empty_ex = mesh::MarchingCubes::create(
-        device.value(), allocator.value(), empty_config);
+    vkc::Result<mesh::MarchingCubes> empty_ex =
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator, empty_config);
     CHECK(empty_ex.ok());
     mesh::MarchingCubes ex = std::move(empty_ex).value();
 
@@ -735,18 +699,18 @@ int main() {
   // only when it is not empty already, and the real extract between the two
   // must count as not empty, or the second would hand out the real one's count.
   {
-    vkc::Result<vol::VoxelBlockGrid> empty_result = vol::VoxelBlockGrid::create(
-        device.value(), allocator.value(), gp, attrs, 2);
+    vkc::Result<vol::VoxelBlockGrid> empty_result =
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
     CHECK(empty_result.ok());
     vol::VoxelBlockGrid empty_grid = std::move(empty_result).value();
     vkc::Result<mesh::MarchingCubes> one_result =
-        mesh::MarchingCubes::create(device.value(), allocator.value());
+        mesh::MarchingCubes::create(gpu.device, gpu.allocator);
     CHECK(one_result.ok());
     mesh::MarchingCubes one = std::move(one_result).value();
     const auto index_count = [&](const mesh::DeviceMesh& m) -> std::uint32_t {
       const std::vector<VkDrawIndexedIndirectCommand> c =
-          copy_out<VkDrawIndexedIndirectCommand>(
-              device.value(), allocator.value(), m.indirect, 1);
+          copy_out<VkDrawIndexedIndirectCommand>(gpu.device, gpu.allocator,
+                                                 m.indirect, 1);
       return c.empty() ? ~0u : c[0].indexCount;
     };
     vkc::Result<mesh::DeviceMesh> a = one.extract_device(empty_grid, 0.0f);
@@ -764,10 +728,10 @@ int main() {
   // offsets, so create refuses it.
   {
     vkc::Result<vkc::Device> plain =
-        vkc::Device::create(instance.value(), gpu.value(), {});
+        vkc::Device::create(gpu.instance, gpu.physical, {});
     CHECK(plain.ok());
     vkc::Result<vkc::Allocator> plain_allocator =
-        vkc::Allocator::create(instance.value().handle(), plain.value());
+        vkc::Allocator::create(gpu.instance.handle(), plain.value());
     CHECK(plain_allocator.ok());
     vkc::Result<mesh::MarchingCubes> refused =
         mesh::MarchingCubes::create(plain.value(), plain_allocator.value());
@@ -783,3 +747,7 @@ int main() {
   std::fprintf(stderr, "marching_cubes_config: OK\n");
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }

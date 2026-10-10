@@ -13,7 +13,7 @@
 // the truncation band would leave a hole if its vertices were dilated as
 // points, and does not here), that the distance prune actually prunes (a far
 // corner of a slanted triangle's bounding box stays unallocated), idempotent
-// re-run, and the null / degenerate / out-of-range guards. Exits 0 (skip) where
+// re-run, and the null / degenerate / out-of-range guards. Skips where
 // no device is present.
 
 #include <algorithm>
@@ -28,16 +28,14 @@
 #include "test_meshes.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "no_device.hpp"
+#include "gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -115,35 +113,7 @@ int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
   return 0;
 }
 
-}  // namespace
-
-int main() {
-  vkc::Result<vkc::Instance> instance = vkc::Instance::create({});
-  if (!instance) {
-    return vr_test::no_device("no Vulkan instance",
-                              instance.status().message());
-  }
-  vkc::Result<vkc::PhysicalDeviceInfo> gpu =
-      instance.value().select_physical_device(vr::device_requirements());
-  if (!gpu) {
-    return vr_test::no_device("no compute-capable device",
-                              gpu.status().message());
-  }
-  vkc::Result<vkc::Device> device = vkc::Device::create(
-      instance.value(), gpu.value(), vr::device_requirements());
-  if (!device) {
-    std::fprintf(stderr, "device create failed: %s\n",
-                 device.status().message().c_str());
-    return 1;
-  }
-  vkc::Result<vkc::Allocator> allocator =
-      vkc::Allocator::create(instance.value().handle(), device.value());
-  if (!allocator) {
-    std::fprintf(stderr, "allocator create failed: %s\n",
-                 allocator.status().message().c_str());
-    return 1;
-  }
-
+int gpu_main(vr_test::GpuContext& gpu) {
   // 5 mm voxels, 8-voxel (40 mm) blocks, a 40 mm band -- the production
   // defaults -- over a small 8192-block heap, which is ample for the meshes
   // below and cheap to init.
@@ -158,7 +128,7 @@ int main() {
   grid.max_chain = 128;
 
   vkc::Result<vol::VoxelHashMap> map_result =
-      vol::VoxelHashMap::create(device.value(), allocator.value(), grid);
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
   CHECK(map_result.ok());
   vol::VoxelHashMap& map = map_result.value();
 
@@ -297,3 +267,7 @@ int main() {
   std::printf("volume_allocate_triangles: OK\n");
   return 0;
 }
+
+}  // namespace
+
+int main() { return vr_test::run_on_gpu(gpu_main); }
