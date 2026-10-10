@@ -303,10 +303,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @brief The device bytes this grid's buffers take at @p num_buckets
   ///        buckets: every attribute array and the map's grid-sized table.
   ///
-  /// What a @ref resize to that count allocates beside the live grid before
-  /// it frees the old buffers, so a caller can check its memory first. Read
-  /// from the attributes declared at @ref create, so a caller never restates
-  /// the per-voxel layout.
+  /// A storage-footprint query, read from the attributes declared at @ref
+  /// create. Peak resize memory also includes the old grid, temporary rehash
+  /// and staging buffers, host scratch, and allocator/driver overhead. A
+  /// caller budgeting a resize must account for those separately.
   /// @param num_buckets  A bucket count, at most @ref max_num_buckets.
   /// @return The bytes; 0 when moved-from or @p num_buckets is not positive.
   std::uint64_t bytes_at(std::int32_t num_buckets) const noexcept;

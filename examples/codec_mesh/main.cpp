@@ -225,7 +225,6 @@ vkc::Status run(const Options& opt) {
   // Grow only for a capacity limit. Lost bucket-lock races leave a residue
   // over a table with room, which a retry places: the mesh integrator refuses
   // a band with a block missing.
-  vr::volume::GridGrowth growth;
   for (int contended = 0;;) {
     vr::volume::AllocFailures failures;
     VKC_ASSIGN(const auto failed,
@@ -240,14 +239,7 @@ vkc::Status run(const Options& opt) {
       }
       continue;
     }
-    VKC_ASSIGN(const vr::volume::GrowthEvent grown, growth.grow(volume));
-    if (grown.outcome == vr::volume::GrowthOutcome::ResizeFailed) {
-      return grown.error;
-    }
-    if (!grown.grew()) {
-      return vkc::Status::out_of_memory(
-          "mesh allocation exceeds grid capacity");
-    }
+    VKC_TRY(vr::volume::grow_grid(volume));
   }
   VKC_ASSIGN(vr::tsdf::MeshIntegrator integrator,
              vr::tsdf::MeshIntegrator::create(device, allocator));

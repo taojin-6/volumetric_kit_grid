@@ -7,6 +7,7 @@
 #include <atomic>
 #include <functional>
 #include <limits>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1064,7 +1065,16 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
     // free ones so a future allocation never hands out a live block.
     return rebuild_heap_excluding(active);
   };
-  if (core::Status st = grow(); !st.ok()) {
+  core::Status st;
+  try {
+    st = grow();
+  } catch (const std::bad_alloc&) {
+    // Host scratch can fail after the grown table was installed. Use the
+    // same rollback as a GPU failure before the caller can resume fusion.
+    st = core::Status::out_of_memory(
+        "VoxelHashMap::resize: host allocation failed");
+  }
+  if (!st.ok()) {
     commit(old, old_grid);  // roll back to the untouched live map
     heap_free_ = old_heap_free;
     return st;
