@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, scalar) readonly buffer Grids {
+  VoxelGridParams grids[];
+};
+layout(set = 0, binding = 1, scalar) writeonly buffer Results {
+  uvec2 results[];
+};
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  int tb = truncationBlocks(grids[i]);
+  // The depth allocator's exact uint32 expression at its maximum 256 centres.
+  // Evaluate only the count: never dispatch billions of allocation candidates.
+  uint side = uint(2 * tb + 1);
+  uint cube = side * side * side;
+  results[i] = uvec2(uint(tb), 256u * cube);
+}

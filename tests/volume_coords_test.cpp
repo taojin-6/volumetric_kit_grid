@@ -7,6 +7,7 @@
 // validation (including the NaN floats an `x <= 0` guard would admit). Pure
 // host math -- no device -- so it always runs.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -102,7 +103,7 @@ int main() {
   vol::VoxelGridParams wide = grid;
   wide.trunc_dist = 0.10f;  // 0.10 / 0.04 = 2.5 -> ceil -> 3.
   CHECK(vol::truncation_blocks(wide) == 3);
-  wide.trunc_dist = 0.0f;  // clamped to a minimum of 1.
+  wide.trunc_dist = 0.001f;  // clamped to a minimum of 1.
   CHECK(vol::truncation_blocks(wide) == 1);
 
   // --- VoxelGridParams::validate: this set is valid; a zero bucket count
@@ -187,9 +188,42 @@ int main() {
   bad = grid;
   bad.trunc_dist = nan;
   CHECK(!bad.validate().ok());
-  // Infinity is not rejected here on purpose -- it is representable, orders the
-  // way the checks assume, and no arithmetic in the tiers below turns it into a
-  // silently-wrong answer the way a NaN does.
+  // Positive infinity passes a positivity check but cannot reach the helpers:
+  // an infinite ratio is undefined when truncation_blocks converts it to int,
+  // and an infinite block extent silently collapses a positive band to zero.
+  const float inf = std::numeric_limits<float>::infinity();
+  bad = grid;
+  bad.voxel_size = inf;
+  CHECK(!bad.validate().ok());
+  bad = grid;
+  bad.trunc_dist = inf;
+  CHECK(!bad.validate().ok());
+  // Finite inputs can overflow either derived expression, too.
+  bad = grid;
+  bad.voxel_size = std::numeric_limits<float>::max();
+  CHECK(!bad.validate().ok());
+  bad = grid;
+  bad.voxel_size = std::numeric_limits<float>::min();
+  bad.trunc_dist = std::numeric_limits<float>::max();
+  CHECK(!bad.validate().ok());
+
+  // The depth kernel counts up to 256 distinct centres times a cubic band in
+  // uint32. Pin the largest representable radius, including its float edge,
+  // without actually allocating/enumerating billions of candidates.
+  vol::VoxelGridParams limit = grid;
+  limit.voxel_size = 0.125f;  // exact block extent of 1 metre
+  limit.trunc_dist = 127.0f;
+  CHECK(limit.validate().ok());
+  CHECK(vol::truncation_blocks(limit) == 127);
+  constexpr std::uint64_t kMaxItems = 256ull * 255 * 255 * 255;
+  constexpr std::uint64_t kNextItems = 256ull * 257 * 257 * 257;
+  CHECK(kMaxItems == 4244832000ull);
+  CHECK(kMaxItems + 255 <= std::numeric_limits<std::uint32_t>::max());
+  CHECK(kNextItems > std::numeric_limits<std::uint32_t>::max());
+  limit.trunc_dist = std::nextafter(127.0f, inf);
+  CHECK(!limit.validate().ok());
+  limit.trunc_dist = 128.0f;
+  CHECK(!limit.validate().ok());
 
   std::printf("recon volume coords test passed\n");
   return 0;

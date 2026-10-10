@@ -128,6 +128,8 @@ inline Vec3i world_to_block(Vec3f world, const VoxelGridParams& grid) {
 /// The TSDF truncation distance @ref VoxelGridParams::trunc_dist (metres)
 /// expressed as a whole number of blocks, so allocation can expand a centre
 /// block into the surrounding band it will integrate into.
+/// @pre `grid.validate().ok()`; the finite ratio and its integer range are
+///      checked there before this helper converts it.
 /// @param grid  Grid parameters (uses block_size, voxel_size, trunc_dist).
 /// @return The truncation half-width in blocks, clamped to at least 1.
 inline int truncation_blocks(const VoxelGridParams& grid) {

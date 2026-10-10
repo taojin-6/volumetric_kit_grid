@@ -7,6 +7,7 @@
 /// @brief Voxel-grid resolution + hash-table capacity -- the parameters every
 ///        voxel-hash operation is measured against.
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -46,6 +47,8 @@ struct VoxelGridParams {
   /// rather than per-call on the device hot path.
   /// The two precomputed fields (`voxels_per_block`, `num_blocks`) are checked
   /// against their defining products so a stale value cannot slip through.
+  /// Metric fields and the block extent must be finite. The truncation radius
+  /// must be at most 127 blocks so a depth tile's candidate count fits uint32.
   /// @return An OK `Status` when every field is valid, otherwise
   ///         `Status::invalid_argument` naming the offending field.
   core::Status validate() const;
@@ -74,17 +77,11 @@ static_assert(std::is_standard_layout_v<VoxelGridParams>,
               "VoxelGridParams must be standard-layout");
 
 inline core::Status VoxelGridParams::validate() const {
-  // `!(x > 0)` rather than `x <= 0` so a NaN is rejected too: every comparison
-  // with a NaN is false, so `<= 0` lets one straight through. It is not a
-  // theoretical input -- a metric derived from a sensor's intrinsics is one
-  // division by an unset focal length away -- and nothing downstream catches
-  // it. A NaN voxel_size reaches the meshing push constants, every vertex
-  // position comes out NaN, and the extract returns Status::ok() with a
-  // full-size mesh the renderer simply does not draw. Same shape for
-  // trunc_dist below, and for every float this struct validates.
-  if (!(voxel_size > 0.0f)) {
+  // Positivity alone admits infinity; <= 0 alone also admits NaN. Neither can
+  // reach the coordinate math or the float-to-int truncation-radius conversion.
+  if (!(voxel_size > 0.0f) || !std::isfinite(voxel_size)) {
     return core::Status::invalid_argument(
-        "VoxelGridParams: voxel_size must be > 0");
+        "VoxelGridParams: voxel_size must be finite and > 0");
   }
   if (block_size <= 0) {
     return core::Status::invalid_argument(
@@ -106,9 +103,25 @@ inline core::Status VoxelGridParams::validate() const {
     return core::Status::invalid_argument(
         "VoxelGridParams: voxels_per_block must equal block_size^3");
   }
-  if (!(trunc_dist > 0.0f)) {
+  if (!(trunc_dist > 0.0f) || !std::isfinite(trunc_dist)) {
     return core::Status::invalid_argument(
-        "VoxelGridParams: trunc_dist must be > 0");
+        "VoxelGridParams: trunc_dist must be finite and > 0");
+  }
+  const float block_extent = static_cast<float>(block_size) * voxel_size;
+  if (!std::isfinite(block_extent)) {
+    return core::Status::invalid_argument(
+        "VoxelGridParams: block_size * voxel_size must be finite");
+  }
+  // Match truncation_blocks / truncationBlocks's float arithmetic, before any
+  // float-to-int cast. hash_allocate_depth counts s_centres * (2*tb+1)^3 in
+  // uint32, with at most 256 centres: tb=127 needs 4,244,832,000 items (and
+  // room for the final 256-lane increment); tb=128 needs 4,345,495,808 and
+  // overflows. This representation bound also makes the int radius safe.
+  // Comparing the ratio rejects infinity from finite-input division overflow.
+  if (!(trunc_dist / block_extent <= 127.0f)) {
+    return core::Status::invalid_argument(
+        "VoxelGridParams: truncation radius must be <= 127 blocks (a depth "
+        "tile's candidate count must fit uint32)");
   }
   // Two, not one. The last entry of each bucket is that bucket's chain anchor,
   // so at bucket_size == 1 *every* slot in the table is an anchor and there is

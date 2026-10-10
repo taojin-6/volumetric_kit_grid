@@ -114,6 +114,8 @@ void main() {
   // TODO(volume): skip the blocks neighbouring centres' bands share (18 of 27
   // between adjacent centres), if allocate's device time matters again.
   int tb = truncationBlocks(pc.grid);
+  // VoxelGridParams::validate bounds tb <= 127 so even 256 distinct centres
+  // and the final lane increment fit uint32. Keep that bound with this count.
   uint side = uint(2 * tb + 1);
   uint cube = side * side * side;
   uint items = s_centres * cube;

@@ -14,14 +14,18 @@
 // table, negative-bias blocks, idempotent re-run, clear(), and null/zero-count
 // guards. Skips where no device is present.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <set>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/compute_kernel.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -31,6 +35,7 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 #include "gpu_test.hpp"
+#include "grid_truncation_comp.spv.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -94,7 +99,57 @@ vr::Vec3i unproject_to_block(const vr::DepthCameraParams& cam,
   return vol::world_to_block(world, grid);
 }
 
+// Exercise the real shared GLSL helper at the largest representable depth
+// candidate count. A tiny compute pass checks host/device parity without
+// enumerating the band, which would require billions of candidate visits.
+int truncation_bounds_case(const vr_test::Gpu& gpu) {
+  const vol::VoxelGridParams base{0.125f, 8, 512, 1.0f, 8, 8, 64, 128};
+  std::vector<vol::VoxelGridParams> grids(6, base);
+  grids[0].trunc_dist = 0.25f;
+  grids[1].trunc_dist = 2.5f;
+  grids[2].trunc_dist = std::nextafter(127.0f, 0.0f);
+  grids[3].trunc_dist = 127.0f;
+  grids[4].voxel_size = std::numeric_limits<float>::min();
+  grids[4].trunc_dist = 8.0f * grids[4].voxel_size;
+  grids[5].voxel_size = std::numeric_limits<float>::max() / 16.0f;
+  grids[5].trunc_dist = 8.0f * grids[5].voxel_size;
+  for (const auto& grid : grids) CHECK(grid.validate().ok());
+  const auto count = static_cast<std::uint32_t>(grids.size());
+
+  vkc::ComputeKernel kernel;
+  vkc::KernelSetBuilder builder(gpu.device);
+  CHECK(builder
+            .add(kernel, "grid_truncation", vr_grid_truncation_comp_spv,
+                 vr_grid_truncation_comp_spv_size, 2)
+            .ok());
+  auto pool = builder.build();
+  auto input = vr_test::upload_device_buffer(
+      gpu.device, gpu.allocator, grids.data(), count * sizeof(base));
+  auto output = vkc::device_storage_buffer(gpu.allocator,
+                                           count * 2 * sizeof(std::uint32_t));
+  CHECK(pool.ok() && input.ok() && output.ok());
+  kernel.set.write_storage_buffer(0, input->handle(), 0, VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(1, output->handle(), 0, VK_WHOLE_SIZE);
+  CHECK(vkc::dispatch(gpu.device, kernel, nullptr, 0, count,
+                      gpu.device.caps().limits().maxComputeWorkGroupCount[0])
+            .ok());
+  auto got = vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                               *output, count * 2);
+  CHECK(got.ok());
+  for (std::size_t i = 0; i < grids.size(); ++i) {
+    const auto tb =
+        static_cast<std::uint32_t>(vol::truncation_blocks(grids[i]));
+    const std::uint64_t side = 2 * tb + 1;
+    const std::uint64_t items = 256 * side * side * side;
+    CHECK(items + 255 <= std::numeric_limits<std::uint32_t>::max());
+    CHECK(got.value()[2 * i] == tb);
+    CHECK(got.value()[2 * i + 1] == items);
+  }
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
+  CHECK(truncation_bounds_case(gpu) == 0);
   // A small grid: 1024 buckets x 8, 8192-block heap -- ample for a couple of
   // 27-block bands, and cheap to init.
   vol::VoxelGridParams grid{};
