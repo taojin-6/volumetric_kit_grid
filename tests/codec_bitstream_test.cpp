@@ -23,20 +23,13 @@
 #include "bitstream.hpp"
 #include "codec_frames.hpp"
 #include "dct_tables.hpp"
+#include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

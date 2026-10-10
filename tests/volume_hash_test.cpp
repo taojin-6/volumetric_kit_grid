@@ -1,33 +1,22 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Spatial-hash tests: determinism, bucket range, three locked known values (one
+// Spatial-hash tests: bucket range, three locked known values (one
 // per prime), and a weak distribution sanity check. Pure host math -- no device
 // -- so it always runs.
 
 #include <cstdint>
 #include <cstdio>
 
+#include "test_check.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
 
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
-
 int main() {
   constexpr std::int32_t kBuckets = 30000;
-
-  // --- Determinism: same coordinate -> same bucket.
-  const vr::Vec3i coord(12, -7, 3);
-  CHECK(vol::hash_bucket(coord, kBuckets) == vol::hash_bucket(coord, kBuckets));
 
   // --- Range: always in [0, num_buckets), including negative coordinates.
   for (int x = -50; x <= 50; ++x) {

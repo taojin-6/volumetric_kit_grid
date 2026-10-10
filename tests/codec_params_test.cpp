@@ -18,20 +18,13 @@
 
 #include "dct_tables.hpp"
 #include "fnv1a.hpp"
+#include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace codec = volumetric_kit::recon::codec;
 using codec::kVoxelsPerBlock;
 using codec::detail::kBasisSize;
 using codec::detail::kEdge;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

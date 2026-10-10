@@ -17,6 +17,7 @@
 #include "codec_frames.hpp"
 #include "device_frame_reader.hpp"
 #include "device_frame_writer.hpp"
+#include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
@@ -31,14 +32,6 @@ namespace d = volumetric_kit::recon::codec::detail;
 using codec_frames::extreme_frame;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

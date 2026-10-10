@@ -307,29 +307,20 @@ int moves_case(Gpu& gpu) {
 }
 
 int gpu_main(vr_test::GpuContext& gpu) {
-  vkc::Result<codec::Encoder> e =
-      codec::Encoder::create(gpu.device, gpu.allocator);
-  CHECK(e.ok());
-  codec::Encoder enc = std::move(e).value();
-
-  if (empty_grid_case(gpu, enc) != 0) return 1;
-  if (order_independent_case(gpu, enc) != 0) return 1;
-  if (unobserved_dropped_case(gpu, enc) != 0) return 1;
-  if (metrics_case(gpu, enc) != 0) return 1;
-  if (device_list_case(gpu, enc) != 0) return 1;
-  if (device_matches_host_case(gpu) != 0) return 1;
-  // The same contract with the coding on the device.
   codec::EncoderConfig device_config;
   device_config.entropy = codec::EntropyCoding::kDevice;
-  vkc::Result<codec::Encoder> d =
-      codec::Encoder::create(gpu.device, gpu.allocator, device_config);
-  CHECK(d.ok());
-  codec::Encoder device_enc = std::move(d).value();
-  if (empty_grid_case(gpu, device_enc) != 0) return 1;
-  if (order_independent_case(gpu, device_enc) != 0) return 1;
-  if (unobserved_dropped_case(gpu, device_enc) != 0) return 1;
-  if (metrics_case(gpu, device_enc) != 0) return 1;
-  if (device_list_case(gpu, device_enc) != 0) return 1;
+  const codec::EncoderConfig configs[] = {{}, device_config};
+  for (const auto& config : configs) {
+    auto made = codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(made.ok());
+    codec::Encoder enc = std::move(made).value();
+    if (empty_grid_case(gpu, enc) != 0) return 1;
+    if (order_independent_case(gpu, enc) != 0) return 1;
+    if (unobserved_dropped_case(gpu, enc) != 0) return 1;
+    if (metrics_case(gpu, enc) != 0) return 1;
+    if (device_list_case(gpu, enc) != 0) return 1;
+  }
+  if (device_matches_host_case(gpu) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");
