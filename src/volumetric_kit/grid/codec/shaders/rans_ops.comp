@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The device frame's coder steps: one invocation per block writes its
-// block's steps, in the order the encoder takes them, from the block's
-// offset, as `start | freq << 16` words. The host lays each segment's blocks last
-// first, so a segment's steps are one run that rans_encode.comp streams
-// through: the branchy symbol walk runs here, a block per invocation, and
-// only the rANS state's chain stays serial.
+// The device frame's coder steps: one invocation per block walks its symbols
+// in the order the host writer emits them and writes each one's steps, as
+// `start | freq << 16` words, downward from the end of the block's run. The
+// encoder takes steps last first, and the host lays each segment's blocks
+// last first, so a segment's steps are one run in the encoder's order that
+// rans_encode.comp streams through: the branchy symbol walk runs here, a
+// block per invocation, and only the rANS state's chain stays serial.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -19,8 +20,8 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 3, std430) readonly buffer Tables {
   uint tables[];  // per model, per symbol, at model_base: cum | freq << 16
 };
-layout(set = 0, binding = 4, std430) readonly buffer StepOffsets {
-  uint step_offsets[];  // per block
+layout(set = 0, binding = 4, std430) readonly buffer StepEnds {
+  uint step_ends[];  // per block: one past its run's last step
 };
 layout(set = 0, binding = 5, std430) writeonly buffer Steps {
   uint steps[];
@@ -28,26 +29,25 @@ layout(set = 0, binding = 5, std430) writeonly buffer Steps {
 
 const uint kScaleBits = 12u;
 
-uint g_at = 0u;
+uint g_at = 0u;  // the step written last: the next goes below it
 
 void sink_symbol(uint model, uint symbol) {
-  steps[g_at++] = tables[model_base(model) + symbol];
+  steps[--g_at] = tables[model_base(model) + symbol];
 }
 
-// RansWriter::put_bits's chunks, low first in decode order: here high first.
+// RansWriter::put_bits's steps: chunks of at most 12 bits, low first.
 void sink_bits(uint value, uint bits) {
-  const uint chunks = (bits + 11u) / 12u;
-  for (uint c = chunks; c-- > 0u;) {
-    const uint n = c + 1u == chunks ? bits - 12u * c : 12u;
-    const uint chunk = (value >> (12u * c)) & ((1u << n) - 1u);
+  for (uint low = 0u; low < bits; low += 12u) {
+    const uint n = min(bits - low, 12u);
+    const uint chunk = (value >> low) & ((1u << n) - 1u);
     const uint shift = kScaleBits - n;
-    steps[g_at++] = (chunk << shift) | ((1u << shift) << 16u);
+    steps[--g_at] = (chunk << shift) | ((1u << shift) << 16u);
   }
 }
 
 void main() {
   const uint i = pc.item_base + gl_GlobalInvocationID.x;
   if (i >= pc.num_blocks) return;
-  g_at = step_offsets[i];
-  walk_block(i, i % pc.segment_size == 0u);
+  g_at = step_ends[i];
+  walk_block(i);
 }

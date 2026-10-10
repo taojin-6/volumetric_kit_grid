@@ -32,7 +32,7 @@ struct RansPush {
 static_assert(sizeof(RansPush) == 20, "RansPush must be 20 bytes");
 
 /// @return Every model's symbols back to back, in TABLES order (each model
-///         at rans_models.glsl's `model_base`), as the kernels read them:
+///         at @ref frame_model_base), as the kernels read them:
 ///         `cum | freq << 16`.
 inline std::vector<std::uint32_t> rans_table_entries(
     const std::vector<FrequencyTable>& tables) {

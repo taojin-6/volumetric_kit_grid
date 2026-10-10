@@ -2,14 +2,9 @@
 // Copyright (c) 2026 Tao Jin
 
 // A block's frame symbols on the device, shared by rans_count.comp and
-// rans_encode.comp. The host writer (bitstream.cpp's emit_block) is the
-// reference: these kernels must produce its frames byte for byte, which the
-// device frame test checks.
-//
-// The walk runs in the order the encoder runs the coder -- each block's
-// symbols last first, a raw field's chunks high first -- because rANS encodes
-// in reverse. Counting is order-free, so both kernels share it. The includer
-// defines the two sinks declared below.
+// rans_ops.comp: frame_grammar.glsl's writer half over the forward output,
+// in the order the host writer emits them. The includer defines the two
+// sinks.
 
 #ifndef VR_RANS_WALK_GLSL
 #define VR_RANS_WALK_GLSL
@@ -19,8 +14,10 @@
 #define VR_HASH_COMMON_NO_PUSH_CONSTANTS
 #include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
 
-#include "rans_models.glsl"
 #include "rans_push.glsl"
+
+#define VR_FRAME_WRITER
+#include "frame_grammar.glsl"
 
 layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
   BlockIndex blocks[];  // in frame order; only coord is read
@@ -31,122 +28,27 @@ layout(set = 0, binding = 1, scalar) readonly buffer Masks {
 layout(set = 0, binding = 2, scalar) readonly buffer Coefficients {
   uint coefficients[];  // two int16 a word, (K + 1) / 2 words a block
 };
-// What the includer does with each symbol and each raw field of 1-32 bits.
-void sink_symbol(uint model, uint symbol);
-void sink_bits(uint value, uint bits);
 
-uint bit_length(uint v) { return uint(findMSB(v) + 1); }
+uint g_coefficients = 0u;  // the block's first word
 
-// emit_unsigned and emit_signed, reversed: the raw field, then the class.
-void walk_unsigned(uint model, uint u) {
-  const uint c = bit_length(u);
-  if (c > 1u) sink_bits(u - (1u << (c - 1u)), c - 1u);
-  sink_symbol(model, c);
+// Within the transform's +-32767, except in an entry the forward rejected and
+// never wrote: clamped, so the count kernel, which runs before the rejection
+// is refused, stays within the model's classes.
+int coefficient(uint j) {
+  const uint word = coefficients[g_coefficients + j / 2u];
+  return max(bitfieldExtract(int(word), int(16u * (j & 1u)), 16), -32767);
 }
 
-void walk_signed(uint model, uint magnitude, bool negative) {
-  const uint c = bit_length(magnitude);
-  if (c > 0u) {
-    const uint below = magnitude - (1u << (c - 1u));
-    sink_bits((below << 1u) | (negative ? 1u : 0u), c);
-  }
-  sink_symbol(model, c);
-}
-
-// A signed step from a to b, which the sort keeps within 2^32 - 1.
-void walk_step(uint model, int a, int b) {
-  const bool negative = b < a;
-  walk_signed(model, negative ? uint(a) - uint(b) : uint(b) - uint(a),
-              negative);
-}
-
-uint plane_symbol(uint z) {
-  bool same = true;
-  bool empty = true;
-  bool full = true;
-  for (uint y = 0u; y < 8u; ++y) {
-    const uint line = mask_line(8u * z + y);
-    same = same && line == (z > 0u ? mask_line(8u * (z - 1u) + y) : 0x00u);
-    empty = empty && line == 0x00u;
-    full = full && line == 0xFFu;
-  }
-  return same ? kSame : empty ? kAllEmpty : full ? kAllFull : kOther;
-}
-
-// emit_block, reversed: coefficients, then the mask, then the coordinate.
-void walk_block(uint i, bool first) {
-  // Two coefficients a word, the next word's load in flight while this
-  // word's pair is walked.
-  const uint k = pc.coefficient_count;
-  const uint words = (k + 1u) / 2u;
-  const uint base = i * words;
-  uint next = coefficients[base + words - 1u];
-  for (uint w = words; w-- > 0u;) {
-    const uint word = next;
-    if (w > 0u) next = coefficients[base + w - 1u];
-    for (uint part = 2u; part-- > 0u;) {
-      const uint j = 2u * w + part;
-      if (j >= k) continue;  // an odd K's pad
-      const int v = bitfieldExtract(int(word), int(16u * part), 16);
-      // Within the transform's +-32767, except in an entry the forward
-      // rejected and never wrote: clamped, so the count kernel, which runs
-      // before the rejection is refused, stays within the model's classes.
-      walk_signed(kFirstCoef + j, min(uint(abs(v)), 32767u), v < 0);
-    }
-  }
-
-  bool full = true;
-  bool none = true;
+void walk_block(uint i) {
   for (uint w = 0u; w < kMaskWords; ++w) {
     g_mask[w] = masks[i * kMaskWords + w];
-    full = full && g_mask[w] == ~0u;
-    none = none && g_mask[w] == 0u;
   }
-  const uint mask_class = full ? kMaskFull : none ? kMaskEmpty : kMaskPartial;
-  if (mask_class == kMaskPartial) {
-    for (uint z = 8u; z-- > 0u;) {
-      const uint plane = plane_symbol(z);
-      if (plane == kOther) {
-        for (uint y = 8u; y-- > 0u;) {
-          const uint line = mask_line(8u * z + y);
-          const uint predictor = line_predictor(z, y);
-          const uint context = line_context(predictor);
-          const uint s = line == predictor ? kSame
-                         : line == 0x00u   ? kAllEmpty
-                         : line == 0xFFu   ? kAllFull
-                                           : kOther;
-          if (s == kOther) sink_symbol(kByte + context, line);
-          sink_symbol(kLine + context, s);
-        }
-      }
-      sink_symbol(kPlane, plane);
-    }
-  }
-  sink_symbol(kMaskClass, mask_class);
-
+  g_coefficients = i * ((pc.coefficient_count + 1u) / 2u);
+  const bool first = i % pc.segment_size == 0u;
   const ivec3 cur = blocks[i].coord;
-  if (first) {
-    // A segment's first block, in full, as x, y, z: reversed, z first.
-    sink_bits(uint(cur.z), 32u);
-    sink_bits(uint(cur.y), 32u);
-    sink_bits(uint(cur.x), 32u);
-    return;
-  }
-  const ivec3 prev = blocks[i - 1u].coord;
-  const uint dz = uint(cur.z) - uint(prev.z);  // the sort keeps z rising
-  if (dz == 0u) {
-    const uint dy = uint(cur.y) - uint(prev.y);  // and y within a z slice
-    if (dy == 0u) {
-      walk_unsigned(kDxRun, uint(cur.x) - uint(prev.x) - 1u);
-    } else {
-      walk_step(kDxFree, prev.x, cur.x);
-    }
-    walk_unsigned(kDySame, dy);
-  } else {
-    walk_step(kDxFree, prev.x, cur.x);
-    walk_step(kDyFree, prev.y, cur.y);
-  }
-  walk_unsigned(kDz, dz);
+  ivec3 prev = cur;
+  if (!first) prev = blocks[i - 1u].coord;
+  emit_block(first, prev, cur, pc.coefficient_count);
 }
 
 #endif  // VR_RANS_WALK_GLSL

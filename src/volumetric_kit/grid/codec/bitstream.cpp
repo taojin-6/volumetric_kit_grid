@@ -16,221 +16,91 @@
 namespace volumetric_kit::recon::codec::detail {
 namespace {
 
-// --- The models: one frequency table each, in this order in TABLES. ---------
+// --- The models and the block grammar. -------------------------------------
 //
-// The coordinate models are split by what the sort already guarantees about
-// the delta: after a block in the same (y, z) row the x step is at least 1
-// (kDxRun codes step - 1, so a run is a stream of zeros), within the same z
-// slice the y step is non-negative (kDySame), and after a step in z the other
-// two are free to go either way.
-//
-// A partial mask is coded a z plane at a time, and a plane a line (one byte,
-// eight voxels along x) at a time, each against the one before it: a fused
-// band's mask edge is a smooth surface, so most planes and lines repeat their
-// neighbour or are all one value. On room0 that is 2.2 bytes a block where
-// the 64 raw bytes through one table were 8.3 (the 2026-10-01 entry).
-enum Model : std::uint32_t {
-  kDz = 0,     // unsigned: z step
-  kDySame,     // unsigned: y step, z unchanged
-  kDyFree,     // signed:   y step after a z step
-  kDxRun,      // unsigned: x step - 1, y and z unchanged
-  kDxFree,     // signed:   x step after a y or z step
-  kMaskClass,  // 0 all observed, 1 none observed, 2 partial
-  kPlane,      // a partial mask's plane: same as the last, empty, full, lines
-  kLine,       // then a line of it, three models by its predictor's class
-  kByte = kLine + 3,       // then a line's byte, by the same three
-  kFirstCoef = kByte + 3,  // then one model per coefficient index j < K
+// shaders/frame_models.glsl and shaders/frame_grammar.glsl, the kernels' own
+// GLSL, compiled here as C++ once these four names are defined.
+
+using uint = std::uint32_t;
+using glm::ivec3;
+using glm::uvec2;
+
+// GLSL's findMSB: the index of the highest set bit, -1 for 0.
+int findMSB(uint v) { return v == 0 ? -1 : 31 - __builtin_clz(v); }
+
+#include "shaders/frame_models.glsl"
+
+static_assert(kMaskWords == kMaskWordsPerBlock &&
+                  kLinesPerPlane == std::uint32_t(kBlockSize) &&
+                  kPlanes == std::uint32_t(kBlockSize),
+              "the frame's block is the codec's");
+
+// The grammar's writer half over a sink: the histogram pass and the encode
+// pass walk exactly the same symbols, as the device's count and coding passes
+// do, so a table built from one walk and a stream written by another could
+// only disagree by construction, never by accident.
+template <typename Sink>
+struct BlockWriter {
+  Sink& sink;
+  const uint* g_mask = nullptr;  // the block's
+  const std::int16_t* coefficients = nullptr;
+
+  void sink_symbol(uint model, uint symbol) { sink.symbol(model, symbol); }
+  void sink_bits(uint value, uint bits) { sink.bits(value, bits); }
+  int coefficient(uint j) const { return coefficients[j]; }
+
+#define VR_FRAME_WRITER
+#include "shaders/frame_grammar.glsl"
+#undef VR_FRAME_WRITER
 };
 
-// A class is a bit length: 0 for zero, else 1 + floor(log2 |v|). Coordinate
-// deltas reach 2^32 - 1 (INT32_MIN to INT32_MAX), so 33 classes; quantized
-// coefficients are within +-32767 < 2^15, so 16.
-constexpr std::uint32_t kCoordClasses = 33;
-constexpr std::uint32_t kCoefClasses = 16;
-constexpr std::uint32_t kMaskClasses = 3;
-constexpr std::uint32_t kMaskFull = 0;
-constexpr std::uint32_t kMaskEmpty = 1;
-constexpr std::uint32_t kMaskPartial = 2;
-// A plane or a line: the same as its predictor, all unobserved, all observed,
-// or neither -- a plane then coded line by line, a line by its byte. The
-// writer tries them in this order, so a value two of them name is written as
-// the first.
-constexpr std::uint32_t kSame = 0;
-constexpr std::uint32_t kAllEmpty = 1;
-constexpr std::uint32_t kAllFull = 2;
-constexpr std::uint32_t kOther = 3;
-constexpr std::uint32_t kRunClasses = 4;
-constexpr std::uint32_t kByteSymbols = 256;
-constexpr std::uint32_t kLinesPerPlane = kBlockSize;  // y
-constexpr std::uint32_t kPlanes = kBlockSize;         // z
-static_assert(kMaskWordsPerBlock * 4 == kLinesPerPlane * kPlanes,
-              "a mask byte is one line of the block");
+struct CountSink {
+  std::vector<std::vector<std::uint64_t>>& counts;
+  void symbol(uint model, uint s) { ++counts[model][s]; }
+  void bits(uint, uint) {}
+};
+
+struct WriteSink {
+  RansWriter& writer;
+  const std::vector<FrequencyTable>& tables;
+  void symbol(uint model, uint s) { writer.put(tables[model], s); }
+  void bits(uint value, uint n) { writer.put_bits(value, n); }
+};
+
+// The grammar's reader half over one segment's stream: the device's decode
+// reads it with the same lines.
+struct BlockReader {
+  RansReader& coder;
+  const std::vector<FrequencyTable>& tables;
+  uint* g_mask = nullptr;  // the block's
+  std::int16_t* coefficients = nullptr;
+  ivec3 g_coord{0};  // the block before's, then this one's
+
+  uint get(uint model) { return coder.get(tables[model]); }
+  uint get_bits(uint bits) { return coder.get_bits(bits); }
+  bool coder_failed() const { return coder.failed(); }
+  void store_coefficient(uint j, int value) {
+    coefficients[j] = static_cast<std::int16_t>(value);
+  }
+
+#define VR_FRAME_READER
+#include "shaders/frame_grammar.glsl"
+#undef VR_FRAME_READER
+};
 
 }  // namespace
 
 std::uint32_t frame_model_count(std::uint32_t k) { return kFirstCoef + k; }
 
 std::uint32_t frame_model_alphabet(std::uint32_t model) {
-  if (model <= kDxFree) return kCoordClasses;
-  if (model == kMaskClass) return kMaskClasses;
-  if (model < kByte) return kRunClasses;  // kPlane and the kLine models
-  if (model < kFirstCoef) return kByteSymbols;
-  return kCoefClasses;
+  return model_alphabet(model);
+}
+
+std::uint32_t frame_model_base(std::uint32_t model) {
+  return model_base(model);
 }
 
 namespace {
-
-std::uint32_t bit_length(std::uint64_t v) {
-  return v == 0 ? 0 : 64 - std::uint32_t(__builtin_clzll(v));
-}
-
-// A partial mask's line l = y + 8 z is byte l % 4 of word l / 4.
-std::uint32_t mask_line(const std::uint32_t* mask, std::uint32_t l) {
-  return (mask[l / 4] >> (8 * (l % 4))) & 0xFFu;
-}
-
-// Which of the three line models a predictor selects.
-std::uint32_t line_context(std::uint32_t predictor) {
-  return predictor == 0x00u ? 0 : predictor == 0xFFu ? 1 : 2;
-}
-
-// A line's predictor: the line before it in its plane, else the same line of
-// the plane before, else (the first line of the block) unobserved.
-std::uint32_t line_predictor(const std::uint32_t* mask, std::uint32_t z,
-                             std::uint32_t y) {
-  if (y > 0) return mask_line(mask, 8 * z + y - 1);
-  return z > 0 ? mask_line(mask, 8 * (z - 1)) : 0x00u;
-}
-
-// --- The one description of a block's symbols.
-// --------------------------------
-//
-// Templated on a sink so the histogram pass and the encode pass walk exactly
-// the same symbols: a table built from one walk and a stream written by
-// another could only disagree by construction, never by accident. The reader
-// below mirrors it by hand, and the round-trip tests are what hold the two
-// together.
-
-template <typename Sink>
-void emit_unsigned(Sink& sink, std::uint32_t model, std::uint64_t u) {
-  const std::uint32_t c = bit_length(u);
-  sink.symbol(model, c);
-  if (c > 1) {
-    sink.bits(static_cast<std::uint32_t>(u - (std::uint64_t(1) << (c - 1))),
-              c - 1);
-  }
-}
-
-// The sign is the low bit of one raw field of c bits, above it the c - 1 below
-// the leading one, so a value of class c <= 12 costs one coder step rather
-// than two. c is at most 32 (a step across all of int32), so the field fits.
-template <typename Sink>
-void emit_signed(Sink& sink, std::uint32_t model, std::int64_t v) {
-  const std::uint64_t m = v < 0 ? std::uint64_t(-v) : std::uint64_t(v);
-  const std::uint32_t c = bit_length(m);
-  sink.symbol(model, c);
-  if (c > 0) {
-    const std::uint64_t below = m - (std::uint64_t(1) << (c - 1));
-    sink.bits(static_cast<std::uint32_t>((below << 1) | (v < 0 ? 1u : 0u)), c);
-  }
-}
-
-// What a partial mask's plane z is against the plane before it (unobserved
-// before the first), and so whether its lines follow.
-std::uint32_t plane_symbol(const std::uint32_t* mask, std::uint32_t z) {
-  bool same = true;
-  bool empty = true;
-  bool full = true;
-  for (std::uint32_t y = 0; y < kLinesPerPlane; ++y) {
-    const std::uint32_t line = mask_line(mask, 8 * z + y);
-    same = same && line == (z > 0 ? mask_line(mask, 8 * (z - 1) + y) : 0x00u);
-    empty = empty && line == 0x00u;
-    full = full && line == 0xFFu;
-  }
-  return same ? kSame : empty ? kAllEmpty : full ? kAllFull : kOther;
-}
-
-template <typename Sink>
-void emit_partial_mask(Sink& sink, const std::uint32_t* mask) {
-  for (std::uint32_t z = 0; z < kPlanes; ++z) {
-    const std::uint32_t plane = plane_symbol(mask, z);
-    sink.symbol(kPlane, plane);
-    if (plane != kOther) {
-      continue;
-    }
-    for (std::uint32_t y = 0; y < kLinesPerPlane; ++y) {
-      const std::uint32_t line = mask_line(mask, 8 * z + y);
-      const std::uint32_t predictor = line_predictor(mask, z, y);
-      const std::uint32_t context = line_context(predictor);
-      const std::uint32_t s = line == predictor ? kSame
-                              : line == 0x00u   ? kAllEmpty
-                              : line == 0xFFu   ? kAllFull
-                                                : kOther;
-      sink.symbol(kLine + context, s);
-      if (s == kOther) {
-        sink.symbol(kByte + context, line);
-      }
-    }
-  }
-}
-
-template <typename Sink>
-void emit_block(Sink& sink, const Vec3i* prev, const Vec3i& cur,
-                const std::uint32_t* mask, const std::int16_t* coeffs,
-                std::uint32_t k) {
-  if (prev == nullptr) {
-    // A segment's first block, in full: the segment decodes on its own.
-    sink.bits(static_cast<std::uint32_t>(cur.x), 32);
-    sink.bits(static_cast<std::uint32_t>(cur.y), 32);
-    sink.bits(static_cast<std::uint32_t>(cur.z), 32);
-  } else {
-    const std::int64_t dz = std::int64_t(cur.z) - prev->z;  // >= 0: sorted
-    emit_unsigned(sink, kDz, std::uint64_t(dz));
-    const std::int64_t dy = std::int64_t(cur.y) - prev->y;
-    const std::int64_t dx = std::int64_t(cur.x) - prev->x;
-    if (dz == 0) {
-      emit_unsigned(sink, kDySame, std::uint64_t(dy));  // >= 0: sorted
-      if (dy == 0) {
-        emit_unsigned(sink, kDxRun, std::uint64_t(dx - 1));  // dx >= 1
-      } else {
-        emit_signed(sink, kDxFree, dx);
-      }
-    } else {
-      emit_signed(sink, kDyFree, dy);
-      emit_signed(sink, kDxFree, dx);
-    }
-  }
-
-  bool full = true;
-  bool none = true;
-  for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
-    full = full && mask[w] == ~0u;
-    none = none && mask[w] == 0u;
-  }
-  sink.symbol(kMaskClass, full ? kMaskFull : none ? kMaskEmpty : kMaskPartial);
-  if (!full && !none) {
-    emit_partial_mask(sink, mask);
-  }
-
-  for (std::uint32_t j = 0; j < k; ++j) {
-    emit_signed(sink, kFirstCoef + j, coeffs[j]);
-  }
-}
-
-struct CountSink {
-  std::vector<std::vector<std::uint64_t>>& counts;
-  void symbol(std::uint32_t model, std::uint32_t s) { ++counts[model][s]; }
-  void bits(std::uint32_t, std::uint32_t) {}
-};
-
-struct WriteSink {
-  RansWriter& writer;
-  const std::vector<FrequencyTable>& tables;
-  void symbol(std::uint32_t model, std::uint32_t s) {
-    writer.put(tables[model], s);
-  }
-  void bits(std::uint32_t value, std::uint32_t n) { writer.put_bits(value, n); }
-};
 
 // --- Byte-level serialization.
 // ------------------------------------------------
@@ -362,7 +232,7 @@ core::Status read_tables(const std::uint8_t* data, std::size_t size,
   ByteReader r(data, size);
   tables.assign(frame_model_count(k), FrequencyTable{});
   for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
-    const std::uint32_t n = frame_model_alphabet(m);
+    const std::uint32_t n = model_alphabet(m);
     FrequencyTable& t = tables[m];
     t.freq.assign(n, 0);
     const std::uint32_t used = r.varint();
@@ -390,119 +260,6 @@ core::Status read_tables(const std::uint8_t* data, std::size_t size,
     return bad("the TABLES section has trailing bytes");
   }
   return {};
-}
-
-// The reader's mirror of emit_unsigned / emit_signed. Class c > 1 carries c-1
-// raw bits below its leading one.
-std::uint64_t get_unsigned(RansReader& r, const FrequencyTable& t) {
-  const std::uint32_t c = r.get(t);
-  if (c <= 1) {
-    return c;
-  }
-  return (std::uint64_t(1) << (c - 1)) + r.get_bits(c - 1);
-}
-
-std::int64_t get_signed(RansReader& r, const FrequencyTable& t) {
-  const std::uint32_t c = r.get(t);
-  if (c == 0) {
-    return 0;
-  }
-  const std::uint32_t field = r.get_bits(c);
-  const std::uint64_t m = (std::uint64_t(1) << (c - 1)) + (field >> 1);
-  return (field & 1u) != 0 ? -std::int64_t(m) : std::int64_t(m);
-}
-
-// The mirror of emit_partial_mask.
-void read_partial_mask(RansReader& r, const std::vector<FrequencyTable>& t,
-                       std::uint32_t* mask) {
-  for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
-    mask[w] = 0;
-  }
-  for (std::uint32_t z = 0; z < kPlanes; ++z) {
-    const std::uint32_t plane = r.get(t[kPlane]);
-    for (std::uint32_t y = 0; y < kLinesPerPlane; ++y) {
-      std::uint32_t line = 0;
-      if (plane == kOther) {
-        const std::uint32_t predictor = line_predictor(mask, z, y);
-        const std::uint32_t context = line_context(predictor);
-        const std::uint32_t s = r.get(t[kLine + context]);
-        line = s == kSame       ? predictor
-               : s == kAllEmpty ? 0x00u
-               : s == kAllFull  ? 0xFFu
-                                : r.get(t[kByte + context]);
-      } else if (plane == kSame) {
-        line = z > 0 ? mask_line(mask, 8 * (z - 1) + y) : 0x00u;
-      } else {
-        line = plane == kAllFull ? 0xFFu : 0x00u;
-      }
-      const std::uint32_t l = 8 * z + y;
-      mask[l / 4] |= line << (8 * (l % 4));
-    }
-  }
-}
-
-// A coordinate the deltas produced, or false if it left int32.
-bool to_coord(std::int64_t v, std::int32_t& out) {
-  if (v < std::numeric_limits<std::int32_t>::min() ||
-      v > std::numeric_limits<std::int32_t>::max()) {
-    return false;
-  }
-  out = static_cast<std::int32_t>(v);
-  return true;
-}
-
-// The mirror of emit_block. Returns false for a coordinate outside int32; the
-// reader's own failure flag carries everything else, including a failure
-// partway through the deltas, whose zeros would otherwise decode as a run step
-// and could be misreported as leaving int32.
-bool read_block(RansReader& r, const std::vector<FrequencyTable>& t,
-                const Vec3i* prev, Vec3i& cur, std::uint32_t* mask,
-                std::int16_t* coeffs, std::uint32_t k) {
-  if (prev == nullptr) {
-    cur.x = static_cast<std::int32_t>(r.get_bits(32));
-    cur.y = static_cast<std::int32_t>(r.get_bits(32));
-    cur.z = static_cast<std::int32_t>(r.get_bits(32));
-  } else {
-    const std::int64_t dz = std::int64_t(get_unsigned(r, t[kDz]));
-    std::int64_t dy = 0;
-    std::int64_t dx = 0;
-    if (dz == 0) {
-      dy = std::int64_t(get_unsigned(r, t[kDySame]));
-      dx = dy == 0 ? std::int64_t(get_unsigned(r, t[kDxRun])) + 1
-                   : get_signed(r, t[kDxFree]);
-    } else {
-      dy = get_signed(r, t[kDyFree]);
-      dx = get_signed(r, t[kDxFree]);
-    }
-    if (r.failed()) {
-      return true;  // the caller's finish() reports the corrupt segment
-    }
-    if (!to_coord(prev->x + dx, cur.x) || !to_coord(prev->y + dy, cur.y) ||
-        !to_coord(prev->z + dz, cur.z)) {
-      return false;
-    }
-  }
-
-  // TODO(codec): refuse a partial mask that decodes all-full or all-empty,
-  // and the mask code's other second spellings: a plane coded line by line
-  // that one plane symbol names, a line coded as the byte another line
-  // symbol names. The writer makes none of them and each decodes correctly,
-  // so each is a second spelling of one frame rather than a wrong one (the
-  // 2026-09-27 and 2026-10-01 entries).
-  const std::uint32_t cls = r.get(t[kMaskClass]);
-  if (cls == kMaskPartial) {
-    read_partial_mask(r, t, mask);
-  } else {
-    for (std::uint32_t w = 0; w < kMaskWordsPerBlock; ++w) {
-      mask[w] = cls == kMaskFull ? ~0u : 0u;
-    }
-  }
-
-  for (std::uint32_t j = 0; j < k; ++j) {
-    // Class < 16, so |value| <= 32767: every coefficient is in range.
-    coeffs[j] = static_cast<std::int16_t>(get_signed(r, t[kFirstCoef + j]));
-  }
-  return true;
 }
 
 // Where a known section's body sits in the frame.
@@ -580,19 +337,24 @@ core::Result<std::vector<std::uint8_t>> write_intra_frame(
   const std::uint32_t r_size = options.segment_size;
   const std::uint64_t segments = frame_segment_count(n, r_size);
 
-  auto prev_of = [&](std::size_t i) -> const Vec3i* {
-    return i % r_size == 0 ? nullptr : &frame.coords[i - 1];
+  // Block i through a writer.
+  auto emit = [&](auto& writer, std::size_t i) {
+    const bool first = i % r_size == 0;
+    writer.g_mask = &b.masks[i * kMaskWordsPerBlock];
+    writer.coefficients = &b.coefficients[i * k];
+    writer.emit_block(first, frame.coords[first ? i : i - 1], frame.coords[i],
+                      k);
   };
 
   // Pass 1: every model's histogram, over exactly the symbols pass 2 writes.
   std::vector<std::vector<std::uint64_t>> counts(frame_model_count(k));
   for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
-    counts[m].assign(frame_model_alphabet(m), 0);
+    counts[m].assign(model_alphabet(m), 0);
   }
   CountSink count_sink{counts};
+  BlockWriter<CountSink> counter{count_sink};
   for (std::size_t i = 0; i < n; ++i) {
-    emit_block(count_sink, prev_of(i), frame.coords[i],
-               &b.masks[i * kMaskWordsPerBlock], &b.coefficients[i * k], k);
+    emit(counter, i);
   }
   std::vector<FrequencyTable> tables = frame_tables(counts);
 
@@ -606,13 +368,13 @@ core::Result<std::vector<std::uint8_t>> write_intra_frame(
   lengths.reserve(static_cast<std::size_t>(segments));
   RansWriter writer;
   WriteSink write_sink{writer, tables};
+  BlockWriter<WriteSink> coder{write_sink};
   for (std::uint64_t s = 0; s < segments; ++s) {
     const std::size_t first = static_cast<std::size_t>(s * r_size);  // < n
     const std::size_t end = static_cast<std::size_t>(
         std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
     for (std::size_t i = first; i < end; ++i) {
-      emit_block(write_sink, prev_of(i), frame.coords[i],
-                 &b.masks[i * kMaskWordsPerBlock], &b.coefficients[i * k], k);
+      emit(coder, i);
     }
     const std::size_t stream_at = payload.size();
     if (!writer.finish(payload)) {
@@ -953,18 +715,19 @@ core::Result<IntraFrame> decode_intra_frame(ParsedFrame parsed) {
   const std::uint8_t* stream = parsed.payload;
   for (std::size_t s = 0; s < parsed.segment_lengths.size(); ++s) {
     RansReader r(stream, parsed.segment_lengths[s]);
+    BlockReader reader{r, parsed.tables};
     const std::size_t first = s * r_size;  // < n
     const std::size_t end = static_cast<std::size_t>(
         std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
     SegmentFault fault = SegmentFault::kNone;
     for (std::size_t i = first; i < end && !r.failed(); ++i) {
-      const Vec3i* prev = i == first ? nullptr : &frame.coords[i - 1];
-      if (!read_block(r, parsed.tables, prev, frame.coords[i],
-                      &frame.blocks.masks[i * kMaskWordsPerBlock],
-                      &frame.blocks.coefficients[i * k], k)) {
+      reader.g_mask = &frame.blocks.masks[i * kMaskWordsPerBlock];
+      reader.coefficients = &frame.blocks.coefficients[i * k];
+      if (!reader.read_block(i == first, k)) {
         fault = SegmentFault::kCoordOverflow;
         break;
       }
+      frame.coords[i] = reader.g_coord;
     }
     if (fault == SegmentFault::kNone && !r.finish()) {
       fault = SegmentFault::kCorrupt;

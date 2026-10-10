@@ -9,7 +9,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,6 +30,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+using codec_frames::extreme_frame;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
 
@@ -201,17 +201,6 @@ int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
   return same_read(reader, host.value());
 }
 
-d::IntraFrame extreme_frame() {
-  d::IntraFrame f = make_frame(0, 4, 1);
-  constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
-  constexpr std::int32_t kMin = std::numeric_limits<std::int32_t>::min();
-  f.coords = {{kMin, kMin, kMin}, {kMax, kMin, kMin}, {kMin, kMax, kMin},
-              {0, 0, kMax},       {1, 0, kMax},       {kMax, kMax, kMax}};
-  f.blocks.masks.assign(f.coords.size() * codec::kMaskWordsPerBlock, ~0u);
-  f.blocks.coefficients.assign(f.coords.size() * 4, 0);
-  return f;
-}
-
 int matches_host_case(d::DeviceFrameWriter& writer,
                       d::DeviceFrameReader& reader) {
   // Block counts on and off a segment boundary, K odd and even up to the
@@ -230,6 +219,22 @@ int matches_host_case(d::DeviceFrameWriter& writer,
   CHECK(same_bytes(writer, reader, f, 1) == 0);
   // A smaller frame after larger ones reuses the retained buffers.
   CHECK(same_bytes(writer, reader, make_frame(5, 64, 7), 64) == 0);
+  return 0;
+}
+
+// The golden frames: the device writes their pinned bytes, so every machine
+// writes the same frame, and reads them as the host does.
+int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
+  for (const codec_frames::GoldenFrame& g : codec_frames::kGoldenFrames) {
+    d::FrameWriteOptions options;
+    options.segment_size = g.segment_size;
+    const vkc::Result<std::vector<std::uint8_t>> bytes =
+        device_write(writer, codec_frames::golden_frame(g), options);
+    CHECK(bytes.ok());
+    CHECK(bytes.value().size() == g.size);
+    CHECK(vr_test::fnv1a(bytes.value()) == g.hash);
+    CHECK(same_read(reader, bytes.value()) == 0);
+  }
   return 0;
 }
 
@@ -383,6 +388,7 @@ int main() {
   g_device = &device.value();
   g_allocator = &allocator.value();
   if (matches_host_case(writer, reader) != 0) return 1;
+  if (golden_case(writer, reader) != 0) return 1;
   if (corruption_case(reader) != 0) return 1;
   if (segment_limit_case(reader) != 0) return 1;
   if (out_of_range_case(device.value(), allocator.value(), writer) != 0) {

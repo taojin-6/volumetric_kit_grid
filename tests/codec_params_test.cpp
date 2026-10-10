@@ -17,6 +17,7 @@
 #include <limits>
 
 #include "dct_tables.hpp"
+#include "fnv1a.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace codec = volumetric_kit::recon::codec;
@@ -187,11 +188,7 @@ int zigzag_case() {
   // The whole table: FNV-1a over its 512 voxel indices (x + 8y + 64z), one
   // index per step, computed from zigzag_table.cuh's kZigZagOrder when the
   // order was ported. Any entry out of place changes it.
-  std::uint32_t hash = 2166136261u;
-  for (std::uint32_t v : order) {
-    hash = (hash ^ v) * 16777619u;
-  }
-  CHECK(hash == 0x26fa5e49u);
+  CHECK(vr_test::fnv1a(order) == 0x26fa5e49u);
   return 0;
 }
 

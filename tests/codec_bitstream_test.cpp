@@ -41,7 +41,6 @@ namespace d = volumetric_kit::recon::codec::detail;
 namespace {
 
 constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
-constexpr std::int32_t kMin32 = std::numeric_limits<std::int32_t>::min();
 
 using codec_frames::Lcg;
 using codec_frames::make_frame;
@@ -121,17 +120,37 @@ int round_trip_case() {
 
 // Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
 int extreme_coords_case() {
-  d::IntraFrame f = make_frame(0, 4, 1);
-  f.coords = {
-      {kMin32, kMin32, kMin32}, {kMax32, kMin32, kMin32},  // dx = 2^32 - 1
-      {kMin32, kMax32, kMin32},                            // dy, dx back
-      {0, 0, kMax32},                                      // dz
-      {1, 0, kMax32},           {kMax32, kMax32, kMax32},
-  };
-  f.blocks.masks.assign(f.coords.size() * codec::kMaskWordsPerBlock, ~0u);
-  f.blocks.coefficients.assign(f.coords.size() * 4, 0);
+  const d::IntraFrame f = codec_frames::extreme_frame();
   CHECK(round_trip(f, 64) == 0);
   CHECK(round_trip(f, 1) == 0);  // every coordinate in full
+  return 0;
+}
+
+// The golden frames' bytes, which pin v3 itself: a writer and a reader changed
+// together still round-trip, but no longer write these.
+int golden_case() {
+  for (const codec_frames::GoldenFrame& g : codec_frames::kGoldenFrames) {
+    const d::IntraFrame f = codec_frames::golden_frame(g);
+    d::FrameWriteOptions opt;
+    opt.segment_size = g.segment_size;
+    const vkc::Result<std::vector<std::uint8_t>> bytes =
+        d::write_intra_frame(f, opt);
+    CHECK(bytes.ok());
+    const std::uint32_t content = codec_frames::content_hash(f);
+    const std::uint32_t hash = vr_test::fnv1a(bytes.value());
+    if (content != g.content || bytes.value().size() != g.size ||
+        hash != g.hash) {
+      std::fprintf(stderr,
+                   "golden frame %zu blocks, K %u, R %u: content 0x%08xu, "
+                   "%zu bytes, hash 0x%08xu\n",
+                   f.coords.size(), g.k, g.segment_size, content,
+                   bytes.value().size(), hash);
+    }
+    CHECK(content == g.content);
+    CHECK(bytes.value().size() == g.size);
+    CHECK(hash == g.hash);
+    CHECK(round_trip(f, g.segment_size) == 0);
+  }
   return 0;
 }
 
@@ -171,6 +190,22 @@ int write_refusals_case() {
   d::FrameWriteOptions zero;
   zero.segment_size = 0;
   CHECK(refused(good, zero));
+  return 0;
+}
+
+// The models' layout, which the kernels index their counts and tables by:
+// each model's first entry is every earlier model's alphabet summed, and one
+// past the last model is the arrays' size.
+int model_layout_case() {
+  for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
+    CHECK(d::frame_model_base(0) == 0);
+    std::uint32_t sum = 0;
+    for (std::uint32_t m = 0; m < d::frame_model_count(k); ++m) {
+      CHECK(d::frame_model_base(m) == sum);
+      sum += d::frame_model_alphabet(m);
+    }
+    CHECK(d::frame_model_base(d::frame_model_count(k)) == sum);
+  }
   return 0;
 }
 
@@ -642,7 +677,9 @@ int zero_frame_cost_case() {
 int main() {
   if (round_trip_case() != 0) return 1;
   if (extreme_coords_case() != 0) return 1;
+  if (golden_case() != 0) return 1;
   if (write_refusals_case() != 0) return 1;
+  if (model_layout_case() != 0) return 1;
   if (assemble_refusals_case() != 0) return 1;
   if (header_refusals_case() != 0) return 1;
   if (section_rules_case() != 0) return 1;
