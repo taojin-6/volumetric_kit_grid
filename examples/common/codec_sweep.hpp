@@ -14,6 +14,7 @@
 
 #include "codec_quantization.hpp"
 #include "codec_stream.hpp"
+#include "stage_table.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
@@ -128,10 +129,8 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
       std::snprintf(f, sizeof f, "%.4f", c.fscore.f);
     }
     const auto gpu_ms = [](const vkc::StageMetrics& rows, const char* name) {
-      for (const vkc::StageRow& r : rows.rows()) {
-        if (std::strcmp(r.name, name) == 0 && r.has_gpu) return r.gpu_ms;
-      }
-      return -1.0;
+      const vkc::StageRow* row = find_row(rows, name);
+      return row != nullptr && row->has_gpu ? row->gpu_ms : -1.0;
     };
     char enc_gpu[16] = "-";
     char dec_gpu[16] = "-";
