@@ -5,8 +5,8 @@
 
 // Candidate tables for the codec examples' rate-distortion study. These are
 // hypotheses to measure, not tuned production defaults. Every table treats
-// axis permutations alike and has a DC weight of one, so --step has the same
-// meaning across the families.
+// axis permutations alike and has a DC weight of one, so
+// codec.quantization_scale has the same meaning across the families.
 
 #include <cstdint>
 #include <string>
