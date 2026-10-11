@@ -15,18 +15,11 @@
 #include <system_error>
 #include <vector>
 
+#include "test_check.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace fs = std::filesystem;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

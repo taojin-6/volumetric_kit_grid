@@ -23,6 +23,7 @@
 
 #include <glm/glm.hpp>
 
+#include "test_check.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
@@ -30,14 +31,6 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace eval = volumetric_kit::recon::eval;
 namespace mesh = volumetric_kit::recon::mesh;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

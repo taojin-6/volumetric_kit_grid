@@ -11,16 +11,9 @@
 #include <string>
 
 #include "stage_table.hpp"
+#include "test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 int main() {
   vkc::StageMetrics rows;

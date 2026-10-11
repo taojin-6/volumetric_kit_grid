@@ -18,16 +18,9 @@
 #include <vector>
 
 #include "rans.hpp"
+#include "test_check.hpp"
 
 namespace d = volumetric_kit::recon::codec::detail;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

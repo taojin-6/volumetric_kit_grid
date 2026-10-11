@@ -745,41 +745,25 @@ int device_matches_host_case(Gpu& gpu) {
 }
 
 int gpu_main(vr_test::GpuContext& gpu) {
-  vkc::Result<codec::Decoder> d =
-      codec::Decoder::create(gpu.device, gpu.allocator);
-  CHECK(d.ok());
-  codec::Decoder dec = std::move(d).value();
-
-  if (round_trip_case(gpu, dec) != 0) return 1;
-  if (mesh_case(gpu, dec) != 0) return 1;
-  if (sequence_case(gpu, dec) != 0) return 1;
-  if (untouched_case(gpu, dec) != 0) return 1;
-  if (out_of_memory_case(gpu, dec) != 0) return 1;
-  if (quantization_sequence_case(gpu, dec) != 0) return 1;
-  if (frame_info_case(gpu) != 0) return 1;
-  if (refusals_case(gpu, dec) != 0) return 1;
-  if (metrics_case(gpu, dec) != 0) return 1;
-  if (device_matches_host_case(gpu) != 0) return 1;
-  // The same contract with the decoding on the device.
   codec::DecoderConfig device_config;
   device_config.entropy = codec::EntropyCoding::kDevice;
-  vkc::Result<codec::Decoder> dd =
-      codec::Decoder::create(gpu.device, gpu.allocator, device_config);
-  CHECK(dd.ok());
-  codec::Decoder device_dec = std::move(dd).value();
-  if (round_trip_case(gpu, device_dec) != 0) return 1;
-  if (mesh_case(gpu, device_dec) != 0) return 1;
-  if (sequence_case(gpu, device_dec) != 0) return 1;
-  if (untouched_case(gpu, device_dec) != 0) return 1;
-  if (out_of_memory_case(gpu, device_dec) != 0) return 1;
-  if (quantization_sequence_case(gpu, device_dec, device_config) != 0) {
-    return 1;
+  const codec::DecoderConfig configs[] = {{}, device_config};
+  for (const auto& config : configs) {
+    auto made = codec::Decoder::create(gpu.device, gpu.allocator, config);
+    CHECK(made.ok());
+    codec::Decoder dec = std::move(made).value();
+    if (round_trip_case(gpu, dec) != 0) return 1;
+    if (mesh_case(gpu, dec) != 0) return 1;
+    if (sequence_case(gpu, dec) != 0) return 1;
+    if (untouched_case(gpu, dec) != 0) return 1;
+    if (out_of_memory_case(gpu, dec) != 0) return 1;
+    if (quantization_sequence_case(gpu, dec, config) != 0) return 1;
+    if (refusals_case(gpu, dec) != 0) return 1;
+    if (metrics_case(gpu, dec) != 0) return 1;
+    if (moves_case(gpu, config) != 0) return 1;
   }
-  if (refusals_case(gpu, device_dec) != 0) return 1;
-  if (metrics_case(gpu, device_dec) != 0) return 1;
-  if (moves_case(gpu) != 0) return 1;
-  // Decoders that hold a live device reader.
-  if (moves_case(gpu, device_config) != 0) return 1;
+  if (frame_info_case(gpu) != 0) return 1;
+  if (device_matches_host_case(gpu) != 0) return 1;
   std::printf("codec Decoder: OK\n");
   return 0;
 }

@@ -24,6 +24,7 @@
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
 #include "grid_readback.hpp"
+#include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -43,14 +44,6 @@ namespace codec = volumetric_kit::recon::codec;
 using codec::detail::DctBlocks;
 using codec::detail::DctTransform;
 using codec::detail::DctTransformConfig;
-
-#define CHECK(cond)                                                        \
-  do {                                                                     \
-    if (!(cond)) {                                                         \
-      std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-      return 1;                                                            \
-    }                                                                      \
-  } while (0)
 
 namespace {
 

@@ -3,15 +3,11 @@
 
 #pragma once
 
-// Cameras round a sphere at the world origin, what each sees, and a check
-// that two grids fused from them hold the same blocks with the same bits.
+// Cameras round a sphere at the world origin and what each sees.
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <map>
-#include <tuple>
 #include <vector>
 
 #include "grid_readback.hpp"
@@ -76,81 +72,6 @@ inline SphereView sphere_view(int index) {
     }
   }
   return v;
-}
-
-using BlockCoord = std::tuple<int, int, int>;
-
-// Every active block's coordinate and first voxel (`ptr` is a voxel offset).
-inline vkc::Result<std::map<BlockCoord, std::int32_t>> blocks_of(
-    volumetric_kit::recon::volume::VoxelBlockGrid& grid) {
-  VKC_ASSIGN(std::vector<volumetric_kit::recon::volume::BlockIndex> active,
-             grid.map().compact_active_blocks());
-  std::map<BlockCoord, std::int32_t> out;
-  for (const auto& b : active) {
-    out[BlockCoord{b.coord.x, b.coord.y, b.coord.z}] = b.ptr;
-  }
-  return out;
-}
-
-// Whether `a` and `b` hold the same blocks, and in each the same bits of
-// weight, tsdf and colour in every voxel; a block's slot may differ, since
-// allocation order is the GPU's. Prints the first difference. `observed`, if
-// given, receives the voxels with weight.
-inline bool same_grids(const Gpu& gpu,
-                       volumetric_kit::recon::volume::VoxelBlockGrid& a,
-                       volumetric_kit::recon::volume::VoxelBlockGrid& b,
-                       std::size_t* observed = nullptr) {
-  auto ba = blocks_of(a);
-  auto bb = blocks_of(b);
-  if (!ba.ok() || !bb.ok()) {
-    std::fprintf(stderr, "same_grids: compaction failed\n");
-    return false;
-  }
-  if (ba.value().size() != bb.value().size()) {
-    std::fprintf(stderr, "same_grids: %zu blocks against %zu\n",
-                 ba.value().size(), bb.value().size());
-    return false;
-  }
-  using Words = std::vector<std::uint32_t>;
-  const char* names[] = {"weight", "tsdf", "color"};
-  Words wa[3], wb[3];
-  for (int n = 0; n < 3; ++n) {
-    auto ra =
-        read_attribute<std::uint32_t>(gpu.device, gpu.allocator, a, names[n]);
-    auto rb =
-        read_attribute<std::uint32_t>(gpu.device, gpu.allocator, b, names[n]);
-    if (!ra.ok() || !rb.ok()) {
-      std::fprintf(stderr, "same_grids: no %s attribute\n", names[n]);
-      return false;
-    }
-    wa[n] = std::move(ra).value();
-    wb[n] = std::move(rb).value();
-  }
-  const auto voxels = std::size_t(a.grid().voxels_per_block);
-  std::size_t weighted = 0;
-  for (const auto& [coord, ptr] : ba.value()) {
-    const auto other = bb.value().find(coord);
-    if (other == bb.value().end()) {
-      std::fprintf(stderr, "same_grids: block (%d, %d, %d) only in one\n",
-                   std::get<0>(coord), std::get<1>(coord), std::get<2>(coord));
-      return false;
-    }
-    for (std::size_t k = 0; k < voxels; ++k) {
-      const std::size_t ia = std::size_t(ptr) + k;
-      const std::size_t ib = std::size_t(other->second) + k;
-      for (int n = 0; n < 3; ++n) {
-        if (wa[n][ia] != wb[n][ib]) {
-          std::fprintf(stderr, "same_grids: %s differs in (%d, %d, %d)\n",
-                       names[n], std::get<0>(coord), std::get<1>(coord),
-                       std::get<2>(coord));
-          return false;
-        }
-      }
-      weighted += wa[0][ia] != 0 ? 1 : 0;
-    }
-  }
-  if (observed != nullptr) *observed = weighted;
-  return true;
 }
 
 }  // namespace vr_test
