@@ -5,17 +5,21 @@
 
 // The stream tests' own .vrst bytes, built from the layout stream/session.hpp
 // states and not from the library: a bitwise CRC-32, chunks with any fields,
-// and the edits a test makes to a file. Also a reader's every record, read in
-// file order as a player would.
+// and the edits a test makes to a file. Also what both tests share of the
+// library: payloads, record fields, an open that says why it failed, and a
+// reader's every record, read in file order as a player would.
 
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "scratch_dir.hpp"
@@ -173,6 +177,42 @@ inline Bytes flipped(Bytes bytes, std::uint64_t offset, int bit) {
 
 inline bool cut(const std::string& path, std::uint64_t size) {
   return ::truncate(path.c_str(), static_cast<off_t>(size)) == 0;
+}
+
+// Deterministic bytes, distinct per seed.
+inline Bytes pattern(std::size_t size, std::uint64_t seed) {
+  Bytes b(size);
+  std::uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
+  for (std::size_t i = 0; i < size; ++i) {
+    x = x * 6364136223846793005ull + 1442695040888963407ull;
+    b[i] = static_cast<std::uint8_t>(x >> 56);
+  }
+  return b;
+}
+
+inline stream::RecordInfo info(std::uint16_t track, bool key, std::uint64_t pts,
+                               std::uint64_t seq,
+                               std::uint64_t set = stream::kNoSet) {
+  stream::RecordInfo i;
+  i.track = track;
+  i.key = key;
+  i.pts_ns = pts;
+  i.seq = seq;
+  i.set = set;
+  return i;
+}
+
+// The reader of `path`, or null, with the reason on stderr.
+inline std::unique_ptr<stream::StreamReader> open(
+    const std::string& path, const stream::ReaderOptions& options = {}) {
+  volumetric_kit::core::Result<std::unique_ptr<stream::StreamReader>> r =
+      stream::StreamReader::open(path, options);
+  if (!r.ok()) {
+    std::fprintf(stderr, "open %s: %s\n", path.c_str(),
+                 r.status().message().c_str());
+    return nullptr;
+  }
+  return std::move(r).value();
 }
 
 // What reading every record of a reader in file order found.

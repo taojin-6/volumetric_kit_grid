@@ -35,17 +35,20 @@ struct ReaderOptions {
 /// hit.
 struct Recovery {
   /// The file ends with the footer @ref StreamWriter::finish writes: a
-  /// `TAIL` naming the `INDX` just before it, both intact, which counts the
-  /// tracks and key records the file holds.
+  /// `TAIL` naming the `INDX` just before it, which passes both its CRCs and
+  /// is sized for the session's tracks and its key count.
   bool finished = false;
-  /// The file ends with a `TAIL`, but the footer it closes is not intact.
+  /// Not @ref finished, though the scan found a chunk tagged `TAIL`, its
+  /// header intact or not, where the footer's `TAIL` starts: the 40 bytes
+  /// before the file's end.
   bool footer_damaged = false;
   /// Where the records end: what follows is @ref torn_bytes.
   std::uint64_t end = 0;
-  /// The bytes after the last whole chunk: part of a chunk, or damage with
-  /// no whole chunk after it.
+  /// The bytes from @ref end on: a chunk whose body the file cuts short, or
+  /// damage after which no chunk header passes its checks.
   std::uint64_t torn_bytes = 0;
-  /// The bytes of the damaged spans, each followed by a whole chunk.
+  /// The bytes of the damaged spans, each from a chunk header that fails its
+  /// checks to the next `RECD`, `INDX` or `TAIL` header that passes them.
   std::uint64_t damaged_bytes = 0;
   std::uint64_t damaged_spans = 0;  ///< Their count.
 };
@@ -172,7 +175,8 @@ class VR_STREAM_API StreamReader {
   /// @brief Read a record's payload, checking its header again and its
   ///        payload against its CRC.
   /// @param record   A record @ref next returned from this reader.
-  /// @param payload  Receives the payload, resized to fit.
+  /// @param payload  Receives the payload, resized to fit; what it holds
+  ///                 after a failure is unspecified.
   /// @return OK; `Status::Code::InvalidArgument` naming the offset when the
   ///         payload fails its CRC or the header is no longer
   ///         @p record 's; `Status::Code::OutOfMemory` for a payload above

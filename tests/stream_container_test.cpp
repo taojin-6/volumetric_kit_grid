@@ -33,17 +33,9 @@ namespace {
 
 using Code = vkc::Status::Code;
 using vrst::Bytes;
-
-// Deterministic bytes, distinct per seed.
-Bytes pattern(std::size_t size, std::uint64_t seed) {
-  Bytes b(size);
-  std::uint64_t x = seed * 0x9E3779B97F4A7C15ull + 1;
-  for (std::size_t i = 0; i < size; ++i) {
-    x = x * 6364136223846793005ull + 1442695040888963407ull;
-    b[i] = static_cast<std::uint8_t>(x >> 56);
-  }
-  return b;
-}
+using vrst::info;
+using vrst::open;
+using vrst::pattern;
 
 Bytes unhex(const char* hex) {
   Bytes b;
@@ -67,17 +59,6 @@ stream::Session one_track(const std::string& writer = "test") {
   return s;
 }
 
-stream::RecordInfo info(std::uint16_t track, bool key, std::uint64_t pts,
-                        std::uint64_t seq, std::uint64_t set = stream::kNoSet) {
-  stream::RecordInfo i;
-  i.track = track;
-  i.key = key;
-  i.pts_ns = pts;
-  i.seq = seq;
-  i.set = set;
-  return i;
-}
-
 std::unique_ptr<stream::StreamWriter> create(const std::string& path,
                                              const stream::Session& session) {
   vkc::Result<std::unique_ptr<stream::StreamWriter>> w =
@@ -88,18 +69,6 @@ std::unique_ptr<stream::StreamWriter> create(const std::string& path,
     return nullptr;
   }
   return std::move(w).value();
-}
-
-std::unique_ptr<stream::StreamReader> open(
-    const std::string& path, const stream::ReaderOptions& options = {}) {
-  vkc::Result<std::unique_ptr<stream::StreamReader>> r =
-      stream::StreamReader::open(path, options);
-  if (!r.ok()) {
-    std::fprintf(stderr, "open %s: %s\n", path.c_str(),
-                 r.status().message().c_str());
-    return nullptr;
-  }
-  return std::move(r).value();
 }
 
 Code open_code(const std::string& path) {
@@ -146,8 +115,7 @@ std::uint64_t file_size(const std::string& path) {
              : ~std::uint64_t{0};
 }
 
-// --- The CRC.
-// -----------------------------------------------------------------
+// --- The CRC. ----------------------------------------------------------------
 
 // Every length to 64, and a few longer, from each of the 8 alignments of a
 // buffer: each record's body_crc is the bitwise CRC of what was appended.
@@ -184,8 +152,7 @@ int crc_case(const std::string& dir) {
   return 0;
 }
 
-// --- Golden bytes.
-// -------------------------------------------------------------
+// --- Golden bytes. -----------------------------------------------------------
 
 // Two tracks, three records, the footer: 552 bytes. Chunks at 0 (VRST), 144,
 // 208 and 264 (RECD), 328 (INDX) and 512 (TAIL).
@@ -290,8 +257,7 @@ int golden_case(const std::string& dir) {
   return 0;
 }
 
-// --- Round trips.
-// --------------------------------------------------------------
+// --- Round trips. ------------------------------------------------------------
 
 struct Appended {
   stream::RecordInfo info;
@@ -423,8 +389,7 @@ int round_trip_case(const std::string& dir) {
   return 0;
 }
 
-// --- Seeking.
-// ------------------------------------------------------------------
+// --- Seeking. ----------------------------------------------------------------
 
 int seek_case(const std::string& dir) {
   stream::Session s = one_track();
@@ -493,8 +458,7 @@ int seek_case(const std::string& dir) {
   return 0;
 }
 
-// --- Unknown kinds, chunks and fields.
-// -----------------------------------------
+// --- Unknown kinds, chunks and fields. ---------------------------------------
 
 int unknown_case(const std::string& dir) {
   stream::Session s = one_track();
@@ -531,8 +495,7 @@ int unknown_case(const std::string& dir) {
   return 0;
 }
 
-// --- Limits.
-// -------------------------------------------------------------------
+// --- Limits. -----------------------------------------------------------------
 
 int limits_case(const std::string& dir) {
   const std::string path = dir + "/limits.vrst";
@@ -580,18 +543,22 @@ int limits_case(const std::string& dir) {
   forged.size = 8;  // the header says otherwise
   CHECK(rh->read(forged, &payload).domain() == Code::InvalidArgument);
 
-  // A session header claiming a body above 64 MiB is refused unread.
+  // A session header claiming a body above 64 MiB, in a (sparse) file that
+  // holds that much, is refused by the limit, unread.
   const std::string big = dir + "/big_session.vrst";
-  Bytes session = vrst::header("VRST", vrst::session_fields(0, 1, 0),
-                               stream::kMaxSessionBytes + 8, 0);
-  session.resize(session.size() + 64, 0);
+  const Bytes session = vrst::header("VRST", vrst::session_fields(0, 1, 0),
+                                     stream::kMaxSessionBytes + 8, 0);
   CHECK(vrst::write_bytes(big, session));
-  CHECK(open_code(big) == Code::InvalidArgument);
+  CHECK(vrst::cut(big, session.size() + stream::kMaxSessionBytes + 8));
+  const vkc::Status over = stream::StreamReader::open(big).status();
+  CHECK(over.domain() == Code::InvalidArgument);
+  CHECK(over.message().find("above " +
+                            std::to_string(stream::kMaxSessionBytes)) !=
+        std::string::npos);
   return 0;
 }
 
-// --- Writer refusals.
-// ----------------------------------------------------------
+// --- Writer refusals. --------------------------------------------------------
 
 int writer_refusals_case(const std::string& dir) {
   const auto create_code = [](const std::string& path,
@@ -676,8 +643,7 @@ int writer_refusals_case(const std::string& dir) {
   return 0;
 }
 
-// --- Reader refusals.
-// ----------------------------------------------------------
+// --- Reader refusals. --------------------------------------------------------
 
 int reader_refusals_case(const std::string& dir) {
   CHECK(open_code("") == Code::InvalidArgument);
@@ -694,6 +660,19 @@ int reader_refusals_case(const std::string& dir) {
   const Bytes good = vrst::chunk("VRST", vrst::session_fields(0, 1, 0), body);
   CHECK(code(good) == Code::Ok);
   CHECK(code(Bytes(good.begin(), good.begin() + 55)) == Code::InvalidArgument);
+  // Cut inside the session header's padding: no records, nothing torn.
+  const auto pad = static_cast<std::size_t>(vrst::padding(body.size()));
+  CHECK(pad != 0);
+  for (std::size_t size = good.size() - pad; size < good.size(); ++size) {
+    Bytes cut = good;
+    cut.resize(size);
+    CHECK(code(cut) == Code::Ok);
+    auto rc = open(path);
+    CHECK(rc != nullptr && rc->begin().offset == good.size());
+    CHECK(rc->recovery().end == size && rc->recovery().torn_bytes == 0);
+    const vrst::ReadBack none = vrst::read_all(*rc);
+    CHECK(none.ended && none.records.empty() && none.next_errors.empty());
+  }
   Bytes magic = good;
   magic[0] = 'X';
   CHECK(code(magic) == Code::InvalidArgument);
@@ -745,12 +724,26 @@ int reader_refusals_case(const std::string& dir) {
   CHECK(odd.offset == r->begin().offset + 4);
   stream::Position early{0};
   CHECK(r->next(&early, &record).status().domain() == Code::InvalidArgument);
-  // A record whose fields are not the file's.
+  // A record whose fields are not the file's, each changed alone.
   stream::Position pos = r->begin();
   CHECK(r->next(&pos, &record).ok());
-  record.info.pts_ns += 1;
   Bytes payload;
-  CHECK(r->read(record, &payload).domain() == Code::InvalidArgument);
+  CHECK(r->read(record, &payload).ok());
+  using Change = void (*)(stream::Record&);
+  const Change changes[] = {
+      [](stream::Record& c) { c.info.track = 1; },
+      [](stream::Record& c) { c.info.key = !c.info.key; },
+      [](stream::Record& c) { c.info.pts_ns += 1; },
+      [](stream::Record& c) { c.info.seq += 1; },
+      [](stream::Record& c) { c.info.set += 1; },
+      [](stream::Record& c) { c.size += 1; },
+      [](stream::Record& c) { c.offset += 8; },
+  };
+  for (const Change change : changes) {
+    stream::Record changed = record;
+    change(changed);
+    CHECK(r->read(changed, &payload).domain() == Code::InvalidArgument);
+  }
 
   // A file cut short after the open: what is gone is IoError.
   const std::string shrunk = dir + "/shrunk.vrst";
@@ -770,8 +763,7 @@ int reader_refusals_case(const std::string& dir) {
   return 0;
 }
 
-// --- Two threads, one reader.
-// --------------------------------------------------
+// --- Two threads, one reader. ------------------------------------------------
 
 int concurrency_case(const std::string& dir) {
   const std::string path = dir + "/threads.vrst";

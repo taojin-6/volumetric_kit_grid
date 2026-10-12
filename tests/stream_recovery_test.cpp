@@ -4,9 +4,10 @@
 // Host-only tests of what the .vrst reader recovers, through its public API:
 // one bit flipped in a payload, a record header, the session header and the
 // footer; a file cut at every byte of its last record and its footer, and at
-// sampled bytes before; damaged spans, one longer than a resync's block; a
-// writer killed by SIGKILL; and a writer stopped by RLIMIT_FSIZE, whose
-// failure sticks.
+// sampled bytes before; damaged spans, one longer than a resync's block;
+// footers forged not to count, and "TAIL" in a payload where a footer's would
+// start; a writer killed by SIGKILL; and a writer stopped by RLIMIT_FSIZE,
+// whose failure sticks.
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -33,16 +34,9 @@ namespace {
 
 using Code = vkc::Status::Code;
 using vrst::Bytes;
-
-Bytes pattern(std::size_t size, std::uint64_t seed) {
-  Bytes b(size);
-  std::uint64_t x = seed * 0x9E3779B97F4A7C15ull + 7;
-  for (std::size_t i = 0; i < size; ++i) {
-    x = x * 6364136223846793005ull + 1442695040888963407ull;
-    b[i] = static_cast<std::uint8_t>(x >> 56);
-  }
-  return b;
-}
+using vrst::info;
+using vrst::open;
+using vrst::pattern;
 
 stream::Session two_tracks() {
   stream::Session s;
@@ -54,28 +48,6 @@ stream::Session two_tracks() {
     s.tracks.push_back(t);
   }
   return s;
-}
-
-stream::RecordInfo info(std::uint16_t track, bool key, std::uint64_t pts,
-                        std::uint64_t seq) {
-  stream::RecordInfo i;
-  i.track = track;
-  i.key = key;
-  i.pts_ns = pts;
-  i.seq = seq;
-  i.set = seq;
-  return i;
-}
-
-std::unique_ptr<stream::StreamReader> open(const std::string& path) {
-  vkc::Result<std::unique_ptr<stream::StreamReader>> r =
-      stream::StreamReader::open(path);
-  if (!r.ok()) {
-    std::fprintf(stderr, "open %s: %s\n", path.c_str(),
-                 r.status().message().c_str());
-    return nullptr;
-  }
-  return std::move(r).value();
 }
 
 // Write `sizes.size()` records alternating between two tracks, every third a
@@ -123,8 +95,7 @@ std::vector<vrst::ChunkAt> of_tag(const std::vector<vrst::ChunkAt>& chunks,
   return out;
 }
 
-// --- One bit flipped.
-// ----------------------------------------------------------
+// --- One bit flipped. --------------------------------------------------------
 
 int crc_mismatch_case(const std::string& dir) {
   const std::string path = dir + "/flip.vrst";
@@ -164,6 +135,18 @@ int crc_mismatch_case(const std::string& dir) {
   CHECK(back.next_errors == std::vector<Code>{Code::InvalidArgument});
   CHECK(back.ended && back.payloads == without(payloads, {2}));
 
+  // The last record's header: its span ends at the index, and the footer
+  // still closes the file.
+  const vrst::ChunkAt& last = records.back();
+  CHECK(vrst::write_bytes(path, vrst::flipped(original, last.offset + 26, 0)));
+  r = open(path);
+  CHECK(r != nullptr);
+  CHECK(r->recovery().finished && !r->recovery().footer_damaged);
+  CHECK(r->recovery().damaged_spans == 1 &&
+        r->recovery().damaged_bytes == index.offset - last.offset);
+  back = vrst::read_all(*r);
+  CHECK(back.ended && back.payloads == without(payloads, {5}));
+
   // The session header, its fields or its body: nothing to read.
   for (std::uint64_t at : {std::uint64_t{30}, std::uint64_t{60}}) {
     CHECK(vrst::write_bytes(path, vrst::flipped(original, at, 1)));
@@ -193,8 +176,7 @@ int crc_mismatch_case(const std::string& dir) {
   return 0;
 }
 
-// --- Truncation.
-// ---------------------------------------------------------------
+// --- Truncation. -------------------------------------------------------------
 
 int truncation_case(const std::string& dir) {
   const std::string path = dir + "/cut.vrst";
@@ -255,8 +237,7 @@ int truncation_case(const std::string& dir) {
   return 0;
 }
 
-// --- Damaged spans.
-// ------------------------------------------------------------
+// --- Damaged spans. ----------------------------------------------------------
 
 int damaged_span_case(const std::string& dir) {
   const std::string path = dir + "/span.vrst";
@@ -300,8 +281,97 @@ int damaged_span_case(const std::string& dir) {
   return 0;
 }
 
-// --- A killed writer.
-// ----------------------------------------------------------
+// --- Footers. ----------------------------------------------------------------
+
+int footer_case(const std::string& dir) {
+  const std::string path = dir + "/footer.vrst";
+  // One track and one key record, built by hand; then what each check adds.
+  Bytes base =
+      vrst::chunk("VRST", vrst::session_fields(0, 1, 0), vrst::session_body(1));
+  const std::uint64_t record_at = base.size();
+  const Bytes payload = pattern(24, 1);
+  const Bytes record = vrst::record(0, 1, 5, 0, 0, payload);
+  base.insert(base.end(), record.begin(), record.end());
+  const std::uint64_t index_at = base.size();
+  const auto opened = [&](const std::vector<Bytes>& parts) {
+    Bytes file = base;
+    for (const Bytes& p : parts) file.insert(file.end(), p.begin(), p.end());
+    return vrst::write_bytes(path, file) ? open(path) : nullptr;
+  };
+
+  // An INDX naming `tracks` tracks and `keys` keys, its body sized for
+  // `sized_for` tracks and the one key; a TAIL naming `index_offset`.
+  const auto index = [&](std::uint32_t tracks, std::uint32_t sized_for,
+                         std::uint64_t keys) {
+    Bytes fields;
+    vrst::put(fields, tracks, 4);
+    vrst::put(fields, keys, 8);
+    vrst::put(fields, 0, 4);
+    Bytes body;
+    const std::uint64_t summary[] = {1, 1, payload.size(), 5, 5};
+    for (const std::uint64_t v : summary) vrst::put(body, v, 8);
+    body.resize(body.size() + 40 * std::size_t{sized_for - 1}, 0);
+    const std::uint64_t key[] = {record_at, 5, 0, 0};  // track 0, reserved
+    for (const std::uint64_t v : key) vrst::put(body, v, 8);
+    return vrst::chunk("INDX", fields, body);
+  };
+  const auto tail = [](std::uint64_t index_offset) {
+    Bytes fields;
+    vrst::put(fields, 0, 4);
+    vrst::put(fields, index_offset, 8);
+    vrst::put(fields, 0, 4);
+    return vrst::chunk("TAIL", fields, {});
+  };
+
+  // The footer the writer writes: finished.
+  const Bytes good = index(1, 1, 1);
+  auto r = opened({good, tail(index_at)});
+  CHECK(r != nullptr);
+  CHECK(r->recovery().finished && !r->recovery().footer_damaged);
+
+  // Footers that must not count: damaged, the record read all the same.
+  const Bytes unknown = vrst::chunk("ZZZZ", {}, pattern(8, 2));
+  const std::vector<std::vector<Bytes>> forged = {
+      {index(2, 1, 1), tail(index_at)},         // T not the session's
+      {index(1, 1, 2), tail(index_at)},         // K not the body's
+      {good, tail(index_at + 8)},               // the tail names another
+      {good, tail(0)},                          // offset
+      {good, unknown, tail(index_at)},          // a chunk between
+      {good, Bytes(16, 0xEE), tail(index_at)},  // damage between
+  };
+  for (const std::vector<Bytes>& parts : forged) {
+    r = opened(parts);
+    CHECK(r != nullptr);
+    CHECK(!r->recovery().finished && r->recovery().footer_damaged);
+    CHECK(r->recovery().torn_bytes == 0);
+    const vrst::ReadBack back = vrst::read_all(*r);
+    CHECK(back.ended && back.payloads == std::vector<Bytes>{payload});
+  }
+  // A record after the footer: the file does not end with it.
+  r = opened({good, tail(index_at), record});
+  CHECK(r != nullptr);
+  CHECK(!r->recovery().finished && !r->recovery().footer_damaged);
+  CHECK(vrst::read_all(*r).payloads == std::vector<Bytes>(2, payload));
+
+  // "TAIL" in a payload, where a footer's would start, at the end of an
+  // unfinished file, its record whole or cut short: no footer.
+  for (const std::size_t size : {std::size_t{64}, std::size_t{200}}) {
+    Bytes holder(size, 0);
+    std::copy_n("TAIL", 4, holder.begin() + 24);
+    const Bytes last = vrst::record(0, 0, 6, 1, 1, holder);
+    Bytes file = base;
+    file.insert(file.end(), last.begin(), last.begin() + 56 + 64);
+    CHECK(std::equal(file.end() - 40, file.end() - 36, "TAIL"));
+    CHECK(vrst::write_bytes(path, file));
+    r = open(path);
+    CHECK(r != nullptr);
+    CHECK(!r->recovery().finished && !r->recovery().footer_damaged);
+    CHECK(r->recovery().torn_bytes == (size == 64 ? 0u : 56u + 64u));
+  }
+  return 0;
+}
+
+// --- A killed writer. --------------------------------------------------------
 
 int killed_writer_case(const std::string& dir) {
   const std::string path = dir + "/killed.vrst";
@@ -343,8 +413,7 @@ int killed_writer_case(const std::string& dir) {
   return 0;
 }
 
-// --- A writer the file size limit stops.
-// ---------------------------------------
+// --- A writer the file size limit stops. -------------------------------------
 
 int file_size_limit_case(const std::string& dir) {
   const std::string path = dir + "/limited.vrst";
@@ -416,6 +485,7 @@ int main() {
   if (crc_mismatch_case(dir) != 0) return 1;
   if (truncation_case(dir) != 0) return 1;
   if (damaged_span_case(dir) != 0) return 1;
+  if (footer_case(dir) != 0) return 1;
   if (killed_writer_case(dir) != 0) return 1;
   if (file_size_limit_case(dir) != 0) return 1;
   std::puts("stream recovery: OK");

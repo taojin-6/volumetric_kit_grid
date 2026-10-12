@@ -64,7 +64,8 @@ class VR_STREAM_API StreamWriter {
   ///         one with a NUL, a session refused above (with nothing created),
   ///         or anything already at @p path, a symbolic link included (left
   ///         untouched); `Status::Code::NotFound` when the directory does not
-  ///         exist; otherwise `Status::Code::IoError` (the file removed).
+  ///         exist; otherwise `Status::Code::IoError` or
+  ///         `Status::Code::OutOfMemory`, with any file it made removed.
   static core::Result<std::unique_ptr<StreamWriter>> create(
       const std::string& path, const Session& session);
 
@@ -83,9 +84,11 @@ class VR_STREAM_API StreamWriter {
   ///              key's pts no lower than the track's last key's.
   /// @param data  The payload; may be null when @p size is 0.
   /// @param size  The payload's bytes.
-  /// @return OK once written; `Status::Code::InvalidArgument`, with nothing
-  ///         written, for a record breaking the rules above, a null @p data
-  ///         with a nonzero @p size, or a finished writer; or the sticky
+  /// @return OK once written; with nothing written,
+  ///         `Status::Code::InvalidArgument` for a record breaking the rules
+  ///         above, a null @p data with a nonzero @p size, or a finished
+  ///         writer, and `Status::Code::OutOfMemory` when a key's room in the
+  ///         footer index cannot be allocated; or the sticky
   ///         `Status::Code::IoError`.
   core::Status append(const RecordInfo& info, const std::uint8_t* data,
                       std::size_t size);

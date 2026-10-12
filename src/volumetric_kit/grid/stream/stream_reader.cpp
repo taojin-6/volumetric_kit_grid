@@ -96,8 +96,13 @@ core::Status StreamReader::scan() {
   bool after_index = false;
   std::uint64_t index_at = 0;
   detail::Chunk index;
+  // Where a footer's TAIL starts, and whether the scan looked for a chunk
+  // there; elsewhere those bytes are inside a chunk (a payload, perhaps).
+  const std::uint64_t tail_at = file_size_ - detail::kTailBytes;
+  bool tail_reached = false;
   std::uint64_t pos = begin_;
   while (pos < file_size_) {
+    tail_reached = tail_reached || pos == tail_at;
     detail::Chunk c;
     VKC_ASSIGN(const bool valid, detail::read_chunk(kApi, file, pos, &c));
     if (!valid) {
@@ -133,12 +138,11 @@ core::Status StreamReader::scan() {
   }
   recovery_.end = std::min(pos, file_size_);
   recovery_.torn_bytes = file_size_ - recovery_.end;
-  // A file whose last 40 bytes are tagged TAIL meant to end with a footer.
-  if (!recovery_.finished && file_size_ >= begin_ + detail::kTailBytes &&
-      file_size_ % 8 == 0) {
+  // A chunk tagged TAIL where the footer's starts, intact or not: the file
+  // was finished, and its footer is damaged.
+  if (!recovery_.finished && tail_reached) {
     std::uint8_t tag[4];
-    VKC_TRY(detail::read_at(kApi, path_, fd_.get(),
-                            file_size_ - detail::kTailBytes, tag, sizeof(tag)));
+    VKC_TRY(detail::read_at(kApi, path_, fd_.get(), tail_at, tag, sizeof(tag)));
     recovery_.footer_damaged = detail::load_le32(tag) == detail::kTailTag;
   }
   return {};
