@@ -66,60 +66,14 @@ core::Result<std::unique_ptr<StreamReader>> StreamReader::open(
     VKC_ASSIGN(core::UniqueFd fd, detail::open_file(kApi, path));
     VKC_ASSIGN(const std::uint64_t size,
                detail::regular_file_size(kApi, path, fd.get()));
-    const auto refuse = [&](const std::string& why) {
-      return core::Status::invalid_argument(std::string(kApi) + ": " + path +
-                                            " " + why);
-    };
-    if (size < detail::kSessionHeaderBytes) {
-      return refuse("holds " + std::to_string(size) +
-                    " bytes, fewer than a session header's 56");
-    }
-    std::uint8_t header[detail::kMaxHeaderBytes];
-    VKC_TRY(detail::read_at(kApi, path, fd.get(), 0, header,
-                            detail::kSessionHeaderBytes));
-    if (detail::load_le32(header) != detail::kSessionTag) {
-      return refuse("is not a .vrst file: it does not start with VRST");
-    }
-    const std::uint32_t h = detail::load_le32(header + 4);
-    if (h % 8 != 0 || h < detail::kSessionHeaderBytes ||
-        h > detail::kMaxHeaderBytes || h > size) {
-      return refuse("has a session header of " + std::to_string(h) +
-                    " bytes, out of range");
-    }
-    if (h > detail::kSessionHeaderBytes) {
-      VKC_TRY(detail::read_at(kApi, path, fd.get(), detail::kSessionHeaderBytes,
-                              header + detail::kSessionHeaderBytes,
-                              h - detail::kSessionHeaderBytes));
-    }
-    if (detail::crc32(header, h - 4) != detail::load_le32(header + h - 4)) {
-      return refuse("has a session header that fails its CRC");
-    }
     std::unique_ptr<StreamReader> reader(new StreamReader());
-    VKC_ASSIGN(
-        const std::uint32_t tracks,
-        detail::decode_session_header(kApi, path, header, &reader->session_));
-    const std::uint64_t body = detail::load_le64(header + 8);
-    if (body > kMaxSessionBytes) {
-      return refuse("has a session header body of " + std::to_string(body) +
-                    " bytes, above " + std::to_string(kMaxSessionBytes));
-    }
-    if (body > size - h) {
-      return refuse("ends inside its session header");
-    }
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(body));
-    VKC_TRY(
-        detail::read_at(kApi, path, fd.get(), h, bytes.data(), bytes.size()));
-    if (detail::crc32(bytes.data(), bytes.size()) !=
-        detail::load_le32(header + 16)) {
-      return refuse("has a session header body that fails its CRC");
-    }
-    VKC_TRY(detail::decode_session_body(kApi, path, bytes.data(), body, tracks,
-                                        &reader->session_));
+    const detail::FileView file{fd.get(), &path, size, 0};
+    VKC_ASSIGN(reader->begin_,
+               detail::read_session(kApi, file, &reader->session_));
     reader->fd_ = std::move(fd);
     reader->path_ = path;
     reader->options_ = options;
     reader->file_size_ = size;
-    reader->begin_ = h + body + detail::padding(body);
     // TODO(stream): open a finished file from its footer, reading no record,
     // and scan only a file without an intact one.
     VKC_TRY(reader->scan());

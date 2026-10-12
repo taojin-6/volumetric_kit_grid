@@ -146,22 +146,18 @@ core::Result<bool> read_chunk(std::string_view api, const FileView& file,
                               std::uint64_t offset, Chunk* out);
 
 // The first chunk after damage at `from`: the least `from + 8 k` (k >= 1)
-// below `end` where read_chunk finds a `RECD`, `INDX` or `TAIL`, searched a
-// MiB at a time; `end` when there is none.
+// below `end` where read_chunk finds a `RECD`, `INDX` or `TAIL`, searched in
+// blocks of 4 KiB doubling to 1 MiB; `end` when there is none.
 core::Result<std::uint64_t> resync(std::string_view api, const FileView& file,
                                    std::uint64_t from, std::uint64_t end);
 
-// The session header's fields (its first 56 bytes): Unsupported for a version
-// or flag this version does not know; otherwise its track count.
-core::Result<std::uint32_t> decode_session_header(std::string_view api,
-                                                  const std::string& path,
-                                                  const std::uint8_t* header,
-                                                  Session* session);
-
-// The session header's body, `size` bytes holding `tracks` tracks, into
-// `session`: InvalidArgument unless it parses exactly.
-core::Status decode_session_body(std::string_view api, const std::string& path,
-                                 const std::uint8_t* body, std::uint64_t size,
-                                 std::uint32_t tracks, Session* session);
+// Read the session header, the file's first chunk, into `session`: where the
+// chunk after it starts. InvalidArgument for a file shorter than a session
+// header or without its magic, and for a header out of range, failing a CRC
+// or not parsing exactly; Unsupported for a version or flag this version
+// does not know; IoError when a read fails. `file.tracks` is not read.
+core::Result<std::uint64_t> read_session(std::string_view api,
+                                         const FileView& file,
+                                         Session* session);
 
 }  // namespace volumetric_kit::recon::stream::detail

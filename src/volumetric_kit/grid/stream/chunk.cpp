@@ -63,8 +63,22 @@ constexpr std::size_t kIndexOffsetAt = 24;
 
 // How much a scan reads first of a chunk header: all of a record's.
 constexpr std::size_t kFirstRead = 64;
-// What a resync reads at a time.
+// What a resync reads first, doubling to kResyncBlock: damage that is one
+// small record's header costs one small read.
+constexpr std::size_t kResyncFirstBlock = std::size_t{4} << 10;
 constexpr std::size_t kResyncBlock = std::size_t{1} << 20;
+
+// Whether H = `h` is a header size, at least `least`, that fits in the
+// `available` bytes left in the file.
+bool header_fits(std::uint32_t h, std::uint32_t least,
+                 std::uint64_t available) {
+  return h % 8 == 0 && h >= least && h <= kMaxHeaderBytes && h <= available;
+}
+
+// Whether the `h` bytes of `header` pass their CRC, the last 4.
+bool header_crc_ok(const std::uint8_t* header, std::uint32_t h) {
+  return crc32(header, h - 4) == load_le32(header + h - 4);
+}
 
 // Fill the framing of a header of `header_bytes` whose own fields are in
 // place, then its CRC.
@@ -116,6 +130,48 @@ struct BodyReader {
                         : std::string();
   }
 };
+
+// The session header's body, `size` bytes holding `tracks` tracks, into
+// `session`: InvalidArgument unless it parses exactly.
+core::Status parse_session_body(std::string_view api, const std::string& path,
+                                const std::uint8_t* body, std::uint64_t size,
+                                std::uint32_t tracks, Session* session) {
+  if (tracks == 0) return bad_session(api, path, "has no tracks");
+  BodyReader in{body, size};
+  session->tracks.resize(tracks);
+  for (std::uint32_t i = 0; i < tracks; ++i) {
+    Track& track = session->tracks[i];
+    track.kind = static_cast<TrackKind>(in.u16());
+    track.clock = in.u16();
+    track.rate.num = in.u32();
+    track.rate.den = in.u32();
+    track.width = in.u32();
+    track.height = in.u32();
+    (void)in.u32();  // reserved
+    if (in.failed) break;
+    if (static_cast<std::uint16_t>(track.kind) == 0) {
+      return bad_session(api, path,
+                         "gives track " + std::to_string(i) + " kind 0");
+    }
+    if (track.rate.den == 0) {
+      return bad_session(
+          api, path, "gives track " + std::to_string(i) + " a rate_den of 0");
+    }
+  }
+  session->writer = in.string();
+  session->calibration = in.string();
+  for (Track& track : session->tracks) {
+    track.sensor = in.string();
+    track.params = in.string();
+  }
+  if (in.failed) return bad_session(api, path, "body ends inside a field");
+  if (in.pos != size) {
+    return bad_session(api, path,
+                       "body has " + std::to_string(size - in.pos) +
+                           " bytes after its last string");
+  }
+  return {};
+}
 
 void put_string(std::uint8_t*& at, const std::string& s) {
   store_le32(at, static_cast<std::uint32_t>(s.size()));
@@ -274,15 +330,12 @@ core::Result<bool> read_chunk(std::string_view api, const FileView& file,
       static_cast<std::size_t>(std::min<std::uint64_t>(kFirstRead, available));
   VKC_TRY(read_at(api, *file.path, file.fd, offset, header, first));
   const std::uint32_t h = load_le32(header + kHeaderSizeAt);
-  if (h % 8 != 0 || h < kMinHeaderBytes || h > kMaxHeaderBytes ||
-      h > available) {
-    return false;
-  }
+  if (!header_fits(h, kMinHeaderBytes, available)) return false;
   if (h > first) {
     VKC_TRY(read_at(api, *file.path, file.fd, offset + first, header + first,
                     h - first));
   }
-  if (crc32(header, h - 4) != load_le32(header + h - 4)) return false;
+  if (!header_crc_ok(header, h)) return false;
   Chunk c;
   c.tag = load_le32(header);
   c.header_bytes = h;
@@ -311,10 +364,13 @@ core::Result<bool> read_chunk(std::string_view api, const FileView& file,
 
 core::Result<std::uint64_t> resync(std::string_view api, const FileView& file,
                                    std::uint64_t from, std::uint64_t end) {
-  std::vector<std::uint8_t> block(kResyncBlock);
-  for (std::uint64_t at = from + 8; at < end; at += kResyncBlock) {
-    const auto n = static_cast<std::size_t>(
-        std::min<std::uint64_t>(kResyncBlock, file.size - at));
+  std::vector<std::uint8_t> block;
+  std::uint64_t at = from + 8;
+  for (std::size_t want = kResyncFirstBlock; at < end;
+       want = std::min(2 * want, kResyncBlock)) {
+    block.resize(static_cast<std::size_t>(
+        std::min<std::uint64_t>(want, file.size - at)));
+    const std::size_t n = block.size();
     VKC_TRY(read_at(api, *file.path, file.fd, at, block.data(), n));
     for (std::size_t i = 0; i + 4 <= n && at + i < end; i += 8) {
       const std::uint32_t tag = load_le32(block.data() + i);
@@ -323,14 +379,40 @@ core::Result<std::uint64_t> resync(std::string_view api, const FileView& file,
       VKC_ASSIGN(const bool valid, read_chunk(api, file, at + i, &c));
       if (valid) return at + i;
     }
+    at += want;
   }
   return end;
 }
 
-core::Result<std::uint32_t> decode_session_header(std::string_view api,
-                                                  const std::string& path,
-                                                  const std::uint8_t* header,
-                                                  Session* session) {
+core::Result<std::uint64_t> read_session(std::string_view api,
+                                         const FileView& file,
+                                         Session* session) {
+  const std::string& path = *file.path;
+  const auto refuse = [&](const std::string& why) {
+    return core::Status::invalid_argument(std::string(api) + ": " + path + " " +
+                                          why);
+  };
+  if (file.size < kSessionHeaderBytes) {
+    return refuse("holds " + std::to_string(file.size) +
+                  " bytes, fewer than a session header's 56");
+  }
+  std::uint8_t header[kMaxHeaderBytes];
+  VKC_TRY(read_at(api, path, file.fd, 0, header, kSessionHeaderBytes));
+  if (load_le32(header) != kSessionTag) {
+    return refuse("is not a .vrst file: it does not start with VRST");
+  }
+  const std::uint32_t h = load_le32(header + kHeaderSizeAt);
+  if (!header_fits(h, kSessionHeaderBytes, file.size)) {
+    return refuse("has a session header of " + std::to_string(h) +
+                  " bytes, out of range");
+  }
+  if (h > kSessionHeaderBytes) {
+    VKC_TRY(read_at(api, path, file.fd, kSessionHeaderBytes,
+                    header + kSessionHeaderBytes, h - kSessionHeaderBytes));
+  }
+  if (!header_crc_ok(header, h)) {
+    return refuse("has a session header that fails its CRC");
+  }
   const std::uint32_t version = load_le32(header + kVersionAt);
   if (version != kSessionVersion) {
     return core::Status::unsupported(std::string(api) + ": " + path +
@@ -343,49 +425,22 @@ core::Result<std::uint32_t> decode_session_header(std::string_view api,
         std::string(api) + ": " + path + " sets session flags " +
         std::to_string(flags) + ", which version 0 does not define");
   }
+  const std::uint64_t size = load_le64(header + kBodySizeAt);
+  if (size > kMaxSessionBytes) {
+    return refuse("has a session header body of " + std::to_string(size) +
+                  " bytes, above " + std::to_string(kMaxSessionBytes));
+  }
+  if (size > file.size - h) return refuse("ends inside its session header");
+  std::vector<std::uint8_t> body(static_cast<std::size_t>(size));
+  VKC_TRY(read_at(api, path, file.fd, h, body.data(), body.size()));
+  if (crc32(body.data(), body.size()) != load_le32(header + kBodyCrcAt)) {
+    return refuse("has a session header body that fails its CRC");
+  }
   std::memcpy(session->id.data(), header + kSessionIdAt, session->id.size());
   session->created_ns = load_le64(header + kCreatedAt);
-  return std::uint32_t{load_le16(header + kTrackCountAt)};
-}
-
-core::Status decode_session_body(std::string_view api, const std::string& path,
-                                 const std::uint8_t* body, std::uint64_t size,
-                                 std::uint32_t tracks, Session* session) {
-  if (tracks == 0) return bad_session(api, path, "has no tracks");
-  BodyReader in{body, size};
-  session->tracks.resize(tracks);
-  for (std::uint32_t i = 0; i < tracks; ++i) {
-    Track& track = session->tracks[i];
-    track.kind = static_cast<TrackKind>(in.u16());
-    track.clock = in.u16();
-    track.rate.num = in.u32();
-    track.rate.den = in.u32();
-    track.width = in.u32();
-    track.height = in.u32();
-    (void)in.u32();  // reserved
-    if (in.failed) break;
-    if (static_cast<std::uint16_t>(track.kind) == 0) {
-      return bad_session(api, path,
-                         "gives track " + std::to_string(i) + " kind 0");
-    }
-    if (track.rate.den == 0) {
-      return bad_session(
-          api, path, "gives track " + std::to_string(i) + " a rate_den of 0");
-    }
-  }
-  session->writer = in.string();
-  session->calibration = in.string();
-  for (Track& track : session->tracks) {
-    track.sensor = in.string();
-    track.params = in.string();
-  }
-  if (in.failed) return bad_session(api, path, "body ends inside a field");
-  if (in.pos != size) {
-    return bad_session(api, path,
-                       "body has " + std::to_string(size - in.pos) +
-                           " bytes after its last string");
-  }
-  return {};
+  VKC_TRY(parse_session_body(api, path, body.data(), size,
+                             load_le16(header + kTrackCountAt), session));
+  return h + size + padding(size);
 }
 
 }  // namespace volumetric_kit::recon::stream::detail
