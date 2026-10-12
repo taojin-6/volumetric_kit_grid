@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -30,6 +31,13 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+
+inline constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
+inline constexpr std::int32_t kMin32 = std::numeric_limits<std::int32_t>::min();
+
+inline bool same_bits(float a, float b) {
+  return std::memcmp(&a, &b, sizeof(a)) == 0;
+}
 
 struct Lcg {
   std::uint64_t state;
@@ -117,14 +125,12 @@ inline d::Frame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
 
 // Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
 inline d::Frame extreme_frame() {
-  constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
-  constexpr std::int32_t kMin = std::numeric_limits<std::int32_t>::min();
   d::Frame f = make_frame(0, 4, 1);
   f.coords = {
-      {kMin, kMin, kMin}, {kMax, kMin, kMin},  // dx = 2^32 - 1
-      {kMin, kMax, kMin},                      // dy, dx back
-      {0, 0, kMax},                            // dz
-      {1, 0, kMax},       {kMax, kMax, kMax},
+      {kMin32, kMin32, kMin32}, {kMax32, kMin32, kMin32},  // dx = 2^32 - 1
+      {kMin32, kMax32, kMin32},                            // dy, dx back
+      {0, 0, kMax32},                                      // dz
+      {1, 0, kMax32},           {kMax32, kMax32, kMax32},
   };
   f.blocks.masks.assign(f.coords.size() * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(f.coords.size() * 4, 0);
@@ -264,6 +270,41 @@ inline void set_first_x_low_bits(std::vector<std::uint8_t>& payload,
   payload[at + 2] = static_cast<std::uint8_t>(low12 & 0xFF);
   payload[at + 3] = static_cast<std::uint8_t>((payload[at + 3] & 0xF0) |
                                               ((low12 >> 8) & 0x0F));
+}
+
+// A SEGMENTS body with its @p count lengths from @p first replaced by their
+// sum: the same PAYLOAD read as fewer segments.
+inline std::vector<std::uint8_t> join_lengths(
+    const std::vector<std::uint8_t>& segments, std::size_t first,
+    std::size_t count) {
+  std::uint32_t sum = 0;
+  for (std::size_t i = first; i < first + count; ++i) {
+    sum += get_u32(segments, 4 * i);
+  }
+  std::vector<std::uint8_t> out(
+      segments.begin(), segments.begin() + std::ptrdiff_t(4 * first + 4));
+  put_u32(out, 4 * first, sum);
+  out.insert(out.end(), segments.begin() + std::ptrdiff_t(4 * (first + count)),
+             segments.end());
+  return out;
+}
+
+// What assemble_frame lays a parsed frame out from: every field it reads, so
+// it writes the frame's bytes again.
+inline d::CodedFrame coded_frame(const d::ParsedFrame& p) {
+  d::CodedFrame c;
+  c.voxel_size = p.header.voxel_size;
+  c.trunc_dist = p.header.trunc_dist;
+  c.params = p.header.params;
+  c.block_count = p.header.block_count;
+  c.segment_size = p.header.segment_size;
+  c.reference = p.reference;
+  c.update_size = p.update_size;
+  c.new_count = p.new_count;
+  c.tables = p.tables;
+  c.segment_lengths = p.segment_lengths;
+  c.payload.assign(p.payload, p.payload + p.payload_size);
+  return c;
 }
 
 // --- P-frames. --------------------------------------------------------------
@@ -536,7 +577,6 @@ struct RefusalBase {
 };
 
 inline RefusalBase refusal_base() {
-  constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
   RefusalBase base;
   base.reference = make_frame(40, 8, 77);
   const std::vector<std::uint8_t> reference_bytes =
@@ -547,9 +587,14 @@ inline RefusalBase refusal_base() {
     blocks.emplace(target.coords[i], payload_at(target.blocks, i));
   }
   const d::Frame extra = make_frame(8, 8, 79);
-  const vr::Vec3i added[] = {
-      {500, 0, 0}, {501, 0, 0}, {502, 0, 0},           {503, 0, 0},
-      {504, 0, 0}, {505, 0, 0}, {0x7FFFF000, 0, kMax}, {0x7FFFF001, 0, kMax}};
+  const vr::Vec3i added[] = {{500, 0, 0},
+                             {501, 0, 0},
+                             {502, 0, 0},
+                             {503, 0, 0},
+                             {504, 0, 0},
+                             {505, 0, 0},
+                             {0x7FFFF000, 0, kMax32},
+                             {0x7FFFF001, 0, kMax32}};
   for (std::size_t i = 0; i < 8; ++i) {
     blocks.emplace(added[i], payload_at(extra.blocks, i));
   }
@@ -574,12 +619,14 @@ struct InterRefusal {
   const char* what;
   int row;  // in bitstream.hpp's refusal order
   vkc::Status::Code code;
+  std::string says;  // a part of the message only the check under test makes
   InterCase edited;
 };
 
 // The refusal of each check a P-frame reader makes, each one edit from
 // refusal_base()'s frame, in the order the reader makes them; merge_frame's,
-// which needs the reference's coordinates, is the test's.
+// which needs the reference's coordinates, is the test's. An edit that a
+// later check would refuse too is matched by its message.
 inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   using C = vkc::Status::Code;
   const InterCase& good = base.good;
@@ -591,77 +638,114 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   const std::uint32_t u = get_u32(s[0].body, 12);
   const std::uint32_t a = get_u32(s[0].body, 16);
   const std::uint64_t updates = d::frame_segment_count(m, u);
+  const std::uint64_t news = d::frame_segment_count(a, get_u32(b, 36));
+  const std::string mode_table_name =
+      "table " +
+      std::to_string(
+          d::frame_model_count(d::FrameType::kInter, get_u32(b, 20)) - 1);
   // Where segment i's stream starts in PAYLOAD.
   auto stream_at = [&](std::uint64_t i) {
     std::size_t at = 0;
     for (std::uint64_t j = 0; j < i; ++j) at += get_u32(s[2].body, 4 * j);
     return at;
   };
+  auto segment = [](std::uint64_t i, const char* then) {
+    return "segment " + std::to_string(i) + then;
+  };
   std::vector<InterRefusal> out;
-  auto bytes = [&](const char* what, int row, C code,
+  auto bytes = [&](const char* what, int row, C code, std::string says,
                    std::vector<std::uint8_t> edited) {
     InterCase c = good;
     c.bytes = std::move(edited);
-    out.push_back({what, row, code, std::move(c)});
+    out.push_back({what, row, code, std::move(says), std::move(c)});
   };
-  auto sections = [&](const char* what, int row, C code,
+  auto sections = [&](const char* what, int row, C code, std::string says,
                       const std::vector<Section>& edited) {
-    bytes(what, row, code, assemble(b, edited));
+    bytes(what, row, code, std::move(says), assemble(b, edited));
   };
-  auto held = [&](const char* what, int row, C code, InterCase c) {
-    out.push_back({what, row, code, std::move(c)});
+  auto held = [&](const char* what, int row, C code, std::string says,
+                  InterCase c) {
+    out.push_back({what, row, code, std::move(says), std::move(c)});
   };
   std::vector<std::uint8_t> e;
   std::vector<Section> t;
 
   e = b;
   e[6] = 2;
-  bytes("frame type 2", 1, C::Unsupported, e);
+  bytes("frame type 2", 1, C::Unsupported, "frame type 2", e);
   e = b;
   e[4] = 4;
-  bytes("version 4", 1, C::Unsupported, e);
+  bytes("version 4", 1, C::Unsupported, "version 4", e);
   e = b;
   e[7] = 1;
-  bytes("reserved byte", 1, C::InvalidArgument, e);
+  bytes("reserved byte", 1, C::InvalidArgument, "reserved header byte", e);
 
   sections("unknown required section", 2, C::Unsupported,
+           "unknown required section 9",
            {s[0], s[1], s[2], s[3], Section{9, d::kSectionRequired, {1}}});
   t = s;
   t[0].flags |= 2;
-  sections("REFERENCE with an undefined flag", 2, C::Unsupported, t);
+  sections("REFERENCE with an undefined flag", 2, C::Unsupported,
+           "section 4 sets flags 3", t);
 
-  sections("REFERENCE twice", 3, C::InvalidArgument,
+  sections("REFERENCE twice", 3, C::InvalidArgument, "section 4 appears twice",
            {s[0], s[0], s[1], s[2], s[3]});
-  sections("REFERENCE missing", 3, C::InvalidArgument, {s[1], s[2], s[3]});
+  sections("REFERENCE missing", 3, C::InvalidArgument,
+           "REFERENCE section is missing", {s[1], s[2], s[3]});
   e = b;
   e[6] = 0;
-  bytes("REFERENCE on an intra frame", 3, C::InvalidArgument, e);
+  bytes("REFERENCE on an intra frame", 3, C::InvalidArgument,
+        "an intra frame has a REFERENCE section", e);
   e = b;
   e.push_back(0);
-  bytes("a trailing byte", 3, C::InvalidArgument, e);
+  bytes("a trailing byte", 3, C::InvalidArgument, "bytes after the last", e);
 
   t = s;
   t[0].body.pop_back();
-  sections("REFERENCE of 19 bytes", 4, C::InvalidArgument, t);
+  sections("REFERENCE of 19 bytes", 4, C::InvalidArgument, "is not 20 bytes",
+           t);
   t = s;
   t[0].body.push_back(0);
-  sections("REFERENCE of 21 bytes", 4, C::InvalidArgument, t);
+  sections("REFERENCE of 21 bytes", 4, C::InvalidArgument, "is not 20 bytes",
+           t);
   t = s;
   put_u32(t[0].body, 12, 0);
-  sections("update size 0", 4, C::InvalidArgument, t);
-  t = s;
-  put_u32(t[0].body, 16, n + 1);
-  sections("more new blocks than blocks", 4, C::InvalidArgument, t);
+  sections("update size 0", 4, C::InvalidArgument, "update size 0", t);
+  e = b;
+  put_u32(e, 32, a - 1);
+  bytes("fewer blocks than new blocks", 4, C::InvalidArgument,
+        "not between its", e);
   e = b;
   put_u32(e, 32, m + a + 1);
-  bytes("more blocks than survivors and new blocks", 4, C::InvalidArgument, e);
+  bytes("more blocks than survivors and new blocks", 4, C::InvalidArgument,
+        "not between its", e);
+  // The update segments as one, so SEGMENTS still agrees.
   t = s;
   put_u32(t[0].body, 8, 0xFFFFFFFFu);
-  sections("M + A past 2^32 - 1", 4, C::InvalidArgument, t);
+  put_u32(t[0].body, 12, 0xFFFFFFFFu);
+  t[2].body = join_lengths(s[2].body, 0, updates);
+  sections("M + A past 2^32 - 1", 4, C::InvalidArgument, "2^32 - 1 entries", t);
+  // What A <= N bounds: a frame of one block that names 2^22 new ones in one
+  // segment, all else in agreement, would have the reader hold 2^22 + M
+  // entries against a caller's room for one.
+  e = b;
+  put_u32(e, 32, 1);
+  put_u32(e, 36, 0xFFFFFFFFu);
+  t = sections_of(e);
+  put_u32(t[0].body, 16, 1u << 22);
+  t[2].body = join_lengths(s[2].body, updates, news);
+  {
+    InterCase c = good;
+    c.bytes = assemble(e, t);
+    c.max_blocks = 1;
+    held("2^22 new blocks in a frame of 1", 4, C::InvalidArgument,
+         "not between its", c);
+  }
 
   t = s;
   t[1].body.pop_back();
-  sections("mode table cut short", 5, C::InvalidArgument, t);
+  sections("mode table cut short", 5, C::InvalidArgument,
+           mode_table_name + " is malformed", t);
   // The mode table is the last: its bytes are whatever follows the others.
   std::size_t mode_table = 0;
   {
@@ -690,89 +774,107 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
     return r;
   };
   sections("mode table not summing to 4096", 5, C::InvalidArgument,
+           mode_table_name + " does not sum to 4096",
            with_mode_table({2, 0, 0x80, 0x10, 0, 0x80, 0x0F}));
   sections("mode past the alphabet", 5, C::InvalidArgument,
+           mode_table_name + " is malformed",
            with_mode_table({1, 5, 0x80, 0x20}));
   // keep and motion at 2048 each.
-  sections("motion", 6, C::Unsupported,
+  sections("motion", 6, C::Unsupported, "uses the motion mode",
            with_mode_table({2, 0, 0x80, 0x10, 3, 0x80, 0x10}));
   sections("motion, then appended table bytes", 6, C::Unsupported,
+           "uses the motion mode",
            with_mode_table({2, 0, 0x80, 0x10, 3, 0x80, 0x10, 7, 7, 7}));
 
   t = s;
   t[2].body.resize(t[2].body.size() - 4);
-  sections("one segment length fewer", 7, C::InvalidArgument, t);
+  sections("one segment length fewer", 7, C::InvalidArgument,
+           "one length per segment", t);
   t = s;
   put_u32(t[2].body, 0, 3);
-  sections("an odd segment length", 7, C::InvalidArgument, t);
+  sections("an odd segment length", 7, C::InvalidArgument,
+           segment(0, " has an impossible length"), t);
   t = s;
   put_u32(t[2].body, 0, get_u32(t[2].body, 0) + 2);
-  sections("lengths not summing to PAYLOAD", 7, C::InvalidArgument, t);
+  sections("lengths not summing to PAYLOAD", 7, C::InvalidArgument,
+           "do not add up to the PAYLOAD", t);
 
   InterCase c = good;
   c.held = false;
-  held("no reference held", 8, C::NotFound, c);
+  held("no reference held", 8, C::NotFound, "no reference frame is held", c);
   c = good;
   c.reference.hash ^= 1;
-  held("another hash", 8, C::NotFound, c);
+  held("another hash", 8, C::NotFound, "not the one held", c);
   c = good;
   c.reference.header.block_count += 1;
-  held("another held M", 8, C::NotFound, c);
+  held("another held M", 8, C::NotFound, "not the one held", c);
   t = s;
   put_u32(t[0].body, 8, m + 1);  // the same update segments: 41 / 7
-  sections("another M in the frame", 8, C::NotFound, t);
+  sections("another M in the frame", 8, C::NotFound, "not the one held", t);
 
+  const std::string differs = " is not its reference's";
   c = good;
   c.reference.header.voxel_size *= 2.0f;
-  held("held voxel_size", 9, C::InvalidArgument, c);
+  held("held voxel_size", 9, C::InvalidArgument, "voxel_size" + differs, c);
   c = good;
   c.reference.header.trunc_dist *= 2.0f;
-  held("held trunc_dist", 9, C::InvalidArgument, c);
+  held("held trunc_dist", 9, C::InvalidArgument, "trunc_dist" + differs, c);
   c = good;
   c.reference.header.params.coefficient_count += 1;
-  held("held K", 9, C::InvalidArgument, c);
+  held("held K", 9, C::InvalidArgument, "coefficient count" + differs, c);
   c = good;
   c.reference.header.params.quantization_scale *= 2.0f;
-  held("held scale", 9, C::InvalidArgument, c);
+  held("held scale", 9, C::InvalidArgument, "quantization scale" + differs, c);
   c = good;
   c.reference.header.params.quantization_weights[0] *= 2.0f;
-  held("held DC weight", 9, C::InvalidArgument, c);
+  held("held DC weight", 9, C::InvalidArgument,
+       "kept quantization weights" + differs, c);
   e = b;
   put_f32(e, 8, 0.006f);
-  bytes("the frame's voxel_size", 9, C::InvalidArgument, e);
+  bytes("the frame's voxel_size", 9, C::InvalidArgument, "voxel_size" + differs,
+        e);
   e = b;
   put_f32(e, 24, 0.3f);
-  bytes("the frame's scale", 9, C::InvalidArgument, e);
+  bytes("the frame's scale", 9, C::InvalidArgument,
+        "quantization scale" + differs, e);
   e = b;
   put_f32(e, header - 4, 1.5f);
-  bytes("the frame's last kept weight", 9, C::InvalidArgument, e);
+  bytes("the frame's last kept weight", 9, C::InvalidArgument,
+        "kept quantization weights" + differs, e);
 
   c = good;
   c.max_blocks = n - 1;
-  held("more blocks than the caller holds", 10, C::OutOfMemory, c);
+  held("more blocks than the caller holds", 10, C::OutOfMemory,
+       "the caller can hold", c);
 
   t = s;
   t[3].body[0] = 0;
   t[3].body[1] = 0;
-  sections("an update segment's state below L", 11, C::InvalidArgument, t);
+  sections("an update segment's state below L", 11, C::InvalidArgument,
+           segment(0, " is corrupt"), t);
   t = s;
   t[3].body[stream_at(updates)] = 0;
   t[3].body[stream_at(updates) + 1] = 0;
-  sections("a new segment's state below L", 11, C::InvalidArgument, t);
+  sections("a new segment's state below L", 11, C::InvalidArgument,
+           segment(updates, " is corrupt"), t);
   t = s;
   set_first_x_low_bits(t[3].body, stream_at(updates + 1), 502);
   sections("a new segment starting on the one before's end", 11,
-           C::InvalidArgument, t);
+           C::InvalidArgument,
+           segment(updates + 1, " does not start after the one before"), t);
   t = s;
   set_first_x_low_bits(t[3].body, stream_at(updates + 2), 0xFFF);
-  sections("a new segment stepping out of int32", 11, C::InvalidArgument, t);
+  sections("a new segment stepping out of int32", 11, C::InvalidArgument,
+           segment(updates + 2, " steps a coordinate outside int32"), t);
 
   e = b;
   put_u32(e, 32, n + 1);
-  bytes("one block more than survive", 12, C::InvalidArgument, e);
+  bytes("one block more than survive", 12, C::InvalidArgument,
+        "are new, but the frame holds", e);
   e = b;
   put_u32(e, 32, n - 1);
-  bytes("one block fewer than survive", 12, C::InvalidArgument, e);
+  bytes("one block fewer than survive", 12, C::InvalidArgument,
+        "are new, but the frame holds", e);
   return out;
 }
 

@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <limits>
 #include <set>
 #include <string>
@@ -34,19 +33,17 @@ namespace d = volumetric_kit::recon::codec::detail;
 
 namespace {
 
-constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
-
 using codec_frames::assemble;
 using codec_frames::get_u32;
+using codec_frames::kMax32;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
 using codec_frames::put_f32;
 using codec_frames::put_u32;
+using codec_frames::same_bits;
 using codec_frames::Section;
 using codec_frames::sections_of;
 using codec_frames::set_first_x_low_bits;
-
-bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 
 // A frame carries the weights of the K kept bases only.
 bool same_kept_weights(const codec::CodecParams& a,
@@ -275,13 +272,27 @@ int assemble_refusals_case() {
   f = good;
   f.payload.pop_back();
   CHECK(refused(f));
-  // Reference fields on an intra frame.
+  // Reference fields on an intra frame, each named. new_count is REFERENCE's
+  // A, which an intra frame lacks: 0, as parse_frame gives it.
+  auto names = [](const d::CodedFrame& c, const char* field) {
+    const vkc::Result<std::vector<std::uint8_t>> r =
+        d::assemble_frame(d::FrameType::kIntra, c);
+    return !r.ok() &&
+           r.status().message().find(std::string("its ") + field +
+                                     " is not 0") != std::string::npos;
+  };
   f = good;
   f.reference.hash = 1;
-  CHECK(refused(f));
+  CHECK(names(f, "reference hash"));
+  f = good;
+  f.reference.header.block_count = 1;
+  CHECK(names(f, "reference block count"));
   f = good;
   f.update_size = 64;
-  CHECK(refused(f));
+  CHECK(names(f, "update_size"));
+  f = good;
+  f.new_count = f.block_count;
+  CHECK(names(f, "new_count"));
   return 0;
 }
 
@@ -381,15 +392,8 @@ int frame_type_case() {
       d::write_frame(make_frame(100, 16, 5)).value();
   const d::ParsedFrame p =
       d::parse_frame(good.data(), good.size(), 1u << 20, nullptr).value();
-  d::CodedFrame coded;
-  coded.voxel_size = p.header.voxel_size;
-  coded.trunc_dist = p.header.trunc_dist;
-  coded.params = p.header.params;
-  coded.block_count = p.header.block_count;
-  coded.segment_size = p.header.segment_size;
-  coded.tables = p.tables;
-  coded.segment_lengths = p.segment_lengths;
-  coded.payload.assign(p.payload, p.payload + p.payload_size);
+  CHECK(p.update_size == 0 && p.new_count == 0);  // no REFERENCE
+  const d::CodedFrame coded = codec_frames::coded_frame(p);
   CHECK(good[6] == 0);
   CHECK(d::assemble_frame(d::FrameType::kIntra, coded).value() == good);
   CHECK(read(good).value().type == d::FrameType::kIntra);

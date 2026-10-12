@@ -534,9 +534,17 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
     return bad_write("segment_size must be at least 1");
   }
   const std::uint64_t m = frame.reference.header.block_count;
-  if (!inter && (frame.reference.hash != 0 || m != 0 ||
-                 frame.update_size != 0 || frame.new_count != 0)) {
-    return bad_write("an intra frame has no reference");
+  if (!inter) {
+    const char* set = frame.reference.hash != 0 ? "reference hash"
+                      : m != 0                  ? "reference block count"
+                      : frame.update_size != 0  ? "update_size"
+                      : frame.new_count != 0    ? "new_count"
+                                                : nullptr;
+    if (set != nullptr) {
+      return bad_write(
+          std::string("an intra frame has no reference, but its ") + set +
+          " is not 0");
+    }
   }
   if (inter && frame.update_size == 0) {
     return bad_write("update_size must be at least 1");
@@ -857,8 +865,8 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
     }
     frame.reference = *reference;
     frame.update_size = u_size;
+    frame.new_count = a;
   }
-  frame.new_count = a;
   // A block count that is not consistent with the segment table is a corrupt
   // frame, and one that is but exceeds the caller's room is a sound frame too
   // big to hold -- which the caller answers by growing, not by dropping the

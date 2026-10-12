@@ -421,8 +421,8 @@ struct ParsedFrame {
   /// `reference.header.block_count`); none for an intra frame, whose M is
   /// 0.
   FrameReference reference;
-  /// A P-frame's reference entries per update segment (0 for an intra
-  /// frame), and its new blocks (an intra frame's every block).
+  /// A P-frame's reference entries per update segment, and its new blocks;
+  /// 0 for an intra frame, as in @ref CodedFrame.
   std::uint32_t update_size = 0;
   std::uint32_t new_count = 0;
   /// @ref frame_model_count tables, in TABLES order, without the host

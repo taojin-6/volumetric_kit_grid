@@ -6,9 +6,10 @@
 // written byte for byte; round trips of every mode across K, update and
 // segment sizes and the empty cases; I -> P -> P chains on real hashes against
 // an independent oracle (codec_frames.hpp); merge_by_coord against std::set's
-// algorithms; every reader refusal, each one edit from a valid P-frame, in its
-// order and with its code; every writer refusal; and truncation and random
-// corruption, which must fail cleanly and never read out of bounds.
+// algorithms; every reader refusal, each one edit from a valid P-frame, with
+// its code and message, in the order of the reader's stages; every writer
+// refusal, with its code and message; and truncation and random corruption,
+// which must fail cleanly and never read out of bounds.
 // CPU-only, so these always run.
 
 #include <algorithm>
@@ -38,21 +39,19 @@ namespace {
 
 using codec_frames::get_u32;
 using codec_frames::inter_frame;
+using codec_frames::kMax32;
+using codec_frames::kMin32;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
 using codec_frames::put_u32;
 using codec_frames::reference_of;
 using codec_frames::resolve;
+using codec_frames::same_bits;
 using codec_frames::successor;
 using codec_frames::ZyxLess;
 using C = vkc::Status::Code;
 using Bytes = std::vector<std::uint8_t>;
 using Modes = std::map<std::size_t, d::BlockMode>;
-
-constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
-constexpr std::int32_t kMin32 = std::numeric_limits<std::int32_t>::min();
-
-bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 
 // The same content, parameters included: what an intra frame holds.
 bool same_content(const d::Frame& a, const d::Frame& b) {
@@ -87,6 +86,19 @@ bool same_merge(const d::MergedFrame& a, const d::MergedFrame& b) {
     }
   }
   return true;
+}
+
+// A refusal with @p code whose message holds @p says: the check under test,
+// not a later one with the same code. Says what it got otherwise.
+bool refusal_is(const vkc::Status& s, C code, const std::string& says,
+                const char* what) {
+  if (!s.ok() && s.domain() == code &&
+      s.message().find(says) != std::string::npos) {
+    return true;
+  }
+  std::fprintf(stderr, "%s: %s\n", what,
+               s.ok() ? "not refused" : s.message().c_str());
+  return false;
 }
 
 d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
@@ -586,8 +598,8 @@ int merge_by_coord_case() {
 // --- Refusals. --------------------------------------------------------------
 
 // Every check a P-frame reader makes, each refusing one edit of a valid
-// frame with its code; and merge_frame's, a new block on a reference block,
-// whatever that block's mode.
+// frame with its code and message; and merge_frame's, a new block on a
+// reference block, whatever that block's mode.
 int refusals_case() {
   const codec_frames::RefusalBase base = codec_frames::refusal_base();
   const codec_frames::InterCase& good = base.good;
@@ -605,19 +617,17 @@ int refusals_case() {
   CHECK(std::count(read.value().modes.begin(), read.value().modes.end(),
                    d::BlockMode::kSkip) > 0);
 
+  auto read_status = [](const codec_frames::InterCase& c) {
+    return d::read_frame(c.bytes.data(), c.bytes.size(), c.max_blocks,
+                         c.held_reference())
+        .status();
+  };
   std::set<int> rows;
   int last_row = 0;
   for (const codec_frames::InterRefusal& r :
        codec_frames::inter_refusals(base)) {
     const codec_frames::InterCase& c = r.edited;
-    const vkc::Result<d::Frame> got = d::read_frame(
-        c.bytes.data(), c.bytes.size(), c.max_blocks, c.held_reference());
-    const bool as_expected = !got.ok() && got.status().domain() == r.code;
-    if (!as_expected) {
-      std::fprintf(stderr, "row %d, %s: %s\n", r.row, r.what,
-                   got.ok() ? "read" : got.status().message().c_str());
-    }
-    CHECK(as_expected);
+    CHECK(refusal_is(read_status(c), r.code, r.says, r.what));
     CHECK(r.row >= last_row);
     last_row = r.row;
     rows.insert(r.row);
@@ -640,15 +650,24 @@ int refusals_case() {
       code = C::OutOfMemory;
     }
     if (r.row != 8) {
-      const vkc::Result<d::Frame> both =
-          d::read_frame(later.bytes.data(), later.bytes.size(),
-                        later.max_blocks, later.held_reference());
-      if (both.ok() || both.status().domain() != code) {
+      const vkc::Status both = read_status(later);
+      if (both.ok() || both.domain() != code) {
         std::fprintf(stderr, "row %d, %s, with a later refusal: %s\n", r.row,
-                     r.what,
-                     both.ok() ? "read" : both.status().message().c_str());
+                     r.what, both.ok() ? "read" : both.message().c_str());
         return 1;
       }
+    }
+    // REFERENCE's body before TABLES: a malformed table changes nothing.
+    if (r.row == 4) {
+      std::vector<codec_frames::Section> t = codec_frames::sections_of(c.bytes);
+      for (codec_frames::Section& section : t) {
+        if (section.id == std::uint16_t(d::SectionId::kTables)) {
+          section.body = {0xFF};
+        }
+      }
+      later = c;
+      later.bytes = codec_frames::assemble(c.bytes, t);
+      CHECK(refusal_is(read_status(later), r.code, r.says, r.what));
     }
   }
   CHECK(rows.size() == 12 && *rows.begin() == 1 && *rows.rbegin() == 12);
@@ -704,17 +723,17 @@ int refusals_case() {
   return 0;
 }
 
-// Every refusal write_frame and assemble_frame make of a P-frame.
+// Every refusal write_frame and assemble_frame make of a P-frame, each with
+// its code and message.
 int writer_refusals_case() {
   const d::Frame reference = make_frame(30, 8, 51);
   const d::FrameReference id = reference_of(d::write_frame(reference).value());
   const d::Frame target = successor(reference, 52, 150, 400, 5);
   const d::Frame good = inter_frame(id, reference, target);
   const Bytes bytes = d::write_frame(good).value();
-  auto refused = [](const d::Frame& f, C code,
+  auto refused = [](const d::Frame& f, C code, const std::string& says,
                     const d::FrameWriteOptions& o = {}) {
-    const vkc::Result<Bytes> r = d::write_frame(f, o);
-    return !r.ok() && r.status().domain() == code;
+    return refusal_is(d::write_frame(f, o).status(), code, says, "write_frame");
   };
   auto first = [&](d::BlockMode mode) {
     return static_cast<std::size_t>(
@@ -727,54 +746,58 @@ int writer_refusals_case() {
   CHECK(keep < good.modes.size() && skip < good.modes.size() &&
         removed < good.modes.size());
   const std::uint32_t k = 8;
+  const std::string range = "outside +-32767";
   d::Frame f;
 
   f = good;
   f.type = static_cast<d::FrameType>(2);
-  CHECK(refused(f, C::Unsupported));
+  CHECK(refused(f, C::Unsupported, "frame type 2"));
   f = good;
   f.modes[keep] = d::BlockMode::kMotion;
-  CHECK(refused(f, C::Unsupported));
+  CHECK(refused(f, C::Unsupported, "the motion mode"));
   f = good;
   f.modes[keep] = static_cast<d::BlockMode>(5);
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "mode 5 is not a mode"));
   f = good;
   f.modes.pop_back();
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "modes, one per reference block"));
   f = good;
   f.modes.push_back(d::BlockMode::kSkip);
-  CHECK(refused(f, C::InvalidArgument));
-  CHECK(refused(good, C::InvalidArgument, sizes(64, 0)));
-  CHECK(refused(good, C::InvalidArgument, sizes(0, 64)));
+  CHECK(refused(f, C::InvalidArgument, "modes, one per reference block"));
+  CHECK(refused(good, C::InvalidArgument, "update_size must be", sizes(64, 0)));
+  CHECK(
+      refused(good, C::InvalidArgument, "segment_size must be", sizes(0, 64)));
   f = good;
   f.blocks.coefficients.pop_back();
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "coefficients, got"));
   f = good;
   f.blocks.masks.push_back(0);
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "mask words, got"));
   f = good;
   std::swap(f.coords[0], f.coords[1]);
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "not strictly increasing"));
   f = good;
   f.coords[1] = f.coords[0];
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "not strictly increasing"));
   // A written value outside +-32767: a keep residual of -32768 is refused,
   // while a skipped or removed entry's ignored payload is not written.
   f = good;
   f.blocks.coefficients[keep * k] = std::numeric_limits<std::int16_t>::min();
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, range));
   f = good;
   f.blocks.coefficients[skip * k] = std::numeric_limits<std::int16_t>::min();
   f.blocks.masks[removed * codec::kMaskWordsPerBlock] = 7;
   CHECK(d::write_frame(f).value() == bytes);
   f = good;
   f.blocks.coefficients.back() = std::numeric_limits<std::int16_t>::min();
-  CHECK(refused(f, C::InvalidArgument));  // a new block's
-  // M + A past 2^32 - 1, refused before the mode count would be.
+  CHECK(refused(f, C::InvalidArgument, range));  // a new block's
   f = good;
   f.reference.header.block_count = 0xFFFFFFFFu;
-  CHECK(refused(f, C::InvalidArgument));
+  CHECK(refused(f, C::InvalidArgument, "2^32 - 1 entries"));
   // Coding parameters other than the reference's.
+  const char* const parameters[] = {"voxel_size", "trunc_dist",
+                                    "coefficient count", "quantization scale",
+                                    "kept quantization weights"};
   for (int which = 0; which < 5; ++which) {
     f = good;
     d::FrameHeader& h = f.reference.header;
@@ -783,7 +806,8 @@ int writer_refusals_case() {
     if (which == 2) h.params.coefficient_count = 9;
     if (which == 3) h.params.quantization_scale *= 2.0f;
     if (which == 4) h.params.quantization_weights[0] *= 2.0f;
-    CHECK(refused(f, C::InvalidArgument));
+    CHECK(refused(f, C::InvalidArgument,
+                  std::string(parameters[which]) + " is not its reference's"));
   }
   // A weight beyond K is not a coding parameter.
   f = good;
@@ -791,49 +815,48 @@ int writer_refusals_case() {
   CHECK(d::write_frame(f).value() == bytes);
 
   // assemble_frame, from the frame's own parsed sections.
-  const d::ParsedFrame parsed =
-      d::parse_frame(bytes.data(), bytes.size(), 1u << 20, &id).value();
-  d::CodedFrame coded;
-  coded.voxel_size = parsed.header.voxel_size;
-  coded.trunc_dist = parsed.header.trunc_dist;
-  coded.params = parsed.header.params;
-  coded.block_count = parsed.header.block_count;
-  coded.segment_size = parsed.header.segment_size;
-  coded.reference = parsed.reference;
-  coded.update_size = parsed.update_size;
-  coded.new_count = parsed.new_count;
-  coded.tables = parsed.tables;
-  coded.segment_lengths = parsed.segment_lengths;
-  coded.payload.assign(parsed.payload, parsed.payload + parsed.payload_size);
+  const d::CodedFrame coded = codec_frames::coded_frame(
+      d::parse_frame(bytes.data(), bytes.size(), 1u << 20, &id).value());
   CHECK(d::assemble_frame(d::FrameType::kInter, coded).value() == bytes);
-  auto assemble_refused = [](d::FrameType type, const d::CodedFrame& c,
-                             C code) {
-    const vkc::Result<Bytes> r = d::assemble_frame(type, c);
-    return !r.ok() && r.status().domain() == code;
+  auto assemble_refused = [](d::FrameType type, const d::CodedFrame& c, C code,
+                             const std::string& says) {
+    return refusal_is(d::assemble_frame(type, c).status(), code, says,
+                      "assemble_frame");
   };
-  CHECK(assemble_refused(static_cast<d::FrameType>(2), coded, C::Unsupported));
-  CHECK(assemble_refused(d::FrameType::kIntra, coded, C::InvalidArgument));
+  CHECK(assemble_refused(static_cast<d::FrameType>(2), coded, C::Unsupported,
+                         "frame type 2"));
+  CHECK(assemble_refused(d::FrameType::kIntra, coded, C::InvalidArgument,
+                         "an intra frame has no reference"));
+  const std::string disagree = "segment lengths disagree with the header";
   d::CodedFrame c = coded;
   c.tables.pop_back();  // an intra frame's tables
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(
+      assemble_refused(d::FrameType::kInter, c, C::InvalidArgument, disagree));
   c = coded;
   c.segment_lengths.pop_back();
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(
+      assemble_refused(d::FrameType::kInter, c, C::InvalidArgument, disagree));
   c = coded;
   c.update_size = 0;
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument,
+                         "update_size must be"));
+  const std::string survivors = "not the survivors plus the new blocks";
   c = coded;
   c.block_count = c.new_count - 1;
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(
+      assemble_refused(d::FrameType::kInter, c, C::InvalidArgument, survivors));
   c = coded;
   c.block_count = c.reference.header.block_count + c.new_count + 1;
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(
+      assemble_refused(d::FrameType::kInter, c, C::InvalidArgument, survivors));
   c = coded;
   c.reference.header.block_count = 0xFFFFFFFFu;
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument,
+                         "2^32 - 1 entries"));
   c = coded;
   c.params.quantization_scale *= 2.0f;
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument,
+                         "quantization scale is not its reference's"));
   // More than 2^30 - 1 segments: 2^31 reference entries, one an update
   // segment, with nothing allocated for them.
   c = coded;
@@ -841,7 +864,8 @@ int writer_refusals_case() {
   c.update_size = 1;
   c.new_count = 0;
   c.block_count = 0;
-  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument));
+  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument,
+                         "2^30 - 1 segments"));
   return 0;
 }
 
