@@ -34,6 +34,16 @@ static_assert(kMaskWords == kMaskWordsPerBlock &&
                   kLinesPerPlane == std::uint32_t(kBlockSize) &&
                   kPlanes == std::uint32_t(kBlockSize),
               "the frame's block is the codec's");
+static_assert(std::uint32_t(FrameType::kIntra) == kFrameIntra &&
+                  std::uint32_t(FrameType::kInter) == kFrameInter,
+              "the frame types are the models'");
+static_assert(std::uint32_t(BlockMode::kKeep) == kModeKeep &&
+                  std::uint32_t(BlockMode::kSkip) == kModeSkip &&
+                  std::uint32_t(BlockMode::kZero) == kModeZero &&
+                  std::uint32_t(BlockMode::kRemove) == kModeRemove &&
+                  std::uint32_t(BlockMode::kMotion) == kModeMotion &&
+                  kModeSymbols == kModeMotion + 1,
+              "BlockMode is the mode model's alphabet");
 
 // The grammar's writer half over a sink: the histogram pass and the encode
 // pass walk exactly the same symbols, as the device's count and coding passes
@@ -90,14 +100,16 @@ struct BlockReader {
 
 }  // namespace
 
-std::uint32_t frame_model_count(std::uint32_t k) { return kFirstCoef + k; }
-
-std::uint32_t frame_model_alphabet(std::uint32_t model) {
-  return model_alphabet(model);
+std::uint32_t frame_model_count(FrameType type, std::uint32_t k) {
+  return model_count(static_cast<uint>(type), k);
 }
 
-std::uint32_t frame_model_base(std::uint32_t model) {
-  return model_base(model);
+std::uint32_t frame_model_alphabet(std::uint32_t model, std::uint32_t k) {
+  return model_alphabet(model, k);
+}
+
+std::uint32_t frame_model_base(std::uint32_t model, std::uint32_t k) {
+  return model_base(model, k);
 }
 
 namespace {
@@ -207,6 +219,31 @@ core::Status bad_write(const std::string& why) {
 
 bool positive_finite(float f) { return std::isfinite(f) && f > 0.0f; }
 
+bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
+
+// The first of a P-frame's coding parameters that is not its reference's, bit
+// for bit, or null: the one check the reader and both writers make.
+const char* coding_difference(const FrameHeader& reference, float voxel_size,
+                              float trunc_dist, const CodecParams& params) {
+  const CodecParams& held = reference.params;
+  if (!same_bits(voxel_size, reference.voxel_size)) return "voxel_size";
+  if (!same_bits(trunc_dist, reference.trunc_dist)) return "trunc_dist";
+  if (params.coefficient_count != held.coefficient_count) {
+    return "coefficient count";
+  }
+  if (!same_bits(params.quantization_scale, held.quantization_scale)) {
+    return "quantization scale";
+  }
+  static const auto zigzag = zigzag_order();
+  for (std::uint32_t j = 0; j < params.coefficient_count; ++j) {
+    if (!same_bits(params.quantization_weights[zigzag[j]],
+                   held.quantization_weights[zigzag[j]])) {
+      return "kept quantization weights";
+    }
+  }
+  return nullptr;
+}
+
 // Tables: per model, a varint count of used symbols, then per used symbol the
 // gap from the previous one (the first counts from -1) and its frequency.
 void write_tables(ByteWriter& w, const std::vector<FrequencyTable>& tables) {
@@ -228,11 +265,13 @@ void write_tables(ByteWriter& w, const std::vector<FrequencyTable>& tables) {
 }
 
 core::Status read_tables(const std::uint8_t* data, std::size_t size,
-                         std::uint32_t k, std::vector<FrequencyTable>& tables) {
+                         FrameType type, std::uint32_t k,
+                         std::vector<FrequencyTable>& tables) {
   ByteReader r(data, size);
-  tables.assign(frame_model_count(k), FrequencyTable{});
-  for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
-    const std::uint32_t n = model_alphabet(m);
+  const std::uint32_t models = frame_model_count(type, k);
+  tables.assign(models, FrequencyTable{});
+  for (std::uint32_t m = 0; m < models; ++m) {
+    const std::uint32_t n = model_alphabet(m, k);
     FrequencyTable& t = tables[m];
     t.freq.assign(n, 0);
     const std::uint32_t used = r.varint();
@@ -256,6 +295,14 @@ core::Status read_tables(const std::uint8_t* data, std::size_t size,
     }
     t.finalize();
   }
+  // Right after the mode table, the last: a later motion design may append
+  // models there only when motion has a frequency (frame_models.glsl).
+  if (type == FrameType::kInter &&
+      tables[mode_model(k)].freq[kModeMotion] != 0) {
+    return core::Status::unsupported(
+        "codec frame: a P-frame that uses the motion mode, which this reader "
+        "does not decode");
+  }
   if (!r.at_end()) {
     return bad("the TABLES section has trailing bytes");
   }
@@ -275,7 +322,8 @@ const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
 
 // The checks write_frame makes before coding anything.
 core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
-  VKC_TRY(check_frame_type(frame.type, "write_frame"));
+  VKC_TRY(check_frame_type(frame.type, FrameType::kInter, "write_frame"));
+  const bool inter = frame.type == FrameType::kInter;
   const DctBlocks& b = frame.blocks;
   if (!positive_finite(frame.voxel_size)) {
     return bad_write("voxel_size must be finite and positive");
@@ -287,14 +335,38 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
   if (options.segment_size == 0) {
     return bad_write("segment_size must be at least 1");
   }
-  const std::size_t n = frame.coords.size();
-  const std::uint32_t k = b.params.coefficient_count;
-  if (n > std::numeric_limits<std::uint32_t>::max()) {
-    return bad_write("more than 2^32 - 1 blocks");
+  if (inter && options.update_size == 0) {
+    return bad_write("update_size must be at least 1");
   }
-  // Sizes in 64 bits: n * K wraps a 32-bit size_t long before 2^32 blocks.
-  const std::uint64_t coefficient_count = std::uint64_t(n) * k;
-  const std::uint64_t mask_count = std::uint64_t(n) * kMaskWordsPerBlock;
+  // M reference entries, then A blocks: an intra frame's M is 0. Stream
+  // positions are u32, on the device too.
+  const std::uint64_t m = inter ? frame.reference.header.block_count : 0;
+  const std::uint64_t a = frame.coords.size();
+  if (m + a > std::numeric_limits<std::uint32_t>::max()) {
+    return bad_write("more than 2^32 - 1 entries");
+  }
+  if (frame.modes.size() != m) {
+    return bad_write("expected " + std::to_string(m) +
+                     " modes, one per reference block, got " +
+                     std::to_string(frame.modes.size()));
+  }
+  for (BlockMode mode : frame.modes) {
+    if (static_cast<uint>(mode) >= kModeSymbols) {
+      return bad_write("mode " + std::to_string(static_cast<uint>(mode)) +
+                       " is not a mode");
+    }
+  }
+  for (BlockMode mode : frame.modes) {
+    if (mode == BlockMode::kMotion) {
+      return core::Status::unsupported(
+          "write_frame: the motion mode, which this writer does not code");
+    }
+  }
+  const std::uint32_t k = b.params.coefficient_count;
+  // Sizes in 64 bits: (M + A) * K wraps a 32-bit size_t long before 2^32
+  // entries.
+  const std::uint64_t coefficient_count = (m + a) * k;
+  const std::uint64_t mask_count = (m + a) * kMaskWordsPerBlock;
   if (b.coefficients.size() != coefficient_count) {
     return bad_write("expected " + std::to_string(coefficient_count) +
                      " coefficients, got " +
@@ -304,12 +376,14 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
     return bad_write("expected " + std::to_string(mask_count) +
                      " mask words, got " + std::to_string(b.masks.size()));
   }
-  if (frame_segment_count(n, options.segment_size) > kMaxFrameSegments) {
+  if (frame_segment_count(m, options.update_size) +
+          frame_segment_count(a, options.segment_size) >
+      kMaxFrameSegments) {
     return bad_write(
         "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
         "u32 length");
   }
-  for (std::size_t i = 1; i < n; ++i) {
+  for (std::size_t i = 1; i < a; ++i) {
     if (!coord_less(frame.coords[i - 1], frame.coords[i])) {
       return bad_write(
           "coordinates are not strictly increasing in (z, y, x) "
@@ -317,10 +391,18 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
           std::to_string(i));
     }
   }
-  for (std::int16_t c : b.coefficients) {
-    if (c < -kMaxQuantizedMagnitude || c > kMaxQuantizedMagnitude) {
-      return bad_write("a coefficient is outside +-" +
-                       std::to_string(kMaxQuantizedMagnitude));
+  // Only what is written: a skip or remove entry's payload is ignored.
+  for (std::uint64_t p = 0; p < m + a; ++p) {
+    if (p < m && frame.modes[p] != BlockMode::kKeep &&
+        frame.modes[p] != BlockMode::kZero) {
+      continue;
+    }
+    for (std::uint32_t j = 0; j < k; ++j) {
+      const std::int16_t c = b.coefficients[std::size_t(p * k + j)];
+      if (c < -kMaxQuantizedMagnitude || c > kMaxQuantizedMagnitude) {
+        return bad_write("a coefficient or residual is outside +-" +
+                         std::to_string(kMaxQuantizedMagnitude));
+      }
     }
   }
   return {};
@@ -328,41 +410,60 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
 
 }  // namespace
 
-core::Status check_frame_type(FrameType type, const char* who) {
-  if (type == FrameType::kIntra) return {};
+core::Status check_frame_type(FrameType type, FrameType newest,
+                              const char* who) {
+  if (static_cast<uint>(type) <= static_cast<uint>(newest)) return {};
   return core::Status::unsupported(
       std::string(who) + ": frame type " +
-      std::to_string(static_cast<std::uint32_t>(type)) +
-      " (only intra is coded)");
+      std::to_string(static_cast<uint>(type)) +
+      (newest == FrameType::kIntra ? " (only intra is coded)"
+                                   : " (only intra and P-frames are coded)"));
 }
 
 core::Result<std::vector<std::uint8_t>> write_frame(
     const Frame& frame, const FrameWriteOptions& options) {
   VKC_TRY(check_frame(frame, options));
+  const bool inter = frame.type == FrameType::kInter;
   const DctBlocks& b = frame.blocks;
-  const std::size_t n = frame.coords.size();
   const std::uint32_t k = b.params.coefficient_count;
+  // Each below 2^32 together (check_frame).
+  const auto m =
+      static_cast<uint>(inter ? frame.reference.header.block_count : 0);
+  const auto a = static_cast<uint>(frame.coords.size());
+  const std::uint32_t u_size = inter ? options.update_size : 0;
   const std::uint32_t r_size = options.segment_size;
-  const std::uint64_t segments = frame_segment_count(n, r_size);
+  const std::uint64_t segments =
+      frame_segment_count(m, u_size) + frame_segment_count(a, r_size);
 
-  // Block i through a writer.
-  auto emit = [&](auto& writer, std::size_t i) {
-    const bool first = i % r_size == 0;
-    writer.g_mask = &b.masks[i * kMaskWordsPerBlock];
-    writer.coefficients = &b.coefficients[i * k];
-    writer.emit_block(first, frame.coords[first ? i : i - 1], frame.coords[i],
-                      k);
+  // Segment s through a writer: an update segment's reference entries, or a
+  // block segment's blocks.
+  auto emit_segment = [&](auto& writer, std::uint64_t s) {
+    const uvec2 range =
+        segment_range(static_cast<uint>(s), m, u_size, a, r_size);
+    for (uint p = range.x; p < range.y; ++p) {
+      writer.g_mask = &b.masks[std::size_t(p) * kMaskWordsPerBlock];
+      writer.coefficients = &b.coefficients[std::size_t(p) * k];
+      if (p < m) {
+        writer.emit_entry(static_cast<uint>(frame.modes[p]), k);
+      } else {
+        const bool first = p == range.x;
+        const uint q = p - m;
+        writer.emit_block(first, frame.coords[first ? q : q - 1],
+                          frame.coords[q], k);
+      }
+    }
   };
 
   // Pass 1: every model's histogram, over exactly the symbols pass 2 writes.
-  std::vector<std::vector<std::uint64_t>> counts(frame_model_count(k));
-  for (std::uint32_t m = 0; m < frame_model_count(k); ++m) {
-    counts[m].assign(model_alphabet(m), 0);
+  const std::uint32_t models = frame_model_count(frame.type, k);
+  std::vector<std::vector<std::uint64_t>> counts(models);
+  for (std::uint32_t model = 0; model < models; ++model) {
+    counts[model].assign(model_alphabet(model, k), 0);
   }
   CountSink count_sink{counts};
   BlockWriter<CountSink> counter{count_sink};
-  for (std::size_t i = 0; i < n; ++i) {
-    emit(counter, i);
+  for (std::uint64_t s = 0; s < segments; ++s) {
+    emit_segment(counter, s);
   }
   std::vector<FrequencyTable> tables = frame_tables(counts);
 
@@ -378,12 +479,7 @@ core::Result<std::vector<std::uint8_t>> write_frame(
   WriteSink write_sink{writer, tables};
   BlockWriter<WriteSink> coder{write_sink};
   for (std::uint64_t s = 0; s < segments; ++s) {
-    const std::size_t first = static_cast<std::size_t>(s * r_size);  // < n
-    const std::size_t end = static_cast<std::size_t>(
-        std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
-    for (std::size_t i = first; i < end; ++i) {
-      emit(coder, i);
-    }
+    emit_segment(coder, s);
     const std::size_t stream_at = payload.size();
     if (!writer.finish(payload)) {
       // Pass 1 counted every symbol pass 2 puts, so this is a bug here.
@@ -392,12 +488,19 @@ core::Result<std::vector<std::uint8_t>> write_frame(
     }
     lengths.push_back(static_cast<std::uint32_t>(payload.size() - stream_at));
   }
+  std::uint32_t survivors = 0;
+  for (BlockMode mode : frame.modes) {
+    survivors += mode != BlockMode::kRemove ? 1u : 0u;
+  }
   CodedFrame coded;
   coded.voxel_size = frame.voxel_size;
   coded.trunc_dist = b.trunc_dist;
   coded.params = b.params;
-  coded.block_count = static_cast<std::uint32_t>(n);
+  coded.block_count = survivors + a;
   coded.segment_size = r_size;
+  coded.reference = frame.reference;
+  coded.update_size = u_size;
+  coded.new_count = inter ? a : 0;
   coded.tables = std::move(tables);
   coded.segment_lengths = std::move(lengths);
   coded.payload = std::move(payload);
@@ -416,6 +519,8 @@ std::vector<FrequencyTable> frame_tables(
 
 core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame) {
+  VKC_TRY(check_frame_type(type, FrameType::kInter, "assemble_frame"));
+  const bool inter = type == FrameType::kInter;
   // The header's fields as check_frame checks them, for the device
   // writer, which codes without a Frame.
   if (!positive_finite(frame.voxel_size)) {
@@ -428,15 +533,41 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   if (frame.segment_size == 0) {
     return bad_write("segment_size must be at least 1");
   }
+  const std::uint64_t m = frame.reference.header.block_count;
+  if (!inter && (frame.reference.hash != 0 || m != 0 ||
+                 frame.update_size != 0 || frame.new_count != 0)) {
+    return bad_write("an intra frame has no reference");
+  }
+  if (inter && frame.update_size == 0) {
+    return bad_write("update_size must be at least 1");
+  }
+  // An intra frame's blocks are all new, against no reference.
+  const std::uint64_t a = inter ? frame.new_count : frame.block_count;
+  if (m + a > std::numeric_limits<std::uint32_t>::max()) {
+    return bad_write("more than 2^32 - 1 entries");
+  }
+  if (frame.block_count < a || frame.block_count > m + a) {
+    return bad_write(
+        "the block count is not the survivors plus the new "
+        "blocks");
+  }
+  if (inter) {
+    if (const char* d =
+            coding_difference(frame.reference.header, frame.voxel_size,
+                              frame.trunc_dist, frame.params)) {
+      return bad_write(std::string("the P-frame's ") + d +
+                       " is not its reference's");
+    }
+  }
   const std::uint32_t k = frame.params.coefficient_count;
-  const std::uint64_t segments =
-      frame_segment_count(frame.block_count, frame.segment_size);
+  const std::uint64_t segments = frame_segment_count(m, frame.update_size) +
+                                 frame_segment_count(a, frame.segment_size);
   if (segments > kMaxFrameSegments) {
     return bad_write(
         "more than 2^30 - 1 segments: SEGMENTS would outgrow its "
         "u32 length");
   }
-  if (frame.tables.size() != frame_model_count(k) ||
+  if (frame.tables.size() != frame_model_count(type, k) ||
       frame.segment_lengths.size() != segments) {
     return bad_write("tables or segment lengths disagree with the header");
   }
@@ -460,6 +591,22 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   ByteWriter tw(tables_body);
   write_tables(tw, frame.tables);
 
+  // REFERENCE, a P-frame's, first.
+  std::vector<std::pair<SectionId, const std::vector<std::uint8_t>*>> sections;
+  std::vector<std::uint8_t> reference_body;
+  if (inter) {
+    ByteWriter rw(reference_body);
+    rw.u32(static_cast<std::uint32_t>(frame.reference.hash));
+    rw.u32(static_cast<std::uint32_t>(frame.reference.hash >> 32));
+    rw.u32(static_cast<std::uint32_t>(m));
+    rw.u32(frame.update_size);
+    rw.u32(frame.new_count);
+    sections.emplace_back(SectionId::kReference, &reference_body);
+  }
+  sections.emplace_back(SectionId::kTables, &tables_body);
+  sections.emplace_back(SectionId::kSegments, &segments_body);
+  sections.emplace_back(SectionId::kPayload, &frame.payload);
+
   std::vector<std::uint8_t> out;
   ByteWriter w(out);
   for (std::uint8_t c : kFrameMagic) {
@@ -476,12 +623,7 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   w.u32(k);  // one weight per kept basis
   w.u32(frame.block_count);
   w.u32(frame.segment_size);
-  const std::array<std::pair<SectionId, const std::vector<std::uint8_t>*>,
-                   kSectionCount>
-      sections = {{{SectionId::kTables, &tables_body},
-                   {SectionId::kSegments, &segments_body},
-                   {SectionId::kPayload, &frame.payload}}};
-  w.u32(kSectionCount);
+  w.u32(static_cast<std::uint32_t>(sections.size()));
   static const auto zigzag = zigzag_order();
   for (std::uint32_t j = 0; j < k; ++j) {
     w.f32(frame.params.quantization_weights[zigzag[j]]);
@@ -546,7 +688,7 @@ core::Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   }
 
   header.type = static_cast<FrameType>(type);
-  VKC_TRY(check_frame_type(header.type, "codec frame"));
+  VKC_TRY(check_frame_type(header.type, FrameType::kInter, "codec frame"));
   if (reserved != 0) {
     return bad("the reserved header byte is not zero");
   }
@@ -570,10 +712,12 @@ core::Result<FrameHeader> read_frame_header(const std::uint8_t* data,
 
 core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
                                       std::size_t size,
-                                      std::uint32_t max_blocks) {
+                                      std::uint32_t max_blocks,
+                                      const FrameReference* reference) {
   VKC_ASSIGN(const FrameHeader header, read_frame_header(data, size));
   ParsedFrame frame;
   frame.header = header;
+  const bool inter = header.type == FrameType::kInter;
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;
   const std::uint32_t section_count = header.section_count;
@@ -619,8 +763,15 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
   if (offset != body_bytes) {
     return bad("bytes after the last section");
   }
+  // Every section, but REFERENCE on a P-frame alone.
   for (std::uint32_t i = 0; i < kSectionCount; ++i) {
-    if (found[i].data == nullptr) {
+    const bool present = found[i].data != nullptr;
+    if (static_cast<SectionId>(i + 1) == SectionId::kReference) {
+      if (present != inter) {
+        return bad(inter ? "a P-frame's REFERENCE section is missing"
+                         : "an intra frame has a REFERENCE section");
+      }
+    } else if (!present) {
       return bad("section " + std::to_string(i + 1) + " is missing");
     }
   }
@@ -628,11 +779,44 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
   const SectionBody& segments_section = section(found, SectionId::kSegments);
   const SectionBody& payload_section = section(found, SectionId::kPayload);
 
-  const std::uint32_t k = header.params.coefficient_count;
-  VKC_TRY(
-      read_tables(tables_section.data, tables_section.size, k, frame.tables));
+  // A P-frame's M reference entries in update segments of U, then its A new
+  // blocks; an intra frame's blocks are all new.
+  std::uint64_t reference_hash = 0;
+  std::uint32_t m = 0;
+  std::uint32_t u_size = 0;
+  std::uint32_t a = n;
+  if (inter) {
+    const SectionBody& r = section(found, SectionId::kReference);
+    if (r.size != kReferenceBodyBytes) {
+      return bad("the REFERENCE section is not " +
+                 std::to_string(kReferenceBodyBytes) + " bytes");
+    }
+    ByteReader rr(r.data, r.size);
+    const std::uint64_t low = rr.u32();
+    reference_hash = low | std::uint64_t(rr.u32()) << 32;
+    m = rr.u32();
+    u_size = rr.u32();
+    a = rr.u32();
+    if (u_size == 0) {
+      return bad("update size 0");
+    }
+    if (a > n || n > std::uint64_t(m) + a) {
+      return bad("it holds " + std::to_string(n) + " blocks, not between its " +
+                 std::to_string(a) + " new blocks and those plus the " +
+                 std::to_string(m) + " of its reference");
+    }
+    // Stream positions are u32, on the device too.
+    if (std::uint64_t(m) + a > std::numeric_limits<std::uint32_t>::max()) {
+      return bad("more than 2^32 - 1 entries");
+    }
+  }
 
-  const std::uint64_t segments = frame_segment_count(n, r_size);
+  const std::uint32_t k = header.params.coefficient_count;
+  VKC_TRY(read_tables(tables_section.data, tables_section.size, header.type, k,
+                      frame.tables));
+
+  const std::uint64_t segments =
+      frame_segment_count(m, u_size) + frame_segment_count(a, r_size);
   if (segments_section.size != segments * 4) {
     return bad("the SEGMENTS section does not list one length per segment");
   }
@@ -650,10 +834,35 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
   if (total != payload_section.size) {
     return bad("the segment lengths do not add up to the PAYLOAD section");
   }
-  // Only now, with the block count consistent with the segment table: a count
-  // that is not is a corrupt frame, and one that is but exceeds the caller's
-  // room is a sound frame too big to hold -- which the caller answers by
-  // growing, not by dropping the frame.
+  // A P-frame against the caller's reference only now, so a corrupt frame
+  // stays InvalidArgument and a motion frame Unsupported whatever is held;
+  // M, a count the caller holds, then bounds the reader's M + A entries.
+  if (inter) {
+    if (reference == nullptr) {
+      return core::Status::not_found(
+          "codec frame: a P-frame, and no reference frame is held; decode an "
+          "I-frame first");
+    }
+    if (reference_hash != reference->hash ||
+        m != reference->header.block_count) {
+      return core::Status::not_found(
+          "codec frame: a P-frame against a reference of " + std::to_string(m) +
+          " blocks that is not the one held (" +
+          std::to_string(reference->header.block_count) +
+          " blocks); decode an I-frame first");
+    }
+    if (const char* d = coding_difference(reference->header, header.voxel_size,
+                                          header.trunc_dist, header.params)) {
+      return bad(std::string("the P-frame's ") + d + " is not its reference's");
+    }
+    frame.reference = *reference;
+    frame.update_size = u_size;
+  }
+  frame.new_count = a;
+  // A block count that is not consistent with the segment table is a corrupt
+  // frame, and one that is but exceeds the caller's room is a sound frame too
+  // big to hold -- which the caller answers by growing, not by dropping the
+  // frame.
   if (n > max_blocks) {
     return core::Status::out_of_memory(
         "codec frame: it holds " + std::to_string(n) +
@@ -666,7 +875,7 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
 }
 
 core::Status check_segment(std::uint64_t s, SegmentFault fault,
-                           const Vec3i* prev_last, const Vec3i& first) {
+                           const Vec3i* prev_last, const Vec3i* first) {
   if (fault == SegmentFault::kCoordOverflow) {
     return bad("segment " + std::to_string(s) +
                " steps a coordinate outside int32");
@@ -678,69 +887,166 @@ core::Status check_segment(std::uint64_t s, SegmentFault fault,
   // is raw bits, which no end check sees, so the order across segments is
   // checked here. Without it a flipped bit decodes a duplicate, and the
   // inverse transform races two workgroups on one block.
-  if (prev_last != nullptr && !coord_less(*prev_last, first)) {
+  if (prev_last != nullptr && first != nullptr &&
+      !coord_less(*prev_last, *first)) {
     return bad("segment " + std::to_string(s) +
                " does not start after the one before ends");
   }
   return {};
 }
 
+core::Status check_survivors(const std::vector<BlockMode>& modes,
+                             std::uint32_t n, std::uint32_t a) {
+  std::uint64_t survivors = 0;
+  for (BlockMode mode : modes) {
+    survivors += mode == BlockMode::kKeep || mode == BlockMode::kSkip ||
+                         mode == BlockMode::kZero
+                     ? 1
+                     : 0;
+  }
+  if (survivors + a != n) {
+    return bad(std::to_string(survivors) + " reference blocks survive and " +
+               std::to_string(a) + " are new, but the frame holds " +
+               std::to_string(n));
+  }
+  return {};
+}
+
 core::Result<Frame> read_frame(const std::uint8_t* data, std::size_t size,
-                               std::uint32_t max_blocks) {
-  VKC_ASSIGN(ParsedFrame parsed, parse_frame(data, size, max_blocks));
+                               std::uint32_t max_blocks,
+                               const FrameReference* reference) {
+  VKC_ASSIGN(ParsedFrame parsed,
+             parse_frame(data, size, max_blocks, reference));
   return decode_frame(std::move(parsed));
 }
 
 core::Result<Frame> decode_frame(ParsedFrame parsed) {
-  VKC_TRY(check_frame_type(parsed.header.type, "decode_frame"));
+  VKC_TRY(
+      check_frame_type(parsed.header.type, FrameType::kInter, "decode_frame"));
   for (FrequencyTable& t : parsed.tables) t.build_decode();
   const FrameHeader& header = parsed.header;
+  const bool inter = header.type == FrameType::kInter;
   const std::uint32_t n = header.block_count;
   const std::uint32_t r_size = header.segment_size;
   const std::uint32_t k = header.params.coefficient_count;
+  // An intra frame is M = 0: its blocks are all new.
+  const std::uint32_t m = inter ? parsed.reference.header.block_count : 0;
+  const std::uint32_t u_size = inter ? parsed.update_size : 0;
+  const std::uint32_t a = inter ? parsed.new_count : n;
+  const std::uint64_t entries = std::uint64_t(m) + a;
   Frame frame;
   frame.type = header.type;
   frame.voxel_size = header.voxel_size;
+  frame.reference = parsed.reference;
   frame.blocks.trunc_dist = header.trunc_dist;
   frame.blocks.params = header.params;
-  // max_blocks bounds these in bytes, but not below what a 32-bit size_t can
-  // count: n * K reaches 2^41. Past this check every index below fits.
-  if (n > frame.coords.max_size() ||
-      std::uint64_t(n) * k > frame.blocks.coefficients.max_size() ||
-      std::uint64_t(n) * kMaskWordsPerBlock > frame.blocks.masks.max_size()) {
+  // max_blocks and the held reference bound these in bytes, but not below
+  // what a 32-bit size_t can count: entries * K reaches 2^41. Past this check
+  // every index below fits.
+  if (a > frame.coords.max_size() || m > frame.modes.max_size() ||
+      entries * k > frame.blocks.coefficients.max_size() ||
+      entries * kMaskWordsPerBlock > frame.blocks.masks.max_size()) {
     return core::Status::out_of_memory(
-        "codec frame: " + std::to_string(n) + " blocks of " +
+        "codec frame: " + std::to_string(entries) + " entries of " +
         std::to_string(k) +
         " coefficients exceed this platform's address space");
   }
-  frame.coords.resize(n);
-  frame.blocks.coefficients.resize(std::size_t(n) * k);
-  frame.blocks.masks.resize(std::size_t(n) * kMaskWordsPerBlock);
+  frame.modes.resize(m);
+  frame.coords.resize(a);
+  frame.blocks.coefficients.resize(std::size_t(entries) * k);
+  frame.blocks.masks.resize(std::size_t(entries) * kMaskWordsPerBlock);
   const std::uint8_t* stream = parsed.payload;
+  const Vec3i* prev_last = nullptr;  // the block segment before's last
   for (std::size_t s = 0; s < parsed.segment_lengths.size(); ++s) {
     RansReader r(stream, parsed.segment_lengths[s]);
     BlockReader reader{r, parsed.tables};
-    const std::size_t first = s * r_size;  // < n
-    const std::size_t end = static_cast<std::size_t>(
-        std::min<std::uint64_t>(n, std::uint64_t(first) + r_size));
+    const uvec2 range =
+        segment_range(static_cast<uint>(s), m, u_size, a, r_size);
     SegmentFault fault = SegmentFault::kNone;
-    for (std::size_t i = first; i < end && !r.failed(); ++i) {
-      reader.g_mask = &frame.blocks.masks[i * kMaskWordsPerBlock];
-      reader.coefficients = &frame.blocks.coefficients[i * k];
-      if (!reader.read_block(i == first, k)) {
-        fault = SegmentFault::kCoordOverflow;
-        break;
+    for (uint p = range.x; p < range.y && !r.failed(); ++p) {
+      reader.g_mask = &frame.blocks.masks[std::size_t(p) * kMaskWordsPerBlock];
+      reader.coefficients = &frame.blocks.coefficients[std::size_t(p) * k];
+      if (p < m) {
+        frame.modes[p] = static_cast<BlockMode>(reader.read_entry(k));
+      } else {
+        if (!reader.read_block(p == range.x, k)) {
+          fault = SegmentFault::kCoordOverflow;
+          break;
+        }
+        frame.coords[p - m] = reader.g_coord;
       }
-      frame.coords[i] = reader.g_coord;
     }
     if (fault == SegmentFault::kNone && !r.finish()) {
       fault = SegmentFault::kCorrupt;
     }
-    VKC_TRY(check_segment(s, fault, s > 0 ? &frame.coords[first - 1] : nullptr,
-                          frame.coords[first]));
+    // An update segment has no coordinate, and a block segment follows the
+    // block segment before it, if any.
+    const bool blocks = range.x >= m;
+    VKC_TRY(check_segment(s, fault, blocks ? prev_last : nullptr,
+                          blocks ? &frame.coords[range.x - m] : nullptr));
+    if (blocks) prev_last = &frame.coords[range.y - 1 - m];
     stream += parsed.segment_lengths[s];
   }
+  if (inter) VKC_TRY(check_survivors(frame.modes, n, a));
   return frame;
+}
+
+core::Result<MergedFrame> merge_frame(const std::vector<Vec3i>& reference,
+                                      const std::vector<BlockMode>& modes,
+                                      const std::vector<Vec3i>& added) {
+  if (modes.size() != reference.size()) {
+    return bad("expected " + std::to_string(reference.size()) +
+               " modes, one per reference block, got " +
+               std::to_string(modes.size()));
+  }
+  if (std::uint64_t(reference.size()) + added.size() >
+      std::numeric_limits<std::uint32_t>::max()) {
+    return bad("more than 2^32 - 1 entries");
+  }
+  const auto m = static_cast<std::uint32_t>(reference.size());
+  MergedFrame out;
+  auto emit = [&out](const Vec3i& c, std::uint32_t from_reference,
+                     std::uint32_t payload) {
+    out.coords.push_back(c);
+    out.sources.push_back(ApplySource{from_reference, payload});
+  };
+  VKC_TRY(merge_by_coord(
+      reference.size(),
+      [&](std::size_t e) -> const Vec3i& { return reference[e]; }, added.size(),
+      [&](std::size_t q) -> const Vec3i& { return added[q]; },
+      [&](std::size_t e, std::size_t q) -> core::Status {
+        // One spelling per block: a reference block is recoded with zero,
+        // never removed and added.
+        if (e != kAbsent && q != kAbsent) {
+          return bad("new block " + std::to_string(q) +
+                     " is on reference block " + std::to_string(e));
+        }
+        if (q != kAbsent) {
+          emit(added[q], kNoSource, m + static_cast<std::uint32_t>(q));
+          return {};
+        }
+        const auto i = static_cast<std::uint32_t>(e);
+        switch (modes[e]) {
+          case BlockMode::kKeep:
+            emit(reference[e], i, i);
+            return {};
+          case BlockMode::kSkip:
+            emit(reference[e], i, kNoSource);
+            return {};
+          case BlockMode::kZero:
+            emit(reference[e], kNoSource, i);
+            return {};
+          case BlockMode::kRemove:
+            return {};
+          case BlockMode::kMotion:
+            return core::Status::unsupported(
+                "codec frame: the motion mode, which this reader does not "
+                "decode");
+        }
+        return bad("mode " + std::to_string(static_cast<uint>(modes[e])) +
+                   " is not a mode");
+      }));
+  return out;
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

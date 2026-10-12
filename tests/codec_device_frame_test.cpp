@@ -99,7 +99,7 @@ vkc::Result<std::vector<std::uint8_t>> device_write(
 vkc::Result<d::Frame> device_read(d::DeviceFrameReader& reader,
                                   const std::uint8_t* data, std::size_t size) {
   VKC_ASSIGN(const d::ParsedFrame parsed,
-             d::parse_frame(data, size, kMaxBlocks));
+             d::parse_frame(data, size, kMaxBlocks, nullptr));
   const std::uint32_t n = parsed.header.block_count;
   const std::uint32_t k = parsed.header.params.coefficient_count;
   const std::uint32_t words = (k + 1) / 2;
@@ -246,7 +246,7 @@ int corruption_case(d::DeviceFrameReader& reader) {
   int order = 0;
   for (const std::vector<std::uint8_t>& good : frames) {
     const vkc::Result<d::ParsedFrame> parsed =
-        d::parse_frame(good.data(), good.size(), kMaxBlocks);
+        d::parse_frame(good.data(), good.size(), kMaxBlocks, nullptr);
     CHECK(parsed.ok());
     const auto payload =
         static_cast<std::uint32_t>(parsed.value().payload - good.data());
@@ -332,17 +332,39 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   return 0;
 }
 
-// The reader refuses a parsed frame of a type it does not decode, as the
-// host's decode_frame does.
+// The reader refuses a parsed frame of a type it does not decode, recording
+// nothing: a P-frame, which the host reads, and a type past it, which the
+// host's decode_frame refuses too.
 int frame_type_case(d::DeviceFrameReader& reader) {
-  const std::vector<std::uint8_t> good =
-      d::write_frame(make_frame(100, 16, 12)).value();
+  const d::Frame reference = make_frame(100, 16, 12);
+  const std::vector<std::uint8_t> intra = d::write_frame(reference).value();
+  CHECK(same_read(reader, intra) == 0);
+  auto decoded = [&reader] {
+    std::vector<vr::Vec3i> coords;
+    for (const vr::volume::BlockIndex& b : reader.blocks()) {
+      coords.push_back(b.coord);
+    }
+    return coords;
+  };
+  const std::vector<vr::Vec3i> before = decoded();
+  CHECK(before == reference.coords);
+  const d::FrameReference id = codec_frames::reference_of(intra);
+  const std::vector<std::uint8_t> inter =
+      d::write_frame(codec_frames::inter_frame(
+                         id, reference,
+                         codec_frames::successor(reference, 13, 50, 300, 9)))
+          .value();
   d::ParsedFrame typed =
-      d::parse_frame(good.data(), good.size(), kMaxBlocks).value();
-  typed.header.type = static_cast<d::FrameType>(1);
-  vkc::CommandBatch batch(*g_device, *g_allocator);
-  CHECK(reader.record_decode(batch, typed).status().domain() ==
-        vkc::Status::Code::Unsupported);
+      d::parse_frame(inter.data(), inter.size(), kMaxBlocks, &id).value();
+  CHECK(typed.header.type == d::FrameType::kInter);
+  for (int type : {1, 2}) {
+    typed.header.type = static_cast<d::FrameType>(type);
+    vkc::CommandBatch batch(*g_device, *g_allocator);
+    CHECK(reader.record_decode(batch, typed).status().domain() ==
+          vkc::Status::Code::Unsupported);
+    CHECK(batch.submit().ok());
+    CHECK(decoded() == before);
+  }
   return 0;
 }
 

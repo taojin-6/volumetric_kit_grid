@@ -8,11 +8,16 @@
 // host the same lines compile as C++ member functions.
 //
 // Inside a segment each block is, in order: its coordinate (the segment's
-// first in full, the rest as deltas from the block before), its mask class
-// (and a partial mask, a plane and a line at a time), then its K
-// coefficients. Every integer is a class -- its bit length -- through its
-// model's table, then one raw field of the bits below its leading one, and
-// below those its sign.
+// first in full, the rest as deltas from the block before), then its
+// payload: its mask class (and a partial mask, a plane and a line at a
+// time), then its K coefficients. Every integer is a class -- its bit length
+// -- through its model's table, then one raw field of the bits below its
+// leading one, and below those its sign.
+//
+// A P-frame's update segment holds reference entries instead, in reference
+// order and with no coordinate: each its mode symbol, then a payload for
+// keep and zero alone, which the caller makes and applies (bitstream.hpp
+// says what each carries): the grammar never sees the reference.
 //
 // The includer picks a half with VR_FRAME_WRITER or VR_FRAME_READER, and
 // defines what it calls: a writer, sink_symbol, sink_bits (a raw field of 1
@@ -123,9 +128,8 @@ void emit_partial_mask() {
   }
 }
 
-// Block cur, after prev unless it is its segment's first, of mask g_mask and
-// K coefficients.
-void emit_block(bool first, ivec3 prev, ivec3 cur, uint k) {
+// Block cur's coordinate, after prev unless it is its segment's first.
+void emit_coord(bool first, ivec3 prev, ivec3 cur) {
   if (first) {
     // A segment's first block, in full: the segment decodes on its own.
     sink_bits(uint(cur.x), 32u);
@@ -148,7 +152,10 @@ void emit_block(bool first, ivec3 prev, ivec3 cur, uint k) {
       emit_step(kDxFree, prev.x, cur.x);
     }
   }
+}
 
+// A payload: the mask g_mask and K coefficients.
+void emit_payload(uint k) {
   bool full = true;
   bool none = true;
   for (uint w = 0u; w < kMaskWords; ++w) {
@@ -163,6 +170,20 @@ void emit_block(bool first, ivec3 prev, ivec3 cur, uint k) {
     const int v = coefficient(j);
     emit_signed(kFirstCoef + j, v < 0 ? 0u - uint(v) : uint(v), v < 0);
   }
+}
+
+// Block cur, after prev unless it is its segment's first, of mask g_mask and
+// K coefficients: an intra frame's block, and a P-frame's new block.
+void emit_block(bool first, ivec3 prev, ivec3 cur, uint k) {
+  emit_coord(first, prev, cur);
+  emit_payload(k);
+}
+
+// A P-frame's reference entry of mode `mode` (below kModeSymbols, never
+// motion): the mode, then for keep and zero the payload.
+void emit_entry(uint mode, uint k) {
+  sink_symbol(mode_model(k), mode);
+  if (mode == kModeKeep || mode == kModeZero) emit_payload(k);
 }
 
 #endif  // VR_FRAME_WRITER
@@ -218,12 +239,12 @@ void read_partial_mask() {
   }
 }
 
-// The block after g_coord, unless it is its segment's first, into g_coord,
-// g_mask and its K coefficients. False for a coordinate outside int32; the
-// coder's own failure carries everything else, including a failure partway
-// through the deltas, whose zeros would otherwise decode as a run step and
-// could be misreported as leaving int32.
-bool read_block(bool first, uint k) {
+// The coordinate after g_coord, unless it is its segment's first, into
+// g_coord. False for one outside int32; the coder's own failure carries
+// everything else, including a failure partway through the deltas, whose
+// zeros would otherwise decode as a run step and could be misreported as
+// leaving int32.
+bool read_coord(bool first) {
   if (first) {
     g_coord.x = int(get_bits(32u));
     g_coord.y = int(get_bits(32u));
@@ -254,7 +275,11 @@ bool read_block(bool first, uint k) {
     g_coord = ivec3(stepped(g_coord.x, dx), stepped(g_coord.y, dy),
                     stepped(g_coord.z, dz));
   }
+  return true;
+}
 
+// A payload, into g_mask and its K coefficients.
+void read_payload(uint k) {
   // TODO(codec): refuse a partial mask that decodes all-full or all-empty,
   // and the mask code's other second spellings: a plane coded line by line
   // that one plane symbol names, a line coded as the byte another line
@@ -276,7 +301,22 @@ bool read_block(bool first, uint k) {
     const uvec2 v = get_signed(kFirstCoef + j);
     store_coefficient(j, v.y != 0u ? -int(v.x) : int(v.x));
   }
+}
+
+// The block after g_coord, unless it is its segment's first, into g_coord,
+// g_mask and its K coefficients. False for a coordinate outside int32.
+bool read_block(bool first, uint k) {
+  if (!read_coord(first)) return false;
+  read_payload(k);
   return true;
+}
+
+// A P-frame's reference entry: its mode, and for keep and zero its payload
+// into g_mask and its K coefficients.
+uint read_entry(uint k) {
+  const uint mode = get(mode_model(k));
+  if (mode == kModeKeep || mode == kModeZero) read_payload(k);
+  return mode;
 }
 
 #endif  // VR_FRAME_READER

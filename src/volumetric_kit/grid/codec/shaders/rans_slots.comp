@@ -31,11 +31,11 @@ void main() {
   const uint model = item >> 12u;
   if (model >= kFirstCoef + pc.coefficient_count) return;
   const uint slot = item & 4095u;
-  const uint base = model_base(model);
+  const uint base = model_base(model, pc.coefficient_count);
   // The last symbol whose cum is at most the slot: every later one starts
   // past it, and one of frequency 0 before it shares its cum.
   uint lo = 0u;  // the first symbol whose cum exceeds the slot
-  uint hi = model_alphabet(model);
+  uint hi = model_alphabet(model, pc.coefficient_count);
   while (lo < hi) {
     const uint mid = (lo + hi) / 2u;
     if ((tables[base + mid] & 0xFFFFu) <= slot) {

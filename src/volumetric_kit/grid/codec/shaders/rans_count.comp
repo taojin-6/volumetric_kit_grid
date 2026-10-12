@@ -23,7 +23,7 @@ layout(set = 0, binding = 4, std430) writeonly buffer Steps {
 uint g_steps = 0u;
 
 void sink_symbol(uint model, uint symbol) {
-  atomicAdd(counts[model_base(model) + symbol], 1u);
+  atomicAdd(counts[model_base(model, pc.coefficient_count) + symbol], 1u);
   g_steps += 1u;
 }
 
