@@ -5,7 +5,7 @@
 
 /// @file device_frame_writer.hpp
 /// @brief Writes an intra frame with its rANS coding on the device, byte for
-///        byte the frame @ref write_intra_frame writes on the host.
+///        byte the frame @ref write_frame writes on the host.
 ///
 /// Internal (under src/, never installed). The forward output stays in device
 /// memory: the host reads back only the symbol counts, to build the frame's
@@ -80,10 +80,10 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @param trunc_dist  The grid's `trunc_dist`, which the coefficients are
   ///                    fractions of.
   /// @param params      The params the coefficients were made with.
-  /// @return The frame's bytes, identical to @ref write_intra_frame's for the
+  /// @return The frame's bytes, identical to @ref write_frame's for the
   ///         same content; `Status::Code::InvalidArgument` for invalid
   ///         params, blocks @ref record_count did not count, or a frame
-  ///         @ref assemble_intra_frame refuses; or a buffer or dispatch
+  ///         @ref assemble_frame refuses; or a buffer or dispatch
   ///         failure. `Status::Code::IoError` only if a kernel's
   ///         table refused a symbol it was counted from, which is a bug here.
   core::Result<std::vector<std::uint8_t>> finish(

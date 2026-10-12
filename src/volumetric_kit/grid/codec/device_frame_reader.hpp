@@ -5,10 +5,10 @@
 
 /// @file device_frame_reader.hpp
 /// @brief Decodes an intra frame's segments on the device, block for block
-///        what @ref read_intra_frame decodes on the host.
+///        what @ref read_frame decodes on the host.
 ///
 /// Internal (under src/, never installed). The host parses the frame
-/// (@ref parse_intra_frame) and uploads only its tables and payload; the
+/// (@ref parse_frame) and uploads only its tables and payload; the
 /// decoded coefficients and masks stay in device memory, where the inverse
 /// transform reads them, and only the coordinates and each segment's fault
 /// come back. Every bulk buffer is device-local and retained between frames
@@ -65,7 +65,7 @@ class VR_CODEC_API DeviceFrameReader {
       core::CommandBatch& batch, const ParsedFrame& frame,
       core::GpuStageScope* stage = nullptr);
 
-  /// @return After the submit, the refusal @ref read_intra_frame makes for
+  /// @return After the submit, the refusal @ref read_frame makes for
   ///         the same frame's segments (@ref check_segment), or OK.
   core::Status check() const;
 

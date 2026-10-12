@@ -137,7 +137,7 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     }
   }
 
-  detail::IntraFrame frame;
+  detail::Frame frame;
   frame.voxel_size = grid.grid().voxel_size;
   {
     core::StageScope forward(metrics, "  ..forward");
@@ -152,7 +152,7 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   core::StageScope entropy(metrics, "  ..rans encode");
   detail::FrameWriteOptions options;
   options.segment_size = config_.segment_size;
-  return detail::write_intra_frame(frame, options);
+  return detail::write_frame(frame, options);
 }
 
 }  // namespace volumetric_kit::recon::codec

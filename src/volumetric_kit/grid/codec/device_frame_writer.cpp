@@ -160,7 +160,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   coded.block_count = n;
   coded.segment_size = segment_size;
   coded.tables = frame_tables(counts);
-  if (n == 0) return assemble_intra_frame(coded);
+  if (n == 0) return assemble_frame(FrameType::kIntra, coded);
 
   // Each symbol's coder step; frequency 0 for one never counted, which the
   // encoder refuses.
@@ -315,7 +315,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   payload_per_block_ = static_cast<std::uint32_t>((total + total / 4) / n + 1);
   coded.segment_lengths = std::move(lengths);
   coded.payload = std::move(payload);
-  return assemble_intra_frame(coded);
+  return assemble_frame(FrameType::kIntra, coded);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

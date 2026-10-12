@@ -55,8 +55,7 @@ inline void slab_mask(Lcg& rng, std::uint32_t* mask) {
 // them, masks mostly full with some empty and some partial -- noise, or a
 // slab's edge -- coefficients small and sparser at higher indices, and the
 // odd extreme value.
-inline d::IntraFrame make_frame(std::size_t n, std::uint32_t k,
-                                std::uint64_t seed) {
+inline d::Frame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
   Lcg rng{seed};
   auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
     return d::coord_less(a, b);
@@ -75,7 +74,7 @@ inline d::IntraFrame make_frame(std::size_t n, std::uint32_t k,
       coords.insert(vr::Vec3i(start.x + int(i), start.y, start.z));
     }
   }
-  d::IntraFrame f;
+  d::Frame f;
   f.voxel_size = 0.005f;
   f.coords.assign(coords.begin(), coords.end());
   f.blocks.params.coefficient_count = k;
@@ -109,10 +108,10 @@ inline d::IntraFrame make_frame(std::size_t n, std::uint32_t k,
 }
 
 // Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
-inline d::IntraFrame extreme_frame() {
+inline d::Frame extreme_frame() {
   constexpr std::int32_t kMax = std::numeric_limits<std::int32_t>::max();
   constexpr std::int32_t kMin = std::numeric_limits<std::int32_t>::min();
-  d::IntraFrame f = make_frame(0, 4, 1);
+  d::Frame f = make_frame(0, 4, 1);
   f.coords = {
       {kMin, kMin, kMin}, {kMax, kMin, kMin},  // dx = 2^32 - 1
       {kMin, kMax, kMin},                      // dy, dx back
@@ -125,7 +124,7 @@ inline d::IntraFrame extreme_frame() {
 }
 
 // What a frame holds, hashed: coordinates, masks and coefficients.
-inline std::uint32_t content_hash(const d::IntraFrame& f) {
+inline std::uint32_t content_hash(const d::Frame& f) {
   std::vector<std::uint32_t> words;
   for (const vr::Vec3i& c : f.coords) {
     words.insert(words.end(), {static_cast<std::uint32_t>(c.x),
@@ -169,7 +168,7 @@ inline constexpr GoldenFrame kGoldenFrames[] = {
     {true, 6, 4, 0, 1, 0x11b607ddu, 236, 0x92cc1c51u},
 };
 
-inline d::IntraFrame golden_frame(const GoldenFrame& g) {
+inline d::Frame golden_frame(const GoldenFrame& g) {
   return g.extreme ? extreme_frame() : make_frame(g.blocks, g.k, g.seed);
 }
 
