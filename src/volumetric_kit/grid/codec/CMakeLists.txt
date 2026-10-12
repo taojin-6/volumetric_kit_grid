@@ -28,7 +28,8 @@ target_sources(
           decoder.cpp
           device_frame_reader.cpp
           device_frame_writer.cpp
-          encoder.cpp)
+          encoder.cpp
+          frame_hash.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.
