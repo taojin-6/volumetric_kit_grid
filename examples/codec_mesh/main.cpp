@@ -156,9 +156,9 @@ vkc::Status run(const Options& opt) {
               config.params.coefficient_count,
               vr_example::quantization_name(opt.codec.quantization_table),
               double(config.params.quantization_scale));
-  VKC_TRY(stream.code(volume, opt.output.prefix.empty()
-                                  ? std::string{}
-                                  : opt.output.prefix + ".vrtc"));
+  VKC_TRY(stream.code(
+      volume, 0,
+      opt.output.prefix.empty() ? std::string{} : opt.output.prefix + ".vrtc"));
   stream.report(30.0, 0);  // One mesh frame, not a measured sequence bitrate.
   VKC_ASSIGN(const mesh::Mesh source, extractor.extract_host(volume));
   VKC_ASSIGN(const mesh::Mesh decoded, extractor.extract_host(stream.player()));
