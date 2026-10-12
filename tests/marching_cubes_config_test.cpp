@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -308,12 +309,11 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // driver (lavapipe, both Linux CI legs) two indices would collapse to one and
   // EXCLUSIVE is the correct answer, which is asserted instead.
   {
-    std::uint32_t family_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(gpu.device.physical_device(),
-                                             &family_count, nullptr);
+    const std::optional<std::uint32_t> other =
+        vr_test::other_queue_family(gpu.device);
     mesh::MarchingCubesConfig shared_config;
-    shared_config.queue_families[0] = 0;
-    shared_config.queue_families[1] = family_count > 1 ? 1 : 0;
+    shared_config.queue_families[0] = gpu.device.queue_family();
+    shared_config.queue_families[1] = other.value_or(gpu.device.queue_family());
     shared_config.queue_family_count = 2;
     vkc::Result<mesh::MarchingCubes> shared_result =
         mesh::MarchingCubes::create(gpu.device, gpu.allocator, shared_config);
@@ -322,8 +322,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vkc::Result<mesh::DeviceMesh> shared_mesh =
         shared.extract_device(small, 0.0f);
     CHECK(shared_mesh.ok());
-    const VkSharingMode expected = family_count > 1 ? VK_SHARING_MODE_CONCURRENT
-                                                    : VK_SHARING_MODE_EXCLUSIVE;
+    const VkSharingMode expected =
+        other ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
     CHECK(shared_mesh.value().sharing_mode == expected);
   }
 
