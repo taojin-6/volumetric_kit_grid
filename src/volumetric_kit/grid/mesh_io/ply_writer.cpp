@@ -10,8 +10,9 @@
 #include <ostream>
 #include <vector>
 
-#include "errors.hpp"
 #include "tinyply_backend.hpp"
+#include "volumetric_kit/core/base/exception_status.hpp"
+#include "volumetric_kit/core/base/file_io.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
 
 namespace volumetric_kit::recon::io {
@@ -45,7 +46,7 @@ bool finite(Vec3f v) {
 }  // namespace
 
 core::Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
-  VKC_TRY(detail::check_path("write_ply", path));
+  VKC_TRY(core::check_path("write_ply", path));
   if (mesh.indices.size() % 3 != 0) {
     return core::Status::invalid_argument(
         "write_ply: incomplete triangle indices");
@@ -135,7 +136,7 @@ core::Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
   }
   return {};
 } catch (...) {
-  return detail::exception_status("write_ply");
+  return core::exception_status("write_ply", core::Status::Code::IoError);
 }
 
 }  // namespace volumetric_kit::recon::io
