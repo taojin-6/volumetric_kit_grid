@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <vector>
 
 #include "codec_quantization.hpp"
@@ -128,19 +129,14 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
     if (tau > 0.0f) {
       std::snprintf(f, sizeof f, "%.4f", c.fscore.f);
     }
-    const auto gpu_ms = [](const vkc::StageMetrics& rows, const char* name) {
-      const vkc::StageRow* row = find_row(rows, name);
-      return row != nullptr && row->has_gpu ? row->gpu_ms : -1.0;
-    };
+    // Device time as a stream's rows count it (device_ms).
     char enc_gpu[16] = "-";
     char dec_gpu[16] = "-";
-    const double enc_device = gpu_ms(enc_rows, "codec encode");
-    const double dec_device = gpu_ms(dec_rows, "codec decode");
-    if (enc_device >= 0.0) {
-      std::snprintf(enc_gpu, sizeof enc_gpu, "%.2f", enc_device / kTimedRounds);
+    if (const std::optional<double> ms = device_ms(enc_rows)) {
+      std::snprintf(enc_gpu, sizeof enc_gpu, "%.2f", *ms / kTimedRounds);
     }
-    if (dec_device >= 0.0) {
-      std::snprintf(dec_gpu, sizeof dec_gpu, "%.2f", dec_device / kTimedRounds);
+    if (const std::optional<double> ms = device_ms(dec_rows)) {
+      std::snprintf(dec_gpu, sizeof dec_gpu, "%.2f", *ms / kTimedRounds);
     }
     std::printf(
         "  %-8s %4u %6.3f | %8zu %7.2f %5.0fx | %7.3f %7.3f %7.3f %6zu | "

@@ -5,41 +5,21 @@
 // and color encoding independently of the writer's backend.
 
 #include <array>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <string>
-#include <system_error>
 #include <vector>
 
+#include "scratch_dir.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 
 namespace vr = volumetric_kit::recon;
-namespace fs = std::filesystem;
 
 namespace {
 
-struct Scratch {
-  fs::path path =
-      fs::temp_directory_path() /
-      ("recon_io_ply_" +
-       std::to_string(
-           std::chrono::steady_clock::now().time_since_epoch().count()));
-  Scratch() { fs::create_directory(path); }
-  ~Scratch() {
-    std::error_code ignored;
-    fs::remove_all(path, ignored);
-  }
-};
-
-std::vector<std::uint8_t> read_bytes(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-}
+using vr_test::read_bytes;
 
 std::uint32_t read_u32(const std::uint8_t* p) {
   return static_cast<std::uint32_t>(p[0]) |
@@ -76,7 +56,7 @@ vr::mesh::Mesh triangle() {
 }  // namespace
 
 int main() {
-  Scratch scratch;
+  vr_test::Scratch scratch("recon_io_ply_");
   const auto path = (scratch.path / "mesh.ply").string();
   const auto mesh = triangle();
   CHECK(vr::io::write_ply(path, mesh));
