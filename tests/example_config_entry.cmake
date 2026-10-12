@@ -44,7 +44,7 @@ if(program_name STREQUAL "codec_mesh")
   file(WRITE "${WORK_DIR}/shape.obj" "v 0 0 0\nv 1 0 0\nv 0 2 0\nf 1 2 3\n")
   file(
     WRITE "${WORK_DIR}/inspect.json"
-    "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"shape.obj\",\"height_m\":1.7,\"up_vector\":[0,1,0]},\"codec\":{\"inspect_only\":true}}\n"
+    "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"shape.obj\",\"height_m\":1.7,\"up_axis\":\"y\"},\"codec\":{\"inspect_only\":true}}\n"
   )
   file(MAKE_DIRECTORY "${WORK_DIR}/elsewhere")
   execute_process(
