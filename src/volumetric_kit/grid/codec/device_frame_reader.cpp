@@ -57,6 +57,8 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
 core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
     core::CommandBatch& batch, const ParsedFrame& frame,
     core::GpuStageScope* stage) {
+  VKC_TRY(
+      check_frame_type(frame.header.type, "DeviceFrameReader::record_decode"));
   const std::uint32_t n = frame.header.block_count;
   const std::uint32_t k = frame.header.params.coefficient_count;
   const auto segments =

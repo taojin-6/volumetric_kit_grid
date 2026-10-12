@@ -4,7 +4,7 @@
 #pragma once
 
 /// @file bitstream.hpp
-/// @brief The v3 intra frame: what a frame holds, and its byte layout.
+/// @brief The v3 frame: what a frame holds, and its byte layout.
 ///
 /// Internal (under src/, never installed): the `Encoder` and `Decoder` build
 /// and consume it; nothing outside the tier should see the layout. The layout
@@ -50,9 +50,9 @@
 /// includes the weights, so `read_frame_info` needs no entropy decode and
 /// returns every parameter the transform uses.
 ///
-/// Version 2 (2026-10-01) is version 1 with that mask and sign; version 1
-/// sent a partial mask as 64 bytes through one table and a sign as a field
-/// of its own.
+/// Version 2 (2026-10-01) is version 1 with the grammar's mask code and sign;
+/// version 1 sent a partial mask as 64 bytes through one table and a sign as
+/// a field of its own.
 
 #include <algorithm>
 #include <cstddef>
@@ -88,9 +88,8 @@ inline constexpr std::uint16_t kSectionRequired = 1;
 /// Every section flag v3 defines. A known section with any other bit set is
 /// refused as `Status::Code::Unsupported`.
 inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
-/// Blocks per segment unless the writer is told otherwise: about 1% of a
-/// default frame in per-segment overhead, and room0's ~107 k blocks in ~1.7 k
-/// independently decodable segments.
+/// Blocks per segment unless the writer is told otherwise:
+/// @ref EncoderConfig::segment_size's default, whose doc gives its cost.
 inline constexpr std::uint32_t kDefaultSegmentSize = 64;
 /// The most segments a frame holds: SEGMENTS' u32 length bounds it.
 inline constexpr std::uint64_t kMaxFrameSegments =
@@ -103,10 +102,17 @@ constexpr std::uint64_t frame_segment_count(std::uint64_t blocks,
   return blocks == 0 ? 0 : (blocks - 1) / segment_size + 1;
 }
 
-/// What a frame's header says it is.
+/// What a frame is: byte 6 of its header. @ref write_frame and the readers
+/// refuse a type they do not code (@ref check_frame_type).
 enum class FrameType : std::uint8_t {
   kIntra = 0,  ///< Self-contained: decodes with no reference frame.
 };
+
+/// @brief The type check @ref write_frame and every reader make.
+/// @param who  The caller, which a refusal names.
+/// @return OK for @ref FrameType::kIntra, the one type this tier codes;
+///         otherwise `Status::Code::Unsupported`.
+VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
@@ -119,9 +125,10 @@ inline constexpr std::uint32_t kSectionCount = 3;
 static_assert(static_cast<std::uint32_t>(SectionId::kPayload) == kSectionCount,
               "section ids run 1..kSectionCount");
 
-/// @brief One intra frame's content, as the writer takes it and the reader
+/// @brief One frame's content, as the writer takes it and the reader
 ///        returns it.
-struct IntraFrame {
+struct Frame {
+  FrameType type = FrameType::kIntra;  ///< What the frame is.
   /// The grid's voxel edge, metres: with the block coordinates it places the
   /// frame in the world, so a decoder builds a grid of the same geometry.
   float voxel_size = 0.0f;
@@ -152,6 +159,8 @@ inline void sort_by_coord(std::vector<volume::BlockIndex>& blocks) {
 
 /// @brief A frame's header, parsed and checked without decoding anything.
 struct FrameHeader {
+  /// What the frame is: a type this reader decodes.
+  FrameType type = FrameType::kIntra;
   float voxel_size = 0.0f;  ///< Metres per voxel edge.
   float trunc_dist = 0.0f;  ///< Metres; the steps are fractions of it.
   CodecParams params;       ///< K, global scale, and the kept bases' weights.
@@ -162,7 +171,7 @@ struct FrameHeader {
 
 /// @brief Parse and check a frame's fixed header -- the first
 ///        @ref frame_header_bytes -- and nothing after it.
-/// @return The header, or the same header refusals as @ref read_intra_frame.
+/// @return The header, or the same header refusals as @ref read_frame.
 VR_CODEC_API core::Result<FrameHeader> read_frame_header(
     const std::uint8_t* data, std::size_t size);
 
@@ -172,8 +181,9 @@ struct FrameWriteOptions {
   std::uint32_t segment_size = kDefaultSegmentSize;
 };
 
-/// @brief Serialize an intra frame.
-/// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
+/// @brief Serialize a frame.
+/// @return The frame's bytes; `Status::Code::Unsupported` for a type other
+///         than @ref FrameType::kIntra; `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, arrays whose sizes disagree with `coords`, coordinates not
 ///         strictly increasing, a coefficient outside ±32767, a segment size
@@ -182,8 +192,8 @@ struct FrameWriteOptions {
 ///         `Status::Code::IoError` only if the coder refuses a symbol its
 ///         own tables were counted from, which is a bug here, never the
 ///         input's.
-VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_intra_frame(
-    const IntraFrame& frame, const FrameWriteOptions& options = {});
+VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_frame(
+    const Frame& frame, const FrameWriteOptions& options = {});
 
 /// @return How many frequency tables a frame keeping @p k coefficients
 ///         carries, in TABLES order.
@@ -201,7 +211,7 @@ VR_CODEC_API std::vector<FrequencyTable> frame_tables(
     const std::vector<std::vector<std::uint64_t>>& counts);
 
 /// @brief A frame whose segments are already coded, which
-///        @ref assemble_intra_frame lays out.
+///        @ref assemble_frame lays out.
 struct CodedFrame {
   float voxel_size = 0.0f;
   float trunc_dist = 0.0f;
@@ -219,16 +229,18 @@ struct CodedFrame {
 /// @brief Lay out a coded frame: header, section table, TABLES, SEGMENTS and
 ///        PAYLOAD. Shared by the host and device writers, so their containers
 ///        cannot differ.
+/// @param type  Written to byte 6 as given: the caller coded the segments
+///              for it.
 /// @return The frame's bytes, or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
 ///         params, a segment size of 0, tables or segment lengths whose
 ///         count the block count and K disagree with, lengths that do not
 ///         sum to the payload, a payload past 4 GiB or more than 2^30 - 1
 ///         segments.
-VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_intra_frame(
-    const CodedFrame& frame);
+VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
+    FrameType type, const CodedFrame& frame);
 
-/// @brief Parse and decode an intra frame.
+/// @brief Parse and decode a frame.
 ///
 /// Reads nothing outside `[data, data + size)`, whatever the bytes say.
 /// @param data        The frame.
@@ -252,15 +264,16 @@ VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_intra_frame(
 ///         well-formed frame of more than @p max_blocks blocks, or one whose
 ///         arrays would not fit this platform's address space (reachable on a
 ///         32-bit build).
-VR_CODEC_API core::Result<IntraFrame> read_intra_frame(
-    const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks);
+VR_CODEC_API core::Result<Frame> read_frame(const std::uint8_t* data,
+                                            std::size_t size,
+                                            std::uint32_t max_blocks);
 
 /// @brief A frame parsed and checked up to its segment streams: what a
 ///        reader, on the host or the device, decodes them from.
 struct ParsedFrame {
   FrameHeader header;
   /// @ref frame_model_count tables, in TABLES order, without the host
-  /// reader's slot lookups (@ref decode_intra_frame builds them).
+  /// reader's slot lookups (@ref decode_frame builds them).
   std::vector<FrequencyTable> tables;
   /// Each segment's stream length in bytes: even, at least 4, summing to
   /// `payload_size`.
@@ -270,22 +283,24 @@ struct ParsedFrame {
   std::size_t payload_size = 0;
 };
 
-/// @brief Everything @ref read_intra_frame checks before it decodes a
+/// @brief Everything @ref read_frame checks before it decodes a
 ///        segment: the header, the sections, the tables, the segment
 ///        lengths, and the block count against @p max_blocks.
-/// @return The parsed frame, or those refusals, as @ref read_intra_frame
+/// @return The parsed frame, or those refusals, as @ref read_frame
 ///         makes them.
-VR_CODEC_API core::Result<ParsedFrame> parse_intra_frame(
-    const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks);
+VR_CODEC_API core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
+                                                   std::size_t size,
+                                                   std::uint32_t max_blocks);
 
-/// @brief Decode a parsed frame's segments on the host: @ref read_intra_frame
-///        after @ref parse_intra_frame.
+/// @brief Decode a parsed frame's segments on the host: @ref read_frame
+///        after @ref parse_frame.
 /// @param parsed  Taken by value: its tables gain the slot lookups only this
 ///                reader needs.
-/// @return The frame, or @ref read_intra_frame's refusals of its segments
-///         (and `Status::Code::OutOfMemory` for arrays past this
+/// @return The frame; `Status::Code::Unsupported` for a type it does not
+///         decode (@ref check_frame_type); or @ref read_frame's refusals of
+///         its segments (and `Status::Code::OutOfMemory` for arrays past this
 ///         platform's address space).
-VR_CODEC_API core::Result<IntraFrame> decode_intra_frame(ParsedFrame parsed);
+VR_CODEC_API core::Result<Frame> decode_frame(ParsedFrame parsed);
 
 /// How a segment's stream failed to decode.
 enum class SegmentFault : std::uint32_t {

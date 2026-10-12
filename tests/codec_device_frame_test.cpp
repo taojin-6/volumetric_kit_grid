@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Tao Jin
 
 // The device frame writer and reader against the host's: every frame the
-// writer writes must be write_intra_frame's, byte for byte, and every frame
-// the reader reads must decode to read_intra_frame's blocks or be refused as
-// it refuses it -- the test the 2026-09-26 decision set for the GPU coder.
-// Skips where no device is present.
+// writer writes must be write_frame's, byte for byte, and every frame the
+// reader reads must decode to read_frame's blocks or be refused as it refuses
+// it -- the test the 2026-09-26 decision set for the GPU coder. Skips where no
+// device is present.
 
 #include <cstdint>
 #include <cstdio>
@@ -55,7 +55,7 @@ vkc::Result<std::unique_ptr<vkc::Buffer>> upload(const void* bytes,
 // The device writer's bytes for a host frame: its blocks uploaded, counted
 // and finished, as the encoder does with the transform's output.
 vkc::Result<std::vector<std::uint8_t>> device_write(
-    d::DeviceFrameWriter& writer, const d::IntraFrame& frame,
+    d::DeviceFrameWriter& writer, const d::Frame& frame,
     const d::FrameWriteOptions& options) {
   const auto n = static_cast<std::uint32_t>(frame.coords.size());
   const std::uint32_t k = frame.blocks.params.coefficient_count;
@@ -96,16 +96,15 @@ vkc::Result<std::vector<std::uint8_t>> device_write(
 }
 
 // The device reader's decode of a frame, read back as the host's.
-vkc::Result<d::IntraFrame> device_read(d::DeviceFrameReader& reader,
-                                       const std::uint8_t* data,
-                                       std::size_t size) {
+vkc::Result<d::Frame> device_read(d::DeviceFrameReader& reader,
+                                  const std::uint8_t* data, std::size_t size) {
   VKC_ASSIGN(const d::ParsedFrame parsed,
-             d::parse_intra_frame(data, size, kMaxBlocks));
+             d::parse_frame(data, size, kMaxBlocks));
   const std::uint32_t n = parsed.header.block_count;
   const std::uint32_t k = parsed.header.params.coefficient_count;
   const std::uint32_t words = (k + 1) / 2;
   std::vector<std::uint32_t> packed(std::size_t(n) * words);
-  d::IntraFrame frame;
+  d::Frame frame;
   frame.voxel_size = parsed.header.voxel_size;
   frame.blocks.trunc_dist = parsed.header.trunc_dist;
   frame.blocks.params = parsed.header.params;
@@ -141,9 +140,9 @@ vkc::Result<d::IntraFrame> device_read(d::DeviceFrameReader& reader,
 int same_read(d::DeviceFrameReader& reader,
               const std::vector<std::uint8_t>& bytes,
               std::string* refusal = nullptr) {
-  const vkc::Result<d::IntraFrame> host =
-      d::read_intra_frame(bytes.data(), bytes.size(), kMaxBlocks);
-  const vkc::Result<d::IntraFrame> device =
+  const vkc::Result<d::Frame> host =
+      d::read_frame(bytes.data(), bytes.size(), kMaxBlocks);
+  const vkc::Result<d::Frame> device =
       device_read(reader, bytes.data(), bytes.size());
   if (host.ok() != device.ok() ||
       (!host.ok() && host.status().message() != device.status().message())) {
@@ -158,8 +157,8 @@ int same_read(d::DeviceFrameReader& reader,
     return 0;
   }
   if (refusal != nullptr) refusal->clear();
-  const d::IntraFrame& a = host.value();
-  const d::IntraFrame& b = device.value();
+  const d::Frame& a = host.value();
+  const d::Frame& b = device.value();
   CHECK(a.voxel_size == b.voxel_size);
   CHECK(a.coords == b.coords);
   CHECK(a.blocks.masks == b.blocks.masks);
@@ -170,11 +169,11 @@ int same_read(d::DeviceFrameReader& reader,
 // The host's frame and the device's, for one frame and segment size, and the
 // device's decode of it.
 int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
-               const d::IntraFrame& frame, std::uint32_t segment_size) {
+               const d::Frame& frame, std::uint32_t segment_size) {
   d::FrameWriteOptions options;
   options.segment_size = segment_size;
   const vkc::Result<std::vector<std::uint8_t>> host =
-      d::write_intra_frame(frame, options);
+      d::write_frame(frame, options);
   const vkc::Result<std::vector<std::uint8_t>> device =
       device_write(writer, frame, options);
   CHECK(host.ok());
@@ -205,7 +204,7 @@ int matches_host_case(d::DeviceFrameWriter& writer,
     }
   }
   // Steps across all of int32, and a segment of first blocks only.
-  const d::IntraFrame f = extreme_frame();
+  const d::Frame f = extreme_frame();
   CHECK(same_bytes(writer, reader, f, 64) == 0);
   CHECK(same_bytes(writer, reader, f, 1) == 0);
   // A smaller frame after larger ones reuses the retained buffers.
@@ -238,8 +237,8 @@ int corruption_case(d::DeviceFrameReader& reader) {
   d::FrameWriteOptions two;
   two.segment_size = 2;
   const std::vector<std::uint8_t> frames[] = {
-      d::write_intra_frame(make_frame(300, 32, 13), sixteen).value(),
-      d::write_intra_frame(extreme_frame(), two).value()};
+      d::write_frame(make_frame(300, 32, 13), sixteen).value(),
+      d::write_frame(extreme_frame(), two).value()};
   Lcg rng{29};
   int decoded = 0;
   int overflow = 0;
@@ -247,7 +246,7 @@ int corruption_case(d::DeviceFrameReader& reader) {
   int order = 0;
   for (const std::vector<std::uint8_t>& good : frames) {
     const vkc::Result<d::ParsedFrame> parsed =
-        d::parse_intra_frame(good.data(), good.size(), kMaxBlocks);
+        d::parse_frame(good.data(), good.size(), kMaxBlocks);
     CHECK(parsed.ok());
     const auto payload =
         static_cast<std::uint32_t>(parsed.value().payload - good.data());
@@ -303,8 +302,8 @@ int out_of_range_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<std::vector<std::uint8_t>> frame =
       writer.finish(blocks, 0.005f, 0.04f, params);
   CHECK(frame.ok());
-  vkc::Result<d::IntraFrame> read =
-      d::read_intra_frame(frame.value().data(), frame.value().size(), 1);
+  vkc::Result<d::Frame> read =
+      d::read_frame(frame.value().data(), frame.value().size(), 1);
   CHECK(read.ok());
   CHECK(read.value().blocks.coefficients[0] == -codec::kMaxQuantizedMagnitude);
   return 0;
@@ -318,19 +317,32 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   d::FrameWriteOptions whole;
   whole.segment_size = kLimit + 1;
   const std::vector<std::uint8_t> long_segment =
-      d::write_intra_frame(make_frame(kLimit + 1, 1, 11), whole).value();
+      d::write_frame(make_frame(kLimit + 1, 1, 11), whole).value();
   CHECK(
-      d::read_intra_frame(long_segment.data(), long_segment.size(), kMaxBlocks)
-          .ok());
-  const vkc::Result<d::IntraFrame> refused =
+      d::read_frame(long_segment.data(), long_segment.size(), kMaxBlocks).ok());
+  const vkc::Result<d::Frame> refused =
       device_read(reader, long_segment.data(), long_segment.size());
   CHECK(!refused.ok());
   CHECK(refused.status().domain() == vkc::Status::Code::InvalidArgument);
   // The header's segment size alone does not count: this frame's one
   // segment holds kLimit blocks.
   const std::vector<std::uint8_t> at_limit =
-      d::write_intra_frame(make_frame(kLimit, 1, 11), whole).value();
+      d::write_frame(make_frame(kLimit, 1, 11), whole).value();
   CHECK(same_read(reader, at_limit) == 0);
+  return 0;
+}
+
+// The reader refuses a parsed frame of a type it does not decode, as the
+// host's decode_frame does.
+int frame_type_case(d::DeviceFrameReader& reader) {
+  const std::vector<std::uint8_t> good =
+      d::write_frame(make_frame(100, 16, 12)).value();
+  d::ParsedFrame typed =
+      d::parse_frame(good.data(), good.size(), kMaxBlocks).value();
+  typed.header.type = static_cast<d::FrameType>(1);
+  vkc::CommandBatch batch(*g_device, *g_allocator);
+  CHECK(reader.record_decode(batch, typed).status().domain() ==
+        vkc::Status::Code::Unsupported);
   return 0;
 }
 
@@ -366,6 +378,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (out_of_range_case(gpu.device, gpu.allocator, writer) != 0) {
     return 1;
   }
+  if (frame_type_case(reader) != 0) return 1;
   if (refusals_case(gpu.device, gpu.allocator) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;

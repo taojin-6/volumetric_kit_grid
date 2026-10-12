@@ -166,7 +166,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                        " (the grid's num_blocks); grow it with "
                        "VoxelBlockGrid::resize and decode again");
     };
-    core::Result<detail::ParsedFrame> parsed = detail::parse_intra_frame(
+    core::Result<detail::ParsedFrame> parsed = detail::parse_frame(
         data, size, static_cast<std::uint32_t>(gp.num_blocks));
     if (!parsed.ok()) return too_big(parsed.status());
     const std::size_t segments = parsed.value().segment_lengths.size();
@@ -186,10 +186,10 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
       }
     }
     if (!on_device) {
-      core::Result<detail::IntraFrame> r =
-          detail::decode_intra_frame(std::move(parsed).value());
+      core::Result<detail::Frame> r =
+          detail::decode_frame(std::move(parsed).value());
       if (!r.ok()) return too_big(r.status());
-      detail::IntraFrame frame = std::move(r).value();
+      detail::Frame frame = std::move(r).value();
       host_coords.resize(frame.coords.size());
       for (std::size_t b = 0; b < host_coords.size(); ++b) {
         host_coords[b].coord = frame.coords[b];

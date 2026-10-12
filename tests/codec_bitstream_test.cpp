@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Host-only tests for the v1 intra frame (bitstream.hpp): round trips across
+// Host-only tests for the v3 frame (bitstream.hpp): round trips across
 // block counts, coefficient counts and segment sizes; coordinates at the ends
 // of int32; every writer refusal; every reader refusal, each made by editing
-// one field or section of a valid frame; the section rules; coordinates out
-// of order across segments; truncation and random corruption, which must fail
-// cleanly and never read out of bounds; and what an all-zero frame costs.
+// one field or section of a valid frame; the frame type the container writes;
+// the section rules; coordinates out of order across segments; truncation and
+// random corruption, which must fail cleanly and never read out of bounds; and
+// what an all-zero frame costs.
 // CPU-only, so these always run.
 
 #include <algorithm>
@@ -53,8 +54,8 @@ bool same_kept_weights(const codec::CodecParams& a,
   return true;
 }
 
-bool same_frame(const d::IntraFrame& a, const d::IntraFrame& b) {
-  return same_bits(a.voxel_size, b.voxel_size) &&
+bool same_frame(const d::Frame& a, const d::Frame& b) {
+  return a.type == b.type && same_bits(a.voxel_size, b.voxel_size) &&
          same_bits(a.blocks.trunc_dist, b.blocks.trunc_dist) &&
          a.blocks.params.coefficient_count ==
              b.blocks.params.coefficient_count &&
@@ -66,24 +67,24 @@ bool same_frame(const d::IntraFrame& a, const d::IntraFrame& b) {
          a.blocks.masks == b.blocks.masks;
 }
 
-vkc::Result<d::IntraFrame> read(const std::vector<std::uint8_t>& bytes,
-                                std::uint32_t max_blocks = 1u << 20) {
-  return d::read_intra_frame(bytes.data(), bytes.size(), max_blocks);
+vkc::Result<d::Frame> read(const std::vector<std::uint8_t>& bytes,
+                           std::uint32_t max_blocks = 1u << 20) {
+  return d::read_frame(bytes.data(), bytes.size(), max_blocks);
 }
 
 // Write, read back, compare, and write again: the frame survives exactly and
 // re-encodes to the same bytes.
-int round_trip(const d::IntraFrame& f, std::uint32_t segment_size) {
+int round_trip(const d::Frame& f, std::uint32_t segment_size) {
   d::FrameWriteOptions opt;
   opt.segment_size = segment_size;
-  vkc::Result<std::vector<std::uint8_t>> bytes = d::write_intra_frame(f, opt);
+  vkc::Result<std::vector<std::uint8_t>> bytes = d::write_frame(f, opt);
   CHECK(bytes.ok());
-  vkc::Result<d::IntraFrame> back =
+  vkc::Result<d::Frame> back =
       read(bytes.value(), static_cast<std::uint32_t>(f.coords.size()));
   CHECK(back.ok());
   CHECK(same_frame(f, back.value()));
   vkc::Result<std::vector<std::uint8_t>> again =
-      d::write_intra_frame(back.value(), opt);
+      d::write_frame(back.value(), opt);
   CHECK(again.ok());
   CHECK(again.value() == bytes.value());
   return 0;
@@ -99,7 +100,7 @@ int round_trip_case() {
   }
   CHECK(round_trip(make_frame(40, codec::kVoxelsPerBlock, 5), 16) == 0);
   // The default segment size, and non-default steps carried bit for bit.
-  d::IntraFrame f = make_frame(300, 32, 9);
+  d::Frame f = make_frame(300, 32, 9);
   f.blocks.params.quantization_scale = 0.3141f;
   for (std::size_t i = 0; i < f.blocks.params.quantization_weights.size();
        ++i) {
@@ -113,7 +114,7 @@ int round_trip_case() {
 
 // Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
 int extreme_coords_case() {
-  const d::IntraFrame f = codec_frames::extreme_frame();
+  const d::Frame f = codec_frames::extreme_frame();
   CHECK(round_trip(f, 64) == 0);
   CHECK(round_trip(f, 1) == 0);  // every coordinate in full
   return 0;
@@ -123,11 +124,10 @@ int extreme_coords_case() {
 // together still round-trip, but no longer write these.
 int golden_case() {
   for (const codec_frames::GoldenFrame& g : codec_frames::kGoldenFrames) {
-    const d::IntraFrame f = codec_frames::golden_frame(g);
+    const d::Frame f = codec_frames::golden_frame(g);
     d::FrameWriteOptions opt;
     opt.segment_size = g.segment_size;
-    const vkc::Result<std::vector<std::uint8_t>> bytes =
-        d::write_intra_frame(f, opt);
+    const vkc::Result<std::vector<std::uint8_t>> bytes = d::write_frame(f, opt);
     CHECK(bytes.ok());
     const std::uint32_t content = codec_frames::content_hash(f);
     const std::uint32_t hash = vr_test::fnv1a(bytes.value());
@@ -148,12 +148,12 @@ int golden_case() {
 }
 
 int write_refusals_case() {
-  const d::IntraFrame good = make_frame(10, 8, 3);
-  CHECK(d::write_intra_frame(good).ok());
-  auto refused = [](const d::IntraFrame& f, d::FrameWriteOptions opt = {}) {
-    return !d::write_intra_frame(f, opt).ok();
+  const d::Frame good = make_frame(10, 8, 3);
+  CHECK(d::write_frame(good).ok());
+  auto refused = [](const d::Frame& f, d::FrameWriteOptions opt = {}) {
+    return !d::write_frame(f, opt).ok();
   };
-  d::IntraFrame f = good;
+  d::Frame f = good;
   std::swap(f.coords[3], f.coords[4]);  // out of order
   CHECK(refused(f));
   f = good;
@@ -183,6 +183,11 @@ int write_refusals_case() {
   d::FrameWriteOptions zero;
   zero.segment_size = 0;
   CHECK(refused(good, zero));
+  f = good;  // a type this writer does not code
+  f.type = static_cast<d::FrameType>(1);
+  const vkc::Result<std::vector<std::uint8_t>> typed = d::write_frame(f);
+  CHECK(!typed.ok());
+  CHECK(typed.status().domain() == vkc::Status::Code::Unsupported);
   return 0;
 }
 
@@ -202,7 +207,7 @@ int model_layout_case() {
   return 0;
 }
 
-// The container check the device writer relies on: assemble_intra_frame
+// The container check the device writer relies on: assemble_frame
 // refuses a coded frame whose header fields or sections disagree.
 int assemble_refusals_case() {
   d::CodedFrame good;
@@ -218,9 +223,9 @@ int assemble_refusals_case() {
   good.tables = d::frame_tables(counts);
   good.segment_lengths = {4, 4, 4};
   good.payload.assign(12, 0);
-  CHECK(d::assemble_intra_frame(good).ok());
+  CHECK(d::assemble_frame(d::FrameType::kIntra, good).ok());
   auto refused = [](const d::CodedFrame& f) {
-    return !d::assemble_intra_frame(f).ok();
+    return !d::assemble_frame(d::FrameType::kIntra, f).ok();
   };
   d::CodedFrame f = good;
   f.voxel_size = std::numeric_limits<float>::infinity();
@@ -319,13 +324,13 @@ std::vector<std::uint8_t> assemble(const std::vector<std::uint8_t>& frame,
 
 bool refused_as(const std::vector<std::uint8_t>& bytes, vkc::Status::Code code,
                 std::uint32_t max_blocks = 1u << 20) {
-  vkc::Result<d::IntraFrame> r = read(bytes, max_blocks);
+  vkc::Result<d::Frame> r = read(bytes, max_blocks);
   return !r.ok() && r.status().domain() == code;
 }
 
 int header_refusals_case() {
-  const d::IntraFrame f = make_frame(100, 16, 4);
-  const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
+  const d::Frame f = make_frame(100, 16, 4);
+  const std::vector<std::uint8_t> good = d::write_frame(f).value();
   CHECK(read(good).ok());
   using C = vkc::Status::Code;
   std::vector<std::uint8_t> b;
@@ -342,9 +347,7 @@ int header_refusals_case() {
   b = good;
   b[4] = 1;
   CHECK(refused_as(b, C::Unsupported));  // version 1, whose mask code differs
-  b = good;
-  b[6] = 1;
-  CHECK(refused_as(b, C::Unsupported));  // frame type 1 (inter)
+  // Byte 6, the frame type, is frame_type_case's.
   b = good;
   b[7] = 1;
   CHECK(refused_as(b, C::InvalidArgument));  // reserved
@@ -401,13 +404,54 @@ int header_refusals_case() {
   b = good;
   b.push_back(0);
   CHECK(refused_as(b, C::InvalidArgument));
-  CHECK(!d::read_intra_frame(nullptr, 64, 100).ok());
+  CHECK(!d::read_frame(nullptr, 64, 100).ok());
+  return 0;
+}
+
+// The container writes the type it is given into byte 6 and nothing else
+// changes, and every reader refuses a type it does not decode.
+int frame_type_case() {
+  const std::vector<std::uint8_t> good =
+      d::write_frame(make_frame(100, 16, 5)).value();
+  const d::ParsedFrame p =
+      d::parse_frame(good.data(), good.size(), 1u << 20).value();
+  d::CodedFrame coded;
+  coded.voxel_size = p.header.voxel_size;
+  coded.trunc_dist = p.header.trunc_dist;
+  coded.params = p.header.params;
+  coded.block_count = p.header.block_count;
+  coded.segment_size = p.header.segment_size;
+  coded.tables = p.tables;
+  coded.segment_lengths = p.segment_lengths;
+  coded.payload.assign(p.payload, p.payload + p.payload_size);
+  CHECK(good[6] == 0);
+  CHECK(d::assemble_frame(d::FrameType::kIntra, coded).value() == good);
+  CHECK(read(good).value().type == d::FrameType::kIntra);
+
+  using C = vkc::Status::Code;
+  for (std::uint32_t type : {1u, 255u}) {
+    std::vector<std::uint8_t> b =
+        d::assemble_frame(static_cast<d::FrameType>(type), coded).value();
+    CHECK(b[6] == type);
+    CHECK(refused_as(b, C::Unsupported));
+    CHECK(d::read_frame_header(b.data(), b.size()).status().domain() ==
+          C::Unsupported);
+    CHECK(d::parse_frame(b.data(), b.size(), 1u << 20).status().domain() ==
+          C::Unsupported);
+    b[6] = 0;
+    CHECK(b == good);
+  }
+  // decode_frame and the device reader take a caller's parsed frame, so they
+  // check its type again.
+  d::ParsedFrame typed = p;
+  typed.header.type = static_cast<d::FrameType>(1);
+  CHECK(d::decode_frame(typed).status().domain() == C::Unsupported);
   return 0;
 }
 
 int section_rules_case() {
-  const d::IntraFrame f = make_frame(100, 16, 6);
-  const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
+  const d::Frame f = make_frame(100, 16, 6);
+  const std::vector<std::uint8_t> good = d::write_frame(f).value();
   const std::vector<Section> s = sections_of(good);
   CHECK(s.size() == 3);
   CHECK(assemble(good, s) == good);  // the helpers are faithful
@@ -426,13 +470,13 @@ int section_rules_case() {
   // An unknown optional section is skipped; an unknown required one stops
   // the read.
   Section extra{9, 0, {1, 2, 3}};
-  vkc::Result<d::IntraFrame> with_extra =
+  vkc::Result<d::Frame> with_extra =
       read(assemble(good, {s[0], extra, s[1], s[2]}));
   CHECK(with_extra.ok());
   CHECK(same_frame(f, with_extra.value()));
   extra.flags = d::kSectionRequired;
   CHECK(refused_as(assemble(good, {s[0], extra, s[1], s[2]}), C::Unsupported));
-  // A flag v1 does not define is refused on a known section, whose body it
+  // A flag v3 does not define is refused on a known section, whose body it
   // may reinterpret, and ignored on an unknown optional one, which is skipped.
   for (std::size_t known = 0; known < 3; ++known) {
     std::vector<Section> flagged = s;
@@ -470,8 +514,8 @@ int section_rules_case() {
 // as a varint count of used symbols.
 int table_rules_case() {
   constexpr std::size_t kModels = 14;
-  const d::IntraFrame f = make_frame(0, 1, 1);
-  const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
+  const d::Frame f = make_frame(0, 1, 1);
+  const std::vector<std::uint8_t> good = d::write_frame(f).value();
   std::vector<Section> s = sections_of(good);
   CHECK(s[0].body == std::vector<std::uint8_t>(kModels, 0));
   using C = vkc::Status::Code;
@@ -526,8 +570,8 @@ void set_first_x_low_bits(std::vector<std::uint8_t>& payload, std::size_t at,
 }
 
 // Blocks all observed with zero coefficients at @p coords, K = 1.
-d::IntraFrame plain_frame(const std::vector<vr::Vec3i>& coords) {
-  d::IntraFrame f = make_frame(0, 1, 1);
+d::Frame plain_frame(const std::vector<vr::Vec3i>& coords) {
+  d::Frame f = make_frame(0, 1, 1);
   f.coords = coords;
   f.blocks.masks.assign(coords.size() * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(coords.size(), 0);
@@ -538,21 +582,21 @@ d::IntraFrame plain_frame(const std::vector<vr::Vec3i>& coords) {
 // writer makes one, so it is made by hand: x = 0x7FFFF000 becomes INT32_MAX,
 // and the next block's run step (+1) leaves int32.
 int coord_overflow_case() {
-  d::IntraFrame f = plain_frame({{0x7FFFF000, 0, 0}, {0x7FFFF001, 0, 0}});
-  const std::vector<std::uint8_t> good = d::write_intra_frame(f).value();
+  d::Frame f = plain_frame({{0x7FFFF000, 0, 0}, {0x7FFFF001, 0, 0}});
+  const std::vector<std::uint8_t> good = d::write_frame(f).value();
   CHECK(read(good).ok());
   std::vector<Section> s = sections_of(good);
   set_first_x_low_bits(s[2].body, 0, 0xFFF);
-  vkc::Result<d::IntraFrame> r = read(assemble(good, s));
+  vkc::Result<d::Frame> r = read(assemble(good, s));
   CHECK(!r.ok());
   CHECK(r.status().message().find("outside int32") != std::string::npos);
   // The same patch one block earlier is merely a different, valid frame:
   // raw bits carry no redundancy (see codec_rans_test).
   f = plain_frame({{0x7FFFF000, 0, 0}});
-  const std::vector<std::uint8_t> one = d::write_intra_frame(f).value();
+  const std::vector<std::uint8_t> one = d::write_frame(f).value();
   s = sections_of(one);
   set_first_x_low_bits(s[2].body, 0, 0xFFF);
-  vkc::Result<d::IntraFrame> moved = read(assemble(one, s));
+  vkc::Result<d::Frame> moved = read(assemble(one, s));
   CHECK(moved.ok());
   CHECK(moved.value().coords[0].x == kMax32);
 
@@ -561,7 +605,7 @@ int coord_overflow_case() {
   // off INT32_MAX: a one-block frame whose header claims two reaches for the
   // never-used z-step table.
   f = plain_frame({{kMax32, 0, 0}});
-  std::vector<std::uint8_t> b = d::write_intra_frame(f).value();
+  std::vector<std::uint8_t> b = d::write_frame(f).value();
   put_u32(b, 32, 2);
   r = read(b);
   CHECK(!r.ok());
@@ -574,11 +618,10 @@ int coord_overflow_case() {
 // flip there decodes cleanly: the reader must check the order itself, or a
 // duplicate reaches the inverse transform as two workgroups on one block.
 int segment_order_case() {
-  const d::IntraFrame f = plain_frame({{4, 0, 0}, {5, 0, 0}});
+  const d::Frame f = plain_frame({{4, 0, 0}, {5, 0, 0}});
   d::FrameWriteOptions one_each;
   one_each.segment_size = 1;
-  const std::vector<std::uint8_t> good =
-      d::write_intra_frame(f, one_each).value();
+  const std::vector<std::uint8_t> good = d::write_frame(f, one_each).value();
   CHECK(read(good).ok());
   const std::vector<Section> s = sections_of(good);
   const std::size_t second = get_u32(s[1].body, 0);  // segment 1's offset
@@ -589,13 +632,13 @@ int segment_order_case() {
   };
   // A duplicate, and a step backwards: both refused.
   for (std::uint32_t x : {4u, 3u}) {
-    vkc::Result<d::IntraFrame> r = with_second_x(x);
+    vkc::Result<d::Frame> r = with_second_x(x);
     CHECK(!r.ok());
     CHECK(r.status().message().find("does not start after") !=
           std::string::npos);
   }
   // A step forwards is only a different, valid frame.
-  vkc::Result<d::IntraFrame> r = with_second_x(9);
+  vkc::Result<d::Frame> r = with_second_x(9);
   CHECK(r.ok());
   CHECK(r.value().coords[1] == vr::Vec3i(9, 0, 0));
   return 0;
@@ -604,18 +647,17 @@ int segment_order_case() {
 // Every truncation fails cleanly, and random corruption never gets the reader
 // out of bounds -- the property the sanitizer job checks on every leg.
 int corruption_case() {
-  const d::IntraFrame small = make_frame(20, 8, 12);
+  const d::Frame small = make_frame(20, 8, 12);
   d::FrameWriteOptions opt;
   opt.segment_size = 4;
-  const std::vector<std::uint8_t> good =
-      d::write_intra_frame(small, opt).value();
+  const std::vector<std::uint8_t> good = d::write_frame(small, opt).value();
   for (std::size_t len = 0; len < good.size(); ++len) {
-    CHECK(!d::read_intra_frame(good.data(), len, 1000).ok());
+    CHECK(!d::read_frame(good.data(), len, 1000).ok());
   }
 
-  const d::IntraFrame f = make_frame(300, 32, 13);
+  const d::Frame f = make_frame(300, 32, 13);
   opt.segment_size = 16;
-  const std::vector<std::uint8_t> big = d::write_intra_frame(f, opt).value();
+  const std::vector<std::uint8_t> big = d::write_frame(f, opt).value();
   Lcg rng{17};
   int refused = 0;
   const int trials = 3000;
@@ -641,13 +683,13 @@ int corruption_case() {
 // state plus its first coordinate in full; every other symbol has
 // probability one and costs nothing.
 int zero_frame_cost_case() {
-  d::IntraFrame f = make_frame(0, 32, 1);
+  d::Frame f = make_frame(0, 32, 1);
   for (int i = 0; i < 640; ++i) {
     f.coords.push_back(vr::Vec3i(i, 0, 0));
   }
   f.blocks.masks.assign(640 * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(640 * 32, 0);
-  const std::vector<std::uint8_t> b = d::write_intra_frame(f).value();
+  const std::vector<std::uint8_t> b = d::write_frame(f).value();
   const std::vector<Section> s = sections_of(b);
   const std::size_t segments = 640 / d::kDefaultSegmentSize;
   std::printf("all-zero frame: %zu bytes for 640 blocks (payload %zu)\n",
@@ -660,7 +702,7 @@ int zero_frame_cost_case() {
   // And a frame with something to say costs far more: the zero case is not
   // passing by encoding nothing.
   const std::vector<std::uint8_t> busy =
-      d::write_intra_frame(make_frame(640, 32, 2)).value();
+      d::write_frame(make_frame(640, 32, 2)).value();
   CHECK(busy.size() - header > 20 * (b.size() - header));
   return 0;
 }
@@ -675,6 +717,7 @@ int main() {
   if (model_layout_case() != 0) return 1;
   if (assemble_refusals_case() != 0) return 1;
   if (header_refusals_case() != 0) return 1;
+  if (frame_type_case() != 0) return 1;
   if (section_rules_case() != 0) return 1;
   if (table_rules_case() != 0) return 1;
   if (coord_overflow_case() != 0) return 1;
