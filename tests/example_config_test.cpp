@@ -36,6 +36,7 @@ int main() {
       {"codec_mesh", cfg::Application::CodecMesh},
       {"fuse_orbbec", cfg::Application::FuseOrbbec},
       {"stream_orbbec", cfg::Application::FuseOrbbec},
+      {"readback_orbbec", cfg::Application::FuseOrbbec},
       {"fuse_render", cfg::Application::FuseRender},
       {"fuse_viewer", cfg::Application::FuseViewer},
       {"rig_viewer", cfg::Application::RigViewer},
@@ -49,6 +50,16 @@ int main() {
                    loaded.status().message().c_str());
     CHECK(loaded);
   }
+
+  const auto readback =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/readback_orbbec.json",
+                cfg::Application::FuseOrbbec);
+  CHECK(readback && readback->operation == cfg::Operation::Stream);
+  CHECK(readback->diagnostics.readback);
+  const auto fusion =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/fuse_orbbec.json",
+                cfg::Application::FuseOrbbec);
+  CHECK(fusion && !fusion->diagnostics.readback);
 
   const auto dataset =
       cfg::parse(R"({
