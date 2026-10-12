@@ -5,6 +5,7 @@
 // unchanged. No file assets, device or camera are opened.
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 
 #include "codec_config.hpp"
@@ -37,6 +38,7 @@ int main() {
       {"fuse_orbbec", cfg::Application::FuseOrbbec},
       {"stream_orbbec", cfg::Application::FuseOrbbec},
       {"readback_orbbec", cfg::Application::FuseOrbbec},
+      {"dump_orbbec", cfg::Application::FuseOrbbec},
       {"fuse_render", cfg::Application::FuseRender},
       {"fuse_viewer", cfg::Application::FuseViewer},
       {"rig_viewer", cfg::Application::RigViewer},
@@ -56,6 +58,19 @@ int main() {
                 cfg::Application::FuseOrbbec);
   CHECK(readback && readback->operation == cfg::Operation::Stream);
   CHECK(readback->diagnostics.readback);
+  CHECK(readback->diagnostics.dump_sets == 0);
+  CHECK(readback->diagnostics.dump_directory.empty());
+  // The first sets' JPEGs and luma, into a directory beside the scenario.
+  const auto dump =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/dump_orbbec.json",
+                cfg::Application::FuseOrbbec);
+  CHECK(dump && dump->operation == cfg::Operation::Stream);
+  CHECK(dump->source.color_codec == cfg::ColorCodec::Mjpeg);
+  CHECK(dump->diagnostics.readback && dump->diagnostics.dump_sets == 20);
+  CHECK(dump->diagnostics.dump_directory ==
+        (std::filesystem::path(VR_CONFIG_FIXTURES) / "results" / "dump")
+            .lexically_normal()
+            .string());
   const auto fusion =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/fuse_orbbec.json",
                 cfg::Application::FuseOrbbec);
