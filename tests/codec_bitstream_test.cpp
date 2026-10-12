@@ -347,9 +347,7 @@ int header_refusals_case() {
   b = good;
   b[4] = 1;
   CHECK(refused_as(b, C::Unsupported));  // version 1, whose mask code differs
-  b = good;
-  b[6] = 1;
-  CHECK(refused_as(b, C::Unsupported));  // frame type 1 (inter)
+  // Byte 6, the frame type, is frame_type_case's.
   b = good;
   b[7] = 1;
   CHECK(refused_as(b, C::InvalidArgument));  // reserved
@@ -443,6 +441,11 @@ int frame_type_case() {
     b[6] = 0;
     CHECK(b == good);
   }
+  // decode_frame and the device reader take a caller's parsed frame, so they
+  // check its type again.
+  d::ParsedFrame typed = p;
+  typed.header.type = static_cast<d::FrameType>(1);
+  CHECK(d::decode_frame(typed).status().domain() == C::Unsupported);
   return 0;
 }
 

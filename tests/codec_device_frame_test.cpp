@@ -332,6 +332,20 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   return 0;
 }
 
+// The reader refuses a parsed frame of a type it does not decode, as the
+// host's decode_frame does.
+int frame_type_case(d::DeviceFrameReader& reader) {
+  const std::vector<std::uint8_t> good =
+      d::write_frame(make_frame(100, 16, 12)).value();
+  d::ParsedFrame typed =
+      d::parse_frame(good.data(), good.size(), kMaxBlocks).value();
+  typed.header.type = static_cast<d::FrameType>(1);
+  vkc::CommandBatch batch(*g_device, *g_allocator);
+  CHECK(reader.record_decode(batch, typed).status().domain() ==
+        vkc::Status::Code::Unsupported);
+  return 0;
+}
+
 int refusals_case(vkc::Device& device, vkc::Allocator& allocator) {
   // finish with nothing counted refuses rather than coding stale steps.
   vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
@@ -364,6 +378,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (out_of_range_case(gpu.device, gpu.allocator, writer) != 0) {
     return 1;
   }
+  if (frame_type_case(reader) != 0) return 1;
   if (refusals_case(gpu.device, gpu.allocator) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;

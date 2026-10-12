@@ -57,10 +57,11 @@ class VR_CODEC_API DeviceFrameReader {
   /// which must happen before @ref check.
   /// @return The decoded blocks where the device holds them, valid until the
   ///         next call (no entries for a frame of none, which records
-  ///         nothing); `Status::Code::InvalidArgument`, before any buffer
-  ///         grows, for a segment longer than
-  ///         @ref kMaxDeviceDecodeSegmentSize or a buffer past
-  ///         `maxStorageBufferRange`; otherwise a buffer failure.
+  ///         nothing); `Status::Code::Unsupported`, recording nothing, for a
+  ///         type it does not decode (@ref check_frame_type);
+  ///         `Status::Code::InvalidArgument`, before any buffer grows, for a
+  ///         segment longer than @ref kMaxDeviceDecodeSegmentSize or a buffer
+  ///         past `maxStorageBufferRange`; otherwise a buffer failure.
   core::Result<ResidentBlocks> record_decode(
       core::CommandBatch& batch, const ParsedFrame& frame,
       core::GpuStageScope* stage = nullptr);

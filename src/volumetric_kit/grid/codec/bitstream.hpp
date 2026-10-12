@@ -103,10 +103,16 @@ constexpr std::uint64_t frame_segment_count(std::uint64_t blocks,
 }
 
 /// What a frame is: byte 6 of its header. @ref write_frame and the readers
-/// refuse a type they do not code as `Status::Code::Unsupported`.
+/// refuse a type they do not code (@ref check_frame_type).
 enum class FrameType : std::uint8_t {
   kIntra = 0,  ///< Self-contained: decodes with no reference frame.
 };
+
+/// @brief The type check @ref write_frame and every reader make.
+/// @param who  The caller, which a refusal names.
+/// @return OK for @ref FrameType::kIntra, the one type this tier codes;
+///         otherwise `Status::Code::Unsupported`.
+VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
@@ -290,8 +296,9 @@ VR_CODEC_API core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
 ///        after @ref parse_frame.
 /// @param parsed  Taken by value: its tables gain the slot lookups only this
 ///                reader needs.
-/// @return The frame, or @ref read_frame's refusals of its segments
-///         (and `Status::Code::OutOfMemory` for arrays past this
+/// @return The frame; `Status::Code::Unsupported` for a type it does not
+///         decode (@ref check_frame_type); or @ref read_frame's refusals of
+///         its segments (and `Status::Code::OutOfMemory` for arrays past this
 ///         platform's address space).
 VR_CODEC_API core::Result<Frame> decode_frame(ParsedFrame parsed);
 

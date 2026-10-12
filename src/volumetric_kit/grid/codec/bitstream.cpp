@@ -275,12 +275,7 @@ const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
 
 // The checks write_frame makes before coding anything.
 core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
-  if (frame.type != FrameType::kIntra) {
-    return core::Status::unsupported(
-        "write_frame: type " +
-        std::to_string(static_cast<std::uint32_t>(frame.type)) +
-        " (this writes intra)");
-  }
+  VKC_TRY(check_frame_type(frame.type, "write_frame"));
   const DctBlocks& b = frame.blocks;
   if (!positive_finite(frame.voxel_size)) {
     return bad_write("voxel_size must be finite and positive");
@@ -332,6 +327,14 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
 }
 
 }  // namespace
+
+core::Status check_frame_type(FrameType type, const char* who) {
+  if (type == FrameType::kIntra) return {};
+  return core::Status::unsupported(
+      std::string(who) + ": frame type " +
+      std::to_string(static_cast<std::uint32_t>(type)) +
+      " (only intra is coded)");
+}
 
 core::Result<std::vector<std::uint8_t>> write_frame(
     const Frame& frame, const FrameWriteOptions& options) {
@@ -542,11 +545,8 @@ core::Result<FrameHeader> read_frame_header(const std::uint8_t* data,
     header.params.quantization_weights[zigzag[j]] = h.f32();
   }
 
-  if (type != static_cast<std::uint32_t>(FrameType::kIntra)) {
-    return core::Status::unsupported(
-        "codec frame: type " + std::to_string(type) + " (this reads intra)");
-  }
   header.type = static_cast<FrameType>(type);
+  VKC_TRY(check_frame_type(header.type, "codec frame"));
   if (reserved != 0) {
     return bad("the reserved header byte is not zero");
   }
@@ -695,6 +695,7 @@ core::Result<Frame> read_frame(const std::uint8_t* data, std::size_t size,
 }
 
 core::Result<Frame> decode_frame(ParsedFrame parsed) {
+  VKC_TRY(check_frame_type(parsed.header.type, "decode_frame"));
   for (FrequencyTable& t : parsed.tables) t.build_decode();
   const FrameHeader& header = parsed.header;
   const std::uint32_t n = header.block_count;
