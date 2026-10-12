@@ -31,7 +31,7 @@ struct EncoderConfig {
   CodecParams params;
   /// Blocks per independently decodable segment, at least 1. Smaller costs a
   /// little more (each segment restates its first coordinate) and decodes
-  /// with more parallelism; the default is about 1% overhead.
+  /// with more parallelism; the default costs 2-3% of a frame.
   std::uint32_t segment_size = 64;
   /// Where the rANS coding runs. The device codes one segment per
   /// invocation, so smaller segments give it more parallelism.

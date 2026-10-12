@@ -88,9 +88,8 @@ inline constexpr std::uint16_t kSectionRequired = 1;
 /// Every section flag v3 defines. A known section with any other bit set is
 /// refused as `Status::Code::Unsupported`.
 inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
-/// Blocks per segment unless the writer is told otherwise: 2-3% of a default
-/// frame in per-segment overhead, and room0's 102 k blocks at 5 mm in 1.6 k
-/// independently decodable segments (measured in the 2026-09-27 frame entry).
+/// Blocks per segment unless the writer is told otherwise:
+/// @ref EncoderConfig::segment_size's default, whose doc gives its cost.
 inline constexpr std::uint32_t kDefaultSegmentSize = 64;
 /// The most segments a frame holds: SEGMENTS' u32 length bounds it.
 inline constexpr std::uint64_t kMaxFrameSegments =
