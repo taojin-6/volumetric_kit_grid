@@ -47,20 +47,30 @@ struct DctTransformConfig {
   std::uint32_t max_blocks_per_dispatch = 0;
 };
 
-/// @brief Blocks where the device holds them: @ref count entries of a block
-///        list, their masks and their coefficients, in the layout the
-///        kernels write. Borrowed from what produced them -- the transform's
+/// @brief Blocks where the device holds them: @ref count entries of masks
+///        and coefficients, and their block list, in the layout the kernels
+///        write. Borrowed from what produced them -- the transform's
 ///        @ref DctTransform::record_forward or the device frame reader -- and
 ///        valid until that object's next call.
+///
+/// A P-frame's entries are its stream positions (bitstream.hpp): its
+/// @ref reference_count reference entries, each with its mode, then its new
+/// blocks, which alone the list holds.
 struct ResidentBlocks {
-  const core::Buffer* list =
-      nullptr;  ///< `volume::BlockIndex` entries, frame order.
+  /// `volume::BlockIndex` entries in frame order, one per block entry:
+  /// `count - reference_count`.
+  const core::Buffer* list = nullptr;
   const core::Buffer* masks =
       nullptr;  ///< `kMaskWordsPerBlock` words an entry.
   /// Two int16 a word, coefficient 2p low; `(K + 1) / 2` words an entry.
   const core::Buffer* coefficients = nullptr;
+  /// A P-frame's mode for each reference entry, a u32 each
+  /// (`frame_models.glsl`'s `kMode*`); null without reference entries.
+  const core::Buffer* modes = nullptr;
   std::uint32_t count = 0;
   std::uint32_t coefficient_count = 0;  ///< K.
+  /// M, the entries before the blocks: 0 for an intra frame.
+  std::uint32_t reference_count = 0;
 };
 
 /// @brief The forward and inverse block DCT, as two GLSL compute kernels, and
@@ -204,7 +214,8 @@ class VR_CODEC_API DctTransform {
   /// grid's `trunc_dist` (both unchecked: the reader decoded them from a
   /// frame whose order and header the caller checked).
   /// @return As @ref inverse, and `Status::Code::InvalidArgument` for
-  ///         buffers missing or smaller than @p in's count needs.
+  ///         buffers missing or smaller than @p in's count needs, or a
+  ///         P-frame's entries, which are not yet its blocks.
   core::Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
                        const CodecParams& params,
                        core::GpuStageScope* stage = nullptr);

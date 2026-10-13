@@ -24,12 +24,15 @@ namespace volumetric_kit::recon::codec::detail {
 /// Mirrors `Push` in rans_push.glsl.
 struct RansPush {
   std::uint32_t item_base = 0;
-  std::uint32_t num_blocks = 0;
+  std::uint32_t num_entries = 0;  ///< M + A, every stream position.
   std::uint32_t coefficient_count = 0;
   std::uint32_t segment_size = 0;
   std::uint32_t segment_count = 0;
+  std::uint32_t frame_type = 0;
+  std::uint32_t reference_count = 0;  ///< M.
+  std::uint32_t update_size = 0;      ///< U.
 };
-static_assert(sizeof(RansPush) == 20, "RansPush must be 20 bytes");
+static_assert(sizeof(RansPush) == 32, "RansPush must be 32 bytes");
 
 /// @return Every model's symbols back to back, in TABLES order (each model
 ///         at @ref frame_model_base), as the kernels read them:
@@ -44,6 +47,13 @@ inline std::vector<std::uint32_t> rans_table_entries(
     }
   }
   return entries;
+}
+
+/// @return A binding's range of @p bytes, but never less than one
+///         @p element: a side a frame lacks (reference entries, or new
+///         blocks) still binds a valid range, which its kernel never reads.
+inline VkDeviceSize binding_range(VkDeviceSize bytes, VkDeviceSize element) {
+  return std::max(bytes, element);
 }
 
 /// Record @p kernel over @p items invocations of @p lanes a workgroup, in as

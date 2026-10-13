@@ -29,7 +29,7 @@ const uint kEmptySlot = 0xFFF00000u;
 void main() {
   const uint item = pc.item_base + gl_GlobalInvocationID.x;
   const uint model = item >> 12u;
-  if (model >= kFirstCoef + pc.coefficient_count) return;
+  if (model >= model_count(pc.frame_type, pc.coefficient_count)) return;
   const uint slot = item & 4095u;
   const uint base = model_base(model, pc.coefficient_count);
   // The last symbol whose cum is at most the slot: every later one starts

@@ -551,6 +551,170 @@ inline d::MergedFrame merge_oracle(const std::vector<vr::Vec3i>& reference,
   return out;
 }
 
+// --- The worked example. ----------------------------------------------------
+//
+// bitstream.hpp's 161-byte P-frame, which every writer, host or device,
+// writes and every reader reads as the format says. Pinned as the example;
+// it may change until golden P-frames freeze type 1.
+
+// Its reference: a = (0,0,0) and b = (4,0,0), K = 1, voxel 1 cm, band 4 cm,
+// scale 0.2, weight 1.
+inline d::Frame example_reference() {
+  d::Frame f = make_frame(0, 1, 1);
+  f.voxel_size = 0.01f;
+  f.blocks.trunc_dist = 0.04f;
+  f.coords = {{0, 0, 0}, {4, 0, 0}};
+  f.blocks.masks.assign(2 * codec::kMaskWordsPerBlock, ~0u);
+  for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; w += 2) {
+    f.blocks.masks[w] = 0x0F0F0F0Fu;  // a partial
+  }
+  f.blocks.coefficients = {5, -2};
+  return f;
+}
+
+// The P-frame, by hand: a kept with residual +1 and its mask unchanged, b
+// skipped, and c = (2,0,0) new with a full mask and coefficient 3. Its
+// REFERENCE names @p hash.
+inline std::vector<std::uint8_t> example_bytes(std::uint64_t hash) {
+  std::vector<std::uint8_t> b = {
+      0x56, 0x52, 0x54, 0x43, 0x03, 0x00, 0x01,
+      0x00,                                            // VRTC, v3, type 1
+      0x0A, 0xD7, 0x23, 0x3C, 0x0A, 0xD7, 0x23, 0x3D,  // 0.01, 0.04
+      0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,  // block size, K
+      0xCD, 0xCC, 0x4C, 0x3E, 0x01, 0x00, 0x00, 0x00,  // scale, weights
+      0x03, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,  // N = 3, R = 64
+      0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,  // S = 4, weight 1
+      // Sections: REFERENCE, TABLES, SEGMENTS, PAYLOAD.
+      0x04, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00,  //
+      0x01, 0x00, 0x01, 0x00, 0x21, 0x00, 0x00, 0x00,  //
+      0x02, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00,  //
+      0x03, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00,  //
+      // REFERENCE: the hash (below), M = 2, U = 64, A = 1.
+      0, 0, 0, 0, 0, 0, 0, 0,                          //
+      0x02, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,  //
+      0x01, 0x00, 0x00, 0x00,                          //
+      // TABLES: five coordinate models unused; the mask class, full and
+      // empty; seven plane, line and byte models unused; coefficient 0,
+      // classes 1 and 2; the modes, keep and skip.
+      0x00, 0x00, 0x00, 0x00, 0x00,              //
+      0x02, 0x00, 0x80, 0x10, 0x00, 0x80, 0x10,  //
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
+      0x02, 0x01, 0x80, 0x10, 0x00, 0x80, 0x10,  //
+      0x02, 0x00, 0x80, 0x10, 0x00, 0x80, 0x10,  //
+      // SEGMENTS: an update segment of 4 bytes, a new segment of 16.
+      0x04, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,  //
+      // keep, mask unchanged, class 1 with sign 0, then skip: the final
+      // state alone.
+      0x20, 0x00, 0x00, 0x90,  //
+      // (2,0,0) in 96 raw bits, mask full, class 2 with field 10.
+      0x10, 0x00, 0x02, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  for (int i = 0; i < 8; ++i) {
+    b[80 + std::size_t(i)] = static_cast<std::uint8_t>(hash >> (8 * i));
+  }
+  return b;
+}
+
+// --- The P-frame matrix. ----------------------------------------------------
+//
+// The P-frames every writer and reader must code alike, each written at
+// every update and segment size of kInterSizes.
+
+// Spellings beyond the automatic choice: zero for some surviving blocks,
+// and keep, with zero residuals and an unchanged mask, for some unchanged
+// ones -- each a second spelling of the same block.
+inline std::map<std::size_t, d::BlockMode> spellings(const d::Frame& reference,
+                                                     const d::Frame& target) {
+  std::map<vr::Vec3i, std::size_t, ZyxLess> at;
+  for (std::size_t i = 0; i < target.coords.size(); ++i) {
+    at.emplace(target.coords[i], i);
+  }
+  std::map<std::size_t, d::BlockMode> out;
+  for (std::size_t e = 0; e < reference.coords.size(); ++e) {
+    const auto it = at.find(reference.coords[e]);
+    if (it == at.end()) continue;
+    if (e % 9 == 4) out[e] = d::BlockMode::kZero;
+    if (e % 7 == 3 && payload_at(reference.blocks, e) ==
+                          payload_at(target.blocks, it->second)) {
+      out[e] = d::BlockMode::kKeep;
+    }
+  }
+  return out;
+}
+
+// Extreme coefficients: residuals of +-32767, differences that wrap, and
+// differences of +-32768, which no class carries, so the block is zero.
+struct Extremes {
+  d::Frame reference;
+  d::Frame target;
+};
+
+inline Extremes extremes(std::uint32_t k) {
+  Extremes x;
+  x.reference = make_frame(12, k, 99);
+  x.target = x.reference;
+  const std::int16_t from[] = {0, 0, -32767, 32767, -16384, 16384, -1};
+  const std::int16_t to[] = {32767, -32767, 32767, -32767,
+                             16384, -16384, 32767};
+  for (std::size_t i = 0; i < 7; ++i) {
+    x.reference.blocks.coefficients[i * k] = from[i];
+    x.target.blocks.coefficients[i * k] = to[i];
+  }
+  return x;
+}
+
+// One P-frame of the matrix: @p p codes @p target against @p reference, on
+// the hash of @p reference's intra bytes.
+struct InterCode {
+  std::string what;
+  d::Frame reference;
+  d::Frame target;
+  d::Frame p;
+};
+
+// The update and segment sizes: 1, 7, 64 and past every frame.
+inline constexpr std::uint32_t kInterSizes[] = {1, 7, 64, 100000};
+
+// Every mode, at K of 1, 64 and 512, and the empty cases: no reference
+// blocks (M = 0), no new ones (A = 0), none left (N = 0), all removed with
+// new ones, all skipped, and the extreme coefficients.
+inline std::vector<InterCode> inter_matrix() {
+  std::vector<InterCode> out;
+  for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
+    const std::size_t m = k == codec::kVoxelsPerBlock ? 24 : 60;
+    const d::Frame reference = make_frame(m, k, 1000 + k);
+    const d::Frame empty = make_frame(0, k, 1);
+    const Extremes x = extremes(k);
+    struct Case {
+      const char* what;
+      const d::Frame* reference;
+      d::Frame target;
+      bool spell;
+    };
+    const Case cases[] = {
+        {"every mode", &reference, successor(reference, k, 80, 400, m / 6),
+         true},
+        {"M = 0", &empty, make_frame(m / 2, k, 2000 + k), false},
+        {"A = 0", &reference, successor(reference, k + 1, 80, 400, 0), true},
+        {"N = 0", &reference, successor(reference, k + 2, 1000, 0, 0), false},
+        {"all removed", &reference, successor(reference, k + 3, 1000, 0, 9),
+         false},
+        {"all skipped", &reference, reference, false},
+        {"extremes", &x.reference, x.target, false},
+    };
+    for (const Case& c : cases) {
+      const d::FrameReference id =
+          reference_of(d::write_frame(*c.reference).value());
+      out.push_back(
+          {std::string(c.what) + ", K " + std::to_string(k), *c.reference,
+           c.target,
+           inter_frame(id, *c.reference, c.target,
+                       c.spell ? spellings(*c.reference, c.target)
+                               : std::map<std::size_t, d::BlockMode>{})});
+    }
+  }
+  return out;
+}
+
 // --- The P-frame refusals. --------------------------------------------------
 
 // A P-frame and what its reader holds.

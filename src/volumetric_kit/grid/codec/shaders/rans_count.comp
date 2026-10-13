@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The device frame's pass 1: every model's symbol counts, and each block's
-// coder steps, which place its steps (rans_ops.comp) and size its segment's
-// output slot. One invocation per block.
+// The device frame's pass 1: every model's symbol counts, each entry's coder
+// steps, which place its steps (rans_ops.comp) and size its segment's output
+// slot, and what write_frame would refuse. One invocation per entry.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -12,12 +12,16 @@ layout(local_size_x = 64) in;
 
 #include "rans_walk.glsl"
 
-// Bindings 0-2 are the walk's.
-layout(set = 0, binding = 3, std430) buffer Counts {
-  uint counts[];  // per model, per symbol, at model_base
+// Bindings 0-3 are the walk's.
+layout(set = 0, binding = 4, std430) buffer Counts {
+  uint counts[];  // per model, per symbol, at model_base, a P-frame's layout
 };
-layout(set = 0, binding = 4, std430) writeonly buffer Steps {
-  uint steps[];  // per block
+layout(set = 0, binding = 5, std430) writeonly buffer Steps {
+  uint steps[];  // per entry
+};
+layout(set = 0, binding = 6, std430) buffer Refusal {
+  uint largest_mode;  // the largest mode past the alphabet, else 0
+  uint out_of_range;  // nonzero when a written value is -32768
 };
 
 uint g_steps = 0u;
@@ -30,8 +34,10 @@ void sink_symbol(uint model, uint symbol) {
 void sink_bits(uint value, uint bits) { g_steps += (bits + 11u) / 12u; }
 
 void main() {
-  const uint i = pc.item_base + gl_GlobalInvocationID.x;
-  if (i >= pc.num_blocks) return;
-  walk_block(i);
-  steps[i] = g_steps;
+  const uint p = pc.item_base + gl_GlobalInvocationID.x;
+  if (p >= pc.num_entries) return;
+  walk_entry(p);
+  steps[p] = g_steps;
+  if (g_bad_mode != 0u) atomicMax(largest_mode, g_bad_mode);
+  if (g_out_of_range) atomicOr(out_of_range, 1u);
 }

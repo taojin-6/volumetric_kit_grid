@@ -77,15 +77,16 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode_on_device(
     VKC_ASSIGN(resident,
                transform_->record_forward(batch, grid, grid.block_list(blocks),
                                           config_.params, rejected, &stage));
-    VKC_TRY(
-        writer_->record_count(batch, resident, config_.segment_size, &stage));
+    VKC_TRY(writer_->record_count(batch, resident, config_.segment_size,
+                                  detail::kDefaultUpdateSize, &stage));
     VKC_TRY(batch.submit());
     VKC_TRY(detail::DctTransform::check_rejected("forward", rejected,
                                                  resident.count));
   }
   core::StageScope entropy(metrics, "  ..rans encode");
   return writer_->finish(resident, grid.grid().voxel_size,
-                         grid.grid().trunc_dist, config_.params, &stage);
+                         grid.grid().trunc_dist, config_.params,
+                         /*reference=*/nullptr, &stage);
 }
 
 core::Result<std::vector<std::uint8_t>> Encoder::encode(

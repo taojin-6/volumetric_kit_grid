@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -989,7 +990,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   }
 
   // Resident blocks the inverse cannot bind: missing buffers, or ones too
-  // small for the count.
+  // small for the count; and a P-frame's entries, which are not its blocks.
   {
     vkc::Result<vkc::Buffer> small = vkc::device_storage_buffer(allocator, 16);
     CHECK(small.ok());
@@ -1001,6 +1002,11 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     resident.masks = &small.value();
     resident.coefficients = &small.value();
     CHECK(!t.inverse(grid, resident, params).ok());
+    resident.reference_count = 1;
+    const vkc::Status entries = t.inverse(grid, resident, params);
+    CHECK(entries.domain() == vkc::Status::Code::InvalidArgument &&
+          entries.message().find("a P-frame's stream positions") !=
+              std::string::npos);
   }
 
   // A list compacted before a remove() names a different block through a

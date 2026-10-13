@@ -4,8 +4,8 @@
 #pragma once
 
 /// @file device_frame_writer.hpp
-/// @brief Writes an intra frame with its rANS coding on the device, byte for
-///        byte the frame @ref write_frame writes on the host.
+/// @brief Writes a frame, intra or P, with its rANS coding on the device,
+///        byte for byte the frame @ref write_frame writes on the host.
 ///
 /// Internal (under src/, never installed). The forward output stays in device
 /// memory: the host reads back only the symbol counts, to build the frame's
@@ -30,18 +30,24 @@
 
 namespace volumetric_kit::recon::codec::detail {
 
-/// @brief Codes intra frames on the device (the 2026-09-26 decision's fifth
-///        PR): one invocation per segment, as the 2026-09-27 format allows.
+/// @brief Codes frames on the device (the 2026-09-26 decision's fifth PR):
+///        one invocation per segment, as the 2026-09-27 format allows.
 ///
 /// A frame takes two batches. The caller's first batch carries the forward
 /// transform (@ref DctTransform::record_forward) and @ref record_count, which
-/// counts every model's symbols and each segment's coder steps. After it is
-/// submitted, @ref finish builds the tables on the host and places every
-/// block's steps. The device writes each block's steps in parallel, runs each
-/// segment's serial rANS chain over its run of them into a slot sized by its
-/// steps, packs the streams into one payload, and reads back only that payload
-/// and the segment lengths. The payload is read up to the last frame's bytes
-/// per block plus 25% with the lengths, and any rest in a second batch.
+/// counts every model's symbols, each entry's coder steps, and what
+/// @ref write_frame would refuse. After it is submitted, @ref finish makes
+/// those refusals (@ref check_entries), builds the tables on the host and
+/// places every entry's steps. The device writes each entry's steps in
+/// parallel, runs each segment's serial rANS chain over its run of them into a
+/// slot sized by its steps, packs the streams into one payload, and reads back
+/// only that payload and the segment lengths. The payload is read up to the
+/// last frame of its type's bytes per entry plus 25% with the lengths, and any
+/// rest in a second batch.
+///
+/// A P-frame's entries are its stream positions (@ref ResidentBlocks): each
+/// reference entry's mode and payload, which the caller has made against the
+/// reference (a keep entry's XOR mask and residuals), then its new blocks.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
@@ -60,35 +66,46 @@ class VR_CODEC_API DeviceFrameWriter {
   ///
   /// The counts arrive when the caller submits @p batch, which must happen
   /// before @ref finish. @p blocks must stay unchanged until then.
-  /// @param blocks        The forward output, coordinates strictly
-  ///                      increasing in frame order and coefficients within
-  ///                      +-32767 (what the transform writes).
-  /// @param segment_size  Blocks per segment, at least 1, which @ref finish
-  ///                      codes at.
-  /// @return OK, or `Status::Code::InvalidArgument` for a segment size of
-  ///         0, more than 2^30 - 1 segments, or a buffer past
+  /// @param blocks        The entries: the forward output, or a P-frame's
+  ///                      stream positions, the new blocks' coordinates
+  ///                      strictly increasing in frame order.
+  /// @param segment_size  Blocks per segment, at least 1: a P-frame's new
+  ///                      blocks per segment.
+  /// @param update_size   A P-frame's reference entries per update segment,
+  ///                      at least 1 when @p blocks has any.
+  /// @return OK, or `Status::Code::InvalidArgument` for a segment size of 0,
+  ///         an update size of 0 with reference entries, more reference
+  ///         entries than entries, a buffer the entries need missing, more
+  ///         than 2^30 - 1 segments, or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.
   core::Status record_count(core::CommandBatch& batch,
                             const ResidentBlocks& blocks,
                             std::uint32_t segment_size,
+                            std::uint32_t update_size,
                             core::GpuStageScope* stage = nullptr);
 
-  /// @brief Code the frame @ref record_count counted, at the segment size it
+  /// @brief Code the frame @ref record_count counted, at the sizes it
   ///        counted with, and lay it out.
-  /// @param blocks      The same output @ref record_count was given.
+  /// @param blocks      The same entries @ref record_count was given.
   /// @param voxel_size  The grid's voxel edge, metres.
   /// @param trunc_dist  The grid's `trunc_dist`, which the coefficients are
   ///                    fractions of.
   /// @param params      The params the coefficients were made with.
+  /// @param reference   A P-frame's reference, whose block count is the
+  ///                    blocks' reference entries; null for an intra frame.
   /// @return The frame's bytes, identical to @ref write_frame's for the
-  ///         same content; `Status::Code::InvalidArgument` for invalid
-  ///         params, blocks @ref record_count did not count, or a frame
-  ///         @ref assemble_frame refuses; or a buffer or dispatch
-  ///         failure. `Status::Code::IoError` only if a kernel's
-  ///         table refused a symbol it was counted from, which is a bug here.
+  ///         same content; @ref check_coding's refusals, then
+  ///         @ref check_entries', as @ref write_frame makes them;
+  ///         `Status::Code::InvalidArgument` for blocks @ref record_count
+  ///         did not count, a reference whose block count is not the blocks'
+  ///         reference entries, or a frame @ref assemble_frame refuses; or a
+  ///         buffer or dispatch failure.
+  ///         `Status::Code::IoError` only if a kernel's table refused a
+  ///         symbol it was counted from, which is a bug here.
   core::Result<std::vector<std::uint8_t>> finish(
       const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
-      const CodecParams& params, core::GpuStageScope* stage = nullptr);
+      const CodecParams& params, const FrameReference* reference,
+      core::GpuStageScope* stage = nullptr);
 
  private:
   DeviceFrameWriter() = default;
@@ -109,9 +126,9 @@ class VR_CODEC_API DeviceFrameWriter {
 
   // Device-local, retained and grown by ensure_device_scratch.
   core::Buffer counts_;         // per model, per symbol
-  core::Buffer block_steps_;    // coder steps per block
+  core::Buffer entry_steps_;    // coder steps per entry
   core::Buffer tables_;         // per model, per symbol: cum | freq << 16
-  core::Buffer step_ends_;      // one past each block's last step
+  core::Buffer step_ends_;      // one past each entry's last step
   core::Buffer steps_;          // every coder step: start | freq << 16
   core::Buffer segment_steps_;  // each segment's first step, segment count + 1
   core::Buffer slot_offsets_;   // 16-bit words, segment count + 1
@@ -121,16 +138,21 @@ class VR_CODEC_API DeviceFrameWriter {
   core::Buffer payload_;
   core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
   core::Buffer failed_;       // set when a table refuses a symbol
+  core::Buffer refusal_;      // what write_frame would refuse: two words
 
   // What record_count reads back at the caller's submit: the counts, at
-  // frame_model_base, and each block's steps.
+  // frame_model_base in a P-frame's layout, each entry's steps, and the
+  // largest mode past the alphabet and whether a written value is -32768.
   std::vector<std::uint32_t> counts_host_;
   std::vector<std::uint32_t> steps_host_;
-  // The segment size record_count counted with (0 before any), and the last
-  // frame's payload bytes per block plus 25%, the readback's prediction (0
-  // before any).
+  std::uint32_t refusal_host_[2] = {};
+  // The sizes record_count counted with (segment size 0 before any), and
+  // per frame type the last frame's payload bytes per entry plus 25%, the
+  // readback's prediction (0 before any).
   std::uint32_t segment_size_ = 0;
-  std::uint32_t payload_per_block_ = 0;
+  std::uint32_t update_size_ = 0;
+  std::uint32_t reference_count_ = 0;
+  std::uint32_t payload_per_entry_[2] = {};
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

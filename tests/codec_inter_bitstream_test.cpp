@@ -18,7 +18,6 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
-#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -51,7 +50,6 @@ using codec_frames::successor;
 using codec_frames::ZyxLess;
 using C = vkc::Status::Code;
 using Bytes = std::vector<std::uint8_t>;
-using Modes = std::map<std::size_t, d::BlockMode>;
 
 // The same content, parameters included: what an intra frame holds.
 bool same_content(const d::Frame& a, const d::Frame& b) {
@@ -150,69 +148,12 @@ int hash_case() {
 
 // --- The worked example. ----------------------------------------------------
 
-// The reference of the worked example: a = (0,0,0) and b = (4,0,0), K = 1,
-// voxel 1 cm, band 4 cm, scale 0.2, weight 1.
-d::Frame example_reference() {
-  d::Frame f = make_frame(0, 1, 1);
-  f.voxel_size = 0.01f;
-  f.blocks.trunc_dist = 0.04f;
-  f.coords = {{0, 0, 0}, {4, 0, 0}};
-  f.blocks.masks.assign(2 * codec::kMaskWordsPerBlock, ~0u);
-  for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; w += 2) {
-    f.blocks.masks[w] = 0x0F0F0F0Fu;  // a partial
-  }
-  f.blocks.coefficients = {5, -2};
-  return f;
-}
-
-// The worked example's P-frame, by hand: a kept with residual +1 and its mask
-// unchanged, b skipped, and c = (2,0,0) new with a full mask and coefficient
-// 3. Its REFERENCE names @p hash.
-Bytes example_bytes(std::uint64_t hash) {
-  Bytes b = {0x56, 0x52, 0x54, 0x43, 0x03, 0x00, 0x01,
-             0x00,  // VRTC, v3, type 1
-             0x0A, 0xD7, 0x23, 0x3C, 0x0A, 0xD7, 0x23, 0x3D,  // 0.01, 0.04
-             0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,  // block size, K
-             0xCD, 0xCC, 0x4C, 0x3E, 0x01, 0x00, 0x00, 0x00,  // scale, weights
-             0x03, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,  // N = 3, R = 64
-             0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,  // S = 4, weight 1
-             // Sections: REFERENCE, TABLES, SEGMENTS, PAYLOAD.
-             0x04, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00,  //
-             0x01, 0x00, 0x01, 0x00, 0x21, 0x00, 0x00, 0x00,  //
-             0x02, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00,  //
-             0x03, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00,  //
-             // REFERENCE: the hash (below), M = 2, U = 64, A = 1.
-             0, 0, 0, 0, 0, 0, 0, 0,                          //
-             0x02, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,  //
-             0x01, 0x00, 0x00, 0x00,                          //
-             // TABLES: five coordinate models unused; the mask class, full and
-             // empty; seven plane, line and byte models unused; coefficient 0,
-             // classes 1 and 2; the modes, keep and skip.
-             0x00, 0x00, 0x00, 0x00, 0x00,              //
-             0x02, 0x00, 0x80, 0x10, 0x00, 0x80, 0x10,  //
-             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
-             0x02, 0x01, 0x80, 0x10, 0x00, 0x80, 0x10,  //
-             0x02, 0x00, 0x80, 0x10, 0x00, 0x80, 0x10,  //
-             // SEGMENTS: an update segment of 4 bytes, a new segment of 16.
-             0x04, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,  //
-             // keep, mask unchanged, class 1 with sign 0, then skip: the final
-             // state alone.
-             0x20, 0x00, 0x00, 0x90,  //
-             // (2,0,0) in 96 raw bits, mask full, class 2 with field 10.
-             0x10, 0x00, 0x02, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-  for (int i = 0; i < 8; ++i) {
-    b[80 + std::size_t(i)] = static_cast<std::uint8_t>(hash >> (8 * i));
-  }
-  return b;
-}
-
 // The worked example of the format: 161 bytes, read as the format says and
-// written back byte for byte. Pinned as the example; it may change until
-// golden P-frames freeze type 1.
+// written back byte for byte.
 int worked_example_case() {
-  const d::Frame reference = example_reference();
+  const d::Frame reference = codec_frames::example_reference();
   const d::FrameReference id = reference_of(d::write_frame(reference).value());
-  const Bytes bytes = example_bytes(id.hash);
+  const Bytes bytes = codec_frames::example_bytes(id.hash);
   CHECK(bytes.size() == 161);
 
   const vkc::Result<d::Frame> read =
@@ -366,95 +307,26 @@ int round_trip(const d::Frame& reference, const d::Frame& target,
   return 0;
 }
 
-// Spellings beyond the automatic choice: zero for some surviving blocks,
-// and keep, with zero residuals and an unchanged mask, for some unchanged
-// ones -- each a second spelling of the same block.
-Modes spellings(const d::Frame& reference, const d::Frame& target) {
-  std::set<vr::Vec3i, ZyxLess> unchanged;
-  std::map<vr::Vec3i, std::size_t, ZyxLess> at;
-  for (std::size_t i = 0; i < target.coords.size(); ++i) {
-    at.emplace(target.coords[i], i);
-  }
-  Modes out;
-  for (std::size_t e = 0; e < reference.coords.size(); ++e) {
-    const auto it = at.find(reference.coords[e]);
-    if (it == at.end()) continue;
-    if (e % 9 == 4) out[e] = d::BlockMode::kZero;
-    if (e % 7 == 3 && codec_frames::payload_at(reference.blocks, e) ==
-                          codec_frames::payload_at(target.blocks, it->second)) {
-      out[e] = d::BlockMode::kKeep;
-    }
-  }
-  return out;
-}
-
-// Extreme coefficients: residuals of +-32767, differences that wrap, and
-// differences of +-32768, which no class carries, so the block is zero.
-struct Extremes {
-  d::Frame reference;
-  d::Frame target;
-};
-
-Extremes extremes(std::uint32_t k) {
-  Extremes x;
-  x.reference = make_frame(12, k, 99);
-  x.target = x.reference;
-  const std::int16_t from[] = {0, 0, -32767, 32767, -16384, 16384, -1};
-  const std::int16_t to[] = {32767, -32767, 32767, -32767,
-                             16384, -16384, 32767};
-  for (std::size_t i = 0; i < 7; ++i) {
-    x.reference.blocks.coefficients[i * k] = from[i];
-    x.target.blocks.coefficients[i * k] = to[i];
-  }
-  return x;
-}
-
-// Every mode, K of 1, 64 and 512, update and segment sizes of 1, 7, 64 and
-// past the frame, and the empty cases: no reference blocks (M = 0), no new
-// ones (A = 0), none left (N = 0), all removed with new ones, all skipped,
-// and the extreme coefficients.
+// The matrix (codec_frames.hpp): every mode, K of 1, 64 and 512, and the
+// empty cases, each at update and segment sizes of 1, 7, 64 and past the
+// frame.
 int round_trip_case() {
   std::uint64_t seen[5] = {};
-  for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
-    const std::size_t m = k == codec::kVoxelsPerBlock ? 24 : 60;
-    const d::Frame reference = make_frame(m, k, 1000 + k);
-    const d::Frame empty = make_frame(0, k, 1);
-    const Extremes x = extremes(k);
-    struct Case {
-      const char* what;
-      const d::Frame* reference;
-      d::Frame target;
-      bool spell;
-    };
-    const Case cases[] = {
-        {"every mode", &reference, successor(reference, k, 80, 400, m / 6),
-         true},
-        {"M = 0", &empty, make_frame(m / 2, k, 2000 + k), false},
-        {"A = 0", &reference, successor(reference, k + 1, 80, 400, 0), true},
-        {"N = 0", &reference, successor(reference, k + 2, 1000, 0, 0), false},
-        {"all removed", &reference, successor(reference, k + 3, 1000, 0, 9),
-         false},
-        {"all skipped", &reference, reference, false},
-        {"extremes", &x.reference, x.target, false},
-    };
-    for (const Case& c : cases) {
-      const d::FrameReference id =
-          reference_of(d::write_frame(*c.reference).value());
-      const d::Frame p =
-          inter_frame(id, *c.reference, c.target,
-                      c.spell ? spellings(*c.reference, c.target) : Modes{});
-      for (const d::BlockMode mode : p.modes) ++seen[std::size_t(mode)];
-      for (std::uint32_t u : {1u, 7u, 64u, 100000u}) {
-        for (std::uint32_t r : {1u, 7u, 64u, 100000u}) {
-          if (round_trip(*c.reference, c.target, p, sizes(r, u)) != 0) {
-            std::fprintf(stderr, "%s: K %u, U %u, R %u\n", c.what, k, u, r);
-            return 1;
-          }
+  for (const codec_frames::InterCode& c : codec_frames::inter_matrix()) {
+    for (const d::BlockMode mode : c.p.modes) ++seen[std::size_t(mode)];
+    for (std::uint32_t u : codec_frames::kInterSizes) {
+      for (std::uint32_t r : codec_frames::kInterSizes) {
+        if (round_trip(c.reference, c.target, c.p, sizes(r, u)) != 0) {
+          std::fprintf(stderr, "%s: U %u, R %u\n", c.what.c_str(), u, r);
+          return 1;
         }
       }
     }
-    // The extremes code as they must: keep with residuals +-32767 and
-    // wrapped to -2 and 2, and zero where the difference is +-32768.
+  }
+  // The extremes code as they must: keep with residuals +-32767 and wrapped
+  // to -2 and 2, and zero where the difference is +-32768.
+  for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
+    const codec_frames::Extremes x = codec_frames::extremes(k);
     const d::FrameReference id =
         reference_of(d::write_frame(x.reference).value());
     const d::Frame p = inter_frame(id, x.reference, x.target);

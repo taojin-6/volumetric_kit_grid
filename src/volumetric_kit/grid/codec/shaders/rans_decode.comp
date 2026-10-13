@@ -3,11 +3,12 @@
 
 // The device frame's decode: one invocation per segment runs rans.hpp's
 // RansReader, with the same 32-bit integer arithmetic, under
-// frame_grammar.glsl's reader half over the segment's stream, and writes each
-// block's coordinate, mask and coefficients where the inverse transform reads
-// them. The host reader is the reference: the same frame decodes to the same
-// blocks, and a segment fails here exactly when it fails there, which the
-// device frame test checks.
+// frame_grammar.glsl's reader half over the segment's stream. Each entry's
+// mask and coefficients land at its stream position (segment_range), a
+// P-frame's reference entry's mode beside them and a new block's coordinate
+// at its place in the list. The host reader is the reference: the same frame
+// decodes to the same entries, and a segment fails here exactly when it fails
+// there, which the device frame test checks.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -33,16 +34,19 @@ layout(set = 0, binding = 2, std430) readonly buffer SegmentWords {
   uint segment_words[];  // each segment's first word, segment_count + 1
 };
 layout(set = 0, binding = 3, scalar) writeonly buffer Blocks {
-  BlockIndex blocks[];  // coord, ptr 0
+  BlockIndex blocks[];  // the new blocks in frame order: coord, ptr 0
 };
 layout(set = 0, binding = 4, std430) writeonly buffer Masks {
-  uint masks[];  // kMaskWords a block
+  uint masks[];  // kMaskWords an entry
 };
 layout(set = 0, binding = 5, std430) writeonly buffer Coefficients {
-  uint coefficients[];  // two int16 a word, (K + 1) / 2 words a block
+  uint coefficients[];  // two int16 a word, (K + 1) / 2 words an entry
 };
 layout(set = 0, binding = 6, std430) writeonly buffer Faults {
   uint faults[];  // a SegmentFault per segment
+};
+layout(set = 0, binding = 7, std430) writeonly buffer Modes {
+  uint modes[];  // a P-frame's, one a reference entry
 };
 
 const uint kRansLower = 1u << 16u;
@@ -103,7 +107,7 @@ uint get_bits(uint bits) {
 
 bool coder_failed() { return g_failed; }
 
-uint g_coefficients = 0u;  // the block's first word
+uint g_coefficients = 0u;  // the entry's first word
 uint g_low = 0u;           // an even coefficient, waiting for the odd one
 
 // Two coefficients a word, low first.
@@ -126,23 +130,29 @@ void main() {
   g_pos = begin + 2u;
   g_failed = g_x < kRansLower;
 
-  const uint first = s * pc.segment_size;  // < num_blocks
-  const uint end = pc.num_blocks - first > pc.segment_size
-                       ? first + pc.segment_size
-                       : pc.num_blocks;
+  const uint m = pc.reference_count;
+  const uvec2 range = segment_range(s, m, pc.update_size, pc.num_entries - m,
+                                    pc.segment_size);
   const uint k = pc.coefficient_count;
   uint fault = kFaultNone;
   g_coord = ivec3(0);
-  for (uint i = first; i < end && !g_failed; ++i) {
-    g_coefficients = i * ((k + 1u) / 2u);
-    if (!read_block(i == first, k)) {
-      fault = kFaultCoordOverflow;
-      break;
+  for (uint p = range.x; p < range.y && !g_failed; ++p) {
+    g_coefficients = p * ((k + 1u) / 2u);
+    if (p < m) {
+      // A skip or a remove has no payload, and writes none.
+      const uint mode = read_entry(k);
+      modes[p] = mode;
+      if (mode != kModeKeep && mode != kModeZero) continue;
+    } else {
+      if (!read_block(p == range.x, k)) {
+        fault = kFaultCoordOverflow;
+        break;
+      }
+      blocks[p - m].coord = g_coord;
+      blocks[p - m].ptr = 0;
     }
-    blocks[i].coord = g_coord;
-    blocks[i].ptr = 0;
     for (uint w = 0u; w < kMaskWords; ++w) {
-      masks[i * kMaskWords + w] = g_mask[w];
+      masks[p * kMaskWords + w] = g_mask[w];
     }
     // An odd K's last word, its pad zero.
     if ((k & 1u) != 0u) coefficients[g_coefficients + k / 2u] = g_low;
