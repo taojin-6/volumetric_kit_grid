@@ -32,9 +32,6 @@ struct ResidentBlocks;
 
 /// @brief What a frame's header says: enough to build a grid it decodes into.
 struct FrameInfo {
-  /// Intra, or a P-frame, which decodes only after the frame it was coded
-  /// against (@ref Decoder).
-  FrameType type = FrameType::kIntra;
   /// Metres per voxel edge. A grid decoding the frame must match it exactly.
   float voxel_size = 0.0f;
   /// Metres. A grid decoding the frame must match it exactly: the
@@ -47,6 +44,9 @@ struct FrameInfo {
   /// The coefficient count, scale, and kept bases' weights it was coded with;
   /// weights beyond the K cutoff are not carried and read as 1.
   CodecParams params;
+  /// Intra, or a P-frame, which decodes only after the frame it was coded
+  /// against (@ref Decoder).
+  FrameType type = FrameType::kIntra;
 };
 
 /// @brief Read a frame's complete header, including its quantization weights.
@@ -99,9 +99,12 @@ struct DecoderConfig {
 /// rebuilt from a grid -- so it decodes into any grid of its geometry, a
 /// fresh one included, to exactly the blocks an intra frame of the same
 /// content decodes to. Every decode that succeeds, intra or P, makes its
-/// frame the reference; one refused or failed keeps the reference it had.
+/// frame the reference; one refused or failed keeps the reference it had, so
+/// the same frame decoded again, after a resize say, decodes against it.
 /// The reference and the frame being decoded take `64 + 4 * ceil(K / 2)`
-/// bytes of device memory a block each.
+/// bytes of device memory a block each, and the frame 24 more; a frame
+/// decoded on the host uploads up to another `64 + 4 * ceil(K / 2)` a
+/// block. All of it is kept, sized for the largest frame decoded.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time, and
@@ -139,9 +142,7 @@ class VR_CODEC_API Decoder {
   /// blocks the two frames share still hold the previous frame's voxels, and
   /// blocks new to this one are empty, so it is not worth meshing. The next
   /// successful decode restores it exactly, since each decode starts from
-  /// whatever the grid holds. Neither a refusal nor a failure changes the
-  /// held reference, so the same frame decoded again decodes against the
-  /// same one.
+  /// whatever the grid holds.
   /// @param data     The frame.
   /// @param size     Its exact length.
   /// @param grid     The grid to decode into: 4-byte float `tsdf` and

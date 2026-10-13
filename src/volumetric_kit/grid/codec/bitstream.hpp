@@ -526,7 +526,8 @@ static_assert(sizeof(ApplySource) == 8 &&
                   offsetof(ApplySource, payload) == 4,
               "ApplySource is two u32, as the apply kernel reads it");
 
-/// @brief A decoded P-frame's blocks in the frame's order.
+/// @brief A decoded frame's blocks in the frame's order, a P-frame's or an
+///        intra frame's.
 struct MergedFrame {
   /// The frame's N coordinates, strictly increasing: the grid's block set,
   /// and the next reference's coordinates.
@@ -537,7 +538,8 @@ struct MergedFrame {
 
 /// @brief Merge a P-frame's surviving reference entries with its new blocks
 ///        (@ref merge_by_coord): keep gives {e, e}, skip {e, none}, zero
-///        {none, e}, new block q {none, M + q}, and remove nothing.
+///        {none, e}, new block q {none, M + q}, and remove nothing. An intra
+///        frame's blocks are new blocks on an empty reference.
 /// @param reference  The reference's M coordinates, strictly increasing.
 /// @param modes      The P-frame's M modes.
 /// @param added      Its A new coordinates, strictly increasing.

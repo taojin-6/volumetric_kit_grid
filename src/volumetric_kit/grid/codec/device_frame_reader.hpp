@@ -107,7 +107,7 @@ class VR_CODEC_API DeviceFrameReader {
   core::Buffer segment_words_;  // each segment's first 16-bit word, count + 1
   core::Buffer list_;           // volume::BlockIndex a new block
   core::Buffer masks_;          // kMaskWordsPerBlock words an entry
-  core::Buffer coefficients_;   // two int16 a word, (K + 1) / 2 words an entry
+  core::Buffer coefficients_;   // coefficient_words(K) words an entry
   core::Buffer modes_;          // a u32 a reference entry
   core::Buffer faults_;         // a SegmentFault a segment
 

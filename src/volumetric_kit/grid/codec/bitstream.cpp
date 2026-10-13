@@ -1025,6 +1025,16 @@ core::Result<MergedFrame> merge_frame(const std::vector<Vec3i>& reference,
   }
   const auto m = static_cast<std::uint32_t>(reference.size());
   MergedFrame out;
+  // No reference, an intra frame's or an empty one: the new blocks as they
+  // are, each from its own payload, with nothing to walk.
+  if (m == 0) {
+    out.coords = added;
+    out.sources.resize(added.size());
+    for (std::size_t q = 0; q < added.size(); ++q) {
+      out.sources[q].payload = static_cast<std::uint32_t>(q);
+    }
+    return out;
+  }
   // At most every reference block and every new one.
   out.coords.reserve(reference.size() + added.size());
   out.sources.reserve(reference.size() + added.size());

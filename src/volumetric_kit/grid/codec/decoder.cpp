@@ -43,15 +43,6 @@ core::Status contended(const char* doing, std::uint32_t blocks) {
       "(a resize would not help)");
 }
 
-// The entries of a host-decoded frame the apply reads: keep, zero and new.
-std::uint32_t payload_entries(const std::vector<detail::ApplySource>& sources) {
-  std::uint32_t n = 0;
-  for (const detail::ApplySource& s : sources) {
-    n += s.payload != detail::kNoSource ? 1u : 0u;
-  }
-  return n;
-}
-
 }  // namespace
 
 core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
@@ -243,7 +234,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     // not bound M.
     VKC_TRY(store_->reserve(static_cast<std::uint32_t>(frame.coords.size()),
                             header.params.coefficient_count,
-                            on_device ? 0 : payload_entries(frame.sources)));
+                            on_device ? nullptr : &frame.sources));
 
     // A merge of two sorted lists: what the grid holds that the frame lacks
     // is removed (VoxelBlockGrid::remove zeroes it, so a later reuse of its

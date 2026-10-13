@@ -94,8 +94,10 @@ enum class EntropyCoding {
   /// encode or uploaded once decoded.
   kHost,
   /// On the device, one invocation per segment: the coefficients and masks
-  /// stay in device memory, and only the frame, the symbol counts (encoding)
-  /// and the coordinates (decoding) cross the bus.
+  /// stay in device memory, and only the frame and per-block bookkeeping
+  /// cross the bus: the symbol counts when encoding; when decoding, the
+  /// coordinates and modes read back, and each block's coordinate and
+  /// sources uploaded for the apply.
   kDevice,
 };
 

@@ -35,28 +35,32 @@ namespace volumetric_kit::recon::codec::detail {
 ///        of device memory that swap at each @ref commit.
 ///
 /// The current slot holds the reference: each block's 16 mask words and
-/// `(K + 1) / 2` coefficient words, in the reference's order. The spare
-/// receives the next frame from @ref record_apply (`inter_apply.comp`), with
-/// that frame's block list beside it, and becomes the current slot only at
-/// @ref commit. So until a decode commits, the reference stays as it was,
-/// whatever was recorded or failed. An intra frame takes the same apply,
-/// from its payload alone, so every decoded frame lands in the store by one
-/// path.
+/// @ref coefficient_words(K) coefficient words, in the reference's order.
+/// The spare receives the next frame from @ref record_apply
+/// (`inter_apply.comp`), with that frame's block list beside it, and becomes
+/// the current slot only at @ref commit. So until a decode commits, the
+/// reference stays as it was, whatever was recorded or failed. An intra frame
+/// takes the same apply, from its payload alone, so every decoded frame lands
+/// in the store by one path.
 ///
-/// Each slot takes `64 + 4 * ((K + 1) / 2)` bytes a block, and the list,
-/// the sources and, on the host path, the upload `16`, `8` and
-/// `64 + 4 * ((K + 1) / 2)`. Every buffer is device-local and retained,
-/// growing as @ref reserve asks (`ensure_device_scratch`).
+/// Each slot takes `64 + 4 * coefficient_words(K)` bytes a block, and the
+/// list, the sources and, on the host path, the upload `16`, `8` and
+/// `64 + 4 * coefficient_words(K)`. Every buffer is device-local and
+/// retained, growing as @ref reserve asks (`ensure_device_scratch`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
 class VR_CODEC_API ReferenceStore {
  public:
   /// @brief Build the apply kernel and the store's first, smallest buffers.
+  /// @param max_blocks_per_dispatch  Blocks per apply dispatch, as
+  ///        @ref DctTransformConfig::max_blocks_per_dispatch: 0 means the
+  ///        device's `maxComputeWorkGroupCount[0]`, which caps it either way.
   /// @return The store, holding no reference; or a pipeline, pool or
   ///         allocation failure.
   static core::Result<std::unique_ptr<ReferenceStore>> create(
-      core::Device& device, core::Allocator& allocator);
+      core::Device& device, core::Allocator& allocator,
+      std::uint32_t max_blocks_per_dispatch = 0);
 
   ~ReferenceStore() = default;
   ReferenceStore(const ReferenceStore&) = delete;
@@ -74,15 +78,17 @@ class VR_CODEC_API ReferenceStore {
   const std::vector<Vec3i>& coords() const noexcept { return coords_; }
 
   /// @brief Make the spare hold a frame of @p n blocks of @p k coefficients,
-  ///        and the upload @p uploaded entries, before anything is recorded:
-  ///        what lets a decoder refuse before it touches the grid.
-  /// @param uploaded  The entries @ref record_upload will upload; 0 when the
-  ///                  device decoded the payload.
+  ///        and the upload the entries @ref record_upload will take, before
+  ///        anything is recorded: what lets a decoder refuse before it
+  ///        touches the grid.
+  /// @param host_sources  A host-decoded frame's sources, as
+  ///                      @ref record_upload will take them; null when the
+  ///                      device decoded the payload, which nothing uploads.
   /// @return OK; `Status::Code::InvalidArgument` for a buffer past
   ///         `maxStorageBufferRange`; or an allocation's failure. The held
   ///         reference is untouched either way.
   core::Status reserve(std::uint32_t n, std::uint32_t k,
-                       std::uint32_t uploaded);
+                       const std::vector<ApplySource>* host_sources);
 
   /// @brief Upload the entries of a host-decoded frame that @p sources name,
   ///        in the order they name them, and renumber each source's payload
@@ -138,6 +144,8 @@ class VR_CODEC_API ReferenceStore {
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
   std::uint32_t max_workgroup_count_x_ = 0;
+  // The blocks one apply dispatch covers: create's cap, at most the above.
+  std::uint32_t blocks_per_dispatch_ = 0;
   VkDeviceSize max_storage_buffer_range_ = 0;
 
   // Declared before pool_, so the pool is destroyed first.

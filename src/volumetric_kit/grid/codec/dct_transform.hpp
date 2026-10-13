@@ -62,7 +62,7 @@ struct ResidentBlocks {
   const core::Buffer* list = nullptr;
   const core::Buffer* masks =
       nullptr;  ///< `kMaskWordsPerBlock` words an entry.
-  /// Two int16 a word, coefficient 2p low; `(K + 1) / 2` words an entry.
+  /// Two int16 a word, coefficient 2p low; @ref coefficient_words an entry.
   const core::Buffer* coefficients = nullptr;
   /// A P-frame's mode for each reference entry, a u32 each
   /// (`frame_models.glsl`'s `kMode*`); null without reference entries.

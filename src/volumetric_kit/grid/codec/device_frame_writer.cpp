@@ -40,7 +40,6 @@ constexpr std::uint64_t kFirstPayloadPerEntry = 32;
 void bind_walk(core::ComputeKernel& kernel, const ResidentBlocks& blocks) {
   const VkDeviceSize entries = blocks.count;
   const VkDeviceSize m = blocks.reference_count;
-  const VkDeviceSize k = blocks.coefficient_count;
   const VkDeviceSize mask_bytes =
       entries * kMaskWordsPerBlock * sizeof(std::uint32_t);
   const core::Buffer* list = entries > m ? blocks.list : blocks.masks;
@@ -52,7 +51,8 @@ void bind_walk(core::ComputeKernel& kernel, const ResidentBlocks& blocks) {
   kernel.set.write_storage_buffer(1, blocks.masks->handle(), 0, mask_bytes);
   kernel.set.write_storage_buffer(
       2, blocks.coefficients->handle(), 0,
-      entries * ((k + 1) / 2) * sizeof(std::uint32_t));
+      entries * coefficient_words(blocks.coefficient_count) *
+          sizeof(std::uint32_t));
   kernel.set.write_storage_buffer(
       3, modes->handle(), 0,
       binding_range(m * sizeof(std::uint32_t), sizeof(std::uint32_t)));

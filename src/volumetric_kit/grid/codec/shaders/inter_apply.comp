@@ -74,7 +74,7 @@ void main() {
   const ApplySource s = sources[block];
   const bool from_reference = s.reference != kNoSource;
   const bool from_payload = s.payload != kNoSource;
-  const uint words = (pc.coefficient_count + 1u) / 2u;
+  const uint words = (pc.coefficient_count + 1u) / 2u;  // coefficient_words
   // The last word's high half is an odd K's pad.
   const uint last = (pc.coefficient_count & 1u) != 0u ? 0xFFFFu : 0xFFFFFFFFu;
   // The mask's words, then the coefficients', a lane each.

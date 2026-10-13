@@ -80,23 +80,12 @@ vkc::Result<Resident> resident(const d::Frame& frame) {
   const auto m = static_cast<std::uint32_t>(frame.modes.size());
   const auto a = static_cast<std::uint32_t>(frame.coords.size());
   const std::uint32_t entries = m + a;
-  const std::uint32_t k = frame.blocks.params.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
   Resident r;
   r.blocks.count = entries;
   r.blocks.reference_count = m;
-  r.blocks.coefficient_count = k;
+  r.blocks.coefficient_count = frame.blocks.params.coefficient_count;
   if (entries != 0) {
-    // Two int16 a word, each entry starting a word of its own.
-    std::vector<std::uint32_t> packed(std::size_t(entries) * words, 0);
-    for (std::uint32_t p = 0; p < entries; ++p) {
-      for (std::uint32_t j = 0; j < k; ++j) {
-        const auto v = static_cast<std::uint16_t>(
-            frame.blocks.coefficients[std::size_t(p) * k + j]);
-        packed[std::size_t(p) * words + j / 2] |= std::uint32_t(v)
-                                                  << (16 * (j & 1));
-      }
-    }
+    const std::vector<std::uint32_t> packed = codec_frames::pack(frame.blocks);
     VKC_ASSIGN(r.masks,
                upload(frame.blocks.masks.data(),
                       frame.blocks.masks.size() * sizeof(std::uint32_t)));
@@ -150,7 +139,7 @@ vkc::Result<d::Frame> device_read(d::DeviceFrameReader& reader,
   VKC_ASSIGN(const d::ParsedFrame parsed,
              d::parse_frame(data, size, max_blocks, reference));
   const std::uint32_t k = parsed.header.params.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
+  const std::uint32_t words = d::coefficient_words(k);
   d::Frame frame;
   frame.type = parsed.header.type;
   frame.voxel_size = parsed.header.voxel_size;

@@ -2,13 +2,14 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for P-frame decoding: the reference store's apply against
-// independent uint16 arithmetic, at every source kind and K, as its slots
-// grow; and the Decoder's chains -- an I-frame, then P-frames -- leaving the
-// grid exactly as an intra decode of the same content does, bit for bit, on
-// every entropy path, kAuto crossing between them mid-chain, with every mode,
-// new blocks and the empty cases; a P-frame whose reference is not held
-// refused as NotFound, and every refusal and failure leaving the reference
-// as it was. Internal headers by include path; skips with no device.
+// independent uint16 arithmetic, at every source kind and K, in one dispatch
+// or several, as its slots grow; and the Decoder's chains -- an I-frame, then
+// P-frames -- leaving the grid exactly as an intra decode of the same content
+// does, bit for bit, on every entropy path, kAuto crossing between them
+// mid-chain, with every mode, new blocks and the empty cases; a P-frame whose
+// reference is not held refused as NotFound, and every refusal and failure
+// leaving the reference as it was. Internal headers by include path; skips
+// with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -34,9 +35,11 @@ namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
 using namespace codec_fixture;
 using codec_frames::append_payload;
+using codec_frames::apply_residual;
 using codec_frames::inter_frame;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
+using codec_frames::pack;
 using codec_frames::Payload;
 using codec_frames::payload_at;
 using codec_frames::reference_of;
@@ -49,23 +52,6 @@ namespace {
 constexpr std::uint32_t kMaxBlocks = 1u << 20;
 
 // --- The store. -------------------------------------------------------------
-
-// Two int16 a word, each entry starting a word of its own, an odd K's pad
-// half @p pad: the layout the device reader writes and the apply reads.
-std::vector<std::uint32_t> pack(const d::DctBlocks& b, std::uint16_t pad = 0) {
-  const std::uint32_t k = b.params.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
-  const std::size_t n = b.masks.size() / codec::kMaskWordsPerBlock;
-  std::vector<std::uint32_t> out(n * words, 0);
-  for (std::size_t i = 0; i < n; ++i) {
-    for (std::uint32_t j = 0; j < words * 2; ++j) {
-      const std::uint16_t v =
-          j < k ? static_cast<std::uint16_t>(b.coefficients[i * k + j]) : pad;
-      out[i * words + j / 2] |= std::uint32_t(v) << (16 * (j & 1));
-    }
-  }
-  return out;
-}
 
 // @p n entries of K coefficients drawn from all of int16, and masks of every
 // kind.
@@ -101,7 +87,7 @@ struct Applied {
 
 vkc::Result<Applied> read_spare(Gpu& gpu, const d::ResidentBlocks& spare) {
   const std::uint32_t k = spare.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
+  const std::uint32_t words = d::coefficient_words(k);
   Applied out;
   if (spare.count == 0) return out;
   VKC_ASSIGN(const std::vector<std::uint32_t> masks,
@@ -141,8 +127,7 @@ Payload expected(const Payload* reference, const Payload* payload) {
   if (payload == nullptr) return *reference;
   Payload t = *reference;
   for (std::size_t j = 0; j < t.q.size(); ++j) {
-    t.q[j] = static_cast<std::int16_t>(std::uint16_t(
-        std::uint16_t(reference->q[j]) + std::uint16_t(payload->q[j])));
+    t.q[j] = apply_residual(reference->q[j], payload->q[j]);
   }
   for (std::size_t w = 0; w < t.mask.size(); ++w) {
     t.mask[w] = reference->mask[w] ^ payload->mask[w];
@@ -159,7 +144,7 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const d::DctBlocks& r,
   for (std::size_t i = 0; i < m; ++i) {
     sources[i] = {d::kNoSource, static_cast<std::uint32_t>(i)};
   }
-  CHECK(store.reserve(std::uint32_t(m), k, std::uint32_t(m)).ok());
+  CHECK(store.reserve(std::uint32_t(m), k, &sources).ok());
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   vkc::Result<d::ResidentBlocks> upload =
       store.record_upload(batch, r, sources);
@@ -183,10 +168,12 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const d::DctBlocks& r,
 
 // Every source kind against a held reference, its payload uploaded from the
 // host or bound where the device left it, at K of 1, 21, 64 and 512, with
-// residuals from all of int16 so many wrap.
-int apply_case(Gpu& gpu) {
+// residuals from all of int16 so many wrap; at @p max_blocks_per_dispatch 4,
+// the nine blocks in three dispatches.
+int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
-      d::ReferenceStore::create(gpu.device, gpu.allocator);
+      d::ReferenceStore::create(gpu.device, gpu.allocator,
+                                max_blocks_per_dispatch);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
   CHECK(store.held() == nullptr && store.coords().empty());
@@ -215,9 +202,7 @@ int apply_case(Gpu& gpu) {
     const std::vector<vr::Vec3i> coords = row_of(sources.size());
     for (const bool device : {false, true}) {
       std::vector<d::ApplySource> s = sources;
-      CHECK(store
-                .reserve(std::uint32_t(s.size()), k,
-                         device ? 0 : std::uint32_t(s.size()))
+      CHECK(store.reserve(std::uint32_t(s.size()), k, device ? nullptr : &s)
                 .ok());
       vkc::CommandBatch batch(gpu.device, gpu.allocator);
       // The device reader's layout, its pads not 0, which the apply drops.
@@ -278,10 +263,11 @@ int apply_case(Gpu& gpu) {
 
 // The slots grow under a held reference, whose words a growing spare never
 // disturbs; and only commit changes what is held, whatever was recorded or
-// refused before it.
+// refused before it. Seven blocks a dispatch, so 50 blocks take eight
+// dispatches, the last of one block, and 700 take 100.
 int grow_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
-      d::ReferenceStore::create(gpu.device, gpu.allocator);
+      d::ReferenceStore::create(gpu.device, gpu.allocator, 7);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
   Lcg rng{23};
@@ -300,7 +286,7 @@ int grow_case(Gpu& gpu) {
     for (std::size_t q = 0; q < n - m; ++q) {
       sources.push_back({d::kNoSource, std::uint32_t(q)});
     }
-    CHECK(store.reserve(std::uint32_t(n), k, std::uint32_t(n - m)).ok());
+    CHECK(store.reserve(std::uint32_t(n), k, &sources).ok());
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
     vkc::Result<d::ResidentBlocks> up =
         store.record_upload(batch, fresh, sources);
@@ -346,7 +332,11 @@ int apply_refusals_case(Gpu& gpu) {
   Lcg rng{29};
   CHECK(commit_intra(gpu, store, random_entries(4, 8, rng), 7) == 0);
   const d::DctBlocks payload = random_entries(4, 8, rng);
-  CHECK(store.reserve(4, 8, 4).ok());
+  const std::uint32_t none = d::kNoSource;
+  // Room for the whole payload uploaded.
+  const std::vector<d::ApplySource> every = {
+      {none, 0}, {none, 1}, {none, 2}, {none, 3}};
+  CHECK(store.reserve(4, 8, &every).ok());
   // The payload uploaded as given, then applied at @p k over @p blocks.
   auto refuses = [&](std::vector<d::ApplySource> sources, std::uint32_t k,
                      std::size_t blocks, const char* says) {
@@ -361,14 +351,13 @@ int apply_refusals_case(Gpu& gpu) {
     return !r.ok() && r.status().domain() == C::InvalidArgument &&
            r.status().message().find(says) != std::string::npos;
   };
-  const std::uint32_t none = d::kNoSource;
   CHECK(refuses({{0, none}, {4, none}}, 8, 2, "reads reference entry 4"));
   CHECK(refuses({{0, 0}}, 9, 1, "at K 9"));
   CHECK(refuses({{none, 4}}, 8, 1, "names entry 4 of 4"));
   CHECK(refuses(std::vector<d::ApplySource>(100, {0, none}), 8, 100,
                 "more than were reserved"));
   CHECK(refuses({{0, none}}, 8, 2, "1 sources for 2 blocks"));
-  CHECK(store.reserve(1u << 31, 8, 0).domain() == C::InvalidArgument);
+  CHECK(store.reserve(1u << 31, 8, nullptr).domain() == C::InvalidArgument);
   CHECK(store.held()->hash == 7 && store.coords() == row_of(4));
   return 0;
 }
@@ -825,7 +814,8 @@ int moves_case(Gpu& gpu, const Spheres& s) {
 }  // namespace
 
 int gpu_main(vr_test::GpuContext& gpu) {
-  if (apply_case(gpu) != 0) return 1;
+  if (apply_case(gpu, 0) != 0) return 1;
+  if (apply_case(gpu, 4) != 0) return 1;
   if (grow_case(gpu) != 0) return 1;
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;

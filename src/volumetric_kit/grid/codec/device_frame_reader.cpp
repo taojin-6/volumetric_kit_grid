@@ -118,7 +118,7 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   const VkDeviceSize mask_bytes =
       VkDeviceSize(entries) * kMaskWordsPerBlock * sizeof(std::uint32_t);
   const VkDeviceSize coeff_bytes =
-      VkDeviceSize(entries) * ((k + 1) / 2) * sizeof(std::uint32_t);
+      VkDeviceSize(entries) * coefficient_words(k) * sizeof(std::uint32_t);
   const VkDeviceSize mode_bytes = VkDeviceSize(m) * sizeof(std::uint32_t);
   const VkDeviceSize fault_bytes =
       VkDeviceSize(segments) * sizeof(std::uint32_t);

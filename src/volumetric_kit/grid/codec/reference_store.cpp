@@ -33,10 +33,17 @@ constexpr std::uint32_t kApplyBindings = 7;
 constexpr VkDeviceSize kMaskBytes = kMaskWordsPerBlock * sizeof(std::uint32_t);
 static_assert(kMaskWordsPerBlock == 16, "inter_apply.comp's kMaskWords is 16");
 
-// Bytes of one entry's coefficients: two int16 a word, each entry starting a
-// word of its own, as the transform reads them.
+// Bytes of one entry's coefficients, as the transform reads them.
 VkDeviceSize coefficient_bytes(std::uint32_t k) {
-  return VkDeviceSize((k + 1) / 2) * sizeof(std::uint32_t);
+  return VkDeviceSize(coefficient_words(k)) * sizeof(std::uint32_t);
+}
+
+// The entries a host-decoded frame's upload takes: those its sources name a
+// payload for (keep, zero and new).
+std::uint32_t uploaded_entries(const std::vector<ApplySource>& sources) {
+  std::uint32_t n = 0;
+  for (const ApplySource& s : sources) n += s.payload != kNoSource ? 1u : 0u;
+  return n;
 }
 
 // A binding's range of @p entries of @p bytes each, never less than one: a
@@ -54,7 +61,8 @@ core::Status fail(const char* op, const std::string& why) {
 }  // namespace
 
 core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
-    core::Device& device, core::Allocator& allocator) {
+    core::Device& device, core::Allocator& allocator,
+    std::uint32_t max_blocks_per_dispatch) {
   VKC_TRY(check_device_requirements(device, "ReferenceStore::create"));
   std::unique_ptr<ReferenceStore> owned(new ReferenceStore());
   ReferenceStore& s = *owned;
@@ -70,6 +78,10 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   s.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
+  s.blocks_per_dispatch_ =
+      max_blocks_per_dispatch == 0
+          ? s.max_workgroup_count_x_
+          : std::min(max_blocks_per_dispatch, s.max_workgroup_count_x_);
   s.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
   // One entry of each, so the side of a frame with none -- the reference of
   // an intra frame, the payload of an all-skip P-frame -- binds a buffer.
@@ -96,9 +108,12 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   return owned;
 }
 
-core::Status ReferenceStore::reserve(std::uint32_t n, std::uint32_t k,
-                                     std::uint32_t uploaded) {
+core::Status ReferenceStore::reserve(
+    std::uint32_t n, std::uint32_t k,
+    const std::vector<ApplySource>* host_sources) {
   Slot& spare = slots_[current_ ^ 1u];
+  const std::uint32_t uploaded =
+      host_sources != nullptr ? uploaded_entries(*host_sources) : 0;
   struct Scratch {
     core::Buffer& buffer;
     VkDeviceSize bytes;
@@ -134,16 +149,14 @@ core::Result<ResidentBlocks> ReferenceStore::record_upload(
     std::vector<ApplySource>& sources) {
   const std::uint32_t k = entries.params.coefficient_count;
   const std::size_t positions = entries.masks.size() / kMaskWordsPerBlock;
-  std::uint64_t count = 0;
   for (const ApplySource& s : sources) {
-    if (s.payload == kNoSource) continue;
-    if (s.payload >= positions) {
+    if (s.payload != kNoSource && s.payload >= positions) {
       return fail("record_upload", "a source names entry " +
                                        std::to_string(s.payload) + " of " +
                                        std::to_string(positions));
     }
-    ++count;
   }
+  const std::uint64_t count = uploaded_entries(sources);
   ResidentBlocks out;
   out.masks = &upload_.masks;
   out.coefficients = &upload_.coefficients;
@@ -256,10 +269,10 @@ core::Result<ResidentBlocks> ReferenceStore::record_apply(
   ApplyPush push;
   push.num_blocks = static_cast<std::uint32_t>(n);
   push.coefficient_count = k;
-  for (std::uint32_t base = 0; base < n; base += max_workgroup_count_x_) {
+  for (std::uint32_t base = 0; base < n; base += blocks_per_dispatch_) {
     push.block_base = base;
     const auto groups = static_cast<std::uint32_t>(
-        std::min<VkDeviceSize>(max_workgroup_count_x_, n - base));
+        std::min<VkDeviceSize>(blocks_per_dispatch_, n - base));
     VKC_TRY(batch.dispatch(apply, &push, sizeof(push), groups,
                            max_workgroup_count_x_, stage));
   }

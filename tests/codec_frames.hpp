@@ -344,6 +344,25 @@ inline void append_payload(d::DctBlocks& b, const Payload& p) {
   b.coefficients.insert(b.coefficients.end(), p.q.begin(), p.q.end());
 }
 
+// @p b's coefficients as the device holds them: two int16 a word,
+// coefficient 2p low, each entry starting a word of its own, an odd K's pad
+// half @p pad.
+inline std::vector<std::uint32_t> pack(const d::DctBlocks& b,
+                                       std::uint16_t pad = 0) {
+  const std::uint32_t k = b.params.coefficient_count;
+  const std::uint32_t words = d::coefficient_words(k);
+  const std::size_t n = b.masks.size() / codec::kMaskWordsPerBlock;
+  std::vector<std::uint32_t> out(n * words, 0);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (std::uint32_t j = 0; j < words * 2; ++j) {
+      const std::uint16_t v =
+          j < k ? static_cast<std::uint16_t>(b.coefficients[i * k + j]) : pad;
+      out[i * words + j / 2] |= std::uint32_t(v) << (16 * (j & 1));
+    }
+  }
+  return out;
+}
+
 // (t - r) mod 2^16, as int16.
 inline std::int16_t residual(std::int16_t t, std::int16_t r) {
   return static_cast<std::int16_t>(static_cast<std::uint16_t>(
