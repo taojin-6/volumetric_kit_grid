@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <limits>
 #include <set>
 #include <string>
@@ -34,12 +33,17 @@ namespace d = volumetric_kit::recon::codec::detail;
 
 namespace {
 
-constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
-
+using codec_frames::assemble;
+using codec_frames::get_u32;
+using codec_frames::kMax32;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
-
-bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
+using codec_frames::put_f32;
+using codec_frames::put_u32;
+using codec_frames::same_bits;
+using codec_frames::Section;
+using codec_frames::sections_of;
+using codec_frames::set_first_x_low_bits;
 
 // A frame carries the weights of the K kept bases only.
 bool same_kept_weights(const codec::CodecParams& a,
@@ -184,25 +188,44 @@ int write_refusals_case() {
   zero.segment_size = 0;
   CHECK(refused(good, zero));
   f = good;  // a type this writer does not code
-  f.type = static_cast<d::FrameType>(1);
+  f.type = static_cast<d::FrameType>(2);
   const vkc::Result<std::vector<std::uint8_t>> typed = d::write_frame(f);
   CHECK(!typed.ok());
   CHECK(typed.status().domain() == vkc::Status::Code::Unsupported);
+  // An intra frame has no reference and no modes (P-frames are
+  // recon_codec_inter_bitstream's).
+  f = good;
+  f.reference.hash = 1;
+  CHECK(refused(f));
+  f = good;
+  f.modes.push_back(d::BlockMode::kSkip);
+  CHECK(refused(f));
   return 0;
 }
 
 // The models' layout, which the kernels index their counts and tables by:
 // each model's first entry is every earlier model's alphabet summed, and one
-// past the last model is the arrays' size.
+// past the last model is the arrays' size. A P-frame's layout is an intra
+// frame's plus the mode model, last.
 int model_layout_case() {
   for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
-    CHECK(d::frame_model_base(0) == 0);
+    const std::uint32_t intra = d::frame_model_count(d::FrameType::kIntra, k);
+    const std::uint32_t inter = d::frame_model_count(d::FrameType::kInter, k);
+    CHECK(inter == intra + 1);
+    CHECK(d::frame_model_base(0, k) == 0);
     std::uint32_t sum = 0;
-    for (std::uint32_t m = 0; m < d::frame_model_count(k); ++m) {
-      CHECK(d::frame_model_base(m) == sum);
-      sum += d::frame_model_alphabet(m);
+    for (std::uint32_t m = 0; m < inter; ++m) {
+      CHECK(d::frame_model_base(m, k) == sum);
+      sum += d::frame_model_alphabet(m, k);
     }
-    CHECK(d::frame_model_base(d::frame_model_count(k)) == sum);
+    CHECK(d::frame_model_base(inter, k) == sum);
+    // The intra models end where the mode model starts, which has one
+    // symbol per mode.
+    CHECK(d::frame_model_base(intra, k) ==
+          sum - d::frame_model_alphabet(intra, k));
+    CHECK(d::frame_model_alphabet(intra, k) ==
+          std::uint32_t(d::BlockMode::kMotion) + 1);
+    CHECK(d::frame_model_alphabet(intra - 1, k) == 16);
   }
   return 0;
 }
@@ -216,9 +239,10 @@ int assemble_refusals_case() {
   good.params.coefficient_count = 8;
   good.block_count = 10;
   good.segment_size = 4;  // three segments
-  std::vector<std::vector<std::uint64_t>> counts(d::frame_model_count(8));
+  std::vector<std::vector<std::uint64_t>> counts(
+      d::frame_model_count(d::FrameType::kIntra, 8));
   for (std::uint32_t m = 0; m < counts.size(); ++m) {
-    counts[m].assign(d::frame_model_alphabet(m), 1);
+    counts[m].assign(d::frame_model_alphabet(m, 8), 1);
   }
   good.tables = d::frame_tables(counts);
   good.segment_lengths = {4, 4, 4};
@@ -248,79 +272,32 @@ int assemble_refusals_case() {
   f = good;
   f.payload.pop_back();
   CHECK(refused(f));
+  // Reference fields on an intra frame, each named. new_count is REFERENCE's
+  // A, which an intra frame lacks: 0, as parse_frame gives it.
+  auto names = [](const d::CodedFrame& c, const char* field) {
+    const vkc::Result<std::vector<std::uint8_t>> r =
+        d::assemble_frame(d::FrameType::kIntra, c);
+    return !r.ok() &&
+           r.status().message().find(std::string("its ") + field +
+                                     " is not 0") != std::string::npos;
+  };
+  f = good;
+  f.reference.hash = 1;
+  CHECK(names(f, "reference hash"));
+  f = good;
+  f.reference.header.block_count = 1;
+  CHECK(names(f, "reference block count"));
+  f = good;
+  f.update_size = 64;
+  CHECK(names(f, "update_size"));
+  f = good;
+  f.new_count = f.block_count;
+  CHECK(names(f, "new_count"));
   return 0;
 }
 
 // --- Editing a valid frame.
 // ----------------------------------------------------
-
-void put_u32(std::vector<std::uint8_t>& b, std::size_t at, std::uint32_t v) {
-  for (int i = 0; i < 4; ++i) {
-    b[at + std::size_t(i)] = static_cast<std::uint8_t>(v >> (8 * i));
-  }
-}
-
-void put_f32(std::vector<std::uint8_t>& b, std::size_t at, float f) {
-  std::uint32_t v = 0;
-  std::memcpy(&v, &f, sizeof(v));
-  put_u32(b, at, v);
-}
-
-std::uint32_t get_u32(const std::vector<std::uint8_t>& b, std::size_t at) {
-  std::uint32_t v = 0;
-  for (int i = 0; i < 4; ++i) {
-    v |= std::uint32_t(b[at + std::size_t(i)]) << (8 * i);
-  }
-  return v;
-}
-
-struct Section {
-  std::uint16_t id;
-  std::uint16_t flags;
-  std::vector<std::uint8_t> body;
-};
-
-// Split a frame into its fixed header and sections, and put one back
-// together, so a test can drop, repeat, reorder or rewrite a section.
-std::vector<Section> sections_of(const std::vector<std::uint8_t>& b) {
-  std::vector<Section> out;
-  const std::uint32_t count = get_u32(b, 40);
-  const std::size_t header = d::frame_header_bytes(get_u32(b, 20));
-  std::size_t body = header + count * d::kSectionEntryBytes;
-  for (std::uint32_t i = 0; i < count; ++i) {
-    const std::size_t e = header + i * d::kSectionEntryBytes;
-    Section s;
-    s.id = static_cast<std::uint16_t>(b[e] | (b[e + 1] << 8));
-    s.flags = static_cast<std::uint16_t>(b[e + 2] | (b[e + 3] << 8));
-    const std::uint32_t len = get_u32(b, e + 4);
-    s.body.assign(b.begin() + std::ptrdiff_t(body),
-                  b.begin() + std::ptrdiff_t(body + len));
-    body += len;
-    out.push_back(std::move(s));
-  }
-  return out;
-}
-
-std::vector<std::uint8_t> assemble(const std::vector<std::uint8_t>& frame,
-                                   const std::vector<Section>& sections) {
-  std::vector<std::uint8_t> b(
-      frame.begin(), frame.begin() + std::ptrdiff_t(d::frame_header_bytes(
-                                         get_u32(frame, 20))));
-  put_u32(b, 40, static_cast<std::uint32_t>(sections.size()));
-  for (const Section& s : sections) {
-    b.push_back(static_cast<std::uint8_t>(s.id));
-    b.push_back(static_cast<std::uint8_t>(s.id >> 8));
-    b.push_back(static_cast<std::uint8_t>(s.flags));
-    b.push_back(static_cast<std::uint8_t>(s.flags >> 8));
-    for (int i = 0; i < 4; ++i) {
-      b.push_back(static_cast<std::uint8_t>(s.body.size() >> (8 * i)));
-    }
-  }
-  for (const Section& s : sections) {
-    b.insert(b.end(), s.body.begin(), s.body.end());
-  }
-  return b;
-}
 
 bool refused_as(const std::vector<std::uint8_t>& bytes, vkc::Status::Code code,
                 std::uint32_t max_blocks = 1u << 20) {
@@ -414,37 +391,37 @@ int frame_type_case() {
   const std::vector<std::uint8_t> good =
       d::write_frame(make_frame(100, 16, 5)).value();
   const d::ParsedFrame p =
-      d::parse_frame(good.data(), good.size(), 1u << 20).value();
-  d::CodedFrame coded;
-  coded.voxel_size = p.header.voxel_size;
-  coded.trunc_dist = p.header.trunc_dist;
-  coded.params = p.header.params;
-  coded.block_count = p.header.block_count;
-  coded.segment_size = p.header.segment_size;
-  coded.tables = p.tables;
-  coded.segment_lengths = p.segment_lengths;
-  coded.payload.assign(p.payload, p.payload + p.payload_size);
+      d::parse_frame(good.data(), good.size(), 1u << 20, nullptr).value();
+  CHECK(p.update_size == 0 && p.new_count == 0);  // no REFERENCE
+  const d::CodedFrame coded = codec_frames::coded_frame(p);
   CHECK(good[6] == 0);
   CHECK(d::assemble_frame(d::FrameType::kIntra, coded).value() == good);
   CHECK(read(good).value().type == d::FrameType::kIntra);
 
   using C = vkc::Status::Code;
-  for (std::uint32_t type : {1u, 255u}) {
-    std::vector<std::uint8_t> b =
-        d::assemble_frame(static_cast<d::FrameType>(type), coded).value();
-    CHECK(b[6] == type);
+  // Past a P-frame, no writer or reader codes a type.
+  for (std::uint32_t type : {2u, 255u}) {
+    CHECK(d::assemble_frame(static_cast<d::FrameType>(type), coded)
+              .status()
+              .domain() == C::Unsupported);
+    std::vector<std::uint8_t> b = good;
+    b[6] = static_cast<std::uint8_t>(type);
     CHECK(refused_as(b, C::Unsupported));
     CHECK(d::read_frame_header(b.data(), b.size()).status().domain() ==
           C::Unsupported);
-    CHECK(d::parse_frame(b.data(), b.size(), 1u << 20).status().domain() ==
-          C::Unsupported);
-    b[6] = 0;
-    CHECK(b == good);
+    CHECK(d::parse_frame(b.data(), b.size(), 1u << 20, nullptr)
+              .status()
+              .domain() == C::Unsupported);
   }
+  // An intra frame relabelled a P-frame lacks its REFERENCE section.
+  std::vector<std::uint8_t> b = good;
+  b[6] = 1;
+  CHECK(d::read_frame_header(b.data(), b.size()).ok());
+  CHECK(refused_as(b, C::InvalidArgument));
   // decode_frame and the device reader take a caller's parsed frame, so they
   // check its type again.
   d::ParsedFrame typed = p;
-  typed.header.type = static_cast<d::FrameType>(1);
+  typed.header.type = static_cast<d::FrameType>(2);
   CHECK(d::decode_frame(typed).status().domain() == C::Unsupported);
   return 0;
 }
@@ -485,6 +462,12 @@ int section_rules_case() {
   }
   extra.flags = 2;
   CHECK(read(assemble(good, {s[0], extra, s[1], s[2]})).ok());
+  // REFERENCE, a P-frame's, is refused on an intra frame.
+  const Section reference{static_cast<std::uint16_t>(d::SectionId::kReference),
+                          d::kSectionRequired,
+                          std::vector<std::uint8_t>(d::kReferenceBodyBytes, 0)};
+  CHECK(refused_as(assemble(good, {reference, s[0], s[1], s[2]}),
+                   C::InvalidArgument));
 
   // SEGMENTS must list one length per segment, each a whole number of words
   // and at least a state, adding up to the PAYLOAD.
@@ -554,19 +537,6 @@ int table_rules_case() {
   CHECK(
       refused_as(with_tables({1, 0, 0x80, 0xA0, 0x00}, 1), C::InvalidArgument));
   return 0;
-}
-
-// Rewrite the low 12 bits of the x of the first block of the segment whose
-// stream starts at @p at in PAYLOAD. A segment's first raw chunk is the low 12
-// bits of its stream's initial state word (bytes 2-3), and raw bits leave the
-// state untouched, so this moves that one coordinate and nothing else -- the
-// edit no end check can see, and so how a test reaches what only a flipped
-// raw bit makes.
-void set_first_x_low_bits(std::vector<std::uint8_t>& payload, std::size_t at,
-                          std::uint32_t low12) {
-  payload[at + 2] = static_cast<std::uint8_t>(low12 & 0xFF);
-  payload[at + 3] = static_cast<std::uint8_t>((payload[at + 3] & 0xF0) |
-                                              ((low12 >> 8) & 0x0F));
 }
 
 // Blocks all observed with zero coefficients at @p coords, K = 1.

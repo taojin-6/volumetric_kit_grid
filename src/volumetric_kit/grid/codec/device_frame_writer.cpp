@@ -95,7 +95,8 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
     return fail("record_count", "more than 2^30 - 1 segments");
   }
   segment_size_ = segment_size;
-  counts_host_.assign(frame_model_base(frame_model_count(k)), 0);
+  counts_host_.assign(
+      frame_model_base(frame_model_count(FrameType::kIntra, k), k), 0);
   steps_host_.assign(n, 0);
   if (n == 0) return {};
 
@@ -139,7 +140,8 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t segment_size = segment_size_;
   if (segment_size == 0 || k != blocks.coefficient_count ||
-      counts_host_.size() != frame_model_base(frame_model_count(k)) ||
+      counts_host_.size() !=
+          frame_model_base(frame_model_count(FrameType::kIntra, k), k) ||
       steps_host_.size() != n) {
     return fail("finish", "these blocks were not the ones record_count saw");
   }
@@ -147,11 +149,11 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
       static_cast<std::uint32_t>(frame_segment_count(n, segment_size));
 
   // The tables, from the device's counts through the host's normalization.
-  const std::uint32_t models = frame_model_count(k);
+  const std::uint32_t models = frame_model_count(FrameType::kIntra, k);
   std::vector<std::vector<std::uint64_t>> counts(models);
   for (std::uint32_t m = 0; m < models; ++m) {
-    counts[m].assign(counts_host_.begin() + frame_model_base(m),
-                     counts_host_.begin() + frame_model_base(m + 1));
+    counts[m].assign(counts_host_.begin() + frame_model_base(m, k),
+                     counts_host_.begin() + frame_model_base(m + 1, k));
   }
   CodedFrame coded;
   coded.voxel_size = voxel_size;

@@ -3,8 +3,9 @@
 
 // The v3 frame's symbol models -- one frequency table each, in this order in
 // TABLES -- with each model's alphabet and its first entry in the per-symbol
-// arrays (the device's counts and tables), and the symbols a block's mask is
-// coded with. The one definition: the kernels include it as GLSL, and
+// arrays (the device's counts and tables), the symbols a block's mask is
+// coded with, a P-frame's reference-entry modes, and where each segment's
+// entries sit. The one definition: the kernels include it as GLSL, and
 // bitstream.cpp as C++ (see frame_grammar.glsl), so it is written in what the
 // two languages share.
 
@@ -32,6 +33,7 @@ const uint kPlane = 6u;      // a partial mask's plane: same, empty, full, lines
 const uint kLine = 7u;       // then its lines, three models by predictor
 const uint kByte = kLine + 3u;       // then a line's byte, by the same three
 const uint kFirstCoef = kByte + 3u;  // then one model per coefficient j < K
+// and, in a P-frame only, the mode model (mode_model, below).
 
 // A class is a bit length: 0 for zero, else 1 + floor(log2 |v|). Coordinate
 // deltas reach 2^32 - 1 (INT32_MIN to INT32_MAX), so 33 classes; quantized
@@ -61,12 +63,34 @@ const uint kMaskWords = 16u;
 const uint kLinesPerPlane = 8u;  // y
 const uint kPlanes = 8u;         // z
 
-uint model_alphabet(uint model) {
+// The frame types (header byte 6) that change the models.
+const uint kFrameIntra = 0u;
+const uint kFrameInter = 1u;
+
+// A P-frame's mode for each entry of its reference (bitstream.hpp gives what
+// each carries): one symbol of the mode model, which has no context. Motion
+// is reserved: a frame whose mode table gives it a frequency is refused.
+const uint kModeKeep = 0u;
+const uint kModeSkip = 1u;
+const uint kModeZero = 2u;
+const uint kModeRemove = 3u;
+const uint kModeMotion = 4u;
+const uint kModeSymbols = 5u;
+
+uint mode_model(uint k) { return kFirstCoef + k; }
+
+// How many models a frame of type `type` keeping k coefficients has.
+uint model_count(uint type, uint k) {
+  return kFirstCoef + k + (type == kFrameInter ? 1u : 0u);
+}
+
+uint model_alphabet(uint model, uint k) {
   if (model < kMaskClass) return kCoordClasses;
   if (model < kPlane) return kMaskClasses;
   if (model < kByte) return kRunClasses;
   if (model < kFirstCoef) return kByteSymbols;
-  return kCoefClasses;
+  if (model < mode_model(k)) return kCoefClasses;
+  return kModeSymbols;
 }
 
 // The first entry of each run of models with one alphabet.
@@ -76,13 +100,30 @@ const uint kByteBase = kPlaneBase + kRunClasses * (kByte - kPlane);
 const uint kFirstCoefBase = kByteBase + kByteSymbols * (kFirstCoef - kByte);
 
 // The sum of every earlier model's alphabet; for one past the last model, the
-// whole array's size.
-uint model_base(uint model) {
+// whole array's size. The mode model starts where coefficient table K would.
+uint model_base(uint model, uint k) {
   if (model < kMaskClass) return kCoordClasses * model;
   if (model < kPlane) return kMaskClassBase;
   if (model < kByte) return kPlaneBase + kRunClasses * (model - kPlane);
   if (model < kFirstCoef) return kByteBase + kByteSymbols * (model - kByte);
-  return kFirstCoefBase + kCoefClasses * (model - kFirstCoef);
+  if (model <= mode_model(k)) {
+    return kFirstCoefBase + kCoefClasses * (model - kFirstCoef);
+  }
+  return kFirstCoefBase + kCoefClasses * k + kModeSymbols;
+}
+
+// The stream positions [x, y) segment s covers. A P-frame's m reference
+// entries come first, u to an update segment, entry e at position e; then
+// its a new blocks, r to a segment, new block q at position m + q. An intra
+// frame is the case m = 0. Within u32, since a frame's m + a is.
+uvec2 segment_range(uint s, uint m, uint u, uint a, uint r) {
+  const uint updates = m == 0u ? 0u : (m - 1u) / u + 1u;
+  if (s < updates) {
+    const uint first = s * u;
+    return uvec2(first, m - first > u ? first + u : m);
+  }
+  const uint first = (s - updates) * r;
+  return uvec2(m + first, m + (a - first > r ? first + r : a));
 }
 
 #endif  // VR_FRAME_MODELS_GLSL

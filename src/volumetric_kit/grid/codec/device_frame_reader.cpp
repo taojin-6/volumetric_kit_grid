@@ -57,8 +57,8 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
 core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
     core::CommandBatch& batch, const ParsedFrame& frame,
     core::GpuStageScope* stage) {
-  VKC_TRY(
-      check_frame_type(frame.header.type, "DeviceFrameReader::record_decode"));
+  VKC_TRY(check_frame_type(frame.header.type, FrameType::kIntra,
+                           "DeviceFrameReader::record_decode"));
   const std::uint32_t n = frame.header.block_count;
   const std::uint32_t k = frame.header.params.coefficient_count;
   const auto segments =
@@ -83,7 +83,7 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
 
   // Every size first, so a frame the device cannot hold grows nothing.
   const std::vector<std::uint32_t> entries = rans_table_entries(frame.tables);
-  const std::uint32_t models = frame_model_count(k);
+  const std::uint32_t models = frame_model_count(FrameType::kIntra, k);
   const VkDeviceSize entry_bytes = entries.size() * sizeof(std::uint32_t);
   const VkDeviceSize slot_bytes =
       VkDeviceSize(models) * kRansScale * sizeof(std::uint32_t);
@@ -176,7 +176,7 @@ core::Status DeviceFrameReader::check() const {
     const std::size_t first = s * r;
     VKC_TRY(check_segment(s, static_cast<SegmentFault>(faults_host_[s]),
                           s > 0 ? &blocks_host_[first - 1].coord : nullptr,
-                          blocks_host_[first].coord));
+                          &blocks_host_[first].coord));
   }
   return {};
 }

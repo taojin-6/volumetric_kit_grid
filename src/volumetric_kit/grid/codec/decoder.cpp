@@ -47,6 +47,8 @@ core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
                                         std::size_t size) {
   VKC_ASSIGN(const detail::FrameHeader header,
              detail::read_frame_header(data, size));
+  VKC_TRY(detail::check_frame_type(header.type, detail::FrameType::kIntra,
+                                   "read_frame_info"));
   FrameInfo info;
   info.voxel_size = header.voxel_size;
   info.trunc_dist = header.trunc_dist;
@@ -138,6 +140,8 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // never mistaken for one the grid is too small for.
   VKC_ASSIGN(const detail::FrameHeader header,
              detail::read_frame_header(data, size));
+  VKC_TRY(detail::check_frame_type(header.type, detail::FrameType::kIntra,
+                                   "Decoder::decode"));
   if (header.voxel_size != gp.voxel_size ||
       header.trunc_dist != gp.trunc_dist) {
     return fail("the frame's geometry (voxel_size " +
@@ -167,7 +171,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                        "VoxelBlockGrid::resize and decode again");
     };
     core::Result<detail::ParsedFrame> parsed = detail::parse_frame(
-        data, size, static_cast<std::uint32_t>(gp.num_blocks));
+        data, size, static_cast<std::uint32_t>(gp.num_blocks), nullptr);
     if (!parsed.ok()) return too_big(parsed.status());
     const std::size_t segments = parsed.value().segment_lengths.size();
     // kAuto decodes on the host whatever the device cannot: a frame it
@@ -220,21 +224,16 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     detail::sort_by_coord(current);
     std::vector<volume::BlockIndex> gone;
     std::vector<volume::BlockIndex> missing;
-    std::size_t i = 0;
-    std::size_t j = 0;
-    while (i < current.size() || j < frame_blocks.size()) {
-      if (j == frame_blocks.size() ||
-          (i < current.size() &&
-           detail::coord_less(current[i].coord, frame_blocks[j].coord))) {
-        gone.push_back(current[i++]);
-      } else if (i == current.size() ||
-                 detail::coord_less(frame_blocks[j].coord, current[i].coord)) {
-        missing.push_back(frame_blocks[j++]);
-      } else {
-        ++i;
-        ++j;
-      }
-    }
+    VKC_TRY(detail::merge_by_coord(
+        current.size(),
+        [&](std::size_t i) -> const Vec3i& { return current[i].coord; },
+        frame_blocks.size(),
+        [&](std::size_t j) -> const Vec3i& { return frame_blocks[j].coord; },
+        [&](std::size_t i, std::size_t j) {
+          if (j == detail::kAbsent) gone.push_back(current[i]);
+          if (i == detail::kAbsent) missing.push_back(frame_blocks[j]);
+          return core::Status{};
+        }));
     for (int round = 0; !gone.empty(); ++round) {
       volume::AllocFailures failures;
       VKC_ASSIGN(
