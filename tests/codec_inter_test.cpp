@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// GPU test for P-frame decoding: the reference store's apply against
+// GPU test for decoding on the device: the reference store's apply against
 // independent uint16 arithmetic, at every source kind and K, in one dispatch
-// or several, as its slots grow; and the Decoder's chains -- an I-frame, then
-// P-frames -- leaving the grid exactly as an intra decode of the same content
-// does, bit for bit, on every entropy path, kAuto crossing between them
-// mid-chain, with every mode, new blocks and the empty cases; a P-frame whose
-// reference is not held refused as NotFound, and every refusal and failure
-// leaving the reference as it was. Internal headers by include path; skips
-// with no device.
+// or several, as its slots grow; and the Decoder's frames -- the Encoder's,
+// and chains of an I-frame, then P-frames -- leaving the grid exactly as the
+// CPU oracle's decode of the same content does, bit for bit, with every mode,
+// new blocks and the empty cases; a P-frame whose reference is not held
+// refused as NotFound, a frame the device cannot decode refused, and every
+// refusal and failure leaving the reference as it was. Internal headers by
+// include path; skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -23,6 +23,7 @@
 #include "bitstream.hpp"
 #include "codec_fixture.hpp"
 #include "codec_frames.hpp"
+#include "dct_transform.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
@@ -364,12 +365,6 @@ int apply_refusals_case(Gpu& gpu) {
 
 // --- The Decoder. -----------------------------------------------------------
 
-codec::DecoderConfig on(codec::EntropyCoding entropy) {
-  codec::DecoderConfig c;
-  c.entropy = entropy;
-  return c;
-}
-
 // A grid built from a frame's header, as a player builds one.
 vkc::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
                                           std::int32_t num_buckets = 512) {
@@ -382,31 +377,28 @@ vkc::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
   return make_grid(gpu, shape);
 }
 
-// What an intra frame decodes to: a decoder of its own, a fresh grid.
-vkc::Result<Snapshot> intra_decode(Gpu& gpu, const Bytes& frame) {
-  VKC_ASSIGN(codec::Decoder dec,
-             codec::Decoder::create(gpu.device, gpu.allocator,
-                                    on(codec::EntropyCoding::kHost)));
+// What an intra frame decodes to by the oracle: the CPU rANS reader's
+// entries (read_frame, which pins the format's bytes), inverse-transformed
+// into a fresh grid of the frame's blocks -- no device reader, no apply, no
+// reference.
+vkc::Result<Snapshot> oracle_decode(Gpu& gpu, const Bytes& frame) {
+  VKC_ASSIGN(const d::Frame content,
+             d::read_frame(frame.data(), frame.size(), kMaxBlocks));
   VKC_ASSIGN(vol::VoxelBlockGrid grid, grid_for(gpu, frame));
-  VKC_TRY(dec.decode(frame.data(), frame.size(), grid));
+  VKC_TRY(allocate(grid, content.coords));
+  // The grid's blocks in frame order, entry for entry with the content's.
+  VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
+  VKC_ASSIGN(std::unique_ptr<d::DctTransform> transform,
+             d::DctTransform::create(gpu.device, gpu.allocator));
+  VKC_TRY(transform->inverse(grid, grid.block_list(blocks), content.blocks));
   return snapshot(gpu, grid);
 }
 
 // Whether @p grid holds what @p frame, an intra frame, decodes to.
 bool holds(Gpu& gpu, vol::VoxelBlockGrid& grid, const Bytes& frame) {
-  vkc::Result<Snapshot> want = intra_decode(gpu, frame);
+  vkc::Result<Snapshot> want = oracle_decode(gpu, frame);
   vkc::Result<Snapshot> got = snapshot(gpu, grid);
   return want.ok() && got.ok() && want.value() == got.value();
-}
-
-// The segments a frame holds, from its SEGMENTS section.
-std::size_t segments_of(const Bytes& frame) {
-  for (const codec_frames::Section& s : codec_frames::sections_of(frame)) {
-    if (s.id == static_cast<std::uint16_t>(d::SectionId::kSegments)) {
-      return s.body.size() / 4;
-    }
-  }
-  return 0;
 }
 
 d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
@@ -448,24 +440,19 @@ Step i_step(const Bytes& intra) {
 }
 
 // Decode a chain's frames in order into one grid, which after each must hold
-// that step's intra decode; under each entropy path.
+// the oracle's decode of that step's intra frame.
 int run_chain(Gpu& gpu, const std::vector<Step>& chain, const char* what) {
-  for (codec::EntropyCoding entropy :
-       {codec::EntropyCoding::kHost, codec::EntropyCoding::kDevice,
-        codec::EntropyCoding::kAuto}) {
-    vkc::Result<codec::Decoder> dec =
-        codec::Decoder::create(gpu.device, gpu.allocator, on(entropy));
-    vkc::Result<vol::VoxelBlockGrid> grid = grid_for(gpu, chain[0].sent);
-    CHECK(dec.ok() && grid.ok());
-    for (std::size_t i = 0; i < chain.size(); ++i) {
-      const Bytes& f = chain[i].sent;
-      const vkc::Status s =
-          dec.value().decode(f.data(), f.size(), grid.value());
-      if (!s.ok() || !holds(gpu, grid.value(), chain[i].intra)) {
-        std::fprintf(stderr, "%s: step %zu, entropy %d: %s\n", what, i,
-                     int(entropy), s.ok() ? "differs" : s.message().c_str());
-        return 1;
-      }
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> grid = grid_for(gpu, chain[0].sent);
+  CHECK(dec.ok() && grid.ok());
+  for (std::size_t i = 0; i < chain.size(); ++i) {
+    const Bytes& f = chain[i].sent;
+    const vkc::Status s = dec.value().decode(f.data(), f.size(), grid.value());
+    if (!s.ok() || !holds(gpu, grid.value(), chain[i].intra)) {
+      std::fprintf(stderr, "%s: step %zu: %s\n", what, i,
+                   s.ok() ? "differs" : s.message().c_str());
+      return 1;
     }
   }
   return 0;
@@ -530,6 +517,37 @@ int synthetic_case(Gpu& gpu) {
   return 0;
 }
 
+// The Encoder's frames of one sphere at an odd K, at the default segments
+// and finer ones, each into a fresh grid: as the oracle decodes them.
+int encoder_case(Gpu& gpu) {
+  vkc::Result<vol::VoxelBlockGrid> g =
+      sphere_grid(gpu, Sphere{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f});
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(g.ok() && dec.ok());
+  for (std::uint32_t segment_size : {64u, 3u}) {
+    codec::EncoderConfig config;
+    config.params.coefficient_count = 37;
+    config.segment_size = segment_size;
+    vkc::Result<codec::Encoder> enc =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(enc.ok());
+    vkc::Result<Bytes> frame = enc.value().encode(g.value());
+    CHECK(frame.ok());
+    CHECK(codec::read_frame_info(frame.value().data(), frame.value().size())
+              .value()
+              .block_count > 0);
+    vkc::Result<vol::VoxelBlockGrid> player = grid_for(gpu, frame.value());
+    CHECK(player.ok());
+    CHECK(
+        dec.value()
+            .decode(frame.value().data(), frame.value().size(), player.value())
+            .ok());
+    CHECK(holds(gpu, player.value(), frame.value()));
+  }
+  return 0;
+}
+
 // I-frames from the Encoder, of a sphere that moves and grows.
 struct Spheres {
   std::vector<Step> chain;  // I, P, P
@@ -538,7 +556,7 @@ struct Spheres {
 vkc::Result<Bytes> encode_sphere(Gpu& gpu, const Sphere& s) {
   VKC_ASSIGN(vol::VoxelBlockGrid g, sphere_grid(gpu, s));
   codec::EncoderConfig config;
-  config.segment_size = 3;  // enough segments for kAuto to decode on device
+  config.segment_size = 3;
   VKC_ASSIGN(codec::Encoder enc,
              codec::Encoder::create(gpu.device, gpu.allocator, config));
   return enc.encode(g);
@@ -555,8 +573,7 @@ vkc::Result<Spheres> spheres(Gpu& gpu) {
     intra.push_back(std::move(frame));
   }
   out.chain.push_back(i_step(intra[0]));
-  // Long segments, then short ones: kAuto decodes the I-frame and the
-  // second P-frame on the device, and the first on the host.
+  // Long segments, then short ones.
   const d::FrameWriteOptions few = sizes(64, 64);
   const d::FrameWriteOptions many = sizes(1, 2);
   for (int t = 1; t < 3; ++t) {
@@ -568,22 +585,18 @@ vkc::Result<Spheres> spheres(Gpu& gpu) {
   return out;
 }
 
-// The sphere chain on every entropy path, kAuto crossing from the device to
-// the host and back; the last P-frame into a fresh grid built from its own
+// The sphere chain; the last P-frame into a fresh grid built from its own
 // header.
 int sphere_case(Gpu& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
-  CHECK(segments_of(chain[0].sent) >= codec::kMinDeviceDecodeSegments);
-  CHECK(segments_of(chain[1].sent) < codec::kMinDeviceDecodeSegments);
-  CHECK(segments_of(chain[2].sent) >= codec::kMinDeviceDecodeSegments);
   const Census c = census(chain[0], chain[1]);
   CHECK(c.modes[std::size_t(d::BlockMode::kKeep)] > 0);
   CHECK(c.modes[std::size_t(d::BlockMode::kRemove)] > 0);
   CHECK(c.added > 0);
   CHECK(run_chain(gpu, chain, "spheres") == 0);
 
-  vkc::Result<codec::Decoder> dec = codec::Decoder::create(
-      gpu.device, gpu.allocator, on(codec::EntropyCoding::kAuto));
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
   CHECK(dec.ok() && g.ok());
   for (int i = 0; i < 2; ++i) {
@@ -623,8 +636,8 @@ int refused(Gpu& gpu, codec::Decoder& dec, const Bytes& frame,
 // no reference held; a later I-frame held; another decoder's reference.
 int not_found_case(Gpu& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
-  vkc::Result<codec::Decoder> made = codec::Decoder::create(
-      gpu.device, gpu.allocator, on(codec::EntropyCoding::kAuto));
+  vkc::Result<codec::Decoder> made =
+      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
   CHECK(made.ok() && g.ok());
   codec::Decoder& dec = made.value();
@@ -647,10 +660,10 @@ int not_found_case(Gpu& gpu, const Spheres& s) {
 
   // Each decoder holds its own: a second one that never saw the I-frame
   // refuses what the first decodes.
-  vkc::Result<codec::Decoder> other = codec::Decoder::create(
-      gpu.device, gpu.allocator, on(codec::EntropyCoding::kHost));
-  vkc::Result<codec::Decoder> first = codec::Decoder::create(
-      gpu.device, gpu.allocator, on(codec::EntropyCoding::kHost));
+  vkc::Result<codec::Decoder> other =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<codec::Decoder> first =
+      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> og = grid_for(gpu, chain[0].sent);
   CHECK(other.ok() && first.ok() && og.ok());
   CHECK(first.value()
@@ -667,10 +680,9 @@ int not_found_case(Gpu& gpu, const Spheres& s) {
   return 0;
 }
 
-// InvalidArgument from checks outside the device decode, under kAuto at a
-// size it decodes on the device -- a new block on a reference block (after
-// it), and a scale not the reference's (before it) -- leaving the grid and
-// the reference as they were.
+// InvalidArgument from checks outside the device decode -- a new block on a
+// reference block (after it), and a scale not the reference's (before it) --
+// leaving the grid and the reference as they were.
 int invalid_case(Gpu& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
   // The second P-frame with one more new block: the coordinate of a block
@@ -700,13 +712,12 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   }
   p.blocks = std::move(blocks);
   const Bytes on_reference = d::write_frame(p, sizes(1, 2)).value();
-  CHECK(segments_of(on_reference) >= codec::kMinDeviceDecodeSegments);
 
   Bytes rescaled = chain[2].sent;
   codec_frames::put_f32(rescaled, 24, 0.3f);
 
-  vkc::Result<codec::Decoder> made = codec::Decoder::create(
-      gpu.device, gpu.allocator, on(codec::EntropyCoding::kAuto));
+  vkc::Result<codec::Decoder> made =
+      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
   CHECK(made.ok() && g.ok());
   codec::Decoder& dec = made.value();
@@ -737,53 +748,49 @@ int out_of_memory_case(Gpu& gpu, const Spheres& s) {
       p_step(few[0], successor(few[0].content, 42, 100, 400, 6), sizes(4, 4)));
   few.push_back(
       p_step(few[1], successor(few[1].content, 43, 100, 400, 2), sizes(4, 4)));
-  for (codec::EntropyCoding entropy :
-       {codec::EntropyCoding::kHost, codec::EntropyCoding::kDevice}) {
-    vkc::Result<codec::Decoder> made =
-        codec::Decoder::create(gpu.device, gpu.allocator, on(entropy));
-    vkc::Result<vol::VoxelBlockGrid> big = grid_for(gpu, chain[0].sent);
-    CHECK(made.ok() && big.ok());
-    codec::Decoder& dec = made.value();
-    CHECK(dec.decode(chain[0].sent.data(), chain[0].sent.size(), big.value())
-              .ok());
+  vkc::Result<codec::Decoder> made =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> big = grid_for(gpu, chain[0].sent);
+  CHECK(made.ok() && big.ok());
+  codec::Decoder& dec = made.value();
+  CHECK(
+      dec.decode(chain[0].sent.data(), chain[0].sent.size(), big.value()).ok());
 
-    // Too few slots: refused at the parse, the grid untouched.
-    const Bytes& p = chain[1].sent;
-    const std::uint32_t n =
-        codec::read_frame_info(p.data(), p.size()).value().block_count;
-    GridShape tiny;
-    tiny.num_buckets = 4;
-    vkc::Result<vol::VoxelBlockGrid> small = make_grid(gpu, tiny);
-    CHECK(small.ok() && n > 32);
-    CHECK(refused(gpu, dec, p, small.value(), C::OutOfMemory,
-                  "the caller can hold") == 0);
-    CHECK(small.value().resize(std::int32_t(n)).ok());
-    CHECK(dec.decode(p.data(), p.size(), small.value()).ok());
-    CHECK(holds(gpu, small.value(), chain[1].intra));
+  // Too few slots: refused at the parse, the grid untouched.
+  const Bytes& p = chain[1].sent;
+  const std::uint32_t n =
+      codec::read_frame_info(p.data(), p.size()).value().block_count;
+  GridShape tiny;
+  tiny.num_buckets = 4;
+  vkc::Result<vol::VoxelBlockGrid> small = make_grid(gpu, tiny);
+  CHECK(small.ok() && n > 32);
+  CHECK(refused(gpu, dec, p, small.value(), C::OutOfMemory,
+                "the caller can hold") == 0);
+  CHECK(small.value().resize(std::int32_t(n)).ok());
+  CHECK(dec.decode(p.data(), p.size(), small.value()).ok());
+  CHECK(holds(gpu, small.value(), chain[1].intra));
 
-    // A table that cannot place them: refused once the grid has changed.
-    CHECK(dec.decode(few[0].sent.data(), few[0].sent.size(), big.value()).ok());
-    const Bytes& q = few[1].sent;
-    const std::uint32_t m =
-        codec::read_frame_info(q.data(), q.size()).value().block_count;
-    GridShape cramped;
-    cramped.bucket_size = 2;
-    cramped.num_buckets = std::int32_t((m + 1) / 2);
-    cramped.max_chain = 1;
-    vkc::Result<vol::VoxelBlockGrid> tight = make_grid(gpu, cramped);
-    CHECK(tight.ok());
-    const vkc::Status st = dec.decode(q.data(), q.size(), tight.value());
-    CHECK(!st.ok() && st.domain() == C::OutOfMemory);
-    // The failed frame is not held: a P-frame on it is NotFound.
-    CHECK(refused(gpu, dec, few[2].sent, big.value(), C::NotFound,
-                  "not the one held") == 0);
-    CHECK(tight.value().resize(cramped.num_buckets * 8).ok());
-    CHECK(dec.decode(q.data(), q.size(), tight.value()).ok());
-    CHECK(holds(gpu, tight.value(), few[1].intra));
-    CHECK(
-        dec.decode(few[2].sent.data(), few[2].sent.size(), tight.value()).ok());
-    CHECK(holds(gpu, tight.value(), few[2].intra));
-  }
+  // A table that cannot place them: refused once the grid has changed.
+  CHECK(dec.decode(few[0].sent.data(), few[0].sent.size(), big.value()).ok());
+  const Bytes& q = few[1].sent;
+  const std::uint32_t m =
+      codec::read_frame_info(q.data(), q.size()).value().block_count;
+  GridShape cramped;
+  cramped.bucket_size = 2;
+  cramped.num_buckets = std::int32_t((m + 1) / 2);
+  cramped.max_chain = 1;
+  vkc::Result<vol::VoxelBlockGrid> tight = make_grid(gpu, cramped);
+  CHECK(tight.ok());
+  const vkc::Status st = dec.decode(q.data(), q.size(), tight.value());
+  CHECK(!st.ok() && st.domain() == C::OutOfMemory);
+  // The failed frame is not held: a P-frame on it is NotFound.
+  CHECK(refused(gpu, dec, few[2].sent, big.value(), C::NotFound,
+                "not the one held") == 0);
+  CHECK(tight.value().resize(cramped.num_buckets * 8).ok());
+  CHECK(dec.decode(q.data(), q.size(), tight.value()).ok());
+  CHECK(holds(gpu, tight.value(), few[1].intra));
+  CHECK(dec.decode(few[2].sent.data(), few[2].sent.size(), tight.value()).ok());
+  CHECK(holds(gpu, tight.value(), few[2].intra));
   return 0;
 }
 
@@ -811,6 +818,41 @@ int moves_case(Gpu& gpu, const Spheres& s) {
   return 0;
 }
 
+// A frame the device cannot decode -- a segment of more than
+// kMaxDeviceDecodeSegmentSize entries, of new blocks or of reference entries
+// -- refused with the device's code, InvalidArgument, the grid and the
+// reference as they were; nothing decodes it on the host. Segments of
+// exactly the limit decode.
+int device_refusal_case(Gpu& gpu) {
+  constexpr std::uint32_t kLimit = codec::kMaxDeviceDecodeSegmentSize;
+  const d::Frame first = make_frame(kLimit + 1, 8, 71);
+  std::vector<Step> chain;
+  chain.push_back(i_step(d::write_frame(first, sizes(kLimit, 1)).value()));
+  const d::Frame next = successor(first, 72, 50, 300, 4);
+  chain.push_back(p_step(chain[0], next, sizes(64, kLimit)));
+  const Bytes long_intra = d::write_frame(first, sizes(kLimit + 1, 1)).value();
+  const Bytes long_update = p_step(chain[0], next, sizes(64, kLimit + 1)).sent;
+
+  vkc::Result<codec::Decoder> made =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
+  CHECK(made.ok() && g.ok());
+  codec::Decoder& dec = made.value();
+  const Bytes& i = chain[0].sent;
+  CHECK(dec.decode(i.data(), i.size(), g.value()).ok());
+  CHECK(holds(gpu, g.value(), chain[0].intra));
+  const std::string says = "segments of " + std::to_string(kLimit + 1);
+  CHECK(refused(gpu, dec, long_intra, g.value(), C::InvalidArgument,
+                says.c_str()) == 0);
+  CHECK(refused(gpu, dec, long_update, g.value(), C::InvalidArgument,
+                says.c_str()) == 0);
+  // Both refusals kept the reference: the P-frame on it decodes.
+  const Bytes& p = chain[1].sent;
+  CHECK(dec.decode(p.data(), p.size(), g.value()).ok());
+  CHECK(holds(gpu, g.value(), chain[1].intra));
+  return 0;
+}
+
 }  // namespace
 
 int gpu_main(vr_test::GpuContext& gpu) {
@@ -819,6 +861,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (grow_case(gpu) != 0) return 1;
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
+  if (encoder_case(gpu) != 0) return 1;
+  if (device_refusal_case(gpu) != 0) return 1;
   vkc::Result<Spheres> s = spheres(gpu);
   CHECK(s.ok());
   if (sphere_case(gpu, s.value()) != 0) return 1;

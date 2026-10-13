@@ -26,8 +26,6 @@ namespace detail {
 class DctTransform;
 class DeviceFrameReader;
 class ReferenceStore;
-struct ParsedFrame;
-struct ResidentBlocks;
 }  // namespace detail
 
 /// @brief What a frame's header says: enough to build a grid it decodes into.
@@ -67,13 +65,6 @@ struct FrameInfo {
 VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
                                                      std::size_t size);
 
-/// @brief How a @ref Decoder decodes a frame.
-struct DecoderConfig {
-  /// Where the rANS decoding runs. The device decodes one segment per
-  /// invocation, so a frame of smaller segments gives it more parallelism.
-  EntropyCoding entropy = EntropyCoding::kAuto;
-};
-
 /// @brief Decodes frames into a caller's @ref volume::VoxelBlockGrid -- the
 ///        codec's playback side (the 2026-09-26 decision).
 ///
@@ -102,26 +93,29 @@ struct DecoderConfig {
 /// frame the reference; one refused or failed keeps the reference it had, so
 /// the same frame decoded again, after a resize say, decodes against it.
 /// The reference and the frame being decoded take `64 + 4 * ceil(K / 2)`
-/// bytes of device memory a block each, and the frame 24 more; a frame
-/// decoded on the host uploads up to another `64 + 4 * ceil(K / 2)` a
-/// block. All of it is kept, sized for the largest frame decoded.
+/// bytes of device memory a block each, and the frame 24 more; the rANS
+/// decode takes `64 + 4 * ceil(K / 2)` an entry it decodes (a P-frame's
+/// reference entries and its new blocks), beside the frame's payload and
+/// tables. All of it is kept, sized for the largest frame decoded.
+///
+/// The rANS decode runs on the device, one segment an invocation, and its
+/// coefficients and masks stay there; a frame the device cannot decode is
+/// refused, never decoded on the host.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time, and
 ///          nothing else may modify the grid during one.
 class VR_CODEC_API Decoder {
  public:
-  /// @brief Build the inverse transform's kernels, and with
-  ///        @ref EntropyCoding::kDevice the rANS decoder's; @ref
-  ///        EntropyCoding::kAuto builds those at its first device frame.
+  /// @brief Build the kernels: the rANS decoder's, the apply's and the
+  ///        inverse transform's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
-  /// @param config     How frames are decoded.
-  /// @return The decoder, or a pipeline or allocation failure.
+  /// @return The decoder, or a pipeline or allocation failure: a device
+  ///         whose kernels do not build has no decoder.
   static core::Result<Decoder> create(core::Device& device,
-                                      core::Allocator& allocator,
-                                      const DecoderConfig& config = {});
+                                      core::Allocator& allocator);
 
   ~Decoder();
   Decoder(Decoder&& other) noexcept;
@@ -150,9 +144,9 @@ class VR_CODEC_API Decoder {
   ///                 frame's `voxel_size` and `trunc_dist` exactly (see
   ///                 @ref read_frame_info).
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
-  ///                 row with both halves -- its device half is the apply,
-  ///                 the inverse transform and, decoded on the device, the
-  ///                 rANS kernels -- over the breakdown rows
+  ///                 row with both halves -- its device half is the rANS
+  ///                 kernels, the apply and the inverse transform -- over
+  ///                 the breakdown rows
   ///                 `"  ..rans decode"` (parsing and decoding the frame),
   ///                 `"  ..active set"` (the compaction), `"  ..apply"`
   ///                 (merging a P-frame's blocks with its reference's, then
@@ -169,9 +163,11 @@ class VR_CODEC_API Decoder {
   ///         reference's included); `Status::Code::NotFound` for a P-frame
   ///         whose reference this decoder does not hold (none, or another
   ///         frame): the stream's P-frames decode again from its next
-  ///         I-frame;
-  ///         with @ref EntropyCoding::kDevice, a frame the device cannot
-  ///         decode (see @ref EntropyCoding);
+  ///         I-frame; a frame the device cannot decode:
+  ///         `Status::Code::InvalidArgument` for a segment of more than
+  ///         @ref kMaxDeviceDecodeSegmentSize entries or a buffer past
+  ///         `maxStorageBufferRange`, `Status::Code::OutOfMemory` past free
+  ///         device memory;
   ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other
@@ -195,26 +191,13 @@ class VR_CODEC_API Decoder {
  private:
   Decoder();
 
-  /// Build @ref reader_ unless it is built, or return the failure of the
-  /// one build tried.
-  core::Status ensure_reader();
-  /// Decode @p frame's segments on the built reader, through the submit; the
-  /// reader's check() then judges them.
-  core::Result<detail::ResidentBlocks> decode_on_device(
-      const detail::ParsedFrame& frame, core::GpuStageScope& stage);
-
-  DecoderConfig config_;
-  // Borrowed (must outlive this); what the device decode's batch runs on.
+  // Borrowed (must outlive this); what the decode's batches run on.
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
+  std::unique_ptr<detail::DeviceFrameReader> reader_;
   // The reference a P-frame decodes against, and the apply into it.
   std::unique_ptr<detail::ReferenceStore> store_;
-  // Built at create for kDevice, at the first device frame for kAuto, and
-  // never for kHost; and why that build failed, after which kAuto decodes
-  // every frame on the host.
-  std::unique_ptr<detail::DeviceFrameReader> reader_;
-  core::Status reader_failure_;
   // Device spans for the transform; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;
 };

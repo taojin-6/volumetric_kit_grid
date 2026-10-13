@@ -68,7 +68,8 @@ inline std::vector<SweepConfig> sweep_configs() {
 /// vertices with no decoded surface within it -- holes.
 ///
 /// @param base    The command line's configuration: each row keeps its
-///                entropy coding and segment size, and sets the params.
+///                encoder's entropy coding and segment size, and sets the
+///                params.
 /// @param player  The grid to decode into: a stream's player, already built
 ///                for this geometry (it grows if a frame needs it).
 inline vkc::Status run_codec_sweep(vkc::Device& device,
@@ -78,10 +79,8 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
                                    vr::mesh::MarchingCubes& extractor,
                                    const vr::codec::EncoderConfig& base,
                                    vr::volume::VoxelBlockGrid& player) {
-  vr::codec::DecoderConfig dc;
-  dc.entropy = base.entropy;
   VKC_ASSIGN(vr::codec::Decoder dec,
-             vr::codec::Decoder::create(device, allocator, dc));
+             vr::codec::Decoder::create(device, allocator));
   int grows = 0;
   const float tau = reference.options().fscore_threshold;
   if (tau > 0.0f) {

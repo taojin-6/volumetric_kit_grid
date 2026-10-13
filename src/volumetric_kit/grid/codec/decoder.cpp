@@ -10,7 +10,6 @@
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_reader.hpp"
-#include "entropy_choice.hpp"
 #include "frame_hash.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -66,39 +65,15 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept = default;
 bool Decoder::valid() const noexcept { return transform_ != nullptr; }
 
 core::Result<Decoder> Decoder::create(core::Device& device,
-                                      core::Allocator& allocator,
-                                      const DecoderConfig& config) {
+                                      core::Allocator& allocator) {
   Decoder d;
-  d.config_ = config;
   d.device_ = &device;
   d.allocator_ = &allocator;
   VKC_ASSIGN(d.transform_, detail::DctTransform::create(device, allocator));
+  VKC_ASSIGN(d.reader_, detail::DeviceFrameReader::create(device, allocator));
   VKC_ASSIGN(d.store_, detail::ReferenceStore::create(device, allocator));
-  // kAuto builds the reader at its first device frame, which a small scene
-  // never reaches.
-  if (config.entropy == EntropyCoding::kDevice) VKC_TRY(d.ensure_reader());
   VKC_ASSIGN(d.gpu_timer_, core::GpuTimer::create(device));
   return d;
-}
-
-core::Status Decoder::ensure_reader() {
-  if (reader_ != nullptr) return {};
-  // A build that failed fails again, so it is tried once.
-  if (!reader_failure_.ok()) return reader_failure_;
-  core::Result<std::unique_ptr<detail::DeviceFrameReader>> reader =
-      detail::DeviceFrameReader::create(*device_, *allocator_);
-  if (!reader.ok()) return reader_failure_ = reader.status();
-  reader_ = std::move(reader).value();
-  return {};
-}
-
-core::Result<detail::ResidentBlocks> Decoder::decode_on_device(
-    const detail::ParsedFrame& frame, core::GpuStageScope& stage) {
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_ASSIGN(const detail::ResidentBlocks resident,
-             reader_->record_decode(batch, frame, &stage));
-  VKC_TRY(batch.submit());
-  return resident;
 }
 
 core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
@@ -152,59 +127,34 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                 "); build the grid from read_frame_info");
   }
   const bool inter = header.type == FrameType::kInter;
-  // The frame's new blocks, a P-frame's modes, and the payload by stream
-  // position: on the host, or where the device decoded it.
+  // The frame's new blocks, and its payload by stream position where the
+  // device decoded it; a P-frame's modes stay the reader's.
   std::vector<Vec3i> added;
-  std::vector<detail::BlockMode> modes;
-  detail::DctBlocks host_entries;
-  detail::ResidentBlocks resident;
-  bool on_device = false;
+  detail::ResidentBlocks payload;
   {
     // The whole frame, entropy-decoded, a P-frame against the reference
     // held: a corrupt one, or one on another reference, is refused here,
     // with the grid untouched. The heap bounds the block count the reader
-    // will allocate for, so a frame the grid cannot hold is refused here too.
+    // will allocate for, so a frame the grid cannot hold is refused here too;
+    // a frame the device cannot hold is refused as the reader refuses it.
     core::StageScope read(metrics, "  ..rans decode");
-    auto too_big = [](const core::Status& s) {
-      return s.domain() != core::Status::Code::OutOfMemory
-                 ? s
-                 : core::Status::out_of_memory(
-                       "Decoder::decode: " + s.message() +
-                       " (the grid's num_blocks); grow it with "
-                       "VoxelBlockGrid::resize and decode again");
-    };
     core::Result<detail::ParsedFrame> parsed = detail::parse_frame(
         data, size, static_cast<std::uint32_t>(gp.num_blocks), store_->held());
-    if (!parsed.ok()) return too_big(parsed.status());
-    const std::size_t segments = parsed.value().segment_lengths.size();
-    // kAuto decodes on the host whatever the device cannot: a frame it
-    // cannot hold, or every frame once its kernels failed to build.
-    if (detail::codes_on_device(config_.entropy, segments,
-                                kMinDeviceDecodeSegments) &&
-        ensure_reader().ok()) {
-      core::Result<detail::ResidentBlocks> r =
-          decode_on_device(parsed.value(), stage);
-      if (r.ok()) {
-        VKC_TRY(reader_->check());
-        resident = r.value();
-        on_device = true;
-        added.reserve(reader_->blocks().size());
-        for (const volume::BlockIndex& b : reader_->blocks()) {
-          added.push_back(b.coord);
-        }
-        modes = reader_->modes();
-      } else if (!detail::retry_on_host(config_.entropy, r.status())) {
-        return r.status();
-      }
+    if (!parsed.ok()) {
+      const core::Status& s = parsed.status();
+      if (s.domain() != core::Status::Code::OutOfMemory) return s;
+      return core::Status::out_of_memory(
+          "Decoder::decode: " + s.message() +
+          " (the grid's num_blocks); grow it with VoxelBlockGrid::resize and "
+          "decode again");
     }
-    if (!on_device) {
-      core::Result<detail::Frame> r =
-          detail::decode_frame(std::move(parsed).value());
-      if (!r.ok()) return too_big(r.status());
-      detail::Frame frame = std::move(r).value();
-      added = std::move(frame.coords);
-      modes = std::move(frame.modes);
-      host_entries = std::move(frame.blocks);
+    core::CommandBatch batch(*device_, *allocator_);
+    VKC_ASSIGN(payload, reader_->record_decode(batch, parsed.value(), &stage));
+    VKC_TRY(batch.submit());
+    VKC_TRY(reader_->check());
+    added.reserve(reader_->blocks().size());
+    for (const volume::BlockIndex& b : reader_->blocks()) {
+      added.push_back(b.coord);
     }
   }
 
@@ -221,20 +171,18 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     const std::vector<Vec3i> no_reference;
     VKC_ASSIGN(frame,
                detail::merge_frame(inter ? store_->coords() : no_reference,
-                                   modes, added));
+                                   reader_->modes(), added));
     // Then room on the device for its N blocks, before the grid changes:
-    // the store's spare, list and sources, and the host path's upload. Each,
-    // like every buffer the inverse binds -- K <= 512 coefficients and 16
-    // mask words a block, 20 bytes of hash entry a slot -- is at most the
-    // 4-byte tsdf array once the frame fits the heap, and
-    // VoxelBlockGrid::create / resize bound that array to
-    // maxStorageBufferRange (attribute() confirmed it covers the live grid),
-    // so no range check refuses once the grid starts to change. A P-frame's
-    // reader bound its M + A entries itself: a fresh grid sized from N does
-    // not bound M.
+    // the store's spare, list and sources. Each, like every buffer the
+    // inverse binds -- K <= 512 coefficients and 16 mask words a block, 20
+    // bytes of hash entry a slot -- is at most the 4-byte tsdf array once
+    // the frame fits the heap, and VoxelBlockGrid::create / resize bound
+    // that array to maxStorageBufferRange (attribute() confirmed it covers
+    // the live grid), so no range check refuses once the grid starts to
+    // change. A P-frame's reader bound its M + A entries itself: a fresh
+    // grid sized from N does not bound M.
     VKC_TRY(store_->reserve(static_cast<std::uint32_t>(frame.coords.size()),
-                            header.params.coefficient_count,
-                            on_device ? nullptr : &frame.sources));
+                            header.params.coefficient_count, nullptr));
 
     // A merge of two sorted lists: what the grid holds that the frame lacks
     // is removed (VoxelBlockGrid::remove zeroes it, so a later reuse of its
@@ -311,11 +259,6 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   {
     core::StageScope inverse(metrics, "  ..inverse");
     core::CommandBatch batch(*device_, *allocator_);
-    detail::ResidentBlocks payload = resident;
-    if (!on_device) {
-      VKC_ASSIGN(payload,
-                 store_->record_upload(batch, host_entries, frame.sources));
-    }
     VKC_ASSIGN(const detail::ResidentBlocks blocks,
                store_->record_apply(batch, payload, frame.sources, frame.coords,
                                     &stage));

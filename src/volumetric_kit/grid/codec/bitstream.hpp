@@ -402,7 +402,11 @@ struct CodedFrame {
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame);
 
-/// @brief Parse and decode a frame.
+/// @brief Parse and decode a frame on the host: the tests' oracle for the
+///        device reader, which is what the `Decoder` decodes with.
+///
+/// TODO(codec): the host reader (this and @ref decode_frame) has no library
+/// caller; it moves under tests/.
 ///
 /// Reads nothing outside `[data, data + size)`, whatever the bytes say.
 /// @param data        The frame.
