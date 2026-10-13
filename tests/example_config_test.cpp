@@ -52,6 +52,9 @@ int main() {
       std::fprintf(stderr, "%s: %s\n", example.file,
                    loaded.status().message().c_str());
     CHECK(loaded);
+    // Classic unless the rig viewer's.
+    CHECK(loaded->fusion.dynamic ==
+          (example.application == cfg::Application::RigViewer));
   }
 
   const auto readback =
