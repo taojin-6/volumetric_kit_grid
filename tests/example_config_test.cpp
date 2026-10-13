@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // The integration boundary: core-validated settings reach the runtime options
-// unchanged. No file assets, device or camera are opened.
+// unchanged, and the codec checks the steps core leaves to it. No file
+// assets, device or camera are opened.
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -104,15 +105,34 @@ int main() {
                                   cfg::Application::CodecReplica);
   CHECK(encoded);
   const auto encoder = vr_example::encoder_config(encoded.value().codec);
-  CHECK(encoder.params.coefficient_count == 128);
-  CHECK(encoder.params.quantization_scale == 0.3F);
-  CHECK(encoder.params.quantization_weights[0] == 1.F);
-  CHECK(encoder.params.quantization_weights[1] == 1.125F);
-  CHECK(encoder.params.quantization_weights[2] == 1.5F);
-  CHECK(encoder.entropy == vr::codec::EntropyCoding::kDevice);
-  CHECK(encoder.segment_size == 32);
-  // The runtime library's own contract agrees with the central input policy.
-  CHECK(encoder.params.validate().ok());
+  CHECK(encoder.ok());
+  CHECK(encoder->params.coefficient_count == 128);
+  CHECK(encoder->params.quantization_scale == 0.3F);
+  // The radial table's weights (codec_quantization.hpp), 1 at DC.
+  CHECK(encoder->params.quantization_weights[0] == 1.F);
+  CHECK(encoder->params.quantization_weights[1] == 1.125F);
+  CHECK(encoder->params.quantization_weights[2] == 1.5F);
+  CHECK(encoder->params.quantization_weights[1 + 8 * 2 + 64 * 3] == 2.75F);
+  CHECK(encoder->entropy == vr::codec::EntropyCoding::kDevice);
+  CHECK(encoder->segment_size == 32);
+
+  // Steps out of the codec's bounds load, and the codec refuses them: too
+  // fine everywhere, or too coarse at radial's highest frequency.
+  for (const char* codec_section :
+       {R"({"quantization_scale": 0.0001})",
+        R"({"quantization_table": "radial", "coefficient_count": 512,
+            "quantization_scale": 4})"}) {
+    const auto out_of_bounds =
+        cfg::parse(std::string(R"({"version": 1, "operation": "codec",
+                        "source": {"kind": "dataset", "path": "room0"},
+                        "codec": )") +
+                       codec_section + "}",
+                   cfg::Application::CodecReplica);
+    CHECK(out_of_bounds);
+    const auto refused = vr_example::encoder_config(out_of_bounds->codec);
+    CHECK(!refused.ok() &&
+          refused.status().domain() == vkc::Status::Code::InvalidArgument);
+  }
 
   const auto mesh = cfg::parse(R"({
     "version": 1, "operation": "codec",

@@ -78,6 +78,9 @@ vkc::Status run(const Options& opt) {
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_input.ply", input));
   }
   if (opt.codec.inspect_only) return {};
+  // Before any GPU work: a step the codec refuses costs none.
+  VKC_ASSIGN(const vr::codec::EncoderConfig config,
+             vr_example::encoder_config(opt.codec));
   if (opt.source.sdf_mode == vr_example::config::SdfMode::Signed &&
       !topology.supports_signed()) {
     return vkc::Status::invalid_argument(
@@ -148,8 +151,6 @@ vkc::Status run(const Options& opt) {
   vr_example::print_stage_rows("mesh conversion", conversion, 1, 2);
   VKC_ASSIGN(mesh::MarchingCubes extractor,
              mesh::MarchingCubes::create(device, allocator));
-  const vr::codec::EncoderConfig& config =
-      vr_example::encoder_config(opt.codec);
   VKC_ASSIGN(vr_example::CodecStream stream,
              vr_example::CodecStream::create(device, allocator, config));
   std::printf("codec: K %u, table %s, quantization scale %.6g\n",
