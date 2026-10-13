@@ -6,20 +6,42 @@
 /// @file examples/common/codec_config.hpp
 /// @brief Map the core's validated codec and mesh settings to runtime types.
 
+#include "codec_quantization.hpp"
+#include "codec_stream.hpp"
 #include "config.hpp"
+#include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
 
 namespace vr_example {
 
-/// @return Runtime encoder settings; all values and weights come from core.
-inline volumetric_kit::recon::codec::EncoderConfig encoder_config(
-    const config::Codec& settings) {
+/// @return The selected table's name, as @ref apply_quantization_table and
+///         the measurement report take it.
+inline const char* quantization_name(config::QuantizationTable table) {
+  switch (table) {
+    case config::QuantizationTable::Uniform:
+      return "uniform";
+    case config::QuantizationTable::Band:
+      return "band";
+    case config::QuantizationTable::Radial:
+      return "radial";
+  }
+  return "unknown";
+}
+
+/// @return Runtime encoder settings: core's values, and the weights of its
+///         `quantization_table` (@ref apply_quantization_table); or
+///         InvalidArgument from `CodecParams::validate` for a kept
+///         coefficient's step outside the codec's bounds, which core leaves
+///         to the codec.
+inline volumetric_kit::core::Result<volumetric_kit::recon::codec::EncoderConfig>
+encoder_config(const config::Codec& settings) {
   namespace codec = volumetric_kit::recon::codec;
   codec::EncoderConfig result;
   result.params.coefficient_count = settings.coefficient_count;
   result.params.quantization_scale = settings.quantization_scale;
-  result.params.quantization_weights = settings.quantization_weights;
+  VKC_TRY(apply_quantization_table(
+      result.params, quantization_name(settings.quantization_table)));
   result.segment_size = settings.segment_size;
   switch (settings.entropy) {
     case config::Entropy::Auto:
@@ -32,24 +54,15 @@ inline volumetric_kit::recon::codec::EncoderConfig encoder_config(
       result.entropy = codec::EntropyCoding::kDevice;
       break;
   }
+  VKC_TRY(result.params.validate());
   return result;
 }
 
-// TODO(examples): CodecOutputs from core #30's output.csv and
-// output.frame_directory, for codec_replica's and codec_mesh's
-// CodecStream::create; until then they write no rows or frames.
-
-/// @return The selected table's name for the measurement report.
-inline const char* quantization_name(config::QuantizationTable table) {
-  switch (table) {
-    case config::QuantizationTable::Uniform:
-      return "uniform";
-    case config::QuantizationTable::Band:
-      return "band";
-    case config::QuantizationTable::Radial:
-      return "radial";
-  }
-  return "unknown";
+/// @return Where a codec stream writes besides its report: core's
+///         `output.csv` and `output.stream`, already relative to the
+///         scenario's directory; an empty path writes nothing.
+inline CodecOutputs codec_outputs(const config::Output& output) {
+  return {output.csv, output.stream};
 }
 
 /// @return Runtime SDF parameters copied from core's validated mesh source.
