@@ -332,13 +332,7 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
   VKC_TRY(check_frame_type(frame.type, FrameType::kInter, "write_frame"));
   const bool inter = frame.type == FrameType::kInter;
   const DctBlocks& b = frame.blocks;
-  if (!positive_finite(frame.voxel_size)) {
-    return bad_write("voxel_size must be finite and positive");
-  }
-  if (!positive_finite(b.trunc_dist)) {
-    return bad_write("trunc_dist must be finite and positive");
-  }
-  VKC_TRY(b.params.validate());
+  VKC_TRY(check_coding(frame.voxel_size, b.trunc_dist, b.params));
   if (options.segment_size == 0) {
     return bad_write("segment_size must be at least 1");
   }
@@ -417,6 +411,17 @@ core::Status check_frame_type(FrameType type, FrameType newest,
       std::to_string(static_cast<uint>(type)) +
       (newest == FrameType::kIntra ? " (only intra is coded)"
                                    : " (only intra and P-frames are coded)"));
+}
+
+core::Status check_coding(float voxel_size, float trunc_dist,
+                          const CodecParams& params) {
+  if (!positive_finite(voxel_size)) {
+    return bad_write("voxel_size must be finite and positive");
+  }
+  if (!positive_finite(trunc_dist)) {
+    return bad_write("trunc_dist must be finite and positive");
+  }
+  return params.validate();
 }
 
 core::Status check_entries(std::uint32_t largest_mode, bool motion,
@@ -538,13 +543,7 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   const bool inter = type == FrameType::kInter;
   // The header's fields as check_frame checks them, for the device
   // writer, which codes without a Frame.
-  if (!positive_finite(frame.voxel_size)) {
-    return bad_write("voxel_size must be finite and positive");
-  }
-  if (!positive_finite(frame.trunc_dist)) {
-    return bad_write("trunc_dist must be finite and positive");
-  }
-  VKC_TRY(frame.params.validate());
+  VKC_TRY(check_coding(frame.voxel_size, frame.trunc_dist, frame.params));
   if (frame.segment_size == 0) {
     return bad_write("segment_size must be at least 1");
   }

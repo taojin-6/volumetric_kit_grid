@@ -331,6 +331,14 @@ struct FrameWriteOptions {
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_frame(
     const Frame& frame, const FrameWriteOptions& options = {});
 
+/// @brief The refusals @ref write_frame makes after the type's, of the
+///        coding parameters, which @ref assemble_frame and the device
+///        writer make first too: one place for their codes and words.
+/// @return OK, or `Status::Code::InvalidArgument` for a non-positive or
+///         non-finite @p voxel_size or @p trunc_dist, or invalid @p params.
+VR_CODEC_API core::Status check_coding(float voxel_size, float trunc_dist,
+                                       const CodecParams& params);
+
 /// @brief The last refusals @ref write_frame makes, of what its entries
 ///        hold, which the device writer's count pass finds: one place for
 ///        both writers' codes and words.

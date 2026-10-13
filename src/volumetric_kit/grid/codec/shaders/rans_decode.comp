@@ -107,7 +107,7 @@ uint get_bits(uint bits) {
 
 bool coder_failed() { return g_failed; }
 
-uint g_coefficients = 0u;  // the block's first word
+uint g_coefficients = 0u;  // the entry's first word
 uint g_low = 0u;           // an even coefficient, waiting for the odd one
 
 // Two coefficients a word, low first.

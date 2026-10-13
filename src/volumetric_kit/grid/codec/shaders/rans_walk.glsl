@@ -19,11 +19,11 @@
 #define VR_FRAME_WRITER
 #include "frame_grammar.glsl"
 
-// By stream position (segment_range): a P-frame's M reference entries, then
-// its new blocks; an intra frame's blocks.
 layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
   BlockIndex blocks[];  // the new blocks in frame order; only coord is read
 };
+// By stream position (segment_range): a P-frame's M reference entries, then
+// its new blocks; an intra frame's blocks.
 layout(set = 0, binding = 1, scalar) readonly buffer Masks {
   uint masks[];  // kMaskWords an entry
 };

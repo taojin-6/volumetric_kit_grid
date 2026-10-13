@@ -94,11 +94,12 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @param reference   A P-frame's reference, whose block count is the
   ///                    blocks' reference entries; null for an intra frame.
   /// @return The frame's bytes, identical to @ref write_frame's for the
-  ///         same content; @ref check_entries' refusals, as @ref write_frame
-  ///         makes them; `Status::Code::InvalidArgument` for invalid params,
-  ///         blocks @ref record_count did not count, a reference whose block
-  ///         count is not the blocks' reference entries, or a frame
-  ///         @ref assemble_frame refuses; or a buffer or dispatch failure.
+  ///         same content; @ref check_coding's refusals, then
+  ///         @ref check_entries', as @ref write_frame makes them;
+  ///         `Status::Code::InvalidArgument` for blocks @ref record_count
+  ///         did not count, a reference whose block count is not the blocks'
+  ///         reference entries, or a frame @ref assemble_frame refuses; or a
+  ///         buffer or dispatch failure.
   ///         `Status::Code::IoError` only if a kernel's table refused a
   ///         symbol it was counted from, which is a bug here.
   core::Result<std::vector<std::uint8_t>> finish(
@@ -150,6 +151,7 @@ class VR_CODEC_API DeviceFrameWriter {
   // readback's prediction (0 before any).
   std::uint32_t segment_size_ = 0;
   std::uint32_t update_size_ = 0;
+  std::uint32_t reference_count_ = 0;
   std::uint32_t payload_per_entry_[2] = {};
 };
 

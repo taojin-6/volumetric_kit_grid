@@ -68,23 +68,24 @@ d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
   return o;
 }
 
-// The device writer's bytes for a host frame: its entries uploaded, counted
-// and finished, as the encoder does with the transform's output -- a
-// P-frame's modes, its payloads at their stream positions, and its new
-// blocks.
-vkc::Result<Bytes> device_write(d::DeviceFrameWriter& writer,
-                                const d::Frame& frame,
-                                const d::FrameWriteOptions& options) {
+// A host frame's entries in device buffers, as the encoder holds the
+// transform's output: a P-frame's modes, its payloads at their stream
+// positions, and its new blocks.
+struct Resident {
+  d::ResidentBlocks blocks;
+  std::unique_ptr<vkc::Buffer> list, masks, coefficients, modes;
+};
+
+vkc::Result<Resident> resident(const d::Frame& frame) {
   const auto m = static_cast<std::uint32_t>(frame.modes.size());
   const auto a = static_cast<std::uint32_t>(frame.coords.size());
   const std::uint32_t entries = m + a;
   const std::uint32_t k = frame.blocks.params.coefficient_count;
   const std::uint32_t words = (k + 1) / 2;
-  d::ResidentBlocks blocks;
-  blocks.count = entries;
-  blocks.reference_count = m;
-  blocks.coefficient_count = k;
-  std::unique_ptr<vkc::Buffer> list, masks, coefficients, modes;
+  Resident r;
+  r.blocks.count = entries;
+  r.blocks.reference_count = m;
+  r.blocks.coefficient_count = k;
   if (entries != 0) {
     // Two int16 a word, each entry starting a word of its own.
     std::vector<std::uint32_t> packed(std::size_t(entries) * words, 0);
@@ -96,37 +97,46 @@ vkc::Result<Bytes> device_write(d::DeviceFrameWriter& writer,
                                                   << (16 * (j & 1));
       }
     }
-    VKC_ASSIGN(masks,
+    VKC_ASSIGN(r.masks,
                upload(frame.blocks.masks.data(),
                       frame.blocks.masks.size() * sizeof(std::uint32_t)));
-    VKC_ASSIGN(coefficients,
+    VKC_ASSIGN(r.coefficients,
                upload(packed.data(), packed.size() * sizeof(std::uint32_t)));
-    blocks.masks = masks.get();
-    blocks.coefficients = coefficients.get();
+    r.blocks.masks = r.masks.get();
+    r.blocks.coefficients = r.coefficients.get();
   }
   if (a != 0) {
     std::vector<vr::volume::BlockIndex> entries_of(a);
     for (std::uint32_t q = 0; q < a; ++q) entries_of[q].coord = frame.coords[q];
-    VKC_ASSIGN(list,
+    VKC_ASSIGN(r.list,
                upload(entries_of.data(),
                       entries_of.size() * sizeof(vr::volume::BlockIndex)));
-    blocks.list = list.get();
+    r.blocks.list = r.list.get();
   }
   if (m != 0) {
     std::vector<std::uint32_t> words_of(m);
     for (std::uint32_t e = 0; e < m; ++e) {
       words_of[e] = static_cast<std::uint32_t>(frame.modes[e]);
     }
-    VKC_ASSIGN(modes, upload(words_of.data(),
-                             words_of.size() * sizeof(std::uint32_t)));
-    blocks.modes = modes.get();
+    VKC_ASSIGN(r.modes, upload(words_of.data(),
+                               words_of.size() * sizeof(std::uint32_t)));
+    r.blocks.modes = r.modes.get();
   }
+  return r;
+}
+
+// The device writer's bytes for a host frame: its entries uploaded, counted
+// and finished, as the encoder does with the transform's output.
+vkc::Result<Bytes> device_write(d::DeviceFrameWriter& writer,
+                                const d::Frame& frame,
+                                const d::FrameWriteOptions& options) {
+  VKC_ASSIGN(const Resident r, resident(frame));
   vkc::CommandBatch batch(*g_device, *g_allocator);
-  VKC_TRY(writer.record_count(batch, blocks, options.segment_size,
+  VKC_TRY(writer.record_count(batch, r.blocks, options.segment_size,
                               options.update_size));
   VKC_TRY(batch.submit());
   return writer.finish(
-      blocks, frame.voxel_size, frame.blocks.trunc_dist, frame.blocks.params,
+      r.blocks, frame.voxel_size, frame.blocks.trunc_dist, frame.blocks.params,
       frame.type == d::FrameType::kInter ? &frame.reference : nullptr);
 }
 
@@ -448,21 +458,27 @@ int inter_refusals_case(d::DeviceFrameReader& reader) {
 // with its code and message: a mode past the alphabet (the largest named),
 // motion, and a written -32768 -- a keep residual, a zero or new block's
 // coefficient, an intra frame's -- which the count clamps so no count
-// indexes past its model. A skipped entry's -32768 is not written, so both
-// write the frame.
+// indexes past its model. Bad coding parameters come first on both, with
+// any of these. A skipped entry's -32768 is not written, so both write the
+// frame.
 int writer_refusals_case(d::DeviceFrameWriter& writer) {
   const d::Frame reference = make_frame(30, 8, 51);
   const d::FrameReference id = reference_of(d::write_frame(reference).value());
-  const d::Frame good =
-      inter_frame(id, reference, successor(reference, 52, 150, 400, 5));
-  auto first = [&](d::BlockMode mode) {
-    const auto it = std::find(good.modes.begin(), good.modes.end(), mode);
-    return static_cast<std::size_t>(it - good.modes.begin());
+  const d::Frame target = successor(reference, 52, 150, 400, 5);
+  auto first = [](const d::Frame& p, d::BlockMode mode) {
+    const auto it = std::find(p.modes.begin(), p.modes.end(), mode);
+    return static_cast<std::size_t>(it - p.modes.begin());
   };
-  const std::size_t keep = first(d::BlockMode::kKeep);
-  const std::size_t skip = first(d::BlockMode::kSkip);
-  const std::size_t zero = first(d::BlockMode::kZero);
-  CHECK(keep < good.modes.size() && skip < good.modes.size());
+  // A skip spelled as zero: the frame writes a zero entry too.
+  const std::size_t spelled =
+      first(inter_frame(id, reference, target), d::BlockMode::kSkip);
+  const d::Frame good =
+      inter_frame(id, reference, target, {{spelled, d::BlockMode::kZero}});
+  const std::size_t keep = first(good, d::BlockMode::kKeep);
+  const std::size_t skip = first(good, d::BlockMode::kSkip);
+  const std::size_t zero = first(good, d::BlockMode::kZero);
+  CHECK(keep < good.modes.size() && skip < good.modes.size() &&
+        zero < good.modes.size());
   const std::uint32_t k = 8;
   const std::int16_t low = std::numeric_limits<std::int16_t>::min();
   struct Edit {
@@ -478,22 +494,30 @@ int writer_refusals_case(d::DeviceFrameWriter& writer) {
   f.modes[keep] = static_cast<d::BlockMode>(5);
   edits.push_back({"mode 5", C::InvalidArgument, f});
   f.modes[skip] = static_cast<d::BlockMode>(7);
-  f.modes[keep + 1] = d::BlockMode::kMotion;
+  f.modes[zero] = d::BlockMode::kMotion;
   edits.push_back({"modes 5 and 7, and motion", C::InvalidArgument, f});
   f = good;
   f.blocks.coefficients[keep * k + 3] = low;
   edits.push_back({"a keep residual of -32768", C::InvalidArgument, f});
   f = good;
-  if (zero < good.modes.size()) {
-    f.blocks.coefficients[zero * k] = low;
-    edits.push_back({"a zero coefficient of -32768", C::InvalidArgument, f});
-  }
+  f.blocks.coefficients[zero * k] = low;
+  edits.push_back({"a zero coefficient of -32768", C::InvalidArgument, f});
   f = good;
   f.blocks.coefficients.back() = low;
   edits.push_back({"a new block's -32768", C::InvalidArgument, f});
   f = make_frame(10, 1, 3);
   f.blocks.coefficients[4] = low;
   edits.push_back({"an intra frame's -32768", C::InvalidArgument, f});
+  f = good;
+  f.voxel_size = 0.0f;
+  f.modes[keep] = d::BlockMode::kMotion;
+  edits.push_back({"voxel_size 0, and motion", C::InvalidArgument, f});
+  f.modes[keep] = static_cast<d::BlockMode>(9);
+  edits.push_back({"voxel_size 0, and mode 9", C::InvalidArgument, f});
+  f = good;
+  f.blocks.trunc_dist = -1.0f;
+  f.blocks.coefficients[keep * k + 3] = low;
+  edits.push_back({"trunc_dist -1, and a -32768", C::InvalidArgument, f});
   for (const Edit& e : edits) {
     const vkc::Result<Bytes> host = d::write_frame(e.frame);
     const vkc::Result<Bytes> device = device_write(writer, e.frame, {});
@@ -508,6 +532,8 @@ int writer_refusals_case(d::DeviceFrameWriter& writer) {
   }
   CHECK(d::write_frame(edits[2].frame).status().message() ==
         "write_frame: mode 7 is not a mode");
+  CHECK(d::write_frame(edits.back().frame).status().message() ==
+        "write_frame: trunc_dist must be finite and positive");
   f = good;
   f.blocks.coefficients[skip * k] = low;
   CHECK(device_write(writer, f, {}).value() == d::write_frame(good).value());
@@ -547,6 +573,15 @@ int segment_limit_case(d::DeviceFrameReader& reader) {
   CHECK(refused(d::write_frame(skips, sizes(64, kLimit + 1)).value(), &id));
   CHECK(same_read(reader, d::write_frame(skips, sizes(64, kLimit)).value(),
                   &id) == 0);
+  // Nor does the block count: kLimit + 2 blocks, the one new block alone in
+  // a segment of kLimit + 1.
+  const d::Frame one_new = inter_frame(id, many, successor(many, 15, 0, 0, 1));
+  CHECK(one_new.coords.size() == 1);
+  std::string why = "not read";
+  CHECK(same_read(reader,
+                  d::write_frame(one_new, sizes(kLimit + 1, 64)).value(), &id,
+                  &why) == 0);
+  CHECK(why.empty());
   // kLimit + 1 new blocks after a small reference, in one segment, and then
   // kLimit of them.
   const d::Frame few = make_frame(3, 1, 13);
@@ -586,26 +621,58 @@ int frame_type_case(d::DeviceFrameReader& reader) {
   return 0;
 }
 
-// The writer's own refusals: finish with nothing counted, rather than coding
-// stale steps; reference entries without an update size; and a reference
-// that does not hold the blocks' reference entries, or none for blocks that
-// have them.
+// The writer's own refusals: entries it cannot walk -- more reference
+// entries than entries, or without the modes or list they need -- each
+// counting nothing, so finish refuses, rather than coding stale steps; a
+// finish whose blocks have another reference count than were counted;
+// reference entries without an update size; and a reference that does not
+// hold the blocks' reference entries, or none for blocks that have them.
 int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
                   d::DeviceFrameWriter& writer) {
-  vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
-      d::DeviceFrameWriter::create(device, allocator);
-  CHECK(fresh.ok());
-  d::ResidentBlocks uncounted;
-  uncounted.count = 10;
-  uncounted.coefficient_count = 8;
-  codec::CodecParams params;
-  params.coefficient_count = 8;
-  CHECK(!fresh.value()->finish(uncounted, 0.005f, 0.04f, params, nullptr).ok());
-
   const d::Frame reference = make_frame(20, 8, 61);
   const d::FrameReference id = reference_of(d::write_frame(reference).value());
   d::Frame p =
       inter_frame(id, reference, successor(reference, 62, 100, 300, 4));
+  CHECK(!p.modes.empty() && !p.coords.empty());
+  const Resident r = resident(p).value();
+  auto finish = [&](d::DeviceFrameWriter& w, const d::ResidentBlocks& blocks,
+                    const d::FrameReference& held) {
+    return w.finish(blocks, p.voxel_size, p.blocks.trunc_dist, p.blocks.params,
+                    &held);
+  };
+  auto uncounted = [](const vkc::Result<Bytes>& written) {
+    return !written.ok() &&
+           written.status().message() ==
+               "DeviceFrameWriter::finish: these blocks were not the ones "
+               "record_count saw";
+  };
+
+  vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
+      d::DeviceFrameWriter::create(device, allocator);
+  CHECK(fresh.ok());
+  std::vector<d::ResidentBlocks> unwalkable(3, r.blocks);
+  unwalkable[0].reference_count = r.blocks.count + 1;
+  unwalkable[1].modes = nullptr;
+  unwalkable[2].list = nullptr;
+  vkc::CommandBatch batch(*g_device, *g_allocator);
+  for (const d::ResidentBlocks& blocks : unwalkable) {
+    CHECK(fresh.value()->record_count(batch, blocks, 64, 64).domain() ==
+          C::InvalidArgument);
+  }
+  CHECK(batch.submit().ok());
+  CHECK(uncounted(finish(*fresh.value(), r.blocks, p.reference)));
+
+  // Counted with M reference entries, finished with M - 1 against a
+  // reference of M - 1 blocks.
+  vkc::CommandBatch counted(*g_device, *g_allocator);
+  CHECK(writer.record_count(counted, r.blocks, 64, 64).ok());
+  CHECK(counted.submit().ok());
+  d::ResidentBlocks fewer = r.blocks;
+  fewer.reference_count -= 1;
+  d::FrameReference shorter = p.reference;
+  shorter.header.block_count -= 1;
+  CHECK(uncounted(finish(writer, fewer, shorter)));
+
   CHECK(device_write(writer, p, sizes(64, 0)).status().domain() ==
         C::InvalidArgument);
   p.reference.header.block_count += 1;

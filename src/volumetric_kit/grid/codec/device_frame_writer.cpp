@@ -155,6 +155,7 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   }
   segment_size_ = segment_size;
   update_size_ = update_size;
+  reference_count_ = m;
   // A P-frame's layout, whose mode model comes last: an intra frame's counts
   // are its prefix.
   counts_host_.assign(
@@ -192,13 +193,15 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
     const CodecParams& params, const FrameReference* reference,
     core::GpuStageScope* stage) {
-  VKC_TRY(params.validate());
+  // write_frame's refusals in its order: the coding parameters first.
+  VKC_TRY(check_coding(voxel_size, trunc_dist, params));
   const std::uint32_t entries = blocks.count;
   const std::uint32_t m = blocks.reference_count;
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t segment_size = segment_size_;
   const std::uint32_t update_size = update_size_;
-  if (segment_size == 0 || k != blocks.coefficient_count || m > entries ||
+  if (segment_size == 0 || k != blocks.coefficient_count ||
+      m != reference_count_ ||
       counts_host_.size() !=
           frame_model_base(frame_model_count(FrameType::kInter, k), k) ||
       steps_host_.size() != entries) {
