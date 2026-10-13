@@ -157,6 +157,14 @@ constexpr std::uint64_t frame_segment_count(std::uint64_t blocks,
   return blocks == 0 ? 0 : (blocks - 1) / segment_size + 1;
 }
 
+/// @return The stream positions `[x, y)` segment @p s covers in a frame of
+///         @p m reference entries, @p u to an update segment, and @p a new
+///         blocks, @p r to a segment: `frame_models.glsl`'s `segment_range`,
+///         for the device coders' host halves. An intra frame is `m = 0`.
+VR_CODEC_API glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
+                                            std::uint32_t u, std::uint32_t a,
+                                            std::uint32_t r);
+
 /// What a frame is: byte 6 of its header. @ref write_frame and the readers
 /// refuse a type they do not code (@ref check_frame_type).
 enum class FrameType : std::uint8_t {
@@ -322,6 +330,20 @@ struct FrameWriteOptions {
 ///         never the input's.
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_frame(
     const Frame& frame, const FrameWriteOptions& options = {});
+
+/// @brief The last refusals @ref write_frame makes, of what its entries
+///        hold, which the device writer's count pass finds: one place for
+///        both writers' codes and words.
+/// @param largest_mode  The largest mode past @ref BlockMode::kMotion; 0 for
+///                      none.
+/// @param motion        Whether a mode is @ref BlockMode::kMotion.
+/// @param out_of_range  Whether a written coefficient or residual (a keep,
+///                      zero or new entry's) is outside ±32767.
+/// @return OK, or in this order: `Status::Code::InvalidArgument` for a mode
+///         past the alphabet, `Status::Code::Unsupported` for motion, and
+///         `Status::Code::InvalidArgument` for a value out of range.
+VR_CODEC_API core::Status check_entries(std::uint32_t largest_mode, bool motion,
+                                        bool out_of_range);
 
 /// @return How many frequency tables a frame of @p type keeping @p k
 ///         coefficients carries, in TABLES order.

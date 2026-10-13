@@ -3,6 +3,7 @@
 
 #include "bitstream.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -110,6 +111,12 @@ std::uint32_t frame_model_alphabet(std::uint32_t model, std::uint32_t k) {
 
 std::uint32_t frame_model_base(std::uint32_t model, std::uint32_t k) {
   return model_base(model, k);
+}
+
+glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
+                               std::uint32_t u, std::uint32_t a,
+                               std::uint32_t r) {
+  return segment_range(s, m, u, a, r);
 }
 
 namespace {
@@ -350,18 +357,6 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
                      " modes, one per reference block, got " +
                      std::to_string(frame.modes.size()));
   }
-  for (BlockMode mode : frame.modes) {
-    if (static_cast<uint>(mode) >= kModeSymbols) {
-      return bad_write("mode " + std::to_string(static_cast<uint>(mode)) +
-                       " is not a mode");
-    }
-  }
-  for (BlockMode mode : frame.modes) {
-    if (mode == BlockMode::kMotion) {
-      return core::Status::unsupported(
-          "write_frame: the motion mode, which this writer does not code");
-    }
-  }
   const std::uint32_t k = b.params.coefficient_count;
   // Sizes in 64 bits: (M + A) * K wraps a 32-bit size_t long before 2^32
   // entries.
@@ -391,21 +386,25 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
           std::to_string(i));
     }
   }
-  // Only what is written: a skip or remove entry's payload is ignored.
+  // What the device writer's count pass finds too. Only what is written: a
+  // skip or remove entry's payload is ignored.
+  std::uint32_t largest_mode = 0;
+  bool motion = false;
+  bool out_of_range = false;
   for (std::uint64_t p = 0; p < m + a; ++p) {
-    if (p < m && frame.modes[p] != BlockMode::kKeep &&
-        frame.modes[p] != BlockMode::kZero) {
-      continue;
+    if (p < m) {
+      const auto mode = static_cast<uint>(frame.modes[std::size_t(p)]);
+      if (mode >= kModeSymbols) largest_mode = std::max(largest_mode, mode);
+      motion = motion || mode == kModeMotion;
+      if (mode != kModeKeep && mode != kModeZero) continue;
     }
     for (std::uint32_t j = 0; j < k; ++j) {
       const std::int16_t c = b.coefficients[std::size_t(p * k + j)];
-      if (c < -kMaxQuantizedMagnitude || c > kMaxQuantizedMagnitude) {
-        return bad_write("a coefficient or residual is outside +-" +
-                         std::to_string(kMaxQuantizedMagnitude));
-      }
+      out_of_range = out_of_range || c < -kMaxQuantizedMagnitude ||
+                     c > kMaxQuantizedMagnitude;
     }
   }
-  return {};
+  return check_entries(largest_mode, motion, out_of_range);
 }
 
 }  // namespace
@@ -418,6 +417,22 @@ core::Status check_frame_type(FrameType type, FrameType newest,
       std::to_string(static_cast<uint>(type)) +
       (newest == FrameType::kIntra ? " (only intra is coded)"
                                    : " (only intra and P-frames are coded)"));
+}
+
+core::Status check_entries(std::uint32_t largest_mode, bool motion,
+                           bool out_of_range) {
+  if (largest_mode != 0) {
+    return bad_write("mode " + std::to_string(largest_mode) + " is not a mode");
+  }
+  if (motion) {
+    return core::Status::unsupported(
+        "write_frame: the motion mode, which this writer does not code");
+  }
+  if (out_of_range) {
+    return bad_write("a coefficient or residual is outside +-" +
+                     std::to_string(kMaxQuantizedMagnitude));
+  }
+  return {};
 }
 
 core::Result<std::vector<std::uint8_t>> write_frame(
