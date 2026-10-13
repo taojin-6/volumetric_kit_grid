@@ -52,9 +52,11 @@ int main() {
       std::fprintf(stderr, "%s: %s\n", example.file,
                    loaded.status().message().c_str());
     CHECK(loaded);
-    // Classic unless the rig viewer's.
+    // Classic unless the rig viewer's; no template writes codec rows or
+    // frames.
     CHECK(loaded->fusion.dynamic ==
           (example.application == cfg::Application::RigViewer));
+    CHECK(loaded->output.csv.empty() && loaded->output.stream.empty());
   }
 
   const auto readback =
@@ -99,13 +101,15 @@ int main() {
         "/tmp/scenarios/intrinsics.json");
   CHECK(dataset.value().fusion.truncation_m == 0.04F);
 
-  const auto encoded = cfg::parse(R"({
+  const auto encoded =
+      cfg::parse(R"({
     "version": 1, "operation": "codec", "source": {"kind": "dataset", "path": "room0"},
     "codec": {"coefficient_count": 128, "quantization_scale": 0.3,
               "quantization_table": "radial", "entropy": "device",
-              "segment_size": 32, "encode_every": 0, "sweep": true}
+              "segment_size": 32, "encode_every": 0, "sweep": true},
+    "output": {"csv": "results/rows.csv", "stream": "../streams/room0.vrst"}
   })",
-                                  cfg::Application::CodecReplica);
+                 cfg::Application::CodecReplica, "/tmp/scenarios");
   CHECK(encoded);
   const auto encoder = vr_example::encoder_config(encoded.value().codec);
   CHECK(encoder.ok());
@@ -118,6 +122,11 @@ int main() {
   CHECK(encoder->params.quantization_weights[1 + 8 * 2 + 64 * 3] == 2.75F);
   CHECK(encoder->entropy == vr::codec::EntropyCoding::kDevice);
   CHECK(encoder->segment_size == 32);
+  // The outputs, relative to the scenario's directory.
+  const vr_example::CodecOutputs outputs =
+      vr_example::codec_outputs(encoded.value().output);
+  CHECK(outputs.csv == "/tmp/scenarios/results/rows.csv");
+  CHECK(outputs.stream == "/tmp/streams/room0.vrst");
 
   // Steps out of the codec's bounds load, and the codec refuses them: too
   // fine everywhere, or too coarse at radial's highest frequency.

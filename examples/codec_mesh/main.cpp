@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <string>
 
 #include "codec_config.hpp"
 #include "codec_stream.hpp"
@@ -152,14 +151,15 @@ vkc::Status run(const Options& opt) {
   VKC_ASSIGN(mesh::MarchingCubes extractor,
              mesh::MarchingCubes::create(device, allocator));
   VKC_ASSIGN(vr_example::CodecStream stream,
-             vr_example::CodecStream::create(device, allocator, config));
+             vr_example::CodecStream::create(
+                 device, allocator, config,
+                 vr_example::codec_outputs(opt.output), "codec_mesh"));
   std::printf("codec: K %u, table %s, quantization scale %.6g\n",
               config.params.coefficient_count,
               vr_example::quantization_name(opt.codec.quantization_table),
               double(config.params.quantization_scale));
-  VKC_TRY(stream.code(
-      volume, 0,
-      opt.output.prefix.empty() ? std::string{} : opt.output.prefix + ".vrtc"));
+  VKC_TRY(stream.code(volume, 0, 0));
+  VKC_TRY(stream.finish());
   stream.report(30.0, 0);  // One mesh frame, not a measured sequence bitrate.
   VKC_ASSIGN(const mesh::Mesh source, extractor.extract_host(volume));
   VKC_ASSIGN(const mesh::Mesh decoded, extractor.extract_host(stream.player()));

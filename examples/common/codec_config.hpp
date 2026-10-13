@@ -7,6 +7,7 @@
 /// @brief Map the core's validated codec and mesh settings to runtime types.
 
 #include "codec_quantization.hpp"
+#include "codec_stream.hpp"
 #include "config.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
@@ -57,9 +58,12 @@ encoder_config(const config::Codec& settings) {
   return result;
 }
 
-// TODO(examples): CodecOutputs from core #30's output.csv and
-// output.frame_directory, for codec_replica's and codec_mesh's
-// CodecStream::create; until then they write no rows or frames.
+/// @return Where a codec stream writes besides its report: core's
+///         `output.csv` and `output.stream`, already relative to the
+///         scenario's directory; an empty path writes nothing.
+inline CodecOutputs codec_outputs(const config::Output& output) {
+  return {output.csv, output.stream};
+}
 
 /// @return Runtime SDF parameters copied from core's validated mesh source.
 inline volumetric_kit::recon::tsdf::MeshSdfParams mesh_sdf_config(
