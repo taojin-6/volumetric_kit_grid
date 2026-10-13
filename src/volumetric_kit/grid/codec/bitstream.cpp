@@ -614,9 +614,6 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
       return core::Status::unsupported(
           "codec frame: unknown required section " + std::to_string(id));
     }
-    // TODO(codec): the optional CRC section of the 2026-09-27 entry, should a
-    // consumer ever keep frames where nothing else checks them. A v3 reader
-    // skips it here, so adding it needs no new version.
     offset += length;
   }
   if (offset != body_bytes) {
