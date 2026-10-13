@@ -16,7 +16,8 @@
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
 
-#include "errors.hpp"
+#include "volumetric_kit/core/base/exception_status.hpp"
+#include "volumetric_kit/core/base/file_io.hpp"
 
 namespace volumetric_kit::recon::io {
 namespace {
@@ -81,7 +82,7 @@ core::Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
 }
 
 core::Result<TriangleMesh> import_mesh(const std::string& path) {
-  VKC_TRY(detail::check_path("load_mesh", path));
+  VKC_TRY(core::check_path("load_mesh", path));
   std::error_code error;
   const auto file = std::filesystem::status(path, error);
   if (error == std::errc::no_such_file_or_directory ||
@@ -218,7 +219,7 @@ core::Result<TriangleMesh> load_mesh(const std::string& path) {
   try {
     return import_mesh(path);
   } catch (...) {
-    return detail::exception_status("load_mesh");
+    return core::exception_status("load_mesh", core::Status::Code::IoError);
   }
 }
 
