@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "volumetric_kit/core/base/check.hpp"
+#include "volumetric_kit/core/base/exception_status.hpp"
 
 namespace volumetric_kit::recon::stream::detail {
 namespace {
@@ -39,25 +40,29 @@ constexpr mode_t kNewFileMode =
 }  // namespace
 
 core::Status system_failure(std::string_view api, std::string_view what,
-                            const std::string& path, int error) {
-  std::string message(api);
-  message += ": ";
-  message += what;
-  message += ' ';
-  message += path;
-  message += ": ";
-  message += std::generic_category().message(error);
-  switch (error) {
-    case ENOENT:
-    case ENOTDIR:  // a component of the path is not a directory
-      return core::Status::not_found(std::move(message));
-    case EEXIST:
-    case EISDIR:
-      return core::Status::invalid_argument(std::move(message));
-    case ENOMEM:
-      return core::Status::out_of_memory(std::move(message));
-    default:
-      return core::Status::io_error(std::move(message));
+                            const std::string& path, int error) noexcept {
+  try {
+    std::string message(api);
+    message += ": ";
+    message += what;
+    message += ' ';
+    message += path;
+    message += ": ";
+    message += std::generic_category().message(error);
+    switch (error) {
+      case ENOENT:
+      case ENOTDIR:  // a component of the path is not a directory
+        return core::Status::not_found(std::move(message));
+      case EEXIST:
+      case EISDIR:
+        return core::Status::invalid_argument(std::move(message));
+      case ENOMEM:
+        return core::Status::out_of_memory(std::move(message));
+      default:
+        return core::Status::io_error(std::move(message));
+    }
+  } catch (...) {
+    return core::exception_status(api, core::Status::Code::IoError);
   }
 }
 

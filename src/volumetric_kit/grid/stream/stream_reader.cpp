@@ -196,44 +196,56 @@ std::size_t StreamReader::key_count(std::uint16_t track) const noexcept {
 
 core::Result<Position> StreamReader::key(std::uint16_t track,
                                          std::size_t n) const {
-  if (track >= keys_.size()) {
-    return core::Status::invalid_argument(
-        "StreamReader::key: " + path_ + ": track " + std::to_string(track) +
-        ", but the session has " + std::to_string(keys_.size()));
+  constexpr std::string_view kApi = "StreamReader::key";
+  try {
+    if (track >= keys_.size()) {
+      return core::Status::invalid_argument(
+          "StreamReader::key: " + path_ + ": track " + std::to_string(track) +
+          ", but the session has " + std::to_string(keys_.size()));
+    }
+    if (n >= keys_[track].size()) {
+      return core::Status::not_found(
+          "StreamReader::key: " + path_ + ": track " + std::to_string(track) +
+          " has " + std::to_string(keys_[track].size()) + " key records, no " +
+          std::to_string(n));
+    }
+    return Position{keys_[track][n].offset};
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
   }
-  if (n >= keys_[track].size()) {
-    return core::Status::not_found("StreamReader::key: " + path_ + ": track " +
-                                   std::to_string(track) + " has " +
-                                   std::to_string(keys_[track].size()) +
-                                   " key records, no " + std::to_string(n));
-  }
-  return Position{keys_[track][n].offset};
 }
 
 core::Result<Position> StreamReader::key_at(std::uint16_t track,
                                             std::uint64_t pts_ns) const {
-  const auto where = [&] {
-    return "StreamReader::key_at: " + path_ + ": track " +
-           std::to_string(track);
-  };
-  if (track >= keys_.size()) {
-    return core::Status::invalid_argument(where() + ", but the session has " +
-                                          std::to_string(keys_.size()));
+  constexpr std::string_view kApi = "StreamReader::key_at";
+  try {
+    const auto where = [&] {
+      return "StreamReader::key_at: " + path_ + ": track " +
+             std::to_string(track);
+    };
+    if (track >= keys_.size()) {
+      return core::Status::invalid_argument(where() + ", but the session has " +
+                                            std::to_string(keys_.size()));
+    }
+    if (keys_unordered_[track]) {
+      return core::Status::invalid_argument(
+          where() + "'s key pts decrease, so no key is found by its pts");
+    }
+    const std::vector<KeyPoint>& keys = keys_[track];
+    const auto after =
+        std::upper_bound(keys.begin(), keys.end(), pts_ns,
+                         [](std::uint64_t pts, const KeyPoint& key) {
+                           return pts < key.pts_ns;
+                         });
+    if (after == keys.begin()) {
+      return core::Status::not_found(where() +
+                                     " has no key record at or before pts " +
+                                     std::to_string(pts_ns));
+    }
+    return Position{std::prev(after)->offset};
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
   }
-  if (keys_unordered_[track]) {
-    return core::Status::invalid_argument(
-        where() + "'s key pts decrease, so no key is found by its pts");
-  }
-  const std::vector<KeyPoint>& keys = keys_[track];
-  const auto after = std::upper_bound(
-      keys.begin(), keys.end(), pts_ns,
-      [](std::uint64_t pts, const KeyPoint& key) { return pts < key.pts_ns; });
-  if (after == keys.begin()) {
-    return core::Status::not_found(where() +
-                                   " has no key record at or before pts " +
-                                   std::to_string(pts_ns));
-  }
-  return Position{std::prev(after)->offset};
 }
 
 Position StreamReader::begin() const noexcept { return Position{begin_}; }
@@ -242,12 +254,12 @@ core::Result<bool> StreamReader::next(Position* pos, Record* record) const {
   constexpr std::string_view kApi = "StreamReader::next";
   VKC_CHECK(pos != nullptr && record != nullptr,
             "StreamReader::next takes a position and a record");
-  if (pos->offset % 8 != 0 || pos->offset < begin_) {
-    return core::Status::invalid_argument(std::string(kApi) + ": " + path_ +
-                                          ": " + std::to_string(pos->offset) +
-                                          " is not a chunk position");
-  }
   try {
+    if (pos->offset % 8 != 0 || pos->offset < begin_) {
+      return core::Status::invalid_argument(std::string(kApi) + ": " + path_ +
+                                            ": " + std::to_string(pos->offset) +
+                                            " is not a chunk position");
+    }
     const detail::FileView file{
         fd_.get(), &path_, file_size_,
         static_cast<std::uint32_t>(session_.tracks.size())};

@@ -92,6 +92,8 @@ struct Record {
 ///
 /// The file is read as it was at @ref open: its size then is where reading
 /// stops.
+/// Host allocation failures, including building a diagnostic for invalid
+/// arguments or missing keys, return `Status::Code::OutOfMemory`.
 ///
 /// @code
 /// VKC_ASSIGN(auto reader, stream::StreamReader::open(path));
