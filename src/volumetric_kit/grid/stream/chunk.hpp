@@ -116,6 +116,20 @@ void count_record(TrackStats& stats, const RecordInfo& info,
 
 // --- Decoding. ---------------------------------------------------------------
 
+// One key entry of the `INDX` body, as append_key_entry wrote it.
+struct KeyEntry {
+  std::uint64_t offset = 0;  // its `RECD` chunk's
+  std::uint64_t pts_ns = 0;
+  std::uint64_t set = kNoSet;
+  std::uint16_t track = 0;
+};
+
+// The track summary, of kSummaryBytes, at `p`.
+TrackStats load_summary(const std::uint8_t* p);
+
+// The key entry, of kKeyEntryBytes, at `p`.
+KeyEntry load_key_entry(const std::uint8_t* p);
+
 // The file a reader reads: its descriptor, its path for messages, its size
 // at open and its session's track count.
 struct FileView {

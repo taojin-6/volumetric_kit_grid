@@ -60,6 +60,10 @@ constexpr std::size_t kSetAt = 40;
 constexpr std::size_t kIndexTracksAt = 20;
 constexpr std::size_t kIndexKeysAt = 24;
 constexpr std::size_t kIndexOffsetAt = 24;
+// A key entry's, in the index body; its offset is at 0.
+constexpr std::size_t kEntryPtsAt = 8;
+constexpr std::size_t kEntrySetAt = 16;
+constexpr std::size_t kEntryTrackAt = 24;
 
 // How much a scan reads first of a chunk header: all of a record's.
 constexpr std::size_t kFirstRead = 64;
@@ -272,9 +276,9 @@ void append_key_entry(std::vector<std::uint8_t>& entries, std::uint64_t offset,
   entries.resize(at + kKeyEntryBytes, 0);
   std::uint8_t* p = entries.data() + at;
   store_le64(p, offset);
-  store_le64(p + 8, info.pts_ns);
-  store_le64(p + 16, info.set);
-  store_le16(p + 24, info.track);
+  store_le64(p + kEntryPtsAt, info.pts_ns);
+  store_le64(p + kEntrySetAt, info.set);
+  store_le16(p + kEntryTrackAt, info.track);
 }
 
 std::vector<std::uint8_t> encode_footer(
@@ -317,6 +321,25 @@ void count_record(TrackStats& stats, const RecordInfo& info,
   ++stats.records;
   if (info.key) ++stats.keys;
   stats.payload_bytes += size;
+}
+
+TrackStats load_summary(const std::uint8_t* p) {
+  TrackStats s;
+  s.records = load_le64(p);
+  s.keys = load_le64(p + 8);
+  s.payload_bytes = load_le64(p + 16);
+  s.min_pts_ns = load_le64(p + 24);
+  s.max_pts_ns = load_le64(p + 32);
+  return s;
+}
+
+KeyEntry load_key_entry(const std::uint8_t* p) {
+  KeyEntry e;
+  e.offset = load_le64(p);
+  e.pts_ns = load_le64(p + kEntryPtsAt);
+  e.set = load_le64(p + kEntrySetAt);
+  e.track = load_le16(p + kEntryTrackAt);
+  return e;
 }
 
 core::Result<bool> read_chunk(std::string_view api, const FileView& file,
