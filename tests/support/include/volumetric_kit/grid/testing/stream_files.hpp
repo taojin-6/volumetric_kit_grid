@@ -5,9 +5,10 @@
 
 // The stream tests' own .vrst bytes, built from the layout stream/session.hpp
 // states and not from the library: a bitwise CRC-32, chunks with any fields,
-// and the edits a test makes to a file. Also what both tests share of the
-// library: payloads, record fields, an open that says why it failed, and a
-// reader's every record, read in file order as a player would.
+// a footer index read and written, and the edits a test makes to a file. Also
+// what the tests share of the library: payloads, record fields and stats
+// compared, an open that says why it failed, and a reader's every record,
+// read in file order as a player would.
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <utility>
@@ -135,6 +137,81 @@ inline Bytes session_body(std::uint16_t tracks) {
   return b;
 }
 
+// A footer index as its bytes say: the header's T and K, then the body's
+// track summaries and key entries.
+struct KeyEntry {
+  std::uint64_t offset = 0;
+  std::uint64_t pts = 0;
+  std::uint64_t set = 0;
+  std::uint16_t track = 0;
+};
+struct Index {
+  std::uint32_t tracks = 0;
+  std::uint64_t keys = 0;
+  std::vector<stream::TrackStats> summaries;
+  std::vector<KeyEntry> entries;
+};
+
+// The `INDX` chunk of `index`.
+inline Bytes index_chunk(const Index& index) {
+  Bytes fields;
+  put(fields, index.tracks, 4);
+  put(fields, index.keys, 8);
+  put(fields, 0, 4);
+  Bytes body;
+  for (const stream::TrackStats& s : index.summaries) {
+    for (const std::uint64_t v :
+         {s.records, s.keys, s.payload_bytes, s.min_pts_ns, s.max_pts_ns}) {
+      put(body, v, 8);
+    }
+  }
+  for (const KeyEntry& e : index.entries) {
+    put(body, e.offset, 8);
+    put(body, e.pts, 8);
+    put(body, e.set, 8);
+    put(body, e.track, 2);
+    put(body, 0, 6);
+  }
+  return chunk("INDX", fields, body);
+}
+
+// A `TAIL`'s fields, naming `index_offset`, and the `TAIL`.
+inline Bytes tail_fields(std::uint64_t index_offset) {
+  Bytes fields;
+  put(fields, 0, 4);
+  put(fields, index_offset, 8);
+  put(fields, 0, 4);
+  return fields;
+}
+inline Bytes tail_chunk(std::uint64_t index_offset) {
+  return chunk("TAIL", tail_fields(index_offset), {});
+}
+
+// Where a finished file's `INDX` starts, as its `TAIL` says.
+inline std::uint64_t index_offset(const Bytes& file) {
+  return get(file, file.size() - 40 + 24, 8);
+}
+
+// A finished file's footer index.
+inline Index read_index(const Bytes& file) {
+  const std::uint64_t at = index_offset(file);
+  Index index;
+  index.tracks = static_cast<std::uint32_t>(get(file, at + 20, 4));
+  index.keys = get(file, at + 24, 8);
+  std::uint64_t p = at + get(file, at + 4, 4);
+  for (std::uint32_t t = 0; t < index.tracks; ++t, p += 40) {
+    index.summaries.push_back({get(file, p, 8), get(file, p + 8, 8),
+                               get(file, p + 16, 8), get(file, p + 24, 8),
+                               get(file, p + 32, 8)});
+  }
+  for (std::uint64_t k = 0; k < index.keys; ++k, p += 32) {
+    index.entries.push_back({get(file, p, 8), get(file, p + 8, 8),
+                             get(file, p + 16, 8),
+                             static_cast<std::uint16_t>(get(file, p + 24, 2))});
+  }
+  return index;
+}
+
 // One chunk of a file, as its framing says.
 struct ChunkAt {
   std::string tag;
@@ -188,6 +265,17 @@ inline Bytes pattern(std::size_t size, std::uint64_t seed) {
     b[i] = static_cast<std::uint8_t>(x >> 56);
   }
   return b;
+}
+
+inline bool same(const stream::RecordInfo& a, const stream::RecordInfo& b) {
+  return a.track == b.track && a.key == b.key && a.pts_ns == b.pts_ns &&
+         a.seq == b.seq && a.set == b.set;
+}
+
+inline bool same(const stream::TrackStats& a, const stream::TrackStats& b) {
+  return a.records == b.records && a.keys == b.keys &&
+         a.payload_bytes == b.payload_bytes && a.min_pts_ns == b.min_pts_ns &&
+         a.max_pts_ns == b.max_pts_ns;
 }
 
 inline stream::RecordInfo info(std::uint16_t track, bool key, std::uint64_t pts,

@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only tests of what the .vrst reader recovers, through its public API:
-// one bit flipped in a payload, a record header, the session header and the
-// footer; a file cut at every byte of its last record and its footer, and at
-// sampled bytes before; damaged spans, one longer than a resync's block;
-// footers forged not to count, and "TAIL" in a payload where a footer's would
-// start; a writer killed by SIGKILL; and a writer stopped by RLIMIT_FSIZE,
-// whose failure sticks.
+// one bit flipped in a payload, a record header (on both open paths), the
+// session header and the footer; a file cut at every byte of its last record
+// and its footer, and at sampled bytes before; damaged spans, one longer than
+// a resync's block; a hand-built footer, a record after it, and "TAIL" in a
+// payload where a footer's would start; a writer killed by SIGKILL; and a
+// writer stopped by RLIMIT_FSIZE, whose failure sticks.
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -123,29 +123,33 @@ int crc_mismatch_case(const std::string& dir) {
   CHECK(refused.message().find(std::to_string(third.offset)) !=
         std::string::npos);
 
-  // A record header: that record is a damaged span, the rest read.
-  CHECK(vrst::write_bytes(path, vrst::flipped(original, third.offset + 26, 0)));
-  r = open(path);
-  CHECK(r != nullptr);
-  CHECK(r->recovery().finished);  // the footer is intact
-  CHECK(r->recovery().damaged_spans == 1 &&
-        r->recovery().damaged_bytes == third.next() - third.offset);
-  CHECK(r->stats()[0].records == 2 && r->stats()[1].records == 3);
-  back = vrst::read_all(*r);
-  CHECK(back.next_errors == std::vector<Code>{Code::InvalidArgument});
-  CHECK(back.ended && back.payloads == without(payloads, {2}));
-
-  // The last record's header: its span ends at the index, and the footer
-  // still closes the file.
-  const vrst::ChunkAt& last = records.back();
-  CHECK(vrst::write_bytes(path, vrst::flipped(original, last.offset + 26, 0)));
-  r = open(path);
-  CHECK(r != nullptr);
-  CHECK(r->recovery().finished && !r->recovery().footer_damaged);
-  CHECK(r->recovery().damaged_spans == 1 &&
-        r->recovery().damaged_bytes == index.offset - last.offset);
-  back = vrst::read_all(*r);
-  CHECK(back.ended && back.payloads == without(payloads, {5}));
+  // A record header, the third's and the last's. The footer still opens the
+  // file, reading no record, so the counts are the index's and reading meets
+  // the damage. With the tail cut off, the scan finds a damaged span, which
+  // ends at the next chunk: a record, or the index.
+  for (const std::size_t lost : {std::size_t{2}, std::size_t{5}}) {
+    const vrst::ChunkAt& hit = records.at(lost);
+    const std::uint64_t span =
+        (lost + 1 < records.size() ? records[lost + 1].offset : index.offset) -
+        hit.offset;
+    CHECK(vrst::write_bytes(path, vrst::flipped(original, hit.offset + 26, 0)));
+    for (const bool footer : {true, false}) {
+      if (!footer) CHECK(vrst::cut(path, tail.offset));
+      r = open(path);
+      CHECK(r != nullptr);
+      const stream::Recovery& rec = r->recovery();
+      CHECK(rec.finished == footer && !rec.footer_damaged);
+      CHECK(rec.damaged_spans == (footer ? 0u : 1u));
+      CHECK(rec.damaged_bytes == (footer ? 0u : span));
+      std::uint64_t counted[2] = {3, 3};  // the tracks alternate
+      if (!footer) --counted[lost % 2];
+      CHECK(r->stats()[0].records == counted[0] &&
+            r->stats()[1].records == counted[1]);
+      back = vrst::read_all(*r);
+      CHECK(back.next_errors == std::vector<Code>{Code::InvalidArgument});
+      CHECK(back.ended && back.payloads == without(payloads, {lost}));
+    }
+  }
 
   // The session header, its fields or its body: nothing to read.
   for (std::uint64_t at : {std::uint64_t{30}, std::uint64_t{60}}) {
@@ -285,7 +289,7 @@ int damaged_span_case(const std::string& dir) {
 
 int footer_case(const std::string& dir) {
   const std::string path = dir + "/footer.vrst";
-  // One track and one key record, built by hand; then what each check adds.
+  // One track and one key record, built by hand.
   Bytes base =
       vrst::chunk("VRST", vrst::session_fields(0, 1, 0), vrst::session_body(1));
   const std::uint64_t record_at = base.size();
@@ -299,56 +303,20 @@ int footer_case(const std::string& dir) {
     return vrst::write_bytes(path, file) ? open(path) : nullptr;
   };
 
-  // An INDX naming `tracks` tracks and `keys` keys, its body sized for
-  // `sized_for` tracks and the one key; a TAIL naming `index_offset`.
-  const auto index = [&](std::uint32_t tracks, std::uint32_t sized_for,
-                         std::uint64_t keys) {
-    Bytes fields;
-    vrst::put(fields, tracks, 4);
-    vrst::put(fields, keys, 8);
-    vrst::put(fields, 0, 4);
-    Bytes body;
-    const std::uint64_t summary[] = {1, 1, payload.size(), 5, 5};
-    for (const std::uint64_t v : summary) vrst::put(body, v, 8);
-    body.resize(body.size() + 40 * std::size_t{sized_for - 1}, 0);
-    const std::uint64_t key[] = {record_at, 5, 0, 0};  // track 0, reserved
-    for (const std::uint64_t v : key) vrst::put(body, v, 8);
-    return vrst::chunk("INDX", fields, body);
-  };
-  const auto tail = [](std::uint64_t index_offset) {
-    Bytes fields;
-    vrst::put(fields, 0, 4);
-    vrst::put(fields, index_offset, 8);
-    vrst::put(fields, 0, 4);
-    return vrst::chunk("TAIL", fields, {});
-  };
-
-  // The footer the writer writes: finished.
-  const Bytes good = index(1, 1, 1);
-  auto r = opened({good, tail(index_at)});
+  // The footer the writer writes: finished, its counts and key read. The
+  // footers that must not count are recon_stream_footer's.
+  const vrst::Index index{
+      1, 1, {{1, 1, payload.size(), 5, 5}}, {{record_at, 5, 0, 0}}};
+  const Bytes good = vrst::index_chunk(index);
+  const Bytes tail = vrst::tail_chunk(index_at);
+  auto r = opened({good, tail});
   CHECK(r != nullptr);
   CHECK(r->recovery().finished && !r->recovery().footer_damaged);
+  CHECK(vrst::same(r->stats()[0], index.summaries[0]));
+  CHECK(r->key_count(0) == 1 && r->key(0, 0).value().offset == record_at);
 
-  // Footers that must not count: damaged, the record read all the same.
-  const Bytes unknown = vrst::chunk("ZZZZ", {}, pattern(8, 2));
-  const std::vector<std::vector<Bytes>> forged = {
-      {index(2, 1, 1), tail(index_at)},         // T not the session's
-      {index(1, 1, 2), tail(index_at)},         // K not the body's
-      {good, tail(index_at + 8)},               // the tail names another
-      {good, tail(0)},                          // offset
-      {good, unknown, tail(index_at)},          // a chunk between
-      {good, Bytes(16, 0xEE), tail(index_at)},  // damage between
-  };
-  for (const std::vector<Bytes>& parts : forged) {
-    r = opened(parts);
-    CHECK(r != nullptr);
-    CHECK(!r->recovery().finished && r->recovery().footer_damaged);
-    CHECK(r->recovery().torn_bytes == 0);
-    const vrst::ReadBack back = vrst::read_all(*r);
-    CHECK(back.ended && back.payloads == std::vector<Bytes>{payload});
-  }
   // A record after the footer: the file does not end with it.
-  r = opened({good, tail(index_at), record});
+  r = opened({good, tail, record});
   CHECK(r != nullptr);
   CHECK(!r->recovery().finished && !r->recovery().footer_damaged);
   CHECK(vrst::read_all(*r).payloads == std::vector<Bytes>(2, payload));

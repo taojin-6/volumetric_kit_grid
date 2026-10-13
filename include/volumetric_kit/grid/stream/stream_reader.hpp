@@ -32,11 +32,19 @@ struct ReaderOptions {
 ///
 /// None of it is an error: a killed writer leaves no footer and perhaps
 /// part of a record, and damage in the middle costs only the records it
-/// hit.
+/// hit. A file opened from its footer is not scanned, so damage among its
+/// records shows only where @ref StreamReader::next meets it.
 struct Recovery {
-  /// The file ends with the footer @ref StreamWriter::finish writes: a
-  /// `TAIL` naming the `INDX` just before it, which passes both its CRCs and
-  /// is sized for the session's tracks and its key count.
+  /// The file ends with the footer @ref StreamWriter::finish writes, and
+  /// @ref StreamReader::open took the counts and key records from it,
+  /// reading no record: a `TAIL` naming the `INDX` that ends where it
+  /// starts, which passes both its CRCs, is sized for the session's tracks
+  /// and its key count (at most the file's size / 56), and lists key records
+  /// in file order, each of a track the session has and at a multiple of 8
+  /// between the session header and the index, no track's pts decreasing,
+  /// and as many of each track as its summary counts. What the index lists
+  /// is not compared with the records: at a key position it got wrong,
+  /// @ref StreamReader::next meets what is there as it would anywhere.
   bool finished = false;
   /// Not @ref finished, though the scan found a chunk tagged `TAIL`, its
   /// header intact or not, where the footer's `TAIL` starts: the 40 bytes
@@ -68,13 +76,15 @@ struct Record {
 
 /// @brief Reads one `.vrst` file (stream/session.hpp).
 ///
-/// **Open scans.** @ref open checks the session header, then reads one
-/// small chunk header after another, never a payload: the records' counts
-/// (@ref stats) and the key records of each track (@ref key, @ref key_at)
-/// come from that scan. A chunk header that fails its CRC, or holds what
-/// no chunk can, starts a search, 8 bytes at a time, for the next `RECD`,
-/// `INDX` or `TAIL` with a valid header; the bytes skipped are a damaged
-/// span (@ref Recovery), and with no chunk after them, the torn tail.
+/// **Open reads the footer, or scans.** @ref open checks the session header,
+/// then takes the records' counts (@ref stats) and each track's key records
+/// (@ref key, @ref key_at) from a finished file's footer index
+/// (@ref Recovery::finished). Any other file it scans, reading one small
+/// chunk header after another, never a payload. A chunk header that fails
+/// its CRC, or holds what no chunk can, starts a search, 8 bytes at a time,
+/// for the next `RECD`, `INDX` or `TAIL` with a valid header; the bytes
+/// skipped are a damaged span (@ref Recovery), and with no chunk after
+/// them, the torn tail.
 ///
 /// **Reading.** @ref next returns record headers in file order from a
 /// @ref Position the caller holds, and @ref read a record's payload, checked
@@ -104,7 +114,8 @@ struct Record {
 /// each with its own @ref Position.
 class VR_STREAM_API StreamReader {
  public:
-  /// @brief Open and scan the file at @p path.
+  /// @brief Open the file at @p path, from its footer when it is finished,
+  ///        otherwise by a scan.
   /// @param path     A `.vrst` file.
   /// @param options  How it is read.
   /// @return The reader; `Status::Code::InvalidArgument` for an empty path or
@@ -126,10 +137,11 @@ class VR_STREAM_API StreamReader {
 
   /// @return The session header.
   const Session& session() const noexcept;
-  /// @return What the scan found besides the records.
+  /// @return What opening the file found besides the records.
   const Recovery& recovery() const noexcept;
-  /// @return Each track's records, by track. A record setting a flag this
-  ///         version does not know is not counted.
+  /// @return Each track's records, by track: as the footer index counts
+  ///         them, or else the scan, which does not count a record setting
+  ///         a flag this version does not know.
   const std::vector<TrackStats>& stats() const noexcept;
 
   /// @param track  A track's index.
@@ -140,7 +152,7 @@ class VR_STREAM_API StreamReader {
   /// @brief Where @p track 's key record @p n is.
   /// @param track  A track's index.
   /// @param n      Which key, from 0 in file order.
-  /// @return Its position, from which @ref next returns it;
+  /// @return Its position, as the footer index or the scan found it;
   ///         `Status::Code::InvalidArgument` for a track that does not exist;
   ///         `Status::Code::NotFound` for @p n of @ref key_count or more.
   core::Result<Position> key(std::uint16_t track, std::size_t n) const;
@@ -189,7 +201,7 @@ class VR_STREAM_API StreamReader {
                     std::vector<std::uint8_t>* payload) const;
 
  private:
-  // A key record, as the scan found it.
+  // A key record, as the footer index or the scan found it.
   struct KeyPoint {
     std::uint64_t offset = 0;
     std::uint64_t pts_ns = 0;
@@ -197,8 +209,12 @@ class VR_STREAM_API StreamReader {
 
   StreamReader() = default;
 
-  // Count the records and find the key records and the footer, from
-  // `begin_` to the file's end.
+  // Take the stats and the key records from the footer: false when the file
+  // has none that passes the checks Recovery::finished lists.
+  core::Result<bool> read_footer();
+
+  // Count the records and find the key records from `begin_` to the file's
+  // end, and whether a footer's TAIL is there.
   core::Status scan();
 
   core::UniqueFd fd_;

@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <iterator>
-#include <limits>
 #include <utility>
 
 #include "chunk.hpp"
@@ -17,44 +16,10 @@
 namespace volumetric_kit::recon::stream {
 namespace {
 
-// What a footer's index body is read in.
+// What a footer's key entries are read in: whole entries.
 constexpr std::size_t kFooterBlock = std::size_t{1} << 20;
-
-// Whether `index`, at `index_at`, and `tail`, at `tail_at`, are the footer
-// StreamWriter::finish writes: the tail ends the file and names the index,
-// which ends where the tail starts, counts the session's tracks, is sized
-// for them and its keys, and passes its body's CRC.
-core::Result<bool> footer_intact(std::string_view api,
-                                 const detail::FileView& file,
-                                 std::uint64_t index_at,
-                                 const detail::Chunk& index,
-                                 std::uint64_t tail_at,
-                                 const detail::Chunk& tail) {
-  if (tail.body_bytes != 0 || tail.header_bytes != file.size - tail_at ||
-      tail.index_offset != index_at || index.tracks != file.tracks) {
-    return false;
-  }
-  const std::uint64_t summaries = detail::kSummaryBytes * file.tracks;
-  if (index.keys > (std::numeric_limits<std::uint64_t>::max() - summaries) /
-                       detail::kKeyEntryBytes ||
-      index.body_bytes != summaries + detail::kKeyEntryBytes * index.keys ||
-      index_at + index.header_bytes + index.body_bytes != tail_at) {
-    return false;
-  }
-  std::vector<std::uint8_t> block(static_cast<std::size_t>(
-      std::min<std::uint64_t>(kFooterBlock, index.body_bytes)));
-  std::uint32_t crc = 0;
-  for (std::uint64_t done = 0; done < index.body_bytes;) {
-    const auto n = static_cast<std::size_t>(
-        std::min<std::uint64_t>(block.size(), index.body_bytes - done));
-    VKC_TRY(detail::read_at(api, *file.path, file.fd,
-                            index_at + index.header_bytes + done, block.data(),
-                            n));
-    crc = detail::crc32(block.data(), n, crc);
-    done += n;
-  }
-  return crc == index.body_crc;
-}
+static_assert(kFooterBlock % detail::kKeyEntryBytes == 0,
+              "a footer block holds whole key entries");
 
 }  // namespace
 
@@ -74,13 +39,97 @@ core::Result<std::unique_ptr<StreamReader>> StreamReader::open(
     reader->path_ = path;
     reader->options_ = options;
     reader->file_size_ = size;
-    // TODO(stream): open a finished file from its footer, reading no record,
-    // and scan only a file without an intact one.
-    VKC_TRY(reader->scan());
+    VKC_ASSIGN(const bool finished, reader->read_footer());
+    if (!finished) VKC_TRY(reader->scan());
     return reader;
   } catch (...) {
     return core::exception_status(kApi, core::Status::Code::IoError);
   }
+}
+
+core::Result<bool> StreamReader::read_footer() {
+  constexpr std::string_view kApi = "StreamReader::open";
+  const std::size_t tracks = session_.tracks.size();
+  const detail::FileView file{fd_.get(), &path_, file_size_,
+                              static_cast<std::uint32_t>(tracks)};
+  if (begin_ > file_size_ ||
+      file_size_ - begin_ < detail::kIndexHeaderBytes + detail::kTailBytes) {
+    return false;  // a cut inside the session header's padding, or no room
+  }
+  // The offset chain, all that makes the two a footer: the TAIL ends the
+  // file and names the INDX, which ends where the TAIL starts.
+  const std::uint64_t tail_at = file_size_ - detail::kTailBytes;
+  detail::Chunk tail;
+  VKC_ASSIGN(bool valid, detail::read_chunk(kApi, file, tail_at, &tail));
+  if (!valid || tail.tag != detail::kTailTag || tail.body_bytes != 0 ||
+      tail.body_crc != 0) {
+    return false;  // its H is 40: no more is left, and no TAIL has less
+  }
+  const std::uint64_t index_at = tail.index_offset;
+  if (index_at % 8 != 0 || index_at < begin_ || index_at >= tail_at) {
+    return false;
+  }
+  detail::Chunk index;
+  VKC_ASSIGN(valid, detail::read_chunk(kApi, file, index_at, &index));
+  // A key record takes at least its header's 56 bytes, which bounds K before
+  // anything is sized by it.
+  if (!valid || index.tag != detail::kIndexTag || index.tracks != tracks ||
+      index.keys > file_size_ / detail::kRecordHeaderBytes ||
+      index.header_bytes > tail_at - index_at ||
+      index.body_bytes != tail_at - index_at - index.header_bytes ||
+      index.body_bytes != detail::kSummaryBytes * tracks +
+                              detail::kKeyEntryBytes * index.keys) {
+    return false;
+  }
+
+  // The track summaries, then the key entries: in file order, each a chunk
+  // position between the session header and the index (begin_ > 0, so the
+  // first passes `last`), of a track the session has, no track's pts
+  // decreasing; and as many of each track as its summary counts.
+  std::uint64_t at = index_at + index.header_bytes;
+  std::vector<std::uint8_t> block(
+      static_cast<std::size_t>(detail::kSummaryBytes * tracks));
+  VKC_TRY(
+      detail::read_at(kApi, path_, fd_.get(), at, block.data(), block.size()));
+  at += block.size();
+  std::uint32_t crc = detail::crc32(block.data(), block.size());
+  stats_.assign(tracks, TrackStats{});
+  keys_.assign(tracks, {});
+  keys_unordered_.assign(tracks, false);
+  for (std::size_t t = 0; t < tracks; ++t) {
+    stats_[t] = detail::load_summary(block.data() + detail::kSummaryBytes * t);
+  }
+  std::uint64_t last = 0;
+  block.resize(static_cast<std::size_t>(std::min<std::uint64_t>(
+      kFooterBlock, detail::kKeyEntryBytes * index.keys)));
+  for (std::uint64_t left = index.keys; left > 0;) {
+    const auto n = static_cast<std::size_t>(
+        std::min<std::uint64_t>(block.size() / detail::kKeyEntryBytes, left));
+    const std::size_t bytes = n * detail::kKeyEntryBytes;
+    VKC_TRY(detail::read_at(kApi, path_, fd_.get(), at, block.data(), bytes));
+    at += bytes;
+    left -= n;
+    crc = detail::crc32(block.data(), bytes, crc);
+    for (std::size_t i = 0; i < n; ++i) {
+      const detail::KeyEntry e =
+          detail::load_key_entry(block.data() + detail::kKeyEntryBytes * i);
+      if (e.offset % 8 != 0 || e.offset <= last || e.offset < begin_ ||
+          e.offset >= index_at || e.track >= tracks) {
+        return false;
+      }
+      std::vector<KeyPoint>& keys = keys_[e.track];
+      if (!keys.empty() && e.pts_ns < keys.back().pts_ns) return false;
+      keys.push_back({e.offset, e.pts_ns});
+      last = e.offset;
+    }
+  }
+  if (crc != index.body_crc) return false;
+  for (std::size_t t = 0; t < tracks; ++t) {
+    if (keys_[t].size() != stats_[t].keys) return false;
+  }
+  recovery_.finished = true;
+  recovery_.end = file_size_;
+  return true;
 }
 
 core::Status StreamReader::scan() {
@@ -91,11 +140,6 @@ core::Status StreamReader::scan() {
   keys_unordered_.assign(tracks, false);
   const detail::FileView file{fd_.get(), &path_, file_size_,
                               static_cast<std::uint32_t>(tracks)};
-  // The chunk just before the one read, while it is an INDX: a TAIL after
-  // it may close the footer.
-  bool after_index = false;
-  std::uint64_t index_at = 0;
-  detail::Chunk index;
   // Where a footer's TAIL starts, and whether the scan looked for a chunk
   // there; elsewhere those bytes are inside a chunk (a payload, perhaps).
   const std::uint64_t tail_at = file_size_ - detail::kTailBytes;
@@ -111,7 +155,6 @@ core::Status StreamReader::scan() {
       if (found == file_size_) break;  // the rest is torn
       recovery_.damaged_bytes += found - pos;
       ++recovery_.damaged_spans;
-      after_index = false;
       pos = found;
       continue;
     }
@@ -125,22 +168,14 @@ core::Status StreamReader::scan() {
         }
         keys.push_back({pos, c.record.pts_ns});
       }
-    } else if (c.tag == detail::kTailTag && after_index) {
-      VKC_ASSIGN(recovery_.finished,
-                 footer_intact(kApi, file, index_at, index, pos, c));
-    }
-    after_index = c.tag == detail::kIndexTag;
-    if (after_index) {
-      index_at = pos;
-      index = c;
     }
     pos += c.header_bytes + c.body_bytes + detail::padding(c.body_bytes);
   }
   recovery_.end = std::min(pos, file_size_);
   recovery_.torn_bytes = file_size_ - recovery_.end;
   // A chunk tagged TAIL where the footer's starts, intact or not: the file
-  // was finished, and its footer is damaged.
-  if (!recovery_.finished && tail_reached) {
+  // was finished, and read_footer refused its footer.
+  if (tail_reached) {
     std::uint8_t tag[4];
     VKC_TRY(detail::read_at(kApi, path_, fd_.get(), tail_at, tag, sizeof(tag)));
     recovery_.footer_damaged = detail::load_le32(tag) == detail::kTailTag;
