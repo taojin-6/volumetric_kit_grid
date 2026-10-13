@@ -152,8 +152,8 @@ struct Index {
   std::vector<KeyEntry> entries;
 };
 
-// The `INDX` chunk of `index`, its body ending with `extra`.
-inline Bytes index_chunk(const Index& index, const Bytes& extra = {}) {
+// The `INDX` chunk of `index`.
+inline Bytes index_chunk(const Index& index) {
   Bytes fields;
   put(fields, index.tracks, 4);
   put(fields, index.keys, 8);
@@ -172,7 +172,6 @@ inline Bytes index_chunk(const Index& index, const Bytes& extra = {}) {
     put(body, e.track, 2);
     put(body, 0, 6);
   }
-  body.insert(body.end(), extra.begin(), extra.end());
   return chunk("INDX", fields, body);
 }
 

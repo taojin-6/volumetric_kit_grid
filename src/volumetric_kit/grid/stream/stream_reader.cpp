@@ -61,7 +61,8 @@ core::Result<bool> StreamReader::read_footer() {
   const std::uint64_t tail_at = file_size_ - detail::kTailBytes;
   detail::Chunk tail;
   VKC_ASSIGN(bool valid, detail::read_chunk(kApi, file, tail_at, &tail));
-  if (!valid || tail.tag != detail::kTailTag || tail.body_bytes != 0) {
+  if (!valid || tail.tag != detail::kTailTag || tail.body_bytes != 0 ||
+      tail.body_crc != 0) {
     return false;  // its H is 40: no more is left, and no TAIL has less
   }
   const std::uint64_t index_at = tail.index_offset;

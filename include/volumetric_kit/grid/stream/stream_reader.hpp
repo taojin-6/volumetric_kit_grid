@@ -42,7 +42,9 @@ struct Recovery {
   /// and its key count (at most the file's size / 56), and lists key records
   /// in file order, each of a track the session has and at a multiple of 8
   /// between the session header and the index, no track's pts decreasing,
-  /// and as many of each track as its summary counts.
+  /// and as many of each track as its summary counts. What the index lists
+  /// is not compared with the records: at a key position it got wrong,
+  /// @ref StreamReader::next meets what is there as it would anywhere.
   bool finished = false;
   /// Not @ref finished, though the scan found a chunk tagged `TAIL`, its
   /// header intact or not, where the footer's `TAIL` starts: the 40 bytes
@@ -150,7 +152,7 @@ class VR_STREAM_API StreamReader {
   /// @brief Where @p track 's key record @p n is.
   /// @param track  A track's index.
   /// @param n      Which key, from 0 in file order.
-  /// @return Its position, from which @ref next returns it;
+  /// @return Its position, as the footer index or the scan found it;
   ///         `Status::Code::InvalidArgument` for a track that does not exist;
   ///         `Status::Code::NotFound` for @p n of @ref key_count or more.
   core::Result<Position> key(std::uint16_t track, std::size_t n) const;

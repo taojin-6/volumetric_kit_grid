@@ -3,14 +3,16 @@
 
 // Host-only tests of opening a finished .vrst file from its footer index,
 // through the public API: the counts and every key lookup equal the scan's of
-// the same file with its TAIL cut off; each footer check refuses a footer
-// forged to fail it alone -- either CRC, B, T, the offset chain from the TAIL
-// to the INDX and on to the TAIL, the key entries' order, alignment, range
-// and tracks, a track's key pts, the summaries' key counts and K's bound of
-// the file's size / 56 -- and the file is then scanned, its footer damaged;
-// and, on a filesystem with sparse files (77, skipped, without), records past
-// 4 GiB beyond a 5 GiB unknown chunk read on both paths, and an index of 2^38
-// keys is refused unread.
+// the same file with its TAIL cut off, over more than one block of key
+// entries; each footer check refuses a footer forged to fail it alone --
+// either CRC, a CRC claimed for the TAIL's empty body, B, T, the offset chain
+// from the TAIL to the INDX and on to the TAIL, the key entries' order,
+// alignment, range and tracks, a track's key pts, the summaries' key counts
+// and K's bound of the file's size / 56 -- and the file is then scanned, its
+// footer damaged; and, on a filesystem with sparse files (77, skipped,
+// without), records past 4 GiB beyond a 5 GiB unknown chunk read on both
+// paths, and an index claiming 2^38 keys is refused with nothing sized by
+// them allocated.
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -25,6 +27,7 @@
 #include <vector>
 
 #include "stream_files.hpp"
+#include "test_allocation_failure.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
@@ -158,8 +161,11 @@ int footer_equals_scan_case(const std::string& dir) {
   struct Shape {
     std::size_t tracks, used, records, key_every;
   };
-  // Three tracks, one empty, a key in five; one track all keys; no records.
-  const Shape shapes[] = {{3, 2, 200, 5}, {1, 1, 100, 1}, {2, 2, 0, 1}};
+  // Three tracks, one empty, a key in five; one track all keys; no records;
+  // and 70,000 keys, over two of the 32,768 key entries the reader reads at a
+  // time.
+  const Shape shapes[] = {
+      {3, 2, 200, 5}, {1, 1, 100, 1}, {2, 2, 0, 1}, {2, 2, 70000, 1}};
   for (const Shape& shape : shapes) {
     const std::string path = dir + "/same.vrst";
     const std::string cut = dir + "/same_cut.vrst";
@@ -248,10 +254,9 @@ int forged_footer_case(const std::string& dir) {
   CHECK(make_sample(dir, &sample));
   const vrst::Index& good = sample.index;
   const std::uint64_t index_at = sample.index_at;
-  const auto with = [&](const vrst::Index& index, const Bytes& extra = {}) {
-    return refooted(
-        sample.file, index_at,
-        {vrst::index_chunk(index, extra), vrst::tail_chunk(index_at)});
+  const auto with = [&](const vrst::Index& index) {
+    return refooted(sample.file, index_at,
+                    {vrst::index_chunk(index), vrst::tail_chunk(index_at)});
   };
   // The builder rebuilds the writer's footer.
   CHECK(with(good) == sample.file);
@@ -268,6 +273,13 @@ int forged_footer_case(const std::string& dir) {
                     vrst::flipped(sample.file, index_at + 40 + 16, 0)});
   forged.push_back(
       {"a damaged TAIL", vrst::flipped(sample.file, sample.tail_at + 20, 0)});
+  // A TAIL's empty body has CRC 0: one claiming another, its header's CRC
+  // passing.
+  forged.push_back(
+      {"a TAIL claiming a body CRC",
+       refooted(sample.file, index_at,
+                {vrst::index_chunk(good),
+                 vrst::header("TAIL", vrst::tail_fields(index_at), 0, 1)})});
   // B and the header's counts. B 8 over 40 T + 32 K, its CRC that of those
   // bytes alone: the size check alone refuses it.
   const Bytes whole = vrst::index_chunk(good);
@@ -523,9 +535,10 @@ int past_4_gib_case(const std::string& dir) {
 }
 
 // An index claiming 2^38 keys, an 8 TiB body that is all hole, every other
-// header check passing: refused by K's bound before its body is read or
-// anything sized by K is allocated, so the open is immediate.
-int unread_index_case(const std::string& dir) {
+// header check passing: refused by K's bound, and the file scanned, with no
+// allocation of even 64 KiB -- none sized by K, not even a block of its
+// entries.
+int huge_index_case(const std::string& dir) {
   const std::string path = dir + "/huge_index.vrst";
   const Bytes session =
       vrst::chunk("VRST", vrst::session_fields(0, 1, 0), vrst::session_body(1));
@@ -549,8 +562,16 @@ int unread_index_case(const std::string& dir) {
     return kSkip;
   }
   CHECK(kKeys > (tail_at + 40) / 56);
+  vr_test::allocation_failure.largest = 0;
+  vr_test::allocation_failure.measure = true;
   auto r = open(path);
+  vr_test::allocation_failure.measure = false;
   CHECK(r != nullptr);
+  if (vr_test::allocation_failure.largest >= (std::size_t{64} << 10)) {
+    std::fprintf(stderr, "the open allocated %zu bytes at once\n",
+                 vr_test::allocation_failure.largest);
+    return 1;
+  }
   CHECK(!r->recovery().finished && r->recovery().footer_damaged);
   CHECK(r->stats()[0].records == 0 && r->key_count(0) == 0);
   return 0;
@@ -570,8 +591,8 @@ int main() {
     return kSkip;
   }
   if (past_4_gib_case(dir) != 0) return 1;
-  const int unread = unread_index_case(dir);
-  if (unread != 0) return unread;
+  const int huge = huge_index_case(dir);
+  if (huge != 0) return huge;
   std::puts("stream footer: OK");
   return 0;
 }
