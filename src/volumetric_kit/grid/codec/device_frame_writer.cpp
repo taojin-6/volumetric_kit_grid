@@ -30,9 +30,46 @@ constexpr std::uint32_t kCountLanes = 64;
 constexpr std::uint32_t kOpsLanes = 64;
 constexpr std::uint32_t kEncodeLanes = 32;
 
-// The payload readback's prediction before any frame: about three times
-// what room0 codes.
-constexpr std::uint64_t kFirstPayloadPerBlock = 32;
+// The payload readback's prediction before any frame of a type: about three
+// times what room0 codes in an intra frame.
+constexpr std::uint64_t kFirstPayloadPerEntry = 32;
+
+// The walk's bindings (rans_walk.glsl), which the count and coder-step
+// kernels share. A side the entries lack -- new blocks, or reference entries
+// and their modes -- binds the masks, which it never reads.
+void bind_walk(core::ComputeKernel& kernel, const ResidentBlocks& blocks) {
+  const VkDeviceSize entries = blocks.count;
+  const VkDeviceSize m = blocks.reference_count;
+  const VkDeviceSize k = blocks.coefficient_count;
+  const VkDeviceSize mask_bytes =
+      entries * kMaskWordsPerBlock * sizeof(std::uint32_t);
+  const core::Buffer* list = entries > m ? blocks.list : blocks.masks;
+  const core::Buffer* modes = m != 0 ? blocks.modes : blocks.masks;
+  kernel.set.write_storage_buffer(
+      0, list->handle(), 0,
+      binding_range((entries - m) * sizeof(volume::BlockIndex),
+                    sizeof(volume::BlockIndex)));
+  kernel.set.write_storage_buffer(1, blocks.masks->handle(), 0, mask_bytes);
+  kernel.set.write_storage_buffer(
+      2, blocks.coefficients->handle(), 0,
+      entries * ((k + 1) / 2) * sizeof(std::uint32_t));
+  kernel.set.write_storage_buffer(
+      3, modes->handle(), 0,
+      binding_range(m * sizeof(std::uint32_t), sizeof(std::uint32_t)));
+}
+
+// The walk's push constants, for a frame of @p segments.
+RansPush walk_push(const ResidentBlocks& blocks, std::uint32_t segment_size,
+                   std::uint32_t update_size, std::uint64_t segments) {
+  RansPush push;
+  push.num_entries = blocks.count;
+  push.coefficient_count = blocks.coefficient_count;
+  push.segment_size = segment_size;
+  push.segment_count = static_cast<std::uint32_t>(segments);
+  push.reference_count = blocks.reference_count;
+  push.update_size = update_size;
+  return push;
+}
 
 core::Status fail(const char* op, const std::string& why) {
   return core::Status::invalid_argument(std::string("DeviceFrameWriter::") +
@@ -53,9 +90,9 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
   push.size = sizeof(RansPush);
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(w.count_kernel_, "codec_rans_count", vr_rans_count_comp_spv,
-                 vr_rans_count_comp_spv_size, 5, &push));
+                 vr_rans_count_comp_spv_size, 7, &push));
   VKC_TRY(kb.add(w.ops_kernel_, "codec_rans_ops", vr_rans_ops_comp_spv,
-                 vr_rans_ops_comp_spv_size, 6, &push));
+                 vr_rans_ops_comp_spv_size, 7, &push));
   VKC_TRY(kb.add(w.encode_kernel_, "codec_rans_encode", vr_rans_encode_comp_spv,
                  vr_rans_encode_comp_spv_size, 6, &push));
   VKC_TRY(kb.add(w.scan_kernel_, "codec_rans_scan", vr_rans_scan_comp_spv,
@@ -72,6 +109,11 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(w.failed_.handle()),
                          "codec.rans_failed");
+  VKC_ASSIGN(w.refusal_,
+             core::device_storage_buffer(allocator, sizeof(w.refusal_host_)));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(w.refusal_.handle()),
+                         "codec.rans_refusal");
   VKC_ASSIGN(w.gather_args_, core::device_storage_buffer(
                                  allocator, sizeof(VkDispatchIndirectCommand),
                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
@@ -84,108 +126,157 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
 core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
                                              const ResidentBlocks& blocks,
                                              std::uint32_t segment_size,
+                                             std::uint32_t update_size,
                                              core::GpuStageScope* stage) {
+  const std::uint32_t entries = blocks.count;
+  const std::uint32_t m = blocks.reference_count;
+  const std::uint32_t k = blocks.coefficient_count;
   if (segment_size == 0) {
     return fail("record_count", "segment_size must be at least 1");
   }
-  const std::uint32_t n = blocks.count;
-  const std::uint32_t k = blocks.coefficient_count;
-  const std::uint64_t segments = frame_segment_count(n, segment_size);
+  if (m > entries) {
+    return fail("record_count", std::to_string(m) +
+                                    " reference entries, more than the " +
+                                    std::to_string(entries) + " entries");
+  }
+  if (m != 0 && update_size == 0) {
+    return fail("record_count", "update_size must be at least 1");
+  }
+  if (entries != 0 &&
+      (blocks.masks == nullptr || blocks.coefficients == nullptr ||
+       (entries > m && blocks.list == nullptr) ||
+       (m != 0 && blocks.modes == nullptr))) {
+    return fail("record_count", "the entries lack a buffer they need");
+  }
+  const std::uint64_t segments = frame_segment_count(m, update_size) +
+                                 frame_segment_count(entries - m, segment_size);
   if (segments > kMaxFrameSegments) {
     return fail("record_count", "more than 2^30 - 1 segments");
   }
   segment_size_ = segment_size;
+  update_size_ = update_size;
+  // A P-frame's layout, whose mode model comes last: an intra frame's counts
+  // are its prefix.
   counts_host_.assign(
-      frame_model_base(frame_model_count(FrameType::kIntra, k), k), 0);
-  steps_host_.assign(n, 0);
-  if (n == 0) return {};
+      frame_model_base(frame_model_count(FrameType::kInter, k), k), 0);
+  steps_host_.assign(entries, 0);
+  refusal_host_[0] = refusal_host_[1] = 0;
+  if (entries == 0) return {};
 
   const VkDeviceSize range = max_storage_buffer_range_;
   const VkDeviceSize count_bytes = counts_host_.size() * sizeof(std::uint32_t);
   const VkDeviceSize step_bytes = steps_host_.size() * sizeof(std::uint32_t);
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, counts_,
                                       count_bytes, range, "codec.rans_counts"));
-  VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, block_steps_,
+  VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, entry_steps_,
                                       step_bytes, range,
-                                      "codec.rans_block_steps"));
+                                      "codec.rans_entry_steps"));
   VKC_TRY(batch.zero(counts_, 0, count_bytes));
+  VKC_TRY(batch.zero(refusal_, 0, sizeof(refusal_host_)));
 
   core::ComputeKernel& kernel = count_kernel_;
-  kernel.set.write_storage_buffer(0, blocks.list->handle(), 0,
-                                  VkDeviceSize(n) * sizeof(volume::BlockIndex));
-  kernel.set.write_storage_buffer(
-      1, blocks.masks->handle(), 0,
-      VkDeviceSize(n) * kMaskWordsPerBlock * sizeof(std::uint32_t));
-  kernel.set.write_storage_buffer(
-      2, blocks.coefficients->handle(), 0,
-      VkDeviceSize(n) * ((k + 1) / 2) * sizeof(std::uint32_t));
-  kernel.set.write_storage_buffer(3, counts_.handle(), 0, count_bytes);
-  kernel.set.write_storage_buffer(4, block_steps_.handle(), 0, step_bytes);
-  RansPush push;
-  push.num_blocks = n;
-  push.coefficient_count = k;
-  push.segment_size = segment_size;
-  push.segment_count = static_cast<std::uint32_t>(segments);
-  VKC_TRY(dispatch_items(batch, kernel, push, n, kCountLanes,
+  bind_walk(kernel, blocks);
+  kernel.set.write_storage_buffer(4, counts_.handle(), 0, count_bytes);
+  kernel.set.write_storage_buffer(5, entry_steps_.handle(), 0, step_bytes);
+  kernel.set.write_storage_buffer(6, refusal_.handle(), 0,
+                                  sizeof(refusal_host_));
+  RansPush push = walk_push(blocks, segment_size, update_size, segments);
+  VKC_TRY(dispatch_items(batch, kernel, push, entries, kCountLanes,
                          max_workgroup_count_x_, stage));
   VKC_TRY(batch.readback(counts_, 0, count_bytes, counts_host_.data()));
-  return batch.readback(block_steps_, 0, step_bytes, steps_host_.data());
+  VKC_TRY(batch.readback(refusal_, 0, sizeof(refusal_host_), refusal_host_));
+  return batch.readback(entry_steps_, 0, step_bytes, steps_host_.data());
 }
 
 core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
-    const CodecParams& params, core::GpuStageScope* stage) {
+    const CodecParams& params, const FrameReference* reference,
+    core::GpuStageScope* stage) {
   VKC_TRY(params.validate());
-  const std::uint32_t n = blocks.count;
+  const std::uint32_t entries = blocks.count;
+  const std::uint32_t m = blocks.reference_count;
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t segment_size = segment_size_;
-  if (segment_size == 0 || k != blocks.coefficient_count ||
+  const std::uint32_t update_size = update_size_;
+  if (segment_size == 0 || k != blocks.coefficient_count || m > entries ||
       counts_host_.size() !=
-          frame_model_base(frame_model_count(FrameType::kIntra, k), k) ||
-      steps_host_.size() != n) {
+          frame_model_base(frame_model_count(FrameType::kInter, k), k) ||
+      steps_host_.size() != entries) {
     return fail("finish", "these blocks were not the ones record_count saw");
   }
+  const std::uint32_t a = entries - m;
+  const FrameType type =
+      reference != nullptr ? FrameType::kInter : FrameType::kIntra;
+  const std::uint32_t held =
+      reference != nullptr ? reference->header.block_count : 0;
+  if (m != held) {
+    return fail("finish", "expected " + std::to_string(held) +
+                              " reference entries, one per reference block, "
+                              "got " +
+                              std::to_string(m));
+  }
+  // write_frame's last refusals, from what the count found. The mode model
+  // follows an intra frame's last (frame_models.glsl).
+  const std::uint32_t modes =
+      frame_model_base(frame_model_count(FrameType::kIntra, k), k);
+  VKC_TRY(check_entries(
+      refusal_host_[0],
+      counts_host_[modes + static_cast<std::uint32_t>(BlockMode::kMotion)] != 0,
+      refusal_host_[1] != 0));
   const auto segments =
-      static_cast<std::uint32_t>(frame_segment_count(n, segment_size));
+      static_cast<std::uint32_t>(frame_segment_count(m, update_size) +
+                                 frame_segment_count(a, segment_size));
 
   // The tables, from the device's counts through the host's normalization.
-  const std::uint32_t models = frame_model_count(FrameType::kIntra, k);
+  const std::uint32_t models = frame_model_count(type, k);
   std::vector<std::vector<std::uint64_t>> counts(models);
-  for (std::uint32_t m = 0; m < models; ++m) {
-    counts[m].assign(counts_host_.begin() + frame_model_base(m, k),
-                     counts_host_.begin() + frame_model_base(m + 1, k));
+  for (std::uint32_t model = 0; model < models; ++model) {
+    counts[model].assign(counts_host_.begin() + frame_model_base(model, k),
+                         counts_host_.begin() + frame_model_base(model + 1, k));
+  }
+  // The survivors: every reference entry but a removed one, motion refused.
+  std::uint64_t survivors = 0;
+  for (BlockMode mode :
+       {BlockMode::kKeep, BlockMode::kSkip, BlockMode::kZero}) {
+    survivors += counts_host_[modes + static_cast<std::uint32_t>(mode)];
   }
   CodedFrame coded;
   coded.voxel_size = voxel_size;
   coded.trunc_dist = trunc_dist;
   coded.params = params;
-  coded.block_count = n;
+  coded.block_count = static_cast<std::uint32_t>(survivors + a);
   coded.segment_size = segment_size;
+  if (reference != nullptr) {
+    coded.reference = *reference;
+    coded.update_size = update_size;
+    coded.new_count = a;
+  }
   coded.tables = frame_tables(counts);
-  if (n == 0) return assemble_frame(FrameType::kIntra, coded);
+  if (entries == 0) return assemble_frame(type, coded);
 
   // Each symbol's coder step; frequency 0 for one never counted, which the
   // encoder refuses.
-  const std::vector<std::uint32_t> entries = rans_table_entries(coded.tables);
-  // The coder takes a segment's steps last first, so its blocks are laid out
-  // last first, each block's steps written down from its run's end: the
+  const std::vector<std::uint32_t> table_entries =
+      rans_table_entries(coded.tables);
+  // The coder takes a segment's steps last first, so its entries are laid
+  // out last first, each entry's steps written down from its run's end: the
   // segment's steps are one run in the order the coder takes them. Its slot
   // holds at most a word per step and the final state's two, rounded up to
   // whole 32-bit words so no two segments share one.
-  std::vector<std::uint32_t> step_ends(n);
+  std::vector<std::uint32_t> step_ends(entries);
   std::vector<std::uint32_t> segment_steps(std::size_t(segments) + 1, 0);
   std::vector<std::uint32_t> slot_offsets(std::size_t(segments) + 1, 0);
   std::uint64_t step_total = 0;
   std::uint64_t slot_words16 = 0;
   for (std::uint32_t s = 0; s < segments; ++s) {
-    const std::uint64_t first = std::uint64_t(s) * segment_size;
-    const std::uint64_t end = std::min<std::uint64_t>(n, first + segment_size);
+    const glm::uvec2 range =
+        frame_segment_range(s, m, update_size, a, segment_size);
     segment_steps[s] = static_cast<std::uint32_t>(step_total);
     slot_offsets[s] = static_cast<std::uint32_t>(slot_words16);
     const std::uint64_t begin = step_total;
-    for (std::uint64_t i = end; i-- > first;) {
-      step_total += steps_host_[i];
-      step_ends[i] = static_cast<std::uint32_t>(step_total);
+    for (std::uint32_t p = range.y; p-- > range.x;) {
+      step_total += steps_host_[p];
+      step_ends[p] = static_cast<std::uint32_t>(step_total);
     }
     slot_words16 += (step_total - begin + 3) & ~std::uint64_t{1};
     if (step_total * 4 > std::numeric_limits<std::uint32_t>::max() ||
@@ -197,10 +288,11 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   slot_offsets[segments] = static_cast<std::uint32_t>(slot_words16);
 
   const VkDeviceSize range = max_storage_buffer_range_;
-  const VkDeviceSize entry_bytes = entries.size() * sizeof(std::uint32_t);
+  const VkDeviceSize entry_bytes = table_entries.size() * sizeof(std::uint32_t);
   const VkDeviceSize offset_bytes = slot_offsets.size() * sizeof(std::uint32_t);
   const VkDeviceSize slot_bytes = slot_words16 * 2;
-  const VkDeviceSize step_end_bytes = VkDeviceSize(n) * sizeof(std::uint32_t);
+  const VkDeviceSize step_end_bytes =
+      VkDeviceSize(entries) * sizeof(std::uint32_t);
   const VkDeviceSize step_bytes = step_total * sizeof(std::uint32_t);
   const VkDeviceSize length_bytes =
       VkDeviceSize(segments) * sizeof(std::uint32_t);
@@ -229,24 +321,17 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
                                       slot_bytes, range, "codec.rans_payload"));
 
   core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.upload(tables_, 0, entries.data(), entry_bytes));
+  VKC_TRY(batch.upload(tables_, 0, table_entries.data(), entry_bytes));
   VKC_TRY(batch.upload(step_ends_, 0, step_ends.data(), step_end_bytes));
   VKC_TRY(batch.upload(segment_steps_, 0, segment_steps.data(), offset_bytes));
   VKC_TRY(batch.upload(slot_offsets_, 0, slot_offsets.data(), offset_bytes));
   VKC_TRY(batch.zero(failed_, 0, sizeof(std::uint32_t)));
 
   core::ComputeKernel& ops = ops_kernel_;
-  ops.set.write_storage_buffer(0, blocks.list->handle(), 0,
-                               VkDeviceSize(n) * sizeof(volume::BlockIndex));
-  ops.set.write_storage_buffer(
-      1, blocks.masks->handle(), 0,
-      VkDeviceSize(n) * kMaskWordsPerBlock * sizeof(std::uint32_t));
-  ops.set.write_storage_buffer(
-      2, blocks.coefficients->handle(), 0,
-      VkDeviceSize(n) * ((k + 1) / 2) * sizeof(std::uint32_t));
-  ops.set.write_storage_buffer(3, tables_.handle(), 0, entry_bytes);
-  ops.set.write_storage_buffer(4, step_ends_.handle(), 0, step_end_bytes);
-  ops.set.write_storage_buffer(5, steps_.handle(), 0, step_bytes);
+  bind_walk(ops, blocks);
+  ops.set.write_storage_buffer(4, tables_.handle(), 0, entry_bytes);
+  ops.set.write_storage_buffer(5, step_ends_.handle(), 0, step_end_bytes);
+  ops.set.write_storage_buffer(6, steps_.handle(), 0, step_bytes);
   core::ComputeKernel& encode = encode_kernel_;
   encode.set.write_storage_buffer(0, steps_.handle(), 0, step_bytes);
   encode.set.write_storage_buffer(1, segment_steps_.handle(), 0, offset_bytes);
@@ -268,13 +353,10 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
                                   offset_bytes);
   gather.set.write_storage_buffer(4, payload_.handle(), 0, slot_bytes);
 
-  RansPush push;
-  push.num_blocks = n;
-  push.coefficient_count = k;
-  push.segment_size = segment_size;
-  push.segment_count = segments;
-  VKC_TRY(dispatch_items(batch, ops, push, n, kOpsLanes, max_workgroup_count_x_,
-                         stage));
+  RansPush push = walk_push(blocks, segment_size, update_size, segments);
+  push.frame_type = static_cast<std::uint32_t>(type);
+  VKC_TRY(dispatch_items(batch, ops, push, entries, kOpsLanes,
+                         max_workgroup_count_x_, stage));
   VKC_TRY(dispatch_items(batch, encode, push, segments, kEncodeLanes,
                          max_workgroup_count_x_, stage));
   VKC_TRY(batch.dispatch(scan_kernel_, &push, sizeof(push), 1,
@@ -285,10 +367,11 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   // Read the payload's likely size with the lengths, and any rest after.
   std::vector<std::uint32_t> lengths(segments);
   std::uint32_t failed = 0;
-  const std::uint64_t per_block =
-      payload_per_block_ != 0 ? payload_per_block_ : kFirstPayloadPerBlock;
+  std::uint32_t& per_entry = payload_per_entry_[static_cast<int>(type)];
   const VkDeviceSize guess = std::min<VkDeviceSize>(
-      slot_bytes, (per_block * n + 3) & ~VkDeviceSize{3});
+      slot_bytes,
+      ((per_entry != 0 ? per_entry : kFirstPayloadPerEntry) * entries + 3) &
+          ~VkDeviceSize{3});
   std::vector<std::uint8_t> payload(static_cast<std::size_t>(guess));
   VKC_TRY(batch.readback(lengths_, 0, length_bytes, lengths.data()));
   VKC_TRY(batch.readback(failed_, 0, sizeof(failed), &failed));
@@ -314,10 +397,10 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     VKC_TRY(tail.submit());
   }
   payload.resize(static_cast<std::size_t>(total));
-  payload_per_block_ = static_cast<std::uint32_t>((total + total / 4) / n + 1);
+  per_entry = static_cast<std::uint32_t>((total + total / 4) / entries + 1);
   coded.segment_lengths = std::move(lengths);
   coded.payload = std::move(payload);
-  return assemble_frame(FrameType::kIntra, coded);
+  return assemble_frame(type, coded);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

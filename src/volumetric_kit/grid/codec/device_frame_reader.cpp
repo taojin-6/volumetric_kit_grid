@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "rans_dispatch.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -45,7 +46,7 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
   VKC_TRY(kb.add(r.slots_kernel_, "codec_rans_slots", vr_rans_slots_comp_spv,
                  vr_rans_slots_comp_spv_size, 2, &push));
   VKC_TRY(kb.add(r.decode_kernel_, "codec_rans_decode", vr_rans_decode_comp_spv,
-                 vr_rans_decode_comp_spv_size, 7, &push));
+                 vr_rans_decode_comp_spv_size, 8, &push));
   VKC_ASSIGN(r.pool_, kb.build());
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
@@ -57,45 +58,68 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
 core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
     core::CommandBatch& batch, const ParsedFrame& frame,
     core::GpuStageScope* stage) {
-  VKC_TRY(check_frame_type(frame.header.type, FrameType::kIntra,
+  VKC_TRY(check_frame_type(frame.header.type, FrameType::kInter,
                            "DeviceFrameReader::record_decode"));
+  const FrameType type = frame.header.type;
+  const bool inter = type == FrameType::kInter;
   const std::uint32_t n = frame.header.block_count;
   const std::uint32_t k = frame.header.params.coefficient_count;
+  const std::uint32_t r_size = frame.header.segment_size;
+  // An intra frame is M = 0: its blocks are all new.
+  const std::uint32_t m = inter ? frame.reference.header.block_count : 0;
+  const std::uint32_t u_size = inter ? frame.update_size : 0;
+  const std::uint32_t a = inter ? frame.new_count : n;
+  const std::uint32_t entries = m + a;  // below 2^32 (parse_frame)
   const auto segments =
       static_cast<std::uint32_t>(frame.segment_lengths.size());
   // One invocation decodes a whole segment, and the frame sets its length.
-  const std::uint32_t longest = std::min(n, frame.header.segment_size);
+  const std::uint32_t longest =
+      std::max(std::min(m, u_size), std::min(a, r_size));
   if (longest > kMaxDeviceDecodeSegmentSize) {
     return fail("record_decode",
                 "segments of " + std::to_string(longest) +
-                    " blocks, past the " +
+                    " entries, past the " +
                     std::to_string(kMaxDeviceDecodeSegmentSize) +
                     " one invocation decodes within a GPU watchdog's limit");
   }
+  // What check() judges the frame by, once nothing else can refuse it.
+  auto adopt = [&] {
+    type_ = type;
+    block_count_ = n;
+    reference_count_ = m;
+    update_size_ = u_size;
+    new_count_ = a;
+    segment_size_ = r_size;
+    modes_host_.clear();
+    // Overwritten by the readback.
+    blocks_host_.resize(a);
+    mode_words_.resize(m);
+    faults_host_.resize(segments);
+  };
   ResidentBlocks out;
   out.coefficient_count = k;
-  if (n == 0) {
-    blocks_host_.clear();
-    faults_host_.clear();
-    segment_size_ = frame.header.segment_size;
+  if (segments == 0) {
+    adopt();
     return out;
   }
 
   // Every size first, so a frame the device cannot hold grows nothing.
-  const std::vector<std::uint32_t> entries = rans_table_entries(frame.tables);
-  const std::uint32_t models = frame_model_count(FrameType::kIntra, k);
-  const VkDeviceSize entry_bytes = entries.size() * sizeof(std::uint32_t);
+  const std::vector<std::uint32_t> table_entries =
+      rans_table_entries(frame.tables);
+  const std::uint32_t models = frame_model_count(type, k);
+  const VkDeviceSize entry_bytes = table_entries.size() * sizeof(std::uint32_t);
   const VkDeviceSize slot_bytes =
       VkDeviceSize(models) * kRansScale * sizeof(std::uint32_t);
   const VkDeviceSize payload_bytes =
       (frame.payload_size + 3) & ~VkDeviceSize{3};
   const VkDeviceSize word_bytes =
       (VkDeviceSize(segments) + 1) * sizeof(std::uint32_t);
-  const VkDeviceSize list_bytes = VkDeviceSize(n) * sizeof(volume::BlockIndex);
+  const VkDeviceSize list_bytes = VkDeviceSize(a) * sizeof(volume::BlockIndex);
   const VkDeviceSize mask_bytes =
-      VkDeviceSize(n) * kMaskWordsPerBlock * sizeof(std::uint32_t);
+      VkDeviceSize(entries) * kMaskWordsPerBlock * sizeof(std::uint32_t);
   const VkDeviceSize coeff_bytes =
-      VkDeviceSize(n) * ((k + 1) / 2) * sizeof(std::uint32_t);
+      VkDeviceSize(entries) * ((k + 1) / 2) * sizeof(std::uint32_t);
+  const VkDeviceSize mode_bytes = VkDeviceSize(m) * sizeof(std::uint32_t);
   const VkDeviceSize fault_bytes =
       VkDeviceSize(segments) * sizeof(std::uint32_t);
   struct Scratch {
@@ -108,9 +132,12 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
       {slots_, slot_bytes, "codec.rans_slots"},
       {payload_, payload_bytes, "codec.rans_decode_payload"},
       {segment_words_, word_bytes, "codec.rans_segment_words"},
-      {list_, list_bytes, "codec.rans_decode_list"},
+      {list_, binding_range(list_bytes, sizeof(volume::BlockIndex)),
+       "codec.rans_decode_list"},
       {masks_, mask_bytes, "codec.rans_decode_masks"},
       {coefficients_, coeff_bytes, "codec.rans_decode_coefficients"},
+      {modes_, binding_range(mode_bytes, sizeof(std::uint32_t)),
+       "codec.rans_decode_modes"},
       {faults_, fault_bytes, "codec.rans_faults"},
   };
   const VkDeviceSize range = max_storage_buffer_range_;
@@ -127,12 +154,9 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   for (std::uint32_t s = 0; s < segments; ++s) {
     segment_words[s + 1] = segment_words[s] + frame.segment_lengths[s] / 2;
   }
-  segment_size_ = frame.header.segment_size;
-  // Overwritten by the readback.
-  blocks_host_.resize(n);
-  faults_host_.resize(segments);
+  adopt();
 
-  VKC_TRY(batch.upload(tables_, 0, entries.data(), entry_bytes));
+  VKC_TRY(batch.upload(tables_, 0, table_entries.data(), entry_bytes));
   VKC_TRY(batch.upload(segment_words_, 0, segment_words.data(), word_bytes));
   VKC_ASSIGN(void* staged, batch.reserve_upload(payload_, 0, payload_bytes));
   std::memcpy(staged, frame.payload, frame.payload_size);
@@ -145,39 +169,69 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   decode.set.write_storage_buffer(0, slots_.handle(), 0, slot_bytes);
   decode.set.write_storage_buffer(1, payload_.handle(), 0, payload_bytes);
   decode.set.write_storage_buffer(2, segment_words_.handle(), 0, word_bytes);
-  decode.set.write_storage_buffer(3, list_.handle(), 0, list_bytes);
+  decode.set.write_storage_buffer(
+      3, list_.handle(), 0,
+      binding_range(list_bytes, sizeof(volume::BlockIndex)));
   decode.set.write_storage_buffer(4, masks_.handle(), 0, mask_bytes);
   decode.set.write_storage_buffer(5, coefficients_.handle(), 0, coeff_bytes);
   decode.set.write_storage_buffer(6, faults_.handle(), 0, fault_bytes);
+  decode.set.write_storage_buffer(
+      7, modes_.handle(), 0, binding_range(mode_bytes, sizeof(std::uint32_t)));
 
   RansPush push;
-  push.num_blocks = n;
+  push.num_entries = entries;
   push.coefficient_count = k;
-  push.segment_size = frame.header.segment_size;
+  push.segment_size = r_size;
   push.segment_count = segments;
+  push.frame_type = static_cast<std::uint32_t>(type);
+  push.reference_count = m;
+  push.update_size = u_size;
   VKC_TRY(dispatch_items(batch, slots_kernel_, push,
                          std::uint64_t(models) * kRansScale, kSlotsLanes,
                          max_workgroup_count_x_, stage));
   VKC_TRY(dispatch_items(batch, decode, push, segments, kDecodeLanes,
                          max_workgroup_count_x_, stage));
-  VKC_TRY(batch.readback(list_, 0, list_bytes, blocks_host_.data()));
+  if (a != 0) {
+    VKC_TRY(batch.readback(list_, 0, list_bytes, blocks_host_.data()));
+  }
+  if (m != 0) {
+    VKC_TRY(batch.readback(modes_, 0, mode_bytes, mode_words_.data()));
+  }
   VKC_TRY(batch.readback(faults_, 0, fault_bytes, faults_host_.data()));
 
   out.list = &list_;
   out.masks = &masks_;
   out.coefficients = &coefficients_;
-  out.count = n;
+  out.modes = m != 0 ? &modes_ : nullptr;
+  out.count = entries;
+  out.reference_count = m;
   return out;
 }
 
-core::Status DeviceFrameReader::check() const {
-  const std::size_t r = segment_size_;
-  for (std::size_t s = 0; s < faults_host_.size(); ++s) {
-    const std::size_t first = s * r;
-    VKC_TRY(check_segment(s, static_cast<SegmentFault>(faults_host_[s]),
-                          s > 0 ? &blocks_host_[first - 1].coord : nullptr,
-                          &blocks_host_[first].coord));
+core::Status DeviceFrameReader::check() {
+  modes_host_.clear();
+  // An update segment has no coordinate, and a block segment follows the
+  // block segment before it, if any.
+  const Vec3i* prev_last = nullptr;
+  for (std::uint32_t s = 0; s < faults_host_.size(); ++s) {
+    const glm::uvec2 range = frame_segment_range(
+        s, reference_count_, update_size_, new_count_, segment_size_);
+    const bool blocks = range.x >= reference_count_;
+    VKC_TRY(check_segment(
+        s, static_cast<SegmentFault>(faults_host_[s]),
+        blocks ? prev_last : nullptr,
+        blocks ? &blocks_host_[range.x - reference_count_].coord : nullptr));
+    if (blocks) prev_last = &blocks_host_[range.y - 1 - reference_count_].coord;
   }
+  if (type_ != FrameType::kInter) return {};
+  // Every segment decoded whole, so each mode is one the table gives: below
+  // the motion mode, which the parser refused a frequency.
+  std::vector<BlockMode> modes(mode_words_.size());
+  for (std::size_t e = 0; e < modes.size(); ++e) {
+    modes[e] = static_cast<BlockMode>(mode_words_[e]);
+  }
+  VKC_TRY(check_survivors(modes, block_count_, new_count_));
+  modes_host_ = std::move(modes);
   return {};
 }
 

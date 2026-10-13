@@ -503,6 +503,10 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                                " coefficients, and the params " +
                                std::to_string(params.coefficient_count));
   }
+  if (in.reference_count != 0) {
+    return fail("inverse",
+                "the entries are a P-frame's stream positions, not its blocks");
+  }
   if (in.count > static_cast<std::uint32_t>(grid.grid().num_blocks)) {
     return fail("inverse", std::to_string(in.count) +
                                " blocks, more than this grid's block heap (" +
