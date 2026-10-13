@@ -4,7 +4,6 @@
 #include "reference_store.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <string>
 #include <utility>
 
@@ -36,14 +35,6 @@ static_assert(kMaskWordsPerBlock == 16, "inter_apply.comp's kMaskWords is 16");
 // Bytes of one entry's coefficients, as the transform reads them.
 VkDeviceSize coefficient_bytes(std::uint32_t k) {
   return VkDeviceSize(coefficient_words(k)) * sizeof(std::uint32_t);
-}
-
-// The entries a host-decoded frame's upload takes: those its sources name a
-// payload for (keep, zero and new).
-std::uint32_t uploaded_entries(const std::vector<ApplySource>& sources) {
-  std::uint32_t n = 0;
-  for (const ApplySource& s : sources) n += s.payload != kNoSource ? 1u : 0u;
-  return n;
 }
 
 // A binding's range of @p entries of @p bytes each, never less than one: a
@@ -98,8 +89,6 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
       {s.slots_[1].coefficients, widest, "codec.reference_coefficients"},
       {s.list_, sizeof(volume::BlockIndex), "codec.reference_list"},
       {s.sources_, sizeof(ApplySource), "codec.apply_sources"},
-      {s.upload_.masks, kMaskBytes, "codec.apply_upload_masks"},
-      {s.upload_.coefficients, widest, "codec.apply_upload_coefficients"},
   };
   for (const First& f : first) {
     VKC_TRY(core::ensure_device_scratch(device, allocator, f.buffer, f.bytes,
@@ -108,12 +97,8 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   return owned;
 }
 
-core::Status ReferenceStore::reserve(
-    std::uint32_t n, std::uint32_t k,
-    const std::vector<ApplySource>* host_sources) {
+core::Status ReferenceStore::reserve(std::uint32_t n, std::uint32_t k) {
   Slot& spare = slots_[current_ ^ 1u];
-  const std::uint32_t uploaded =
-      host_sources != nullptr ? uploaded_entries(*host_sources) : 0;
   struct Scratch {
     core::Buffer& buffer;
     VkDeviceSize bytes;
@@ -126,10 +111,6 @@ core::Status ReferenceStore::reserve(
       {list_, VkDeviceSize(n) * sizeof(volume::BlockIndex),
        "codec.reference_list"},
       {sources_, VkDeviceSize(n) * sizeof(ApplySource), "codec.apply_sources"},
-      {upload_.masks, VkDeviceSize(uploaded) * kMaskBytes,
-       "codec.apply_upload_masks"},
-      {upload_.coefficients, VkDeviceSize(uploaded) * coefficient_bytes(k),
-       "codec.apply_upload_coefficients"},
   };
   // Every range first, so a frame the device cannot hold grows nothing.
   for (const Scratch& b : scratch) {
@@ -142,54 +123,6 @@ core::Status ReferenceStore::reserve(
                                         b.name));
   }
   return {};
-}
-
-core::Result<ResidentBlocks> ReferenceStore::record_upload(
-    core::CommandBatch& batch, const DctBlocks& entries,
-    std::vector<ApplySource>& sources) {
-  const std::uint32_t k = entries.params.coefficient_count;
-  const std::size_t positions = entries.masks.size() / kMaskWordsPerBlock;
-  for (const ApplySource& s : sources) {
-    if (s.payload != kNoSource && s.payload >= positions) {
-      return fail("record_upload", "a source names entry " +
-                                       std::to_string(s.payload) + " of " +
-                                       std::to_string(positions));
-    }
-  }
-  const std::uint64_t count = uploaded_entries(sources);
-  ResidentBlocks out;
-  out.masks = &upload_.masks;
-  out.coefficients = &upload_.coefficients;
-  out.coefficient_count = k;
-  const VkDeviceSize row_bytes = coefficient_bytes(k);
-  if (count * kMaskBytes > upload_.masks.size() ||
-      count * row_bytes > upload_.coefficients.size()) {
-    return fail("record_upload",
-                std::to_string(count) + " entries, more than were reserved");
-  }
-  if (count == 0) return out;
-  VKC_ASSIGN(void* staged_masks,
-             batch.reserve_upload(upload_.masks, 0, count * kMaskBytes));
-  VKC_ASSIGN(void* staged_coefficients,
-             batch.reserve_upload(upload_.coefficients, 0, count * row_bytes));
-  auto* masks = static_cast<std::uint32_t*>(staged_masks);
-  auto* rows = static_cast<std::uint8_t*>(staged_coefficients);
-  std::uint32_t at = 0;
-  for (ApplySource& s : sources) {
-    if (s.payload == kNoSource) continue;
-    const std::size_t p = s.payload;
-    std::memcpy(masks + std::size_t(at) * kMaskWordsPerBlock,
-                entries.masks.data() + p * kMaskWordsPerBlock, kMaskBytes);
-    std::uint8_t* row = rows + std::size_t(at) * row_bytes;
-    std::memcpy(row, entries.coefficients.data() + p * k,
-                k * sizeof(std::int16_t));
-    // An odd K's pad half-word, 0 as the device reader writes it.
-    std::memset(row + k * sizeof(std::int16_t), 0,
-                row_bytes - k * sizeof(std::int16_t));
-    s.payload = at++;
-  }
-  out.count = at;
-  return out;
 }
 
 core::Result<ResidentBlocks> ReferenceStore::record_apply(

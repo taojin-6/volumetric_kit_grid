@@ -44,8 +44,7 @@ namespace volumetric_kit::recon::codec::detail {
 /// in the store by one path.
 ///
 /// Each slot takes `64 + 4 * coefficient_words(K)` bytes a block, and the
-/// list, the sources and, on the host path, the upload `16`, `8` and
-/// `64 + 4 * coefficient_words(K)`. Every buffer is device-local and
+/// list and the sources `16` and `8`. Every buffer is device-local and
 /// retained, growing as @ref reserve asks (`ensure_device_scratch`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
@@ -77,38 +76,18 @@ class VR_CODEC_API ReferenceStore {
   ///         held.
   const std::vector<Vec3i>& coords() const noexcept { return coords_; }
 
-  /// @brief Make the spare hold a frame of @p n blocks of @p k coefficients,
-  ///        and the upload the entries @ref record_upload will take, before
-  ///        anything is recorded: what lets a decoder refuse before it
-  ///        touches the grid.
-  /// @param host_sources  A host-decoded frame's sources, as
-  ///                      @ref record_upload will take them; null when the
-  ///                      device decoded the payload, which nothing uploads.
+  /// @brief Make the spare hold a frame of @p n blocks of @p k
+  ///        coefficients before anything is recorded: what lets a decoder
+  ///        refuse before it touches the grid.
   /// @return OK; `Status::Code::InvalidArgument` for a buffer past
   ///         `maxStorageBufferRange`; or an allocation's failure. The held
   ///         reference is untouched either way.
-  core::Status reserve(std::uint32_t n, std::uint32_t k,
-                       const std::vector<ApplySource>* host_sources);
-
-  /// @brief Upload the entries of a host-decoded frame that @p sources name,
-  ///        in the order they name them, and renumber each source's payload
-  ///        to its place in the upload: skip and remove entries, which have
-  ///        no payload, never cross the bus.
-  /// @param batch    The batch to record into; submitted by the caller.
-  /// @param entries  @ref read_frame's payload by stream position.
-  /// @param sources  @ref merge_frame's; each payload a stream position of
-  ///                 @p entries, rewritten to an upload index.
-  /// @return The upload, for @ref record_apply (no list, which the store
-  ///         keeps); `Status::Code::InvalidArgument` for more entries than
-  ///         @ref reserve made room for, or a source past @p entries.
-  core::Result<ResidentBlocks> record_upload(core::CommandBatch& batch,
-                                             const DctBlocks& entries,
-                                             std::vector<ApplySource>& sources);
+  core::Status reserve(std::uint32_t n, std::uint32_t k);
 
   /// @brief Record the apply of a decoded frame into the spare.
   /// @param batch    The batch to record into; submitted by the caller.
-  /// @param payload  Where the frame's payload sits: the device frame
-  ///                 reader's entries, or @ref record_upload's.
+  /// @param payload  The frame's entries by stream position, where the
+  ///                 device frame reader decoded them.
   /// @param sources  Each block's, in frame order (@ref merge_frame); an
   ///                 intra frame's are `{kNoSource, i}`.
   /// @param coords   The blocks' coordinates, the same order: uploaded as
@@ -157,7 +136,6 @@ class VR_CODEC_API ReferenceStore {
   std::uint32_t current_ = 0;
   core::Buffer list_;     // the spare's blocks, volume::BlockIndex each
   core::Buffer sources_;  // the apply's, an ApplySource a block
-  Slot upload_;           // a host-decoded payload, compacted
 
   bool held_ = false;
   FrameReference reference_;

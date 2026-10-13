@@ -182,7 +182,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     // change. A P-frame's reader bound its M + A entries itself: a fresh
     // grid sized from N does not bound M.
     VKC_TRY(store_->reserve(static_cast<std::uint32_t>(frame.coords.size()),
-                            header.params.coefficient_count, nullptr));
+                            header.params.coefficient_count));
 
     // A merge of two sorted lists: what the grid holds that the frame lacks
     // is removed (VoxelBlockGrid::remove zeroes it, so a later reuse of its

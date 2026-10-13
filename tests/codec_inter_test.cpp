@@ -78,6 +78,38 @@ std::vector<vr::Vec3i> row_of(std::size_t n) {
   return out;
 }
 
+// Entries where the device frame reader leaves them: by stream position, two
+// coefficients a word, an odd K's pad half @p pad, which the apply drops.
+struct Uploaded {
+  vkc::Buffer masks;
+  vkc::Buffer coefficients;
+  std::uint32_t count = 0;
+  std::uint32_t k = 0;
+  d::ResidentBlocks resident() const {
+    d::ResidentBlocks r;
+    r.masks = &masks;
+    r.coefficients = &coefficients;
+    r.count = count;
+    r.coefficient_count = k;
+    return r;
+  }
+};
+
+vkc::Result<Uploaded> upload(Gpu& gpu, const d::DctBlocks& entries,
+                             std::uint16_t pad = 0) {
+  Uploaded out;
+  out.count = std::uint32_t(entries.masks.size() / codec::kMaskWordsPerBlock);
+  out.k = entries.params.coefficient_count;
+  VKC_ASSIGN(out.masks, vr_test::upload_device_buffer(
+                            gpu.device, gpu.allocator, entries.masks.data(),
+                            entries.masks.size() * sizeof(std::uint32_t)));
+  const std::vector<std::uint32_t> packed = pack(entries, pad);
+  VKC_ASSIGN(out.coefficients, vr_test::upload_device_buffer(
+                                   gpu.device, gpu.allocator, packed.data(),
+                                   packed.size() * sizeof(std::uint32_t)));
+  return out;
+}
+
 // The spare as the last apply left it, unpacked: each block's payload, and
 // whether every odd K's pad half was written 0.
 struct Applied {
@@ -145,13 +177,12 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const d::DctBlocks& r,
   for (std::size_t i = 0; i < m; ++i) {
     sources[i] = {d::kNoSource, static_cast<std::uint32_t>(i)};
   }
-  CHECK(store.reserve(std::uint32_t(m), k, &sources).ok());
+  CHECK(store.reserve(std::uint32_t(m), k).ok());
+  vkc::Result<Uploaded> up = upload(gpu, r);
+  CHECK(up.ok());
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  vkc::Result<d::ResidentBlocks> upload =
-      store.record_upload(batch, r, sources);
-  CHECK(upload.ok());
   vkc::Result<d::ResidentBlocks> spare =
-      store.record_apply(batch, upload.value(), sources, row_of(m));
+      store.record_apply(batch, up.value().resident(), sources, row_of(m));
   CHECK(spare.ok());
   CHECK(batch.submit().ok());
   vkc::Result<Applied> got = read_spare(gpu, spare.value());
@@ -167,10 +198,10 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const d::DctBlocks& r,
   return 0;
 }
 
-// Every source kind against a held reference, its payload uploaded from the
-// host or bound where the device left it, at K of 1, 21, 64 and 512, with
-// residuals from all of int16 so many wrap; at @p max_blocks_per_dispatch 4,
-// the nine blocks in three dispatches.
+// Every source kind against a held reference, its payload where the device
+// reader leaves it, pads not 0, at K of 1, 21, 64 and 512, with residuals
+// from all of int16 so many wrap; at @p max_blocks_per_dispatch 4, the nine
+// blocks in three dispatches.
 int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
       d::ReferenceStore::create(gpu.device, gpu.allocator,
@@ -201,62 +232,36 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
                                                  {8, 8},
                                                  {d::kNoSource, 10}};
     const std::vector<vr::Vec3i> coords = row_of(sources.size());
-    for (const bool device : {false, true}) {
-      std::vector<d::ApplySource> s = sources;
-      CHECK(store.reserve(std::uint32_t(s.size()), k, device ? nullptr : &s)
-                .ok());
-      vkc::CommandBatch batch(gpu.device, gpu.allocator);
-      // The device reader's layout, its pads not 0, which the apply drops.
-      vkc::Result<vkc::Buffer> masks = vr_test::upload_device_buffer(
-          gpu.device, gpu.allocator, payload.masks.data(),
-          payload.masks.size() * sizeof(std::uint32_t));
-      const std::vector<std::uint32_t> packed = pack(payload, 0xBEEF);
-      vkc::Result<vkc::Buffer> coefficients = vr_test::upload_device_buffer(
-          gpu.device, gpu.allocator, packed.data(),
-          packed.size() * sizeof(std::uint32_t));
-      CHECK(masks.ok() && coefficients.ok());
-      d::ResidentBlocks resident;
-      resident.masks = &masks.value();
-      resident.coefficients = &coefficients.value();
-      resident.count = std::uint32_t(m + 2);
-      resident.coefficient_count = k;
-      if (!device) {
-        vkc::Result<d::ResidentBlocks> up =
-            store.record_upload(batch, payload, s);
-        CHECK(up.ok());
-        resident = up.value();
-        // Only the seven entries with a payload went up.
-        CHECK(resident.count == 7);
+    CHECK(store.reserve(std::uint32_t(sources.size()), k).ok());
+    vkc::Result<Uploaded> up = upload(gpu, payload, 0xBEEF);
+    CHECK(up.ok());
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vkc::Result<d::ResidentBlocks> spare =
+        store.record_apply(batch, up.value().resident(), sources, coords);
+    CHECK(spare.ok());
+    CHECK(batch.submit().ok());
+    vkc::Result<Applied> got = read_spare(gpu, spare.value());
+    CHECK(got.ok());
+    CHECK(got.value().pads_zero);
+    CHECK(got.value().coords == coords);
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+      const d::ApplySource& src = sources[i];
+      const Payload ref = src.reference != d::kNoSource
+                              ? payload_at(r, src.reference)
+                              : Payload{};
+      const Payload pay = src.payload != d::kNoSource
+                              ? payload_at(payload, src.payload)
+                              : Payload{};
+      const Payload want =
+          expected(src.reference != d::kNoSource ? &ref : nullptr,
+                   src.payload != d::kNoSource ? &pay : nullptr);
+      if (!(got.value().blocks[i] == want)) {
+        std::fprintf(stderr, "K %u, block %zu\n", k, i);
+        return 1;
       }
-      vkc::Result<d::ResidentBlocks> spare =
-          store.record_apply(batch, resident, s, coords);
-      CHECK(spare.ok());
-      CHECK(batch.submit().ok());
-      vkc::Result<Applied> got = read_spare(gpu, spare.value());
-      CHECK(got.ok());
-      CHECK(got.value().pads_zero);
-      CHECK(got.value().coords == coords);
-      for (std::size_t i = 0; i < sources.size(); ++i) {
-        const d::ApplySource& src = sources[i];
-        const Payload ref = src.reference != d::kNoSource
-                                ? payload_at(r, src.reference)
-                                : Payload{};
-        const Payload pay = src.payload != d::kNoSource
-                                ? payload_at(payload, src.payload)
-                                : Payload{};
-        const Payload want =
-            expected(src.reference != d::kNoSource ? &ref : nullptr,
-                     src.payload != d::kNoSource ? &pay : nullptr);
-        if (!(got.value().blocks[i] == want)) {
-          std::fprintf(stderr, "K %u, block %zu (%s payload)\n", k, i,
-                       device ? "device" : "host");
-          return 1;
-        }
-      }
-      // Applied and submitted, but not committed: the reference is as it
-      // was.
-      CHECK(store.held()->hash == hash && store.coords() == row_of(m));
     }
+    // Applied and submitted, but not committed: the reference is as it was.
+    CHECK(store.held()->hash == hash && store.coords() == row_of(m));
     ++hash;
   }
   return 0;
@@ -287,13 +292,12 @@ int grow_case(Gpu& gpu) {
     for (std::size_t q = 0; q < n - m; ++q) {
       sources.push_back({d::kNoSource, std::uint32_t(q)});
     }
-    CHECK(store.reserve(std::uint32_t(n), k, &sources).ok());
-    vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    vkc::Result<d::ResidentBlocks> up =
-        store.record_upload(batch, fresh, sources);
+    CHECK(store.reserve(std::uint32_t(n), k).ok());
+    vkc::Result<Uploaded> up = upload(gpu, fresh);
     CHECK(up.ok());
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
     vkc::Result<d::ResidentBlocks> spare =
-        store.record_apply(batch, up.value(), sources, row_of(n));
+        store.record_apply(batch, up.value().resident(), sources, row_of(n));
     CHECK(spare.ok());
     CHECK(batch.submit().ok());
     vkc::Result<Applied> got = read_spare(gpu, spare.value());
@@ -309,7 +313,9 @@ int grow_case(Gpu& gpu) {
     // Refused, and recorded but never committed: nothing changes.
     const d::FrameReference before = *store.held();
     vkc::CommandBatch refused(gpu.device, gpu.allocator);
-    CHECK(store.record_apply(refused, up.value(), sources, row_of(n - 1))
+    CHECK(store
+              .record_apply(refused, up.value().resident(), sources,
+                            row_of(n - 1))
               .status()
               .domain() == C::InvalidArgument);
     CHECK(store.held()->hash == before.hash && store.coords() == row_of(m));
@@ -332,33 +338,33 @@ int apply_refusals_case(Gpu& gpu) {
   d::ReferenceStore& store = *made.value();
   Lcg rng{29};
   CHECK(commit_intra(gpu, store, random_entries(4, 8, rng), 7) == 0);
-  const d::DctBlocks payload = random_entries(4, 8, rng);
+  vkc::Result<Uploaded> up = upload(gpu, random_entries(4, 8, rng));
+  CHECK(up.ok());
   const std::uint32_t none = d::kNoSource;
-  // Room for the whole payload uploaded.
-  const std::vector<d::ApplySource> every = {
-      {none, 0}, {none, 1}, {none, 2}, {none, 3}};
-  CHECK(store.reserve(4, 8, &every).ok());
-  // The payload uploaded as given, then applied at @p k over @p blocks.
-  auto refuses = [&](std::vector<d::ApplySource> sources, std::uint32_t k,
-                     std::size_t blocks, const char* says) {
+  CHECK(store.reserve(4, 8).ok());
+  // The payload applied as given at @p k over @p blocks.
+  auto refuses = [&](const std::vector<d::ApplySource>& sources,
+                     std::uint32_t k, std::size_t blocks, const char* says) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    d::ResidentBlocks payload = up.value().resident();
+    payload.coefficient_count = k;
     vkc::Result<d::ResidentBlocks> r =
-        store.record_upload(batch, payload, sources);
-    if (r.ok()) {
-      d::ResidentBlocks up = r.value();
-      up.coefficient_count = k;
-      r = store.record_apply(batch, up, sources, row_of(blocks));
-    }
+        store.record_apply(batch, payload, sources, row_of(blocks));
     return !r.ok() && r.status().domain() == C::InvalidArgument &&
            r.status().message().find(says) != std::string::npos;
   };
   CHECK(refuses({{0, none}, {4, none}}, 8, 2, "reads reference entry 4"));
   CHECK(refuses({{0, 0}}, 9, 1, "at K 9"));
-  CHECK(refuses({{none, 4}}, 8, 1, "names entry 4 of 4"));
+  CHECK(refuses({{none, 4}}, 8, 1, "reads payload entry 4 of 4"));
   CHECK(refuses(std::vector<d::ApplySource>(100, {0, none}), 8, 100,
                 "more than were reserved"));
   CHECK(refuses({{0, none}}, 8, 2, "1 sources for 2 blocks"));
-  CHECK(store.reserve(1u << 31, 8, nullptr).domain() == C::InvalidArgument);
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  CHECK(store.record_apply(batch, d::ResidentBlocks{}, {{none, 0}}, row_of(1))
+            .status()
+            .message()
+            .find("no payload buffers") != std::string::npos);
+  CHECK(store.reserve(1u << 31, 8).domain() == C::InvalidArgument);
   CHECK(store.held()->hash == 7 && store.coords() == row_of(4));
   return 0;
 }
