@@ -35,7 +35,7 @@ inline volumetric_kit::recon::codec::EncoderConfig encoder_config(
   return result;
 }
 
-// TODO(examples): CodecOutputs from core 0.5.0's output.csv and
+// TODO(examples): CodecOutputs from core #30's output.csv and
 // output.frame_directory, for codec_replica's and codec_mesh's
 // CodecStream::create; until then they write no rows or frames.
 
