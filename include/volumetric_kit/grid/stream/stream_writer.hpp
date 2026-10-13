@@ -31,9 +31,12 @@ namespace volumetric_kit::recon::stream {
 /// A power loss can lose what came after the last @ref sync.
 ///
 /// **A failed write sticks.** After a write or flush fails, every call
-/// returns that same `Status::Code::IoError` and writes nothing more; the
-/// file reads as a killed writer's. After @ref finish, every call is
-/// refused.
+/// returns the saved failure and writes nothing more; the file reads as a
+/// killed writer's. After @ref finish, every call is refused.
+/// Host allocation failures, including building or copying a diagnostic,
+/// return `Status::Code::OutOfMemory`. Validation or preparation allocation
+/// failures leave the writer unchanged; a failed write or flush remains
+/// sticky even when its diagnostic cannot be allocated.
 ///
 /// @code
 /// stream::Session session;
@@ -88,21 +91,23 @@ class VR_STREAM_API StreamWriter {
   ///         `Status::Code::InvalidArgument` for a record breaking the rules
   ///         above, a null @p data with a nonzero @p size, or a finished
   ///         writer, and `Status::Code::OutOfMemory` when a key's room in the
-  ///         footer index cannot be allocated; or the sticky
-  ///         `Status::Code::IoError`.
+  ///         footer index cannot be allocated; or the saved I/O failure.
+  ///         Diagnostic allocation failures are also
+  ///         `Status::Code::OutOfMemory`.
   core::Status append(const RecordInfo& info, const std::uint8_t* data,
                       std::size_t size);
 
   /// @brief Flush what is written to storage: `fsync`, or on Apple
   ///        `F_FULLFSYNC`, as `fsync` there stops at the drive's cache.
-  /// @return OK; `Status::Code::InvalidArgument` once finished; or the
-  ///         sticky `Status::Code::IoError`.
+  /// @return OK; `Status::Code::InvalidArgument` once finished; the saved I/O
+  ///         failure; or `Status::Code::OutOfMemory` for diagnostic allocation.
   core::Status sync();
 
   /// @brief Write the footer (`INDX` and `TAIL`), flush and close the file.
   /// @return OK; `Status::Code::InvalidArgument` once finished;
   ///         `Status::Code::OutOfMemory` when the index cannot be built (the
-  ///         writer unchanged); or the sticky `Status::Code::IoError`.
+  ///         writer unchanged) or a diagnostic cannot be allocated; or the
+  ///         saved I/O failure.
   core::Status finish();
 
   /// @return The file's bytes written so far.

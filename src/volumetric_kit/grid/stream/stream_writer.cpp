@@ -71,91 +71,99 @@ core::Status StreamWriter::check_open(std::string_view api) const {
 core::Status StreamWriter::append(const RecordInfo& info,
                                   const std::uint8_t* data, std::size_t size) {
   constexpr std::string_view kApi = "StreamWriter::append";
-  VKC_TRY(check_open(kApi));
-  const auto refuse = [&](const std::string& why) {
-    return core::Status::invalid_argument(std::string(kApi) + ": " + path_ +
-                                          ": " + why);
-  };
-  if (info.track >= state_.size()) {
-    return refuse("track " + std::to_string(info.track) +
-                  ", but the session has " + std::to_string(state_.size()));
-  }
-  if (data == nullptr && size != 0) {
-    return refuse("a null payload of " + std::to_string(size) + " bytes");
-  }
-  TrackState& state = state_[info.track];
-  if (state.any && info.seq <= state.last_seq) {
-    return refuse("track " + std::to_string(info.track) + "'s seq " +
-                  std::to_string(info.seq) + " does not follow its last, " +
-                  std::to_string(state.last_seq));
-  }
-  if (info.key && state.any_key && info.pts_ns < state.last_key_pts_ns) {
-    return refuse("track " + std::to_string(info.track) + "'s key pts " +
-                  std::to_string(info.pts_ns) + " is before its last key's, " +
-                  std::to_string(state.last_key_pts_ns));
-  }
-  // The index entry's room comes first, so a record once written is always
-  // indexed.
-  if (info.key &&
-      index_keys_.capacity() - index_keys_.size() < detail::kKeyEntryBytes) {
-    try {
+  try {
+    VKC_TRY(check_open(kApi));
+    const auto refuse = [&](const std::string& why) {
+      return core::Status::invalid_argument(std::string(kApi) + ": " + path_ +
+                                            ": " + why);
+    };
+    if (info.track >= state_.size()) {
+      return refuse("track " + std::to_string(info.track) +
+                    ", but the session has " + std::to_string(state_.size()));
+    }
+    if (data == nullptr && size != 0) {
+      return refuse("a null payload of " + std::to_string(size) + " bytes");
+    }
+    TrackState& state = state_[info.track];
+    if (state.any && info.seq <= state.last_seq) {
+      return refuse("track " + std::to_string(info.track) + "'s seq " +
+                    std::to_string(info.seq) + " does not follow its last, " +
+                    std::to_string(state.last_seq));
+    }
+    if (info.key && state.any_key && info.pts_ns < state.last_key_pts_ns) {
+      return refuse("track " + std::to_string(info.track) + "'s key pts " +
+                    std::to_string(info.pts_ns) +
+                    " is before its last key's, " +
+                    std::to_string(state.last_key_pts_ns));
+    }
+    // The index entry's room comes first, so a record once written is always
+    // indexed.
+    if (info.key &&
+        index_keys_.capacity() - index_keys_.size() < detail::kKeyEntryBytes) {
       index_keys_.reserve(std::max<std::size_t>(2 * index_keys_.capacity(),
                                                 64 * detail::kKeyEntryBytes));
-    } catch (...) {
-      return core::exception_status(kApi, core::Status::Code::IoError);
     }
+    std::uint8_t header[detail::kRecordHeaderBytes];
+    detail::encode_record_header(info, size, detail::crc32(data, size), header);
+    const auto pad = static_cast<std::size_t>(detail::padding(size));
+    const detail::Bytes parts[3] = {
+        {header, sizeof(header)}, {data, size}, {kZeros, pad}};
+    core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 3);
+    if (!written.ok()) {
+      failure_ = std::move(written);
+      return failure_;
+    }
+    const std::uint64_t offset = size_;
+    size_ += sizeof(header) + std::uint64_t{size} + pad;
+    state.any = true;
+    state.last_seq = info.seq;
+    if (info.key) {
+      state.any_key = true;
+      state.last_key_pts_ns = info.pts_ns;
+      detail::append_key_entry(index_keys_, offset, info);
+    }
+    detail::count_record(stats_[info.track], info, size);
+    return {};
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
   }
-  std::uint8_t header[detail::kRecordHeaderBytes];
-  detail::encode_record_header(info, size, detail::crc32(data, size), header);
-  const auto pad = static_cast<std::size_t>(detail::padding(size));
-  const detail::Bytes parts[3] = {
-      {header, sizeof(header)}, {data, size}, {kZeros, pad}};
-  core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 3);
-  if (!written.ok()) {
-    failure_ = written;
-    return written;
-  }
-  const std::uint64_t offset = size_;
-  size_ += sizeof(header) + std::uint64_t{size} + pad;
-  state.any = true;
-  state.last_seq = info.seq;
-  if (info.key) {
-    state.any_key = true;
-    state.last_key_pts_ns = info.pts_ns;
-    detail::append_key_entry(index_keys_, offset, info);
-  }
-  detail::count_record(stats_[info.track], info, size);
-  return {};
 }
 
 core::Status StreamWriter::sync() {
   constexpr std::string_view kApi = "StreamWriter::sync";
-  VKC_TRY(check_open(kApi));
-  core::Status flushed = detail::flush_file(kApi, path_, fd_.get());
-  if (!flushed.ok()) failure_ = flushed;
-  return flushed;
+  try {
+    VKC_TRY(check_open(kApi));
+    core::Status flushed = detail::flush_file(kApi, path_, fd_.get());
+    if (!flushed.ok()) {
+      failure_ = std::move(flushed);
+      return failure_;
+    }
+    return {};
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
+  }
 }
 
 core::Status StreamWriter::finish() {
   constexpr std::string_view kApi = "StreamWriter::finish";
-  VKC_TRY(check_open(kApi));
-  std::vector<std::uint8_t> footer;
   try {
-    footer = detail::encode_footer(stats_, index_keys_, size_);
+    VKC_TRY(check_open(kApi));
+    const std::vector<std::uint8_t> footer =
+        detail::encode_footer(stats_, index_keys_, size_);
+    const detail::Bytes part{footer.data(), footer.size()};
+    core::Status done = detail::write_all(kApi, path_, fd_.get(), &part, 1);
+    if (done.ok()) done = detail::flush_file(kApi, path_, fd_.get());
+    if (done.ok()) done = detail::close_file(kApi, path_, fd_);
+    if (!done.ok()) {
+      failure_ = std::move(done);
+      return failure_;
+    }
+    size_ += footer.size();
+    finished_ = true;
+    return {};
   } catch (...) {
     return core::exception_status(kApi, core::Status::Code::IoError);
   }
-  const detail::Bytes part{footer.data(), footer.size()};
-  core::Status done = detail::write_all(kApi, path_, fd_.get(), &part, 1);
-  if (done.ok()) done = detail::flush_file(kApi, path_, fd_.get());
-  if (done.ok()) done = detail::close_file(kApi, path_, fd_);
-  if (!done.ok()) {
-    failure_ = done;
-    return done;
-  }
-  size_ += footer.size();
-  finished_ = true;
-  return {};
 }
 
 std::uint64_t StreamWriter::size() const noexcept { return size_; }
