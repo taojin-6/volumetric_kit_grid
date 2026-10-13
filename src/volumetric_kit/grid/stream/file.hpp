@@ -21,8 +21,10 @@ namespace volumetric_kit::recon::stream::detail {
 // "<api>: <what> <path>: <the system's reason>", in the domain `error` says:
 // NotFound for a missing file or directory, InvalidArgument for something
 // already there or a directory, OutOfMemory, and IoError for the rest.
+// Diagnostic allocation failures must still return a Status so a writer can
+// latch the failed I/O, including after a partial write.
 core::Status system_failure(std::string_view api, std::string_view what,
-                            const std::string& path, int error);
+                            const std::string& path, int error) noexcept;
 
 // A new file at `path`, opened for writing, created only if nothing is there
 // (O_EXCL: not even a symbolic link), with 0666 less the umask.
