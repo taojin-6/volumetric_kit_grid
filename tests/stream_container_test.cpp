@@ -36,6 +36,7 @@ using vrst::Bytes;
 using vrst::info;
 using vrst::open;
 using vrst::pattern;
+using vrst::same;
 
 Bytes unhex(const char* hex) {
   Bytes b;
@@ -80,11 +81,6 @@ bool append(stream::StreamWriter& w, const stream::RecordInfo& i,
   return w.append(i, payload.data(), payload.size()).ok();
 }
 
-bool same(const stream::RecordInfo& a, const stream::RecordInfo& b) {
-  return a.track == b.track && a.key == b.key && a.pts_ns == b.pts_ns &&
-         a.seq == b.seq && a.set == b.set;
-}
-
 bool same(const stream::Track& a, const stream::Track& b) {
   return a.kind == b.kind && a.clock == b.clock && a.rate.num == b.rate.num &&
          a.rate.den == b.rate.den && a.width == b.width &&
@@ -100,12 +96,6 @@ bool same(const stream::Session& a, const stream::Session& b) {
     if (!same(a.tracks[i], b.tracks[i])) return false;
   }
   return true;
-}
-
-bool same(const stream::TrackStats& a, const stream::TrackStats& b) {
-  return a.records == b.records && a.keys == b.keys &&
-         a.payload_bytes == b.payload_bytes && a.min_pts_ns == b.min_pts_ns &&
-         a.max_pts_ns == b.max_pts_ns;
 }
 
 std::uint64_t file_size(const std::string& path) {
