@@ -29,7 +29,8 @@ target_sources(
           device_frame_reader.cpp
           device_frame_writer.cpp
           encoder.cpp
-          frame_hash.cpp)
+          frame_hash.cpp
+          reference_store.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.
@@ -65,9 +66,9 @@ target_include_directories(
          "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>"
          "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 
-# Compile the three DCT kernels to SPIR-V and embed them (dct_transform.cpp
-# #includes the generated *.spv.hpp on a PRIVATE path), so recon_codec ships the
-# transform with no runtime shader files.
+# Compile the kernels -- the DCT's, the P-frame apply and the rANS coders' -- to
+# SPIR-V and embed them (their sources #include the generated *.spv.hpp on a
+# PRIVATE path), so recon_codec ships with no runtime shader files.
 include(vr_embed)
 vr_embed_shaders(
   recon_codec
@@ -75,6 +76,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_forward.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_apply.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_count.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_decode.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_ops.comp"
