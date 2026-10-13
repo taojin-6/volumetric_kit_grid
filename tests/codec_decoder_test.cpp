@@ -559,6 +559,7 @@ int frame_info_case(Gpu& gpu) {
   vkc::Result<codec::FrameInfo> info =
       codec::read_frame_info(frame.value().data(), frame.value().size());
   CHECK(info.ok());
+  CHECK(info.value().type == codec::FrameType::kIntra);
   CHECK(info.value().voxel_size == kVoxel);
   CHECK(info.value().trunc_dist == kTrunc);
   CHECK(info.value().params.coefficient_count == 20);
@@ -582,10 +583,10 @@ int frame_info_case(Gpu& gpu) {
   vkc::Result<codec::FrameInfo> v2 = codec::read_frame_info(bad.data(), 44);
   CHECK(!v2.ok() && v2.status().domain() == vkc::Status::Code::Unsupported);
   bad = frame.value();
-  bad[6] = 1;  // a P-frame, which no public reader decodes yet
-  vkc::Result<codec::FrameInfo> p =
+  bad[6] = 2;  // a frame type no reader decodes
+  vkc::Result<codec::FrameInfo> t2 =
       codec::read_frame_info(bad.data(), bad.size());
-  CHECK(!p.ok() && p.status().domain() == vkc::Status::Code::Unsupported);
+  CHECK(!t2.ok() && t2.status().domain() == vkc::Status::Code::Unsupported);
   return 0;
 }
 
@@ -623,8 +624,8 @@ int refusals_case(Gpu& gpu, codec::Decoder& dec) {
   CHECK(!sc.ok() && sc.domain() == vkc::Status::Code::InvalidArgument);
   none = gc.value().map().compact_active_blocks();
   CHECK(none.ok() && none.value().empty());
-  // A P-frame, which the decoder does not decode yet, refused with the grid
-  // as the frame before left it.
+  // A frame type no decoder decodes, refused with the grid as the frame
+  // before left it.
   vkc::Result<vol::VoxelBlockGrid> held = grid_for(gpu, frame.value());
   CHECK(held.ok());
   CHECK(dec.decode(frame.value().data(), frame.value().size(), held.value())
@@ -632,7 +633,7 @@ int refusals_case(Gpu& gpu, codec::Decoder& dec) {
   vkc::Result<Snapshot> before = snapshot(gpu, held.value());
   CHECK(before.ok());
   Bytes inter = frame.value();
-  inter[6] = 1;
+  inter[6] = 2;
   const vkc::Status sp = dec.decode(inter.data(), inter.size(), held.value());
   CHECK(!sp.ok() && sp.domain() == vkc::Status::Code::Unsupported);
   vkc::Result<Snapshot> after = snapshot(gpu, held.value());

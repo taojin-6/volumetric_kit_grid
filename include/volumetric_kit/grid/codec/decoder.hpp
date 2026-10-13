@@ -4,8 +4,9 @@
 #pragma once
 
 /// @file codec/decoder.hpp
-/// @brief Decode an intra frame into a @ref volume::VoxelBlockGrid, and read
-///        a frame's header without decoding it.
+/// @brief Decode a frame -- intra, or a P-frame against the frame decoded
+///        before it -- into a @ref volume::VoxelBlockGrid, and read a frame's
+///        header without decoding it.
 
 #include <cstddef>
 #include <cstdint>
@@ -24,18 +25,23 @@ namespace volumetric_kit::recon::codec {
 namespace detail {
 class DctTransform;
 class DeviceFrameReader;
+class ReferenceStore;
 struct ParsedFrame;
 struct ResidentBlocks;
 }  // namespace detail
 
 /// @brief What a frame's header says: enough to build a grid it decodes into.
 struct FrameInfo {
+  /// Intra, or a P-frame, which decodes only after the frame it was coded
+  /// against (@ref Decoder).
+  FrameType type = FrameType::kIntra;
   /// Metres per voxel edge. A grid decoding the frame must match it exactly.
   float voxel_size = 0.0f;
   /// Metres. A grid decoding the frame must match it exactly: the
   /// coefficients are fractions of it.
   float trunc_dist = 0.0f;
-  /// Blocks the frame holds; a grid decoding it needs at least this many
+  /// Blocks the decoded frame holds (a P-frame's reference blocks that
+  /// survive, and its new ones); a grid decoding it needs at least this many
   /// (`num_blocks`), plus the hash-table room to place them.
   std::uint32_t block_count = 0;
   /// The coefficient count, scale, and kept bases' weights it was coded with;
@@ -52,10 +58,12 @@ struct FrameInfo {
 /// @param data  The frame (at least its complete header: 44 bytes plus four
 ///              per kept coefficient).
 /// @param size  Bytes available at @p data.
-/// @return The header, or `Status::Code::Unsupported` for another version,
-///         frame type or block size, and `Status::Code::InvalidArgument`
-///         for anything else malformed. It does not check the rest of the
-///         frame, which @ref Decoder::decode does.
+/// @return The header, a P-frame's included, or
+///         `Status::Code::Unsupported` for another version, a frame type
+///         past @ref FrameType::kInter or another block size, and
+///         `Status::Code::InvalidArgument` for anything else malformed. It
+///         does not check the rest of the frame, which @ref Decoder::decode
+///         does.
 VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
                                                      std::size_t size);
 
@@ -66,8 +74,8 @@ struct DecoderConfig {
   EntropyCoding entropy = EntropyCoding::kAuto;
 };
 
-/// @brief Decodes intra frames into a caller's @ref volume::VoxelBlockGrid --
-///        the codec's playback side (the 2026-09-26 decision).
+/// @brief Decodes frames into a caller's @ref volume::VoxelBlockGrid -- the
+///        codec's playback side (the 2026-09-26 decision).
 ///
 /// After a successful @ref decode the grid holds **exactly** the frame's
 /// blocks, whatever it held before: blocks the frame lacks are removed (and
@@ -84,6 +92,16 @@ struct DecoderConfig {
 /// attribute is refused: a block kept across frames would carry that
 /// attribute's previous values (a `color`, say) under the new geometry, and
 /// nothing could tell which blocks those were.
+///
+/// A P-frame (@ref FrameType::kInter, experimental) decodes against the last
+/// frame this decoder decoded, its reference, which the decoder keeps on the
+/// device as it decoded it -- quantized coefficients and masks, never
+/// rebuilt from a grid -- so it decodes into any grid of its geometry, a
+/// fresh one included, to exactly the blocks an intra frame of the same
+/// content decodes to. Every decode that succeeds, intra or P, makes its
+/// frame the reference; one refused or failed keeps the reference it had.
+/// The reference and the frame being decoded take `64 + 4 * ceil(K / 2)`
+/// bytes of device memory a block each.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time, and
@@ -108,18 +126,22 @@ class VR_CODEC_API Decoder {
   Decoder(const Decoder&) = delete;
   Decoder& operator=(const Decoder&) = delete;
 
-  /// @brief Decode one intra frame into @p grid.
+  /// @brief Decode one frame into @p grid: an intra frame, or a P-frame
+  ///        against the reference this decoder holds.
   ///
   /// Everything that can be checked before the grid is touched is: the grid's
   /// attributes, its geometry against the frame's header, the whole frame
-  /// parsed and entropy-decoded, and the grid's heap against its block count.
-  /// A refusal there leaves @p grid exactly as it was. A failure **after** the
-  /// grid starts to change -- the hash table cannot place every block, its
-  /// bucket locks keep losing races, or a dispatch fails -- leaves it valid but
-  /// holding **neither** frame: blocks the two frames share still hold the
-  /// previous frame's voxels, and blocks new to this one are empty, so it is
-  /// not worth meshing. The next successful decode restores it exactly, since
-  /// each decode starts from whatever the grid holds.
+  /// parsed and entropy-decoded, a P-frame against the held reference, and
+  /// the grid's heap against its block count. A refusal there leaves @p grid
+  /// exactly as it was. A failure **after** the grid starts to change -- the
+  /// hash table cannot place every block, its bucket locks keep losing races,
+  /// or a dispatch fails -- leaves it valid but holding **neither** frame:
+  /// blocks the two frames share still hold the previous frame's voxels, and
+  /// blocks new to this one are empty, so it is not worth meshing. The next
+  /// successful decode restores it exactly, since each decode starts from
+  /// whatever the grid holds. Neither a refusal nor a failure changes the
+  /// held reference, so the same frame decoded again decodes against the
+  /// same one.
   /// @param data     The frame.
   /// @param size     Its exact length.
   /// @param grid     The grid to decode into: 4-byte float `tsdf` and
@@ -127,18 +149,26 @@ class VR_CODEC_API Decoder {
   ///                 frame's `voxel_size` and `trunc_dist` exactly (see
   ///                 @ref read_frame_info).
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
-  ///                 row with both halves -- its device half is the inverse
-  ///                 transform and, decoded on the device, the rANS
-  ///                 kernels -- over the breakdown rows `"  ..rans decode"`
-  ///                 (parsing and decoding the frame), `"  ..active set"`
-  ///                 (the compaction), `"  ..apply"` (merging the two block
-  ///                 sets, and removing and allocating blocks) and
-  ///                 `"  ..inverse"` (the transform). Named apart from the @ref
-  ///                 Encoder's, so both timed into one `StageMetrics` stay
-  ///                 apart. `nullptr` measures nothing.
+  ///                 row with both halves -- its device half is the apply,
+  ///                 the inverse transform and, decoded on the device, the
+  ///                 rANS kernels -- over the breakdown rows
+  ///                 `"  ..rans decode"` (parsing and decoding the frame),
+  ///                 `"  ..active set"` (the compaction), `"  ..apply"`
+  ///                 (merging a P-frame's blocks with its reference's, then
+  ///                 the grid's block set with the frame's, and removing and
+  ///                 allocating blocks) and `"  ..inverse"` (making the
+  ///                 frame's blocks from the reference and the payload, and
+  ///                 the transform, in one submit). Named apart from the
+  ///                 @ref Encoder's, so both timed into one `StageMetrics`
+  ///                 stay apart. `nullptr` measures nothing.
   /// @return OK, or: whatever the frame reader refuses
-  ///         (`Status::Code::Unsupported`, @ref
-  ///         Status::Code::InvalidArgument for a malformed or corrupt frame);
+  ///         (`Status::Code::Unsupported`,
+  ///         `Status::Code::InvalidArgument` for a malformed or corrupt
+  ///         frame, a P-frame whose coding parameters are not its
+  ///         reference's included); `Status::Code::NotFound` for a P-frame
+  ///         whose reference this decoder does not hold (none, or another
+  ///         frame): the stream's P-frames decode again from its next
+  ///         I-frame;
   ///         with @ref EntropyCoding::kDevice, a frame the device cannot
   ///         decode (see @ref EntropyCoding);
   ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
@@ -177,6 +207,8 @@ class VR_CODEC_API Decoder {
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
+  // The reference a P-frame decodes against, and the apply into it.
+  std::unique_ptr<detail::ReferenceStore> store_;
   // Built at create for kDevice, at the first device frame for kAuto, and
   // never for kHost; and why that build failed, after which kAuto decodes
   // every frame on the host.

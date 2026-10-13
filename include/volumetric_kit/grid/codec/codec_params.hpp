@@ -111,11 +111,22 @@ inline constexpr std::uint32_t kMinDeviceEncodeSegments = 48;
 /// more than encoding: its symbol walk is inside the serial chain.
 inline constexpr std::uint32_t kMinDeviceDecodeSegments = 80;
 
-/// The longest segment, in blocks, the device decodes. One invocation decodes
-/// a whole segment, at 30 to 45 us a block on Apple M5 Max and RTX 5090, and
-/// the frame sets its length; this keeps one invocation near 50 ms there,
-/// well inside a GPU watchdog's limit on a slower device.
+/// The longest segment, in entries, the device decodes: blocks, or a
+/// P-frame's reference entries. One invocation decodes a whole segment, at 30
+/// to 45 us a block on Apple M5 Max and RTX 5090, and the frame sets its
+/// length; this keeps one invocation near 50 ms there, well inside a GPU
+/// watchdog's limit on a slower device.
 inline constexpr std::uint32_t kMaxDeviceDecodeSegmentSize = 1024;
+
+/// @brief What a frame is: byte 6 of its header (@ref FrameInfo::type).
+enum class FrameType : std::uint8_t {
+  /// Self-contained: decodes with no other frame.
+  kIntra = 0,
+  /// A P-frame: decodes against the frame its @ref Decoder decoded before
+  /// it, its reference. Experimental: its bytes may change until golden
+  /// P-frames freeze them.
+  kInter = 1,
+};
 
 /// @brief How a frame's blocks are transformed and quantized.
 ///

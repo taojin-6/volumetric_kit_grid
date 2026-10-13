@@ -58,8 +58,8 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
 core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
     core::CommandBatch& batch, const ParsedFrame& frame,
     core::GpuStageScope* stage) {
-  VKC_TRY(check_frame_type(frame.header.type, FrameType::kInter,
-                           "DeviceFrameReader::record_decode"));
+  VKC_TRY(
+      check_frame_type(frame.header.type, "DeviceFrameReader::record_decode"));
   const FrameType type = frame.header.type;
   const bool inter = type == FrameType::kInter;
   const std::uint32_t n = frame.header.block_count;

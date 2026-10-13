@@ -329,7 +329,7 @@ const SectionBody& section(const std::array<SectionBody, kSectionCount>& found,
 
 // The checks write_frame makes before coding anything.
 core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
-  VKC_TRY(check_frame_type(frame.type, FrameType::kInter, "write_frame"));
+  VKC_TRY(check_frame_type(frame.type, "write_frame"));
   const bool inter = frame.type == FrameType::kInter;
   const DctBlocks& b = frame.blocks;
   VKC_TRY(check_coding(frame.voxel_size, b.trunc_dist, b.params));
@@ -403,14 +403,13 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
 
 }  // namespace
 
-core::Status check_frame_type(FrameType type, FrameType newest,
-                              const char* who) {
-  if (static_cast<uint>(type) <= static_cast<uint>(newest)) return {};
-  return core::Status::unsupported(
-      std::string(who) + ": frame type " +
-      std::to_string(static_cast<uint>(type)) +
-      (newest == FrameType::kIntra ? " (only intra is coded)"
-                                   : " (only intra and P-frames are coded)"));
+core::Status check_frame_type(FrameType type, const char* who) {
+  if (static_cast<uint>(type) <= static_cast<uint>(FrameType::kInter)) {
+    return {};
+  }
+  return core::Status::unsupported(std::string(who) + ": frame type " +
+                                   std::to_string(static_cast<uint>(type)) +
+                                   " (only intra and P-frames are coded)");
 }
 
 core::Status check_coding(float voxel_size, float trunc_dist,
@@ -539,7 +538,7 @@ std::vector<FrequencyTable> frame_tables(
 
 core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame) {
-  VKC_TRY(check_frame_type(type, FrameType::kInter, "assemble_frame"));
+  VKC_TRY(check_frame_type(type, "assemble_frame"));
   const bool inter = type == FrameType::kInter;
   // The header's fields as check_frame checks them, for the device
   // writer, which codes without a Frame.
@@ -710,7 +709,7 @@ core::Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   }
 
   header.type = static_cast<FrameType>(type);
-  VKC_TRY(check_frame_type(header.type, FrameType::kInter, "codec frame"));
+  VKC_TRY(check_frame_type(header.type, "codec frame"));
   if (reserved != 0) {
     return bad("the reserved header byte is not zero");
   }
@@ -943,8 +942,7 @@ core::Result<Frame> read_frame(const std::uint8_t* data, std::size_t size,
 }
 
 core::Result<Frame> decode_frame(ParsedFrame parsed) {
-  VKC_TRY(
-      check_frame_type(parsed.header.type, FrameType::kInter, "decode_frame"));
+  VKC_TRY(check_frame_type(parsed.header.type, "decode_frame"));
   for (FrequencyTable& t : parsed.tables) t.build_decode();
   const FrameHeader& header = parsed.header;
   const bool inter = header.type == FrameType::kInter;
@@ -1027,6 +1025,9 @@ core::Result<MergedFrame> merge_frame(const std::vector<Vec3i>& reference,
   }
   const auto m = static_cast<std::uint32_t>(reference.size());
   MergedFrame out;
+  // At most every reference block and every new one.
+  out.coords.reserve(reference.size() + added.size());
+  out.sources.reserve(reference.size() + added.size());
   auto emit = [&out](const Vec3i& c, std::uint32_t from_reference,
                      std::uint32_t payload) {
     out.coords.push_back(c);

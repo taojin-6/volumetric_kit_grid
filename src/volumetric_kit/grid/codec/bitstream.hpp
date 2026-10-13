@@ -165,20 +165,14 @@ VR_CODEC_API glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
                                             std::uint32_t u, std::uint32_t a,
                                             std::uint32_t r);
 
-/// What a frame is: byte 6 of its header. @ref write_frame and the readers
-/// refuse a type they do not code (@ref check_frame_type).
-enum class FrameType : std::uint8_t {
-  kIntra = 0,  ///< Self-contained: decodes with no reference frame.
-  kInter = 1,  ///< A P-frame: decodes against its reference frame.
-};
+/// What a frame is (codec_params.hpp): byte 6 of its header.
+using codec::FrameType;
 
 /// @brief The type check @ref write_frame and every reader make.
-/// @param newest  The last type the caller codes: every type up to it is.
-/// @param who     The caller, which a refusal names.
-/// @return OK for a type up to @p newest; otherwise
+/// @param who  The caller, which a refusal names.
+/// @return OK for an intra frame or a P-frame; otherwise
 ///         `Status::Code::Unsupported`.
-VR_CODEC_API core::Status check_frame_type(FrameType type, FrameType newest,
-                                           const char* who);
+VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {

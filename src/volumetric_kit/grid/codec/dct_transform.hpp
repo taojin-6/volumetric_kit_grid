@@ -50,8 +50,8 @@ struct DctTransformConfig {
 /// @brief Blocks where the device holds them: @ref count entries of masks
 ///        and coefficients, and their block list, in the layout the kernels
 ///        write. Borrowed from what produced them -- the transform's
-///        @ref DctTransform::record_forward or the device frame reader -- and
-///        valid until that object's next call.
+///        @ref DctTransform::record_forward, the device frame reader or the
+///        reference store -- and valid until that object's next call.
 ///
 /// A P-frame's entries are its stream positions (bitstream.hpp): its
 /// @ref reference_count reference entries, each with its mode, then its new
@@ -218,6 +218,17 @@ class VR_CODEC_API DctTransform {
   ///         P-frame's entries, which are not yet its blocks.
   core::Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
                        const CodecParams& params,
+                       core::GpuStageScope* stage = nullptr);
+
+  /// @brief @ref inverse from blocks the device holds, recorded into the
+  ///        caller's @p batch after what it already holds -- the reference
+  ///        store's upload and apply -- and submitted with it, so the three
+  ///        share one submit.
+  /// @param batch  Holding what the inverse reads; submitted here once the
+  ///               checks pass (a refusal submits nothing).
+  /// @return As the overload above.
+  core::Status inverse(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+                       const ResidentBlocks& in, const CodecParams& params,
                        core::GpuStageScope* stage = nullptr);
 
   /// @brief The entries of @p list whose block holds an observed voxel

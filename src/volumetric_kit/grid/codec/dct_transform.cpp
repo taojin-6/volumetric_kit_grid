@@ -495,6 +495,15 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                                    const ResidentBlocks& in,
                                    const CodecParams& params,
                                    core::GpuStageScope* stage) {
+  core::CommandBatch batch(*device_, *allocator_);
+  return inverse(batch, grid, in, params, stage);
+}
+
+core::Status DctTransform::inverse(core::CommandBatch& batch,
+                                   volume::VoxelBlockGrid& grid,
+                                   const ResidentBlocks& in,
+                                   const CodecParams& params,
+                                   core::GpuStageScope* stage) {
   VKC_ASSIGN(GridViews views,
              check_inputs("inverse", grid, volume::BlockList{}, params));
   if (in.coefficient_count != params.coefficient_count) {
@@ -513,7 +522,7 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                                std::to_string(grid.grid().num_blocks) + ")");
   }
   if (in.count == 0) {
-    return {};
+    return batch.submit();
   }
   // Bound where they are, so each must hold the entries the kernel reads.
   const VkDeviceSize n = in.count;
@@ -525,7 +534,6 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
     return fail("inverse", "the resident buffers do not hold " +
                                std::to_string(in.count) + " blocks");
   }
-  core::CommandBatch batch(*device_, *allocator_);
   return run_inverse(batch, grid, views, in, params, stage);
 }
 
