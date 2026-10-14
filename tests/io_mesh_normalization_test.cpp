@@ -336,14 +336,17 @@ int refusals() {
   CHECK(refused(mesh, bad_axis));
 
   // Axes that are not a proper rotation: a reflection, a repeated axis, a
-  // scaled one. Both fits and apply refuse them; within 1e-6 is a rotation.
+  // scaled one, and unit axes sheared off square with a positive
+  // determinant. Both fits and apply refuse them; within 1e-6 is a rotation.
   io::MeshAxes reflection;
   reflection.z = {0, 0, -1};
   io::MeshAxes repeated;
   repeated.x = repeated.z = repeated.up;
   io::MeshAxes stretched;
   stretched.x = {2, 0, 0};
-  for (const auto& wrong : {reflection, repeated, stretched}) {
+  io::MeshAxes sheared;
+  sheared.up = {0.6, 0.8, 0};
+  for (const auto& wrong : {reflection, repeated, stretched, sheared}) {
     const auto measured = io::mesh_bounds(mesh, wrong);
     CHECK(refused_for(io::fit_transform(measured, 1.7), "proper rotation"));
     CHECK(refused_for(io::scale_transform(measured, 1.0), "proper rotation"));
@@ -575,6 +578,11 @@ int topology() {
     CHECK(damaged.degenerate_triangles == 3);
     CHECK(!damaged.supports_signed(true));
   }
+  // So does an area that is infinite rather than NaN.
+  const float inf = std::numeric_limits<float>::infinity();
+  const auto unbounded =
+      audit({{{0, 0, 0}, {inf, 1, 2}, {3, 5, 7}}, {0, 1, 2}});
+  CHECK(unbounded.degenerate_triangles == 1);
 
   // Two components, one inside out.
   auto pair_mesh = tetrahedron();
