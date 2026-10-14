@@ -435,8 +435,7 @@ vkc::Result<Snapshot> oracle_decode(Gpu& gpu, const Bytes& frame) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
   VKC_ASSIGN(std::unique_ptr<d::DctTransform> transform,
              d::DctTransform::create(gpu.device, gpu.allocator));
-  VKC_TRY(oracle::inverse(gpu, *transform, grid, grid.block_list(blocks),
-                          content.blocks));
+  VKC_TRY(oracle::inverse(gpu, *transform, grid, blocks, content.blocks));
   return snapshot(gpu, grid);
 }
 

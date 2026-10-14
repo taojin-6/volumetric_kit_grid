@@ -163,49 +163,6 @@ class VR_VOLUME_API VoxelBlockGrid {
     return map_.topology_epoch();
   }
 
-  /// @brief Anchor a compacted block list to this grid, ready to pass to a
-  ///        consumer that runs over a subset.
-  ///
-  /// The pairing @ref BlockList documents as a discipline, made a call instead:
-  /// the pointer, the count and the epoch all come from one expression, so the
-  /// epoch cannot be fetched from a different grid, read a frame early, or
-  /// simply forgotten -- and a forgotten one is not a compile error, since
-  /// @ref BlockList::epoch has a default that no live grid ever equals.
-  ///
-  /// @warning Borrowing, not owning: @p blocks must outlive the returned list
-  ///          and must not be reallocated under it. Call this beside the
-  ///          consumer rather than caching the result.
-  /// @param blocks  A compacted active set, typically straight from
-  ///                @ref VoxelHashMap::compact_active_blocks.
-  /// @return The list, stamped with this grid's current @ref topology_epoch.
-  BlockList block_list(const std::vector<BlockIndex>& blocks) const noexcept {
-    return BlockList{blocks.data(), static_cast<std::uint32_t>(blocks.size()),
-                     topology_epoch()};
-  }
-  /// Deleted: the list would outlive the vector it borrows, so
-  /// `block_list(map().compact_active_blocks().value())` dangles by the next
-  /// statement. Name the compaction first, then anchor it.
-  BlockList block_list(std::vector<BlockIndex>&&) const = delete;
-
-  /// @brief Check a caller-supplied @ref BlockList against this grid, for a
-  ///        consumer about to upload it and index attribute storage with it.
-  ///
-  /// Refuses a list that is null with a count; one holding more blocks than the
-  /// heap, which the epoch is blind to, since a vector re-compacted shorter
-  /// under a cached list keeps its old count through every allocate and
-  /// resize, and the upload would read past the caller's array; and one
-  /// compacted at another @ref topology_epoch, whose in-range ptrs a
-  /// `remove()` / `clear()` has handed to different blocks. An empty list names
-  /// no block, so it passes whatever its epoch: that is what lets a
-  /// default-constructed `BlockList{}` mean "nothing".
-  ///
-  /// Not checked: that each entry is a block this grid handed out. That is
-  /// O(count) per call, and every consumer answers it on the device instead.
-  /// @param blocks  The list.
-  /// @param who     Prefixes the error message (the consumer's entry point).
-  /// @return OK, or `Status::Code::InvalidArgument` naming the refusal.
-  core::Status check_block_list(const BlockList& blocks, const char* who) const;
-
   /// @brief Look up an attribute's backing store by name.
   ///
   /// Also the one place the attribute arrays are checked against the live grid,

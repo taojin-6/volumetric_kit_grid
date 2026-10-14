@@ -584,9 +584,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// whether that cache still describes this table, which it otherwise cannot:
   /// a removed block's index goes back to a LIFO heap and is re-drawn by the
   /// next allocation, so the same slot silently comes to mean a different block
-  /// at a different coordinate. A compacted @ref BlockList is such a cache. The
-  /// block stamps are not, since the map zeroes a slot's record as it frees the
-  /// block.
+  /// at a different coordinate. A compacted @ref DeviceBlockList is such a
+  /// cache. The block stamps are not, since the map zeroes a slot's record as
+  /// it frees the block.
   ///
   /// It lives *here*, on the table that hands block indices out and takes them
   /// back, rather than on @ref VoxelBlockGrid -- which is what makes it
