@@ -8,15 +8,14 @@
 ///        `Decoder`'s only reader, whose entries the tests' CPU oracle pins.
 ///
 /// Internal (under src/, never installed). The host parses the frame
-/// (@ref parse_frame) and uploads only its tables and payload; the
-/// decoded coefficients and masks stay in device memory, where the inverse
-/// transform reads them, and only the new blocks' coordinates, a P-frame's
-/// modes and each segment's fault come back. Every bulk buffer is
-/// device-local and retained between frames (`ensure_device_scratch`).
+/// (@ref parse_frame) and uploads only its tables and payload; the decoded
+/// entries stay in device memory, where the decoder's merge and the inverse
+/// transform read them, and only the reader's verdict comes back. Every bulk
+/// buffer is device-local and retained between frames
+/// (`ensure_device_scratch`).
 
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
@@ -36,16 +35,18 @@ namespace volumetric_kit::recon::codec::detail {
 /// One batch per frame: the tables go up and are expanded on the device into
 /// each model's slot lookup, the payload goes up, each segment decodes its
 /// entries into the inverse transform's layout at their stream positions
-/// (@ref ResidentBlocks), and the coordinates, modes and faults come back:
-/// 16 bytes a new block and 4 a reference entry. After the caller submits
-/// it, @ref check gives the reader's verdict. A skip or remove entry's
-/// payload is left as it was: nothing reads it.
+/// (@ref ResidentBlocks), the segments are judged (`rans_verdict.comp`: the
+/// first that failed, its fault or its order against the segment before),
+/// and the survivor ranks are scanned (`survivor_ranks.comp`). Eight bytes
+/// come back: the first failing segment, and the survivor count. After the
+/// caller submits it, @ref check gives the reader's verdict. A skip or
+/// remove entry's payload is left as it was: nothing reads it.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
 class VR_CODEC_API DeviceFrameReader {
  public:
-  /// @brief Build the two kernels.
+  /// @brief Build the four kernels.
   /// @return The reader, or a pipeline or pool failure.
   static core::Result<std::unique_ptr<DeviceFrameReader>> create(
       core::Device& device, core::Allocator& allocator);
@@ -54,13 +55,15 @@ class VR_CODEC_API DeviceFrameReader {
   DeviceFrameReader(const DeviceFrameReader&) = delete;
   DeviceFrameReader& operator=(const DeviceFrameReader&) = delete;
 
-  /// @brief Record the decode of @p frame's segments into @p batch.
+  /// @brief Record the decode of @p frame's segments, and its verdict, into
+  ///        @p batch.
   ///
-  /// The coordinates, modes and faults arrive when the caller submits
-  /// @p batch, which must happen before @ref check.
-  /// @return The decoded entries where the device holds them, valid until
-  ///         the next call (none for a frame of no segments, which records
-  ///         nothing); `Status::Code::Unsupported`, recording nothing, for a
+  /// The verdict arrives when the caller submits @p batch, which must happen
+  /// before @ref check.
+  /// @return The decoded entries where the device holds them, with the
+  ///         survivor ranks, valid until the next call (no entries for a
+  ///         frame of no segments, which records only the verdict's reset);
+  ///         `Status::Code::Unsupported`, recording nothing, for a
   ///         type it does not decode (@ref check_frame_type);
   ///         `Status::Code::InvalidArgument`, before any buffer grows, for a
   ///         size @ref check_segment_size refuses or a buffer past
@@ -69,21 +72,10 @@ class VR_CODEC_API DeviceFrameReader {
       core::CommandBatch& batch, const ParsedFrame& frame,
       core::GpuStageScope* stage = nullptr);
 
-  /// @return After the submit, the refusal of the frame's segments
-  ///         (@ref check_segment) and, for a P-frame, its survivors
-  ///         (@ref check_survivors), or OK.
-  core::Status check();
-
-  /// @return The decoded new blocks' coordinates, `ptr` 0, in frame order,
-  ///         as the last submit read them back: an intra frame's every
-  ///         block.
-  const std::vector<volume::BlockIndex>& blocks() const noexcept {
-    return blocks_host_;
-  }
-
-  /// @return A P-frame's mode for each reference entry, in reference order,
-  ///         once @ref check is OK; empty for an intra frame.
-  const std::vector<BlockMode>& modes() const noexcept { return modes_host_; }
+  /// @return After the submit, the refusal of the first segment that
+  ///         failed (@ref check_segment) and, for a P-frame, of its
+  ///         survivors (@ref check_survivors), or OK.
+  core::Status check() const;
 
  private:
   DeviceFrameReader() = default;
@@ -97,6 +89,8 @@ class VR_CODEC_API DeviceFrameReader {
   // Declared before pool_, so the pool is destroyed first.
   core::ComputeKernel slots_kernel_;
   core::ComputeKernel decode_kernel_;
+  core::ComputeKernel verdict_kernel_;
+  core::ComputeKernel ranks_kernel_;
   core::DescriptorPool pool_;
 
   // Device-local, retained and grown by ensure_device_scratch.
@@ -109,19 +103,16 @@ class VR_CODEC_API DeviceFrameReader {
   core::Buffer coefficients_;   // coefficient_words(K) words an entry
   core::Buffer modes_;          // a u32 a reference entry
   core::Buffer faults_;         // a SegmentFault a segment
+  core::Buffer ranks_;          // M + 1 u32: the survivors before each entry
+  core::Buffer verdict_;        // the first failing segment, the survivors
 
-  // What the last submit read back, which check() judges, and what of the
-  // frame recorded last it judges by.
-  std::vector<volume::BlockIndex> blocks_host_;
-  std::vector<std::uint32_t> mode_words_;
-  std::vector<std::uint32_t> faults_host_;
-  std::vector<BlockMode> modes_host_;  // mode_words_, once check() passes
+  // What the last submit read back, which check() judges -- the first
+  // failing segment as s << 2 | kind (kNoVerdict for none) and the survivor
+  // count -- and what of the frame recorded last it judges by.
+  std::uint32_t verdict_host_[2] = {};
   FrameType type_ = FrameType::kIntra;
-  std::uint32_t block_count_ = 0;      // N
-  std::uint32_t reference_count_ = 0;  // M
-  std::uint32_t update_size_ = 0;      // U
-  std::uint32_t new_count_ = 0;        // A
-  std::uint32_t segment_size_ = 0;     // R
+  std::uint32_t block_count_ = 0;  // N
+  std::uint32_t new_count_ = 0;    // A
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

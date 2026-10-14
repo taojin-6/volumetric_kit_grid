@@ -676,36 +676,24 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
   return frame;
 }
 
-core::Status check_segment(std::uint64_t s, SegmentFault fault,
-                           const Vec3i* prev_last, const Vec3i* first) {
-  if (fault == SegmentFault::kCoordOverflow) {
-    return bad("segment " + std::to_string(s) +
-               " steps a coordinate outside int32");
+core::Status check_segment(std::uint64_t s, SegmentFault fault) {
+  switch (fault) {
+    case SegmentFault::kNone:
+      return {};
+    case SegmentFault::kCoordOverflow:
+      return bad("segment " + std::to_string(s) +
+                 " steps a coordinate outside int32");
+    case SegmentFault::kOutOfOrder:
+      return bad("segment " + std::to_string(s) +
+                 " does not start after the one before ends");
+    case SegmentFault::kCorrupt:
+      break;
   }
-  if (fault != SegmentFault::kNone) {
-    return bad("segment " + std::to_string(s) + " is corrupt");
-  }
-  // Within a segment the deltas cannot step backwards; its first coordinate
-  // is raw bits, which no end check sees, so the order across segments is
-  // checked here. Without it a flipped bit decodes a duplicate, and the
-  // inverse transform races two workgroups on one block.
-  if (prev_last != nullptr && first != nullptr &&
-      !coord_less(*prev_last, *first)) {
-    return bad("segment " + std::to_string(s) +
-               " does not start after the one before ends");
-  }
-  return {};
+  return bad("segment " + std::to_string(s) + " is corrupt");
 }
 
-core::Status check_survivors(const std::vector<BlockMode>& modes,
-                             std::uint32_t n, std::uint32_t a) {
-  std::uint64_t survivors = 0;
-  for (BlockMode mode : modes) {
-    survivors += mode == BlockMode::kKeep || mode == BlockMode::kSkip ||
-                         mode == BlockMode::kZero
-                     ? 1
-                     : 0;
-  }
+core::Status check_survivors(std::uint64_t survivors, std::uint32_t n,
+                             std::uint32_t a) {
   if (survivors + a != n) {
     return bad(std::to_string(survivors) + " reference blocks survive and " +
                std::to_string(a) + " are new, but the frame holds " +
@@ -714,75 +702,9 @@ core::Status check_survivors(const std::vector<BlockMode>& modes,
   return {};
 }
 
-core::Result<MergedFrame> merge_frame(const std::vector<Vec3i>& reference,
-                                      const std::vector<BlockMode>& modes,
-                                      const std::vector<Vec3i>& added) {
-  if (modes.size() != reference.size()) {
-    return bad("expected " + std::to_string(reference.size()) +
-               " modes, one per reference block, got " +
-               std::to_string(modes.size()));
-  }
-  if (std::uint64_t(reference.size()) + added.size() >
-      std::numeric_limits<std::uint32_t>::max()) {
-    return bad("more than 2^32 - 1 entries");
-  }
-  const auto m = static_cast<std::uint32_t>(reference.size());
-  MergedFrame out;
-  // No reference, an intra frame's or an empty one: the new blocks as they
-  // are, each from its own payload, with nothing to walk.
-  if (m == 0) {
-    out.coords = added;
-    out.sources.resize(added.size());
-    for (std::size_t q = 0; q < added.size(); ++q) {
-      out.sources[q].payload = static_cast<std::uint32_t>(q);
-    }
-    return out;
-  }
-  // At most every reference block and every new one.
-  out.coords.reserve(reference.size() + added.size());
-  out.sources.reserve(reference.size() + added.size());
-  auto emit = [&out](const Vec3i& c, std::uint32_t from_reference,
-                     std::uint32_t payload) {
-    out.coords.push_back(c);
-    out.sources.push_back(ApplySource{from_reference, payload});
-  };
-  VKC_TRY(merge_by_coord(
-      reference.size(),
-      [&](std::size_t e) -> const Vec3i& { return reference[e]; }, added.size(),
-      [&](std::size_t q) -> const Vec3i& { return added[q]; },
-      [&](std::size_t e, std::size_t q) -> core::Status {
-        // One spelling per block: a reference block is recoded with zero,
-        // never removed and added.
-        if (e != kAbsent && q != kAbsent) {
-          return bad("new block " + std::to_string(q) +
-                     " is on reference block " + std::to_string(e));
-        }
-        if (q != kAbsent) {
-          emit(added[q], kNoSource, m + static_cast<std::uint32_t>(q));
-          return {};
-        }
-        const auto i = static_cast<std::uint32_t>(e);
-        switch (modes[e]) {
-          case BlockMode::kKeep:
-            emit(reference[e], i, i);
-            return {};
-          case BlockMode::kSkip:
-            emit(reference[e], i, kNoSource);
-            return {};
-          case BlockMode::kZero:
-            emit(reference[e], kNoSource, i);
-            return {};
-          case BlockMode::kRemove:
-            return {};
-          case BlockMode::kMotion:
-            return core::Status::unsupported(
-                "codec frame: the motion mode, which this reader does not "
-                "decode");
-        }
-        return bad("mode " + std::to_string(static_cast<uint>(modes[e])) +
-                   " is not a mode");
-      }));
-  return out;
+core::Status check_new_block(std::uint32_t q, std::uint32_t e) {
+  return bad("new block " + std::to_string(q) + " is on reference block " +
+             std::to_string(e));
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

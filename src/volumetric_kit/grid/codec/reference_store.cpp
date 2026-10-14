@@ -5,9 +5,7 @@
 
 #include <algorithm>
 #include <string>
-#include <utility>
 
-#include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -25,10 +23,12 @@ struct ApplyPush {
   std::uint32_t block_base = 0;
   std::uint32_t num_blocks = 0;
   std::uint32_t coefficient_count = 0;
+  std::uint32_t reference_count = 0;
+  std::uint32_t payload_count = 0;
 };
-static_assert(sizeof(ApplyPush) == 12, "ApplyPush must be 12 bytes");
+static_assert(sizeof(ApplyPush) == 20, "ApplyPush must be 20 bytes");
 
-constexpr std::uint32_t kApplyBindings = 7;
+constexpr std::uint32_t kApplyBindings = 8;
 constexpr VkDeviceSize kMaskBytes = kMaskWordsPerBlock * sizeof(std::uint32_t);
 static_assert(kMaskWordsPerBlock == 16, "inter_apply.comp's kMaskWords is 16");
 
@@ -75,7 +75,7 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
           : std::min(max_blocks_per_dispatch, s.max_workgroup_count_x_);
   s.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
   // One entry of each, so a side with none -- the reference of an intra
-  // frame -- binds a buffer.
+  // frame -- binds a buffer; and the fault count.
   struct First {
     core::Buffer& buffer;
     VkDeviceSize bytes;
@@ -85,10 +85,12 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   const First first[] = {
       {s.slots_[0].masks, kMaskBytes, "codec.reference_masks"},
       {s.slots_[0].coefficients, widest, "codec.reference_coefficients"},
+      {s.slots_[0].list, sizeof(volume::BlockIndex), "codec.reference_list"},
       {s.slots_[1].masks, kMaskBytes, "codec.reference_masks"},
       {s.slots_[1].coefficients, widest, "codec.reference_coefficients"},
-      {s.list_, sizeof(volume::BlockIndex), "codec.reference_list"},
+      {s.slots_[1].list, sizeof(volume::BlockIndex), "codec.reference_list"},
       {s.sources_, sizeof(ApplySource), "codec.apply_sources"},
+      {s.faults_, sizeof(std::uint32_t), "codec.apply_faults"},
   };
   for (const First& f : first) {
     VKC_TRY(core::ensure_device_scratch(device, allocator, f.buffer, f.bytes,
@@ -108,7 +110,7 @@ core::Status ReferenceStore::reserve(std::uint32_t n, std::uint32_t k) {
       {spare.masks, VkDeviceSize(n) * kMaskBytes, "codec.reference_masks"},
       {spare.coefficients, VkDeviceSize(n) * coefficient_bytes(k),
        "codec.reference_coefficients"},
-      {list_, VkDeviceSize(n) * sizeof(volume::BlockIndex),
+      {spare.list, VkDeviceSize(n) * sizeof(volume::BlockIndex),
        "codec.reference_list"},
       {sources_, VkDeviceSize(n) * sizeof(ApplySource), "codec.apply_sources"},
   };
@@ -126,68 +128,48 @@ core::Status ReferenceStore::reserve(std::uint32_t n, std::uint32_t k) {
 }
 
 core::Result<ResidentBlocks> ReferenceStore::record_apply(
-    core::CommandBatch& batch, const ResidentBlocks& payload,
-    const std::vector<ApplySource>& sources, const std::vector<Vec3i>& coords,
+    core::CommandBatch& batch, const ResidentBlocks& payload, std::uint32_t n,
     core::GpuStageScope* stage) {
-  if (sources.size() != coords.size()) {
-    return fail("record_apply", std::to_string(sources.size()) +
-                                    " sources for " +
-                                    std::to_string(coords.size()) + " blocks");
-  }
-  if (!coords.empty() &&
-      (payload.masks == nullptr || payload.coefficients == nullptr)) {
-    return fail("record_apply", "no payload buffers");
-  }
+  faults_host_ = 0;
   const std::uint32_t k = payload.coefficient_count;
   const Slot& reference = slots_[current_];
   const Slot& spare = slots_[current_ ^ 1u];
-  const VkDeviceSize n = coords.size();
-  if (n * kMaskBytes > spare.masks.size() ||
-      n * coefficient_bytes(k) > spare.coefficients.size() ||
-      n * sizeof(volume::BlockIndex) > list_.size() ||
-      n * sizeof(ApplySource) > sources_.size()) {
+  const VkDeviceSize blocks = n;
+  if (blocks * kMaskBytes > spare.masks.size() ||
+      blocks * coefficient_bytes(k) > spare.coefficients.size() ||
+      blocks * sizeof(volume::BlockIndex) > spare.list.size() ||
+      blocks * sizeof(ApplySource) > sources_.size()) {
     return fail("record_apply",
                 std::to_string(n) + " blocks, more than were reserved");
   }
-  // The reference's layout is its K; only a P-frame of the same K reads it.
-  const std::uint32_t m = held_ ? reference_.header.block_count : 0;
+  if (n != 0 && (payload.masks == nullptr || payload.coefficients == nullptr)) {
+    return fail("record_apply", "no payload buffers");
+  }
+  // A P-frame's entries read the reference, which is laid out at its own K;
+  // an intra frame's read none, whatever is held.
+  const std::uint32_t m = payload.reference_count;
+  const std::uint32_t held_m = held_ ? reference_.header.block_count : 0;
   const std::uint32_t held_k =
       held_ ? reference_.header.params.coefficient_count : 1;
-  for (const ApplySource& s : sources) {
-    if (s.reference != kNoSource && (s.reference >= m || held_k != k)) {
-      return fail("record_apply", "a source reads reference entry " +
-                                      std::to_string(s.reference) + " of " +
-                                      std::to_string(m) + " at K " +
-                                      std::to_string(k));
-    }
-    if (s.payload != kNoSource && s.payload >= payload.count) {
-      return fail("record_apply", "a source reads payload entry " +
-                                      std::to_string(s.payload) + " of " +
-                                      std::to_string(payload.count));
-    }
+  if (m != 0 && (m != held_m || k != held_k)) {
+    return fail("record_apply", "a P-frame of " + std::to_string(m) +
+                                    " reference entries at K " +
+                                    std::to_string(k) + ", on a reference of " +
+                                    std::to_string(held_m) + " at K " +
+                                    std::to_string(held_k));
   }
   ResidentBlocks out;
-  out.list = &list_;
+  out.list = &spare.list;
   out.masks = &spare.masks;
   out.coefficients = &spare.coefficients;
-  out.count = static_cast<std::uint32_t>(n);
+  out.count = n;
   out.coefficient_count = k;
   if (n == 0) return out;
-
-  // The blocks by coordinate alone, ptr 0: the inverse finds each in the
-  // hash table.
-  VKC_ASSIGN(void* staged,
-             batch.reserve_upload(list_, 0, n * sizeof(volume::BlockIndex)));
-  auto* list = static_cast<volume::BlockIndex*>(staged);
-  for (std::size_t i = 0; i < n; ++i) {
-    list[i] = volume::BlockIndex{coords[i], 0};
-  }
-  VKC_TRY(batch.upload(sources_, 0, sources.data(), n * sizeof(ApplySource)));
 
   const VkDeviceSize row_bytes = coefficient_bytes(k);
   core::ComputeKernel& apply = apply_kernel_;
   apply.set.write_storage_buffer(0, sources_.handle(), 0,
-                                 n * sizeof(ApplySource));
+                                 blocks * sizeof(ApplySource));
   apply.set.write_storage_buffer(1, reference.masks.handle(), 0,
                                  range(m, kMaskBytes));
   apply.set.write_storage_buffer(2, reference.coefficients.handle(), 0,
@@ -196,30 +178,41 @@ core::Result<ResidentBlocks> ReferenceStore::record_apply(
                                  range(payload.count, kMaskBytes));
   apply.set.write_storage_buffer(4, payload.coefficients->handle(), 0,
                                  range(payload.count, row_bytes));
-  apply.set.write_storage_buffer(5, spare.masks.handle(), 0, n * kMaskBytes);
+  apply.set.write_storage_buffer(5, spare.masks.handle(), 0,
+                                 blocks * kMaskBytes);
   apply.set.write_storage_buffer(6, spare.coefficients.handle(), 0,
-                                 n * row_bytes);
+                                 blocks * row_bytes);
+  apply.set.write_storage_buffer(7, faults_.handle(), 0, sizeof(std::uint32_t));
   ApplyPush push;
-  push.num_blocks = static_cast<std::uint32_t>(n);
+  push.num_blocks = n;
   push.coefficient_count = k;
+  push.reference_count = m;
+  push.payload_count = payload.count;
+  VKC_TRY(batch.fill(faults_, 0, sizeof(std::uint32_t), 0u));
   for (std::uint32_t base = 0; base < n; base += blocks_per_dispatch_) {
     push.block_base = base;
-    const auto groups = static_cast<std::uint32_t>(
-        std::min<VkDeviceSize>(blocks_per_dispatch_, n - base));
+    const std::uint32_t groups = std::min(blocks_per_dispatch_, n - base);
     VKC_TRY(batch.dispatch(apply, &push, sizeof(push), groups,
                            max_workgroup_count_x_, stage));
   }
+  VKC_TRY(batch.readback(faults_, 0, sizeof(std::uint32_t), &faults_host_));
   return out;
 }
 
-void ReferenceStore::commit(const FrameReference& reference,
-                            std::vector<Vec3i>&& coords) {
-  VKC_CHECK(coords.size() == reference.header.block_count,
-            "ReferenceStore::commit takes the frame's own coordinates");
+core::Status ReferenceStore::check_apply() const {
+  if (faults_host_ != 0) {
+    return fail("record_apply",
+                std::to_string(faults_host_) +
+                    " of the frame's blocks read past the reference or the "
+                    "payload");
+  }
+  return {};
+}
+
+void ReferenceStore::commit(const FrameReference& reference) {
   current_ ^= 1u;
   held_ = true;
   reference_ = reference;
-  coords_ = std::move(coords);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// A decoded frame's blocks in frame order and where each comes from
+// (block_lists.hpp): the reference's surviving entries merged with the
+// frame's new blocks, an entry an invocation, each placed by counting what
+// sorts before it. With no ties -- a tie is row 13's refusal, below -- a
+// block's place is the survivors below it plus the new blocks below it:
+//   reference entry e that survives: ranks[e] + lower_bound(new, ref[e]),
+//     its sources {e, e} for keep, {e, none} for skip, {none, e} for zero;
+//   new block q: q + ranks[lower_bound(ref, new[q])], sources {none, M + q}.
+// An intra frame is M = 0, its positions q. Row 13 is a new block on a
+// reference block, whatever that entry's mode: the smallest such q and e,
+// which on a frame rows 11 and 12 passed are one pair, the first a walk in
+// frame order meets. Writes stop at position N, so a corrupt frame, refused
+// before anything reads these, writes nowhere else.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+
+#include "block_lists_push.glsl"
+#include "frame_models.glsl"
+
+layout(local_size_x = 256) in;
+
+// Mirrors kNoSource and ApplySource in bitstream.hpp.
+const uint kNoSource = 0xFFFFFFFFu;
+struct ApplySource {
+  uint reference;
+  uint payload;
+};
+
+layout(set = 0, binding = 0, scalar) readonly buffer Reference {
+  BlockIndex reference[];  // M, strictly increasing
+};
+layout(set = 0, binding = 1, scalar) readonly buffer Added {
+  BlockIndex added[];  // A, strictly increasing once row 11 passes
+};
+layout(set = 0, binding = 2, std430) readonly buffer Modes {
+  uint modes[];  // M
+};
+layout(set = 0, binding = 3, std430) readonly buffer Ranks {
+  uint ranks[];  // M + 1: the survivors before each entry
+};
+layout(set = 0, binding = 4, scalar) writeonly buffer Frame {
+  BlockIndex frame[];  // N, ptr 0
+};
+layout(set = 0, binding = 5, scalar) writeonly buffer Sources {
+  ApplySource sources[];  // N
+};
+layout(set = 0, binding = 6, std430) buffer Collision {
+  uint collision_q;  // the first new block on a reference block, or ~0
+  uint collision_e;  // and that reference entry
+};
+
+VR_COORD_SEARCH(in_reference, reference)
+VR_COORD_SEARCH(in_added, added)
+
+void main() {
+  const uint t = pc.item_base + gl_GlobalInvocationID.x;
+  const uint m = pc.reference_count;
+  if (t >= pc.count) return;
+  if (t < m) {
+    const uint mode = modes[t];
+    if (mode != kModeKeep && mode != kModeSkip && mode != kModeZero) return;
+    const ivec3 c = reference[t].coord;
+    const uint at = ranks[t] + in_added_lower(c, 0u, pc.new_count);
+    if (at >= pc.block_count) return;
+    frame[at].coord = c;
+    frame[at].ptr = 0;
+    sources[at] = ApplySource(mode != kModeZero ? t : kNoSource,
+                              mode != kModeSkip ? t : kNoSource);
+    return;
+  }
+  const uint q = t - m;
+  const ivec3 c = added[q].coord;
+  const uint e = in_reference_lower(c, 0u, m);
+  if (e < m && reference[e].coord == c) {
+    atomicMin(collision_q, q);
+    atomicMin(collision_e, e);
+  }
+  const uint at = q + ranks[e];
+  if (at >= pc.block_count) return;
+  frame[at].coord = c;
+  frame[at].ptr = 0;
+  sources[at] = ApplySource(kNoSource, t);
+}

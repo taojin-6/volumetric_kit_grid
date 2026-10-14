@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// Rows 11 and 12's segment half, judged on the device after rans_decode.comp
+// (device_frame_reader.hpp): an invocation a segment takes its fault, else,
+// for a block segment with a block segment before it, whether its first
+// coordinate follows that one's last, and keeps the smallest failing segment
+// as s << 2 | kind, which check_segment words. The smallest is the segment
+// the CPU oracle's walk stops at: every one before it decoded clean, so the
+// coordinates it compares are real, and a later segment's comparison against
+// a corrupt one never wins. Segments number below 2^30 (kMaxFrameSegments),
+// so the word holds them.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+
+#include "frame_models.glsl"
+#include "rans_push.glsl"
+
+layout(set = 0, binding = 0, std430) readonly buffer Faults {
+  uint faults[];  // a SegmentFault a segment
+};
+layout(set = 0, binding = 1, scalar) readonly buffer Blocks {
+  BlockIndex blocks[];  // the new blocks, in frame order
+};
+layout(set = 0, binding = 2, std430) buffer Verdict {
+  uint verdict;    // the smallest s << 2 | kind, ~0 for none
+  uint survivors;  // survivor_ranks.comp's
+};
+
+// Mirrors SegmentFault::kOutOfOrder (bitstream.hpp).
+const uint kFaultOutOfOrder = 3u;
+
+void main() {
+  const uint s = pc.item_base + gl_GlobalInvocationID.x;
+  if (s >= pc.segment_count) return;
+  uint kind = faults[s];
+  const uint m = pc.reference_count;
+  const uvec2 range = segment_range(s, m, pc.update_size, pc.num_entries - m,
+                                    pc.segment_size);
+  if (kind == 0u && range.x > m &&
+      !vrCoordLess(blocks[range.x - m - 1u].coord, blocks[range.x - m].coord)) {
+    kind = kFaultOutOfOrder;
+  }
+  if (kind != 0u) atomicMin(verdict, (s << 2u) | kind);
+}

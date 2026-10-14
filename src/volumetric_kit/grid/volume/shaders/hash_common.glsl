@@ -60,7 +60,7 @@ const int kLockEntry = -2;
 const int kNoOffset = 0;
 
 // Whether a slot's ptr names a block, neither free nor locked mid-insert: what
-// the compactions list.
+// the compactions list, and the codec's grid diff takes for a grid block.
 bool vrEntryActive(int ptr) { return ptr != kFreeEntry && ptr != kLockEntry; }
 
 const uint kHashPrimeX = 73856093u;

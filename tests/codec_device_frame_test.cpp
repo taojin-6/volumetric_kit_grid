@@ -6,7 +6,9 @@
 // or be refused as it refuses it, and every frame the reader reads must
 // decode to oracle::read_frame's entries or be refused as it refuses it, with
 // the same code and message -- the test the 2026-09-26 decision set for the
-// GPU coder. Skips where no device is present.
+// GPU coder -- the reader's verdict naming the first failing segment however
+// many fail, and its survivor ranks an exclusive scan. Skips where no device
+// is present.
 
 #include <algorithm>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -105,7 +108,10 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   VKC_ASSIGN(const d::ResidentBlocks resident,
              reader.record_decode(batch, parsed));
   const std::uint32_t entries = resident.count;
+  const std::uint32_t m = resident.reference_count;
   std::vector<std::uint32_t> packed(std::size_t(entries) * words);
+  std::vector<std::uint32_t> modes(m);
+  std::vector<vr::volume::BlockIndex> list(entries - m);
   frame.blocks.masks.resize(std::size_t(entries) * codec::kMaskWordsPerBlock);
   if (entries != 0) {
     VKC_TRY(batch.readback(*resident.masks, 0,
@@ -114,11 +120,22 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
     VKC_TRY(batch.readback(*resident.coefficients, 0,
                            packed.size() * sizeof(std::uint32_t),
                            packed.data()));
-    VKC_TRY(batch.submit());
   }
+  if (m != 0) {
+    VKC_TRY(batch.readback(*resident.modes, 0, m * sizeof(std::uint32_t),
+                           modes.data()));
+  }
+  if (!list.empty()) {
+    VKC_TRY(batch.readback(*resident.list, 0,
+                           list.size() * sizeof(vr::volume::BlockIndex),
+                           list.data()));
+  }
+  VKC_TRY(batch.submit());
   VKC_TRY(reader.check());
-  frame.modes = reader.modes();
-  for (const vr::volume::BlockIndex& b : reader.blocks()) {
+  for (const std::uint32_t mode : modes) {
+    frame.modes.push_back(static_cast<d::BlockMode>(mode));
+  }
+  for (const vr::volume::BlockIndex& b : list) {
     frame.coords.push_back(b.coord);
   }
   frame.blocks.coefficients.resize(std::size_t(entries) * k);
@@ -540,9 +557,22 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
           inter_frame(id, reference, successor(reference, 13, 100, 300, 20)))
           .value();
   CHECK(same_read(reader, intra) == 0);
-  auto decoded = [&reader] {
+  // The coordinates the reader holds after a decode of the intra frame.
+  d::ResidentBlocks held;
+  {
+    vkc::CommandBatch batch(*g_device, *g_allocator);
+    vkc::Result<d::ResidentBlocks> r = reader.record_decode(
+        batch, d::parse_frame(intra.data(), intra.size(), kMaxBlocks, nullptr)
+                   .value());
+    CHECK(r.ok() && batch.submit().ok() && reader.check().ok());
+    held = r.value();
+  }
+  auto decoded = [&held] {
     std::vector<vr::Vec3i> coords;
-    for (const vr::volume::BlockIndex& b : reader.blocks()) {
+    for (const vr::volume::BlockIndex& b :
+         vr_test::read_back<vr::volume::BlockIndex>(*g_device, *g_allocator,
+                                                    *held.list, held.count)
+             .value()) {
       coords.push_back(b.coord);
     }
     return coords;
@@ -584,6 +614,105 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
   longer.update_size = codec::kMaxDeviceDecodeSegmentSize + 1;
   CHECK(refused(longer, C::InvalidArgument,
                 "DeviceFrameReader::record_decode: update size " + past) == 0);
+  return 0;
+}
+
+// The reader's verdict is the first segment that fails, however many do and
+// whichever way: a corrupt first segment, the second and the last starting
+// on the segment before's end, and pairs of them -- each the oracle's code
+// and message -- and it is reset for the next frame, which reads clean.
+int verdict_case(d::DeviceFrameReader& reader) {
+  oracle::Frame row = make_frame(20, 4, 41);
+  row.coords.clear();
+  for (int x = 0; x < 20; ++x) row.coords.push_back(vr::Vec3i(x, 3, -2));
+  const Bytes good = oracle::write_frame(row, sizes(4, 64)).value();
+  const d::ParsedFrame parsed =
+      d::parse_frame(good.data(), good.size(), kMaxBlocks, nullptr).value();
+  const auto payload = static_cast<std::size_t>(parsed.payload - good.data());
+  // Where segment s's stream starts in the frame.
+  auto at = [&](std::size_t s) {
+    std::size_t offset = payload;
+    for (std::size_t i = 0; i < s; ++i) offset += parsed.segment_lengths[i];
+    return offset;
+  };
+  // Segment s's first x set to @p x, at or before the last of segment s - 1
+  // (4s - 1): out of order. Or its state set below L: corrupt.
+  auto out_of_order = [&](Bytes& b, std::size_t s, std::uint32_t x) {
+    b[at(s) + 2] = static_cast<std::uint8_t>(x & 0xFF);
+    b[at(s) + 3] = static_cast<std::uint8_t>((b[at(s) + 3] & 0xF0) | (x >> 8));
+  };
+  auto corrupt = [&](Bytes& b, std::size_t s) {
+    b[at(s)] = 0;
+    b[at(s) + 1] = 0;
+  };
+  struct Edit {
+    const char* what;
+    std::vector<std::pair<std::size_t, int>> edits;  // segment, x or -1
+    std::string says;
+  };
+  const Edit edits[] = {
+      {"segment 0 corrupt", {{0, -1}}, "segment 0 is corrupt"},
+      {"segment 1 out of order", {{1, 0}}, "segment 1 does not start after"},
+      {"the last out of order", {{4, 2}}, "segment 4 does not start after"},
+      {"1 out of order, 3 corrupt",
+       {{1, 1}, {3, -1}},
+       "segment 1 does not start after"},
+      {"2 corrupt, 4 out of order", {{2, -1}, {4, 0}}, "segment 2 is corrupt"},
+      {"1 corrupt, 3 out of order", {{3, 5}, {1, -1}}, "segment 1 is corrupt"},
+  };
+  for (const Edit& e : edits) {
+    Bytes b = good;
+    for (const auto& [s, x] : e.edits) {
+      if (x < 0) {
+        corrupt(b, s);
+      } else {
+        out_of_order(b, s, std::uint32_t(x));
+      }
+    }
+    std::string why;
+    if (same_read(reader, b, nullptr, &why) != 0 ||
+        why.find(e.says) == std::string::npos) {
+      std::fprintf(stderr, "%s: %s\n", e.what, why.c_str());
+      return 1;
+    }
+    // The next frame reads clean: the verdict is the frame's own.
+    CHECK(same_read(reader, good, nullptr, &why) == 0 && why.empty());
+  }
+  return 0;
+}
+
+// The survivor ranks: entry e's is how many of the reference entries before
+// it survive, an exclusive scan, and entry M's the survivor count, at M on
+// and off the scan's 256-entry chunks and past 65,536.
+int ranks_case(d::DeviceFrameReader& reader) {
+  for (const std::size_t m :
+       {std::size_t(0), std::size_t(1), std::size_t(255), std::size_t(256),
+        std::size_t(257), std::size_t(65537)}) {
+    const oracle::Frame reference = make_frame(m, 2, 70 + m);
+    const d::FrameReference id =
+        reference_of(oracle::write_frame(reference).value());
+    const oracle::Frame p =
+        inter_frame(id, reference, successor(reference, 71 + m, 300, 200, 9));
+    CHECK(p.modes.size() == m);
+    const Bytes bytes = oracle::write_frame(p).value();
+    const d::ParsedFrame parsed =
+        d::parse_frame(bytes.data(), bytes.size(), kMaxBlocks, &id).value();
+    vkc::CommandBatch batch(*g_device, *g_allocator);
+    vkc::Result<d::ResidentBlocks> r = reader.record_decode(batch, parsed);
+    CHECK(r.ok() && r.value().ranks != nullptr);
+    CHECK(batch.submit().ok() && reader.check().ok());
+    vkc::Result<std::vector<std::uint32_t>> ranks =
+        vr_test::read_back<std::uint32_t>(*g_device, *g_allocator,
+                                          *r.value().ranks, m + 1);
+    CHECK(ranks.ok());
+    std::vector<std::uint32_t> survives(m + 1, 0);
+    for (std::size_t e = 0; e < m; ++e) {
+      survives[e] = p.modes[e] == d::BlockMode::kRemove ? 0 : 1;
+    }
+    std::vector<std::uint32_t> expected(m + 1);
+    std::exclusive_scan(survives.begin(), survives.end(), expected.begin(), 0u);
+    CHECK(ranks.value() == expected);
+  }
   return 0;
 }
 
@@ -675,6 +804,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (writer_refusals_case(writer) != 0) return 1;
   if (segment_rule_case(writer, reader) != 0) return 1;
   if (parsed_frame_case(reader) != 0) return 1;
+  if (verdict_case(reader) != 0) return 1;
+  if (ranks_case(reader) != 0) return 1;
   if (refusals_case(gpu.device, gpu.allocator, writer) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;

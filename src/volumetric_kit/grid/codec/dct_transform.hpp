@@ -74,6 +74,9 @@ struct ResidentBlocks {
   /// A P-frame's mode for each reference entry, a u32 each
   /// (`frame_models.glsl`'s `kMode*`); null without reference entries.
   const core::Buffer* modes = nullptr;
+  /// The device frame reader's: for each reference entry e, and at e = M,
+  /// how many of the entries before it survive, a u32 each; null elsewhere.
+  const core::Buffer* ranks = nullptr;
   std::uint32_t count = 0;
   std::uint32_t coefficient_count = 0;  ///< K.
   /// M, the entries before the blocks: 0 for an intra frame.

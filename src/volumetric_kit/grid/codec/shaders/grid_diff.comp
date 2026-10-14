@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The grid's block set against a decoded frame's (block_lists.hpp), in two
+// passes over the hash table, which must be quiescent (hash_lookup.glsl):
+//   pass 0, an invocation a slot: an occupied slot (vrEntryActive) whose
+//     coordinate a binary search of the frame's sorted list misses is gone;
+//   pass 1, an invocation a frame block: one the table does not hold
+//     (vrFindBlockPtr) is missing, ptr 0.
+// Each list is appended in no order: the grid removes the one and allocates
+// the other, and both draw heap slots atomically anyway.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VR_HASH_ENTRIES_BINDING 0
+#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+
+#include "block_lists_push.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 1, scalar) readonly buffer Frame {
+  BlockIndex frame[];  // N, strictly increasing
+};
+layout(set = 0, binding = 2, scalar) writeonly buffer Gone {
+  BlockIndex gone[];  // at most a slot each
+};
+layout(set = 0, binding = 3, scalar) writeonly buffer Missing {
+  BlockIndex missing[];  // at most N
+};
+layout(set = 0, binding = 4, std430) buffer Counts {
+  uint gone_count;
+  uint missing_count;
+};
+
+VR_COORD_SEARCH(in_frame, frame)
+
+void main() {
+  const uint i = pc.item_base + gl_GlobalInvocationID.x;
+  if (i >= pc.count) return;
+  if (pc.pass == 0u) {
+    const int ptr = vr_hash_entries[i].ptr;
+    if (!vrEntryActive(ptr)) return;
+    const ivec3 c = vr_hash_entries[i].pos;
+    const uint at = in_frame_lower(c, 0u, pc.block_count);
+    if (at < pc.block_count && frame[at].coord == c) return;
+    const uint slot = atomicAdd(gone_count, 1u);
+    gone[slot].coord = c;
+    gone[slot].ptr = ptr;
+    return;
+  }
+  const ivec3 c = frame[i].coord;
+  if (vrFindBlockPtr(c, pc.num_buckets, pc.bucket_size, pc.max_chain) >= 0) {
+    return;
+  }
+  const uint slot = atomicAdd(missing_count, 1u);
+  missing[slot].coord = c;
+  missing[slot].ptr = 0;
+}

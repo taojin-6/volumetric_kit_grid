@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// A frame's survivor ranks (device_frame_reader.hpp): ranks[e], how many of
+// the reference entries before e survive -- keep, skip or zero -- for
+// e = 0..M, so ranks[M] is the survivor count, which goes beside the verdict
+// for check_survivors. An intra frame is M = 0: ranks[0] = 0. One workgroup,
+// scan.glsl a chunk at a time.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "frame_models.glsl"
+#include "rans_push.glsl"
+#include "scan.glsl"
+
+layout(local_size_x = kScanLanes) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Modes {
+  uint modes[];  // M
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Ranks {
+  uint ranks[];  // M + 1
+};
+layout(set = 0, binding = 2, std430) buffer Verdict {
+  uint verdict;  // rans_verdict.comp's
+  uint survivors;
+};
+
+void main() {
+  const uint lane = gl_LocalInvocationID.x;
+  const uint m = pc.reference_count;
+  uint carry = 0u;
+  for (uint base = 0u; base <= m; base += kScanLanes) {
+    const uint e = base + lane;
+    const bool survives = e < m && modes[e] <= kModeZero;  // keep, skip, zero
+    const uint rank = vrScanChunk(survives ? 1u : 0u, carry);
+    if (e <= m) ranks[e] = rank;
+  }
+  if (lane == 0u) survivors = carry;
+}

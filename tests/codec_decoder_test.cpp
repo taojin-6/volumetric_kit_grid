@@ -662,15 +662,17 @@ int metrics_case(Gpu& gpu, codec::Decoder& dec) {
             .ok());
   const vkc::StageRow* top = find_row(m, "codec decode");
   CHECK(top != nullptr);
-  for (const char* sub :
-       {"  ..rans decode", "  ..active set", "  ..apply", "  ..inverse"}) {
+  for (const char* sub : {"  ..rans decode", "  ..apply", "  ..inverse"}) {
     const vkc::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
   }
+  // The grid's blocks are diffed against the frame's on the device, so the
+  // decode compacts nothing.
+  CHECK(find_row(m, "  ..active set") == nullptr);
   CHECK(m.total_cpu_ms() == top->cpu_ms);
   // Encoding into the same metrics adds its own rows beside these rather
-  // than summing into them (the one shared row is the map's compaction).
+  // than summing into them.
   vkc::StageMetrics both = m;
   vkc::Result<codec::Encoder> enc =
       codec::Encoder::create(gpu.device, gpu.allocator);
