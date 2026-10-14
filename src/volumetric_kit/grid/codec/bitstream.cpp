@@ -14,17 +14,24 @@
 #include "rans.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
-namespace {
 
 // --- The models. -------------------------------------------------------------
 //
 // shaders/frame_models.glsl, the kernels' own GLSL, compiled here as C++ once
-// these two names are defined.
+// these two names are defined: in a namespace of their own, so a model
+// function this file does not call is not an unused one.
+namespace glsl {
 
 using uint = std::uint32_t;
 using glm::uvec2;
 
 #include "shaders/frame_models.glsl"
+
+}  // namespace glsl
+
+namespace {
+
+using namespace glsl;
 
 static_assert(kMaskWords == kMaskWordsPerBlock &&
                   kLinesPerPlane == std::uint32_t(kBlockSize) &&
