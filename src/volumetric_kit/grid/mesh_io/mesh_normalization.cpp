@@ -232,7 +232,10 @@ core::Result<MeshTopology> audit_mesh_topology(const TriangleMesh& mesh) try {
     const Vec3d pa(mesh.positions[a]);
     const Vec3d area = glm::cross(Vec3d(mesh.positions[b]) - pa,
                                   Vec3d(mesh.positions[c]) - pa);
-    if (!(glm::dot(area, area) > 0.0)) ++result.degenerate_triangles;
+    const double twice_area_squared = glm::dot(area, area);
+    if (!(std::isfinite(twice_area_squared) && twice_area_squared > 0.0)) {
+      ++result.degenerate_triangles;
+    }
     for (std::size_t e = 0; e < 3; ++e) {
       const auto from = mesh.indices[t + e];
       const auto to = mesh.indices[t + (e + 1) % 3];

@@ -244,6 +244,22 @@ int tilted_tetrahedron() {
   const auto above = io::up_axes({0, 0.4, 0.92});   // up.z = 0.9170
   CHECK(below && below.value().x[2] == 0.0 && below.value().x[0] != 0.0);
   CHECK(above && above.value().x[0] == 0.0 && above.value().x[2] != 0.0);
+  // At |up.z| = 0.9 exactly the reference is already +X: x = +Y, not −Y.
+  bool at_boundary = false;
+  double a = std::sqrt(0.19);
+  for (int step = 0; step < 64 && !at_boundary; ++step) {
+    const auto edge = io::up_axes({a, 0, 0.9});
+    at_boundary = edge && edge.value().up.z == 0.9;
+    if (at_boundary) CHECK(edge.value().x == Vec3d(0, 1, 0));
+    a = std::nextafter(a, 1.0);
+  }
+  CHECK(at_boundary);
+  // Any finite, nonzero length: the squared length of these over- or
+  // underflows, yet each is +Y.
+  for (const double length : {1e160, 1e-170, 4.9e-324}) {
+    const auto far = io::up_axes({0, length, 0});
+    CHECK(far && far.value().up == Vec3d(0, 1, 0));
+  }
   return 0;
 }
 
@@ -350,7 +366,7 @@ int refusals() {
       CHECK(std::isnan(poisoned_bounds.min[a]) &&
             std::isnan(poisoned_bounds.max[a]));
     }
-    CHECK(!io::fit_transform(poisoned_bounds, 1.7));
+    CHECK(refused_for(io::fit_transform(poisoned_bounds, 1.7), "not finite"));
     CHECK(!io::scale_transform(poisoned_bounds, 1.0));
     CHECK(refused(poisoned, fit));
     auto sequence = io::mesh_bounds(io::TriangleMesh{}, axes);
@@ -387,6 +403,15 @@ int refusals() {
   // Float overflow.
   CHECK(refused(mesh, io::scale_transform(bounds, 1e300).value()));
   CHECK(refused(mesh, io::fit_transform(bounds, 1e300).value()));
+  // Nothing to place is not a refusal: an empty frame stays empty.
+  io::TriangleMesh nothing;
+  CHECK(io::apply_transform(nothing, fit) && nothing.positions.empty());
+  // An output of exactly the largest float is in range.
+  io::TriangleMesh corner{{{1, 0, 0}, {0, 1, 0}}, {}};
+  io::MeshTransform largest;
+  largest.metres_per_unit = double(std::numeric_limits<float>::max());
+  CHECK(io::apply_transform(corner, largest));
+  CHECK(corner.positions[0].x == std::numeric_limits<float>::max());
   // Height collapse: a scale so small that every Y rounds to zero.
   CHECK(refused(mesh, io::fit_transform(bounds, 1e-100).value()));
   CHECK(refused(mesh, io::scale_transform(bounds, 1e-60).value()));
@@ -524,6 +549,32 @@ int topology() {
   const auto empty = audit(io::TriangleMesh{});
   CHECK(empty.components == 0 && empty.edges == 0);
   CHECK(!empty.supports_signed() && !empty.supports_signed(true));
+
+  // A closed, double-sided sheet encloses nothing: zero volume is refused.
+  const auto sheet =
+      audit({{{0, 0, 0}, {1, 0, 0}, {0, 1, 0}}, {0, 1, 2, 0, 2, 1}});
+  CHECK(sheet.boundary_edges == 0 && sheet.inconsistent_edges == 0 &&
+        sheet.nonmanifold_edges == 0 && sheet.degenerate_triangles == 0 &&
+        sheet.components == 1 && sheet.nonpositive_components == 1 &&
+        sheet.signed_volume == 0.0);
+  CHECK(!sheet.supports_signed(true));
+
+  // Two triangles that share only a vertex, each holding it last or first,
+  // are one component.
+  const auto bowtie =
+      audit({{{0, 0, 0}, {1, 0, 0}, {0, 0, 1}, {0, 1, 0}, {1, 1, 0}},
+             {0, 1, 2, 2, 3, 4}});
+  CHECK(bowtie.components == 1);
+
+  // A non-finite position makes every triangle on it degenerate.
+  for (const float bad : {std::numeric_limits<float>::quiet_NaN(),
+                          std::numeric_limits<float>::infinity()}) {
+    auto broken = tetrahedron();
+    broken.positions[3] = {bad, bad, bad};
+    const auto damaged = audit(broken);
+    CHECK(damaged.degenerate_triangles == 3);
+    CHECK(!damaged.supports_signed(true));
+  }
 
   // Two components, one inside out.
   auto pair_mesh = tetrahedron();
