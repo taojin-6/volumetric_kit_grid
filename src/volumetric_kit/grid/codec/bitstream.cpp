@@ -167,8 +167,8 @@ bool positive_finite(float f) { return std::isfinite(f) && f > 0.0f; }
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 
-// The first of a P-frame's coding parameters that is not its reference's, bit
-// for bit, or null: the one check the reader and both writers make.
+}  // namespace
+
 const char* coding_difference(const FrameHeader& reference, float voxel_size,
                               float trunc_dist, const CodecParams& params) {
   const CodecParams& held = reference.params;
@@ -189,6 +189,8 @@ const char* coding_difference(const FrameHeader& reference, float voxel_size,
   }
   return nullptr;
 }
+
+namespace {
 
 // Tables: per model, a varint count of used symbols, then per used symbol the
 // gap from the previous one (the first counts from -1) and its frequency.

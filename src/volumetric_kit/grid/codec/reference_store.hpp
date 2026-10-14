@@ -4,15 +4,16 @@
 #pragma once
 
 /// @file reference_store.hpp
-/// @brief The frame a P-frame decodes against, kept where the inverse
-///        transform reads it, and the apply that makes each decoded frame
-///        from it.
+/// @brief The frame a P-frame is coded or decoded against, kept where the
+///        transforms read and write it: the decoder's apply that makes each
+///        decoded frame from it, and the encoder's diff that codes each
+///        P-frame against it.
 ///
-/// Internal (under src/, never installed). The decoded frame's quantized
+/// Internal (under src/, never installed). The frame's quantized
 /// coefficients and masks, and its block list, stay on the device, in the
 /// transform's layout; the host keeps its @ref FrameReference alone. A
 /// reference is never rebuilt from a grid: the grid holds dequantized SDF,
-/// and a residual adds to the q the reference decoded to.
+/// and a residual adds to the q the reference was coded with.
 
 #include <cstdint>
 #include <memory>
@@ -28,35 +29,51 @@
 
 namespace volumetric_kit::recon::codec::detail {
 
-/// @brief Where a decoded frame's blocks and their sources go before the
-///        apply reads them: the store's spare list and its sources, which the
-///        decoder's merge writes (@ref BlockLists::record_merge).
+/// @brief Where the next frame's blocks go, as @ref ReferenceStore::reserve
+///        last sized them: the store's spare, and the apply's sources. The
+///        decoder's merge writes the list and the sources
+///        (@ref BlockLists::record_merge) and its apply the masks and
+///        coefficients; the encoder copies its sorted list into the list and
+///        its forward writes the masks and coefficients
+///        (@ref DctTransform::record_forward).
 struct FrameBuffers {
   const core::Buffer* list = nullptr;     ///< `volume::BlockIndex` a block.
   const core::Buffer* sources = nullptr;  ///< An @ref ApplySource a block.
+  const core::Buffer* masks = nullptr;    ///< `kMaskWordsPerBlock` words.
+  /// @ref coefficient_words "coefficient_words(K)" words a block.
+  const core::Buffer* coefficients = nullptr;
 };
 
-/// @brief The held reference frame and the frame being decoded, in two slots
-///        of device memory that swap at each @ref commit.
+/// @brief The held reference frame and the frame being coded or decoded, in
+///        two slots of device memory that swap at each @ref commit.
 ///
 /// The current slot holds the reference: each block's 16 mask words and
 /// @ref coefficient_words(K) coefficient words, and its block list, in the
-/// reference's order. The spare receives the next frame -- its list and
-/// sources from the decoder's merge, its words from @ref record_apply
-/// (`inter_apply.comp`) -- and becomes the current slot only at @ref commit.
-/// So until a decode commits, the reference stays as it was, whatever was
-/// recorded or failed. An intra frame takes the same apply, from its payload
-/// alone, so every decoded frame lands in the store by one path.
+/// reference's order. The spare receives the next frame (@ref frame_buffers)
+/// and becomes the current slot only at @ref commit. So until a frame
+/// commits, the reference stays as it was, whatever was recorded or failed.
+///
+/// A decoder's frame comes from its merge and @ref record_apply
+/// (`inter_apply.comp`); an intra frame takes the same apply, from its
+/// payload alone, so every decoded frame lands in the store by one path. An
+/// encoder's comes from its sort and forward transform, intra or P alike,
+/// and a P-frame's entries are coded from it against the reference by
+/// @ref record_diff (`inter_diff.comp`). Every frame either side commits is
+/// the q and masks the next one is coded or decoded against.
 ///
 /// Each slot takes `80 + 4 * coefficient_words(K)` bytes a block, and the
-/// sources `8`. Every buffer is device-local and retained, growing as
-/// @ref reserve asks (`ensure_device_scratch`).
+/// sources `8`; the diff takes `64 + 4 * coefficient_words(K)` an entry it
+/// codes (a reference entry, and a block of the frame), and 16 more a block
+/// of the frame and 8 a reference entry. Every buffer is device-local and
+/// retained, growing as @ref reserve and @ref record_diff ask
+/// (`ensure_device_scratch`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
 class VR_CODEC_API ReferenceStore {
  public:
-  /// @brief Build the apply kernel and the store's first, smallest buffers.
+  /// @brief Build the apply's and the diff's kernels and the store's first,
+  ///        smallest buffers.
   /// @param max_blocks_per_dispatch  Blocks per apply dispatch, as
   ///        @ref DctTransformConfig::max_blocks_per_dispatch: 0 means the
   ///        device's `maxComputeWorkGroupCount[0]`, which caps it either way.
@@ -85,15 +102,17 @@ class VR_CODEC_API ReferenceStore {
     return slots_[current_].list;
   }
 
-  /// @return The spare's list and the sources, as @ref reserve last sized
-  ///         them, for the merge to write and @ref record_apply to read.
+  /// @return The spare and the sources, as @ref reserve last sized them.
   FrameBuffers frame_buffers() const noexcept {
-    return FrameBuffers{&slots_[current_ ^ 1u].list, &sources_};
+    const Slot& spare = slots_[current_ ^ 1u];
+    return FrameBuffers{&spare.list, &sources_, &spare.masks,
+                        &spare.coefficients};
   }
 
   /// @brief Make the spare hold a frame of @p n blocks of @p k
   ///        coefficients before anything is recorded: what lets a decoder
-  ///        refuse before it touches the grid.
+  ///        refuse before it touches the grid, and gives an encoder's forward
+  ///        its output.
   /// @return OK; `Status::Code::InvalidArgument` for a buffer past
   ///         `maxStorageBufferRange`; or an allocation's failure. The held
   ///         reference is untouched either way.
@@ -127,10 +146,43 @@ class VR_CODEC_API ReferenceStore {
   ///         past what was bound.
   core::Status check_apply() const;
 
+  /// @brief Record a P-frame's entries against the held reference, coded
+  ///        from the frame of @p n blocks the spare holds once the commands
+  ///        @p batch already holds have run (an encoder's sorted list,
+  ///        copied in, and its forward), into this store's own buffers.
+  ///
+  /// `inter_diff.comp` gives each reference entry its mode -- remove when
+  /// the frame lacks its block, skip when the block is unchanged, keep or
+  /// zero otherwise -- and the payload keep and zero carry; then the
+  /// survivor ranks; then each block the reference lacks its place among
+  /// the new blocks, its coordinate and its payload (the kernel has the
+  /// rules and the price that picks zero over keep). The frame's blocks must
+  /// be strictly increasing, as the encoder's sort leaves them. Reads back 8
+  /// bytes, the survivor count, which @ref diffed needs.
+  /// @param batch  The batch to record into; submitted by the caller.
+  /// @param n      The frame's blocks.
+  /// @param k      Their K, the held reference's.
+  /// @param stage  As @ref record_apply.
+  /// @return OK; `Status::Code::InvalidArgument` for no reference held, a K
+  ///         other than its, more blocks than @ref reserve made room for,
+  ///         more than 2^32 - 1 entries, or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
+  core::Status record_diff(core::CommandBatch& batch, std::uint32_t n,
+                           std::uint32_t k,
+                           core::GpuStageScope* stage = nullptr);
+
+  /// @return After the last @ref record_diff's batch has run, the P-frame's
+  ///         M + A entries by stream position, as the device frame writer
+  ///         codes them, valid until the next @ref record_diff; or
+  ///         `Status::Code::InvalidArgument` for a survivor count past the
+  ///         reference's or the frame's blocks (a bug, never a frame's).
+  core::Result<ResidentBlocks> diffed() const;
+
   /// @brief Hold the spare as the reference: the only call that changes
   ///        @ref held and @ref reference_list.
-  /// @pre The last @ref record_apply's batch was submitted and succeeded,
-  ///      and the spare's list holds the frame's
+  /// @pre The batch that made the spare's frame -- the last
+  ///      @ref record_apply's, or an encoder's forward -- was submitted and
+  ///      succeeded, and the spare's list holds the frame's
   ///      `reference.header.block_count` blocks.
   void commit(const FrameReference& reference);
 
@@ -155,6 +207,8 @@ class VR_CODEC_API ReferenceStore {
 
   // Declared before pool_, so the pool is destroyed first.
   core::ComputeKernel apply_kernel_;
+  core::ComputeKernel diff_kernel_;
+  core::ComputeKernel ranks_kernel_;  // survivor_ranks.comp, between passes
   core::DescriptorPool pool_;
 
   // slots_[current_] holds the reference; the other is the spare.
@@ -162,11 +216,27 @@ class VR_CODEC_API ReferenceStore {
   std::uint32_t current_ = 0;
   core::Buffer sources_;  // the apply's, an ApplySource a block
   core::Buffer faults_;   // the apply's out-of-range sources, a u32
+  // The diff's P-frame entries: masks and coefficients by stream position,
+  // a mode a reference entry, the survivor ranks (M + 1), the new blocks'
+  // list, and the ranks' two words (survivor_ranks.comp's verdict layout,
+  // the survivor count second).
+  core::Buffer diff_masks_;
+  core::Buffer diff_coefficients_;
+  core::Buffer modes_;
+  core::Buffer ranks_;
+  core::Buffer added_;
+  core::Buffer survivors_;
 
   bool held_ = false;
   FrameReference reference_;
   // What the last apply's batch read back of faults_.
   std::uint32_t faults_host_ = 0;
+  // The last diff's M, blocks and K, and what its batch read back of
+  // survivors_.
+  std::uint32_t diff_m_ = 0;
+  std::uint32_t diff_n_ = 0;
+  std::uint32_t diff_k_ = 0;
+  std::uint32_t survivors_host_[2] = {};
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

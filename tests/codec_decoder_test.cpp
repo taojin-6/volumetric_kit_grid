@@ -7,8 +7,11 @@
 // sphere it came from; frame after frame into one grid leaves exactly the
 // last frame; every refusal before the grid is touched leaves it untouched;
 // a grid whose hash table cannot place the frame says so and recovers after a
-// resize; read_frame_info; the stage rows; the moves. Links recon_mesh, which
-// the codec tier itself may not. Skips with no device.
+// resize; read_frame_info; the stage rows; the moves; and the Encoder's
+// P-frame chains, at a period of 30 and open-ended, decoding to exactly the
+// grids its I-frames of the same content do, and recovering from a lost
+// frame through force_intra(). Links recon_mesh, which the codec tier itself
+// may not. Skips with no device.
 
 #include <algorithm>
 #include <cmath>
@@ -721,6 +724,126 @@ int moves_case(Gpu& gpu) {
   return 0;
 }
 
+// A sphere that moves and grows beside one that stays, at step @p t.
+vkc::Result<vol::VoxelBlockGrid> chain_grid(Gpu& gpu, int t) {
+  const Sphere moving{
+      vr::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
+      0.07f + 0.002f * float(t)};
+  return two_sphere_grid(gpu, moving,
+                         Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
+}
+
+// Chains of P-frames at a period of 30 and open-ended, each decoded frame
+// after frame into one grid by a decoder of its own, leave that grid bit for
+// bit as an all-intra chain of the same grids leaves another, at every frame;
+// the period's chain crosses its second I-frame.
+int p_chain_case(Gpu& gpu) {
+  struct Chain {
+    std::uint32_t period;
+    codec::Encoder enc;
+    codec::Decoder dec;
+    vol::VoxelBlockGrid grid;
+  };
+  std::vector<Chain> chains;
+  for (const std::uint32_t period : {1u, 30u, ~0u}) {
+    codec::EncoderConfig config;
+    config.intra_period = period;
+    vkc::Result<codec::Encoder> enc =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    vkc::Result<codec::Decoder> dec =
+        codec::Decoder::create(gpu.device, gpu.allocator);
+    vkc::Result<vol::VoxelBlockGrid> grid = make_grid(gpu);
+    CHECK(enc.ok() && dec.ok() && grid.ok());
+    chains.push_back(Chain{period, std::move(enc).value(),
+                           std::move(dec).value(), std::move(grid).value()});
+  }
+  std::size_t p_frames = 0;
+  for (int t = 0; t < 32; ++t) {
+    vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
+    CHECK(g.ok());
+    std::vector<Snapshot> decoded;
+    for (Chain& c : chains) {
+      vkc::Result<Bytes> frame = c.enc.encode(g.value());
+      CHECK(frame.ok());
+      vkc::Result<codec::FrameInfo> info =
+          codec::read_frame_info(frame.value().data(), frame.value().size());
+      CHECK(info.ok());
+      const bool intra = t % std::int64_t(c.period) == 0;
+      CHECK(info.value().type ==
+            (intra ? codec::FrameType::kIntra : codec::FrameType::kInter));
+      p_frames += intra ? 0 : 1;
+      CHECK(c.dec.decode(frame.value().data(), frame.value().size(), c.grid)
+                .ok());
+      vkc::Result<Snapshot> snap = snapshot(gpu, c.grid);
+      CHECK(snap.ok());
+      decoded.push_back(std::move(snap).value());
+    }
+    for (const Snapshot& s : decoded) {
+      if (!(s == decoded[0])) {
+        std::fprintf(stderr, "frame %d: a chain differs from all-intra\n", t);
+        return 1;
+      }
+    }
+    CHECK(!decoded[0].coords.empty());
+  }
+  CHECK(p_frames == 30 + 31);
+  return 0;
+}
+
+// A frame the Encoder returned and the player lost breaks the chain: the
+// P-frame after it is NotFound, the grid untouched; force_intra() makes the
+// next frame an I-frame, which the player decodes, and the P-frames after
+// it decode as the all-intra chain does.
+int lost_frame_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 30;
+  vkc::Result<codec::Encoder> made =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<codec::Decoder> intra_dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
+  vkc::Result<vol::VoxelBlockGrid> intra_player = make_grid(gpu);
+  CHECK(made.ok() && dec.ok() && intra_dec.ok() && player.ok() &&
+        intra_player.ok());
+  codec::Encoder& enc = made.value();
+  for (int t = 0; t < 6; ++t) {
+    vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
+    CHECK(g.ok());
+    if (t == 3) enc.force_intra();
+    vkc::Result<Bytes> frame = enc.encode(g.value());
+    CHECK(frame.ok());
+    const Bytes& f = frame.value();
+    if (t == 1) continue;  // lost
+    if (t == 2) {
+      vkc::Result<Snapshot> before = snapshot(gpu, player.value());
+      const vkc::Status s =
+          dec.value().decode(f.data(), f.size(), player.value());
+      CHECK(!s.ok() && s.domain() == vkc::Status::Code::NotFound);
+      vkc::Result<Snapshot> after = snapshot(gpu, player.value());
+      CHECK(before.ok() && after.ok() && before.value() == after.value());
+      continue;
+    }
+    vkc::Result<codec::FrameInfo> info =
+        codec::read_frame_info(f.data(), f.size());
+    CHECK(info.ok() &&
+          info.value().type == (t == 0 || t == 3 ? codec::FrameType::kIntra
+                                                 : codec::FrameType::kInter));
+    CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
+    vkc::Result<Bytes> intra = encode_with(gpu, g.value());
+    CHECK(intra.ok());
+    CHECK(intra_dec.value()
+              .decode(intra.value().data(), intra.value().size(),
+                      intra_player.value())
+              .ok());
+    vkc::Result<Snapshot> got = snapshot(gpu, player.value());
+    vkc::Result<Snapshot> want = snapshot(gpu, intra_player.value());
+    CHECK(got.ok() && want.ok() && got.value() == want.value());
+  }
+  return 0;
+}
+
 }  // namespace
 
 int gpu_main(vr_test::GpuContext& gpu) {
@@ -737,6 +860,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (metrics_case(gpu, dec) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   if (frame_info_case(gpu) != 0) return 1;
+  if (p_chain_case(gpu) != 0) return 1;
+  if (lost_frame_case(gpu) != 0) return 1;
   std::printf("codec Decoder: OK\n");
   return 0;
 }

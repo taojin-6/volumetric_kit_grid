@@ -316,6 +316,7 @@ core::Result<std::uint32_t> DctTransform::observed(
 core::Result<ResidentBlocks> DctTransform::record_forward(
     core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
     const core::Buffer& list, std::uint32_t count, const CodecParams& params,
+    const core::Buffer& masks, const core::Buffer& coefficients,
     std::uint32_t& rejected, core::GpuStageScope* stage) {
   rejected = 0;
   VKC_ASSIGN(GridViews views, check_inputs("forward", grid, params));
@@ -343,15 +344,23 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
                                    sizeof(std::int16_t);
   const VkDeviceSize mask_bytes =
       VkDeviceSize(count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
-  VKC_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
-  VKC_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
+  if (masks.size() < mask_bytes || coefficients.size() < coeff_bytes) {
+    return fail("forward", "the output buffers do not hold " +
+                               std::to_string(count) + " blocks");
+  }
+  VKC_TRY(core::check_storage_buffer_range(
+      "DctTransform::forward: the coefficients", coeff_bytes,
+      max_storage_buffer_range_));
+  VKC_TRY(core::check_storage_buffer_range("DctTransform::forward: the masks",
+                                           mask_bytes,
+                                           max_storage_buffer_range_));
   VKC_TRY(record(batch, forward_kernel_, grid, views, list.handle(), count,
-                 params, coefficients_.handle(), masks_.handle(), mask_bytes,
+                 params, coefficients.handle(), masks.handle(), mask_bytes,
                  stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
   out.list = &list;
-  out.masks = &masks_;
-  out.coefficients = &coefficients_;
+  out.masks = &masks;
+  out.coefficients = &coefficients;
   out.count = count;
   return out;
 }

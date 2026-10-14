@@ -103,6 +103,14 @@ std::uint32_t model_alphabet(std::uint32_t model, std::uint32_t k);
 std::vector<std::uint32_t> entry_steps(const Frame& frame,
                                        std::uint32_t segment_size);
 
+// The bits the Encoder's static price (inter_diff.comp) gives a payload of
+// @p mask (16 words) and @p k coefficients: frame_grammar.glsl's
+// emit_payload walked with a symbol costing bit_length(symbol) + 1 bits, a
+// byte model's 8, and a raw field its bits -- the price that picks a
+// P-frame's zero over keep when strictly lower.
+std::uint64_t payload_price(const std::uint32_t* mask,
+                            const std::int16_t* coefficients, std::uint32_t k);
+
 // The device writer's step layout (step_layout.hpp), on the host, in 64
 // bits: E, the steps before each entry, then their total; and each
 // segment's slot's first 16-bit word -- a word a step and the state's two,

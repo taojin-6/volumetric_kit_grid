@@ -56,9 +56,9 @@ struct DctTransformConfig {
 /// @brief Blocks where the device holds them: @ref count entries of masks
 ///        and coefficients, and their block list, in the layout the kernels
 ///        write. Borrowed from what produced them -- the transform's
-///        @ref DctTransform::record_forward (whose list is its caller's), the
-///        device frame reader or the reference store -- and valid until that
-///        object's next call.
+///        @ref DctTransform::record_forward (whose buffers are its caller's),
+///        the device frame reader or the reference store -- and valid until
+///        that object's next call.
 ///
 /// A P-frame's entries are its stream positions (bitstream.hpp): its
 /// @ref reference_count reference entries, each with its mode, then its new
@@ -119,12 +119,13 @@ struct ResidentBlocks {
 ///
 /// Every buffer is device-local, and no block list, coefficient or mask
 /// leaves the device: the forward reads its list where the caller holds it,
-/// is recorded into the caller's batch and leaves its output for the device
-/// frame writer, and the inverse reads its input where the reference store's
-/// apply wrote it, in the caller's batch too; each reads back its reject
-/// count alone, and the observed filter its count and reject tally. Scratch
-/// buffers grow when needed and remain allocated for later calls. The
-/// coefficients travel two to a word, 16 bits each.
+/// is recorded into the caller's batch and writes its output where the
+/// caller says (the encoder's reference store, from which the device frame
+/// writer codes it), and the inverse reads its input where the reference
+/// store's apply wrote it, in the caller's batch too; each reads back its
+/// reject count alone, and the observed filter its count and reject tally.
+/// The observed list grows when needed and remains allocated for later
+/// calls. The coefficients travel two to a word, 16 bits each.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -146,36 +147,42 @@ class VR_CODEC_API DctTransform {
   DctTransform& operator=(const DctTransform&) = delete;
 
   /// @brief Record the transform and quantization of the first @p count
-  ///        blocks of @p list into @p batch, leaving the output on the device
-  ///        for the device frame writer.
+  ///        blocks of @p list into @p batch, its output into @p masks and
+  ///        @p coefficients by list position.
   ///
-  /// The masks and coefficients stay in this transform's buffers until its
-  /// next call, beside @p list, which the output borrows. When @p batch is
-  /// submitted, @p rejected receives the entries the kernel found no block
-  /// for, which @ref check_rejected turns into a refusal.
-  /// @param batch     The batch to record into; submitted by the caller.
-  /// @param grid      The grid the list names; must carry 4-byte `tsdf` and
-  ///                  `weight` attributes and have `block_size` 8.
-  /// @param list      `volume::BlockIndex` entries on the device, found by
-  ///                  `coord` (each `ptr` is ignored); must outlive the
-  ///                  output.
-  /// @param count     The entries to transform.
-  /// @param params    The coefficient count and steps.
-  /// @param rejected  Written at submit; must outlive it.
-  /// @param stage     Optional scope the caller's stage row is open under; the
-  ///                  dispatches record their device spans into it. `nullptr`
-  ///                  times nothing.
-  /// @return The resident output (no entries for @p count 0, which records
-  ///         nothing), or, before anything is recorded,
-  ///         `Status::Code::InvalidArgument` for invalid @p params, a grid
-  ///         that is moved-from, has another block size, a non-positive
-  ///         `trunc_dist`, or lacks a float `tsdf` / `weight`; more entries
-  ///         than the grid's block heap; a @p list `StorageInput::check`
-  ///         refuses for them; or a buffer that would exceed
+  /// When @p batch is submitted, @p rejected receives the entries the
+  /// kernel found no block for, which @ref check_rejected turns into a
+  /// refusal.
+  /// @param batch         The batch to record into; submitted by the caller.
+  /// @param grid          The grid the list names; must carry 4-byte `tsdf`
+  ///                      and `weight` attributes and have `block_size` 8.
+  /// @param list          `volume::BlockIndex` entries on the device, found
+  ///                      by `coord` (each `ptr` is ignored); must outlive
+  ///                      the output.
+  /// @param count         The entries to transform.
+  /// @param params        The coefficient count and steps.
+  /// @param masks         Where each entry's `kMaskWordsPerBlock` mask words
+  ///                      go; must outlive the output.
+  /// @param coefficients  Where each entry's @ref coefficient_words(K)
+  ///                      words go, an odd K's pad half 0; must outlive the
+  ///                      output.
+  /// @param rejected      Written at submit; must outlive it.
+  /// @param stage         Optional scope the caller's stage row is open
+  ///                      under; the dispatches record their device spans
+  ///                      into it. `nullptr` times nothing.
+  /// @return The output, borrowing @p list, @p masks and @p coefficients
+  ///         (no entries for @p count 0, which records nothing), or, before
+  ///         anything is recorded, `Status::Code::InvalidArgument` for
+  ///         invalid @p params, a grid that is moved-from, has another block
+  ///         size, a non-positive `trunc_dist`, or lacks a float `tsdf` /
+  ///         `weight`; more entries than the grid's block heap; a @p list
+  ///         `StorageInput::check` refuses for them; output buffers smaller
+  ///         than they need; or a buffer that would exceed
   ///         `maxStorageBufferRange`. Otherwise a buffer failure.
   core::Result<ResidentBlocks> record_forward(
       core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
       const core::Buffer& list, std::uint32_t count, const CodecParams& params,
+      const core::Buffer& masks, const core::Buffer& coefficients,
       std::uint32_t& rejected, core::GpuStageScope* stage = nullptr);
 
   /// @return The refusal for @p rejected entries of @p count the kernels
@@ -296,10 +303,8 @@ class VR_CODEC_API DctTransform {
   // in each call's batch. Forward/inverse only read the first word back.
   core::Buffer rejected_;
   // Scratch stays alive between calls; each binding uses its logical range,
-  // not the retained capacity. No allocation when a call fits these buffers.
+  // not the retained capacity. No allocation when a call fits it.
   core::Buffer observed_blocks_;
-  core::Buffer coefficients_;
-  core::Buffer masks_;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

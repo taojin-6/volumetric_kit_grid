@@ -1,21 +1,27 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// GPU test for decoding on the device: the reference store's apply against
-// independent uint16 arithmetic, at every source kind and K, in one dispatch
-// or several, as its slots grow, and its sources past what is bound counted
-// and refused; and the Decoder's frames -- the Encoder's, and chains of an
-// I-frame, then P-frames, new blocks at int32's extremes among them --
+// GPU test for P-frames on the device. Decoding: the reference store's apply
+// against independent uint16 arithmetic, at every source kind and K, in one
+// dispatch or several, as its slots grow, and its sources past what is bound
+// counted and refused; and the Decoder's frames -- the Encoder's, and chains
+// of an I-frame, then P-frames, new blocks at int32's extremes among them --
 // leaving the grid exactly as the CPU oracle's decode of the same content
 // does, bit for bit, with every mode, new blocks and the empty cases; a
 // P-frame whose reference is not held refused as NotFound, a segment longer
 // than the format allows refused, every refusal and failure leaving the
 // reference as it was, and the device buffers grown and shrunk frame to
-// frame. Internal headers by include path; skips with no device.
+// frame. Encoding: every frame of the Encoder's chains the CPU oracle's
+// bytes, its P-frames priced as the oracle prices them; each of the diff's
+// choices from one edit of a frame; a difference of 32768 coded zero, in
+// either half of a coefficient word; and the diff's refusals. Internal
+// headers by include path; skips with no device.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -27,6 +33,7 @@
 #include "codec_frames.hpp"
 #include "codec_oracle.hpp"
 #include "codec_oracle_device.hpp"
+#include "codec_oracle_encode.hpp"
 #include "dct_transform.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -966,6 +973,410 @@ int segment_rule_case(Gpu& gpu) {
   return 0;
 }
 
+// --- The Encoder's P-frames. -------------------------------------------------
+
+// One frame of an Encoder's chain: what it sent, the oracle's intra frame of
+// the same grid, and the content both code, read off that intra frame.
+struct Coded {
+  Bytes sent;
+  Bytes intra;
+  oracle::Frame content;
+};
+
+// Encode @p grid with @p enc and hold the bytes to the oracle's: an I-frame
+// to the oracle's intra frame of the grid, a P-frame to the oracle's writer
+// over encoder_frame against the chain's last frame, at U =
+// kDefaultUpdateSize. Appends the frame to @p chain.
+int encode_checked(Gpu& gpu, codec::Encoder& enc,
+                   const codec::EncoderConfig& config,
+                   vol::VoxelBlockGrid& grid, std::vector<Coded>& chain) {
+  vkc::Result<Bytes> sent = enc.encode(grid);
+  vkc::Result<Bytes> intra = oracle::encode(gpu, grid, config);
+  CHECK(sent.ok() && intra.ok());
+  vkc::Result<oracle::Frame> content = oracle::read_frame(
+      intra.value().data(), intra.value().size(), kMaxBlocks);
+  vkc::Result<codec::FrameInfo> info =
+      codec::read_frame_info(sent.value().data(), sent.value().size());
+  CHECK(content.ok() && info.ok());
+  if (info.value().type == codec::FrameType::kIntra) {
+    CHECK(sent.value() == intra.value());
+  } else {
+    CHECK(!chain.empty());
+    const Coded& prev = chain.back();
+    oracle::FrameWriteOptions options;
+    options.segment_size = config.segment_size;
+    options.update_size = d::kDefaultUpdateSize;
+    vkc::Result<Bytes> want = oracle::write_frame(
+        codec_frames::encoder_frame(reference_of(prev.sent), prev.content,
+                                    content.value()),
+        options);
+    CHECK(want.ok());
+    if (sent.value() != want.value()) {
+      std::fprintf(stderr, "frame %zu: the P-frame is not the oracle's\n",
+                   chain.size());
+      return 1;
+    }
+  }
+  chain.push_back(Coded{std::move(sent).value(), std::move(intra).value(),
+                        std::move(content).value()});
+  return 0;
+}
+
+// The modes a P-frame of @p chain's last two holds, and its new blocks.
+Census census_of(const std::vector<Coded>& chain) {
+  const Coded& prev = chain[chain.size() - 2];
+  const Coded& p = chain.back();
+  const d::FrameReference id = reference_of(prev.sent);
+  const oracle::Frame f =
+      oracle::read_frame(p.sent.data(), p.sent.size(), kMaxBlocks, &id).value();
+  Census c;
+  for (d::BlockMode m : f.modes) ++c.modes[std::size_t(m)];
+  c.added = f.coords.size();
+  return c;
+}
+
+codec::FrameType type_of(const Bytes& frame) {
+  return codec::read_frame_info(frame.data(), frame.size()).value().type;
+}
+
+// A sphere that moves and grows beside one that stays: chains at period 4
+// and open-ended, at an odd K in segments of 3 and at the defaults, every
+// frame the oracle's bytes, every P-frame decoding to its I-frame's grid;
+// and among the P-frames every mode the encoder chooses but motion, and new
+// blocks.
+int encoder_chain_case(Gpu& gpu) {
+  for (const std::uint32_t period : {4u, ~0u}) {
+    for (const bool odd : {true, false}) {
+      codec::EncoderConfig config;
+      config.intra_period = period;
+      if (odd) {
+        config.params.coefficient_count = 37;
+        config.segment_size = 3;
+      }
+      vkc::Result<codec::Encoder> enc =
+          codec::Encoder::create(gpu.device, gpu.allocator, config);
+      vkc::Result<codec::Decoder> dec =
+          codec::Decoder::create(gpu.device, gpu.allocator);
+      CHECK(enc.ok() && dec.ok());
+      std::vector<Coded> chain;
+      Census all;
+      vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
+      CHECK(player.ok());
+      for (int t = 0; t < 7; ++t) {
+        const Sphere moving{
+            vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
+            0.09f + 0.006f * float(t)};
+        const Sphere still{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
+        vkc::Result<vol::VoxelBlockGrid> g =
+            two_sphere_grid(gpu, moving, still);
+        CHECK(g.ok());
+        CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
+        const bool intra = t == 0 || (period == 4 && t == 4);
+        CHECK(type_of(chain.back().sent) ==
+              (intra ? codec::FrameType::kIntra : codec::FrameType::kInter));
+        const Bytes& f = chain.back().sent;
+        CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
+        CHECK(holds(gpu, player.value(), chain.back().intra));
+        if (!intra) {
+          const Census c = census_of(chain);
+          for (std::size_t m = 0; m < 5; ++m) all.modes[m] += c.modes[m];
+          all.added += c.added;
+        }
+      }
+      CHECK(all.modes[std::size_t(d::BlockMode::kKeep)] > 0);
+      CHECK(all.modes[std::size_t(d::BlockMode::kSkip)] > 0);
+      CHECK(all.modes[std::size_t(d::BlockMode::kRemove)] > 0);
+      CHECK(all.modes[std::size_t(d::BlockMode::kMotion)] == 0);
+      CHECK(all.added > 0);
+    }
+  }
+  return 0;
+}
+
+// A block's voxels: SDF as a fraction of the band, and whether each is
+// observed.
+struct Voxels {
+  std::vector<float> sdf = std::vector<float>(kVpb, 0.0f);
+  std::vector<bool> observed = std::vector<bool>(kVpb, true);
+};
+
+using Content = std::map<vr::Vec3i, Voxels, codec_frames::ZyxLess>;
+
+Voxels constant(float sdf) {
+  Voxels v;
+  v.sdf.assign(kVpb, sdf);
+  return v;
+}
+
+// Values drawn from all of [-1, 1]: every coefficient large.
+Voxels noise(Lcg& rng) {
+  Voxels v;
+  for (float& f : v.sdf) f = float(rng.below(2001)) / 1000.0f - 1.0f;
+  return v;
+}
+
+// A plane through the block: a fused surface's smooth field.
+Voxels slope(int tilt) {
+  Voxels v;
+  for (std::uint32_t i = 0; i < kVpb; ++i) {
+    const int x = int(i % 8);
+    const int y = int(i / 8 % 8);
+    const int z = int(i / 64);
+    v.sdf[i] = float(x + tilt * y + z - 7) / 16.0f;
+  }
+  return v;
+}
+
+// A grid holding exactly @p content, of the fixture's geometry.
+vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
+                                              const Content& content) {
+  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
+  std::vector<vr::Vec3i> coords;
+  for (const auto& [c, voxels] : content) coords.push_back(c);
+  VKC_TRY(allocate(gpu, grid, coords));
+  VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
+  VKC_ASSIGN(
+      std::vector<float> tsdf,
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VKC_ASSIGN(std::vector<float> weight,
+             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                            "weight"));
+  for (const vol::BlockIndex& b : blocks) {
+    const Voxels& v = content.at(b.coord);
+    for (std::uint32_t i = 0; i < kVpb; ++i) {
+      tsdf[std::uint32_t(b.ptr) + i] = v.observed[i] ? v.sdf[i] * kTrunc : 0.0f;
+      weight[std::uint32_t(b.ptr) + i] = v.observed[i] ? 2.0f : 0.0f;
+    }
+  }
+  VKC_TRY(
+      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
+                                   weight));
+  return grid;
+}
+
+// What the diff chooses, each from one edit of a reference frame: an
+// unchanged grid all skip; one block changed, one entry that is not; a mask
+// changed alone, keep with residuals of 0; a block gone and one added; an
+// empty grid, every entry removed, and the frame after it an I-frame; and
+// new content against unrelated content zero, a small change keep. Every
+// frame is the oracle's, and the prices agree.
+int diff_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 1000;
+  config.segment_size = 2;
+  vkc::Result<codec::Encoder> made =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  CHECK(made.ok());
+  codec::Encoder& enc = made.value();
+  Lcg rng{91};
+  Content base;
+  base[vr::Vec3i(0, 0, 0)] = constant(0.3f);
+  base[vr::Vec3i(1, 0, 0)] = slope(1);
+  base[vr::Vec3i(3, 0, 0)] = slope(2);
+  base[vr::Vec3i(0, 2, 0)] = noise(rng);
+  base[vr::Vec3i(-4, 1, 7)] = noise(rng);
+  base[vr::Vec3i(5, -3, 2)] = constant(-0.6f);
+  std::vector<Coded> chain;
+  // Encode @p content, a P-frame on the chain's last frame: its modes, in
+  // reference order, and its new blocks.
+  auto next = [&](const Content& content, oracle::Frame& p) {
+    vkc::Result<vol::VoxelBlockGrid> g = content_grid(gpu, content);
+    if (!g.ok() || encode_checked(gpu, enc, config, g.value(), chain) != 0 ||
+        type_of(chain.back().sent) != codec::FrameType::kInter) {
+      return false;
+    }
+    const d::FrameReference id = reference_of(chain[chain.size() - 2].sent);
+    const Bytes& f = chain.back().sent;
+    vkc::Result<oracle::Frame> read =
+        oracle::read_frame(f.data(), f.size(), kMaxBlocks, &id);
+    if (!read.ok()) return false;
+    p = std::move(read).value();
+    return true;
+  };
+  auto count = [](const oracle::Frame& p, d::BlockMode mode) {
+    return std::size_t(std::count(p.modes.begin(), p.modes.end(), mode));
+  };
+  vkc::Result<vol::VoxelBlockGrid> first = content_grid(gpu, base);
+  CHECK(first.ok());
+  CHECK(encode_checked(gpu, enc, config, first.value(), chain) == 0);
+  CHECK(type_of(chain.back().sent) == codec::FrameType::kIntra);
+  const std::size_t m = base.size();
+
+  oracle::Frame p;
+  CHECK(next(base, p));
+  CHECK(count(p, d::BlockMode::kSkip) == m && p.coords.empty());
+
+  // A plane of one block lowered: several coefficients change.
+  Content changed = base;
+  for (std::uint32_t i = 0; i < 64; ++i) {
+    changed.at(vr::Vec3i(1, 0, 0)).sdf[i] -= 0.3f;
+  }
+  CHECK(next(changed, p));
+  CHECK(count(p, d::BlockMode::kSkip) == m - 1 && p.coords.empty());
+
+  // One voxel of the constant block unobserved: the forward fills it with
+  // the same value, so the coefficients stay and the mask alone changes.
+  Content masked = changed;
+  masked.at(vr::Vec3i(0, 0, 0)).observed[77] = false;
+  CHECK(next(masked, p));
+  CHECK(p.modes[0] == d::BlockMode::kKeep);
+  CHECK(count(p, d::BlockMode::kSkip) == m - 1);
+  const Payload x = payload_at(p.blocks, 0);
+  CHECK(std::all_of(x.q.begin(), x.q.end(),
+                    [](std::int16_t v) { return v == 0; }));
+  std::uint32_t bits = 0;
+  for (std::uint32_t w : x.mask) bits += std::uint32_t(__builtin_popcount(w));
+  CHECK(bits == 1 && (x.mask[77 / 32] >> (77 % 32) & 1u) == 1u);
+
+  Content moved = masked;
+  moved.erase(vr::Vec3i(3, 0, 0));
+  moved[vr::Vec3i(2, 0, 0)] = slope(3);
+  CHECK(next(moved, p));
+  CHECK(count(p, d::BlockMode::kRemove) == 1 &&
+        count(p, d::BlockMode::kSkip) == m - 1);
+  CHECK(p.coords == std::vector<vr::Vec3i>{vr::Vec3i(2, 0, 0)});
+
+  // A smooth block where noise was is zero, its residuals costing more than
+  // its values; noise with one plane lowered is keep, the other way round.
+  Content unrelated = moved;
+  unrelated.at(vr::Vec3i(0, 2, 0)) = slope(1);
+  for (std::uint32_t i = 448; i < kVpb; ++i) {
+    float& v = unrelated.at(vr::Vec3i(-4, 1, 7)).sdf[i];
+    v = std::max(v - 0.2f, -1.0f);
+  }
+  CHECK(next(unrelated, p));
+  const oracle::Frame& ref = chain[chain.size() - 2].content;
+  std::map<vr::Vec3i, d::BlockMode, codec_frames::ZyxLess> mode_of;
+  for (std::size_t e = 0; e < ref.coords.size(); ++e) {
+    mode_of[ref.coords[e]] = p.modes[e];
+  }
+  CHECK(mode_of.at(vr::Vec3i(0, 2, 0)) == d::BlockMode::kZero);
+  CHECK(mode_of.at(vr::Vec3i(-4, 1, 7)) == d::BlockMode::kKeep);
+
+  // Every block gone: N = 0, all removed; then M = 0, so an I-frame.
+  CHECK(next(Content{}, p));
+  CHECK(count(p, d::BlockMode::kRemove) == p.modes.size() && p.coords.empty() &&
+        !p.modes.empty());
+  CHECK(
+      codec::read_frame_info(chain.back().sent.data(), chain.back().sent.size())
+          .value()
+          .block_count == 0);
+  vkc::Result<vol::VoxelBlockGrid> again = content_grid(gpu, base);
+  CHECK(again.ok());
+  CHECK(encode_checked(gpu, enc, config, again.value(), chain) == 0);
+  CHECK(type_of(chain.back().sent) == codec::FrameType::kIntra);
+  return 0;
+}
+
+// A difference of 32768 in coefficient @p j -- +16384 against -16384, at a
+// scale that puts it exactly there, which the I-frames confirm -- is the one
+// residual no class carries, so the block is zero, where the price would
+// keep it: what the two blocks share makes the target's values cost more
+// than the residuals. At j = 0, a word's low half, the DC of a mean SDF of
+// +-0.9 beside a shared ramp along x; at j = 3, the (1, 0, 0) basis and a
+// word's high half, its cosine at +-0.75 on a shared level. The P-frame
+// decodes to the target's grid.
+int wrap_case(Gpu& gpu, std::uint32_t j) {
+  codec::EncoderConfig config;
+  config.intra_period = 2;
+  config.params.coefficient_count = 4;
+  // The DC of a block of normalized SDF v is v sqrt(512); the (1, 0, 0)
+  // coefficient of a cos(pi (2x + 1) / 16) is 16 a.
+  const float amplitude = j == 0 ? 0.9f : 0.75f;
+  config.params.quantization_scale =
+      amplitude * (j == 0 ? 22.627417f : 16.0f) / 16384.0f;
+  CHECK(config.params.quantization_scale > codec::kMinStep);
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  CHECK(enc.ok());
+  // The block of coefficient j at +-16384, the other part shared.
+  auto block = [&](float sign) {
+    Voxels v;
+    for (std::uint32_t i = 0; i < kVpb; ++i) {
+      const int x = int(i % 8);
+      const double wave = std::cos(3.14159265358979 * (2 * x + 1) / 16.0);
+      v.sdf[i] = j == 0 ? sign * amplitude + 0.1f * float(2 * x - 7) / 7.0f
+                        : 0.2f + sign * amplitude * float(wave);
+    }
+    return v;
+  };
+  Content up;
+  up[vr::Vec3i(0, 0, 0)] = block(1.0f);
+  up[vr::Vec3i(1, 0, 0)] = slope(1);
+  Content down = up;
+  down.at(vr::Vec3i(0, 0, 0)) = block(-1.0f);
+  std::vector<Coded> chain;
+  vkc::Result<vol::VoxelBlockGrid> a = content_grid(gpu, up);
+  vkc::Result<vol::VoxelBlockGrid> b = content_grid(gpu, down);
+  CHECK(a.ok() && b.ok());
+  CHECK(encode_checked(gpu, enc.value(), config, a.value(), chain) == 0);
+  CHECK(encode_checked(gpu, enc.value(), config, b.value(), chain) == 0);
+  const Payload r = payload_at(chain[0].content.blocks, 0);
+  const Payload t = payload_at(chain[1].content.blocks, 0);
+  CHECK(r.q[j] == 16384 && t.q[j] == -16384);
+  // The premise: keep's residuals, the -32768 included, price below the
+  // target's values.
+  Payload x = t;
+  for (std::size_t i = 0; i < x.q.size(); ++i) {
+    x.q[i] = codec_frames::residual(t.q[i], r.q[i]);
+  }
+  for (std::size_t w = 0; w < x.mask.size(); ++w) x.mask[w] ^= r.mask[w];
+  CHECK(x.q[j] == std::numeric_limits<std::int16_t>::min());
+  CHECK(oracle::payload_price(x.mask.data(), x.q.data(), 4) <
+        oracle::payload_price(t.mask.data(), t.q.data(), 4));
+  CHECK(type_of(chain[1].sent) == codec::FrameType::kInter);
+  const Census c = census_of(chain);
+  CHECK(c.modes[std::size_t(d::BlockMode::kZero)] == 1);
+  CHECK(c.modes[std::size_t(d::BlockMode::kSkip)] == 1);
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
+  CHECK(dec.ok() && player.ok());
+  for (const Coded& f : chain) {
+    CHECK(
+        dec.value().decode(f.sent.data(), f.sent.size(), player.value()).ok());
+  }
+  CHECK(holds(gpu, player.value(), chain[1].intra));
+  return 0;
+}
+
+// What the diff refuses before it records: no reference held, a K not the
+// reference's, more blocks than reserved; and the entries it leaves.
+int diff_refusals_case(Gpu& gpu) {
+  vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
+      d::ReferenceStore::create(gpu.device, gpu.allocator);
+  CHECK(made.ok());
+  d::ReferenceStore& store = *made.value();
+  auto refused = [&](std::uint32_t n, std::uint32_t k, const char* says) {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    const vkc::Status s = store.record_diff(batch, n, k);
+    return !s.ok() && s.domain() == C::InvalidArgument &&
+           s.message().find(says) != std::string::npos;
+  };
+  CHECK(refused(0, 8, "no reference is held"));
+  Lcg rng{37};
+  CHECK(commit_intra(gpu, store, random_entries(5, 8, rng), 3) == 0);
+  CHECK(store.reserve(4, 8).ok());
+  CHECK(refused(4, 9, "a frame at K 9 on a reference at K 8"));
+  CHECK(refused(1000, 8, "1000 blocks, more than were reserved"));
+  // A frame of no blocks: every entry removed, nothing new.
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  CHECK(store.record_diff(batch, 0, 8).ok());
+  CHECK(batch.submit().ok());
+  vkc::Result<d::ResidentBlocks> entries = store.diffed();
+  CHECK(entries.ok() && entries.value().count == 5 &&
+        entries.value().reference_count == 5);
+  vkc::Result<std::vector<std::uint32_t>> modes =
+      vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                        *entries.value().modes, 5);
+  CHECK(modes.ok() &&
+        modes.value() == std::vector<std::uint32_t>(
+                             5, std::uint32_t(d::BlockMode::kRemove)));
+  CHECK(store.held()->hash == 3);
+  return 0;
+}
+
 }  // namespace
 
 int gpu_main(vr_test::GpuContext& gpu) {
@@ -985,7 +1396,12 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (out_of_memory_case(gpu, s.value()) != 0) return 1;
   if (scratch_case(gpu, s.value()) != 0) return 1;
   if (moves_case(gpu, s.value()) != 0) return 1;
-  std::printf("codec P-frame decode: OK\n");
+  if (encoder_chain_case(gpu) != 0) return 1;
+  if (diff_case(gpu) != 0) return 1;
+  if (wrap_case(gpu, 0) != 0) return 1;
+  if (wrap_case(gpu, 3) != 0) return 1;
+  if (diff_refusals_case(gpu) != 0) return 1;
+  std::printf("codec P-frames: OK\n");
   return 0;
 }
 
