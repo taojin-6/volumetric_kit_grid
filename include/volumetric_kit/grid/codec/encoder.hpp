@@ -21,6 +21,7 @@
 namespace volumetric_kit::recon::codec {
 
 namespace detail {
+class BlockLists;
 class DctTransform;
 class DeviceFrameWriter;
 }  // namespace detail
@@ -99,9 +100,9 @@ class VR_CODEC_API Encoder {
   ///                 `"  ..active set"` (the compaction, when the map holds
   ///                 no list that is still its active set), `"  ..observed"`
   ///                 (finding the blocks with an observed voxel),
-  ///                 `"  ..sort"`, `"  ..forward"` (the transform, and the
-  ///                 symbol count, which shares its batch) and
-  ///                 `"  ..rans encode"` (coding and laying out the frame).
+  ///                 `"  ..forward"` (sorting them, the transform and the
+  ///                 symbol count, one batch) and `"  ..rans encode"` (coding
+  ///                 and laying out the frame).
   ///                 Named apart from the
   ///                 @ref Decoder's, so both timed into one
   ///                 `StageMetrics` stay apart. `nullptr` measures
@@ -128,6 +129,7 @@ class VR_CODEC_API Encoder {
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
+  std::unique_ptr<detail::BlockLists> lists_;
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
   // Device spans for the kernels; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;

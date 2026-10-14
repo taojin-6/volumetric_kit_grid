@@ -56,7 +56,8 @@ static_assert(offsetof(BlockIndex, ptr) == 12, "BlockIndex layout drift");
 
 /// @return `true` if block coordinate @p a sorts before @p b: by z, then y,
 ///         then x. The one order every sorted block list here uses, the
-///         codec's frames included.
+///         codec's frames included; `vrCoordLess` in
+///         `volume/shaders/coord_order.glsl` mirrors it for kernels.
 inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
   if (a.z != b.z) return a.z < b.z;
   if (a.y != b.y) return a.y < b.y;

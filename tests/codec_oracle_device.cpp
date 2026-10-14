@@ -79,10 +79,19 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
   out = DctBlocks{};
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t words = d::coefficient_words(k);
+  // The list on the device, as the encoder's sort leaves it; none for a null
+  // or empty one, which the transform refuses or takes as it is.
+  vkc::Buffer list;
+  if (blocks.blocks != nullptr && blocks.count != 0) {
+    VKC_ASSIGN(list, vr_test::upload_device_buffer(
+                         gpu.device, gpu.allocator, blocks.blocks,
+                         blocks.count * sizeof(vol::BlockIndex)));
+  }
   std::uint32_t rejected = 0;
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_ASSIGN(const d::ResidentBlocks resident,
-             t.record_forward(batch, grid, blocks, params, rejected));
+  VKC_ASSIGN(
+      const d::ResidentBlocks resident,
+      t.record_forward(batch, grid, list, blocks.count, params, rejected));
   const std::size_t n = resident.count;
   std::vector<std::uint32_t> packed(n * words);
   std::vector<std::uint32_t> masks(n * codec::kMaskWordsPerBlock);
