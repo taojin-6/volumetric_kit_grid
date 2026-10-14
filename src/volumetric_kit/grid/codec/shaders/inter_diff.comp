@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// A P-frame's entries, made by the encoder against its reference
+// (reference_store.hpp): the target -- the frame the forward made, in frame
+// order, in the store's spare -- split against the reference's blocks, each
+// reference entry coded against the target block on its coordinate. Two
+// passes, an invocation an item, with the survivor ranks
+// (survivor_ranks.comp) between them:
+//   pass 0, reference entry e: a binary search of the target's list for its
+//     coordinate. None is remove. A target block whose mask words and
+//     coefficient words all equal the reference's is skip. Otherwise the
+//     mask XOR and the residuals r_j = (q_t - q_ref) mod 2^16: an r_j of
+//     -32768, which no class carries, makes it zero, the target as it is;
+//     else it is keep, unless the target's payload prices strictly below the
+//     residual's, which is zero too. Keep and zero write their payload at
+//     stream position e, and every entry its mode.
+//   pass 1, target block t: a binary search of the reference's list. A block
+//     on a reference coordinate survives, pass 0's; any other is new block
+//     q = t - ranks[e] (the survivors below it), its coordinate added[q] and
+//     its payload at position M + q, as the forward made it.
+// The price is a static stand-in for the frame's tables, which do not exist
+// yet: emit_payload walked with a symbol costing bit_length(symbol) + 1
+// bits, a byte model's 8, and a raw field its bits. Integer only, so every
+// device chooses alike; it changes the encoder's bytes, never what a frame
+// decodes to. Writes stay below the bound buffers' entries.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+
+layout(local_size_x = 64) in;
+
+// Mirrors DiffPush in reference_store.cpp.
+layout(push_constant, std430) uniform Push {
+  uint item_base;          // first item this dispatch covers
+  uint reference_count;    // M, the reference's blocks
+  uint target_count;       // the target's blocks
+  uint coefficient_count;  // K, the reference's and the target's
+  uint pass;               // 0 the reference's entries, 1 the target's blocks
+}
+pc;
+
+layout(set = 0, binding = 0, scalar) readonly buffer ReferenceList {
+  BlockIndex reference_list[];  // M, strictly increasing
+};
+layout(set = 0, binding = 1, scalar) readonly buffer TargetList {
+  BlockIndex target_list[];  // strictly increasing
+};
+layout(set = 0, binding = 2, std430) readonly buffer ReferenceMasks {
+  uint reference_masks[];  // kMaskWords an entry
+};
+layout(set = 0, binding = 3, std430) readonly buffer ReferenceCoefficients {
+  uint reference_coefficients[];  // two int16 a word, (K + 1) / 2 an entry
+};
+layout(set = 0, binding = 4, std430) readonly buffer TargetMasks {
+  uint target_masks[];
+};
+layout(set = 0, binding = 5, std430) readonly buffer TargetCoefficients {
+  uint target_coefficients[];
+};
+// By stream position: the M reference entries, then the new blocks.
+layout(set = 0, binding = 6, std430) writeonly buffer Masks {
+  uint masks[];
+};
+layout(set = 0, binding = 7, std430) writeonly buffer Coefficients {
+  uint coefficients[];
+};
+layout(set = 0, binding = 8, std430) writeonly buffer Modes {
+  uint modes[];  // M
+};
+layout(set = 0, binding = 9, std430) readonly buffer Ranks {
+  uint ranks[];  // M + 1: the survivors before each reference entry
+};
+layout(set = 0, binding = 10, scalar) writeonly buffer Added {
+  BlockIndex added[];  // the new blocks, ptr 0
+};
+
+VR_COORD_SEARCH(in_reference, reference_list)
+VR_COORD_SEARCH(in_target, target_list)
+
+#define VR_FRAME_WRITER
+#include "frame_grammar.glsl"
+
+// What the price walks: the target entry's first coefficient word, the
+// reference entry's, and whether it walks keep's residuals or zero's values.
+uint g_target = 0u;
+uint g_reference = 0u;
+bool g_residual = false;
+uint g_bits = 0u;
+
+int coefficient(uint j) {
+  const int at = int(16u * (j & 1u));
+  const int t =
+      bitfieldExtract(int(target_coefficients[g_target + j / 2u]), at, 16);
+  if (!g_residual) return t;
+  const int r = bitfieldExtract(
+      int(reference_coefficients[g_reference + j / 2u]), at, 16);
+  return bitfieldExtract(t - r, 0, 16);  // (t - r) mod 2^16, as int16
+}
+
+void sink_symbol(uint model, uint symbol) {
+  g_bits += model >= kByte && model < kFirstCoef ? 8u : bit_length(symbol) + 1u;
+}
+
+void sink_bits(uint value, uint bits) { g_bits += bits; }
+
+// The bits emit_payload's walk over g_mask prices.
+uint price(bool residual) {
+  g_residual = residual;
+  g_bits = 0u;
+  emit_payload(pc.coefficient_count);
+  return g_bits;
+}
+
+// Each 16-bit half of a less b's, mod 2^16: a borrow out of the low half is
+// dropped, not taken from the high one.
+uint sub_halves(uint a, uint b) {
+  return ((a - b) & 0xFFFFu) | (((a >> 16u) - (b >> 16u)) << 16u);
+}
+
+void reference_entry(uint e, uint words) {
+  const ivec3 c = reference_list[e].coord;
+  const uint n = pc.target_count;
+  const uint t = in_target_lower(c, 0u, n);
+  if (t >= n || target_list[t].coord != c) {
+    modes[e] = kModeRemove;
+    return;
+  }
+  const uint k = pc.coefficient_count;
+  bool same = true;
+  for (uint w = 0u; w < kMaskWords; ++w) {
+    g_mask[w] = target_masks[t * kMaskWords + w] ^
+                reference_masks[e * kMaskWords + w];
+    same = same && g_mask[w] == 0u;
+  }
+  bool wraps = false;
+  for (uint w = 0u; w < words; ++w) {
+    const uint r = sub_halves(target_coefficients[t * words + w],
+                              reference_coefficients[e * words + w]);
+    same = same && r == 0u;
+    // The high half of an odd K's last word is its pad, not a residual.
+    wraps = wraps || (r & 0xFFFFu) == 0x8000u ||
+            (2u * w + 1u < k && (r >> 16u) == 0x8000u);
+  }
+  if (same) {
+    modes[e] = kModeSkip;
+    return;
+  }
+  g_target = t * words;
+  g_reference = e * words;
+  bool zero = wraps;
+  if (!zero) {
+    const uint keep = price(true);  // over the XOR mask
+    for (uint w = 0u; w < kMaskWords; ++w) {
+      g_mask[w] = target_masks[t * kMaskWords + w];
+    }
+    zero = price(false) < keep;
+  }
+  modes[e] = zero ? kModeZero : kModeKeep;
+  for (uint w = 0u; w < kMaskWords; ++w) {
+    const uint target = target_masks[t * kMaskWords + w];
+    masks[e * kMaskWords + w] =
+        zero ? target : target ^ reference_masks[e * kMaskWords + w];
+  }
+  for (uint w = 0u; w < words; ++w) {
+    const uint target = target_coefficients[t * words + w];
+    coefficients[e * words + w] =
+        zero ? target
+             : sub_halves(target, reference_coefficients[e * words + w]);
+  }
+}
+
+void target_block(uint t, uint words) {
+  const uint m = pc.reference_count;
+  const ivec3 c = target_list[t].coord;
+  const uint e = in_reference_lower(c, 0u, m);
+  if (e < m && reference_list[e].coord == c) return;
+  const uint q = t - ranks[e];
+  added[q].coord = c;
+  added[q].ptr = 0;
+  const uint p = m + q;
+  for (uint w = 0u; w < kMaskWords; ++w) {
+    masks[p * kMaskWords + w] = target_masks[t * kMaskWords + w];
+  }
+  for (uint w = 0u; w < words; ++w) {
+    coefficients[p * words + w] = target_coefficients[t * words + w];
+  }
+}
+
+void main() {
+  const uint i = pc.item_base + gl_GlobalInvocationID.x;
+  const uint words = (pc.coefficient_count + 1u) / 2u;  // coefficient_words
+  if (pc.pass == 0u) {
+    if (i < pc.reference_count) reference_entry(i, words);
+  } else if (i < pc.target_count) {
+    target_block(i, words);
+  }
+}

@@ -35,12 +35,18 @@ Encoder& Encoder::operator=(Encoder&& other) noexcept = default;
 
 bool Encoder::valid() const noexcept { return transform_ != nullptr; }
 
+void Encoder::force_intra() noexcept { force_intra_ = true; }
+
 core::Result<Encoder> Encoder::create(core::Device& device,
                                       core::Allocator& allocator,
                                       const EncoderConfig& config) {
   VKC_TRY(config.params.validate());
   VKC_TRY(detail::check_segment_size("Encoder", "segment_size",
                                      config.segment_size));
+  if (config.intra_period == 0) {
+    return core::Status::invalid_argument(
+        "Encoder: intra_period 0; 1 makes every frame an I-frame");
+  }
   Encoder e;
   e.config_ = config;
   e.device_ = &device;
@@ -81,14 +87,29 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     VKC_ASSIGN(observed, transform_->observed(grid, list, &stage));
   }
 
+  // A P-frame codes against the frame returned last, unless the rules on
+  // encode() make this an I-frame. The encoder's params never change, so of
+  // the coding parameters only the grid's geometry can differ.
+  const volume::VoxelGridParams& gp = grid.grid();
+  const CodecParams& params = config_.params;
+  const detail::FrameReference* reference = store_->held();
+  if (reference != nullptr &&
+      (force_intra_ || gop_position_ == 0 ||
+       reference->header.block_count == 0 ||
+       detail::coding_difference(reference->header, gp.voxel_size,
+                                 gp.trunc_dist, params) != nullptr)) {
+    reference = nullptr;
+  }
+
   // Then, in one batch, into the order the frame requires -- the hash
   // table's order is whatever the allocate atomics left, so sorting is also
   // what makes the same content give the same bytes -- and through the
   // forward, into the reference store's spare: the frame the decoder will
-  // hold, which this one holds too once it returns the frame. The same
-  // batch counts its symbols: only the counts cross before the coding.
-  const volume::VoxelGridParams& gp = grid.grid();
-  const CodecParams& params = config_.params;
+  // hold, which this one holds too once it returns the frame. An I-frame's
+  // symbols are counted in the same batch. A P-frame's entries are coded
+  // against the reference there too, and since only the device knows how
+  // many blocks are new, counted in a second batch. Only counts cross before
+  // the coding.
   std::uint32_t rejected = 0;
   detail::ResidentBlocks entries;
   {
@@ -106,20 +127,34 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
                transform_->record_forward(
                    batch, grid, *frame.list, observed, params, *frame.masks,
                    *frame.coefficients, rejected, &stage));
-    VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
-                                  detail::kDefaultUpdateSize, &stage));
+    if (reference != nullptr) {
+      VKC_TRY(store_->record_diff(batch, observed, params.coefficient_count,
+                                  &stage));
+    } else {
+      VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
+                                    detail::kDefaultUpdateSize, &stage));
+    }
     VKC_TRY(batch.submit());
     VKC_TRY(
         detail::DctTransform::check_rejected("forward", rejected, observed));
+    if (reference != nullptr) {
+      VKC_ASSIGN(entries, store_->diffed());
+      core::CommandBatch count(*device_, *allocator_);
+      VKC_TRY(writer_->record_count(count, entries, config_.segment_size,
+                                    detail::kDefaultUpdateSize, &stage));
+      VKC_TRY(count.submit());
+    }
   }
   std::vector<std::uint8_t> bytes;
   {
     core::StageScope entropy(metrics, "  ..rans encode");
     VKC_ASSIGN(bytes, writer_->finish(entries, gp.voxel_size, gp.trunc_dist,
-                                      params, /*reference=*/nullptr, &stage));
+                                      params, reference, &stage));
   }
-  // Only a frame returned is held. It holds every block the forward made,
-  // which the spare holds in frame order.
+  // Only a frame returned becomes the reference, and counts toward the
+  // period. It holds every block the forward made -- a P-frame's survivors
+  // and new blocks, an I-frame's all -- which the spare holds in frame order,
+  // so the next P-frame's M is the spare's list.
   VKC_ASSIGN(const detail::FrameHeader header,
              detail::read_frame_header(bytes.data(), bytes.size()));
   if (header.block_count != observed) {
@@ -130,6 +165,9 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   }
   store_->commit(detail::FrameReference{
       detail::frame_hash(bytes.data(), bytes.size()), header});
+  gop_position_ = (reference != nullptr ? gop_position_ : 0) + 1;
+  if (gop_position_ == config_.intra_period) gop_position_ = 0;
+  force_intra_ = false;
   return bytes;
 }
 

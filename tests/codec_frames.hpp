@@ -468,6 +468,32 @@ inline oracle::Frame inter_frame(
   return p;
 }
 
+// The P-frame the Encoder writes for @p target against @p reference:
+// inter_frame's, but zero for a block inter_frame keeps whose target payload
+// prices strictly below its residual's (codec_oracle::payload_price).
+inline oracle::Frame encoder_frame(const d::FrameReference& id,
+                                   const oracle::Frame& reference,
+                                   const oracle::Frame& target) {
+  const oracle::Frame keep = inter_frame(id, reference, target);
+  const std::uint32_t k = reference.blocks.params.coefficient_count;
+  std::map<vr::Vec3i, std::size_t, ZyxLess> in_target;
+  for (std::size_t i = 0; i < target.coords.size(); ++i) {
+    in_target.emplace(target.coords[i], i);
+  }
+  std::map<std::size_t, d::BlockMode> priced;
+  for (std::size_t e = 0; e < keep.modes.size(); ++e) {
+    if (keep.modes[e] != d::BlockMode::kKeep) continue;
+    const Payload x = payload_at(keep.blocks, e);
+    const Payload t =
+        payload_at(target.blocks, in_target.at(reference.coords[e]));
+    if (oracle::payload_price(t.mask.data(), t.q.data(), k) <
+        oracle::payload_price(x.mask.data(), x.q.data(), k)) {
+      priced.emplace(e, d::BlockMode::kZero);
+    }
+  }
+  return inter_frame(id, reference, target, priced);
+}
+
 // The intra frame a decoded P-frame @p p makes of @p reference's blocks
 // (refusing nothing: a new block at a reference coordinate replaces it).
 inline oracle::Frame resolve(const oracle::Frame& reference,

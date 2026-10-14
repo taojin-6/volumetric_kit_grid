@@ -61,6 +61,16 @@ struct StepSink {
   }
 };
 
+// The Encoder's static price (payload_price).
+struct PriceSink {
+  std::uint64_t total = 0;
+  void symbol(uint model, uint s) {
+    const bool byte = model >= kByte && model < kFirstCoef;
+    total += byte ? 8 : std::uint64_t(s == 0 ? 0 : 32 - __builtin_clz(s)) + 1;
+  }
+  void bits(uint, uint n) { total += n; }
+};
+
 struct WriteSink {
   RansWriter& writer;
   const std::vector<d::FrequencyTable>& tables;
@@ -205,6 +215,16 @@ std::vector<std::uint32_t> entry_steps(const Frame& frame,
     out[p] = sink.steps;
   }
   return out;
+}
+
+std::uint64_t payload_price(const std::uint32_t* mask,
+                            const std::int16_t* coefficients, std::uint32_t k) {
+  glsl::PriceSink sink;
+  glsl::BlockWriter<glsl::PriceSink> walk{sink};
+  walk.g_mask = mask;
+  walk.coefficients = coefficients;
+  walk.emit_payload(k);
+  return sink.total;
 }
 
 StepLayout step_layout(const std::vector<std::uint32_t>& steps, std::uint32_t m,

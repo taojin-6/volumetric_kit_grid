@@ -246,6 +246,16 @@ VR_CODEC_API core::Result<FrameHeader> read_frame_header(
 VR_CODEC_API core::Status check_coding(float voxel_size, float trunc_dist,
                                        const CodecParams& params);
 
+/// @brief The rule a P-frame's coding parameters keep: its reference's, bit
+///        for bit. The one check the reader, the writers and the encoder's
+///        choice of frame type make.
+/// @return The first of @p voxel_size, @p trunc_dist and @p params' K,
+///         scale and kept weights that is not @p reference's, by name; null
+///         when none is.
+VR_CODEC_API const char* coding_difference(const FrameHeader& reference,
+                                           float voxel_size, float trunc_dist,
+                                           const CodecParams& params);
+
 /// @brief The last refusals a writer makes, of what its entries hold, which
 ///        the device writer's count pass finds: one place for their codes
 ///        and words.

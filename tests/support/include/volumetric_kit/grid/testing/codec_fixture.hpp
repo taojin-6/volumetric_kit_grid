@@ -139,12 +139,12 @@ inline std::vector<vr::Vec3i> band_blocks(const Sphere& s, float voxel = kVoxel,
   return out;
 }
 
-// Write the sphere into every active block: a voxel within the band is
-// observed (weight 2) with its true SDF clamped to +-trunc; one outside it is
-// unobserved (weight 0, tsdf 0) -- the shape a fused grid has, partially
-// observed blocks included.
-inline vkc::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
-                                const Sphere& s) {
+// Write the field @p sdf (signed distance of a world point, metres) into
+// every active block: a voxel within the band is observed (weight 2) with its
+// SDF clamped to +-trunc; one outside it is unobserved (weight 0, tsdf 0) --
+// the shape a fused grid has, partially observed blocks included.
+template <typename Sdf>
+vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   VKC_ASSIGN(
       std::vector<float> tsdf,
@@ -159,7 +159,7 @@ inline vkc::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
       const vr::Vec3f p(float(b.coord.x * 8 + int(v % 8)) * voxel,
                         float(b.coord.y * 8 + int((v / 8) % 8)) * voxel,
                         float(b.coord.z * 8 + int(v / 64)) * voxel);
-      const float d = s.sdf(p);
+      const float d = sdf(p);
       const bool obs = std::fabs(d) <= trunc;
       tsdf[std::uint32_t(b.ptr) + v] = obs ? d : 0.0f;
       weight[std::uint32_t(b.ptr) + v] = obs ? 2.0f : 0.0f;
@@ -169,6 +169,32 @@ inline vkc::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
       vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
   return vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
                                   weight);
+}
+
+// write_field of one sphere.
+inline vkc::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
+                                const Sphere& s) {
+  return write_field(gpu, grid, [&s](const vr::Vec3f& p) { return s.sdf(p); });
+}
+
+// A grid holding the union of two spheres, @p a and @p b, each's band blocks
+// allocated and the nearer surface's distance written: one sphere that
+// moves beside one that stays, as a chain of frames.
+inline vkc::Result<vol::VoxelBlockGrid> two_sphere_grid(Gpu& gpu,
+                                                        const Sphere& a,
+                                                        const Sphere& b) {
+  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
+  std::vector<vr::Vec3i> coords = band_blocks(a);
+  for (const vr::Vec3i& c : band_blocks(b)) {
+    if (std::find(coords.begin(), coords.end(), c) == coords.end()) {
+      coords.push_back(c);
+    }
+  }
+  VKC_TRY(allocate(grid, coords));
+  VKC_TRY(write_field(gpu, grid, [&a, &b](const vr::Vec3f& p) {
+    return std::min(a.sdf(p), b.sdf(p));
+  }));
+  return grid;
 }
 
 // A grid holding the sphere: its band blocks allocated and written, plus
