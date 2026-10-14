@@ -396,9 +396,10 @@ int period_case(Gpu& gpu) {
 }
 
 // Each rule that makes an I-frame, at a period of 3: the first frame, the
-// period, force_intra(), a grid of another voxel size -- and the grid after
-// it, against that one -- and a reference of no blocks; a P-frame otherwise,
-// costing the same rows as an I-frame.
+// period, force_intra(), a grid of another voxel size or of another
+// trunc_dist alone -- and the grid after each, against that one -- and a
+// reference of no blocks; a P-frame otherwise, costing the same rows as an
+// I-frame.
 int intra_rules_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;
@@ -410,8 +411,11 @@ int intra_rules_case(Gpu& gpu) {
   coarse.voxel_size = 0.006f;
   vkc::Result<vol::VoxelBlockGrid> c =
       sphere_grid(gpu, chain_sphere(1), coarse);
+  GridShape wide;
+  wide.trunc_dist = 0.05f;
+  vkc::Result<vol::VoxelBlockGrid> w = sphere_grid(gpu, chain_sphere(1), wide);
   vkc::Result<vol::VoxelBlockGrid> empty = make_grid(gpu);
-  CHECK(made.ok() && a.ok() && b.ok() && c.ok() && empty.ok());
+  CHECK(made.ok() && a.ok() && b.ok() && c.ok() && w.ok() && empty.ok());
   codec::Encoder& enc = made.value();
   using T = codec::FrameType;
   constexpr T I = T::kIntra;
@@ -430,6 +434,8 @@ int intra_rules_case(Gpu& gpu) {
       {&b.value(), true, I},       // force_intra()
       {&a.value(), false, P},      //
       {&c.value(), false, I},      // another voxel size
+      {&a.value(), false, I},      // and back
+      {&w.value(), false, I},      // another trunc_dist
       {&a.value(), false, I},      // and back
       {&empty.value(), false, P},  // every block removed
       {&a.value(), false, I},      // a reference of no blocks
@@ -457,6 +463,9 @@ int intra_rules_case(Gpu& gpu) {
 // A refused encode -- a grid of another block size, or with no weight --
 // keeps the reference, the period's count and a pending force_intra():
 // the frames after it are the ones an encoder that never saw it writes.
+// Both refuse before the store is written; a later refusal (the diff's, the
+// writer's) has no public trigger, and keeps them alike, since only the
+// spare and scratch are written before the commit.
 int refusal_keeps_chain_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;

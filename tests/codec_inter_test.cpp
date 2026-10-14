@@ -13,10 +13,12 @@
 // reference as it was, and the device buffers grown and shrunk frame to
 // frame. Encoding: every frame of the Encoder's chains the CPU oracle's
 // bytes, its P-frames priced as the oracle prices them; each of the diff's
-// choices from one edit of a frame; a difference of 32768 coded zero; and the
-// diff's refusals. Internal headers by include path; skips with no device.
+// choices from one edit of a frame; a difference of 32768 coded zero, in
+// either half of a coefficient word; and the diff's refusals. Internal
+// headers by include path; skips with no device.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -1268,34 +1270,43 @@ int diff_case(Gpu& gpu) {
   return 0;
 }
 
-// A DC difference of 32768 -- +16384 against -16384, at a scale that puts a
-// block of mean SDF +-0.9 exactly there, which the I-frames confirm -- is the
-// one residual no class carries, so the block is zero, where the price would
-// keep it: a ramp the two blocks share makes the target's values cost more
-// than the residuals. The P-frame decodes to the target's grid.
-int wrap_case(Gpu& gpu) {
+// A difference of 32768 in coefficient @p j -- +16384 against -16384, at a
+// scale that puts it exactly there, which the I-frames confirm -- is the one
+// residual no class carries, so the block is zero, where the price would
+// keep it: what the two blocks share makes the target's values cost more
+// than the residuals. At j = 0, a word's low half, the DC of a mean SDF of
+// +-0.9 beside a shared ramp along x; at j = 3, the (1, 0, 0) basis and a
+// word's high half, its cosine at +-0.75 on a shared level. The P-frame
+// decodes to the target's grid.
+int wrap_case(Gpu& gpu, std::uint32_t j) {
   codec::EncoderConfig config;
   config.intra_period = 2;
   config.params.coefficient_count = 4;
-  // The DC of a block of normalized SDF v is v sqrt(512).
-  config.params.quantization_scale = 0.9f * 22.627417f / 16384.0f;
+  // The DC of a block of normalized SDF v is v sqrt(512); the (1, 0, 0)
+  // coefficient of a cos(pi (2x + 1) / 16) is 16 a.
+  const float amplitude = j == 0 ? 0.9f : 0.75f;
+  config.params.quantization_scale =
+      amplitude * (j == 0 ? 22.627417f : 16.0f) / 16384.0f;
   CHECK(config.params.quantization_scale > codec::kMinStep);
   vkc::Result<codec::Encoder> enc =
       codec::Encoder::create(gpu.device, gpu.allocator, config);
   CHECK(enc.ok());
-  // A level plus a ramp along x of mean 0.
-  auto ramped = [](float level) {
+  // The block of coefficient j at +-16384, the other part shared.
+  auto block = [&](float sign) {
     Voxels v;
     for (std::uint32_t i = 0; i < kVpb; ++i) {
-      v.sdf[i] = level + 0.1f * float(2 * int(i % 8) - 7) / 7.0f;
+      const int x = int(i % 8);
+      const double wave = std::cos(3.14159265358979 * (2 * x + 1) / 16.0);
+      v.sdf[i] = j == 0 ? sign * amplitude + 0.1f * float(2 * x - 7) / 7.0f
+                        : 0.2f + sign * amplitude * float(wave);
     }
     return v;
   };
   Content up;
-  up[vr::Vec3i(0, 0, 0)] = ramped(0.9f);
+  up[vr::Vec3i(0, 0, 0)] = block(1.0f);
   up[vr::Vec3i(1, 0, 0)] = slope(1);
   Content down = up;
-  down.at(vr::Vec3i(0, 0, 0)) = ramped(-0.9f);
+  down.at(vr::Vec3i(0, 0, 0)) = block(-1.0f);
   std::vector<Coded> chain;
   vkc::Result<vol::VoxelBlockGrid> a = content_grid(gpu, up);
   vkc::Result<vol::VoxelBlockGrid> b = content_grid(gpu, down);
@@ -1304,15 +1315,15 @@ int wrap_case(Gpu& gpu) {
   CHECK(encode_checked(gpu, enc.value(), config, b.value(), chain) == 0);
   const Payload r = payload_at(chain[0].content.blocks, 0);
   const Payload t = payload_at(chain[1].content.blocks, 0);
-  CHECK(r.q[0] == 16384 && t.q[0] == -16384);
+  CHECK(r.q[j] == 16384 && t.q[j] == -16384);
   // The premise: keep's residuals, the -32768 included, price below the
   // target's values.
   Payload x = t;
-  for (std::size_t j = 0; j < x.q.size(); ++j) {
-    x.q[j] = codec_frames::residual(t.q[j], r.q[j]);
+  for (std::size_t i = 0; i < x.q.size(); ++i) {
+    x.q[i] = codec_frames::residual(t.q[i], r.q[i]);
   }
   for (std::size_t w = 0; w < x.mask.size(); ++w) x.mask[w] ^= r.mask[w];
-  CHECK(x.q[0] == std::numeric_limits<std::int16_t>::min());
+  CHECK(x.q[j] == std::numeric_limits<std::int16_t>::min());
   CHECK(oracle::payload_price(x.mask.data(), x.q.data(), 4) <
         oracle::payload_price(t.mask.data(), t.q.data(), 4));
   CHECK(type_of(chain[1].sent) == codec::FrameType::kInter);
@@ -1388,7 +1399,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (moves_case(gpu, s.value()) != 0) return 1;
   if (encoder_chain_case(gpu) != 0) return 1;
   if (diff_case(gpu) != 0) return 1;
-  if (wrap_case(gpu) != 0) return 1;
+  if (wrap_case(gpu, 0) != 0) return 1;
+  if (wrap_case(gpu, 3) != 0) return 1;
   if (diff_refusals_case(gpu) != 0) return 1;
   std::printf("codec P-frames: OK\n");
   return 0;
