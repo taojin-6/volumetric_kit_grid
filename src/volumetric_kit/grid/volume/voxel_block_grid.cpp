@@ -341,17 +341,55 @@ core::Result<std::uint32_t> VoxelBlockGrid::remove(
     return core::Status::invalid_argument(
         "VoxelBlockGrid::remove: coords is null");
   }
+  // Nothing to zero: the map stages the coordinates itself.
+  if (attributes_.empty()) {
+    return map_.remove(coords, count, out_failures);
+  }
+  // Staged once, for the zeroing and the map's remove alike.
+  const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(BlockIndex);
+  VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
+                                           bytes, max_storage_buffer_range_));
+  VKC_ASSIGN(const core::Buffer list,
+             core::device_storage_buffer(*allocator_, bytes));
+  core::CommandBatch batch(*device_, *allocator_);
+  VKC_TRY(batch.upload(list, 0, coords, bytes));
+  return zero_and_remove(batch, list, count, out_failures, nullptr);
+}
 
+core::Result<std::uint32_t> VoxelBlockGrid::remove(
+    const core::Buffer& coords, std::uint32_t count,
+    AllocFailures* out_failures) {
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        "VoxelBlockGrid::remove: moved-from grid");
+  }
+  if (count == 0) {
+    return std::uint32_t{0};
+  }
+  // Before anything is zeroed or freed, so a refused input changes nothing.
+  const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(BlockIndex);
+  VKC_TRY(core::StorageInput(coords).check("VoxelBlockGrid::remove: the coords",
+                                           bytes));
+  VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
+                                           bytes, max_storage_buffer_range_));
+  core::CommandBatch batch(*device_, *allocator_);
+  return zero_and_remove(batch, coords, count, out_failures, nullptr);
+}
+
+core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
+    core::CommandBatch& batch, const core::Buffer& list, std::uint32_t count,
+    AllocFailures* out_failures, core::GpuStageScope* stage) {
   if (!attributes_.empty()) {
     // The zero kernel finds each coord's block in the table itself, so this
     // costs the count, not the grid.
-    VKC_TRY(zero_listed_blocks(coords, count));
+    VKC_TRY(prepare_block_kernels());
+    VKC_TRY(record_zero(batch, list, count, stage));
   }
-
+  VKC_TRY(batch.submit());
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
   // actually freed -- so there is nothing to bump here, and no way for the raw
   // map() path to skip it (see VoxelHashMap::topology_epoch).
-  return map_.remove(coords, count, out_failures);
+  return map_.remove(list, count, out_failures);
 }
 
 core::Status VoxelBlockGrid::clear() {
@@ -470,9 +508,8 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
   // Only the small stale/failure counts reach the host; the coordinates never
   // make a round trip through a host vector and a second device allocation.
   core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(record_zero(batch, stale_list_, stale, &stage));
-  VKC_TRY(batch.submit());
-  VKC_ASSIGN(const std::uint32_t failed, map_.remove(stale_list_, stale));
+  VKC_ASSIGN(const std::uint32_t failed,
+             zero_and_remove(batch, stale_list_, stale, nullptr, &stage));
   return stale - std::min(failed, stale);
 }
 
@@ -504,21 +541,6 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                                max_workgroup_count_x_, stage));
   }
   return {};
-}
-
-core::Status VoxelBlockGrid::zero_listed_blocks(const BlockIndex* coords,
-                                                std::uint32_t count) {
-  VKC_TRY(prepare_block_kernels());
-  const VkDeviceSize list_bytes = VkDeviceSize(count) * sizeof(BlockIndex);
-  VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
-                                           list_bytes,
-                                           max_storage_buffer_range_));
-  VKC_ASSIGN(const core::Buffer list,
-             core::device_storage_buffer(*allocator_, list_bytes));
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.upload(list, 0, coords, list_bytes));
-  VKC_TRY(record_zero(batch, list, count, nullptr));
-  return batch.submit();
 }
 
 core::Status VoxelBlockGrid::check_block_list(const BlockList& blocks,

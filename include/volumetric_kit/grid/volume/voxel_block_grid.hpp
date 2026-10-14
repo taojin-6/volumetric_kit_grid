@@ -253,6 +253,24 @@ class VR_VOLUME_API VoxelBlockGrid {
                                      std::uint32_t count,
                                      AllocFailures* out_failures = nullptr);
 
+  /// @brief @ref remove from a device buffer of @ref BlockIndex, so the
+  ///        coordinates cross the bus neither way.
+  ///
+  /// The same zeroing, then @ref VoxelHashMap::remove over the same buffer: two
+  /// submits. The input is checked first, so a refused call zeroes nothing and
+  /// leaves @ref topology_epoch as it was. The buffer must remain alive and
+  /// unchanged until this synchronous call returns.
+  /// @param coords  Storage buffer with known device-local memory holding at
+  ///                least @p count block indices (only `coord` is read).
+  /// @param count   Number of entries; zero is a no-op.
+  /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
+  /// @return As the host overload; `Status::Code::InvalidArgument` also for
+  ///         a @p coords `StorageInput::check` refuses, or past
+  ///         `maxStorageBufferRange`.
+  core::Result<std::uint32_t> remove(const core::Buffer& coords,
+                                     std::uint32_t count,
+                                     AllocFailures* out_failures = nullptr);
+
   /// @brief Empty the grid: clear the block index and zero every attribute.
   ///
   /// @ref VoxelHashMap::clear returns every block to the heap, so every
@@ -381,9 +399,15 @@ class VR_VOLUME_API VoxelBlockGrid {
   // attribute a dispatch, each block found by its coord.
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
                            std::uint32_t count, core::GpuStageScope* stage);
-  // Upload `coords` and zero their blocks, in one batch.
-  core::Status zero_listed_blocks(const BlockIndex* coords,
-                                  std::uint32_t count);
+  // Every removal's body -- both remove overloads' and free_stale_blocks':
+  // zero the first `count` blocks `list` names, recorded into `batch` after
+  // what it holds and submitted, then free them through the map. `list` is
+  // the caller's to check.
+  core::Result<std::uint32_t> zero_and_remove(core::CommandBatch& batch,
+                                              const core::Buffer& list,
+                                              std::uint32_t count,
+                                              AllocFailures* out_failures,
+                                              core::GpuStageScope* stage);
   // The block pass: stamps, and with a max_age the stale blocks listed in
   // stale_list_. Returns how many.
   core::Result<std::uint32_t> block_pass(std::uint32_t max_age,

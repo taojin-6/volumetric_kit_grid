@@ -176,6 +176,23 @@ class VR_VOLUME_API VoxelHashMap {
                                        std::uint32_t count,
                                        AllocFailures* out_failures = nullptr);
 
+  /// @brief @ref allocate from a device buffer of @ref BlockIndex, so the
+  ///        coordinates cross the bus neither way.
+  ///
+  /// The same checks, rounds, tally and @ref AllocFailures split as the host
+  /// overload; only `coord` is read. The buffer must remain alive and
+  /// unchanged until this synchronous call returns.
+  /// @param coords  Storage buffer with known device-local memory holding at
+  ///                least @p count block indices.
+  /// @param count   Number of entries; zero is a no-op.
+  /// @param out_failures  As the host overload.
+  /// @return As the host overload; `Status::Code::InvalidArgument` also for
+  ///         a @p coords `StorageInput::check` refuses, or past
+  ///         `maxStorageBufferRange`.
+  core::Result<std::uint32_t> allocate(const core::Buffer& coords,
+                                       std::uint32_t count,
+                                       AllocFailures* out_failures = nullptr);
+
   /// @brief Allocate voxel blocks from a posed depth frame.
   ///
   /// Each pixel's depth sample is unprojected (via @p camera's pinhole

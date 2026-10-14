@@ -5,7 +5,8 @@
 // verify they are distinct, correctly-sized device buffers keyed by the block
 // pool, that the composed VoxelHashMap still allocates, that resize grows the
 // attribute arrays while preserving per-voxel data at the same block pointer,
-// and the error / move paths. Runs on the real driver (MoltenVK / NVIDIA);
+// that remove zeroes what it frees from a host list or a device one, and the
+// error / move paths. Runs on the real driver (MoltenVK / NVIDIA);
 // exits 0 (skip) where no device is present.
 
 #include <cstdint>
@@ -22,6 +23,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+#include "buffer_readback.hpp"
 #include "grid_readback.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
@@ -317,6 +319,82 @@ int gpu_main(vr_test::GpuContext& gpu) {
     tsdf_grown_data = get("tsdf");
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
     CHECK(tsdf_grown_data[ptrs[3]] == 0.0f);
+  }
+
+  // --- The same from a device list: zeroed and freed as from a host one,
+  // duplicates and an absent coord included, and never a live entry past the
+  // count. A refused list zeroes nothing and keeps the topology epoch.
+  {
+    const vr::Vec3i quad[4] = {
+        {60, 60, 60}, {61, 60, 60}, {60, 61, 60}, {61, 61, 60}};
+    vol::BlockIndex blocks[4]{};
+    for (int i = 0; i < 4; ++i) {
+      blocks[i].coord = quad[i];
+    }
+    CHECK(vbg.map().allocate(blocks, 4).value() == 0);
+    vkc::Result<std::vector<vol::BlockIndex>> live =
+        vbg.map().compact_active_blocks();
+    CHECK(live.ok());
+    std::int32_t ptrs[4] = {-1, -1, -1, -1};
+    for (const vol::BlockIndex& blk : live.value()) {
+      for (int i = 0; i < 4; ++i) {
+        if (blk.coord == quad[i]) ptrs[i] = blk.ptr;
+      }
+    }
+    for (int i = 0; i < 4; ++i) {
+      CHECK(ptrs[i] >= 0);
+      tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
+      weight_grown_data[ptrs[i] + vpb - 1] = 3.0f;
+    }
+    CHECK(put("tsdf", tsdf_grown_data) && put("weight", weight_grown_data));
+    vol::BlockIndex absent{};
+    absent.coord = vr::Vec3i(7000, 7000, 7000);
+    const std::vector<vol::BlockIndex> list = {blocks[1], absent, blocks[2],
+                                               blocks[1], blocks[3]};
+    const std::uint32_t count = 4;  // blocks[3] is past it
+    vkc::Result<vkc::Buffer> device_list =
+        vr_test::upload_device_buffer(gpu.device, gpu.allocator, list.data(),
+                                      list.size() * sizeof(vol::BlockIndex));
+    CHECK(device_list.ok());
+
+    // Refused: no buffer, one shorter than the count, one that is not a
+    // storage buffer.
+    const std::uint64_t epoch = vbg.topology_epoch();
+    const vkc::Buffer empty;
+    vkc::BufferDesc desc;
+    desc.size = sizeof(vol::BlockIndex);
+    desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    desc.memory = vkc::MemoryUsage::DeviceOnly;
+    vkc::Result<vkc::Buffer> transfer_only = gpu.allocator.create_buffer(desc);
+    CHECK(transfer_only.ok());
+    CHECK(vbg.remove(empty, 1).status().domain() ==
+          vkc::Status::Code::InvalidArgument);
+    CHECK(vbg.remove(device_list.value(), std::uint32_t(list.size()) + 1)
+              .status()
+              .domain() == vkc::Status::Code::InvalidArgument);
+    CHECK(vbg.remove(transfer_only.value(), 1).status().domain() ==
+          vkc::Status::Code::InvalidArgument);
+    CHECK(vbg.remove(device_list.value(), 0).ok());
+    CHECK(vbg.topology_epoch() == epoch);
+    tsdf_grown_data = get("tsdf");
+    for (int i = 0; i < 4; ++i) {
+      CHECK(tsdf_grown_data[ptrs[i]] == 0.25f * float(i + 1));
+    }
+
+    vkc::Result<std::uint32_t> removed = vbg.remove(device_list.value(), count);
+    CHECK(removed.ok() && removed.value() == 0);
+    CHECK(vbg.topology_epoch() != epoch);
+    CHECK(heap_agrees());
+    tsdf_grown_data = get("tsdf");
+    weight_grown_data = get("weight");
+    for (int i = 0; i < 4; ++i) {
+      const bool gone = i == 1 || i == 2;
+      CHECK(tsdf_grown_data[ptrs[i]] == (gone ? 0.0f : 0.25f * float(i + 1)));
+      CHECK(weight_grown_data[ptrs[i] + vpb - 1] == (gone ? 0.0f : 3.0f));
+    }
+    vkc::Result<std::vector<vol::BlockIndex>> after =
+        vbg.map().compact_active_blocks();
+    CHECK(after.ok() && after.value().size() == live.value().size() - 2);
   }
 
   // --- An attribute whose blocks share 4-byte words -- a block of 5^3 voxels

@@ -530,6 +530,13 @@ core::Result<std::uint32_t> VoxelHashMap::allocate(
                           sizeof(BlockIndex), count, allocate_, out_failures);
 }
 
+core::Result<std::uint32_t> VoxelHashMap::allocate(
+    const core::Buffer& coords, std::uint32_t count,
+    AllocFailures* out_failures) {
+  return run_input_kernel("VoxelHashMap::allocate", core::StorageInput(coords),
+                          sizeof(BlockIndex), count, allocate_, out_failures);
+}
+
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const float* depth, const DepthCameraParams& camera,
     AllocFailures* out_failures, core::StageMetrics* metrics) {
