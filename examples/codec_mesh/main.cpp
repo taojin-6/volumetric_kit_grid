@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Geometry-only mesh -> TSDF -> codec -> marching cubes evaluation. The input
-// is never changed. Height and head-up direction are explicit normalization
-// choices applied after the IO tier imports geometry in source coordinates.
+// Geometry-only mesh -> TSDF -> codec -> marching cubes evaluation. The source
+// file is never changed. The scenario's head-up direction and height place the
+// imported mesh in metres through io's opt-in normalization helpers.
 
 #include <algorithm>
 #include <cstdio>
@@ -12,8 +12,8 @@
 #include "codec_stream.hpp"
 #include "codec_sweep.hpp"
 #include "config.hpp"
+#include "geometry_mesh.hpp"
 #include "grid_layout.hpp"
-#include "mesh_normalization.hpp"
 #include "stage_table.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -21,6 +21,7 @@
 #include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
 #include "volumetric_kit/recon/io/mesh_io.hpp"
+#include "volumetric_kit/recon/io/mesh_normalization.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
@@ -34,34 +35,37 @@ namespace {
 
 using Options = vr_example::config::Config;
 
-void print_bounds(const char* label, const vr_example::MeshBounds& b) {
+void print_bounds(const char* label, const vr::io::MeshBounds& b) {
   std::printf("%s: x [%.9g, %.9g], y [%.9g, %.9g], z [%.9g, %.9g]\n", label,
               b.min[0], b.max[0], b.min[1], b.max[1], b.min[2], b.max[2]);
 }
 
 vkc::Status run(const Options& opt) {
   VKC_ASSIGN(vr::io::TriangleMesh geometry, vr::io::load_mesh(opt.source.path));
-  VKC_ASSIGN(const auto normalization,
-             vr_example::normalize_mesh_height(geometry, opt.source.height_m,
-                                               *opt.source.up_vector));
+  VKC_ASSIGN(const vr::io::MeshAxes axes,
+             vr::io::up_axes(*opt.source.up_vector));
+  const vr::io::MeshBounds input_bounds = vr::io::mesh_bounds(geometry);
+  const vr::io::MeshBounds upright = vr::io::mesh_bounds(geometry, axes);
+  VKC_ASSIGN(const vr::io::MeshTransform normalization,
+             vr::io::fit_transform(upright, opt.source.height_m));
+  VKC_TRY(vr::io::apply_transform(geometry, normalization));
   // Audited after normalization, on the float metres the conversion reads,
   // so a triangle that collapses in the conversion counts as degenerate.
-  const auto topology = vr_example::audit_mesh_topology(geometry);
+  VKC_ASSIGN(const auto topology, vr::io::audit_mesh_topology(geometry));
   std::printf(
       "mesh: %zu vertices, %zu triangles; geometry only, physical scale "
       "set by source.height_m\n",
       geometry.positions.size(), geometry.indices.size() / 3);
-  print_bounds("input bounds (source units)", normalization.original);
+  print_bounds("input bounds (source units)", input_bounds);
   std::printf(
       "head-up (input coordinates): (%.9g, %.9g, %.9g); projected height %.12g "
       "source units\n",
-      normalization.up[0], normalization.up[1], normalization.up[2],
-      normalization.original_height);
+      axes.up[0], axes.up[1], axes.up[2], upright.max[1] - upright.min[1]);
   std::printf(
       "normalization: %.12g metres/source-unit; rotate head-up to +Y, centre "
       "X/Z, feet at Y=0\n",
       normalization.metres_per_unit);
-  print_bounds("normalized bounds (metres)", normalization.normalized);
+  print_bounds("normalized bounds (metres)", vr::io::mesh_bounds(geometry));
   std::printf(
       "indexed topology: %zu edges, %zu boundary, %zu nonmanifold, %zu "
       "inconsistently oriented; "
