@@ -490,14 +490,6 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
   return run_inverse(batch, grid, views, resident, in.params, stage);
 }
 
-core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
-                                   const ResidentBlocks& in,
-                                   const CodecParams& params,
-                                   core::GpuStageScope* stage) {
-  core::CommandBatch batch(*device_, *allocator_);
-  return inverse(batch, grid, in, params, stage);
-}
-
 core::Status DctTransform::inverse(core::CommandBatch& batch,
                                    volume::VoxelBlockGrid& grid,
                                    const ResidentBlocks& in,

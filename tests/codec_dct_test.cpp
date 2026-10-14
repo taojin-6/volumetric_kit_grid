@@ -994,16 +994,20 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   {
     vkc::Result<vkc::Buffer> small = vkc::device_storage_buffer(allocator, 16);
     CHECK(small.ok());
+    const auto inverse = [&](const codec::detail::ResidentBlocks& in) {
+      vkc::CommandBatch batch(device, allocator);
+      return t.inverse(batch, grid, in, params);
+    };
     codec::detail::ResidentBlocks resident;
     resident.count = std::uint32_t(blocks.size());
     resident.coefficient_count = params.coefficient_count;
-    CHECK(!t.inverse(grid, resident, params).ok());
+    CHECK(!inverse(resident).ok());
     resident.list = &small.value();
     resident.masks = &small.value();
     resident.coefficients = &small.value();
-    CHECK(!t.inverse(grid, resident, params).ok());
+    CHECK(!inverse(resident).ok());
     resident.reference_count = 1;
-    const vkc::Status entries = t.inverse(grid, resident, params);
+    const vkc::Status entries = inverse(resident);
     CHECK(entries.domain() == vkc::Status::Code::InvalidArgument &&
           entries.message().find("a P-frame's stream positions") !=
               std::string::npos);

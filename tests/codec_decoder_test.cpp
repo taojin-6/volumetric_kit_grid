@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -424,8 +425,11 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   const vkc::Status s = dec.decode(fb.value().data(), fb.value().size(), small);
   CHECK(!s.ok());
   // Too small, not corrupt: the same answer as a table that cannot place the
-  // blocks, so one recovery serves both.
+  // blocks, so one recovery serves both, and it names the grid's slots and
+  // that recovery.
   CHECK(s.domain() == vkc::Status::Code::OutOfMemory);
+  CHECK(s.message().find("num_blocks") != std::string::npos &&
+        s.message().find("VoxelBlockGrid::resize") != std::string::npos);
   vkc::Result<Snapshot> small_after = snapshot(gpu, small);
   CHECK(small_after.ok() && small_after.value() == small_before.value());
   // Another geometry with more blocks than the grid has slots is refused for
@@ -488,6 +492,7 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
       dec.decode(frame.value().data(), frame.value().size(), tight);
   CHECK(!s.ok());
   CHECK(s.domain() == vkc::Status::Code::OutOfMemory);
+  CHECK(s.message().find("VoxelBlockGrid::resize") != std::string::npos);
 
   // The documented recovery.
   CHECK(tight.resize(cramped.num_buckets * 8).ok());

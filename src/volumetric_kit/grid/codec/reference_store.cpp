@@ -74,8 +74,8 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
           ? s.max_workgroup_count_x_
           : std::min(max_blocks_per_dispatch, s.max_workgroup_count_x_);
   s.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
-  // One entry of each, so the side of a frame with none -- the reference of
-  // an intra frame, the payload of an all-skip P-frame -- binds a buffer.
+  // One entry of each, so a side with none -- the reference of an intra
+  // frame -- binds a buffer.
   struct First {
     core::Buffer& buffer;
     VkDeviceSize bytes;

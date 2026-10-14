@@ -95,8 +95,10 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// The reference and the frame being decoded take `64 + 4 * ceil(K / 2)`
 /// bytes of device memory a block each, and the frame 24 more; the rANS
 /// decode takes `64 + 4 * ceil(K / 2)` an entry it decodes (a P-frame's
-/// reference entries and its new blocks), beside the frame's payload and
-/// tables. All of it is kept, sized for the largest frame decoded.
+/// reference entries and its new blocks), 16 more a new block and 4 a
+/// reference entry, and 16 KiB a frequency table for its slot lookup, beside
+/// the frame's payload and tables. All of it is kept, sized for the largest
+/// frame decoded.
 ///
 /// The rANS decode runs on the device, one segment an invocation, and its
 /// coefficients and masks stay there; a frame the device cannot decode is
@@ -167,7 +169,7 @@ class VR_CODEC_API Decoder {
   ///         `Status::Code::InvalidArgument` for a segment of more than
   ///         @ref kMaxDeviceDecodeSegmentSize entries or a buffer past
   ///         `maxStorageBufferRange`, `Status::Code::OutOfMemory` past free
-  ///         device memory;
+  ///         device memory, which a resize does not recover;
   ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other

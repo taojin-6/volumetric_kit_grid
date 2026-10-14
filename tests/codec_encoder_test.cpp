@@ -3,12 +3,14 @@
 
 // GPU test for codec::Encoder: an empty grid is a valid frame; the bytes are
 // independent of the order the hash table holds the blocks in; blocks with no
-// observed voxel are left out; its stage rows; its refusals and its moves.
+// observed voxel are left out; its stage rows; its refusals (a segment longer
+// than the Decoder decodes among them) and its moves.
 // Decoding is codec_decoder_test's. Skips with no device.
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -244,6 +246,16 @@ int refusals_case(Gpu& gpu) {
   codec::EncoderConfig bad;
   bad.segment_size = 0;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
+  // Segments the Decoder cannot decode; the longest it can is accepted.
+  bad.segment_size = codec::kMaxDeviceDecodeSegmentSize + 1;
+  const vkc::Result<codec::Encoder> long_segments =
+      codec::Encoder::create(gpu.device, gpu.allocator, bad);
+  CHECK(!long_segments.ok() &&
+        long_segments.status().domain() == vkc::Status::Code::InvalidArgument &&
+        long_segments.status().message().find("longest segment") !=
+            std::string::npos);
+  bad.segment_size = codec::kMaxDeviceDecodeSegmentSize;
+  CHECK(codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
   bad = codec::EncoderConfig{};
   bad.params.coefficient_count = 0;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());

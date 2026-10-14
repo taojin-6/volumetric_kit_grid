@@ -29,9 +29,10 @@ class DeviceFrameWriter;
 struct EncoderConfig {
   /// Coefficients kept per block and their quantization steps.
   CodecParams params;
-  /// Blocks per independently decodable segment, at least 1. Smaller costs a
-  /// little more (each segment restates its first coordinate) and decodes
-  /// with more parallelism; the default costs 2-3% of a frame.
+  /// Blocks per independently decodable segment, from 1 to
+  /// @ref kMaxDeviceDecodeSegmentSize. Smaller costs a little more (each
+  /// segment restates its first coordinate) and decodes with more
+  /// parallelism; the default costs 2-3% of a frame.
   std::uint32_t segment_size = 64;
   /// Where the rANS coding runs. The device codes one segment per
   /// invocation, so smaller segments give it more parallelism.
@@ -68,8 +69,9 @@ class VR_CODEC_API Encoder {
   ///                   this object).
   /// @param config     How frames are coded.
   /// @return The encoder, or `Status::Code::InvalidArgument` for invalid
-  ///         `config.params` or a `segment_size` of 0; otherwise a pipeline
-  ///         or allocation failure.
+  ///         `config.params` or a `segment_size` of 0 or past
+  ///         @ref kMaxDeviceDecodeSegmentSize; otherwise a pipeline or
+  ///         allocation failure.
   static core::Result<Encoder> create(core::Device& device,
                                       core::Allocator& allocator,
                                       const EncoderConfig& config = {});

@@ -189,6 +189,10 @@ class VR_CODEC_API DctTransform {
   /// @brief Reconstruct every block in @p blocks from its coefficients and
   ///        mask, overwriting its `tsdf` and `weight`.
   ///
+  /// TODO(codec): only the tests call this, the CPU oracle's inverse among
+  /// them, with coefficients from the host; it moves under tests/ with the
+  /// host reader.
+  ///
   /// The list must be duplicate-free (unchecked -- a repeat is two workgroups
   /// writing one block).
   /// @param grid    As @ref forward, written in place.
@@ -207,26 +211,20 @@ class VR_CODEC_API DctTransform {
                        const volume::BlockList& blocks, const DctBlocks& in,
                        core::GpuStageScope* stage = nullptr);
 
-  /// @brief @ref inverse from blocks the device holds (the device frame
-  ///        reader's), bound where they are rather than uploaded.
+  /// @brief @ref inverse from blocks the device holds (the reference store's
+  ///        apply output), bound where they are rather than uploaded, and
+  ///        recorded into the caller's @p batch after what it already holds
+  ///        -- that apply -- and submitted with it, so the two share one
+  ///        submit.
   ///
   /// The list must be duplicate-free, and the coefficients made against the
-  /// grid's `trunc_dist` (both unchecked: the reader decoded them from a
-  /// frame whose order and header the caller checked).
+  /// grid's `trunc_dist` (both unchecked: they come from a frame whose order
+  /// and header the caller checked).
+  /// @param batch  Holding what the inverse reads; submitted here once the
+  ///               checks pass (a refusal submits nothing).
   /// @return As @ref inverse, and `Status::Code::InvalidArgument` for
   ///         buffers missing or smaller than @p in's count needs, or a
   ///         P-frame's entries, which are not yet its blocks.
-  core::Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
-                       const CodecParams& params,
-                       core::GpuStageScope* stage = nullptr);
-
-  /// @brief @ref inverse from blocks the device holds, recorded into the
-  ///        caller's @p batch after what it already holds -- the reference
-  ///        store's upload and apply -- and submitted with it, so the three
-  ///        share one submit.
-  /// @param batch  Holding what the inverse reads; submitted here once the
-  ///               checks pass (a refusal submits nothing).
-  /// @return As the overload above.
   core::Status inverse(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
                        const ResidentBlocks& in, const CodecParams& params,
                        core::GpuStageScope* stage = nullptr);
