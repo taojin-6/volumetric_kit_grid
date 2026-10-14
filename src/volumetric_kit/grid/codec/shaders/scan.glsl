@@ -2,11 +2,12 @@
 // Copyright (c) 2026 Tao Jin
 
 // One workgroup's exclusive scan of u32, a chunk of kScanLanes values a call:
-// the codec's one scan, which rans_scan.comp runs over the segments' lengths
+// the codec's one scan, which rans_layout.comp runs over the entries' coder
+// steps and the segments' slots, rans_scan.comp over the segments' lengths
 // and survivor_ranks.comp over a P-frame's survivors. The includer declares
 // local_size_x = kScanLanes, and every lane makes each call, with 0 past the
-// end of its values: a frame has thousands of segments and reference blocks,
-// not millions, so one workgroup walks them a chunk at a time.
+// end of its values: a frame has tens of thousands of entries, not millions,
+// so one workgroup walks them a chunk at a time.
 
 #ifndef VR_SCAN_GLSL
 #define VR_SCAN_GLSL

@@ -722,7 +722,8 @@ int ranks_case(d::DeviceFrameReader& reader) {
 // entries than entries, or without the modes or list they need -- and a
 // segment or update size past the rule, each counting nothing, so finish
 // refuses, rather than coding stale steps; a
-// finish whose blocks have another reference count than were counted;
+// finish whose blocks have another entry or reference count than were
+// counted;
 // reference entries without an update size; and a reference that does not
 // hold the blocks' reference entries, or none for blocks that have them.
 int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
@@ -766,11 +767,16 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   CHECK(batch.submit().ok());
   CHECK(uncounted(finish(*fresh.value(), r.blocks, p.reference)));
 
-  // Counted with M reference entries, finished with M - 1 against a
-  // reference of M - 1 blocks.
+  // Counted with N entries, M of them reference entries; finished with
+  // N - 1 entries, whose layout the count did not make, and with M - 1
+  // against a reference of M - 1 blocks.
   vkc::CommandBatch counted(*g_device, *g_allocator);
   CHECK(writer.record_count(counted, r.blocks, 64, 64).ok());
   CHECK(counted.submit().ok());
+  d::ResidentBlocks shorn = r.blocks;
+  CHECK(shorn.count > shorn.reference_count);
+  shorn.count -= 1;
+  CHECK(uncounted(finish(writer, shorn, p.reference)));
   d::ResidentBlocks fewer = r.blocks;
   fewer.reference_count -= 1;
   d::FrameReference shorter = p.reference;

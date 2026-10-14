@@ -165,14 +165,6 @@ constexpr std::uint64_t frame_segment_count(std::uint64_t blocks,
   return blocks == 0 ? 0 : (blocks - 1) / segment_size + 1;
 }
 
-/// @return The stream positions `[x, y)` segment @p s covers in a frame of
-///         @p m reference entries, @p u to an update segment, and @p a new
-///         blocks, @p r to a segment: `frame_models.glsl`'s `segment_range`,
-///         for the device coders' host halves. An intra frame is `m = 0`.
-VR_CODEC_API glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
-                                            std::uint32_t u, std::uint32_t a,
-                                            std::uint32_t r);
-
 /// What a frame is (codec_params.hpp): byte 6 of its header.
 using codec::FrameType;
 

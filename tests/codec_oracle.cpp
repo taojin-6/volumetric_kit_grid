@@ -52,6 +52,15 @@ struct CountSink {
   void bits(uint, uint) {}
 };
 
+// The coder steps a walk puts: RansWriter's ops.
+struct StepSink {
+  std::uint32_t steps = 0;
+  void symbol(uint, uint) { ++steps; }
+  void bits(uint, uint n) {
+    steps += (n + kRansMaxRawBits - 1) / kRansMaxRawBits;
+  }
+};
+
 struct WriteSink {
   RansWriter& writer;
   const std::vector<d::FrequencyTable>& tables;
@@ -170,6 +179,50 @@ vkc::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
 
 std::uint32_t model_alphabet(std::uint32_t model, std::uint32_t k) {
   return glsl::model_alphabet(model, k);
+}
+
+std::vector<std::uint32_t> entry_steps(const Frame& frame,
+                                       std::uint32_t segment_size) {
+  const DctBlocks& b = frame.blocks;
+  const std::uint32_t k = b.params.coefficient_count;
+  const auto m = static_cast<uint>(frame.modes.size());
+  const auto n = static_cast<uint>(m + frame.coords.size());
+  std::vector<std::uint32_t> out(n);
+  for (uint p = 0; p < n; ++p) {
+    glsl::StepSink sink;
+    glsl::BlockWriter<glsl::StepSink> walk{sink};
+    walk.g_mask = &b.masks[std::size_t(p) * codec::kMaskWordsPerBlock];
+    walk.coefficients = &b.coefficients[std::size_t(p) * k];
+    if (p < m) {
+      const auto mode = static_cast<uint>(frame.modes[p]);
+      if (mode < glsl::kModeSymbols) walk.emit_entry(mode, k);
+    } else {
+      const uint q = p - m;
+      const bool first = q % segment_size == 0;
+      walk.emit_block(first, frame.coords[first ? q : q - 1], frame.coords[q],
+                      k);
+    }
+    out[p] = sink.steps;
+  }
+  return out;
+}
+
+StepLayout step_layout(const std::vector<std::uint32_t>& steps, std::uint32_t m,
+                       std::uint32_t u, std::uint32_t r) {
+  const auto n = static_cast<uint>(steps.size());
+  const std::uint64_t segments =
+      d::frame_segment_count(m, u) + d::frame_segment_count(n - m, r);
+  StepLayout out;
+  out.starts.assign(std::size_t(n) + 1, 0);
+  out.slot_offsets.assign(std::size_t(segments) + 1, 0);
+  for (uint p = 0; p < n; ++p) out.starts[p + 1] = out.starts[p] + steps[p];
+  for (std::uint64_t s = 0; s < segments; ++s) {
+    const glsl::uvec2 range =
+        glsl::segment_range(static_cast<uint>(s), m, u, n - m, r);
+    const std::uint64_t words = out.starts[range.y] - out.starts[range.x];
+    out.slot_offsets[s + 1] = out.slot_offsets[s] + ((words + 3) & ~1ull);
+  }
+  return out;
 }
 
 vkc::Result<std::vector<std::uint8_t>> write_frame(

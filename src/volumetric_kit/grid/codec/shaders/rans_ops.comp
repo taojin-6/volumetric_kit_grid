@@ -4,10 +4,12 @@
 // The device frame's coder steps: one invocation per entry walks its symbols
 // in the order the grammar emits them and writes each one's steps, as
 // `start | freq << 16` words, downward from the end of the entry's run. The
-// encoder takes steps last first, and the host lays each segment's entries
-// last first, so a segment's steps are one run in the encoder's order that
-// rans_encode.comp streams through: the branchy symbol walk runs here, an
-// entry per invocation, and only the rANS state's chain stays serial.
+// encoder takes steps last first, so each segment's entries are laid out last
+// first: entry p of segment [x, y) ends its run at
+// starts[x] + starts[y] - starts[p] (rans_layout.comp's starts), and the
+// segment's steps are one run, starts[x] to starts[y], in the encoder's order
+// that rans_encode.comp streams through. The branchy symbol walk runs here,
+// an entry per invocation, and only the rANS state's chain stays serial.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -20,8 +22,8 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 4, std430) readonly buffer Tables {
   uint tables[];  // per model, per symbol, at model_base: cum | freq << 16
 };
-layout(set = 0, binding = 5, std430) readonly buffer StepEnds {
-  uint step_ends[];  // per entry: one past its run's last step
+layout(set = 0, binding = 5, std430) readonly buffer Starts {
+  uint starts[];  // the steps before each entry, then their total
 };
 layout(set = 0, binding = 6, std430) writeonly buffer Steps {
   uint steps[];
@@ -48,6 +50,10 @@ void sink_bits(uint value, uint bits) {
 void main() {
   const uint p = pc.item_base + gl_GlobalInvocationID.x;
   if (p >= pc.num_entries) return;
-  g_at = step_ends[p];
+  const uint m = pc.reference_count;
+  const uvec2 range =
+      segment_range(segment_of(p, m, pc.update_size, pc.segment_size), m,
+                    pc.update_size, pc.num_entries - m, pc.segment_size);
+  g_at = starts[range.x] + starts[range.y] - starts[p];
   walk_entry(p);
 }

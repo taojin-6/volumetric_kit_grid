@@ -126,4 +126,11 @@ uvec2 segment_range(uint s, uint m, uint u, uint a, uint r) {
   return uvec2(m + first, m + (a - first > r ? first + r : a));
 }
 
+// The segment stream position p falls in, of the same frame.
+uint segment_of(uint p, uint m, uint u, uint r) {
+  if (p < m) return p / u;
+  const uint updates = m == 0u ? 0u : (m - 1u) / u + 1u;
+  return updates + (p - m) / r;
+}
+
 #endif  // VR_FRAME_MODELS_GLSL

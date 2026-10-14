@@ -96,4 +96,25 @@ vkc::Result<Frame> decode_frame(const d::ParsedFrame& parsed);
 // The alphabet of frequency table @p model at @p k (frame_models.glsl).
 std::uint32_t model_alphabet(std::uint32_t model, std::uint32_t k);
 
+// Each of @p frame's entries' coder steps by stream position, in segments of
+// @p segment_size new blocks: a symbol one, a raw field one per chunk of at
+// most 12 bits -- the steps the device writer's count pass finds, and its
+// step layout lays out. A mode past the alphabet takes none.
+std::vector<std::uint32_t> entry_steps(const Frame& frame,
+                                       std::uint32_t segment_size);
+
+// The device writer's step layout (step_layout.hpp), on the host, in 64
+// bits: E, the steps before each entry, then their total; and each
+// segment's slot's first 16-bit word -- a word a step and the state's two,
+// rounded up to even -- then their total.
+struct StepLayout {
+  std::vector<std::uint64_t> starts;
+  std::vector<std::uint64_t> slot_offsets;
+};
+
+// @p steps' layout in a frame of @p m reference entries in update segments
+// of @p u, then new blocks in segments of @p r.
+StepLayout step_layout(const std::vector<std::uint32_t>& steps, std::uint32_t m,
+                       std::uint32_t u, std::uint32_t r);
+
 }  // namespace codec_oracle

@@ -2,9 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // The device frame's pass 1: every model's symbol counts, each entry's coder
-// steps, which place its steps (rans_ops.comp) and size its segment's output
-// slot, and what check_entries refuses (bitstream.hpp). One invocation per
-// entry.
+// steps, which rans_layout.comp lays out, and what check_entries refuses
+// (bitstream.hpp). One invocation per entry.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require

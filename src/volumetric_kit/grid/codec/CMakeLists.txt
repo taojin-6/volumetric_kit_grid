@@ -9,11 +9,12 @@
 # forward/inverse 8^3 DCT that turns a block list into quantized coefficients
 # plus an observed mask, and back), the rANS tables (rans.hpp, header-only), the
 # frame's layout, parsing and checks (bitstream.cpp; the 2026-09-27 decisions),
-# its device coders, the block lists' sort, merge and grid diff
-# (block_lists.cpp), and the decoder's reference (reference_store.cpp). Links
-# recon_volume ALONE -- it reads a grid's tsdf/weight and re-creates blocks
-# through the map, and needs neither the integrator that produced the field nor
-# the mesher that consumes the decoded one.
+# its device coders and their step layout (step_layout.cpp), the block lists'
+# sort, merge and grid diff (block_lists.cpp), and the decoder's reference
+# (reference_store.cpp). Links recon_volume ALONE -- it reads a grid's
+# tsdf/weight and re-creates blocks through the map, and needs neither the
+# integrator that produced the field nor the mesher that consumes the decoded
+# one.
 include(GenerateExportHeader)
 include(GNUInstallDirs)
 
@@ -33,7 +34,8 @@ target_sources(
           device_frame_writer.cpp
           encoder.cpp
           frame_hash.cpp
-          reference_store.cpp)
+          reference_store.cpp
+          step_layout.cpp)
 
 # Per-tier export header (VR_CODEC_API / VR_CODEC_STATIC_DEFINE), isolated so
 # the macros never collide with another tier's on one include path.
@@ -89,6 +91,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_decode.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_ops.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_encode.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_layout.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_scan.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_slots.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_gather.comp"
