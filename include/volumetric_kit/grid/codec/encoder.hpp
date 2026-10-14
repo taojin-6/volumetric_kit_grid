@@ -24,6 +24,7 @@ namespace detail {
 class BlockLists;
 class DctTransform;
 class DeviceFrameWriter;
+class ReferenceStore;
 }  // namespace detail
 
 /// @brief How an @ref Encoder codes a frame.
@@ -53,6 +54,12 @@ struct EncoderConfig {
 /// holds them in, so the same content always makes the same bytes on the same
 /// device (a frame is reproducible per device, decodable on any).
 ///
+/// The forward's output stays on the device as the frame a decoder holds of
+/// it -- quantized coefficients, masks and block list -- and the last frame
+/// @ref encode returned is kept there: the frame being encoded and that one
+/// take `80 + 4 * ceil(K / 2)` bytes of device memory a block each, and the
+/// frame 8 more, all kept, sized for the largest frame.
+///
 /// Geometry only: colour is not coded. A player textures the decoded mesh
 /// from RGB that travels beside the frame.
 ///
@@ -66,7 +73,8 @@ struct EncoderConfig {
 class VR_CODEC_API Encoder {
  public:
   /// @brief Build the kernels: the forward transform's, the block lists'
-  ///        (the sort's among them) and the rANS coder's.
+  ///        (the sort's among them), the reference store's and the rANS
+  ///        coder's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -131,6 +139,8 @@ class VR_CODEC_API Encoder {
   std::unique_ptr<detail::DctTransform> transform_;
   std::unique_ptr<detail::BlockLists> lists_;
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
+  // The last frame returned, kept as the forward made it.
+  std::unique_ptr<detail::ReferenceStore> store_;
   // Device spans for the kernels; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;
 };

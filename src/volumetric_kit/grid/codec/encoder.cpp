@@ -3,6 +3,7 @@
 
 #include "volumetric_kit/recon/codec/encoder.hpp"
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -10,6 +11,8 @@
 #include "block_lists.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_writer.hpp"
+#include "frame_hash.hpp"
+#include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -45,6 +48,7 @@ core::Result<Encoder> Encoder::create(core::Device& device,
   VKC_ASSIGN(e.transform_, detail::DctTransform::create(device, allocator));
   VKC_ASSIGN(e.lists_, detail::BlockLists::create(device, allocator));
   VKC_ASSIGN(e.writer_, detail::DeviceFrameWriter::create(device, allocator));
+  VKC_ASSIGN(e.store_, detail::ReferenceStore::create(device, allocator));
   VKC_ASSIGN(e.gpu_timer_, core::GpuTimer::create(device));
   return e;
 }
@@ -80,29 +84,53 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   // Then, in one batch, into the order the frame requires -- the hash
   // table's order is whatever the allocate atomics left, so sorting is also
   // what makes the same content give the same bytes -- and through the
-  // forward, whose symbols the same batch counts: only the counts cross
-  // before the coding.
+  // forward, into the reference store's spare: the frame the decoder will
+  // hold, which this one holds too once it returns the frame. The same
+  // batch counts its symbols: only the counts cross before the coding.
+  const volume::VoxelGridParams& gp = grid.grid();
+  const CodecParams& params = config_.params;
   std::uint32_t rejected = 0;
-  detail::ResidentBlocks resident;
+  detail::ResidentBlocks entries;
   {
     core::StageScope forward(metrics, "  ..forward");
+    VKC_TRY(store_->reserve(observed, params.coefficient_count));
+    const detail::FrameBuffers frame = store_->frame_buffers();
     core::CommandBatch batch(*device_, *allocator_);
     VKC_ASSIGN(const core::Buffer* sorted,
                lists_->record_sort(batch, transform_->observed_list(), observed,
                                    &stage));
-    VKC_ASSIGN(resident,
-               transform_->record_forward(batch, grid, *sorted, observed,
-                                          config_.params, rejected, &stage));
-    VKC_TRY(writer_->record_count(batch, resident, config_.segment_size,
+    VKC_TRY(batch.copy(*sorted, 0, *frame.list, 0,
+                       VkDeviceSize(observed) * sizeof(volume::BlockIndex),
+                       &stage));
+    VKC_ASSIGN(entries,
+               transform_->record_forward(
+                   batch, grid, *frame.list, observed, params, *frame.masks,
+                   *frame.coefficients, rejected, &stage));
+    VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
                                   detail::kDefaultUpdateSize, &stage));
     VKC_TRY(batch.submit());
-    VKC_TRY(detail::DctTransform::check_rejected("forward", rejected,
-                                                 resident.count));
+    VKC_TRY(
+        detail::DctTransform::check_rejected("forward", rejected, observed));
   }
-  core::StageScope entropy(metrics, "  ..rans encode");
-  return writer_->finish(resident, grid.grid().voxel_size,
-                         grid.grid().trunc_dist, config_.params,
-                         /*reference=*/nullptr, &stage);
+  std::vector<std::uint8_t> bytes;
+  {
+    core::StageScope entropy(metrics, "  ..rans encode");
+    VKC_ASSIGN(bytes, writer_->finish(entries, gp.voxel_size, gp.trunc_dist,
+                                      params, /*reference=*/nullptr, &stage));
+  }
+  // Only a frame returned is held. It holds every block the forward made,
+  // which the spare holds in frame order.
+  VKC_ASSIGN(const detail::FrameHeader header,
+             detail::read_frame_header(bytes.data(), bytes.size()));
+  if (header.block_count != observed) {
+    return core::Status::invalid_argument(
+        "Encoder::encode: the frame holds " +
+        std::to_string(header.block_count) + " blocks of the " +
+        std::to_string(observed) + " the forward made (a bug)");
+  }
+  store_->commit(detail::FrameReference{
+      detail::frame_hash(bytes.data(), bytes.size()), header});
+  return bytes;
 }
 
 }  // namespace volumetric_kit::recon::codec

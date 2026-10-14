@@ -9,6 +9,7 @@
 #include "codec_oracle_encode.hpp"
 #include "grid_readback.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
 
 namespace codec_oracle {
 
@@ -87,11 +88,25 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                          gpu.device, gpu.allocator, blocks.blocks,
                          blocks.count * sizeof(vol::BlockIndex)));
   }
+  // Where the output goes, as the encoder's reference store holds it; none
+  // for params the transform refuses first, or no blocks.
+  vkc::Buffer mask_out;
+  vkc::Buffer coefficient_out;
+  if (params.validate().ok() && blocks.count != 0) {
+    VKC_ASSIGN(mask_out, vkc::device_storage_buffer(
+                             gpu.allocator, VkDeviceSize(blocks.count) *
+                                                codec::kMaskWordsPerBlock *
+                                                sizeof(std::uint32_t)));
+    VKC_ASSIGN(coefficient_out,
+               vkc::device_storage_buffer(
+                   gpu.allocator,
+                   VkDeviceSize(blocks.count) * words * sizeof(std::uint32_t)));
+  }
   std::uint32_t rejected = 0;
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_ASSIGN(
-      const d::ResidentBlocks resident,
-      t.record_forward(batch, grid, list, blocks.count, params, rejected));
+  VKC_ASSIGN(const d::ResidentBlocks resident,
+             t.record_forward(batch, grid, list, blocks.count, params, mask_out,
+                              coefficient_out, rejected));
   const std::size_t n = resident.count;
   std::vector<std::uint32_t> packed(n * words);
   std::vector<std::uint32_t> masks(n * codec::kMaskWordsPerBlock);

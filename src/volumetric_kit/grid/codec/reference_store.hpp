@@ -4,15 +4,15 @@
 #pragma once
 
 /// @file reference_store.hpp
-/// @brief The frame a P-frame decodes against, kept where the inverse
-///        transform reads it, and the apply that makes each decoded frame
-///        from it.
+/// @brief The frame a P-frame is coded or decoded against, kept where the
+///        transforms read and write it, and the apply that makes each
+///        decoded frame from it.
 ///
-/// Internal (under src/, never installed). The decoded frame's quantized
+/// Internal (under src/, never installed). The frame's quantized
 /// coefficients and masks, and its block list, stay on the device, in the
 /// transform's layout; the host keeps its @ref FrameReference alone. A
 /// reference is never rebuilt from a grid: the grid holds dequantized SDF,
-/// and a residual adds to the q the reference decoded to.
+/// and a residual adds to the q the reference was coded with.
 
 #include <cstdint>
 #include <memory>
@@ -28,25 +28,34 @@
 
 namespace volumetric_kit::recon::codec::detail {
 
-/// @brief Where a decoded frame's blocks and their sources go before the
-///        apply reads them: the store's spare list and its sources, which the
-///        decoder's merge writes (@ref BlockLists::record_merge).
+/// @brief Where the next frame's blocks go, as @ref ReferenceStore::reserve
+///        last sized them: the store's spare, and the apply's sources. The
+///        decoder's merge writes the list and the sources
+///        (@ref BlockLists::record_merge) and its apply the masks and
+///        coefficients; the encoder copies its sorted list into the list and
+///        its forward writes the masks and coefficients
+///        (@ref DctTransform::record_forward).
 struct FrameBuffers {
   const core::Buffer* list = nullptr;     ///< `volume::BlockIndex` a block.
   const core::Buffer* sources = nullptr;  ///< An @ref ApplySource a block.
+  const core::Buffer* masks = nullptr;    ///< `kMaskWordsPerBlock` words.
+  /// @ref coefficient_words "coefficient_words(K)" words a block.
+  const core::Buffer* coefficients = nullptr;
 };
 
-/// @brief The held reference frame and the frame being decoded, in two slots
-///        of device memory that swap at each @ref commit.
+/// @brief The held reference frame and the frame being coded or decoded, in
+///        two slots of device memory that swap at each @ref commit.
 ///
 /// The current slot holds the reference: each block's 16 mask words and
 /// @ref coefficient_words(K) coefficient words, and its block list, in the
-/// reference's order. The spare receives the next frame -- its list and
-/// sources from the decoder's merge, its words from @ref record_apply
-/// (`inter_apply.comp`) -- and becomes the current slot only at @ref commit.
-/// So until a decode commits, the reference stays as it was, whatever was
-/// recorded or failed. An intra frame takes the same apply, from its payload
-/// alone, so every decoded frame lands in the store by one path.
+/// reference's order. The spare receives the next frame (@ref frame_buffers)
+/// and becomes the current slot only at @ref commit. So until a frame
+/// commits, the reference stays as it was, whatever was recorded or failed.
+///
+/// A decoder's frame comes from its merge and @ref record_apply
+/// (`inter_apply.comp`); an intra frame takes the same apply, from its
+/// payload alone, so every decoded frame lands in the store by one path. An
+/// encoder's comes from its sort and forward transform.
 ///
 /// Each slot takes `80 + 4 * coefficient_words(K)` bytes a block, and the
 /// sources `8`. Every buffer is device-local and retained, growing as
@@ -85,15 +94,17 @@ class VR_CODEC_API ReferenceStore {
     return slots_[current_].list;
   }
 
-  /// @return The spare's list and the sources, as @ref reserve last sized
-  ///         them, for the merge to write and @ref record_apply to read.
+  /// @return The spare and the sources, as @ref reserve last sized them.
   FrameBuffers frame_buffers() const noexcept {
-    return FrameBuffers{&slots_[current_ ^ 1u].list, &sources_};
+    const Slot& spare = slots_[current_ ^ 1u];
+    return FrameBuffers{&spare.list, &sources_, &spare.masks,
+                        &spare.coefficients};
   }
 
   /// @brief Make the spare hold a frame of @p n blocks of @p k
   ///        coefficients before anything is recorded: what lets a decoder
-  ///        refuse before it touches the grid.
+  ///        refuse before it touches the grid, and gives an encoder's forward
+  ///        its output.
   /// @return OK; `Status::Code::InvalidArgument` for a buffer past
   ///         `maxStorageBufferRange`; or an allocation's failure. The held
   ///         reference is untouched either way.
@@ -129,8 +140,9 @@ class VR_CODEC_API ReferenceStore {
 
   /// @brief Hold the spare as the reference: the only call that changes
   ///        @ref held and @ref reference_list.
-  /// @pre The last @ref record_apply's batch was submitted and succeeded,
-  ///      and the spare's list holds the frame's
+  /// @pre The batch that made the spare's frame -- the last
+  ///      @ref record_apply's, or an encoder's forward -- was submitted and
+  ///      succeeded, and the spare's list holds the frame's
   ///      `reference.header.block_count` blocks.
   void commit(const FrameReference& reference);
 

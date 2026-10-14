@@ -932,13 +932,41 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     desc.memory = vkc::MemoryUsage::DeviceOnly;
     vkc::Result<vkc::Buffer> transfer_only = allocator.create_buffer(desc);
     CHECK(transfer_only.ok());
+    vkc::Result<vkc::Buffer> masks = vkc::device_storage_buffer(
+        allocator, 3 * codec::kMaskWordsPerBlock * sizeof(std::uint32_t));
+    vkc::Result<vkc::Buffer> coefficients = vkc::device_storage_buffer(
+        allocator,
+        3 * codec::detail::coefficient_words(params.coefficient_count) *
+            sizeof(std::uint32_t));
+    CHECK(masks.ok() && coefficients.ok());
     for (const vkc::Buffer* list : {&two.value(), &transfer_only.value()}) {
       std::uint32_t rejected = 0;
       vkc::CommandBatch batch(device, allocator);
       const vkc::Status s =
-          t.record_forward(batch, grid, *list, 3, params, rejected).status();
+          t.record_forward(batch, grid, *list, 3, params, masks.value(),
+                           coefficients.value(), rejected)
+              .status();
       CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
             s.message().find("the block list") != std::string::npos);
+    }
+    // A list of three, and outputs that hold two: refused before anything
+    // is recorded.
+    vkc::Result<vkc::Buffer> three = vr_test::upload_device_buffer(
+        device, allocator, blocks.data(), 3 * sizeof(vol::BlockIndex));
+    CHECK(three.ok());
+    for (const bool short_masks : {true, false}) {
+      const vkc::Buffer& short_one = two.value();  // 32 bytes
+      std::uint32_t rejected = 0;
+      vkc::CommandBatch batch(device, allocator);
+      const vkc::Status s =
+          t.record_forward(batch, grid, three.value(), 3, params,
+                           short_masks ? short_one : masks.value(),
+                           short_masks ? coefficients.value() : short_one,
+                           rejected)
+              .status();
+      CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
+            s.message().find("the output buffers do not hold 3 blocks") !=
+                std::string::npos);
     }
   }
   // More blocks than the heap.
