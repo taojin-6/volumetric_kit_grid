@@ -6,11 +6,14 @@
 /// @file volume/hash_types.hpp
 /// @brief POD storage layouts for the sparse voxel hash map.
 ///
-/// These are the on-device storage layouts shared by the CPU, the Vulkan/GLSL
-/// compute shaders, and the optional CUDA accelerator. They are deliberately
-/// plain structs with `static_assert`'d sizes/offsets so the host and device
-/// views agree byte-for-byte -- a layout drift between the host allocator and a
-/// device kernel is a silent corruption bug, so it is made a compile error.
+/// These are the compute shaders' storage layouts, as plain structs with
+/// `static_assert`'d sizes and offsets. `BlockIndex` and `BlockStamp` cross
+/// the host/device boundary -- a compacted list, a coordinate list a caller
+/// uploads, the stamps read back -- so a layout drift there is a silent
+/// corruption bug, made a compile error on the host side. `HashEntry` never
+/// reaches the host: it documents the device table's layout, which
+/// `volume/shaders/hash_common.glsl` mirrors, and sizes
+/// @ref VoxelHashMap::entries_buffer_size.
 ///
 /// The layout here is the C/CUDA layout (a bare `Vec3i` packs to 12 B, so
 /// `HashEntry` is 20 B with `pos` at offset 4). The GLSL side reads these via
