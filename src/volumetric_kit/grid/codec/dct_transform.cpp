@@ -181,7 +181,7 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
 
 core::Result<DctTransform::GridViews> DctTransform::check_inputs(
     const char* op, const volume::VoxelBlockGrid& grid,
-    const volume::BlockList& blocks, const CodecParams& params) const {
+    const CodecParams& params) const {
   VKC_TRY(params.validate());
   if (!grid.valid()) {
     return fail(op, "moved-from grid");
@@ -203,10 +203,6 @@ core::Result<DctTransform::GridViews> DctTransform::check_inputs(
       views.weight.element_size != sizeof(float)) {
     return fail(op, "the grid's tsdf and weight must be 4-byte floats");
   }
-  // Whether each entry is a live block is the kernels' to answer (see
-  // block_is_live), so the host takes only the O(1) half.
-  VKC_TRY(grid.check_block_list(blocks,
-                                (std::string("DctTransform::") + op).c_str()));
   return views;
 }
 
@@ -293,94 +289,70 @@ core::Status DctTransform::ensure_scratch(core::Buffer& buffer,
                                      max_storage_buffer_range_, name);
 }
 
-core::Status DctTransform::upload_list(core::CommandBatch& batch,
-                                       const volume::BlockList& blocks) {
-  const VkDeviceSize list_bytes =
-      VkDeviceSize(blocks.count) * sizeof(volume::BlockIndex);
-  VKC_TRY(ensure_scratch(block_list_, list_bytes, "codec.block_list"));
-  return batch.upload(block_list_, 0, blocks.blocks, list_bytes);
-}
-
-core::Result<std::vector<volume::BlockIndex>> DctTransform::observed(
+core::Result<std::uint32_t> DctTransform::observed(
     const volume::VoxelBlockGrid& grid, const volume::DeviceBlockList& list,
     core::GpuStageScope* stage) {
-  VKC_ASSIGN(GridViews views, check_inputs("observed", grid,
-                                           volume::BlockList{}, CodecParams{}));
+  VKC_ASSIGN(GridViews views, check_inputs("observed", grid, CodecParams{}));
   VKC_TRY(grid.map().check_device_block_list(list, "DctTransform::observed"));
-  std::vector<volume::BlockIndex> out;
-  if (list.count == 0) {
-    last_observed_ = 0;
-    return out;
-  }
+  if (list.count == 0) return std::uint32_t{0};
   const VkDeviceSize list_bytes =
       VkDeviceSize(list.count) * sizeof(volume::BlockIndex);
   VKC_TRY(
       ensure_scratch(observed_blocks_, list_bytes, "codec.observed_blocks"));
-  // Read a predicted prefix beside the count, rather than pay a second fence
-  // on every call: the last observed count plus 25%, capped by the current
-  // input count, or the whole input when there is no last count (the first
-  // call, or one after an empty result). Only an outgrown prefix costs
-  // another transfer, just as collect_compacted does.
-  const std::uint32_t last = last_observed_;
-  const std::uint32_t guess =
-      last == 0 ? list.count
-                : static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                      list.count, std::uint64_t(last) + last / 4));
-  out.resize(guess);
   Counts counts;
   core::CommandBatch batch(*device_, *allocator_);
   VKC_TRY(record(batch, observed_kernel_, grid, views, list.buffer->handle(),
                  list.count, CodecParams{}, VK_NULL_HANDLE,
                  observed_blocks_.handle(), list_bytes, stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(counts), &counts));
-  VKC_TRY(batch.readback(observed_blocks_, 0,
-                         VkDeviceSize(guess) * sizeof(volume::BlockIndex),
-                         out.data()));
   VKC_TRY(batch.submit());
   VKC_TRY(check_rejected("observed", counts.rejected, list.count));
   if (counts.observed > list.count) {
     return fail("observed", "the device observed count exceeds the input list");
   }
-  out.resize(counts.observed);
-  if (counts.observed > guess) {
-    core::CommandBatch tail(*device_, *allocator_);
-    VKC_TRY(tail.readback(
-        observed_blocks_, VkDeviceSize(guess) * sizeof(volume::BlockIndex),
-        VkDeviceSize(counts.observed - guess) * sizeof(volume::BlockIndex),
-        out.data() + guess));
-    VKC_TRY(tail.submit());
-  }
-  last_observed_ = counts.observed;
-  return out;
+  return counts.observed;
 }
 
 core::Result<ResidentBlocks> DctTransform::record_forward(
     core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
-    const volume::BlockList& blocks, const CodecParams& params,
+    const core::Buffer& list, std::uint32_t count, const CodecParams& params,
     std::uint32_t& rejected, core::GpuStageScope* stage) {
   rejected = 0;
-  VKC_ASSIGN(GridViews views, check_inputs("forward", grid, blocks, params));
+  VKC_ASSIGN(GridViews views, check_inputs("forward", grid, params));
+  if (count > static_cast<std::uint32_t>(grid.grid().num_blocks)) {
+    return fail("forward", std::to_string(count) +
+                               " blocks, more than this grid's block heap (" +
+                               std::to_string(grid.grid().num_blocks) + ")");
+  }
   ResidentBlocks out;
   out.coefficient_count = params.coefficient_count;
-  if (blocks.count == 0) {
+  if (count == 0) {
     return out;
   }
-  const VkDeviceSize coeff_bytes = VkDeviceSize(blocks.count) *
+  // Whether each entry is a live block is the kernel's to answer (see
+  // block_ptr), so the host takes only the O(1) half.
+  const VkDeviceSize list_bytes =
+      VkDeviceSize(count) * sizeof(volume::BlockIndex);
+  VKC_TRY(core::StorageInput(list).check(
+      "DctTransform::forward: the block list", list_bytes));
+  VKC_TRY(
+      core::check_storage_buffer_range("DctTransform::forward: the block list",
+                                       list_bytes, max_storage_buffer_range_));
+  const VkDeviceSize coeff_bytes = VkDeviceSize(count) *
                                    padded_count(params.coefficient_count) *
                                    sizeof(std::int16_t);
   const VkDeviceSize mask_bytes =
-      VkDeviceSize(blocks.count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
+      VkDeviceSize(count) * kMaskWordsPerBlock * sizeof(std::uint32_t);
   VKC_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
   VKC_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
-  VKC_TRY(upload_list(batch, blocks));
-  VKC_TRY(record(batch, forward_kernel_, grid, views, block_list_.handle(),
-                 blocks.count, params, coefficients_.handle(), masks_.handle(),
-                 mask_bytes, stage));
+  VKC_TRY(record(batch, forward_kernel_, grid, views, list.handle(), count,
+                 params, coefficients_.handle(), masks_.handle(), mask_bytes,
+                 stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
-  out.list = &block_list_;
+  out.list = &list;
   out.masks = &masks_;
   out.coefficients = &coefficients_;
-  out.count = blocks.count;
+  out.count = count;
   return out;
 }
 
@@ -389,8 +361,7 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
                                    const ResidentBlocks& in,
                                    const CodecParams& params,
                                    core::GpuStageScope* stage) {
-  VKC_ASSIGN(GridViews views,
-             check_inputs("inverse", grid, volume::BlockList{}, params));
+  VKC_ASSIGN(GridViews views, check_inputs("inverse", grid, params));
   if (in.coefficient_count != params.coefficient_count) {
     return fail("inverse", "the blocks hold " +
                                std::to_string(in.coefficient_count) +

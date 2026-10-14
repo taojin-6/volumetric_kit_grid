@@ -11,7 +11,10 @@
 //   zero, a new block, an intra frame's block: the payload alone.
 // An absent side reads as zero, so one formula serves all three. Integer
 // only, so a P-frame decodes to exactly what the intra frame of the same
-// content does, on any device. An odd K's pad half-word is written 0.
+// content does, on any device. An odd K's pad half-word is written 0. A
+// source past what is bound -- the reference's M entries, the payload's
+// entries -- reads as absent and is counted: the merge never makes one, so a
+// count is a bug the store refuses, never a read out of bounds.
 
 #version 450
 #extension GL_EXT_scalar_block_layout : require
@@ -28,6 +31,8 @@ layout(push_constant, std430) uniform Push {
   uint block_base;         // first block this dispatch covers
   uint num_blocks;         // N, the frame's blocks
   uint coefficient_count;  // K
+  uint reference_count;    // the reference entries a source may read
+  uint payload_count;      // the payload entries a source may read
 }
 pc;
 
@@ -58,6 +63,9 @@ layout(set = 0, binding = 5, std430) writeonly buffer Masks {
 layout(set = 0, binding = 6, std430) writeonly buffer Coefficients {
   uint coefficients[];
 };
+layout(set = 0, binding = 7, std430) buffer Faults {
+  uint faults;  // the blocks with a source past what is bound
+};
 
 // Each 16-bit half of a and b added mod 2^16: a carry out of the low half
 // is dropped, not carried into the high one.
@@ -72,8 +80,15 @@ void main() {
     return;
   }
   const ApplySource s = sources[block];
-  const bool from_reference = s.reference != kNoSource;
-  const bool from_payload = s.payload != kNoSource;
+  const bool past_reference =
+      s.reference != kNoSource && s.reference >= pc.reference_count;
+  const bool past_payload =
+      s.payload != kNoSource && s.payload >= pc.payload_count;
+  if ((past_reference || past_payload) && gl_LocalInvocationIndex == 0u) {
+    atomicAdd(faults, 1u);
+  }
+  const bool from_reference = s.reference != kNoSource && !past_reference;
+  const bool from_payload = s.payload != kNoSource && !past_payload;
   const uint words = (pc.coefficient_count + 1u) / 2u;  // coefficient_words
   // The last word's high half is an odd K's pad.
   const uint last = (pc.coefficient_count & 1u) != 0u ? 0xFFFFu : 0xFFFFFFFFu;

@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// One level of the block sort past the tiles (block_lists.hpp): pairs of
+// sorted runs of pc.run_length entries merged into the other buffer, an entry
+// an invocation, by the same ranks as block_sort_tile.comp's, so the merge is
+// stable. A run with no sibling, the last of an odd count, is copied as it
+// is.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+
+#include "block_lists_push.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer In {
+  BlockIndex runs_in[];
+};
+layout(set = 0, binding = 1, scalar) writeonly buffer Out {
+  BlockIndex runs_out[];
+};
+
+VR_COORD_SEARCH(runs, runs_in)
+
+void main() {
+  const uint i = pc.item_base + gl_GlobalInvocationID.x;
+  if (i >= pc.count) return;
+  const uint run = pc.run_length;  // a power of two
+  const BlockIndex b = runs_in[i];
+  const uint base = i & ~(2u * run - 1u);
+  uint at;
+  if (i - base < run) {
+    const uint right = base + run;
+    const uint right_count = right < pc.count ? min(run, pc.count - right) : 0u;
+    at = i + runs_lower(b.coord, right, right_count);
+  } else {
+    at = i - run + runs_upper(b.coord, base, run);
+  }
+  runs_out[at] = b;
+}

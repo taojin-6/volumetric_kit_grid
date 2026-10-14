@@ -7,12 +7,12 @@
 #include <vector>
 
 #include "bitstream.hpp"
+#include "block_lists.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_writer.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
 
 namespace volumetric_kit::recon::codec {
 namespace {
@@ -43,6 +43,7 @@ core::Result<Encoder> Encoder::create(core::Device& device,
   e.device_ = &device;
   e.allocator_ = &allocator;
   VKC_ASSIGN(e.transform_, detail::DctTransform::create(device, allocator));
+  VKC_ASSIGN(e.lists_, detail::BlockLists::create(device, allocator));
   VKC_ASSIGN(e.writer_, detail::DeviceFrameWriter::create(device, allocator));
   VKC_ASSIGN(e.gpu_timer_, core::GpuTimer::create(device));
   return e;
@@ -68,30 +69,29 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
              grid.map().compact_active_blocks_on_device(metrics));
   // Only the blocks with an observed voxel are coded, found on the device
   // before the transform: a fused band is mostly never integrated, and
-  // transforming those blocks only to drop them read every one back.
-  std::vector<volume::BlockIndex> blocks;
+  // transforming those blocks only to drop them read every one back. Only
+  // their count crosses.
+  std::uint32_t observed = 0;
   {
-    core::StageScope observed(metrics, "  ..observed");
-    VKC_ASSIGN(blocks, transform_->observed(grid, list, &stage));
-  }
-  // Then into the order the frame requires. The hash table's order is
-  // whatever the allocate atomics left, so sorting is also what makes the
-  // same content give the same bytes. TODO(codec): sort on the device, so the
-  // observed list need not cross the bus both ways (the 2026-10-13 rule).
-  {
-    core::StageScope sort(metrics, "  ..sort");
-    detail::sort_by_coord(blocks);
+    core::StageScope row(metrics, "  ..observed");
+    VKC_ASSIGN(observed, transform_->observed(grid, list, &stage));
   }
 
-  // The forward output stays on the device; the same batch counts its
-  // symbols, so only the counts cross before the coding.
+  // Then, in one batch, into the order the frame requires -- the hash
+  // table's order is whatever the allocate atomics left, so sorting is also
+  // what makes the same content give the same bytes -- and through the
+  // forward, whose symbols the same batch counts: only the counts cross
+  // before the coding.
   std::uint32_t rejected = 0;
   detail::ResidentBlocks resident;
   {
     core::StageScope forward(metrics, "  ..forward");
     core::CommandBatch batch(*device_, *allocator_);
+    VKC_ASSIGN(const core::Buffer* sorted,
+               lists_->record_sort(batch, transform_->observed_list(), observed,
+                                   &stage));
     VKC_ASSIGN(resident,
-               transform_->record_forward(batch, grid, grid.block_list(blocks),
+               transform_->record_forward(batch, grid, *sorted, observed,
                                           config_.params, rejected, &stage));
     VKC_TRY(writer_->record_count(batch, resident, config_.segment_size,
                                   detail::kDefaultUpdateSize, &stage));

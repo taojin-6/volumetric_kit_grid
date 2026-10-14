@@ -47,9 +47,9 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
                                const std::vector<vr::Vec3i>& coords = {},
                                std::uint16_t pad = 0);
 
-// @p t's forward output over @p blocks read back, K coefficients to an entry;
-// DctTransform::record_forward's refusals, or its reject count's, leaving
-// @p out empty.
+// @p t's forward output over @p blocks, uploaded as the device list it takes,
+// read back, K coefficients to an entry; DctTransform::record_forward's
+// refusals, or its reject count's, leaving @p out empty.
 vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
                     const vol::BlockList& blocks,

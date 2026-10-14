@@ -918,10 +918,30 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   bad.coefficient_count = 0;
   CHECK(!oracle::forward(ctx, t, grid, grid.block_list(blocks), bad, out).ok());
 
-  // Null with a count.
+  // No list with a count, and a list shorter than its count, or not a
+  // storage buffer.
   vol::BlockList null_list{nullptr, 3, grid.topology_epoch()};
   CHECK(!oracle::forward(ctx, t, grid, null_list, params, out).ok());
-  // More blocks than the heap, which the epoch cannot see.
+  {
+    vkc::Result<vkc::Buffer> two = vr_test::upload_device_buffer(
+        device, allocator, blocks.data(), 2 * sizeof(vol::BlockIndex));
+    CHECK(two.ok());
+    vkc::BufferDesc desc;
+    desc.size = 3 * sizeof(vol::BlockIndex);
+    desc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    desc.memory = vkc::MemoryUsage::DeviceOnly;
+    vkc::Result<vkc::Buffer> transfer_only = allocator.create_buffer(desc);
+    CHECK(transfer_only.ok());
+    for (const vkc::Buffer* list : {&two.value(), &transfer_only.value()}) {
+      std::uint32_t rejected = 0;
+      vkc::CommandBatch batch(device, allocator);
+      const vkc::Status s =
+          t.record_forward(batch, grid, *list, 3, params, rejected).status();
+      CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
+            s.message().find("the block list") != std::string::npos);
+    }
+  }
+  // More blocks than the heap.
   const std::vector<vol::BlockIndex> too_many(
       std::size_t(grid.grid().num_blocks) + 1, blocks[0]);
   CHECK(!oracle::forward(ctx, t, grid, grid.block_list(too_many), params, out)
@@ -1015,8 +1035,9 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
               std::string::npos);
   }
 
-  // A list compacted before a remove() names a different block through a
-  // still in-range ptr, and only the epoch can tell.
+  // A list compacted before a remove() names a block the grid no longer
+  // holds, at a ptr still in range: its coord finds none, so both directions
+  // refuse it.
   const vol::BlockList stale = grid.block_list(blocks);
   vol::BlockIndex gone{};
   gone.coord = blocks[0].coord;
@@ -1062,10 +1083,20 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
 
 // The observed pass keeps exactly the entries of the map's own list whose
 // block holds a voxel at or above kObservedWeight, with each original ptr,
-// and refuses a list the map has moved past. Append order is unspecified.
+// on the device, and refuses a list the map has moved past. Append order is
+// unspecified.
 int observed_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
+  // The entries it kept, read back from where it left them.
+  const auto observed_of = [&](const vol::VoxelBlockGrid& grid,
+                               const vol::DeviceBlockList& list)
+      -> vkc::Result<std::vector<vol::BlockIndex>> {
+    VKC_ASSIGN(const std::uint32_t n, t.observed(grid, list));
+    if (n == 0) return std::vector<vol::BlockIndex>{};
+    return vr_test::read_back<vol::BlockIndex>(device, allocator,
+                                               t.observed_list(), n);
+  };
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -1087,7 +1118,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
       grid.map().compact_active_blocks_on_device();
   CHECK(list.ok() && list.value().count == 4);
   vkc::Result<std::vector<vol::BlockIndex>> kept =
-      t.observed(grid, list.value());
+      observed_of(grid, list.value());
   CHECK(kept.ok());
   const auto by_x = [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
     return a.coord.x < b.coord.x;
@@ -1099,10 +1130,10 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(kept.value()[i].ptr == blocks[2 * i].ptr);
   }
 
-  // Grow beyond the two-entry readback prediction, then shrink to none and
-  // regrow from a zero-entry prediction. No old append count or stale list
-  // tail may survive a call. The all-observed result also checks no duplicate
-  // append and every ptr, across dispatches in the chunked variant below.
+  // Grow past the last count, then shrink to none and regrow. No old append
+  // count may survive a call. The all-observed result also checks no
+  // duplicate append and every ptr, across dispatches in the chunked variant
+  // below.
   for (bool all : {true, false, true}) {
     std::vector<float> weights = attr(ctx, grid, "weight");
     std::fill(weights.begin(), weights.end(), 0.0f);
@@ -1112,7 +1143,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
       }
     }
     put(ctx, grid, "weight", weights);
-    kept = t.observed(grid, list.value());
+    kept = observed_of(grid, list.value());
     CHECK(kept.ok());
     CHECK(kept.value().size() == (all ? blocks.size() : 0u));
     std::sort(kept.value().begin(), kept.value().end(), by_x);
@@ -1135,7 +1166,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
       e.value().map().compact_active_blocks_on_device();
   CHECK(none.ok());
   vkc::Result<std::vector<vol::BlockIndex>> nothing =
-      t.observed(e.value(), none.value());
+      observed_of(e.value(), none.value());
   CHECK(nothing.ok() && nothing.value().empty());
 
   // An empty input followed by a smaller grid reuses the former capacity,
@@ -1154,7 +1185,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
     put(ctx, resized.value(), "weight", weights);
     auto device_list = resized.value().map().compact_active_blocks_on_device();
     CHECK(device_list.ok());
-    auto result = t.observed(resized.value(), device_list.value());
+    auto result = observed_of(resized.value(), device_list.value());
     CHECK(result.ok());
     CHECK(result.value().size() == std::size_t((size + 1) / 2));
     std::sort(result.value().begin(), result.value().end(), by_x);

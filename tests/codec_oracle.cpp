@@ -331,12 +331,24 @@ vkc::Result<Frame> decode_frame(const d::ParsedFrame& parsed) {
     // An update segment has no coordinate, and a block segment follows the
     // block segment before it, if any.
     const bool blocks = range.x >= m;
-    VKC_TRY(d::check_segment(s, fault, blocks ? prev_last : nullptr,
-                             blocks ? &frame.coords[range.x - m] : nullptr));
+    if (fault == d::SegmentFault::kNone && blocks && prev_last != nullptr &&
+        !d::coord_less(*prev_last, frame.coords[range.x - m])) {
+      fault = d::SegmentFault::kOutOfOrder;
+    }
+    VKC_TRY(d::check_segment(s, fault));
     if (blocks) prev_last = &frame.coords[range.y - 1 - m];
     stream += parsed.segment_lengths[s];
   }
-  if (inter) VKC_TRY(d::check_survivors(frame.modes, n, a));
+  if (inter) {
+    std::uint64_t survivors = 0;
+    for (const d::BlockMode mode : frame.modes) {
+      survivors += mode == d::BlockMode::kKeep || mode == d::BlockMode::kSkip ||
+                           mode == d::BlockMode::kZero
+                       ? 1
+                       : 0;
+    }
+    VKC_TRY(d::check_survivors(survivors, n, a));
+  }
   return frame;
 }
 

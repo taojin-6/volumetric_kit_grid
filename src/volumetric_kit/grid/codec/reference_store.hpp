@@ -9,14 +9,13 @@
 ///        from it.
 ///
 /// Internal (under src/, never installed). The decoded frame's quantized
-/// coefficients and masks stay on the device, in the transform's layout;
-/// the host keeps its @ref FrameReference and its block coordinates. A
+/// coefficients and masks, and its block list, stay on the device, in the
+/// transform's layout; the host keeps its @ref FrameReference alone. A
 /// reference is never rebuilt from a grid: the grid holds dequantized SDF,
 /// and a residual adds to the q the reference decoded to.
 
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
@@ -26,25 +25,32 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
+
+/// @brief Where a decoded frame's blocks and their sources go before the
+///        apply reads them: the store's spare list and its sources, which the
+///        decoder's merge writes (@ref BlockLists::record_merge).
+struct FrameBuffers {
+  const core::Buffer* list = nullptr;     ///< `volume::BlockIndex` a block.
+  const core::Buffer* sources = nullptr;  ///< An @ref ApplySource a block.
+};
 
 /// @brief The held reference frame and the frame being decoded, in two slots
 ///        of device memory that swap at each @ref commit.
 ///
 /// The current slot holds the reference: each block's 16 mask words and
-/// @ref coefficient_words(K) coefficient words, in the reference's order.
-/// The spare receives the next frame from @ref record_apply
-/// (`inter_apply.comp`), with that frame's block list beside it, and becomes
-/// the current slot only at @ref commit. So until a decode commits, the
-/// reference stays as it was, whatever was recorded or failed. An intra frame
-/// takes the same apply, from its payload alone, so every decoded frame lands
-/// in the store by one path.
+/// @ref coefficient_words(K) coefficient words, and its block list, in the
+/// reference's order. The spare receives the next frame -- its list and
+/// sources from the decoder's merge, its words from @ref record_apply
+/// (`inter_apply.comp`) -- and becomes the current slot only at @ref commit.
+/// So until a decode commits, the reference stays as it was, whatever was
+/// recorded or failed. An intra frame takes the same apply, from its payload
+/// alone, so every decoded frame lands in the store by one path.
 ///
-/// Each slot takes `64 + 4 * coefficient_words(K)` bytes a block, and the
-/// list and the sources `16` and `8`. Every buffer is device-local and
-/// retained, growing as @ref reserve asks (`ensure_device_scratch`).
+/// Each slot takes `80 + 4 * coefficient_words(K)` bytes a block, and the
+/// sources `8`. Every buffer is device-local and retained, growing as
+/// @ref reserve asks (`ensure_device_scratch`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
@@ -63,6 +69,8 @@ class VR_CODEC_API ReferenceStore {
   ~ReferenceStore() = default;
   ReferenceStore(const ReferenceStore&) = delete;
   ReferenceStore& operator=(const ReferenceStore&) = delete;
+  ReferenceStore(ReferenceStore&&) = delete;
+  ReferenceStore& operator=(ReferenceStore&&) = delete;
 
   /// @return The held reference, for @ref parse_frame; null until the first
   ///         @ref commit.
@@ -70,10 +78,18 @@ class VR_CODEC_API ReferenceStore {
     return held_ ? &reference_ : nullptr;
   }
 
-  /// @return The held reference's block coordinates, strictly increasing:
-  ///         its M entries' places, for @ref merge_frame. Empty with none
-  ///         held.
-  const std::vector<Vec3i>& coords() const noexcept { return coords_; }
+  /// @return The held reference's block list, `volume::BlockIndex` each,
+  ///         `ptr` 0, its coordinates strictly increasing: its M entries'
+  ///         places, which the merge searches. With none held, M is 0.
+  const core::Buffer& reference_list() const noexcept {
+    return slots_[current_].list;
+  }
+
+  /// @return The spare's list and the sources, as @ref reserve last sized
+  ///         them, for the merge to write and @ref record_apply to read.
+  FrameBuffers frame_buffers() const noexcept {
+    return FrameBuffers{&slots_[current_ ^ 1u].list, &sources_};
+  }
 
   /// @brief Make the spare hold a frame of @p n blocks of @p k
   ///        coefficients before anything is recorded: what lets a decoder
@@ -83,39 +99,50 @@ class VR_CODEC_API ReferenceStore {
   ///         reference is untouched either way.
   core::Status reserve(std::uint32_t n, std::uint32_t k);
 
-  /// @brief Record the apply of a decoded frame into the spare.
+  /// @brief Record the apply of a decoded frame of @p n blocks into the
+  ///        spare, from the sources at @ref frame_buffers, which the caller
+  ///        recorded the writing of into @p batch before this.
+  ///
+  /// A source past what is bound -- a reference entry when @p payload holds
+  /// none, or past its M; a payload entry past its count -- is read as
+  /// absent and counted, and @ref check_apply refuses the frame after the
+  /// submit.
   /// @param batch    The batch to record into; submitted by the caller.
   /// @param payload  The frame's entries by stream position, where the
-  ///                 device frame reader decoded them.
-  /// @param sources  Each block's, in frame order (@ref merge_frame); an
-  ///                 intra frame's are `{kNoSource, i}`.
-  /// @param coords   The blocks' coordinates, the same order: uploaded as
-  ///                 the spare's list.
+  ///                 device frame reader decoded them: a P-frame's M must be
+  ///                 the held reference's, at its K.
+  /// @param n        The frame's blocks.
   /// @param stage    Optional scope the apply's device span records into.
   /// @return The spare, valid until the next call, as the inverse reads it
   ///         (no reference entries); `Status::Code::InvalidArgument` for
-  ///         sources and coordinates of different lengths, more blocks than
-  ///         @ref reserve made room for, a source past the payload or the
-  ///         held reference, or one that reads a reference of another K.
+  ///         more blocks than @ref reserve made room for, no payload
+  ///         buffers, or a P-frame of another M or K than the held
+  ///         reference's.
   core::Result<ResidentBlocks> record_apply(
-      core::CommandBatch& batch, const ResidentBlocks& payload,
-      const std::vector<ApplySource>& sources, const std::vector<Vec3i>& coords,
+      core::CommandBatch& batch, const ResidentBlocks& payload, std::uint32_t n,
       core::GpuStageScope* stage = nullptr);
 
+  /// @return After the last @ref record_apply's batch has run, OK, or
+  ///         `Status::Code::InvalidArgument` for the blocks whose source was
+  ///         past what was bound.
+  core::Status check_apply() const;
+
   /// @brief Hold the spare as the reference: the only call that changes
-  ///        @ref held and @ref coords.
+  ///        @ref held and @ref reference_list.
   /// @pre The last @ref record_apply's batch was submitted and succeeded,
-  ///      and @p coords is its `coords`, `reference.header.block_count`
-  ///      long.
-  void commit(const FrameReference& reference, std::vector<Vec3i>&& coords);
+  ///      and the spare's list holds the frame's
+  ///      `reference.header.block_count` blocks.
+  void commit(const FrameReference& reference);
 
  private:
   ReferenceStore() = default;
 
-  /// A frame's coefficients and masks, in the transform's layout.
+  /// A frame's coefficients and masks, in the transform's layout, and its
+  /// block list.
   struct Slot {
     core::Buffer masks;
     core::Buffer coefficients;
+    core::Buffer list;
   };
 
   // Borrowed (must outlive this).
@@ -133,12 +160,13 @@ class VR_CODEC_API ReferenceStore {
   // slots_[current_] holds the reference; the other is the spare.
   Slot slots_[2];
   std::uint32_t current_ = 0;
-  core::Buffer list_;     // the spare's blocks, volume::BlockIndex each
   core::Buffer sources_;  // the apply's, an ApplySource a block
+  core::Buffer faults_;   // the apply's out-of-range sources, a u32
 
   bool held_ = false;
   FrameReference reference_;
-  std::vector<Vec3i> coords_;
+  // What the last apply's batch read back of faults_.
+  std::uint32_t faults_host_ = 0;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

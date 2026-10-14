@@ -9,7 +9,8 @@
 # forward/inverse 8^3 DCT that turns a block list into quantized coefficients
 # plus an observed mask, and back), the rANS tables (rans.hpp, header-only), the
 # frame's layout, parsing and checks (bitstream.cpp; the 2026-09-27 decisions),
-# its device coders, and the decoder's reference (reference_store.cpp). Links
+# its device coders, the block lists' sort, merge and grid diff
+# (block_lists.cpp), and the decoder's reference (reference_store.cpp). Links
 # recon_volume ALONE -- it reads a grid's tsdf/weight and re-creates blocks
 # through the map, and needs neither the integrator that produced the field nor
 # the mesher that consumes the decoded one.
@@ -24,6 +25,7 @@ add_library(volumetric_kit::recon_codec ALIAS recon_codec)
 target_sources(
   recon_codec
   PRIVATE bitstream.cpp
+          block_lists.cpp
           codec_params.cpp
           dct_transform.cpp
           decoder.cpp
@@ -57,8 +59,8 @@ endif()
 
 target_compile_features(recon_codec PUBLIC cxx_std_17)
 
-# PUBLIC: the codec headers expose volume types (VoxelBlockGrid, BlockList) and
-# core types (Result, Status); recon_volume carries recon_core transitively.
+# PUBLIC: the codec headers expose volume types (VoxelBlockGrid) and core types
+# (Result, Status); recon_volume carries recon_core transitively.
 target_link_libraries(recon_codec PUBLIC recon_volume)
 
 target_include_directories(
@@ -67,16 +69,21 @@ target_include_directories(
          "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>"
          "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 
-# Compile the kernels -- the DCT's, the P-frame apply and the rANS coders' -- to
-# SPIR-V and embed them (their sources #include the generated *.spv.hpp on a
-# PRIVATE path), so recon_codec ships with no runtime shader files.
+# Compile the kernels -- the DCT's, the block lists', the P-frame apply and the
+# rANS coders' -- to SPIR-V and embed them (their sources #include the generated
+# *.spv.hpp on a PRIVATE path), so recon_codec ships with no runtime shader
+# files.
 include(vr_embed)
 vr_embed_shaders(
   recon_codec
   SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/block_sort_merge.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/block_sort_tile.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_forward.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_merge.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_diff.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_apply.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_count.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_decode.comp"
@@ -84,7 +91,9 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_encode.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_scan.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_slots.comp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_gather.comp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_gather.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_verdict.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/survivor_ranks.comp")
 
 vr_target_warnings(recon_codec)
 

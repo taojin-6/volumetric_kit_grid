@@ -2,20 +2,24 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for codec::Encoder: an empty grid is a valid frame; the bytes are
-// the CPU oracle's and independent of the order the hash table holds the
+// the CPU oracle's -- its blocks sorted on the host -- blocks at int32's
+// extremes included, and independent of the order the hash table holds the
 // blocks in; blocks with no observed voxel are left out; its stage rows; its
 // refusals (a segment longer than the format allows among them) and its
 // moves. Decoding is codec_decoder_test's. Skips with no device.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "codec_fixture.hpp"
 #include "codec_oracle_encode.hpp"
+#include "grid_readback.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
@@ -147,8 +151,8 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   CHECK(enc.encode(grid, &m).ok());
   const vkc::StageRow* top = find_row(m, "codec encode");
   CHECK(top != nullptr);
-  for (const char* sub : {"  ..active set", "  ..observed", "  ..sort",
-                          "  ..forward", "  ..rans encode"}) {
+  for (const char* sub :
+       {"  ..active set", "  ..observed", "  ..forward", "  ..rans encode"}) {
     const vkc::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
@@ -225,6 +229,58 @@ int oracle_case(Gpu& gpu) {
     CHECK(frame.value().size() > 1000);
     CHECK(frame.value() == oracle.value());
   }
+  return 0;
+}
+
+// Blocks at int32's extremes on every axis, beside a sphere's: the device
+// sort orders them as the oracle's std::sort does, and the frame's deltas span
+// the whole range, so the bytes are still the oracle's.
+int extremes_case(Gpu& gpu, codec::Encoder& enc) {
+  const Sphere s{vr::Vec3f(0.0f), 0.05f};
+  vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  constexpr std::int32_t lo = std::numeric_limits<std::int32_t>::min();
+  constexpr std::int32_t hi = std::numeric_limits<std::int32_t>::max();
+  const std::vector<vr::Vec3i> far = {
+      {lo, 0, 0},   {hi, 0, 0},   {0, lo, 0},   {0, hi, 0},
+      {0, 0, lo},   {0, 0, hi},   {lo, lo, lo}, {hi, hi, hi},
+      {hi, lo, hi}, {lo, hi, lo}, {-1, hi, lo}, {lo + 1, -1, hi - 1}};
+  CHECK(allocate(grid, far).ok());
+  // Observed by hand, as write_sphere's block positions overflow here.
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      grid.map().compact_active_blocks();
+  vkc::Result<std::vector<float>> tsdf =
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf");
+  vkc::Result<std::vector<float>> weight =
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "weight");
+  CHECK(active.ok() && tsdf.ok() && weight.ok());
+  std::size_t marked = 0;
+  for (const vol::BlockIndex& b : active.value()) {
+    if (std::find(far.begin(), far.end(), b.coord) == far.end()) continue;
+    for (std::uint32_t v = 0; v < kVpb; ++v) {
+      const bool obs = (v + std::uint32_t(b.ptr) / kVpb) % 3 != 0;
+      tsdf.value()[std::uint32_t(b.ptr) + v] =
+          obs ? kTrunc * (float(v % 17) / 8.0f - 1.0f) : 0.0f;
+      weight.value()[std::uint32_t(b.ptr) + v] = obs ? 2.0f : 0.0f;
+    }
+    ++marked;
+  }
+  CHECK(marked == far.size());
+  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf",
+                                 tsdf.value())
+            .ok());
+  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
+                                 weight.value())
+            .ok());
+  vkc::Result<std::vector<std::uint8_t>> frame = enc.encode(grid);
+  vkc::Result<std::vector<std::uint8_t>> oracle =
+      codec_oracle::encode(gpu, grid, {});
+  CHECK(frame.ok() && oracle.ok());
+  CHECK(frame.value() == oracle.value());
+  vkc::Result<codec::FrameInfo> info =
+      codec::read_frame_info(frame.value().data(), frame.value().size());
+  CHECK(info.ok() && info.value().block_count > far.size());
   return 0;
 }
 
@@ -317,6 +373,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (metrics_case(gpu, enc) != 0) return 1;
   if (device_list_case(gpu, enc) != 0) return 1;
   if (oracle_case(gpu) != 0) return 1;
+  if (extremes_case(gpu, enc) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");

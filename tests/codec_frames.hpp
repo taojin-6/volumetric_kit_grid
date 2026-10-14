@@ -511,11 +511,18 @@ inline oracle::Frame resolve(const oracle::Frame& reference,
   return f;
 }
 
+// A decoded frame's blocks in frame order, and each one's sources.
+struct Merged {
+  std::vector<vr::Vec3i> coords;
+  std::vector<d::ApplySource> sources;
+};
+
 // A P-frame's blocks in frame order with their sources, by the oracle's own
-// map: what merge_frame must give.
-inline d::MergedFrame merge_oracle(const std::vector<vr::Vec3i>& reference,
-                                   const std::vector<d::BlockMode>& modes,
-                                   const std::vector<vr::Vec3i>& added) {
+// map: what the decoder's merge must give. An intra frame's are new blocks on
+// an empty reference.
+inline Merged merge_oracle(const std::vector<vr::Vec3i>& reference,
+                           const std::vector<d::BlockMode>& modes,
+                           const std::vector<vr::Vec3i>& added) {
   std::map<vr::Vec3i, d::ApplySource, ZyxLess> blocks;
   for (std::size_t e = 0; e < reference.size(); ++e) {
     const auto i = static_cast<std::uint32_t>(e);
@@ -531,7 +538,7 @@ inline d::MergedFrame merge_oracle(const std::vector<vr::Vec3i>& reference,
     blocks[added[q]] = {d::kNoSource,
                         static_cast<std::uint32_t>(reference.size() + q)};
   }
-  d::MergedFrame out;
+  Merged out;
   for (const auto& [c, source] : blocks) {
     out.coords.push_back(c);
     out.sources.push_back(source);
@@ -778,9 +785,9 @@ struct InterRefusal {
 };
 
 // The refusal of each check a P-frame reader makes, each one edit from
-// refusal_base()'s frame, in the order the reader makes them; merge_frame's,
-// which needs the reference's coordinates, is the test's. An edit that a
-// later check would refuse too is matched by its message.
+// refusal_base()'s frame, in the order the reader makes them; row 13's, which
+// needs the reference's coordinates, is the decoder's merge's. An edit that
+// a later check would refuse too is matched by its message.
 inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   using C = vkc::Status::Code;
   const InterCase& good = base.good;

@@ -3,13 +3,15 @@
 
 // GPU test for decoding on the device: the reference store's apply against
 // independent uint16 arithmetic, at every source kind and K, in one dispatch
-// or several, as its slots grow; and the Decoder's frames -- the Encoder's,
-// and chains of an I-frame, then P-frames -- leaving the grid exactly as the
-// CPU oracle's decode of the same content does, bit for bit, with every mode,
-// new blocks and the empty cases; a P-frame whose reference is not held
-// refused as NotFound, a segment longer than the format allows refused, and
-// every refusal and failure leaving the reference as it was. Internal headers
-// by include path; skips with no device.
+// or several, as its slots grow, and its sources past what is bound counted
+// and refused; and the Decoder's frames -- the Encoder's, and chains of an
+// I-frame, then P-frames, new blocks at int32's extremes among them --
+// leaving the grid exactly as the CPU oracle's decode of the same content
+// does, bit for bit, with every mode, new blocks and the empty cases; a
+// P-frame whose reference is not held refused as NotFound, a segment longer
+// than the format allows refused, every refusal and failure leaving the
+// reference as it was, and the device buffers grown and shrunk frame to
+// frame. Internal headers by include path; skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -82,6 +84,39 @@ std::vector<vr::Vec3i> row_of(std::size_t n) {
   return out;
 }
 
+// A frame's sources and blocks written where the merge writes them, the
+// store's frame buffers, after a reserve.
+vkc::Status stage_frame(Gpu& gpu, const d::ReferenceStore& store,
+                        const std::vector<d::ApplySource>& sources,
+                        const std::vector<vr::Vec3i>& coords) {
+  const d::FrameBuffers frame = store.frame_buffers();
+  std::vector<vol::BlockIndex> list;
+  for (const vr::Vec3i& c : coords) list.push_back(vol::BlockIndex{c, 0});
+  if (!sources.empty()) {
+    VKC_TRY(vr_test::write_back(gpu.device, gpu.allocator, *frame.sources,
+                                sources));
+  }
+  if (!list.empty()) {
+    VKC_TRY(vr_test::write_back(gpu.device, gpu.allocator, *frame.list, list));
+  }
+  return {};
+}
+
+// The held reference's coordinates, read back from the store's list.
+std::vector<vr::Vec3i> held_coords(Gpu& gpu, const d::ReferenceStore& store) {
+  std::vector<vr::Vec3i> out;
+  if (store.held() == nullptr) return out;
+  const std::uint32_t m = store.held()->header.block_count;
+  if (m == 0) return out;
+  for (const vol::BlockIndex& b :
+       vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
+                                           store.reference_list(), m)
+           .value()) {
+    out.push_back(b.coord);
+  }
+  return out;
+}
+
 // The spare as the last apply left it, unpacked: each block's payload, and
 // whether every odd K's pad half was written 0.
 struct Applied {
@@ -150,13 +185,14 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
     sources[i] = {d::kNoSource, static_cast<std::uint32_t>(i)};
   }
   CHECK(store.reserve(std::uint32_t(m), k).ok());
+  CHECK(stage_frame(gpu, store, sources, row_of(m)).ok());
   vkc::Result<Resident> up = resident(gpu, r);
   CHECK(up.ok());
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   vkc::Result<d::ResidentBlocks> spare =
-      store.record_apply(batch, up.value().blocks, sources, row_of(m));
+      store.record_apply(batch, up.value().blocks, std::uint32_t(m));
   CHECK(spare.ok());
-  CHECK(batch.submit().ok());
+  CHECK(batch.submit().ok() && store.check_apply().ok());
   vkc::Result<Applied> got = read_spare(gpu, spare.value());
   CHECK(got.ok() && got.value().pads_zero);
   for (std::size_t i = 0; i < m; ++i) {
@@ -166,7 +202,7 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
   id.hash = hash;
   id.header.block_count = static_cast<std::uint32_t>(m);
   id.header.params.coefficient_count = k;
-  store.commit(id, row_of(m));
+  store.commit(id);
   return 0;
 }
 
@@ -180,7 +216,7 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
                                 max_blocks_per_dispatch);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
-  CHECK(store.held() == nullptr && store.coords().empty());
+  CHECK(store.held() == nullptr);
   Lcg rng{17};
   std::uint64_t hash = 1;
   for (std::uint32_t k : {1u, 21u, 64u, codec::kVoxelsPerBlock}) {
@@ -188,7 +224,7 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
     const oracle::DctBlocks r = random_entries(m, k, rng);
     CHECK(commit_intra(gpu, store, r, hash) == 0);
     CHECK(store.held() != nullptr && store.held()->hash == hash);
-    CHECK(store.coords() == row_of(m));
+    CHECK(held_coords(gpu, store) == row_of(m));
 
     // A P-frame's payload by stream position: M entries, then two new.
     const oracle::DctBlocks payload = random_entries(m + 2, k, rng);
@@ -205,13 +241,16 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
                                                  {d::kNoSource, 10}};
     const std::vector<vr::Vec3i> coords = row_of(sources.size());
     CHECK(store.reserve(std::uint32_t(sources.size()), k).ok());
+    CHECK(stage_frame(gpu, store, sources, coords).ok());
     vkc::Result<Resident> up = resident(gpu, payload, {}, {}, 0xBEEF);
     CHECK(up.ok());
+    d::ResidentBlocks entries = up.value().blocks;
+    entries.reference_count = std::uint32_t(m);
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
     vkc::Result<d::ResidentBlocks> spare =
-        store.record_apply(batch, up.value().blocks, sources, coords);
+        store.record_apply(batch, entries, std::uint32_t(sources.size()));
     CHECK(spare.ok());
-    CHECK(batch.submit().ok());
+    CHECK(batch.submit().ok() && store.check_apply().ok());
     vkc::Result<Applied> got = read_spare(gpu, spare.value());
     CHECK(got.ok());
     CHECK(got.value().pads_zero);
@@ -233,7 +272,7 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
       }
     }
     // Applied and submitted, but not committed: the reference is as it was.
-    CHECK(store.held()->hash == hash && store.coords() == row_of(m));
+    CHECK(store.held()->hash == hash && held_coords(gpu, store) == row_of(m));
     ++hash;
   }
   return 0;
@@ -254,53 +293,62 @@ int grow_case(Gpu& gpu) {
   CHECK(commit_intra(gpu, store, held, 100) == 0);
   for (const std::size_t n : {std::size_t(50), std::size_t(700)}) {
     // Every block a skip of a held one, then the rest new: a frame of n
-    // blocks, the spare grown to hold it.
-    const std::size_t m = store.coords().size();
-    const oracle::DctBlocks fresh = random_entries(n - m, k, rng);
+    // blocks, the spare grown to hold it, its payload by stream position.
+    const std::size_t m = store.held()->header.block_count;
+    const oracle::DctBlocks fresh = random_entries(n, k, rng);
     std::vector<d::ApplySource> sources;
     for (std::size_t e = 0; e < m; ++e) {
       sources.push_back({std::uint32_t(e), d::kNoSource});
     }
     for (std::size_t q = 0; q < n - m; ++q) {
-      sources.push_back({d::kNoSource, std::uint32_t(q)});
+      sources.push_back({d::kNoSource, std::uint32_t(m + q)});
     }
     CHECK(store.reserve(std::uint32_t(n), k).ok());
+    CHECK(stage_frame(gpu, store, sources, row_of(n)).ok());
     vkc::Result<Resident> up = resident(gpu, fresh);
     CHECK(up.ok());
+    d::ResidentBlocks entries = up.value().blocks;
+    entries.reference_count = std::uint32_t(m);
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
     vkc::Result<d::ResidentBlocks> spare =
-        store.record_apply(batch, up.value().blocks, sources, row_of(n));
+        store.record_apply(batch, entries, std::uint32_t(n));
     CHECK(spare.ok());
-    CHECK(batch.submit().ok());
+    CHECK(batch.submit().ok() && store.check_apply().ok());
     vkc::Result<Applied> got = read_spare(gpu, spare.value());
-    CHECK(got.ok());
+    CHECK(got.ok() && got.value().coords == row_of(n));
     oracle::DctBlocks next;
     next.params.coefficient_count = k;
     for (std::size_t i = 0; i < n; ++i) {
-      const Payload want =
-          i < m ? payload_at(held, i) : payload_at(fresh, i - m);
+      const Payload want = i < m ? payload_at(held, i) : payload_at(fresh, i);
       CHECK(got.value().blocks[i] == want);
       append_payload(next, want);
     }
-    // Refused, and recorded but never committed: nothing changes.
+    // Refused -- twice the blocks, past the spare's headroom -- and recorded
+    // but never committed: nothing changes.
     const d::FrameReference before = *store.held();
     vkc::CommandBatch refused(gpu.device, gpu.allocator);
-    CHECK(store.record_apply(refused, up.value().blocks, sources, row_of(n - 1))
+    CHECK(store.record_apply(refused, entries, 2 * std::uint32_t(n))
               .status()
               .domain() == C::InvalidArgument);
-    CHECK(store.held()->hash == before.hash && store.coords() == row_of(m));
+    CHECK(store.held()->hash == before.hash &&
+          held_coords(gpu, store) == row_of(m));
     d::FrameReference id;
     id.hash = before.hash + 1;
     id.header.block_count = std::uint32_t(n);
     id.header.params.coefficient_count = k;
-    store.commit(id, row_of(n));
-    CHECK(store.held()->hash == id.hash && store.coords() == row_of(n));
+    store.commit(id);
+    CHECK(store.held()->hash == id.hash &&
+          held_coords(gpu, store) == row_of(n));
     held = std::move(next);
   }
   return 0;
 }
 
-// What the apply refuses before it records anything.
+// What the apply refuses: on the host, before it records anything, a
+// P-frame on another reference's M or K, more blocks than reserved and no
+// payload; and on the device, a source past what is bound -- a reference
+// entry past M, or any for an intra frame, a payload entry past the
+// payload -- read as absent, counted and refused after the submit.
 int apply_refusals_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
       d::ReferenceStore::create(gpu.device, gpu.allocator);
@@ -312,30 +360,51 @@ int apply_refusals_case(Gpu& gpu) {
   CHECK(up.ok());
   const std::uint32_t none = d::kNoSource;
   CHECK(store.reserve(4, 8).ok());
-  // The payload applied as given at @p k over @p blocks.
-  auto refuses = [&](const std::vector<d::ApplySource>& sources,
-                     std::uint32_t k, std::size_t blocks, const char* says) {
+  // The payload, its first @p m entries the reference's, at @p k over
+  // @p sources; the host's refusal, or the device's after the submit.
+  auto refused = [&](const std::vector<d::ApplySource>& sources,
+                     std::uint32_t m, std::uint32_t k, std::uint32_t blocks,
+                     const char* says) {
+    if (!stage_frame(gpu, store, sources, row_of(sources.size())).ok()) {
+      return false;
+    }
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
     d::ResidentBlocks payload = up.value().blocks;
+    payload.reference_count = m;
     payload.coefficient_count = k;
     vkc::Result<d::ResidentBlocks> r =
-        store.record_apply(batch, payload, sources, row_of(blocks));
-    return !r.ok() && r.status().domain() == C::InvalidArgument &&
-           r.status().message().find(says) != std::string::npos;
+        store.record_apply(batch, payload, blocks);
+    vkc::Status s = r.status();
+    if (r.ok()) {
+      s = batch.submit();
+      if (s.ok()) s = store.check_apply();
+    }
+    return !s.ok() && s.domain() == C::InvalidArgument &&
+           s.message().find(says) != std::string::npos;
   };
-  CHECK(refuses({{0, none}, {4, none}}, 8, 2, "reads reference entry 4"));
-  CHECK(refuses({{0, 0}}, 9, 1, "at K 9"));
-  CHECK(refuses({{none, 4}}, 8, 1, "reads payload entry 4 of 4"));
-  CHECK(refuses(std::vector<d::ApplySource>(100, {0, none}), 8, 100,
+  CHECK(refused({{0, none}, {4, none}}, 4, 8, 2,
+                "1 of the frame's blocks read past"));
+  CHECK(refused({{0, none}, {1, 1}}, 0, 8, 2,
+                "2 of the frame's blocks read past"));
+  CHECK(refused({{none, 4}}, 4, 8, 1, "1 of the frame's blocks read past"));
+  CHECK(refused({{0, 0}}, 4, 9, 1, "a P-frame of 4 reference entries at K 9"));
+  CHECK(refused({{0, 0}}, 3, 8, 1, "on a reference of 4 at K 8"));
+  CHECK(refused(std::vector<d::ApplySource>(4, {0, none}), 4, 8, 100,
                 "more than were reserved"));
-  CHECK(refuses({{0, none}}, 8, 2, "1 sources for 2 blocks"));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  CHECK(store.record_apply(batch, d::ResidentBlocks{}, {{none, 0}}, row_of(1))
+  CHECK(store.record_apply(batch, d::ResidentBlocks{}, 1)
             .status()
             .message()
             .find("no payload buffers") != std::string::npos);
   CHECK(store.reserve(1u << 31, 8).domain() == C::InvalidArgument);
-  CHECK(store.held()->hash == 7 && store.coords() == row_of(4));
+  CHECK(store.held()->hash == 7 && held_coords(gpu, store) == row_of(4));
+  // A fault is the call's: the next apply, in range, is clean.
+  CHECK(stage_frame(gpu, store, {{0, none}}, row_of(1)).ok());
+  d::ResidentBlocks payload = up.value().blocks;
+  payload.reference_count = 4;
+  vkc::CommandBatch clean(gpu.device, gpu.allocator);
+  CHECK(store.record_apply(clean, payload, 1).ok());
+  CHECK(clean.submit().ok() && store.check_apply().ok());
   return 0;
 }
 
@@ -494,6 +563,34 @@ int synthetic_case(Gpu& gpu) {
     CHECK(run_chain(gpu, extreme, what.c_str()) == 0);
   }
   return 0;
+}
+
+// A P-frame whose new blocks are at int32's extremes, deltas of 2^32 - 1
+// among them, beside a reference that keeps, skips, zeroes and removes; then
+// back to the reference, which drops them: the merge and the grid diff
+// search them as any other.
+int extremes_chain_case(Gpu& gpu) {
+  const oracle::Frame reference = make_frame(60, 4, 31);
+  const oracle::Frame kept = successor(reference, 32, 100, 400, 0);
+  const oracle::Frame added = codec_frames::extreme_frame();
+  std::map<vr::Vec3i, Payload, codec_frames::ZyxLess> blocks;
+  for (std::size_t i = 0; i < kept.coords.size(); ++i) {
+    blocks.emplace(kept.coords[i], payload_at(kept.blocks, i));
+  }
+  for (std::size_t i = 0; i < added.coords.size(); ++i) {
+    blocks.emplace(added.coords[i], payload_at(added.blocks, i));
+  }
+  oracle::Frame target = make_frame(0, 4, 1);
+  for (const auto& [c, payload] : blocks) {
+    target.coords.push_back(c);
+    append_payload(target.blocks, payload);
+  }
+  std::vector<Step> chain;
+  chain.push_back(i_step(oracle::write_frame(reference).value()));
+  chain.push_back(p_step(chain[0], target, sizes(2, 5)));
+  chain.push_back(p_step(chain[1], reference, sizes(3, 7)));
+  CHECK(census(chain[0], chain[1]).added == added.coords.size());
+  return run_chain(gpu, chain, "int32 extremes");
 }
 
 // The Encoder's frames of one sphere at an odd K, at the default segments
@@ -661,6 +758,7 @@ int not_found_case(Gpu& gpu, const Spheres& s) {
 
 // InvalidArgument from checks outside the device decode -- a new block on a
 // reference block (after it), and a scale not the reference's (before it) --
+// and rows 11 and 12 judged before row 13 on a frame that fails both,
 // leaving the grid and the reference as they were.
 int invalid_case(Gpu& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
@@ -691,6 +789,17 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   }
   p.blocks = std::move(blocks);
   const Bytes on_reference = oracle::write_frame(p, sizes(1, 2)).value();
+  // That frame broken before row 13 too, where the merge still meets the
+  // new block on the reference block: one block more than survive and are
+  // new (row 12), and its first update segment corrupt (row 11).
+  Bytes miscounted = on_reference;
+  codec_frames::put_u32(miscounted, 32,
+                        codec_frames::get_u32(on_reference, 32) + 1);
+  std::vector<codec_frames::Section> t =
+      codec_frames::sections_of(on_reference);
+  t[3].body[0] = 0;
+  t[3].body[1] = 0;
+  const Bytes corrupt = codec_frames::assemble(on_reference, t);
 
   Bytes rescaled = chain[2].sent;
   codec_frames::put_f32(rescaled, 24, 0.3f);
@@ -706,6 +815,10 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   }
   CHECK(refused(gpu, dec, on_reference, g.value(), C::InvalidArgument,
                 "is on reference block") == 0);
+  CHECK(refused(gpu, dec, miscounted, g.value(), C::InvalidArgument,
+                "are new, but the frame holds") == 0);
+  CHECK(refused(gpu, dec, corrupt, g.value(), C::InvalidArgument,
+                "segment 0 is corrupt") == 0);
   CHECK(refused(gpu, dec, rescaled, g.value(), C::InvalidArgument,
                 "quantization scale is not its reference's") == 0);
   CHECK(dec.decode(chain[2].sent.data(), chain[2].sent.size(), g.value()).ok());
@@ -770,6 +883,24 @@ int out_of_memory_case(Gpu& gpu, const Spheres& s) {
   CHECK(holds(gpu, tight.value(), few[1].intra));
   CHECK(dec.decode(few[2].sent.data(), few[2].sent.size(), tight.value()).ok());
   CHECK(holds(gpu, tight.value(), few[2].intra));
+  return 0;
+}
+
+// The device buffers grow with a frame and are kept for smaller ones: a
+// large frame, a small one and the large one again, each into a grid of its
+// own and each as the oracle decodes it.
+int scratch_case(Gpu& gpu, const Spheres& s) {
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(dec.ok());
+  const Bytes& large = s.chain[0].intra;
+  const Bytes small = oracle::write_frame(make_frame(12, 64, 41)).value();
+  for (const Bytes* f : {&large, &small, &large}) {
+    vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, *f);
+    CHECK(g.ok());
+    CHECK(dec.value().decode(f->data(), f->size(), g.value()).ok());
+    CHECK(holds(gpu, g.value(), *f));
+  }
   return 0;
 }
 
@@ -844,6 +975,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (grow_case(gpu) != 0) return 1;
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
+  if (extremes_chain_case(gpu) != 0) return 1;
   if (encoder_case(gpu) != 0) return 1;
   if (segment_rule_case(gpu) != 0) return 1;
   vkc::Result<Spheres> s = spheres(gpu);
@@ -852,6 +984,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (not_found_case(gpu, s.value()) != 0) return 1;
   if (invalid_case(gpu, s.value()) != 0) return 1;
   if (out_of_memory_case(gpu, s.value()) != 0) return 1;
+  if (scratch_case(gpu, s.value()) != 0) return 1;
   if (moves_case(gpu, s.value()) != 0) return 1;
   std::printf("codec P-frame decode: OK\n");
   return 0;

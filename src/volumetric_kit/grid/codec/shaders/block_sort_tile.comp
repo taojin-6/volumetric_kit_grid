@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The block sort's first levels (block_lists.hpp): each workgroup copies a
+// tile of kSortTile entries into shared memory, sorts it by rank-merging runs
+// of 1, 2, ..., kSortTile / 2 entries, and writes it out. A run's entry lands
+// at its index in its run plus the entries of the sibling run that go before
+// it -- for the left run those that sort before it, for the right run those
+// that do not sort after it -- so ties keep their order and the sort is
+// stable. The last tile may be partial.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+
+#include "block_lists_push.glsl"
+
+// Mirrors kSortTile in block_lists.cpp.
+const uint kSortTile = 256u;
+
+layout(local_size_x = kSortTile) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer In {
+  BlockIndex blocks_in[];
+};
+layout(set = 0, binding = 1, scalar) writeonly buffer Out {
+  BlockIndex blocks_out[];
+};
+
+// Two halves of a tile, which the levels ping-pong between: 8 KB.
+shared BlockIndex s_tile[2u * kSortTile];
+
+VR_COORD_SEARCH(tile, s_tile)
+
+void main() {
+  const uint lane = gl_LocalInvocationID.x;
+  const uint first = pc.item_base + gl_WorkGroupID.x * kSortTile;
+  // Uniform across the workgroup, as every barrier below needs.
+  const uint count = min(kSortTile, pc.count - first);
+  if (lane < count) s_tile[lane] = blocks_in[first + lane];
+  barrier();
+  uint src = 0u;
+  for (uint run = 1u; run < kSortTile; run <<= 1u) {
+    if (lane < count) {
+      const BlockIndex b = s_tile[src + lane];
+      const uint base = lane & ~(2u * run - 1u);
+      uint at;
+      if (lane - base < run) {
+        const uint right = base + run;
+        const uint right_count = right < count ? min(run, count - right) : 0u;
+        at = lane + tile_lower(b.coord, src + right, right_count);
+      } else {
+        at = lane - run + tile_upper(b.coord, src + base, run);
+      }
+      s_tile[kSortTile - src + at] = b;
+    }
+    barrier();
+    src = kSortTile - src;
+  }
+  if (lane < count) blocks_out[first + lane] = s_tile[src + lane];
+}

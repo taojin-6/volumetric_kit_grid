@@ -6,18 +6,17 @@
 // reference hash's known answers; the worked example, built by hand, read and
 // written byte for byte; round trips of every mode across K, update and
 // segment sizes and the empty cases; I -> P -> P chains on real hashes against
-// an independent model (codec_frames.hpp); merge_by_coord against std::set's
-// algorithms; every reader refusal, each one edit from a valid P-frame, with
-// its code and message, in the order of the reader's stages; every writer
-// refusal, with its code and message; and truncation and random corruption,
-// which must fail cleanly and never read out of bounds.
+// an independent model (codec_frames.hpp); every reader refusal, each one
+// edit from a valid P-frame, with its code and message, in the order of the
+// reader's stages; every writer refusal, with its code and message; and
+// truncation and random corruption, which must fail cleanly and never read
+// out of bounds. The decoder's merge is codec_block_lists_test's.
 // CPU-only, so these always run.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <iterator>
 #include <limits>
 #include <set>
 #include <string>
@@ -42,8 +41,6 @@ namespace {
 
 using codec_frames::get_u32;
 using codec_frames::inter_frame;
-using codec_frames::kMax32;
-using codec_frames::kMin32;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
 using codec_frames::put_u32;
@@ -75,19 +72,6 @@ bool same_inter(const oracle::Frame& a, const oracle::Frame& b) {
          a.reference.hash == b.reference.hash &&
          a.reference.header.block_count == b.reference.header.block_count &&
          a.modes == b.modes && same_content(a, b);
-}
-
-bool same_merge(const d::MergedFrame& a, const d::MergedFrame& b) {
-  if (a.coords != b.coords || a.sources.size() != b.sources.size()) {
-    return false;
-  }
-  for (std::size_t i = 0; i < a.sources.size(); ++i) {
-    if (a.sources[i].reference != b.sources[i].reference ||
-        a.sources[i].payload != b.sources[i].payload) {
-      return false;
-    }
-  }
-  return true;
 }
 
 // A refusal with @p code whose message holds @p says: the check under test,
@@ -181,18 +165,6 @@ int worked_example_case() {
   oracle::Frame written = p;
   CHECK(oracle::write_frame(written).value() == bytes);
 
-  // a <- (0, 0), c <- (none, 2), b <- (1, none).
-  const vkc::Result<d::MergedFrame> merged =
-      d::merge_frame(reference.coords, p.modes, p.coords);
-  CHECK(merged.ok());
-  CHECK(merged.value().coords ==
-        std::vector<vr::Vec3i>({{0, 0, 0}, {2, 0, 0}, {4, 0, 0}}));
-  const std::uint32_t no = d::kNoSource;
-  const d::ApplySource expected[] = {{0, 0}, {no, 2}, {1, no}};
-  for (std::size_t i = 0; i < 3; ++i) {
-    CHECK(merged.value().sources[i].reference == expected[i].reference);
-    CHECK(merged.value().sources[i].payload == expected[i].payload);
-  }
   // q = (q_a + 1, 3, q_b), masks (mask_a, full, mask_b).
   const oracle::Frame resolved = resolve(reference, p);
   CHECK(resolved.blocks.coefficients == std::vector<std::int16_t>({6, 3, -2}));
@@ -272,9 +244,9 @@ int worked_example_case() {
 // --- Round trips. -----------------------------------------------------------
 
 // Write @p p (coding @p target against @p reference), read it back against
-// its reference, and check it is @p p, writes the same bytes again, merges
-// as the oracle does and resolves to @p target, whose intra bytes the
-// resolved frame writes too.
+// its reference, and check it is @p p, writes the same bytes again, holds
+// @p target's blocks by the merge's model and resolves to @p target, whose
+// intra bytes the resolved frame writes too.
 int round_trip(const oracle::Frame& reference, const oracle::Frame& target,
                const oracle::Frame& p, const oracle::FrameWriteOptions& options,
                Bytes* out = nullptr) {
@@ -295,13 +267,9 @@ int round_trip(const oracle::Frame& reference, const oracle::Frame& target,
   CHECK(same_inter(p, back.value()));
   CHECK(oracle::write_frame(back.value(), options).value() == b);
 
-  const vkc::Result<d::MergedFrame> merged =
-      d::merge_frame(reference.coords, back.value().modes, back.value().coords);
-  CHECK(merged.ok());
-  CHECK(same_merge(merged.value(), codec_frames::merge_oracle(
-                                       reference.coords, back.value().modes,
-                                       back.value().coords)));
-  CHECK(merged.value().coords == target.coords);
+  CHECK(codec_frames::merge_oracle(reference.coords, back.value().modes,
+                                   back.value().coords)
+            .coords == target.coords);
 
   const oracle::Frame resolved = resolve(reference, back.value());
   CHECK(same_content(resolved, target));
@@ -392,93 +360,11 @@ int chain_case() {
   return 0;
 }
 
-// --- merge_by_coord. --------------------------------------------------------
-
-// Against std::set's algorithms on random sorted lists, empty ones and int32
-// extremes included: one visit per distinct coordinate, in order, each side
-// once and in order, and the walk stops at the first refusal.
-int merge_by_coord_case() {
-  Lcg rng{7};
-  const std::int32_t picks[] = {kMin32, -1, 0, 1, 2, kMax32};
-  auto draw = [&]() {
-    const std::int32_t x = picks[rng.below(6)];
-    const std::int32_t y = picks[rng.below(6)];
-    const std::int32_t z = picks[rng.below(6)];
-    return vr::Vec3i(x, y, z);
-  };
-  using Set = std::set<vr::Vec3i, ZyxLess>;
-  for (int trial = 0; trial < 300; ++trial) {
-    Set left;
-    Set right;
-    const std::uint32_t nl = trial % 10 == 0 ? 0 : rng.below(40);
-    const std::uint32_t nr = trial % 10 == 1 ? 0 : rng.below(40);
-    for (std::uint32_t i = 0; i < nl; ++i) left.insert(draw());
-    for (std::uint32_t i = 0; i < nr; ++i) right.insert(draw());
-    const std::vector<vr::Vec3i> l(left.begin(), left.end());
-    const std::vector<vr::Vec3i> r(right.begin(), right.end());
-    std::vector<std::pair<std::size_t, std::size_t>> visits;
-    CHECK(d::merge_by_coord(
-              l.size(), [&](std::size_t i) -> const vr::Vec3i& { return l[i]; },
-              r.size(), [&](std::size_t j) -> const vr::Vec3i& { return r[j]; },
-              [&](std::size_t i, std::size_t j) {
-                visits.emplace_back(i, j);
-                return vkc::Status{};
-              })
-              .ok());
-    std::vector<vr::Vec3i> all, both, only_left, only_right;
-    std::size_t next_i = 0;
-    std::size_t next_j = 0;
-    for (const auto& [i, j] : visits) {
-      CHECK(i != d::kAbsent || j != d::kAbsent);
-      if (i != d::kAbsent) CHECK(i == next_i++);
-      if (j != d::kAbsent) CHECK(j == next_j++);
-      if (i != d::kAbsent && j != d::kAbsent) CHECK(l[i] == r[j]);
-      const vr::Vec3i& c = i != d::kAbsent ? l[i] : r[j];
-      all.push_back(c);
-      if (i != d::kAbsent && j != d::kAbsent) both.push_back(c);
-      if (j == d::kAbsent) only_left.push_back(c);
-      if (i == d::kAbsent) only_right.push_back(c);
-    }
-    CHECK(next_i == l.size() && next_j == r.size());
-    std::vector<vr::Vec3i> expected;
-    std::set_union(l.begin(), l.end(), r.begin(), r.end(),
-                   std::back_inserter(expected), ZyxLess{});
-    CHECK(all == expected);
-    expected.clear();
-    std::set_intersection(l.begin(), l.end(), r.begin(), r.end(),
-                          std::back_inserter(expected), ZyxLess{});
-    CHECK(both == expected);
-    expected.clear();
-    std::set_difference(l.begin(), l.end(), r.begin(), r.end(),
-                        std::back_inserter(expected), ZyxLess{});
-    CHECK(only_left == expected);
-    expected.clear();
-    std::set_difference(r.begin(), r.end(), l.begin(), l.end(),
-                        std::back_inserter(expected), ZyxLess{});
-    CHECK(only_right == expected);
-
-    // A refusal at the third visit ends the walk there.
-    if (all.size() >= 3) {
-      int calls = 0;
-      const vkc::Status s = d::merge_by_coord(
-          l.size(), [&](std::size_t i) -> const vr::Vec3i& { return l[i]; },
-          r.size(), [&](std::size_t j) -> const vr::Vec3i& { return r[j]; },
-          [&](std::size_t, std::size_t) {
-            return ++calls == 3 ? vkc::Status::not_found("third")
-                                : vkc::Status{};
-          });
-      CHECK(s.domain() == C::NotFound && s.message() == "third");
-      CHECK(calls == 3);
-    }
-  }
-  return 0;
-}
-
 // --- Refusals. --------------------------------------------------------------
 
 // Every check a P-frame reader makes, each refusing one edit of a valid
-// frame with its code and message; and merge_frame's, a new block on a
-// reference block, whatever that block's mode.
+// frame with its code and message; and row 13's words, for a new block on a
+// reference block, which the reader's checks pass.
 int refusals_case() {
   const codec_frames::RefusalBase base = codec_frames::refusal_base();
   const codec_frames::InterCase& good = base.good;
@@ -552,8 +438,8 @@ int refusals_case() {
   CHECK(rows.size() == 12 && *rows.begin() == 1 && *rows.rbegin() == 12);
 
   // Row 13: a new block on a reference block, removed or skipped. The
-  // writer cannot see it, and the reader's checks pass; the merge refuses
-  // it.
+  // writer cannot see it, and the reader's checks pass; the decoder's merge
+  // finds it (codec_block_lists_test), and check_new_block words it.
   const oracle::Frame& reference = base.reference;
   const oracle::Frame p =
       oracle::read_frame(good.bytes.data(), good.bytes.size(), good.max_blocks,
@@ -580,26 +466,22 @@ int refusals_case() {
         twice.blocks.coefficients.begin() + std::ptrdiff_t(position * k), k,
         std::int16_t(1));
     const Bytes b = oracle::write_frame(twice).value();
-    const vkc::Result<oracle::Frame> back =
-        oracle::read_frame(b.data(), b.size(), 1u << 20, &good.reference);
-    CHECK(back.ok());
-    const vkc::Result<d::MergedFrame> merged = d::merge_frame(
-        reference.coords, back.value().modes, back.value().coords);
-    CHECK(!merged.ok() && merged.status().domain() == C::InvalidArgument);
+    CHECK(
+        oracle::read_frame(b.data(), b.size(), 1u << 20, &good.reference).ok());
   }
-  // A mode count other than the reference's, and the motion mode.
-  std::vector<d::BlockMode> modes = p.modes;
-  modes.pop_back();
-  CHECK(d::merge_frame(reference.coords, modes, p.coords).status().domain() ==
-        C::InvalidArgument);
-  modes = p.modes;
-  modes[0] = d::BlockMode::kMotion;
-  CHECK(d::merge_frame(reference.coords, modes, p.coords).status().domain() ==
-        C::Unsupported);
-  // check_survivors on its own.
-  CHECK(d::check_survivors(p.modes, n, 8).ok());
-  CHECK(d::check_survivors(p.modes, n + 1, 8).domain() == C::InvalidArgument);
-  CHECK(d::check_survivors(p.modes, n, 7).domain() == C::InvalidArgument);
+  CHECK(refusal_is(d::check_new_block(3, 17), C::InvalidArgument,
+                   "new block 3 is on reference block 17", "check_new_block"));
+  // check_survivors and check_segment on their own.
+  const auto survivors = static_cast<std::uint64_t>(std::count_if(
+      p.modes.begin(), p.modes.end(),
+      [](d::BlockMode mode) { return mode != d::BlockMode::kRemove; }));
+  CHECK(d::check_survivors(survivors, n, 8).ok());
+  CHECK(d::check_survivors(survivors, n + 1, 8).domain() == C::InvalidArgument);
+  CHECK(d::check_survivors(survivors, n, 7).domain() == C::InvalidArgument);
+  CHECK(d::check_segment(5, d::SegmentFault::kNone).ok());
+  CHECK(refusal_is(
+      d::check_segment(5, d::SegmentFault::kOutOfOrder), C::InvalidArgument,
+      "segment 5 does not start after the one before ends", "check_segment"));
   return 0;
 }
 
@@ -810,7 +692,6 @@ int main() {
   if (worked_example_case() != 0) return 1;
   if (round_trip_case() != 0) return 1;
   if (chain_case() != 0) return 1;
-  if (merge_by_coord_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   if (writer_refusals_case() != 0) return 1;
   if (corruption_case() != 0) return 1;

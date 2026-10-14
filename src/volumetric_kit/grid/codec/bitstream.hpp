@@ -50,7 +50,7 @@
 /// small and every decoded list duplicate-free: within a segment the delta
 /// code cannot step backwards, and a reader checks each segment's first
 /// coordinate, raw bits, against the block segment before's last
-/// (@ref check_segment).
+/// (@ref SegmentFault::kOutOfOrder).
 ///
 /// Version 3 replaces DC/AC steps with a global scale and a weight for each of
 /// the K kept bases, 256 bytes at the default K = 64; weights beyond K never
@@ -94,7 +94,7 @@
 ///
 /// A new-block segment is an intra segment. The new coordinates strictly
 /// increase across all A, and none is a reference coordinate (a reference
-/// block is recoded with zero, never removed and added), so @ref merge_frame
+/// block is recoded with zero, never removed and added), so the decoder
 /// merges survivors and new blocks into the frame's order with no ties. Keep,
 /// zero and new blocks code through the intra models, and the modes through
 /// the mode model (`frame_models.glsl`). A P-frame's `voxel_size`,
@@ -110,10 +110,9 @@
 /// and decodes once its reference is held), other coding parameters
 /// `InvalidArgument`; N past the caller's room `OutOfMemory`; then each
 /// segment (@ref check_segment), the survivor count (@ref check_survivors)
-/// and the new coordinates against the reference's (@ref merge_frame), each
-/// `InvalidArgument`.
+/// and the new coordinates against the reference's (@ref check_new_block),
+/// each `InvalidArgument`.
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -215,50 +214,9 @@ enum class BlockMode : std::uint8_t {
 };
 
 /// The frame's order: @ref volume::coord_less, by z, then y, then x -- so a
-/// run of blocks along x is a run of consecutive entries.
+/// run of blocks along x is a run of consecutive entries. The kernels sort
+/// and search by its mirror, `volume/shaders/coord_order.glsl`.
 using volume::coord_less;
-
-/// @brief Sort @p blocks into the order a frame holds them in (@ref
-///        coord_less): the order the encoder writes and the decoder's merge
-///        walks, so the two cannot drift apart.
-inline void sort_by_coord(std::vector<volume::BlockIndex>& blocks) {
-  std::sort(blocks.begin(), blocks.end(),
-            [](const volume::BlockIndex& a, const volume::BlockIndex& b) {
-              return coord_less(a.coord, b.coord);
-            });
-}
-
-/// The index @ref merge_by_coord passes for the side with no entry at a
-/// coordinate.
-inline constexpr std::size_t kAbsent = std::numeric_limits<std::size_t>::max();
-
-/// @brief Walk two lists, each strictly increasing by @ref coord_less, in
-///        that order: the one merge the decoder's grid update, a P-frame's
-///        block order and the encoder's split share.
-/// @param left, right  Callables giving entry `i` of each list's coordinate.
-/// @param visit  Called once per distinct coordinate, in order, as
-///               `visit(i, j)`, with @ref kAbsent for the side that lacks it;
-///               it returns a `core::Status`.
-/// @return OK, or the first non-OK status @p visit returned, where the walk
-///         stopped.
-template <typename Left, typename Right, typename Visit>
-core::Status merge_by_coord(std::size_t nl, Left left, std::size_t nr,
-                            Right right, Visit visit) {
-  std::size_t i = 0;
-  std::size_t j = 0;
-  while (i < nl || j < nr) {
-    core::Status s;
-    if (j == nr || (i < nl && coord_less(left(i), right(j)))) {
-      s = visit(i++, kAbsent);
-    } else if (i == nl || coord_less(right(j), left(i))) {
-      s = visit(kAbsent, j++);
-    } else {
-      s = visit(i++, j++);
-    }
-    if (!s.ok()) return s;
-  }
-  return {};
-}
 
 /// @brief A frame's header, parsed and checked without decoding anything.
 struct FrameHeader {
@@ -418,7 +376,9 @@ VR_CODEC_API core::Result<ParsedFrame> parse_frame(
     const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks,
     const FrameReference* reference);
 
-/// How a segment's stream failed to decode.
+/// How a segment failed, in the order a reader judges it: its own stream's
+/// faults, which the decode finds, then its order against the segment
+/// before, which a reader finds after.
 enum class SegmentFault : std::uint32_t {
   kNone = 0,
   /// A delta stepped a coordinate outside int32, before anything else
@@ -428,31 +388,38 @@ enum class SegmentFault : std::uint32_t {
   /// a symbol from an empty table, or words left or a state other than `L`
   /// at its end (rans.hpp).
   kCorrupt = 2,
+  /// A block segment's first coordinate, raw bits, which no end check sees,
+  /// does not follow the block segment before's last. Without this a flipped
+  /// bit decodes a duplicate, and the inverse races two workgroups on one
+  /// block.
+  kOutOfOrder = 3,
 };
 
-/// @brief The reader's verdict on segment @p s, taken in segment order: its
-///        fault, else whether its first coordinate follows the segment
-///        before's last. One place for both readers' refusals.
-/// @param prev_last  The last coordinate of the block segment before; null
-///                   for the first.
-/// @param first      Segment @p s's first coordinate; null for a P-frame's
-///                   update segment, which has none.
-VR_CODEC_API core::Status check_segment(std::uint64_t s, SegmentFault fault,
-                                        const Vec3i* prev_last,
-                                        const Vec3i* first);
+/// @brief The refusal of a frame at segment @p s, the first that failed:
+///        one place for both readers' codes and words.
+/// @return OK for @ref SegmentFault::kNone; otherwise
+///         `Status::Code::InvalidArgument`.
+VR_CODEC_API core::Status check_segment(std::uint64_t s, SegmentFault fault);
 
 /// @brief A P-frame's survivor count, which only a whole decode knows: one
 ///        place for both readers' refusal.
-/// @return OK when exactly @p n - @p a of @p modes survive (keep, skip or
-///         zero); otherwise `Status::Code::InvalidArgument`.
-VR_CODEC_API core::Status check_survivors(const std::vector<BlockMode>& modes,
+/// @return OK when @p survivors, its reference entries that keep, skip or
+///         zero, are @p n - @p a; otherwise `Status::Code::InvalidArgument`.
+VR_CODEC_API core::Status check_survivors(std::uint64_t survivors,
                                           std::uint32_t n, std::uint32_t a);
+
+/// @brief The refusal of a P-frame whose new block @p q is on reference
+///        entry @p e -- one spelling per block: a reference block is recoded
+///        with zero, never removed and added -- whatever that entry's mode.
+///        The decoder's merge finds the first such pair.
+/// @return `Status::Code::InvalidArgument`.
+VR_CODEC_API core::Status check_new_block(std::uint32_t q, std::uint32_t e);
 
 /// @ref ApplySource's value for a field the block does not take.
 inline constexpr std::uint32_t kNoSource = ~0u;
 
-/// @brief Where one block of a decoded P-frame comes from: laid out as the
-///        apply kernel reads it, two u32.
+/// @brief Where one block of a decoded frame comes from: two u32, as the
+///        decoder's merge kernel writes it and the apply kernel reads it.
 struct ApplySource {
   /// Its reference entry, for keep and skip; else @ref kNoSource.
   std::uint32_t reference = kNoSource;
@@ -464,30 +431,5 @@ static_assert(sizeof(ApplySource) == 8 &&
                   offsetof(ApplySource, reference) == 0 &&
                   offsetof(ApplySource, payload) == 4,
               "ApplySource is two u32, as the apply kernel reads it");
-
-/// @brief A decoded frame's blocks in the frame's order, a P-frame's or an
-///        intra frame's.
-struct MergedFrame {
-  /// The frame's N coordinates, strictly increasing: the grid's block set,
-  /// and the next reference's coordinates.
-  std::vector<Vec3i> coords;
-  /// Each block's sources, entry for entry with `coords`.
-  std::vector<ApplySource> sources;
-};
-
-/// @brief Merge a P-frame's surviving reference entries with its new blocks
-///        (@ref merge_by_coord): keep gives {e, e}, skip {e, none}, zero
-///        {none, e}, new block q {none, M + q}, and remove nothing. An intra
-///        frame's blocks are new blocks on an empty reference.
-/// @param reference  The reference's M coordinates, strictly increasing.
-/// @param modes      The P-frame's M modes.
-/// @param added      Its A new coordinates, strictly increasing.
-/// @return The merged blocks; `Status::Code::InvalidArgument` for a new
-///         coordinate that is a reference coordinate, whatever that entry's
-///         mode, or a mode count other than the reference's; or
-///         `Status::Code::Unsupported` for a motion mode.
-VR_CODEC_API core::Result<MergedFrame> merge_frame(
-    const std::vector<Vec3i>& reference, const std::vector<BlockMode>& modes,
-    const std::vector<Vec3i>& added);
 
 }  // namespace volumetric_kit::recon::codec::detail

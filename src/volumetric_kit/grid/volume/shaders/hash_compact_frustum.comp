@@ -57,7 +57,7 @@ void main() {
   }
 
   int ptr = entries[gid].ptr;
-  if (ptr == kFreeEntry || ptr == kLockEntry) {
+  if (!vrEntryActive(ptr)) {
     return;
   }
 
