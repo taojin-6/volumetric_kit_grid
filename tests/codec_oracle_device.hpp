@@ -52,7 +52,7 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
 // refusals, or its reject count's, leaving @p out empty.
 vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
-                    const vol::BlockList& blocks,
+                    const std::vector<vol::BlockIndex>& blocks,
                     const codec::CodecParams& params, DctBlocks& out);
 
 // @p in's blocks, the entries of @p blocks as given (ptrs included),
@@ -60,7 +60,8 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
 // that disagree with the list or a trunc_dist other than the grid's, else
 // DctTransform::inverse's refusals.
 vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
-                    vol::VoxelBlockGrid& grid, const vol::BlockList& blocks,
+                    vol::VoxelBlockGrid& grid,
+                    const std::vector<vol::BlockIndex>& blocks,
                     const DctBlocks& in);
 
 }  // namespace codec_oracle

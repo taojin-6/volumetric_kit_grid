@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -55,10 +56,10 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(vkc::Device& device,
 }
 
 // `count` distinct blocks along x, allocated into `grid`.
-int fill(vol::VoxelBlockGrid& grid, int count) {
+int fill(const vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) coords[std::size_t(i)].coord = {i, 0, 0};
-  auto failed = grid.map().allocate(coords.data(), std::uint32_t(count));
+  auto failed = vr_test::allocate_blocks(gpu, grid.map(), coords);
   CHECK(failed.ok() && failed.value() == 0);
   return 0;
 }
@@ -67,7 +68,7 @@ int fill(vol::VoxelBlockGrid& grid, int count) {
 vkc::Result<vol::VoxelBlockGrid> filled(vkc::Device& device,
                                         vkc::Allocator& allocator, int blocks) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(device, allocator, params(4)));
-  if (fill(grid, blocks) != 0) {
+  if (fill(vr_test::Gpu{device, allocator}, grid, blocks) != 0) {
     return vkc::Status::io_error("allocation failed");
   }
   return grid;

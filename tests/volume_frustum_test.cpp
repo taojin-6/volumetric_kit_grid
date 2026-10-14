@@ -26,6 +26,7 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
 
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -121,8 +122,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     b.coord = c;
     coords.push_back(b);
   }
-  vkc::Result<std::uint32_t> fail =
-      map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
+  vkc::Result<std::uint32_t> fail = vr_test::allocate_blocks(gpu, map, coords);
   CHECK(fail.ok() && fail.value() == 0);
 
   // Plain compaction: all six blocks are active.
@@ -206,7 +206,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     pcoords.push_back(b);
   }
   vkc::Result<std::uint32_t> pfail =
-      map.allocate(pcoords.data(), static_cast<std::uint32_t>(pcoords.size()));
+      vr_test::allocate_blocks(gpu, map, pcoords);
   CHECK(pfail.ok() && pfail.value() == 0);
 
   vkc::Result<std::vector<vol::BlockIndex>> pvisible =
@@ -251,8 +251,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     b.coord = c;
     vp_coords.push_back(b);
   }
-  vkc::Result<std::uint32_t> vfail = map.allocate(
-      vp_coords.data(), static_cast<std::uint32_t>(vp_coords.size()));
+  vkc::Result<std::uint32_t> vfail =
+      vr_test::allocate_blocks(gpu, map, vp_coords);
   CHECK(vfail.ok() && vfail.value() == 0);
   // lookAtRH from the origin toward world +Z with up = world -Y. Camera right
   // is world +X and camera down world +Y, so the two overloads describe the

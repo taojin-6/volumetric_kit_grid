@@ -328,35 +328,6 @@ std::uint64_t VoxelBlockGrid::bytes_at(
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::remove(
-    const BlockIndex* coords, std::uint32_t count,
-    AllocFailures* out_failures) {
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelBlockGrid::remove: moved-from grid");
-  }
-  if (count == 0) {
-    return std::uint32_t{0};
-  }
-  if (coords == nullptr) {
-    return core::Status::invalid_argument(
-        "VoxelBlockGrid::remove: coords is null");
-  }
-  // Nothing to zero: the map stages the coordinates itself.
-  if (attributes_.empty()) {
-    return map_.remove(coords, count, out_failures);
-  }
-  // Staged once, for the zeroing and the map's remove alike.
-  const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(BlockIndex);
-  VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
-                                           bytes, max_storage_buffer_range_));
-  VKC_ASSIGN(const core::Buffer list,
-             core::device_storage_buffer(*allocator_, bytes));
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.upload(list, 0, coords, bytes));
-  return zero_and_remove(batch, list, count, out_failures, nullptr);
-}
-
-core::Result<std::uint32_t> VoxelBlockGrid::remove(
     const core::Buffer& coords, std::uint32_t count,
     AllocFailures* out_failures) {
   if (!valid()) {
@@ -539,32 +510,6 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                         gp.max_chain};
     VKC_TRY(dispatch_per_block(batch, zero_kernel_, set, push, count,
                                max_workgroup_count_x_, stage));
-  }
-  return {};
-}
-
-core::Status VoxelBlockGrid::check_block_list(const BlockList& blocks,
-                                              const char* who) const {
-  if (blocks.blocks == nullptr && blocks.count != 0) {
-    return core::Status::invalid_argument(
-        std::string(who) + ": the block list is null with a non-zero count");
-  }
-  // Exempt when empty: a default-constructed list's epoch is 0, which
-  // next_topology_epoch() never returns, so the comparison could only fail.
-  if (blocks.count != 0 && blocks.epoch != topology_epoch()) {
-    return core::Status::invalid_argument(
-        std::string(who) +
-        ": the block list was compacted against topology epoch " +
-        std::to_string(blocks.epoch) + ", but this grid is now at " +
-        std::to_string(topology_epoch()) +
-        " (a remove()/clear() since then has re-used its block pointers)");
-  }
-  if (blocks.count > static_cast<std::uint32_t>(grid().num_blocks)) {
-    return core::Status::invalid_argument(
-        std::string(who) + ": the block list holds " +
-        std::to_string(blocks.count) +
-        " blocks, more than this grid's block heap (" +
-        std::to_string(grid().num_blocks) + ")");
   }
   return {};
 }
