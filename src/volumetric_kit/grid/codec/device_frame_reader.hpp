@@ -4,8 +4,8 @@
 #pragma once
 
 /// @file device_frame_reader.hpp
-/// @brief Decodes a frame's segments on the device, intra or P, entry for
-///        entry what @ref read_frame decodes on the host.
+/// @brief Decodes a frame's segments on the device, intra or P: the
+///        `Decoder`'s only reader, whose entries the tests' CPU oracle pins.
 ///
 /// Internal (under src/, never installed). The host parses the frame
 /// (@ref parse_frame) and uploads only its tables and payload; the
@@ -38,8 +38,8 @@ namespace volumetric_kit::recon::codec::detail {
 /// entries into the inverse transform's layout at their stream positions
 /// (@ref ResidentBlocks), and the coordinates, modes and faults come back:
 /// 16 bytes a new block and 4 a reference entry. After the caller submits
-/// it, @ref check gives the host reader's verdict. A skip or remove entry's
-/// payload is left as it was, where the host reader's is zero.
+/// it, @ref check gives the reader's verdict. A skip or remove entry's
+/// payload is left as it was: nothing reads it.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
@@ -63,16 +63,15 @@ class VR_CODEC_API DeviceFrameReader {
   ///         nothing); `Status::Code::Unsupported`, recording nothing, for a
   ///         type it does not decode (@ref check_frame_type);
   ///         `Status::Code::InvalidArgument`, before any buffer grows, for a
-  ///         segment of more than @ref kMaxDeviceDecodeSegmentSize entries or
-  ///         a buffer past `maxStorageBufferRange`; otherwise a buffer
-  ///         failure.
+  ///         size @ref check_segment_size refuses or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
   core::Result<ResidentBlocks> record_decode(
       core::CommandBatch& batch, const ParsedFrame& frame,
       core::GpuStageScope* stage = nullptr);
 
-  /// @return After the submit, the refusal @ref read_frame makes for the
-  ///         same frame's segments (@ref check_segment) and, for a P-frame,
-  ///         its survivors (@ref check_survivors), or OK.
+  /// @return After the submit, the refusal of the frame's segments
+  ///         (@ref check_segment) and, for a P-frame, its survivors
+  ///         (@ref check_survivors), or OK.
   core::Status check();
 
   /// @return The decoded new blocks' coordinates, `ptr` 0, in frame order,

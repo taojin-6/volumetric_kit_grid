@@ -33,7 +33,10 @@
 /// Sections: TABLES (the frame's frequency tables), SEGMENTS (each segment's
 /// stream length, u32), PAYLOAD (the segment streams). A segment is R
 /// consecutive blocks coded as one independent rANS stream (@ref rans.hpp);
-/// the last may be shorter. A decoder refuses an unknown section flagged
+/// the last may be shorter. R is from 1 to @ref kMaxDeviceDecodeSegmentSize,
+/// the longest segment one GPU invocation decodes, so every valid frame
+/// decodes on the device; every writer and reader holds a frame to it
+/// (@ref check_segment_size). A decoder refuses an unknown section flagged
 /// @ref kSectionRequired and skips an unknown optional one. Every other flag
 /// bit is reserved: zero in v3, and a decoder refuses a known section that
 /// sets one, since a later version may define a flag that changes how the
@@ -41,8 +44,13 @@
 ///
 /// Inside a segment the blocks follow the block grammar of
 /// `shaders/frame_grammar.glsl`, through the models of
-/// `shaders/frame_models.glsl`: the one text both the host and the device
-/// code a frame with.
+/// `shaders/frame_models.glsl`: the one text the kernels, and the tests' CPU
+/// oracle, code a frame with. A frame's blocks are strictly increasing in
+/// (z, y, x) order (@ref coord_less), which keeps the coordinate deltas
+/// small and every decoded list duplicate-free: within a segment the delta
+/// code cannot step backwards, and a reader checks each segment's first
+/// coordinate, raw bits, against the block segment before's last
+/// (@ref check_segment).
 ///
 /// Version 3 replaces DC/AC steps with a global scale and a weight for each of
 /// the K kept bases, 256 bytes at the default K = 64; weights beyond K never
@@ -60,7 +68,8 @@
 /// (@ref FrameReference). A P-frame adds a REFERENCE section (id 4), required
 /// on type 1 and refused on type 0, whose 20-byte body is {u64 hash, u32 M,
 /// the reference's block count, u32 U, reference entries per update segment
-/// (at least 1), u32 A, new blocks}. N stays the decoded frame's block count:
+/// (from 1 to the same limit as R), u32 A, new blocks}. N stays the decoded
+/// frame's block count:
 /// the reference blocks that survive plus the A new ones, so
 /// A <= N <= M + A, and M + A < 2^32, since stream positions are u32. R
 /// counts new blocks per segment.
@@ -110,9 +119,9 @@
 #include <limits>
 #include <vector>
 
-#include "dct_blocks.hpp"
 #include "rans.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -138,8 +147,8 @@ inline constexpr std::uint16_t kSectionRequired = 1;
 /// Every section flag v3 defines. A known section with any other bit set is
 /// refused as `Status::Code::Unsupported`.
 inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
-/// Blocks per segment unless the writer is told otherwise:
-/// @ref EncoderConfig::segment_size's default, whose doc gives its cost.
+/// Blocks per segment by default: @ref EncoderConfig::segment_size's, whose
+/// doc gives its cost.
 inline constexpr std::uint32_t kDefaultSegmentSize = 64;
 /// A P-frame's reference entries per update segment unless the writer is
 /// told otherwise.
@@ -168,11 +177,19 @@ VR_CODEC_API glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
 /// What a frame is (codec_params.hpp): byte 6 of its header.
 using codec::FrameType;
 
-/// @brief The type check @ref write_frame and every reader make.
+/// @brief The type check every writer and reader makes.
 /// @param who  The caller, which a refusal names.
 /// @return OK for an intra frame or a P-frame; otherwise
 ///         `Status::Code::Unsupported`.
 VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
+
+/// @brief The segment-size rule every writer and reader holds a frame to: R,
+///        and a P-frame's U, from 1 to @ref kMaxDeviceDecodeSegmentSize.
+/// @param who   The caller, which a refusal names.
+/// @param name  The size's name, which a refusal names too.
+/// @return OK, or `Status::Code::InvalidArgument`.
+VR_CODEC_API core::Status check_segment_size(const char* who, const char* name,
+                                             std::uint32_t size);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
@@ -251,7 +268,7 @@ struct FrameHeader {
   float trunc_dist = 0.0f;  ///< Metres; the steps are fractions of it.
   CodecParams params;       ///< K, global scale, and the kept bases' weights.
   std::uint32_t block_count = 0;    ///< Blocks the frame holds.
-  std::uint32_t segment_size = 0;   ///< Blocks per segment, at least 1.
+  std::uint32_t segment_size = 0;   ///< Blocks per segment, R.
   std::uint32_t section_count = 0;  ///< Entries in the section table.
 };
 
@@ -265,77 +282,23 @@ struct FrameReference {
   FrameHeader header;
 };
 
-/// @brief One frame's content, as the writer takes it and the reader
-///        returns it.
-struct Frame {
-  FrameType type = FrameType::kIntra;  ///< What the frame is.
-  /// The grid's voxel edge, metres: with the block coordinates it places the
-  /// frame in the world, so a decoder builds a grid of the same geometry.
-  float voxel_size = 0.0f;
-  /// A P-frame's reference. An intra frame has none: hash 0 and
-  /// `header.block_count` 0.
-  FrameReference reference;
-  /// A P-frame's mode for each of its reference's M entries, in reference
-  /// order; empty for an intra frame.
-  std::vector<BlockMode> modes;
-  /// Block coordinates, **strictly increasing** in (z, y, x) order (see
-  /// @ref coord_less): a P-frame's A new blocks, an intra frame's every
-  /// block. A format rule, not a convention: it is what makes the deltas
-  /// small, and it guarantees the decoder hands the inverse transform the
-  /// duplicate-free list it requires. Within a segment the delta code cannot
-  /// step backwards; across segments the reader checks it, since a segment's
-  /// first coordinate is raw bits.
-  std::vector<Vec3i> coords;
-  /// The payload by stream position: a P-frame's M reference entries, then
-  /// its new blocks, entry for entry with `coords`; an intra frame's blocks.
-  /// A keep entry holds its XOR mask and residuals. Skip and remove entries
-  /// are zero when read and ignored when written.
-  DctBlocks blocks;
-};
-
 /// @brief Parse and check a frame's fixed header -- the first
 ///        @ref frame_header_bytes -- and nothing after it.
-/// @return The header, or the same header refusals as @ref read_frame.
+/// @return The header, or the same header refusals as @ref parse_frame.
 VR_CODEC_API core::Result<FrameHeader> read_frame_header(
     const std::uint8_t* data, std::size_t size);
 
-/// Writer options.
-struct FrameWriteOptions {
-  /// Blocks per segment, at least 1: a P-frame's new blocks per segment.
-  std::uint32_t segment_size = kDefaultSegmentSize;
-  /// A P-frame's reference entries per update segment, at least 1.
-  std::uint32_t update_size = kDefaultUpdateSize;
-};
-
-/// @brief Serialize a frame.
-/// @return The frame's bytes; `Status::Code::Unsupported` for a type past
-///         @ref FrameType::kInter or a @ref BlockMode::kMotion mode;
-///         `Status::Code::InvalidArgument` for a non-positive or non-finite
-///         `voxel_size` / `trunc_dist`, invalid params, a segment or update
-///         size of 0, a mode count other than the reference's block count, a
-///         mode past @ref BlockMode::kMotion, M + A past 2^32 - 1, arrays
-///         whose sizes disagree with the entries, coordinates not strictly
-///         increasing, a written coefficient or residual outside ±32767, a
-///         P-frame whose coding parameters are not its reference's, an intra
-///         frame with a reference, or a frame whose SEGMENTS or PAYLOAD would
-///         outgrow its u32 length (more than 2^30 - 1 segments, or 4 GiB of
-///         payload). `Status::Code::IoError` only if the coder refuses a
-///         symbol its own tables were counted from, which is a bug here,
-///         never the input's.
-VR_CODEC_API core::Result<std::vector<std::uint8_t>> write_frame(
-    const Frame& frame, const FrameWriteOptions& options = {});
-
-/// @brief The refusals @ref write_frame makes after the type's, of the
-///        coding parameters, which @ref assemble_frame and the device
-///        writer make first too: one place for their codes and words.
+/// @brief The refusals every writer makes after the type's, of the coding
+///        parameters, which @ref assemble_frame and the device writer make
+///        first: one place for their codes and words.
 /// @return OK, or `Status::Code::InvalidArgument` for a non-positive or
 ///         non-finite @p voxel_size or @p trunc_dist, or invalid @p params.
 VR_CODEC_API core::Status check_coding(float voxel_size, float trunc_dist,
                                        const CodecParams& params);
 
-/// @brief The last refusals @ref write_frame makes, of what its entries
-///        hold, which the device writer's count pass finds: one place for
-///        both writers' codes and words.
+/// @brief The last refusals a writer makes, of what its entries hold, which
+///        the device writer's count pass finds: one place for their codes
+///        and words.
 /// @param largest_mode  The largest mode past @ref BlockMode::kMotion; 0 for
 ///                      none.
 /// @param motion        Whether a mode is @ref BlockMode::kMotion.
@@ -350,9 +313,6 @@ VR_CODEC_API core::Status check_entries(std::uint32_t largest_mode, bool motion,
 /// @return How many frequency tables a frame of @p type keeping @p k
 ///         coefficients carries, in TABLES order.
 VR_CODEC_API std::uint32_t frame_model_count(FrameType type, std::uint32_t k);
-/// @return The alphabet size of frequency table @p model at @p k.
-VR_CODEC_API std::uint32_t frame_model_alphabet(std::uint32_t model,
-                                                std::uint32_t k);
 /// @return The first entry of table @p model at @p k in the kernels'
 ///         per-symbol arrays, every table's symbols back to back in TABLES
 ///         order; for @ref frame_model_count, the arrays' size.
@@ -386,15 +346,17 @@ struct CodedFrame {
 };
 
 /// @brief Lay out a coded frame: header, section table, then REFERENCE for a
-///        P-frame, TABLES, SEGMENTS and PAYLOAD. Shared by the host and
-///        device writers, so their containers cannot differ.
+///        P-frame, TABLES, SEGMENTS and PAYLOAD. Every writer's container,
+///        the device writer's and the tests' CPU oracle's, so theirs cannot
+///        differ.
 /// @param type  Written to byte 6 as given: the caller coded the segments
 ///              for it.
 /// @return The frame's bytes; `Status::Code::Unsupported` for a type past
 ///         @ref FrameType::kInter; or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
-///         params, a segment size of 0, a P-frame's update size of 0, M + A
-///         past 2^32 - 1, a block count outside [A, M + A], coding
+///         params, a segment size or a P-frame's update size that
+///         @ref check_segment_size refuses, M + A past 2^32 - 1, a block
+///         count outside [A, M + A], coding
 ///         parameters other than the reference's, reference fields set on an
 ///         intra frame, tables or segment lengths whose count the header
 ///         disagrees with, lengths that do not sum to the payload, a payload
@@ -402,47 +364,8 @@ struct CodedFrame {
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame);
 
-/// @brief Parse and decode a frame on the host: the tests' oracle for the
-///        device reader, which is what the `Decoder` decodes with.
-///
-/// TODO(codec): the host reader (this and @ref decode_frame) has no library
-/// caller; it moves under tests/.
-///
-/// Reads nothing outside `[data, data + size)`, whatever the bytes say.
-/// @param data        The frame.
-/// @param size        Its length; must be exact (trailing bytes are refused).
-/// @param max_blocks  The most blocks the caller can hold. A frame's size does
-///                    not bound its block count -- a block whose every symbol
-///                    has probability one costs no bits -- so this is what
-///                    bounds the work and the allocation: `12 + 64 + 2 K`
-///                    bytes per block, with K from the header (at most 512),
-///                    so at most ~1.1 KB -- about a quarter of the 4 KB of
-///                    `tsdf` + `weight` the grid it decodes into holds per
-///                    block. Checked once the block count agrees with the
-///                    segment table, so a corrupt count is refused as corrupt
-///                    and only a sound frame is refused for its size. A
-///                    P-frame's M reference entries are bounded by the
-///                    reference the caller holds.
-/// @param reference   The reference the caller holds, for a P-frame; null
-///                    for none.
-/// @return The frame, or: `Status::Code::Unsupported` for another version,
-///         frame type, block size, an unknown required section, a known
-///         section with a flag v3 does not define, or a P-frame that uses
-///         the motion mode; `Status::Code::InvalidArgument` for anything
-///         malformed, truncated or inconsistent (coordinates out of order
-///         across segments, and a P-frame whose coding parameters are not
-///         its reference's, included); `Status::Code::NotFound` for a
-///         P-frame whose reference is not @p reference (none held, or
-///         another hash or block count); `Status::Code::OutOfMemory` for a
-///         well-formed frame of more than @p max_blocks blocks, or one whose
-///         arrays would not fit this platform's address space (reachable on a
-///         32-bit build). The order the refusals are made in is this file's.
-VR_CODEC_API core::Result<Frame> read_frame(
-    const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks,
-    const FrameReference* reference = nullptr);
-
-/// @brief A frame parsed and checked up to its segment streams: what a
-///        reader, on the host or the device, decodes them from.
+/// @brief A frame parsed and checked up to its segment streams: what the
+///        device reader, and the tests' CPU oracle, decode them from.
 struct ParsedFrame {
   FrameHeader header;
   /// A P-frame's reference, as the caller held it (M is
@@ -453,8 +376,7 @@ struct ParsedFrame {
   /// 0 for an intra frame, as in @ref CodedFrame.
   std::uint32_t update_size = 0;
   std::uint32_t new_count = 0;
-  /// @ref frame_model_count tables, in TABLES order, without the host
-  /// reader's slot lookups (@ref decode_frame builds them).
+  /// @ref frame_model_count tables, in TABLES order.
   std::vector<FrequencyTable> tables;
   /// Each segment's stream length in bytes: even, at least 4, summing to
   /// `payload_size`.
@@ -464,25 +386,37 @@ struct ParsedFrame {
   std::size_t payload_size = 0;
 };
 
-/// @brief Everything @ref read_frame checks before it decodes a
-///        segment: the header, the sections, the tables, the segment
-///        lengths, a P-frame against @p reference, and the block count
-///        against @p max_blocks.
-/// @return The parsed frame, or those refusals, as @ref read_frame
-///         makes them.
+/// @brief Everything a reader checks before it decodes a segment: the
+///        header, the sections, the tables, the segment lengths, a P-frame
+///        against @p reference, and the block count against @p max_blocks.
+///
+/// Reads nothing outside `[data, data + size)`, whatever the bytes say.
+/// @param data        The frame.
+/// @param size        Its length; must be exact (trailing bytes are refused).
+/// @param max_blocks  The most blocks the caller can hold. A frame's size does
+///                    not bound its block count -- a block whose every symbol
+///                    has probability one costs no bits -- so this is what
+///                    bounds the work and the allocation. Checked once the
+///                    block count agrees with the segment table, so a corrupt
+///                    count is refused as corrupt and only a sound frame is
+///                    refused for its size. A P-frame's M reference entries
+///                    are bounded by the reference the caller holds.
+/// @param reference   The reference the caller holds, for a P-frame; null
+///                    for none.
+/// @return The parsed frame, or: `Status::Code::Unsupported` for another
+///         version, frame type, block size, an unknown required section, a
+///         known section with a flag v3 does not define, or a P-frame that
+///         uses the motion mode; `Status::Code::InvalidArgument` for anything
+///         malformed, truncated or inconsistent (a P-frame whose coding
+///         parameters are not its reference's included);
+///         `Status::Code::NotFound` for a P-frame whose reference is not
+///         @p reference (none held, or another hash or block count);
+///         `Status::Code::OutOfMemory` for a well-formed frame of more than
+///         @p max_blocks blocks. The order the refusals are made in is this
+///         file's; a segment's own are @ref check_segment's.
 VR_CODEC_API core::Result<ParsedFrame> parse_frame(
     const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks,
     const FrameReference* reference);
-
-/// @brief Decode a parsed frame's segments on the host: @ref read_frame
-///        after @ref parse_frame.
-/// @param parsed  Taken by value: its tables gain the slot lookups only this
-///                reader needs.
-/// @return The frame; `Status::Code::Unsupported` for a type it does not
-///         decode (@ref check_frame_type); or @ref read_frame's refusals of
-///         its segments and survivors (and `Status::Code::OutOfMemory` for
-///         arrays past this platform's address space).
-VR_CODEC_API core::Result<Frame> decode_frame(ParsedFrame parsed);
 
 /// How a segment's stream failed to decode.
 enum class SegmentFault : std::uint32_t {
@@ -490,8 +424,9 @@ enum class SegmentFault : std::uint32_t {
   /// A delta stepped a coordinate outside int32, before anything else
   /// failed.
   kCoordOverflow = 1,
-  /// The stream did not decode cleanly and completely (@ref
-  /// RansReader::finish).
+  /// The stream did not decode cleanly and completely: a read past its end,
+  /// a symbol from an empty table, or words left or a state other than `L`
+  /// at its end (rans.hpp).
   kCorrupt = 2,
 };
 

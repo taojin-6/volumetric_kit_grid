@@ -4,12 +4,13 @@
 #pragma once
 
 /// @file device_frame_writer.hpp
-/// @brief Writes a frame, intra or P, with its rANS coding on the device,
-///        byte for byte the frame @ref write_frame writes on the host.
+/// @brief Writes a frame, intra or P, with its rANS coding on the device:
+///        the `Encoder`'s only writer, whose bytes the tests' CPU oracle
+///        pins.
 ///
 /// Internal (under src/, never installed). The forward output stays in device
 /// memory: the host reads back only the symbol counts, to build the frame's
-/// tables with the host's own @ref frame_tables, and the coded segments. Every
+/// tables (@ref frame_tables), and the coded segments. Every
 /// bulk buffer is device-local and retained between frames
 /// (`ensure_device_scratch`); the host reaches them only through
 /// `CommandBatch`, so a discrete GPU moves the same few bytes across PCIe
@@ -36,8 +37,8 @@ namespace volumetric_kit::recon::codec::detail {
 /// A frame takes two batches. The caller's first batch carries the forward
 /// transform (@ref DctTransform::record_forward) and @ref record_count, which
 /// counts every model's symbols, each entry's coder steps, and what
-/// @ref write_frame would refuse. After it is submitted, @ref finish makes
-/// those refusals (@ref check_entries), builds the tables on the host and
+/// @ref check_entries refuses. After it is submitted, @ref finish makes
+/// those refusals, builds the tables on the host and
 /// places every entry's steps. The device writes each entry's steps in
 /// parallel, runs each segment's serial rANS chain over its run of them into a
 /// slot sized by its steps, packs the streams into one payload, and reads back
@@ -69,15 +70,15 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @param blocks        The entries: the forward output, or a P-frame's
   ///                      stream positions, the new blocks' coordinates
   ///                      strictly increasing in frame order.
-  /// @param segment_size  Blocks per segment, at least 1: a P-frame's new
-  ///                      blocks per segment.
+  /// @param segment_size  Blocks per segment: a P-frame's new blocks per
+  ///                      segment.
   /// @param update_size   A P-frame's reference entries per update segment,
-  ///                      at least 1 when @p blocks has any.
-  /// @return OK, or `Status::Code::InvalidArgument` for a segment size of 0,
-  ///         an update size of 0 with reference entries, more reference
-  ///         entries than entries, a buffer the entries need missing, more
-  ///         than 2^30 - 1 segments, or a buffer past
-  ///         `maxStorageBufferRange`; otherwise a buffer failure.
+  ///                      read only when @p blocks holds reference entries.
+  /// @return OK, or `Status::Code::InvalidArgument` for a size
+  ///         @ref check_segment_size refuses, more reference entries than
+  ///         entries, a buffer the entries need missing, more than 2^30 - 1
+  ///         segments, or a buffer past `maxStorageBufferRange`; otherwise a
+  ///         buffer failure.
   core::Status record_count(core::CommandBatch& batch,
                             const ResidentBlocks& blocks,
                             std::uint32_t segment_size,
@@ -93,9 +94,8 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @param params      The params the coefficients were made with.
   /// @param reference   A P-frame's reference, whose block count is the
   ///                    blocks' reference entries; null for an intra frame.
-  /// @return The frame's bytes, identical to @ref write_frame's for the
-  ///         same content; @ref check_coding's refusals, then
-  ///         @ref check_entries', as @ref write_frame makes them;
+  /// @return The frame's bytes; @ref check_coding's refusals, then
+  ///         @ref check_entries';
   ///         `Status::Code::InvalidArgument` for blocks @ref record_count
   ///         did not count, a reference whose block count is not the blocks'
   ///         reference entries, or a frame @ref assemble_frame refuses; or a
@@ -138,7 +138,7 @@ class VR_CODEC_API DeviceFrameWriter {
   core::Buffer payload_;
   core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
   core::Buffer failed_;       // set when a table refuses a symbol
-  core::Buffer refusal_;      // what write_frame would refuse: two words
+  core::Buffer refusal_;      // what check_entries refuses: two words
 
   // What record_count reads back at the caller's submit: the counts, at
   // frame_model_base in a P-frame's layout, each entry's steps, and the

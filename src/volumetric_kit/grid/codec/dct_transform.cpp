@@ -97,8 +97,7 @@ core::Status fail(const char* op, const std::string& why) {
                                         ": " + why);
 }
 
-// The int16 an entry takes on the device (coefficient_words); the host's are
-// K to an entry.
+// The int16 an entry takes on the device (coefficient_words).
 std::size_t padded_count(std::uint32_t k) {
   return std::size_t(coefficient_words(k)) * 2;
 }
@@ -385,111 +384,6 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
   return out;
 }
 
-core::Status DctTransform::forward(const volume::VoxelBlockGrid& grid,
-                                   const volume::BlockList& blocks,
-                                   const CodecParams& params, DctBlocks& out,
-                                   core::GpuStageScope* stage) {
-  out.params = CodecParams{};
-  out.trunc_dist = 0.0f;
-  out.coefficients.clear();
-  out.masks.clear();
-  const std::uint32_t k = params.coefficient_count;
-  const std::size_t padded = padded_count(k);
-  std::uint32_t rejected = 0;
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_ASSIGN(const ResidentBlocks resident,
-             record_forward(batch, grid, blocks, params, rejected, stage));
-  if (resident.count != 0) {
-    std::vector<std::int16_t> coefficients(std::size_t(resident.count) *
-                                           padded);
-    std::vector<std::uint32_t> masks(std::size_t(resident.count) *
-                                     kMaskWordsPerBlock);
-    VKC_TRY(batch.readback(coefficients_, 0,
-                           coefficients.size() * sizeof(std::int16_t),
-                           coefficients.data()));
-    VKC_TRY(batch.readback(masks_, 0, masks.size() * sizeof(std::uint32_t),
-                           masks.data()));
-    VKC_TRY(batch.submit());
-    VKC_TRY(check_rejected("forward", rejected, resident.count));
-    if (padded != k) {
-      // Drop each entry's pad, sliding the rows down in place: std::copy
-      // runs forwards, which a destination before its source allows.
-      for (std::size_t i = 1; i < resident.count; ++i) {
-        const auto row = coefficients.begin() + std::ptrdiff_t(i * padded);
-        std::copy(row, row + k, coefficients.begin() + std::ptrdiff_t(i * k));
-      }
-      coefficients.resize(std::size_t(resident.count) * k);
-    }
-    out.coefficients = std::move(coefficients);
-    out.masks = std::move(masks);
-  }
-  out.params = params;
-  out.trunc_dist = grid.grid().trunc_dist;
-  return {};
-}
-
-core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
-                                   const volume::BlockList& blocks,
-                                   const DctBlocks& in,
-                                   core::GpuStageScope* stage) {
-  VKC_ASSIGN(GridViews views, check_inputs("inverse", grid, blocks, in.params));
-  if (in.trunc_dist != grid.grid().trunc_dist) {
-    return fail("inverse", "the coefficients were normalized by trunc_dist " +
-                               std::to_string(in.trunc_dist) +
-                               ", but this grid's is " +
-                               std::to_string(grid.grid().trunc_dist));
-  }
-  const std::uint32_t k = in.params.coefficient_count;
-  const std::size_t coeff_count = std::size_t(blocks.count) * k;
-  const std::size_t mask_count = std::size_t(blocks.count) * kMaskWordsPerBlock;
-  if (in.coefficients.size() != coeff_count) {
-    return fail("inverse", "expected " + std::to_string(coeff_count) +
-                               " coefficients for the list, got " +
-                               std::to_string(in.coefficients.size()));
-  }
-  if (in.masks.size() != mask_count) {
-    return fail("inverse", "expected " + std::to_string(mask_count) +
-                               " mask words for the list, got " +
-                               std::to_string(in.masks.size()));
-  }
-  if (blocks.count == 0) {
-    return {};
-  }
-
-  const std::size_t padded = padded_count(k);
-  const VkDeviceSize coeff_bytes =
-      VkDeviceSize(blocks.count) * padded * sizeof(std::int16_t);
-  const VkDeviceSize mask_bytes =
-      VkDeviceSize(mask_count) * sizeof(std::uint32_t);
-  VKC_TRY(ensure_scratch(coefficients_, coeff_bytes, "codec.coefficients"));
-  VKC_TRY(ensure_scratch(masks_, mask_bytes, "codec.masks"));
-
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(upload_list(batch, blocks));
-  if (padded == k) {
-    VKC_TRY(
-        batch.upload(coefficients_, 0, in.coefficients.data(), coeff_bytes));
-  } else {
-    // Each entry padded to a whole word, as the kernel reads it.
-    VKC_ASSIGN(void* staged,
-               batch.reserve_upload(coefficients_, 0, coeff_bytes));
-    auto* rows = static_cast<std::int16_t*>(staged);
-    for (std::size_t i = 0; i < blocks.count; ++i) {
-      std::copy_n(in.coefficients.begin() + std::ptrdiff_t(i * k), k,
-                  rows + i * padded);
-      rows[i * padded + k] = 0;
-    }
-  }
-  VKC_TRY(batch.upload(masks_, 0, in.masks.data(), mask_bytes));
-  ResidentBlocks resident;
-  resident.list = &block_list_;
-  resident.masks = &masks_;
-  resident.coefficients = &coefficients_;
-  resident.count = blocks.count;
-  resident.coefficient_count = k;
-  return run_inverse(batch, grid, views, resident, in.params, stage);
-}
-
 core::Status DctTransform::inverse(core::CommandBatch& batch,
                                    volume::VoxelBlockGrid& grid,
                                    const ResidentBlocks& in,
@@ -525,15 +419,6 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
     return fail("inverse", "the resident buffers do not hold " +
                                std::to_string(in.count) + " blocks");
   }
-  return run_inverse(batch, grid, views, in, params, stage);
-}
-
-core::Status DctTransform::run_inverse(core::CommandBatch& batch,
-                                       volume::VoxelBlockGrid& grid,
-                                       const GridViews& views,
-                                       const ResidentBlocks& in,
-                                       const CodecParams& params,
-                                       core::GpuStageScope* stage) {
   std::uint32_t rejected = 0;
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();

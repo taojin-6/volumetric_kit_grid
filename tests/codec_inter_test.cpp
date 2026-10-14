@@ -7,9 +7,9 @@
 // and chains of an I-frame, then P-frames -- leaving the grid exactly as the
 // CPU oracle's decode of the same content does, bit for bit, with every mode,
 // new blocks and the empty cases; a P-frame whose reference is not held
-// refused as NotFound, a frame the device cannot decode refused, and every
-// refusal and failure leaving the reference as it was. Internal headers by
-// include path; skips with no device.
+// refused as NotFound, a segment longer than the format allows refused, and
+// every refusal and failure leaving the reference as it was. Internal headers
+// by include path; skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -23,7 +23,8 @@
 #include "bitstream.hpp"
 #include "codec_fixture.hpp"
 #include "codec_frames.hpp"
-#include "codec_resident.hpp"
+#include "codec_oracle.hpp"
+#include "codec_oracle_device.hpp"
 #include "dct_transform.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -35,6 +36,7 @@
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+namespace oracle = codec_oracle;
 using namespace codec_fixture;
 using codec_frames::append_payload;
 using codec_frames::apply_residual;
@@ -44,9 +46,9 @@ using codec_frames::make_frame;
 using codec_frames::Payload;
 using codec_frames::payload_at;
 using codec_frames::reference_of;
-using codec_frames::Resident;
-using codec_frames::resident;
 using codec_frames::successor;
+using codec_oracle::Resident;
+using codec_oracle::resident;
 using C = vkc::Status::Code;
 using Bytes = std::vector<std::uint8_t>;
 
@@ -58,8 +60,8 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 
 // @p n entries of K coefficients drawn from all of int16, and masks of every
 // kind.
-d::DctBlocks random_entries(std::size_t n, std::uint32_t k, Lcg& rng) {
-  d::DctBlocks b;
+oracle::DctBlocks random_entries(std::size_t n, std::uint32_t k, Lcg& rng) {
+  oracle::DctBlocks b;
   b.params.coefficient_count = k;
   b.trunc_dist = kTrunc;
   for (std::size_t i = 0; i < n; ++i) {
@@ -139,7 +141,7 @@ Payload expected(const Payload* reference, const Payload* payload) {
 }
 
 // An intra frame's apply, committed: what the store holds after decoding it.
-int commit_intra(Gpu& gpu, d::ReferenceStore& store, const d::DctBlocks& r,
+int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
                  std::uint64_t hash) {
   const std::size_t m = r.masks.size() / codec::kMaskWordsPerBlock;
   const std::uint32_t k = r.params.coefficient_count;
@@ -183,13 +185,13 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
   std::uint64_t hash = 1;
   for (std::uint32_t k : {1u, 21u, 64u, codec::kVoxelsPerBlock}) {
     const std::size_t m = 9;
-    const d::DctBlocks r = random_entries(m, k, rng);
+    const oracle::DctBlocks r = random_entries(m, k, rng);
     CHECK(commit_intra(gpu, store, r, hash) == 0);
     CHECK(store.held() != nullptr && store.held()->hash == hash);
     CHECK(store.coords() == row_of(m));
 
     // A P-frame's payload by stream position: M entries, then two new.
-    const d::DctBlocks payload = random_entries(m + 2, k, rng);
+    const oracle::DctBlocks payload = random_entries(m + 2, k, rng);
     // keep, skip, zero, keep, new, skip, zero, keep, new: the reference's
     // entries 0, 1, 2, 4, 5, 6, 8 survive, 3 and 7 are gone.
     const std::vector<d::ApplySource> sources = {{0, 0},
@@ -248,13 +250,13 @@ int grow_case(Gpu& gpu) {
   d::ReferenceStore& store = *made.value();
   Lcg rng{23};
   const std::uint32_t k = 64;
-  d::DctBlocks held = random_entries(3, k, rng);
+  oracle::DctBlocks held = random_entries(3, k, rng);
   CHECK(commit_intra(gpu, store, held, 100) == 0);
   for (const std::size_t n : {std::size_t(50), std::size_t(700)}) {
     // Every block a skip of a held one, then the rest new: a frame of n
     // blocks, the spare grown to hold it.
     const std::size_t m = store.coords().size();
-    const d::DctBlocks fresh = random_entries(n - m, k, rng);
+    const oracle::DctBlocks fresh = random_entries(n - m, k, rng);
     std::vector<d::ApplySource> sources;
     for (std::size_t e = 0; e < m; ++e) {
       sources.push_back({std::uint32_t(e), d::kNoSource});
@@ -272,7 +274,7 @@ int grow_case(Gpu& gpu) {
     CHECK(batch.submit().ok());
     vkc::Result<Applied> got = read_spare(gpu, spare.value());
     CHECK(got.ok());
-    d::DctBlocks next;
+    oracle::DctBlocks next;
     next.params.coefficient_count = k;
     for (std::size_t i = 0; i < n; ++i) {
       const Payload want =
@@ -352,19 +354,20 @@ vkc::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
 }
 
 // What an intra frame decodes to by the oracle: the CPU rANS reader's
-// entries (read_frame, which pins the format's bytes), inverse-transformed
-// into a fresh grid of the frame's blocks -- no device reader, no apply, no
-// reference.
+// entries (oracle::read_frame, which pins the format's bytes),
+// inverse-transformed into a fresh grid of the frame's blocks -- no device
+// reader, no apply, no reference.
 vkc::Result<Snapshot> oracle_decode(Gpu& gpu, const Bytes& frame) {
-  VKC_ASSIGN(const d::Frame content,
-             d::read_frame(frame.data(), frame.size(), kMaxBlocks));
+  VKC_ASSIGN(const oracle::Frame content,
+             oracle::read_frame(frame.data(), frame.size(), kMaxBlocks));
   VKC_ASSIGN(vol::VoxelBlockGrid grid, grid_for(gpu, frame));
   VKC_TRY(allocate(grid, content.coords));
   // The grid's blocks in frame order, entry for entry with the content's.
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
   VKC_ASSIGN(std::unique_ptr<d::DctTransform> transform,
              d::DctTransform::create(gpu.device, gpu.allocator));
-  VKC_TRY(transform->inverse(grid, grid.block_list(blocks), content.blocks));
+  VKC_TRY(oracle::inverse(gpu, *transform, grid, grid.block_list(blocks),
+                          content.blocks));
   return snapshot(gpu, grid);
 }
 
@@ -375,8 +378,8 @@ bool holds(Gpu& gpu, vol::VoxelBlockGrid& grid, const Bytes& frame) {
   return want.ok() && got.ok() && want.value() == got.value();
 }
 
-d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
-  d::FrameWriteOptions o;
+oracle::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
+  oracle::FrameWriteOptions o;
   o.segment_size = r;
   o.update_size = u;
   return o;
@@ -385,29 +388,30 @@ d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
 // One step of a chain: the content a frame decodes to, its intra frame, and
 // the frame sent, an I-frame or a P-frame against the step before.
 struct Step {
-  d::Frame content;
+  oracle::Frame content;
   Bytes intra;
   Bytes sent;
 };
 
 // The P-frame of @p next against @p prev's sent bytes, at @p options, with
 // @p overrides' modes.
-Step p_step(const Step& prev, d::Frame next,
-            const d::FrameWriteOptions& options,
+Step p_step(const Step& prev, oracle::Frame next,
+            const oracle::FrameWriteOptions& options,
             const std::map<std::size_t, d::BlockMode>& overrides = {}) {
   Step s;
   s.content = std::move(next);
-  s.intra = d::write_frame(s.content).value();
-  s.sent = d::write_frame(inter_frame(reference_of(prev.sent), prev.content,
-                                      s.content, overrides),
-                          options)
+  s.intra = oracle::write_frame(s.content).value();
+  s.sent = oracle::write_frame(inter_frame(reference_of(prev.sent),
+                                           prev.content, s.content, overrides),
+                               options)
                .value();
   return s;
 }
 
 Step i_step(const Bytes& intra) {
   Step s;
-  s.content = d::read_frame(intra.data(), intra.size(), kMaxBlocks).value();
+  s.content =
+      oracle::read_frame(intra.data(), intra.size(), kMaxBlocks).value();
   s.intra = intra;
   s.sent = intra;
   return s;
@@ -440,8 +444,8 @@ struct Census {
 
 Census census(const Step& prev, const Step& p) {
   const d::FrameReference id = reference_of(prev.sent);
-  const d::Frame f =
-      d::read_frame(p.sent.data(), p.sent.size(), kMaxBlocks, &id).value();
+  const oracle::Frame f =
+      oracle::read_frame(p.sent.data(), p.sent.size(), kMaxBlocks, &id).value();
   Census c;
   for (d::BlockMode m : f.modes) ++c.modes[std::size_t(m)];
   c.added = f.coords.size();
@@ -457,8 +461,9 @@ int synthetic_case(Gpu& gpu) {
   for (std::uint32_t k : {21u, 64u, codec::kVoxelsPerBlock}) {
     const std::size_t n = k == codec::kVoxelsPerBlock ? 30 : 90;
     std::vector<Step> chain;
-    chain.push_back(i_step(d::write_frame(make_frame(n, k, 500 + k)).value()));
-    const d::Frame f1 = successor(chain[0].content, k, 80, 400, n / 5);
+    chain.push_back(
+        i_step(oracle::write_frame(make_frame(n, k, 500 + k)).value()));
+    const oracle::Frame f1 = successor(chain[0].content, k, 80, 400, n / 5);
     chain.push_back(p_step(chain[0], f1, sizes(3, 7),
                            codec_frames::spellings(chain[0].content, f1)));
     chain.push_back(p_step(chain[1],
@@ -480,7 +485,7 @@ int synthetic_case(Gpu& gpu) {
 
     const codec_frames::Extremes x = codec_frames::extremes(k);
     std::vector<Step> extreme;
-    extreme.push_back(i_step(d::write_frame(x.reference).value()));
+    extreme.push_back(i_step(oracle::write_frame(x.reference).value()));
     extreme.push_back(p_step(extreme[0], x.target, sizes(4, 3)));
     CHECK(
         census(extreme[0], extreme[1]).modes[std::size_t(d::BlockMode::kZero)] >
@@ -548,8 +553,8 @@ vkc::Result<Spheres> spheres(Gpu& gpu) {
   }
   out.chain.push_back(i_step(intra[0]));
   // Long segments, then short ones.
-  const d::FrameWriteOptions few = sizes(64, 64);
-  const d::FrameWriteOptions many = sizes(1, 2);
+  const oracle::FrameWriteOptions few = sizes(64, 64);
+  const oracle::FrameWriteOptions many = sizes(1, 2);
   for (int t = 1; t < 3; ++t) {
     Step s = p_step(out.chain.back(), i_step(intra[std::size_t(t)]).content,
                     t == 1 ? few : many);
@@ -662,7 +667,7 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   // The second P-frame with one more new block: the coordinate of a block
   // its reference has and it removes.
   const d::FrameReference id = reference_of(chain[1].sent);
-  d::Frame p = inter_frame(id, chain[1].content, chain[2].content);
+  oracle::Frame p = inter_frame(id, chain[1].content, chain[2].content);
   const std::size_t m = p.modes.size();
   std::size_t gone = m;
   for (std::size_t e = 0; e < m && gone == m; ++e) {
@@ -674,7 +679,7 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
       std::upper_bound(p.coords.begin(), p.coords.end(), c, d::coord_less) -
       p.coords.begin();
   p.coords.insert(p.coords.begin() + at, c);
-  d::DctBlocks blocks;
+  oracle::DctBlocks blocks;
   blocks.params = p.blocks.params;
   blocks.trunc_dist = p.blocks.trunc_dist;
   for (std::size_t e = 0; e < m + std::size_t(at); ++e) {
@@ -685,7 +690,7 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
     append_payload(blocks, payload_at(p.blocks, e));
   }
   p.blocks = std::move(blocks);
-  const Bytes on_reference = d::write_frame(p, sizes(1, 2)).value();
+  const Bytes on_reference = oracle::write_frame(p, sizes(1, 2)).value();
 
   Bytes rescaled = chain[2].sent;
   codec_frames::put_f32(rescaled, 24, 0.3f);
@@ -717,7 +722,7 @@ int out_of_memory_case(Gpu& gpu, const Spheres& s) {
   // A few blocks, which short chains in a table of as many slots cannot all
   // place, and a resize can.
   std::vector<Step> few;
-  few.push_back(i_step(d::write_frame(make_frame(12, 64, 41)).value()));
+  few.push_back(i_step(oracle::write_frame(make_frame(12, 64, 41)).value()));
   few.push_back(
       p_step(few[0], successor(few[0].content, 42, 100, 400, 6), sizes(4, 4)));
   few.push_back(
@@ -792,20 +797,24 @@ int moves_case(Gpu& gpu, const Spheres& s) {
   return 0;
 }
 
-// A frame the device cannot decode -- a segment of more than
-// kMaxDeviceDecodeSegmentSize entries, of new blocks or of reference entries
-// -- refused with the device's code, InvalidArgument, the grid and the
-// reference as they were; nothing decodes it on the host. Segments of
+// A frame that names a segment longer than kMaxDeviceDecodeSegmentSize -- its
+// segment size, or a P-frame's update size -- is malformed: refused before
+// any device work, with the grid and the reference as they were. Segments of
 // exactly the limit decode.
-int device_refusal_case(Gpu& gpu) {
+int segment_rule_case(Gpu& gpu) {
   constexpr std::uint32_t kLimit = codec::kMaxDeviceDecodeSegmentSize;
-  const d::Frame first = make_frame(kLimit + 1, 8, 71);
+  const oracle::Frame first = make_frame(kLimit, 8, 71);
   std::vector<Step> chain;
-  chain.push_back(i_step(d::write_frame(first, sizes(kLimit, 1)).value()));
-  const d::Frame next = successor(first, 72, 50, 300, 4);
+  chain.push_back(i_step(oracle::write_frame(first, sizes(kLimit, 1)).value()));
+  const oracle::Frame next = successor(first, 72, 50, 300, 4);
   chain.push_back(p_step(chain[0], next, sizes(64, kLimit)));
-  const Bytes long_intra = d::write_frame(first, sizes(kLimit + 1, 1)).value();
-  const Bytes long_update = p_step(chain[0], next, sizes(64, kLimit + 1)).sent;
+  // One entry more named in the header, and in REFERENCE: the same segments.
+  Bytes long_intra = chain[0].sent;
+  codec_frames::put_u32(long_intra, 36, kLimit + 1);
+  std::vector<codec_frames::Section> s =
+      codec_frames::sections_of(chain[1].sent);
+  codec_frames::put_u32(s[0].body, 12, kLimit + 1);
+  const Bytes long_update = codec_frames::assemble(chain[1].sent, s);
 
   vkc::Result<codec::Decoder> made =
       codec::Decoder::create(gpu.device, gpu.allocator);
@@ -815,11 +824,11 @@ int device_refusal_case(Gpu& gpu) {
   const Bytes& i = chain[0].sent;
   CHECK(dec.decode(i.data(), i.size(), g.value()).ok());
   CHECK(holds(gpu, g.value(), chain[0].intra));
-  const std::string says = "segments of " + std::to_string(kLimit + 1);
+  const std::string past = std::to_string(kLimit + 1) + " is not in";
   CHECK(refused(gpu, dec, long_intra, g.value(), C::InvalidArgument,
-                says.c_str()) == 0);
+                ("segment size " + past).c_str()) == 0);
   CHECK(refused(gpu, dec, long_update, g.value(), C::InvalidArgument,
-                says.c_str()) == 0);
+                ("update size " + past).c_str()) == 0);
   // Both refusals kept the reference: the P-frame on it decodes.
   const Bytes& p = chain[1].sent;
   CHECK(dec.decode(p.data(), p.size(), g.value()).ok());
@@ -836,7 +845,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
   if (encoder_case(gpu) != 0) return 1;
-  if (device_refusal_case(gpu) != 0) return 1;
+  if (segment_rule_case(gpu) != 0) return 1;
   vkc::Result<Spheres> s = spheres(gpu);
   CHECK(s.ok());
   if (sphere_case(gpu, s.value()) != 0) return 1;

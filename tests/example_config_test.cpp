@@ -120,7 +120,6 @@ int main() {
   CHECK(encoder->params.quantization_weights[1] == 1.125F);
   CHECK(encoder->params.quantization_weights[2] == 1.5F);
   CHECK(encoder->params.quantization_weights[1 + 8 * 2 + 64 * 3] == 2.75F);
-  CHECK(encoder->entropy == vr::codec::EntropyCoding::kDevice);
   CHECK(encoder->segment_size == 32);
   // The outputs, relative to the scenario's directory.
   const vr_example::CodecOutputs outputs =
@@ -129,11 +128,14 @@ int main() {
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
 
   // Steps out of the codec's bounds load, and the codec refuses them: too
-  // fine everywhere, or too coarse at radial's highest frequency.
+  // fine everywhere, or too coarse at radial's highest frequency. So does
+  // coding on the host, which the codec does not: auto and device are the
+  // same.
   for (const char* codec_section :
        {R"({"quantization_scale": 0.0001})",
         R"({"quantization_table": "radial", "coefficient_count": 512,
-            "quantization_scale": 4})"}) {
+            "quantization_scale": 4})",
+        R"({"entropy": "host"})"}) {
     const auto out_of_bounds =
         cfg::parse(std::string(R"({"version": 1, "operation": "codec",
                         "source": {"kind": "dataset", "path": "room0"},
@@ -145,6 +147,14 @@ int main() {
     CHECK(!refused.ok() &&
           refused.status().domain() == vkc::Status::Code::InvalidArgument);
   }
+  const auto automatic = cfg::parse(
+      R"({"version": 1, "operation": "codec",
+          "source": {"kind": "dataset", "path": "room0"},
+          "codec": {"entropy": "auto", "segment_size": 32}})",
+      cfg::Application::CodecReplica);
+  CHECK(automatic);
+  const auto from_auto = vr_example::encoder_config(automatic->codec);
+  CHECK(from_auto.ok() && from_auto->segment_size == 32);
 
   const auto mesh = cfg::parse(R"({
     "version": 1, "operation": "codec",

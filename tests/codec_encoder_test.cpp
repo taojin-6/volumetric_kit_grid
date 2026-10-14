@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for codec::Encoder: an empty grid is a valid frame; the bytes are
-// independent of the order the hash table holds the blocks in; blocks with no
-// observed voxel are left out; its stage rows; its refusals (a segment longer
-// than the Decoder decodes among them) and its moves.
-// Decoding is codec_decoder_test's. Skips with no device.
+// the CPU oracle's and independent of the order the hash table holds the
+// blocks in; blocks with no observed voxel are left out; its stage rows; its
+// refusals (a segment longer than the format allows among them) and its
+// moves. Decoding is codec_decoder_test's. Skips with no device.
 
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "codec_fixture.hpp"
+#include "codec_oracle_encode.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
@@ -44,6 +45,7 @@ int empty_grid_case(Gpu& gpu, codec::Encoder& enc) {
   vol::VoxelBlockGrid grid = std::move(g).value();
   vkc::Result<std::vector<std::uint8_t>> bytes = enc.encode(grid);
   CHECK(bytes.ok());
+  CHECK(bytes.value() == codec_oracle::encode(gpu, grid, {}).value());
   vkc::Result<codec::FrameInfo> info =
       codec::read_frame_info(bytes.value().data(), bytes.value().size());
   CHECK(info.ok());
@@ -201,43 +203,27 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
-// Device coding writes the host's bytes, here through the public encoder on
-// a fused-looking grid, for the default and a finer segmentation; the
-// automatic choice codes the second on the device, past
-// kMinDeviceEncodeSegments.
-int device_matches_host_case(Gpu& gpu) {
+// The Encoder writes the CPU oracle's bytes for a fused-looking grid, at an
+// odd K, for the default and a finer segmentation and the longest segments.
+int oracle_case(Gpu& gpu) {
   const Sphere s{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  for (std::uint32_t segment_size : {64u, 3u}) {
+  for (std::uint32_t segment_size :
+       {64u, 3u, codec::kMaxDeviceDecodeSegmentSize}) {
     codec::EncoderConfig config;
     config.params.coefficient_count = 37;
     config.segment_size = segment_size;
-    config.entropy = codec::EntropyCoding::kHost;
-    vkc::Result<codec::Encoder> host =
+    vkc::Result<codec::Encoder> enc =
         codec::Encoder::create(gpu.device, gpu.allocator, config);
-    config.entropy = codec::EntropyCoding::kDevice;
-    vkc::Result<codec::Encoder> device =
-        codec::Encoder::create(gpu.device, gpu.allocator, config);
-    config.entropy = codec::EntropyCoding::kAuto;
-    vkc::Result<codec::Encoder> automatic =
-        codec::Encoder::create(gpu.device, gpu.allocator, config);
-    CHECK(host.ok() && device.ok() && automatic.ok());
-    vkc::Result<std::vector<std::uint8_t>> a = host.value().encode(grid);
-    vkc::Result<std::vector<std::uint8_t>> b = device.value().encode(grid);
-    vkc::Result<std::vector<std::uint8_t>> c = automatic.value().encode(grid);
-    CHECK(a.ok() && b.ok() && c.ok());
-    CHECK(a.value().size() > 1000);
-    CHECK(a.value() == b.value());
-    CHECK(a.value() == c.value());
-    vkc::Result<codec::FrameInfo> info =
-        codec::read_frame_info(a.value().data(), a.value().size());
-    CHECK(info.ok());
-    if (segment_size == 3) {
-      CHECK((info.value().block_count + 2) / 3 >=
-            codec::kMinDeviceEncodeSegments);
-    }
+    CHECK(enc.ok());
+    vkc::Result<std::vector<std::uint8_t>> frame = enc.value().encode(grid);
+    vkc::Result<std::vector<std::uint8_t>> oracle =
+        codec_oracle::encode(gpu, grid, config);
+    CHECK(frame.ok() && oracle.ok());
+    CHECK(frame.value().size() > 1000);
+    CHECK(frame.value() == oracle.value());
   }
   return 0;
 }
@@ -252,7 +238,9 @@ int refusals_case(Gpu& gpu) {
       codec::Encoder::create(gpu.device, gpu.allocator, bad);
   CHECK(!long_segments.ok() &&
         long_segments.status().domain() == vkc::Status::Code::InvalidArgument &&
-        long_segments.status().message().find("longest segment") !=
+        long_segments.status().message().find(
+            "segment_size " +
+            std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1)) !=
             std::string::npos);
   bad.segment_size = codec::kMaxDeviceDecodeSegmentSize;
   CHECK(codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
@@ -319,20 +307,16 @@ int moves_case(Gpu& gpu) {
 }
 
 int gpu_main(vr_test::GpuContext& gpu) {
-  codec::EncoderConfig device_config;
-  device_config.entropy = codec::EntropyCoding::kDevice;
-  const codec::EncoderConfig configs[] = {{}, device_config};
-  for (const auto& config : configs) {
-    auto made = codec::Encoder::create(gpu.device, gpu.allocator, config);
-    CHECK(made.ok());
-    codec::Encoder enc = std::move(made).value();
-    if (empty_grid_case(gpu, enc) != 0) return 1;
-    if (order_independent_case(gpu, enc) != 0) return 1;
-    if (unobserved_dropped_case(gpu, enc) != 0) return 1;
-    if (metrics_case(gpu, enc) != 0) return 1;
-    if (device_list_case(gpu, enc) != 0) return 1;
-  }
-  if (device_matches_host_case(gpu) != 0) return 1;
+  vkc::Result<codec::Encoder> made =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  CHECK(made.ok());
+  codec::Encoder enc = std::move(made).value();
+  if (empty_grid_case(gpu, enc) != 0) return 1;
+  if (order_independent_case(gpu, enc) != 0) return 1;
+  if (unobserved_dropped_case(gpu, enc) != 0) return 1;
+  if (metrics_case(gpu, enc) != 0) return 1;
+  if (device_list_case(gpu, enc) != 0) return 1;
+  if (oracle_case(gpu) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");

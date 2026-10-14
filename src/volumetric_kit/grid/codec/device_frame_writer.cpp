@@ -131,16 +131,16 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   const std::uint32_t entries = blocks.count;
   const std::uint32_t m = blocks.reference_count;
   const std::uint32_t k = blocks.coefficient_count;
-  if (segment_size == 0) {
-    return fail("record_count", "segment_size must be at least 1");
-  }
+  VKC_TRY(check_segment_size("DeviceFrameWriter::record_count", "segment_size",
+                             segment_size));
   if (m > entries) {
     return fail("record_count", std::to_string(m) +
                                     " reference entries, more than the " +
                                     std::to_string(entries) + " entries");
   }
-  if (m != 0 && update_size == 0) {
-    return fail("record_count", "update_size must be at least 1");
+  if (m != 0) {
+    VKC_TRY(check_segment_size("DeviceFrameWriter::record_count", "update_size",
+                               update_size));
   }
   if (entries != 0 &&
       (blocks.masks == nullptr || blocks.coefficients == nullptr ||
@@ -193,7 +193,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
     const CodecParams& params, const FrameReference* reference,
     core::GpuStageScope* stage) {
-  // write_frame's refusals in its order: the coding parameters first.
+  // Every writer's refusals in their order: the coding parameters first.
   VKC_TRY(check_coding(voxel_size, trunc_dist, params));
   const std::uint32_t entries = blocks.count;
   const std::uint32_t m = blocks.reference_count;
@@ -218,7 +218,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
                               "got " +
                               std::to_string(m));
   }
-  // write_frame's last refusals, from what the count found. The mode model
+  // The last refusals, from what the count found. The mode model
   // follows an intra frame's last (frame_models.glsl).
   const std::uint32_t modes =
       frame_model_base(frame_model_count(FrameType::kIntra, k), k);
@@ -230,7 +230,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
       static_cast<std::uint32_t>(frame_segment_count(m, update_size) +
                                  frame_segment_count(a, segment_size));
 
-  // The tables, from the device's counts through the host's normalization.
+  // The tables, from the device's counts through the one normalization.
   const std::uint32_t models = frame_model_count(type, k);
   std::vector<std::vector<std::uint64_t>> counts(models);
   for (std::uint32_t model = 0; model < models; ++model) {
@@ -265,7 +265,9 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   // out last first, each entry's steps written down from its run's end: the
   // segment's steps are one run in the order the coder takes them. Its slot
   // holds at most a word per step and the final state's two, rounded up to
-  // whole 32-bit words so no two segments share one.
+  // whole 32-bit words so no two segments share one. TODO(codec): scan the
+  // steps on the device, so they need not cross the bus both ways (the
+  // 2026-10-13 rule).
   std::vector<std::uint32_t> step_ends(entries);
   std::vector<std::uint32_t> segment_steps(std::size_t(segments) + 1, 0);
   std::vector<std::uint32_t> slot_offsets(std::size_t(segments) + 1, 0);

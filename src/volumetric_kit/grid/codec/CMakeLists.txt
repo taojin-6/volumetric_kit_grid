@@ -7,8 +7,8 @@
 # 2026-09-26 decision). Public: CodecParams, and the Encoder and Decoder built
 # on the private pieces (encoder.cpp, decoder.cpp) -- the DctTransform (the GLSL
 # forward/inverse 8^3 DCT that turns a block list into quantized coefficients
-# plus an observed mask, and back), the host rANS reference coder (rans.hpp,
-# header-only), the frame built on it (bitstream.cpp; the 2026-09-27 decisions),
+# plus an observed mask, and back), the rANS tables (rans.hpp, header-only), the
+# frame's layout, parsing and checks (bitstream.cpp; the 2026-09-27 decisions),
 # its device coders, and the decoder's reference (reference_store.cpp). Links
 # recon_volume ALONE -- it reads a grid's tsdf/weight and re-creates blocks
 # through the map, and needs neither the integrator that produced the field nor

@@ -19,7 +19,6 @@
 #include <vector>
 
 #include "bitstream.hpp"
-#include "dct_blocks.hpp"
 #include "dct_transform.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"

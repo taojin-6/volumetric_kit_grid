@@ -101,7 +101,7 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// frame decoded.
 ///
 /// The rANS decode runs on the device, one segment an invocation, and its
-/// coefficients and masks stay there; a frame the device cannot decode is
+/// coefficients and masks stay there; a frame the device cannot hold is
 /// refused, never decoded on the host.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
@@ -161,15 +161,15 @@ class VR_CODEC_API Decoder {
   /// @return OK, or: whatever the frame reader refuses
   ///         (`Status::Code::Unsupported`,
   ///         `Status::Code::InvalidArgument` for a malformed or corrupt
-  ///         frame, a P-frame whose coding parameters are not its
-  ///         reference's included); `Status::Code::NotFound` for a P-frame
-  ///         whose reference this decoder does not hold (none, or another
-  ///         frame): the stream's P-frames decode again from its next
-  ///         I-frame; a frame the device cannot decode:
-  ///         `Status::Code::InvalidArgument` for a segment of more than
-  ///         @ref kMaxDeviceDecodeSegmentSize entries or a buffer past
-  ///         `maxStorageBufferRange`, `Status::Code::OutOfMemory` past free
-  ///         device memory, which a resize does not recover;
+  ///         frame, a segment longer than @ref kMaxDeviceDecodeSegmentSize
+  ///         and a P-frame whose coding parameters are not its reference's
+  ///         included); `Status::Code::NotFound` for a P-frame whose
+  ///         reference this decoder does not hold (none, or another frame):
+  ///         the stream's P-frames decode again from its next I-frame; a
+  ///         frame the device cannot hold: `Status::Code::InvalidArgument`
+  ///         for a buffer past `maxStorageBufferRange`,
+  ///         `Status::Code::OutOfMemory` past free device memory, which a
+  ///         resize does not recover;
   ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Tao Jin
 
 // The device frame's coder steps: one invocation per entry walks its symbols
-// in the order the host writer emits them and writes each one's steps, as
+// in the order the grammar emits them and writes each one's steps, as
 // `start | freq << 16` words, downward from the end of the entry's run. The
 // encoder takes steps last first, and the host lays each segment's entries
 // last first, so a segment's steps are one run in the encoder's order that
@@ -35,7 +35,7 @@ void sink_symbol(uint model, uint symbol) {
   steps[--g_at] = tables[model_base(model, pc.coefficient_count) + symbol];
 }
 
-// RansWriter::put_bits's steps: chunks of at most 12 bits, low first.
+// A raw field's steps (rans.hpp): chunks of at most 12 bits, low first.
 void sink_bits(uint value, uint bits) {
   for (uint low = 0u; low < bits; low += 12u) {
     const uint n = min(bits - low, 12u);

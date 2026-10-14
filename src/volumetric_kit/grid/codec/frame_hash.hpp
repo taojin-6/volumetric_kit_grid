@@ -9,9 +9,9 @@
 ///
 /// Internal (under src/, never installed). XXH64 with seed 0, written from
 /// the published algorithm (no dependency), over a frame's exact bytes: what
-/// `write_frame` or `Encoder::encode` returned and what `Decoder::decode` was
-/// given. It reads bytes with shifts, so it needs no unaligned load and gives
-/// the same value on any host.
+/// `Encoder::encode` returned and what `Decoder::decode` was given. It reads
+/// bytes with shifts, so it needs no unaligned load and gives the same value on
+/// any host.
 
 #include <cstddef>
 #include <cstdint>

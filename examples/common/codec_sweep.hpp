@@ -68,8 +68,7 @@ inline std::vector<SweepConfig> sweep_configs() {
 /// vertices with no decoded surface within it -- holes.
 ///
 /// @param base    The command line's configuration: each row keeps its
-///                encoder's entropy coding and segment size, and sets the
-///                params.
+///                encoder's segment size, and sets the params.
 /// @param player  The grid to decode into: a stream's player, already built
 ///                for this geometry (it grows if a frame needs it).
 inline vkc::Status run_codec_sweep(vkc::Device& device,

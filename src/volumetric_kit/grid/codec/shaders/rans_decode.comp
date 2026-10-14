@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The device frame's decode: one invocation per segment runs rans.hpp's
-// RansReader, with the same 32-bit integer arithmetic, under
-// frame_grammar.glsl's reader half over the segment's stream. Each entry's
-// mask and coefficients land at its stream position (segment_range), a
-// P-frame's reference entry's mode beside them and a new block's coordinate
-// at its place in the list. The host reader is the reference: the same frame
-// decodes to the same entries, and a segment fails here exactly when it fails
-// there, which the device frame test checks.
+// The device frame's decode: one invocation per segment runs the rANS decoder
+// rans.hpp describes, in 32-bit integer arithmetic, under frame_grammar.glsl's
+// reader half over the segment's stream. Each entry's mask and coefficients
+// land at its stream position (segment_range), a P-frame's reference entry's
+// mode beside them and a new block's coordinate at its place in the list. The
+// tests' CPU oracle is the reference: the same frame decodes to the same
+// entries, and a segment fails here exactly when it fails there, which the
+// device frame test checks.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -54,7 +54,7 @@ const uint kFaultNone = 0u;
 const uint kFaultCoordOverflow = 1u;
 const uint kFaultCorrupt = 2u;
 
-// RansReader's state: sticky failure, as there.
+// The decoder's state, its failure sticky.
 uint g_x = 0u;
 uint g_pos = 0u;  // the next word
 uint g_end = 0u;  // one past the segment's last word

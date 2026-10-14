@@ -71,41 +71,14 @@ inline constexpr float kMaxStep = 64.0f;
 static_assert(kMaxStep * kMaxStep >= 4.0f * kVoxelsPerBlock,
               "kMaxStep must quantize every coefficient to 0");
 
-/// @brief Where an @ref Encoder runs a frame's rANS coding. Every frame both
-///        sides can code gives the same bytes, so the choice changes only
-///        the time it takes. A @ref Decoder decodes on the device alone.
-///
-/// The device cannot code a frame past `maxStorageBufferRange` or free
-/// memory. @ref kDevice refuses such a frame
-/// (`Status::Code::InvalidArgument` or `Status::Code::OutOfMemory`),
-/// which the host would code.
-enum class EntropyCoding {
-  /// The device for a frame of at least @ref kMinDeviceEncodeSegments
-  /// segments; the host for a smaller one, which has too few segments for
-  /// the device to run in parallel. A frame the device cannot code is coded
-  /// on the host, and so is every frame once the device's rANS kernels fail
-  /// to build; any other device failure is reported as @ref kDevice reports
-  /// it.
-  kAuto,
-  /// On the host: the coefficients and masks are read back to encode.
-  kHost,
-  /// On the device, one invocation per segment: the coefficients and masks
-  /// stay in device memory, and only the symbol counts and the frame cross
-  /// the bus.
-  kDevice,
-};
-
-/// The fewest segments @ref EntropyCoding::kAuto encodes on the device:
-/// about where the device stopped losing to the host on Apple M5 Max (the
-/// RTX 5090 broke even near 20; the 2026-10-03 encoding decision).
-inline constexpr std::uint32_t kMinDeviceEncodeSegments = 48;
-
-/// The longest segment, in entries, a @ref Decoder decodes: blocks, or a
-/// P-frame's reference entries. One invocation decodes a whole segment, at
-/// 30 to 45 us a block on Apple M5 Max and RTX 5090, and the frame sets its
-/// length; this keeps one invocation near 50 ms there, well inside a GPU
-/// watchdog's limit on a slower device. A frame with a longer segment is
-/// refused (`Status::Code::InvalidArgument`).
+/// The longest segment a frame holds, in entries: a rule of the format, so
+/// every valid frame decodes on the device. A frame's segment size (blocks)
+/// and a P-frame's update size (reference entries) are each from 1 to this;
+/// a reader refuses a frame past it, and the @ref Encoder a `segment_size`
+/// past it (`Status::Code::InvalidArgument`). One invocation decodes a whole
+/// segment, at 30 to 45 us a block on Apple M5 Max and RTX 5090; this keeps
+/// one invocation near 50 ms there, well inside a GPU watchdog's limit on a
+/// slower device.
 inline constexpr std::uint32_t kMaxDeviceDecodeSegmentSize = 1024;
 
 /// @brief What a frame is: byte 6 of its header (@ref FrameInfo::type).

@@ -3,10 +3,10 @@
 
 #pragma once
 
-// Synthetic frames for the codec's frame tests: the host writer's round
-// trips and the device writer's byte comparison draw the same frames, both
-// writers must write the golden frames' pinned bytes, and P-frames come with
-// an oracle of their own and the refusals each check makes.
+// Synthetic frames for the codec's frame tests: the CPU oracle's round trips
+// and the device coders' byte comparison draw the same frames, both writers
+// must write the golden frames' pinned bytes, and P-frames come with a model
+// of their own and the refusals each check makes.
 
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "bitstream.hpp"
+#include "codec_oracle.hpp"
 #include "fnv1a.hpp"
 #include "frame_hash.hpp"
 #include "volumetric_kit/core/base/result.hpp"
@@ -31,6 +32,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+namespace oracle = codec_oracle;
 
 inline constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
 inline constexpr std::int32_t kMin32 = std::numeric_limits<std::int32_t>::min();
@@ -71,7 +73,8 @@ inline void slab_mask(Lcg& rng, std::uint32_t* mask) {
 // them, masks mostly full with some empty and some partial -- noise, or a
 // slab's edge -- coefficients small and sparser at higher indices, and the
 // odd extreme value.
-inline d::Frame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
+inline oracle::Frame make_frame(std::size_t n, std::uint32_t k,
+                                std::uint64_t seed) {
   Lcg rng{seed};
   auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
     return d::coord_less(a, b);
@@ -90,7 +93,7 @@ inline d::Frame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
       coords.insert(vr::Vec3i(start.x + int(i), start.y, start.z));
     }
   }
-  d::Frame f;
+  oracle::Frame f;
   f.voxel_size = 0.005f;
   f.coords.assign(coords.begin(), coords.end());
   f.blocks.params.coefficient_count = k;
@@ -124,8 +127,8 @@ inline d::Frame make_frame(std::size_t n, std::uint32_t k, std::uint64_t seed) {
 }
 
 // Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
-inline d::Frame extreme_frame() {
-  d::Frame f = make_frame(0, 4, 1);
+inline oracle::Frame extreme_frame() {
+  oracle::Frame f = make_frame(0, 4, 1);
   f.coords = {
       {kMin32, kMin32, kMin32}, {kMax32, kMin32, kMin32},  // dx = 2^32 - 1
       {kMin32, kMax32, kMin32},                            // dy, dx back
@@ -138,7 +141,7 @@ inline d::Frame extreme_frame() {
 }
 
 // What a frame holds, hashed: coordinates, masks and coefficients.
-inline std::uint32_t content_hash(const d::Frame& f) {
+inline std::uint32_t content_hash(const oracle::Frame& f) {
   std::vector<std::uint32_t> words;
   for (const vr::Vec3i& c : f.coords) {
     words.insert(words.end(), {static_cast<std::uint32_t>(c.x),
@@ -154,10 +157,11 @@ inline std::uint32_t content_hash(const d::Frame& f) {
 
 // --- Golden frames. ---------------------------------------------------------
 //
-// The v3 bytes every writer, host or device, writes for these frames on every
-// machine: what pins the format, where a round trip would pass a writer and a
-// reader changed together. `content` pins the fixture, so a failure says which
-// changed. A new kFrameVersion brings new values; nothing else may.
+// The v3 bytes every writer, the oracle or the device, writes for these
+// frames on every machine: what pins the format, where a round trip would pass
+// a writer and a reader changed together. `content` pins the fixture, so a
+// failure says which changed. A new kFrameVersion brings new values; nothing
+// else may.
 static_assert(d::kFrameVersion == 3, "the golden frames are v3's");
 
 struct GoldenFrame {
@@ -182,7 +186,7 @@ inline constexpr GoldenFrame kGoldenFrames[] = {
     {true, 6, 4, 0, 1, 0x11b607ddu, 236, 0x92cc1c51u},
 };
 
-inline d::Frame golden_frame(const GoldenFrame& g) {
+inline oracle::Frame golden_frame(const GoldenFrame& g) {
   return g.extreme ? extreme_frame() : make_frame(g.blocks, g.k, g.seed);
 }
 
@@ -272,23 +276,6 @@ inline void set_first_x_low_bits(std::vector<std::uint8_t>& payload,
                                               ((low12 >> 8) & 0x0F));
 }
 
-// A SEGMENTS body with its @p count lengths from @p first replaced by their
-// sum: the same PAYLOAD read as fewer segments.
-inline std::vector<std::uint8_t> join_lengths(
-    const std::vector<std::uint8_t>& segments, std::size_t first,
-    std::size_t count) {
-  std::uint32_t sum = 0;
-  for (std::size_t i = first; i < first + count; ++i) {
-    sum += get_u32(segments, 4 * i);
-  }
-  std::vector<std::uint8_t> out(
-      segments.begin(), segments.begin() + std::ptrdiff_t(4 * first + 4));
-  put_u32(out, 4 * first, sum);
-  out.insert(out.end(), segments.begin() + std::ptrdiff_t(4 * (first + count)),
-             segments.end());
-  return out;
-}
-
 // What assemble_frame lays a parsed frame out from: every field it reads, so
 // it writes the frame's bytes again.
 inline d::CodedFrame coded_frame(const d::ParsedFrame& p) {
@@ -311,7 +298,7 @@ inline d::CodedFrame coded_frame(const d::ParsedFrame& p) {
 //
 // An independent model of the type-1 rules in bitstream.hpp: block identity
 // by a std::map of its own order, and residuals and masks in plain integer
-// arithmetic, so a test that compares the library with it compares two
+// arithmetic, so a test that compares a coder with it compares two
 // implementations.
 
 // The frame order, (z, y, x), written out rather than taken from the library.
@@ -328,7 +315,7 @@ struct Payload {
   bool operator==(const Payload& o) const { return mask == o.mask && q == o.q; }
 };
 
-inline Payload payload_at(const d::DctBlocks& b, std::size_t i) {
+inline Payload payload_at(const oracle::DctBlocks& b, std::size_t i) {
   const std::uint32_t k = b.params.coefficient_count;
   const std::size_t w = codec::kMaskWordsPerBlock;
   return Payload{
@@ -339,28 +326,9 @@ inline Payload payload_at(const d::DctBlocks& b, std::size_t i) {
           b.coefficients.begin() + std::ptrdiff_t(i * k + k))};
 }
 
-inline void append_payload(d::DctBlocks& b, const Payload& p) {
+inline void append_payload(oracle::DctBlocks& b, const Payload& p) {
   b.masks.insert(b.masks.end(), p.mask.begin(), p.mask.end());
   b.coefficients.insert(b.coefficients.end(), p.q.begin(), p.q.end());
-}
-
-// @p b's coefficients as the device holds them: two int16 a word,
-// coefficient 2p low, each entry starting a word of its own, an odd K's pad
-// half @p pad.
-inline std::vector<std::uint32_t> pack(const d::DctBlocks& b,
-                                       std::uint16_t pad = 0) {
-  const std::uint32_t k = b.params.coefficient_count;
-  const std::uint32_t words = d::coefficient_words(k);
-  const std::size_t n = b.masks.size() / codec::kMaskWordsPerBlock;
-  std::vector<std::uint32_t> out(n * words, 0);
-  for (std::size_t i = 0; i < n; ++i) {
-    for (std::uint32_t j = 0; j < words * 2; ++j) {
-      const std::uint16_t v =
-          j < k ? static_cast<std::uint16_t>(b.coefficients[i * k + j]) : pad;
-      out[i * words + j / 2] |= std::uint32_t(v) << (16 * (j & 1));
-    }
-  }
-  return out;
 }
 
 // (t - r) mod 2^16, as int16.
@@ -387,9 +355,9 @@ inline d::FrameReference reference_of(const std::vector<std::uint8_t>& bytes) {
 // @p removed are gone, @p changed change (half of them by a little, the rest
 // anywhere, masks included) and the rest stay as they are; then @p added
 // blocks that the reference lacks. The parameters are the reference's.
-inline d::Frame successor(const d::Frame& reference, std::uint64_t seed,
-                          std::uint32_t removed, std::uint32_t changed,
-                          std::size_t added) {
+inline oracle::Frame successor(const oracle::Frame& reference,
+                               std::uint64_t seed, std::uint32_t removed,
+                               std::uint32_t changed, std::size_t added) {
   Lcg rng{seed};
   const std::uint32_t k = reference.blocks.params.coefficient_count;
   std::map<vr::Vec3i, Payload, ZyxLess> blocks;
@@ -420,7 +388,7 @@ inline d::Frame successor(const d::Frame& reference, std::uint64_t seed,
     }
     blocks.emplace(reference.coords[e], std::move(p));
   }
-  const d::Frame fresh = make_frame(added, k, seed ^ 0x5eedu);
+  const oracle::Frame fresh = make_frame(added, k, seed ^ 0x5eedu);
   std::set<vr::Vec3i, ZyxLess> taken(reference.coords.begin(),
                                      reference.coords.end());
   for (std::size_t i = 0; i < fresh.coords.size(); ++i) {
@@ -429,7 +397,7 @@ inline d::Frame successor(const d::Frame& reference, std::uint64_t seed,
     taken.insert(c);
     blocks.emplace(c, payload_at(fresh.blocks, i));
   }
-  d::Frame f;
+  oracle::Frame f;
   f.voxel_size = reference.voxel_size;
   f.blocks.params = reference.blocks.params;
   f.blocks.trunc_dist = reference.blocks.trunc_dist;
@@ -446,9 +414,9 @@ inline d::Frame successor(const d::Frame& reference, std::uint64_t seed,
 // residual a class cannot carry) is zero, and any other is keep; then the
 // blocks @p reference lacks, new. @p overrides sets a surviving reference
 // block's mode, written as given.
-inline d::Frame inter_frame(
-    const d::FrameReference& id, const d::Frame& reference,
-    const d::Frame& target,
+inline oracle::Frame inter_frame(
+    const d::FrameReference& id, const oracle::Frame& reference,
+    const oracle::Frame& target,
     const std::map<std::size_t, d::BlockMode>& overrides = {}) {
   const std::uint32_t k = reference.blocks.params.coefficient_count;
   std::map<vr::Vec3i, std::size_t, ZyxLess> in_target;
@@ -457,7 +425,7 @@ inline d::Frame inter_frame(
   }
   const std::set<vr::Vec3i, ZyxLess> in_reference(reference.coords.begin(),
                                                   reference.coords.end());
-  d::Frame p;
+  oracle::Frame p;
   p.type = d::FrameType::kInter;
   p.voxel_size = target.voxel_size;
   p.reference = id;
@@ -502,7 +470,8 @@ inline d::Frame inter_frame(
 
 // The intra frame a decoded P-frame @p p makes of @p reference's blocks
 // (refusing nothing: a new block at a reference coordinate replaces it).
-inline d::Frame resolve(const d::Frame& reference, const d::Frame& p) {
+inline oracle::Frame resolve(const oracle::Frame& reference,
+                             const oracle::Frame& p) {
   const std::size_t m = reference.coords.size();
   std::map<vr::Vec3i, Payload, ZyxLess> blocks;
   for (std::size_t e = 0; e < m; ++e) {
@@ -531,7 +500,7 @@ inline d::Frame resolve(const d::Frame& reference, const d::Frame& p) {
   for (std::size_t q = 0; q < p.coords.size(); ++q) {
     blocks[p.coords[q]] = payload_at(p.blocks, m + q);
   }
-  d::Frame f;
+  oracle::Frame f;
   f.voxel_size = p.voxel_size;
   f.blocks.params = p.blocks.params;
   f.blocks.trunc_dist = p.blocks.trunc_dist;
@@ -572,14 +541,14 @@ inline d::MergedFrame merge_oracle(const std::vector<vr::Vec3i>& reference,
 
 // --- The worked example. ----------------------------------------------------
 //
-// bitstream.hpp's 161-byte P-frame, which every writer, host or device,
-// writes and every reader reads as the format says. Pinned as the example;
-// it may change until golden P-frames freeze type 1.
+// bitstream.hpp's 161-byte P-frame, which every writer, the oracle or the
+// device, writes and every reader reads as the format says. Pinned as the
+// example; it may change until golden P-frames freeze type 1.
 
 // Its reference: a = (0,0,0) and b = (4,0,0), K = 1, voxel 1 cm, band 4 cm,
 // scale 0.2, weight 1.
-inline d::Frame example_reference() {
-  d::Frame f = make_frame(0, 1, 1);
+inline oracle::Frame example_reference() {
+  oracle::Frame f = make_frame(0, 1, 1);
   f.voxel_size = 0.01f;
   f.blocks.trunc_dist = 0.04f;
   f.coords = {{0, 0, 0}, {4, 0, 0}};
@@ -641,8 +610,8 @@ inline std::vector<std::uint8_t> example_bytes(std::uint64_t hash) {
 // Spellings beyond the automatic choice: zero for some surviving blocks,
 // and keep, with zero residuals and an unchanged mask, for some unchanged
 // ones -- each a second spelling of the same block.
-inline std::map<std::size_t, d::BlockMode> spellings(const d::Frame& reference,
-                                                     const d::Frame& target) {
+inline std::map<std::size_t, d::BlockMode> spellings(
+    const oracle::Frame& reference, const oracle::Frame& target) {
   std::map<vr::Vec3i, std::size_t, ZyxLess> at;
   for (std::size_t i = 0; i < target.coords.size(); ++i) {
     at.emplace(target.coords[i], i);
@@ -663,8 +632,8 @@ inline std::map<std::size_t, d::BlockMode> spellings(const d::Frame& reference,
 // Extreme coefficients: residuals of +-32767, differences that wrap, and
 // differences of +-32768, which no class carries, so the block is zero.
 struct Extremes {
-  d::Frame reference;
-  d::Frame target;
+  oracle::Frame reference;
+  oracle::Frame target;
 };
 
 inline Extremes extremes(std::uint32_t k) {
@@ -685,13 +654,14 @@ inline Extremes extremes(std::uint32_t k) {
 // the hash of @p reference's intra bytes.
 struct InterCode {
   std::string what;
-  d::Frame reference;
-  d::Frame target;
-  d::Frame p;
+  oracle::Frame reference;
+  oracle::Frame target;
+  oracle::Frame p;
 };
 
-// The update and segment sizes: 1, 7, 64 and past every frame.
-inline constexpr std::uint32_t kInterSizes[] = {1, 7, 64, 100000};
+// The update and segment sizes: 1, 7, 64 and the longest, past every frame.
+inline constexpr std::uint32_t kInterSizes[] = {
+    1, 7, 64, codec::kMaxDeviceDecodeSegmentSize};
 
 // Every mode, at K of 1, 64 and 512, and the empty cases: no reference
 // blocks (M = 0), no new ones (A = 0), none left (N = 0), all removed with
@@ -700,13 +670,13 @@ inline std::vector<InterCode> inter_matrix() {
   std::vector<InterCode> out;
   for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
     const std::size_t m = k == codec::kVoxelsPerBlock ? 24 : 60;
-    const d::Frame reference = make_frame(m, k, 1000 + k);
-    const d::Frame empty = make_frame(0, k, 1);
+    const oracle::Frame reference = make_frame(m, k, 1000 + k);
+    const oracle::Frame empty = make_frame(0, k, 1);
     const Extremes x = extremes(k);
     struct Case {
       const char* what;
-      const d::Frame* reference;
-      d::Frame target;
+      const oracle::Frame* reference;
+      oracle::Frame target;
       bool spell;
     };
     const Case cases[] = {
@@ -722,7 +692,7 @@ inline std::vector<InterCode> inter_matrix() {
     };
     for (const Case& c : cases) {
       const d::FrameReference id =
-          reference_of(d::write_frame(*c.reference).value());
+          reference_of(oracle::write_frame(*c.reference).value());
       out.push_back(
           {std::string(c.what) + ", K " + std::to_string(k), *c.reference,
            c.target,
@@ -754,8 +724,8 @@ struct InterCase {
 // x split across the first two, then two blocks just short of INT32_MAX in x
 // in the last, in which one raw edit steps out of int32.
 struct RefusalBase {
-  d::Frame reference;  // its intra content
-  d::Frame target;
+  oracle::Frame reference;  // its intra content
+  oracle::Frame target;
   InterCase good;
 };
 
@@ -763,13 +733,13 @@ inline RefusalBase refusal_base() {
   RefusalBase base;
   base.reference = make_frame(40, 8, 77);
   const std::vector<std::uint8_t> reference_bytes =
-      d::write_frame(base.reference).value();
-  d::Frame target = successor(base.reference, 78, 100, 400, 0);
+      oracle::write_frame(base.reference).value();
+  oracle::Frame target = successor(base.reference, 78, 100, 400, 0);
   std::map<vr::Vec3i, Payload, ZyxLess> blocks;
   for (std::size_t i = 0; i < target.coords.size(); ++i) {
     blocks.emplace(target.coords[i], payload_at(target.blocks, i));
   }
-  const d::Frame extra = make_frame(8, 8, 79);
+  const oracle::Frame extra = make_frame(8, 8, 79);
   const vr::Vec3i added[] = {{500, 0, 0},
                              {501, 0, 0},
                              {502, 0, 0},
@@ -788,13 +758,14 @@ inline RefusalBase refusal_base() {
     append_payload(base.target.blocks, p);
   }
   base.good.reference = reference_of(reference_bytes);
-  d::FrameWriteOptions options;
+  oracle::FrameWriteOptions options;
   options.segment_size = 3;
   options.update_size = 7;
-  base.good.bytes = d::write_frame(inter_frame(base.good.reference,
-                                               base.reference, base.target),
-                                   options)
-                        .value();
+  base.good.bytes =
+      oracle::write_frame(
+          inter_frame(base.good.reference, base.reference, base.target),
+          options)
+          .value();
   return base;
 }
 
@@ -821,7 +792,6 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   const std::uint32_t u = get_u32(s[0].body, 12);
   const std::uint32_t a = get_u32(s[0].body, 16);
   const std::uint64_t updates = d::frame_segment_count(m, u);
-  const std::uint64_t news = d::frame_segment_count(a, get_u32(b, 36));
   const std::string mode_table_name =
       "table " +
       std::to_string(
@@ -862,6 +832,13 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   e = b;
   e[7] = 1;
   bytes("reserved byte", 1, C::InvalidArgument, "reserved header byte", e);
+  e = b;
+  put_u32(e, 36, codec::kMaxDeviceDecodeSegmentSize + 1);
+  bytes("segment size past the longest", 1, C::InvalidArgument,
+        "segment size " +
+            std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1) +
+            " is not in",
+        e);
 
   sections("unknown required section", 2, C::Unsupported,
            "unknown required section 9",
@@ -894,6 +871,13 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   t = s;
   put_u32(t[0].body, 12, 0);
   sections("update size 0", 4, C::InvalidArgument, "update size 0", t);
+  t = s;
+  put_u32(t[0].body, 12, codec::kMaxDeviceDecodeSegmentSize + 1);
+  sections("update size past the longest", 4, C::InvalidArgument,
+           "update size " +
+               std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1) +
+               " is not in",
+           t);
   e = b;
   put_u32(e, 32, a - 1);
   bytes("fewer blocks than new blocks", 4, C::InvalidArgument,
@@ -902,21 +886,27 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   put_u32(e, 32, m + a + 1);
   bytes("more blocks than survivors and new blocks", 4, C::InvalidArgument,
         "not between its", e);
-  // The update segments as one, so SEGMENTS still agrees.
+  // SEGMENTS, which a later check reads, cannot agree: 2^32 entries take
+  // 2^22 segments of the longest size.
   t = s;
   put_u32(t[0].body, 8, 0xFFFFFFFFu);
-  put_u32(t[0].body, 12, 0xFFFFFFFFu);
-  t[2].body = join_lengths(s[2].body, 0, updates);
   sections("M + A past 2^32 - 1", 4, C::InvalidArgument, "2^32 - 1 entries", t);
-  // What A <= N bounds: a frame of one block that names 2^22 new ones in one
-  // segment, all else in agreement, would have the reader hold 2^22 + M
-  // entries against a caller's room for one.
+  // What A <= N bounds: a frame of one block that names 2^22 new ones, all
+  // else in agreement -- 4,096 new segments of the longest size, four bytes
+  // each -- would have the reader hold 2^22 + M entries against a caller's
+  // room for one.
   e = b;
   put_u32(e, 32, 1);
-  put_u32(e, 36, 0xFFFFFFFFu);
+  put_u32(e, 36, codec::kMaxDeviceDecodeSegmentSize);
   t = sections_of(e);
   put_u32(t[0].body, 16, 1u << 22);
-  t[2].body = join_lengths(s[2].body, updates, news);
+  const std::uint64_t added =
+      d::frame_segment_count(1u << 22, codec::kMaxDeviceDecodeSegmentSize);
+  t[2].body.resize(4 * updates);
+  for (std::uint64_t i = 0; i < added; ++i) {
+    t[2].body.insert(t[2].body.end(), {4, 0, 0, 0});
+  }
+  t[3].body.resize(stream_at(updates) + 4 * added);
   {
     InterCase c = good;
     c.bytes = assemble(e, t);
