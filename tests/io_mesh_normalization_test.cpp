@@ -76,6 +76,19 @@ bool same(const io::MeshTransform& a, const io::MeshTransform& b) {
 
 io::MeshAxes oblique() { return io::up_axes({-2, 1, -3}).value(); }
 
+// A square pyramid without its base, wound outward: apex 0 over the square
+// 1-4, volume 4/3 once the base is capped. Each face is written from its base
+// vertex, or from the apex, which every face shares.
+io::TriangleMesh open_pyramid(bool from_apex) {
+  io::TriangleMesh mesh{
+      {{0, 1, 0}, {-1, 0, -1}, {1, 0, -1}, {1, 0, 1}, {-1, 0, 1}}, {}};
+  mesh.indices =
+      from_apex
+          ? std::vector<std::uint32_t>{0, 2, 1, 0, 3, 2, 0, 4, 3, 0, 1, 4}
+          : std::vector<std::uint32_t>{2, 1, 0, 3, 2, 0, 4, 3, 0, 1, 4, 0};
+  return mesh;
+}
+
 // Refused as InvalidArgument, for the reason given.
 template <typename T>
 bool refused_for(const vkc::Result<T>& result, const std::string& reason) {
@@ -383,6 +396,71 @@ int topology() {
         open.inconsistent_edges == 0 && open.degenerate_triangles == 0 &&
         open.components == 1 && open.nonpositive_components == 0);
   CHECK(!open.supports_signed() && open.supports_signed(true));
+  CHECK(std::abs(open.signed_volume - 8.0 / 6.0) < 1e-12);
+
+  // The hole is capped, so the volume does not depend on index order: the
+  // same faces, each written from vertex 3, give the same volume and verdict.
+  auto turned_mesh = open_mesh;
+  turned_mesh.indices = {3, 0, 1, 3, 2, 0, 3, 1, 2};
+  const auto turned = audit(turned_mesh);
+  CHECK(turned.boundary_edges == 3 && turned.nonpositive_components == 0);
+  CHECK(std::abs(turned.signed_volume - 8.0 / 6.0) < 1e-12);
+  CHECK(!turned.supports_signed() && turned.supports_signed(true));
+
+  // Nor on position or rotation: an open pyramid, either order, as given,
+  // shifted, then rotated.
+  const auto rotation =
+      io::scale_transform(io::mesh_bounds(open_pyramid(true), oblique()), 1.0)
+          .value();
+  for (const bool from_apex : {false, true}) {
+    auto pyramid = open_pyramid(from_apex);
+    for (int copy = 0; copy < 3; ++copy) {
+      if (copy == 1) pyramid = shifted(pyramid, {100, -50, 30});
+      if (copy == 2) CHECK(io::apply_transform(pyramid, rotation));
+      const auto capped = audit(pyramid);
+      CHECK(capped.boundary_edges == 4 && capped.components == 1 &&
+            capped.inconsistent_edges == 0 && capped.nonmanifold_edges == 0 &&
+            capped.nonpositive_components == 0);
+      CHECK(std::abs(capped.signed_volume - 4.0 / 3.0) < 1e-4);
+      CHECK(!capped.supports_signed() && capped.supports_signed(true));
+    }
+    // Inside out, holes allowed or not, it is refused.
+    for (std::size_t t = 0; t < pyramid.indices.size(); t += 3) {
+      std::swap(pyramid.indices[t], pyramid.indices[t + 1]);
+    }
+    const auto inverted = audit(pyramid);
+    CHECK(std::abs(inverted.signed_volume + 4.0 / 3.0) < 1e-4);
+    CHECK(!inverted.supports_signed(true));
+  }
+
+  // A skew hole is capped at the centroid of its vertices: the unit
+  // octahedron (vertices ±X 0-1, ±Y 2-3, ±Z 4-5) without its two faces on edge
+  // +X+Y leaves the loop +Z, +Y, −Z, +X, capped at (0.25, 0.25, 0) to 7/6. That
+  // is the volume of the same mesh with its cap written out.
+  io::TriangleMesh skew_mesh{
+      {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}},
+      {}};
+  for (const std::uint32_t x : {0u, 1u}) {
+    for (const std::uint32_t y : {2u, 3u}) {
+      for (const std::uint32_t z : {4u, 5u}) {
+        if (x == 0 && y == 2) continue;
+        // Wound outward: an odd count of negative axes swaps two vertices.
+        const bool odd = ((x == 1) != (y == 3)) != (z == 5);
+        skew_mesh.indices.insert(skew_mesh.indices.end(),
+                                 {x, odd ? z : y, odd ? y : z});
+      }
+    }
+  }
+  const auto skew = audit(skew_mesh);
+  CHECK(skew.boundary_edges == 4 && skew.nonpositive_components == 0);
+  CHECK(std::abs(skew.signed_volume - 7.0 / 6.0) < 1e-12);
+  auto written = skew_mesh;
+  written.positions.push_back({0.25f, 0.25f, 0.0f});
+  written.indices.insert(written.indices.end(),
+                         {2, 4, 6, 4, 0, 6, 0, 5, 6, 5, 2, 6});
+  const auto closed_cap = audit(written);
+  CHECK(closed_cap.boundary_edges == 0 && closed_cap.inconsistent_edges == 0);
+  CHECK(std::abs(closed_cap.signed_volume - skew.signed_volume) < 1e-12);
 
   // One face flipped.
   auto flipped_mesh = tetrahedron();

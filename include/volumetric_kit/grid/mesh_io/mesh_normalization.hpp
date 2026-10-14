@@ -126,6 +126,9 @@ VR_IO_API core::Status apply_transform(TriangleMesh& mesh,
 /// An edge is an unordered index pair, so positions that coincide but have
 /// distinct indices are distinct vertices. Each component's signed volume is
 /// taken about one of its vertices, so it does not cancel far from the origin.
+/// A component with holes is closed first: each group of boundary edges that
+/// share vertices is capped by a fan to the centroid of its vertices. Its
+/// volume therefore does not depend on index order or on that vertex.
 struct MeshTopology {
   std::size_t edges = 0;              ///< Distinct edges.
   std::size_t boundary_edges = 0;     ///< Edges of one triangle.
@@ -138,7 +141,8 @@ struct MeshTopology {
   std::size_t components = 0;
   /// Components whose signed volume is zero, negative or non-finite.
   std::size_t nonpositive_components = 0;
-  double signed_volume = 0.0;  ///< Sum over components, source units cubed.
+  /// Sum over components, holes capped, in source units cubed.
+  double signed_volume = 0.0;
 
   /// @brief True when closest-face signed distance can use the mesh.
   ///
@@ -156,8 +160,9 @@ struct MeshTopology {
 
 /// @brief Audit a mesh's indexed topology and component volumes.
 ///
-/// Audit the positions the conversion reads, after @ref apply_transform, so
-/// a triangle that collapses at float precision counts as degenerate.
+/// The audit reads the coordinates it is given. A proper similarity, such as
+/// a @ref MeshTransform, scales the volumes by the cube of its scale and
+/// changes no count, except where rounding makes a triangle's area zero.
 /// @return The audit; InvalidArgument for indices that are not whole
 ///         triangles or name a missing position; OutOfMemory for allocation
 ///         failure.

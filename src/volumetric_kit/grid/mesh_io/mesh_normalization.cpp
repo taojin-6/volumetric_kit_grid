@@ -243,6 +243,55 @@ core::Result<MeshTopology> audit_mesh_topology(const TriangleMesh& mesh) try {
     const Vec3d r = Vec3d(mesh.positions[c]) - origin;
     volumes[component] += glm::dot(p, glm::cross(q, r)) / 6.0;
   }
+  if (result.boundary_edges > 0) {
+    // Close each hole before taking the volume: every group of boundary
+    // edges that share vertices gets a fan to the centroid of its vertices,
+    // run against the edges' own direction. A closed surface's volume does
+    // not depend on the point it is taken about, so neither the root vertex
+    // nor the index order changes it. The edges and the centroid sums go in
+    // index order, so the caps do not depend on triangle order either.
+    std::vector<std::uint32_t> groups(mesh.positions.size());
+    std::iota(groups.begin(), groups.end(), 0u);
+    auto group = [&groups](std::uint32_t v) {
+      while (groups[v] != v) {
+        groups[v] = groups[groups[v]];
+        v = groups[v];
+      }
+      return v;
+    };
+    std::vector<bool> on_rim(mesh.positions.size());
+    for (const auto& item : edges) {
+      if (item.second.count != 1) continue;
+      groups[group(item.first.second)] = group(item.first.first);
+      on_rim[item.first.first] = on_rim[item.first.second] = true;
+    }
+    struct Rim {
+      Vec3d sum{0.0};
+      std::size_t count = 0;
+    };
+    std::map<std::uint32_t, Rim> rims;
+    for (std::uint32_t v = 0; v < mesh.positions.size(); ++v) {
+      if (!on_rim[v]) continue;
+      auto& rim = rims[group(v)];
+      rim.sum += Vec3d(mesh.positions[v]);
+      ++rim.count;
+    }
+    for (const auto& item : edges) {
+      if (item.second.count != 1) continue;
+      // Its one triangle runs the edge low to high when the direction is +1;
+      // the cap runs it the other way.
+      const auto low = item.first.first;
+      const auto high = item.first.second;
+      const bool forward = item.second.direction > 0;
+      const auto& rim = rims[group(low)];
+      const auto component = root(low);
+      const Vec3d origin(mesh.positions[component]);
+      const Vec3d p = Vec3d(mesh.positions[forward ? high : low]) - origin;
+      const Vec3d q = Vec3d(mesh.positions[forward ? low : high]) - origin;
+      const Vec3d r = rim.sum / double(rim.count) - origin;
+      volumes[component] += glm::dot(p, glm::cross(q, r)) / 6.0;
+    }
+  }
   result.components = volumes.size();
   for (const auto& volume : volumes) {
     result.signed_volume += volume.second;
