@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // The decoder's lookup: for each model and each of its 4096 slots, the
-// symbol whose [cum, cum + freq) holds the slot, as FrequencyTable's
-// slot_symbol, packed with what the decode step needs. Built on the device
+// symbol whose [cum, cum + freq) holds the slot, packed with what the decode
+// step needs. Built on the device
 // from the frame's tables, so only those (8 KB at K = 64) cross the bus. One
 // invocation per model and slot.
 

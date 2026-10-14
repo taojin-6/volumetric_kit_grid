@@ -3,8 +3,7 @@
 
 // An entry's frame symbols on the device, shared by rans_count.comp and
 // rans_ops.comp: frame_grammar.glsl's writer half over the forward output,
-// in the order the host writer emits them. The includer defines the two
-// sinks.
+// in the order it emits them. The includer defines the two sinks.
 
 #ifndef VR_RANS_WALK_GLSL
 #define VR_RANS_WALK_GLSL
@@ -35,7 +34,7 @@ layout(set = 0, binding = 3, std430) readonly buffer Modes {
 };
 
 uint g_coefficients = 0u;  // the entry's first word
-// What write_frame refuses, found on the way: the mode past the alphabet
+// What check_entries refuses, found on the way: the mode past the alphabet
 // (0 for none), and an emitted -32768.
 uint g_bad_mode = 0u;
 bool g_out_of_range = false;

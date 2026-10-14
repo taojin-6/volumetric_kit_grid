@@ -17,7 +17,6 @@
 #include <memory>
 #include <vector>
 
-#include "dct_blocks.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
@@ -36,6 +35,14 @@ namespace volumetric_kit::recon::codec::detail {
 /// @ref volume::kObservedWeight meshes the same, and a decoded grid is not
 /// fused into. Pushed to the kernel, so this is its one definition.
 inline constexpr float kDecodedWeight = 1.0f;
+
+/// @brief The words one entry's @p k coefficients take on the device: two
+///        int16 a word, each entry starting a word of its own, so an odd K
+///        pads each entry by a half-word (`coefficient_words` in
+///        dct_common.glsl).
+constexpr std::uint32_t coefficient_words(std::uint32_t k) {
+  return k / 2 + k % 2;
+}
 
 /// @brief Construction-time options.
 struct DctTransformConfig {
@@ -95,8 +102,9 @@ struct ResidentBlocks {
 /// holds it -- zero `tsdf`, zero `weight` -- so the mesher uses exactly the
 /// voxels the encoder saw observed.
 ///
-/// Output is indexed by **list position**, not by `ptr` (see @ref DctBlocks).
-/// The order the blocks travel in is the caller's (the encoder sorts them).
+/// Output is indexed by **list position**, not by `ptr`: entry `i`'s mask and
+/// coefficients are the list's entry `i`'s block. The order the blocks travel
+/// in is the caller's (the encoder sorts them).
 ///
 /// Each workgroup first finds its entry's block by its `coord`, through the
 /// grid's hash table, and never reads its `ptr`: so no ptr is trusted, and the
@@ -106,19 +114,18 @@ struct ResidentBlocks {
 /// host scan would be O(count) per call. Like the mesher's probe, it needs the
 /// map quiescent: no allocate may run into the grid during a call.
 ///
-/// Every buffer is device-local. Forward and inverse each use one
-/// `CommandBatch`: the inputs staged up, the dispatches, and the results
-/// and reject count read back. Scratch buffers grow when needed and remain
-/// allocated for later calls. The observed filter compacts its result on the
-/// device and reads back a predicted prefix with the count in one batch; only
-/// a result that outgrows that prefix needs another, transfer-only batch.
-/// The coefficients travel two to a word, 16 bits each.
+/// Every buffer is device-local, and the coefficients and masks never leave
+/// the device: the forward is recorded into the caller's batch and leaves
+/// its output for the device frame writer, and the inverse reads its input
+/// where the reference store's apply wrote it, in the caller's batch too;
+/// each reads back its reject count alone. Scratch buffers grow when needed
+/// and remain allocated for later calls. The observed filter compacts its
+/// result on the device and reads back a predicted prefix with the count in
+/// one batch; only a result that outgrows that prefix needs another,
+/// transfer-only batch. The coefficients travel two to a word, 16 bits each.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
-///
-/// @ref record_forward leaves the forward output on the device for the device
-/// frame writer, which reads the coefficients where they were written.
 class VR_CODEC_API DctTransform {
  public:
   /// @brief Build both kernels and upload the basis and zigzag tables.
@@ -136,46 +143,33 @@ class VR_CODEC_API DctTransform {
   DctTransform(const DctTransform&) = delete;
   DctTransform& operator=(const DctTransform&) = delete;
 
-  /// @brief Transform and quantize every block in @p blocks.
-  /// @param grid    The grid the list names; must carry 4-byte `tsdf` and
-  ///                `weight` attributes and have `block_size` 8.
-  /// @param blocks  The blocks to transform, anchored with
-  ///                @ref volume::VoxelBlockGrid::block_list to a compaction the
-  ///                caller holds -- `auto active =
-  ///                grid.map().compact_active_blocks();` and then
-  ///                `grid.block_list(active.value())`. An empty list is a
-  ///                no-op success.
-  /// @param params  The coefficient count and steps.
-  /// @param out     Receives the coefficients and masks, and @p params and the
-  ///                grid's `trunc_dist` beside them.
-  /// @param stage   Optional scope the caller's stage row is open under; the
-  ///                dispatches record their device spans into it. `nullptr`
-  ///                times nothing.
-  /// @return OK, or `Status::Code::InvalidArgument` for invalid
-  ///         @p params, a grid that is moved-from, has another block size, a
-  ///         non-positive `trunc_dist`, or lacks a float `tsdf` / `weight`; a
-  ///         list that
-  ///         @ref volume::VoxelBlockGrid::check_block_list refuses, or one with
-  ///         an entry whose coord @p grid does not hold; or a buffer that
-  ///         would exceed `maxStorageBufferRange`. Otherwise a buffer or
-  ///         dispatch failure.
-  ///         On failure @p out is left empty.
-  core::Status forward(const volume::VoxelBlockGrid& grid,
-                       const volume::BlockList& blocks,
-                       const CodecParams& params, DctBlocks& out,
-                       core::GpuStageScope* stage = nullptr);
-
-  /// @brief Record @ref forward into @p batch, leaving its output on the
-  ///        device for the device frame writer.
+  /// @brief Record the transform and quantization of every block in
+  ///        @p blocks into @p batch, leaving the output on the device for the
+  ///        device frame writer.
   ///
   /// The list, masks and coefficients stay in this transform's buffers until
   /// its next call. When @p batch is submitted, @p rejected receives the
   /// entries the kernel found no block for, which @ref check_rejected turns
-  /// into the refusal @ref forward makes.
+  /// into a refusal.
   /// @param batch     The batch to record into; submitted by the caller.
+  /// @param grid      The grid the list names; must carry 4-byte `tsdf` and
+  ///                  `weight` attributes and have `block_size` 8.
+  /// @param blocks    The blocks to transform, anchored with
+  ///                  @ref volume::VoxelBlockGrid::block_list to a compaction
+  ///                  the caller holds.
+  /// @param params    The coefficient count and steps.
   /// @param rejected  Written at submit; must outlive it.
+  /// @param stage     Optional scope the caller's stage row is open under; the
+  ///                  dispatches record their device spans into it. `nullptr`
+  ///                  times nothing.
   /// @return The resident output (no entries for an empty list, which records
-  ///         nothing), or the refusals @ref forward makes before dispatching.
+  ///         nothing), or, before anything is recorded,
+  ///         `Status::Code::InvalidArgument` for invalid @p params, a grid
+  ///         that is moved-from, has another block size, a non-positive
+  ///         `trunc_dist`, or lacks a float `tsdf` / `weight`; a list that
+  ///         @ref volume::VoxelBlockGrid::check_block_list refuses; or a buffer
+  ///         that would exceed `maxStorageBufferRange`. Otherwise a buffer
+  ///         failure.
   core::Result<ResidentBlocks> record_forward(
       core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
       const volume::BlockList& blocks, const CodecParams& params,
@@ -186,45 +180,29 @@ class VR_CODEC_API DctTransform {
   static core::Status check_rejected(const char* op, std::uint32_t rejected,
                                      std::uint32_t count);
 
-  /// @brief Reconstruct every block in @p blocks from its coefficients and
-  ///        mask, overwriting its `tsdf` and `weight`.
-  ///
-  /// TODO(codec): only the tests call this, the CPU oracle's inverse among
-  /// them, with coefficients from the host; it moves under tests/ with the
-  /// host reader.
-  ///
-  /// The list must be duplicate-free (unchecked -- a repeat is two workgroups
-  /// writing one block).
-  /// @param grid    As @ref forward, written in place.
-  /// @param blocks  The blocks to reconstruct, in the order @p in was produced
-  ///                in; each coord must be one @p grid holds, and each ptr is
-  ///                ignored.
-  /// @param in      A @ref forward output, or one read back from a frame.
-  /// @param stage   As @ref forward.
-  /// @return OK, the same refusals as @ref forward, or
-  ///         `Status::Code::InvalidArgument` when @p in carries invalid
-  ///         params, another `trunc_dist` than @p grid, or a size that does
-  ///         not match the list. A refusal for entries whose coord the grid
-  ///         does not hold comes from the device, after every other entry has
-  ///         been written; the others refuse before anything is.
-  core::Status inverse(volume::VoxelBlockGrid& grid,
-                       const volume::BlockList& blocks, const DctBlocks& in,
-                       core::GpuStageScope* stage = nullptr);
-
-  /// @brief @ref inverse from blocks the device holds (the reference store's
-  ///        apply output), bound where they are rather than uploaded, and
+  /// @brief Reconstruct every block of @p in from its coefficients and mask,
+  ///        overwriting its `tsdf` and `weight`, from blocks the device holds
+  ///        (the reference store's apply output), bound where they are and
   ///        recorded into the caller's @p batch after what it already holds
   ///        -- that apply -- and submitted with it, so the two share one
   ///        submit.
   ///
   /// The list must be duplicate-free, and the coefficients made against the
   /// grid's `trunc_dist` (both unchecked: they come from a frame whose order
-  /// and header the caller checked).
+  /// and header the caller checked). Each entry's coord must be one @p grid
+  /// holds; its ptr is ignored.
   /// @param batch  Holding what the inverse reads; submitted here once the
   ///               checks pass (a refusal submits nothing).
-  /// @return As @ref inverse, and `Status::Code::InvalidArgument` for
-  ///         buffers missing or smaller than @p in's count needs, or a
-  ///         P-frame's entries, which are not yet its blocks.
+  /// @param grid   As @ref record_forward, written in place.
+  /// @param stage  As @ref record_forward.
+  /// @return OK, @ref record_forward's refusals of @p grid and @p params, or
+  ///         `Status::Code::InvalidArgument` for blocks holding another K
+  ///         than @p params, more blocks than the grid's heap, buffers
+  ///         missing or smaller than @p in's count needs, or a P-frame's
+  ///         entries, which are not yet its blocks; a refusal for entries
+  ///         whose coord the grid does not hold comes from the device, after
+  ///         every other entry has been written. Otherwise a buffer or
+  ///         dispatch failure.
   core::Status inverse(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
                        const ResidentBlocks& in, const CodecParams& params,
                        core::GpuStageScope* stage = nullptr);
@@ -240,14 +218,14 @@ class VR_CODEC_API DctTransform {
   /// growing result reads its remaining tail in a second batch. The encoder
   /// sorts the returned entries by coordinate before transforming, so append
   /// order cannot affect bytes.
-  /// @param grid   As @ref forward.
+  /// @param grid   As @ref record_forward.
   /// @param list   The map's own active list, bound where it is
   ///               (@ref
   ///               volume::VoxelHashMap::compact_active_blocks_on_device).
-  /// @param stage  As @ref forward.
+  /// @param stage  As @ref record_forward.
   /// @return The observed entries; `Status::Code::InvalidArgument` for a
   ///         list @ref volume::VoxelHashMap::check_device_block_list refuses,
-  ///         a grid @ref forward refuses, or a buffer past
+  ///         a grid @ref record_forward refuses, or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer or dispatch failure.
   core::Result<std::vector<volume::BlockIndex>> observed(
       const volume::VoxelBlockGrid& grid, const volume::DeviceBlockList& list,
@@ -286,12 +264,6 @@ class VR_CODEC_API DctTransform {
   /// Stage @p blocks onto the retained block-list buffer, in @p batch.
   core::Status upload_list(core::CommandBatch& batch,
                            const volume::BlockList& blocks);
-  /// Record the inverse over @p in into @p batch after what it holds, then
-  /// submit it and take the reject count's refusal.
-  core::Status run_inverse(core::CommandBatch& batch,
-                           volume::VoxelBlockGrid& grid, const GridViews& views,
-                           const ResidentBlocks& in, const CodecParams& params,
-                           core::GpuStageScope* stage);
 
   // Borrowed (must outlive this).
   core::Device* device_ = nullptr;

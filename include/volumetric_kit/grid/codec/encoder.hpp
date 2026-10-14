@@ -29,14 +29,12 @@ class DeviceFrameWriter;
 struct EncoderConfig {
   /// Coefficients kept per block and their quantization steps.
   CodecParams params;
-  /// Blocks per independently decodable segment, from 1 to
-  /// @ref kMaxDeviceDecodeSegmentSize. Smaller costs a little more (each
-  /// segment restates its first coordinate) and decodes with more
-  /// parallelism; the default costs 2-3% of a frame.
+  /// Blocks per independently coded segment, from 1 to
+  /// @ref kMaxDeviceDecodeSegmentSize. The device codes and decodes one
+  /// segment an invocation, so smaller segments give it more parallelism, at
+  /// a little more size (each segment restates its first coordinate); the
+  /// default costs 2-3% of a frame.
   std::uint32_t segment_size = 64;
-  /// Where the rANS coding runs. The device codes one segment per
-  /// invocation, so smaller segments give it more parallelism.
-  EntropyCoding entropy = EntropyCoding::kAuto;
 };
 
 /// @brief Encodes a @ref volume::VoxelBlockGrid's geometry as one intra frame
@@ -57,13 +55,17 @@ struct EncoderConfig {
 /// Geometry only: colour is not coded. A player textures the decoded mesh
 /// from RGB that travels beside the frame.
 ///
+/// The rANS coding runs on the device, one segment an invocation: the
+/// coefficients and masks stay in device memory, and only the symbol counts
+/// and the frame cross the bus. A frame the device cannot hold is refused,
+/// never coded on the host.
+///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time.
 class VR_CODEC_API Encoder {
  public:
-  /// @brief Build the forward transform's kernels, and with
-  ///        @ref EntropyCoding::kDevice the rANS coder's; @ref
-  ///        EntropyCoding::kAuto builds those at its first device frame.
+  /// @brief Build the kernels: the forward transform's and the rANS
+  ///        coder's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -71,7 +73,8 @@ class VR_CODEC_API Encoder {
   /// @return The encoder, or `Status::Code::InvalidArgument` for invalid
   ///         `config.params` or a `segment_size` of 0 or past
   ///         @ref kMaxDeviceDecodeSegmentSize; otherwise a pipeline or
-  ///         allocation failure.
+  ///         allocation failure: a device whose kernels do not build has no
+  ///         encoder.
   static core::Result<Encoder> create(core::Device& device,
                                       core::Allocator& allocator,
                                       const EncoderConfig& config = {});
@@ -92,22 +95,25 @@ class VR_CODEC_API Encoder {
   ///                 which an extract after this takes back from it.
   /// @param metrics  Optional `StageMetrics` collecting a `"codec encode"`
   ///                 row with both halves -- its device half is the transform
-  ///                 and, coded on the device, the rANS kernels -- over the
-  ///                 breakdown rows `"  ..active set"` (the compaction, when
-  ///                 the map holds no list that is still its active set),
-  ///                 `"  ..observed"` (finding the blocks with an observed
-  ///                 voxel), `"  ..sort"`, `"  ..forward"` (the transform;
-  ///                 on the device, also the symbol count, which shares its
-  ///                 batch) and `"  ..rans encode"` (writing the frame; on
-  ///                 the host, counting included). Named apart from the
+  ///                 and the rANS kernels -- over the breakdown rows
+  ///                 `"  ..active set"` (the compaction, when the map holds
+  ///                 no list that is still its active set), `"  ..observed"`
+  ///                 (finding the blocks with an observed voxel),
+  ///                 `"  ..sort"`, `"  ..forward"` (the transform, and the
+  ///                 symbol count, which shares its batch) and
+  ///                 `"  ..rans encode"` (coding and laying out the frame).
+  ///                 Named apart from the
   ///                 @ref Decoder's, so both timed into one
   ///                 `StageMetrics` stay apart. `nullptr` measures
   ///                 nothing.
   /// @return The frame's bytes (an empty grid is a valid frame of no blocks),
   ///         or `Status::Code::InvalidArgument` for a moved-from encoder,
   ///         a grid the transform refuses (moved-from, another block size,
-  ///         no float `tsdf` / `weight`) or a non-finite `voxel_size`;
-  ///         otherwise a compaction, buffer, pipeline or dispatch failure.
+  ///         no float `tsdf` / `weight`) or a non-finite `voxel_size`; a
+  ///         frame the device cannot hold: `Status::Code::InvalidArgument`
+  ///         for a buffer past `maxStorageBufferRange`,
+  ///         `Status::Code::OutOfMemory` past free device memory; otherwise a
+  ///         compaction, buffer, pipeline or dispatch failure.
   core::Result<std::vector<std::uint8_t>> encode(
       volume::VoxelBlockGrid& grid, core::StageMetrics* metrics = nullptr);
 
@@ -117,26 +123,13 @@ class VR_CODEC_API Encoder {
  private:
   Encoder();
 
-  /// Build @ref writer_ unless it is built, or return the failure of the
-  /// one build tried.
-  core::Status ensure_writer();
-  /// The forward and the rANS coding on the built writer.
-  core::Result<std::vector<std::uint8_t>> encode_on_device(
-      volume::VoxelBlockGrid& grid,
-      const std::vector<volume::BlockIndex>& blocks,
-      core::StageMetrics* metrics, core::GpuStageScope& stage);
-
   EncoderConfig config_;
-  // Borrowed (must outlive this); what the device coding's batch runs on.
+  // Borrowed (must outlive this); what the coding's batches run on.
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
   std::unique_ptr<detail::DctTransform> transform_;
-  // Built at create for kDevice, at the first device frame for kAuto, and
-  // never for kHost; and why that build failed, after which kAuto codes
-  // every frame on the host.
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
-  core::Status writer_failure_;
-  // Device spans for the transform; idle until a caller asks for metrics.
+  // Device spans for the kernels; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;
 };
 

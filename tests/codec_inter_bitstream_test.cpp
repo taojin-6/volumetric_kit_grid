@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Host-only tests for P-frames in the v3 frame (bitstream.hpp, type 1): the
+// Host-only tests for P-frames in the v3 frame (bitstream.hpp, type 1),
+// through the CPU oracle (codec_oracle.hpp) that pins its bytes: the
 // reference hash's known answers; the worked example, built by hand, read and
 // written byte for byte; round trips of every mode across K, update and
 // segment sizes and the empty cases; I -> P -> P chains on real hashes against
-// an independent oracle (codec_frames.hpp); merge_by_coord against std::set's
+// an independent model (codec_frames.hpp); merge_by_coord against std::set's
 // algorithms; every reader refusal, each one edit from a valid P-frame, with
 // its code and message, in the order of the reader's stages; every writer
 // refusal, with its code and message; and truncation and random corruption,
@@ -25,6 +26,8 @@
 
 #include "bitstream.hpp"
 #include "codec_frames.hpp"
+#include "codec_oracle.hpp"
+#include "codec_oracle_rans.hpp"
 #include "frame_hash.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
@@ -33,6 +36,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+namespace oracle = codec_oracle;
 
 namespace {
 
@@ -52,7 +56,7 @@ using C = vkc::Status::Code;
 using Bytes = std::vector<std::uint8_t>;
 
 // The same content, parameters included: what an intra frame holds.
-bool same_content(const d::Frame& a, const d::Frame& b) {
+bool same_content(const oracle::Frame& a, const oracle::Frame& b) {
   return same_bits(a.voxel_size, b.voxel_size) &&
          same_bits(a.blocks.trunc_dist, b.blocks.trunc_dist) &&
          a.blocks.params.coefficient_count ==
@@ -66,7 +70,7 @@ bool same_content(const d::Frame& a, const d::Frame& b) {
 
 // A P-frame as written and as read: its reference, modes, new blocks and
 // every entry's payload (skip and remove are zero on both sides).
-bool same_inter(const d::Frame& a, const d::Frame& b) {
+bool same_inter(const oracle::Frame& a, const oracle::Frame& b) {
   return a.type == d::FrameType::kInter && b.type == d::FrameType::kInter &&
          a.reference.hash == b.reference.hash &&
          a.reference.header.block_count == b.reference.header.block_count &&
@@ -99,8 +103,8 @@ bool refusal_is(const vkc::Status& s, C code, const std::string& says,
   return false;
 }
 
-d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
-  d::FrameWriteOptions o;
+oracle::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
+  oracle::FrameWriteOptions o;
   o.segment_size = r;
   o.update_size = u;
   return o;
@@ -151,15 +155,16 @@ int hash_case() {
 // The worked example of the format: 161 bytes, read as the format says and
 // written back byte for byte.
 int worked_example_case() {
-  const d::Frame reference = codec_frames::example_reference();
-  const d::FrameReference id = reference_of(d::write_frame(reference).value());
+  const oracle::Frame reference = codec_frames::example_reference();
+  const d::FrameReference id =
+      reference_of(oracle::write_frame(reference).value());
   const Bytes bytes = codec_frames::example_bytes(id.hash);
   CHECK(bytes.size() == 161);
 
-  const vkc::Result<d::Frame> read =
-      d::read_frame(bytes.data(), bytes.size(), 3, &id);
+  const vkc::Result<oracle::Frame> read =
+      oracle::read_frame(bytes.data(), bytes.size(), 3, &id);
   CHECK(read.ok());
-  const d::Frame& p = read.value();
+  const oracle::Frame& p = read.value();
   CHECK(p.type == d::FrameType::kInter);
   CHECK(p.modes ==
         std::vector<d::BlockMode>({d::BlockMode::kKeep, d::BlockMode::kSkip}));
@@ -173,8 +178,8 @@ int worked_example_case() {
   masks.insert(masks.end(), full.begin(), full.end());
   CHECK(p.blocks.masks == masks);
 
-  d::Frame written = p;
-  CHECK(d::write_frame(written).value() == bytes);
+  oracle::Frame written = p;
+  CHECK(oracle::write_frame(written).value() == bytes);
 
   // a <- (0, 0), c <- (none, 2), b <- (1, none).
   const vkc::Result<d::MergedFrame> merged =
@@ -189,7 +194,7 @@ int worked_example_case() {
     CHECK(merged.value().sources[i].payload == expected[i].payload);
   }
   // q = (q_a + 1, 3, q_b), masks (mask_a, full, mask_b).
-  const d::Frame resolved = resolve(reference, p);
+  const oracle::Frame resolved = resolve(reference, p);
   CHECK(resolved.blocks.coefficients == std::vector<std::int16_t>({6, 3, -2}));
   std::vector<std::uint32_t> resolved_masks(
       reference.blocks.masks.begin(),
@@ -215,21 +220,22 @@ int worked_example_case() {
   Bytes payload;
   std::vector<std::uint32_t> lengths;
   auto stream = [&](auto&& put) {
-    d::RansWriter w;
+    oracle::RansWriter w;
     put(w);
     const std::size_t at = payload.size();
     CHECK(w.finish(payload));
     lengths.push_back(static_cast<std::uint32_t>(payload.size() - at));
     return 0;
   };
-  CHECK(stream([&](d::RansWriter& w) {  // a: keep, unchanged, +1
+  CHECK(stream([&](oracle::RansWriter& w) {  // a: keep, unchanged, +1
           w.put(mode, 0);
           w.put(mask_class, 1);
           w.put(coefficient, 1);
           w.put_bits(0, 1);
         }) == 0);
-  CHECK(stream([&](d::RansWriter& w) { w.put(mode, 1); }) == 0);  // b: skip
-  CHECK(stream([&](d::RansWriter& w) {  // c: (2,0,0), full, +3
+  CHECK(stream([&](oracle::RansWriter& w) { w.put(mode, 1); }) ==
+        0);                                  // b: skip
+  CHECK(stream([&](oracle::RansWriter& w) {  // c: (2,0,0), full, +3
           w.put_bits(2, 32);
           w.put_bits(0, 32);
           w.put_bits(0, 32);
@@ -246,8 +252,8 @@ int worked_example_case() {
   }
   s[3].body = payload;
   const Bytes one_each = codec_frames::assemble(bytes, s);
-  CHECK(d::write_frame(written, sizes(64, 1)).value() == one_each);
-  CHECK(d::read_frame(one_each.data(), one_each.size(), 3, &id).ok());
+  CHECK(oracle::write_frame(written, sizes(64, 1)).value() == one_each);
+  CHECK(oracle::read_frame(one_each.data(), one_each.size(), 3, &id).ok());
 
   // Had b been removed: mode 3, N = 2, the mode table remove for skip, and
   // the payload unchanged.
@@ -255,9 +261,9 @@ int worked_example_case() {
   put_u32(removed, 32, 2);
   removed[130] = 0x02;  // the gap from keep to remove
   written.modes[1] = d::BlockMode::kRemove;
-  CHECK(d::write_frame(written).value() == removed);
-  const vkc::Result<d::Frame> read_removed =
-      d::read_frame(removed.data(), removed.size(), 2, &id);
+  CHECK(oracle::write_frame(written).value() == removed);
+  const vkc::Result<oracle::Frame> read_removed =
+      oracle::read_frame(removed.data(), removed.size(), 2, &id);
   CHECK(read_removed.ok());
   CHECK(read_removed.value().modes[1] == d::BlockMode::kRemove);
   return 0;
@@ -269,10 +275,10 @@ int worked_example_case() {
 // its reference, and check it is @p p, writes the same bytes again, merges
 // as the oracle does and resolves to @p target, whose intra bytes the
 // resolved frame writes too.
-int round_trip(const d::Frame& reference, const d::Frame& target,
-               const d::Frame& p, const d::FrameWriteOptions& options,
+int round_trip(const oracle::Frame& reference, const oracle::Frame& target,
+               const oracle::Frame& p, const oracle::FrameWriteOptions& options,
                Bytes* out = nullptr) {
-  const vkc::Result<Bytes> bytes = d::write_frame(p, options);
+  const vkc::Result<Bytes> bytes = oracle::write_frame(p, options);
   if (!bytes.ok()) {
     std::fprintf(stderr, "write: %s\n", bytes.status().message().c_str());
   }
@@ -280,14 +286,14 @@ int round_trip(const d::Frame& reference, const d::Frame& target,
   const Bytes& b = bytes.value();
   const auto n = static_cast<std::uint32_t>(target.coords.size());
   CHECK(get_u32(b, 32) == n);
-  const vkc::Result<d::Frame> back =
-      d::read_frame(b.data(), b.size(), n, &p.reference);
+  const vkc::Result<oracle::Frame> back =
+      oracle::read_frame(b.data(), b.size(), n, &p.reference);
   if (!back.ok()) {
     std::fprintf(stderr, "read: %s\n", back.status().message().c_str());
   }
   CHECK(back.ok());
   CHECK(same_inter(p, back.value()));
-  CHECK(d::write_frame(back.value(), options).value() == b);
+  CHECK(oracle::write_frame(back.value(), options).value() == b);
 
   const vkc::Result<d::MergedFrame> merged =
       d::merge_frame(reference.coords, back.value().modes, back.value().coords);
@@ -297,12 +303,12 @@ int round_trip(const d::Frame& reference, const d::Frame& target,
                                        back.value().coords)));
   CHECK(merged.value().coords == target.coords);
 
-  const d::Frame resolved = resolve(reference, back.value());
+  const oracle::Frame resolved = resolve(reference, back.value());
   CHECK(same_content(resolved, target));
-  d::FrameWriteOptions intra;
+  oracle::FrameWriteOptions intra;
   intra.segment_size = options.segment_size;
-  CHECK(d::write_frame(resolved, intra).value() ==
-        d::write_frame(target, intra).value());
+  CHECK(oracle::write_frame(resolved, intra).value() ==
+        oracle::write_frame(target, intra).value());
   if (out != nullptr) *out = b;
   return 0;
 }
@@ -328,8 +334,8 @@ int round_trip_case() {
   for (std::uint32_t k : {1u, 64u, codec::kVoxelsPerBlock}) {
     const codec_frames::Extremes x = codec_frames::extremes(k);
     const d::FrameReference id =
-        reference_of(d::write_frame(x.reference).value());
-    const d::Frame p = inter_frame(id, x.reference, x.target);
+        reference_of(oracle::write_frame(x.reference).value());
+    const oracle::Frame p = inter_frame(id, x.reference, x.target);
     const std::int16_t residuals[] = {32767, -32767, -2, 2};
     for (std::size_t e = 0; e < 4; ++e) {
       CHECK(p.modes[e] == d::BlockMode::kKeep);
@@ -356,23 +362,24 @@ int round_trip_case() {
 // it decodes to its target, as the oracle resolves it, and only against its
 // own reference.
 int chain_case() {
-  d::Frame previous = make_frame(300, 64, 41);
-  d::FrameWriteOptions intra;
+  oracle::Frame previous = make_frame(300, 64, 41);
+  oracle::FrameWriteOptions intra;
   intra.segment_size = 16;
-  d::FrameReference id = reference_of(d::write_frame(previous, intra).value());
+  d::FrameReference id =
+      reference_of(oracle::write_frame(previous, intra).value());
   d::FrameReference stale;
   bool have_stale = false;
   const std::uint32_t update_sizes[] = {64, 1, 7, 300, 16, 64};
   for (std::uint32_t step = 0; step < 6; ++step) {
-    const d::Frame target =
+    const oracle::Frame target =
         successor(previous, 100 + step, 20 + 20 * step, 300, 10 + 5 * step);
-    const d::Frame p = inter_frame(id, previous, target);
+    const oracle::Frame p = inter_frame(id, previous, target);
     Bytes bytes;
     CHECK(round_trip(previous, target, p, sizes(16, update_sizes[step]),
                      &bytes) == 0);
     if (have_stale) {
-      const vkc::Result<d::Frame> wrong =
-          d::read_frame(bytes.data(), bytes.size(), 1u << 20, &stale);
+      const vkc::Result<oracle::Frame> wrong =
+          oracle::read_frame(bytes.data(), bytes.size(), 1u << 20, &stale);
       CHECK(!wrong.ok() && wrong.status().domain() == C::NotFound);
     }
     stale = id;
@@ -475,9 +482,9 @@ int merge_by_coord_case() {
 int refusals_case() {
   const codec_frames::RefusalBase base = codec_frames::refusal_base();
   const codec_frames::InterCase& good = base.good;
-  const vkc::Result<d::Frame> read =
-      d::read_frame(good.bytes.data(), good.bytes.size(), good.max_blocks,
-                    good.held_reference());
+  const vkc::Result<oracle::Frame> read =
+      oracle::read_frame(good.bytes.data(), good.bytes.size(), good.max_blocks,
+                         good.held_reference());
   CHECK(read.ok());
   // What the edits rely on: a removed block, M not a multiple of U, and the
   // new blocks over three segments.
@@ -490,8 +497,8 @@ int refusals_case() {
                    d::BlockMode::kSkip) > 0);
 
   auto read_status = [](const codec_frames::InterCase& c) {
-    return d::read_frame(c.bytes.data(), c.bytes.size(), c.max_blocks,
-                         c.held_reference())
+    return oracle::read_frame(c.bytes.data(), c.bytes.size(), c.max_blocks,
+                              c.held_reference())
         .status();
   };
   std::set<int> rows;
@@ -547,15 +554,16 @@ int refusals_case() {
   // Row 13: a new block on a reference block, removed or skipped. The
   // writer cannot see it, and the reader's checks pass; the merge refuses
   // it.
-  const d::Frame& reference = base.reference;
-  const d::Frame p = d::read_frame(good.bytes.data(), good.bytes.size(),
-                                   good.max_blocks, &good.reference)
-                         .value();
+  const oracle::Frame& reference = base.reference;
+  const oracle::Frame p =
+      oracle::read_frame(good.bytes.data(), good.bytes.size(), good.max_blocks,
+                         &good.reference)
+          .value();
   for (const d::BlockMode mode : {d::BlockMode::kRemove, d::BlockMode::kSkip}) {
     const auto at = std::find(p.modes.begin(), p.modes.end(), mode);
     CHECK(at != p.modes.end());
     const auto e = static_cast<std::size_t>(at - p.modes.begin());
-    d::Frame twice = p;
+    oracle::Frame twice = p;
     const vr::Vec3i c = reference.coords[e];
     const auto q = static_cast<std::size_t>(
         std::lower_bound(twice.coords.begin(), twice.coords.end(), c,
@@ -571,9 +579,9 @@ int refusals_case() {
     twice.blocks.coefficients.insert(
         twice.blocks.coefficients.begin() + std::ptrdiff_t(position * k), k,
         std::int16_t(1));
-    const Bytes b = d::write_frame(twice).value();
-    const vkc::Result<d::Frame> back =
-        d::read_frame(b.data(), b.size(), 1u << 20, &good.reference);
+    const Bytes b = oracle::write_frame(twice).value();
+    const vkc::Result<oracle::Frame> back =
+        oracle::read_frame(b.data(), b.size(), 1u << 20, &good.reference);
     CHECK(back.ok());
     const vkc::Result<d::MergedFrame> merged = d::merge_frame(
         reference.coords, back.value().modes, back.value().coords);
@@ -598,14 +606,16 @@ int refusals_case() {
 // Every refusal write_frame and assemble_frame make of a P-frame, each with
 // its code and message.
 int writer_refusals_case() {
-  const d::Frame reference = make_frame(30, 8, 51);
-  const d::FrameReference id = reference_of(d::write_frame(reference).value());
-  const d::Frame target = successor(reference, 52, 150, 400, 5);
-  const d::Frame good = inter_frame(id, reference, target);
-  const Bytes bytes = d::write_frame(good).value();
-  auto refused = [](const d::Frame& f, C code, const std::string& says,
-                    const d::FrameWriteOptions& o = {}) {
-    return refusal_is(d::write_frame(f, o).status(), code, says, "write_frame");
+  const oracle::Frame reference = make_frame(30, 8, 51);
+  const d::FrameReference id =
+      reference_of(oracle::write_frame(reference).value());
+  const oracle::Frame target = successor(reference, 52, 150, 400, 5);
+  const oracle::Frame good = inter_frame(id, reference, target);
+  const Bytes bytes = oracle::write_frame(good).value();
+  auto refused = [](const oracle::Frame& f, C code, const std::string& says,
+                    const oracle::FrameWriteOptions& o = {}) {
+    return refusal_is(oracle::write_frame(f, o).status(), code, says,
+                      "write_frame");
   };
   auto first = [&](d::BlockMode mode) {
     return static_cast<std::size_t>(
@@ -619,7 +629,7 @@ int writer_refusals_case() {
         removed < good.modes.size());
   const std::uint32_t k = 8;
   const std::string range = "outside +-32767";
-  d::Frame f;
+  oracle::Frame f;
 
   f = good;
   f.type = static_cast<d::FrameType>(2);
@@ -648,7 +658,7 @@ int writer_refusals_case() {
   CHECK(refused(good, C::InvalidArgument,
                 "segment_size " + std::to_string(longest + 1),
                 sizes(longest + 1, 64)));
-  CHECK(d::write_frame(good, sizes(longest, longest)).ok());
+  CHECK(oracle::write_frame(good, sizes(longest, longest)).ok());
   f = good;
   f.blocks.coefficients.pop_back();
   CHECK(refused(f, C::InvalidArgument, "coefficients, got"));
@@ -669,7 +679,7 @@ int writer_refusals_case() {
   f = good;
   f.blocks.coefficients[skip * k] = std::numeric_limits<std::int16_t>::min();
   f.blocks.masks[removed * codec::kMaskWordsPerBlock] = 7;
-  CHECK(d::write_frame(f).value() == bytes);
+  CHECK(oracle::write_frame(f).value() == bytes);
   f = good;
   f.blocks.coefficients.back() = std::numeric_limits<std::int16_t>::min();
   CHECK(refused(f, C::InvalidArgument, range));  // a new block's
@@ -694,7 +704,7 @@ int writer_refusals_case() {
   // A weight beyond K is not a coding parameter.
   f = good;
   f.reference.header.params.quantization_weights[511] = 3.0f;
-  CHECK(d::write_frame(f).value() == bytes);
+  CHECK(oracle::write_frame(f).value() == bytes);
 
   // assemble_frame, from the frame's own parsed sections.
   const d::CodedFrame coded = codec_frames::coded_frame(
@@ -760,17 +770,18 @@ int writer_refusals_case() {
 // Every truncation of a P-frame fails cleanly, and random corruption never
 // gets the reader out of bounds -- what the sanitizer job checks.
 int corruption_case() {
-  const d::Frame reference = make_frame(300, 32, 13);
-  d::FrameWriteOptions sixteen;
+  const oracle::Frame reference = make_frame(300, 32, 13);
+  oracle::FrameWriteOptions sixteen;
   sixteen.segment_size = 16;
   const d::FrameReference id =
-      reference_of(d::write_frame(reference, sixteen).value());
-  const d::Frame target = successor(reference, 14, 60, 500, 30);
+      reference_of(oracle::write_frame(reference, sixteen).value());
+  const oracle::Frame target = successor(reference, 14, 60, 500, 30);
   const Bytes good =
-      d::write_frame(inter_frame(id, reference, target), sizes(16, 16)).value();
-  CHECK(d::read_frame(good.data(), good.size(), 1u << 20, &id).ok());
+      oracle::write_frame(inter_frame(id, reference, target), sizes(16, 16))
+          .value();
+  CHECK(oracle::read_frame(good.data(), good.size(), 1u << 20, &id).ok());
   for (std::size_t len = 0; len < good.size(); ++len) {
-    CHECK(!d::read_frame(good.data(), len, 1u << 20, &id).ok());
+    CHECK(!oracle::read_frame(good.data(), len, 1u << 20, &id).ok());
   }
   Lcg rng{17};
   int refused = 0;
@@ -782,7 +793,8 @@ int corruption_case() {
       b[rng.below(std::uint32_t(b.size()))] ^=
           static_cast<std::uint8_t>(1 + rng.below(255));
     }
-    refused += d::read_frame(b.data(), b.size(), 1u << 20, &id).ok() ? 0 : 1;
+    refused +=
+        oracle::read_frame(b.data(), b.size(), 1u << 20, &id).ok() ? 0 : 1;
   }
   std::printf("P-frame corruption: %d of %d refused\n", refused, trials);
   // Most edits land in the payload, where the segments' end checks catch

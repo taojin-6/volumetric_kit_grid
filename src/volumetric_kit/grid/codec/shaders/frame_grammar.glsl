@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Tao Jin
 
 // A block's symbols in the v3 frame: what a writer emits, and how a reader
-// takes them back. The one text the host and the device code a frame with:
-// the kernels include it as GLSL, and bitstream.cpp includes each half inside
-// a struct, after defining `uint`, `ivec3`, `uvec2` and `findMSB`, so on the
-// host the same lines compile as C++ member functions.
+// takes them back. The one text a frame is coded with: the kernels include it
+// as GLSL, and the tests' CPU oracle (tests/codec_oracle.cpp) includes each
+// half inside a struct, after defining `uint`, `ivec3`, `uvec2` and `findMSB`,
+// so on the host the same lines compile as C++ member functions.
 //
 // Inside a segment each block is, in order: its coordinate (the segment's
 // first in full, the rest as deltas from the block before), then its
@@ -29,8 +29,8 @@
 // Written in what GLSL and C++ mean alike: unsigned arithmetic wherever a
 // value can wrap (a signed overflow is undefined in C++), one coder call a
 // statement (C++ leaves argument order unspecified), no out parameters, and
-// no built-in but findMSB. No include guard: bitstream.cpp includes it once
-// for each half.
+// no built-in but findMSB. No include guard: the oracle includes it once for
+// each half.
 
 #ifndef __cplusplus
 #include "frame_models.glsl"

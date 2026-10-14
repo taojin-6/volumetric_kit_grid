@@ -193,7 +193,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
     const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
     const CodecParams& params, const FrameReference* reference,
     core::GpuStageScope* stage) {
-  // write_frame's refusals in its order: the coding parameters first.
+  // Every writer's refusals in their order: the coding parameters first.
   VKC_TRY(check_coding(voxel_size, trunc_dist, params));
   const std::uint32_t entries = blocks.count;
   const std::uint32_t m = blocks.reference_count;
@@ -218,7 +218,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
                               "got " +
                               std::to_string(m));
   }
-  // write_frame's last refusals, from what the count found. The mode model
+  // The last refusals, from what the count found. The mode model
   // follows an intra frame's last (frame_models.glsl).
   const std::uint32_t modes =
       frame_model_base(frame_model_count(FrameType::kIntra, k), k);
@@ -230,7 +230,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
       static_cast<std::uint32_t>(frame_segment_count(m, update_size) +
                                  frame_segment_count(a, segment_size));
 
-  // The tables, from the device's counts through the host's normalization.
+  // The tables, from the device's counts through the one normalization.
   const std::uint32_t models = frame_model_count(type, k);
   std::vector<std::vector<std::uint64_t>> counts(models);
   for (std::uint32_t model = 0; model < models; ++model) {

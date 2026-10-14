@@ -9,7 +9,6 @@
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_writer.hpp"
-#include "entropy_choice.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -18,10 +17,10 @@
 namespace volumetric_kit::recon::codec {
 namespace {
 
-// The public default restates the writer's, which the installed header cannot
+// The public default restates the frame's, which the installed header cannot
 // name; this is what keeps the two one number.
 static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
-              "EncoderConfig's default segment size is the writer's");
+              "EncoderConfig's default segment size is the frame's");
 
 }  // namespace
 
@@ -44,47 +43,9 @@ core::Result<Encoder> Encoder::create(core::Device& device,
   e.device_ = &device;
   e.allocator_ = &allocator;
   VKC_ASSIGN(e.transform_, detail::DctTransform::create(device, allocator));
-  // kAuto builds the writer at its first device frame, which a small scene
-  // never reaches.
-  if (config.entropy == EntropyCoding::kDevice) VKC_TRY(e.ensure_writer());
+  VKC_ASSIGN(e.writer_, detail::DeviceFrameWriter::create(device, allocator));
   VKC_ASSIGN(e.gpu_timer_, core::GpuTimer::create(device));
   return e;
-}
-
-core::Status Encoder::ensure_writer() {
-  if (writer_ != nullptr) return {};
-  // A build that failed fails again, so it is tried once.
-  if (!writer_failure_.ok()) return writer_failure_;
-  core::Result<std::unique_ptr<detail::DeviceFrameWriter>> writer =
-      detail::DeviceFrameWriter::create(*device_, *allocator_);
-  if (!writer.ok()) return writer_failure_ = writer.status();
-  writer_ = std::move(writer).value();
-  return {};
-}
-
-core::Result<std::vector<std::uint8_t>> Encoder::encode_on_device(
-    volume::VoxelBlockGrid& grid, const std::vector<volume::BlockIndex>& blocks,
-    core::StageMetrics* metrics, core::GpuStageScope& stage) {
-  // The forward output stays on the device; the same batch counts its
-  // symbols, so only the counts cross before the coding.
-  std::uint32_t rejected = 0;
-  detail::ResidentBlocks resident;
-  {
-    core::StageScope forward(metrics, "  ..forward");
-    core::CommandBatch batch(*device_, *allocator_);
-    VKC_ASSIGN(resident,
-               transform_->record_forward(batch, grid, grid.block_list(blocks),
-                                          config_.params, rejected, &stage));
-    VKC_TRY(writer_->record_count(batch, resident, config_.segment_size,
-                                  detail::kDefaultUpdateSize, &stage));
-    VKC_TRY(batch.submit());
-    VKC_TRY(detail::DctTransform::check_rejected("forward", rejected,
-                                                 resident.count));
-  }
-  core::StageScope entropy(metrics, "  ..rans encode");
-  return writer_->finish(resident, grid.grid().voxel_size,
-                         grid.grid().trunc_dist, config_.params,
-                         /*reference=*/nullptr, &stage);
 }
 
 core::Result<std::vector<std::uint8_t>> Encoder::encode(
@@ -121,37 +82,26 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     detail::sort_by_coord(blocks);
   }
 
-  const std::uint64_t segments =
-      detail::frame_segment_count(blocks.size(), config_.segment_size);
-  // kAuto codes on the host whatever the device cannot: a frame it cannot
-  // hold, or every frame once its kernels failed to build. The host refuses
-  // a bad input again, with its own message.
-  if (detail::codes_on_device(config_.entropy, segments,
-                              kMinDeviceEncodeSegments) &&
-      ensure_writer().ok()) {
-    core::Result<std::vector<std::uint8_t>> frame =
-        encode_on_device(grid, blocks, metrics, stage);
-    if (frame.ok() || !detail::retry_on_host(config_.entropy, frame.status())) {
-      return frame;
-    }
-  }
-
-  detail::Frame frame;
-  frame.voxel_size = grid.grid().voxel_size;
+  // The forward output stays on the device; the same batch counts its
+  // symbols, so only the counts cross before the coding.
+  std::uint32_t rejected = 0;
+  detail::ResidentBlocks resident;
   {
     core::StageScope forward(metrics, "  ..forward");
-    VKC_TRY(transform_->forward(grid, grid.block_list(blocks), config_.params,
-                                frame.blocks, &stage));
+    core::CommandBatch batch(*device_, *allocator_);
+    VKC_ASSIGN(resident,
+               transform_->record_forward(batch, grid, grid.block_list(blocks),
+                                          config_.params, rejected, &stage));
+    VKC_TRY(writer_->record_count(batch, resident, config_.segment_size,
+                                  detail::kDefaultUpdateSize, &stage));
+    VKC_TRY(batch.submit());
+    VKC_TRY(detail::DctTransform::check_rejected("forward", rejected,
+                                                 resident.count));
   }
-  frame.coords.reserve(blocks.size());
-  for (const volume::BlockIndex& b : blocks) {
-    frame.coords.push_back(b.coord);
-  }
-
   core::StageScope entropy(metrics, "  ..rans encode");
-  detail::FrameWriteOptions options;
-  options.segment_size = config_.segment_size;
-  return detail::write_frame(frame, options);
+  return writer_->finish(resident, grid.grid().voxel_size,
+                         grid.grid().trunc_dist, config_.params,
+                         /*reference=*/nullptr, &stage);
 }
 
 }  // namespace volumetric_kit::recon::codec

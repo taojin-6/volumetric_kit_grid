@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The device frame's coding: one invocation per segment runs rans.hpp's
-// RansWriter::finish over the segment's coder steps (rans_ops.comp), already
-// in the order it takes them, with the same 32-bit integer arithmetic. Words
+// The device frame's coding: one invocation per segment runs the rANS encoder
+// rans.hpp describes over the segment's coder steps (rans_ops.comp), already
+// in the order it takes them, in 32-bit integer arithmetic. Words
 // go down from the top of the segment's slot, so the stream lands in decode
 // order: the final state's two words, then the words last emitted first.
 
@@ -53,7 +53,7 @@ void main() {
   if (s >= pc.segment_count) return;
   const uint floor16 = slot_offsets[s];
   uint out16 = slot_offsets[s + 1u];  // the next free word is out16 - 1
-  uint x = 1u << 16u;                 // kRansLower
+  uint x = 1u << 16u;                 // L (rans.hpp)
   bool bad = false;
   const uint end = segment_steps[s + 1u];
   // Four steps a round, the next four loaded while these are coded: with

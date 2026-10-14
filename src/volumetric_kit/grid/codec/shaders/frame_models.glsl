@@ -6,8 +6,8 @@
 // arrays (the device's counts and tables), the symbols a block's mask is
 // coded with, a P-frame's reference-entry modes, and where each segment's
 // entries sit. The one definition: the kernels include it as GLSL, and
-// bitstream.cpp as C++ (see frame_grammar.glsl), so it is written in what the
-// two languages share.
+// bitstream.cpp and the tests' CPU oracle as C++ (see frame_grammar.glsl), so
+// it is written in what the two languages share.
 
 #ifndef VR_FRAME_MODELS_GLSL
 #define VR_FRAME_MODELS_GLSL

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Host-only tests for the v3 frame (bitstream.hpp): round trips across
-// block counts, coefficient counts and segment sizes; coordinates at the ends
-// of int32; every writer refusal; every reader refusal, each made by editing
-// one field or section of a valid frame; the frame type the container writes;
-// the section rules; coordinates out of order across segments; truncation and
+// Host-only tests for the v3 frame (bitstream.hpp), through the CPU oracle
+// (codec_oracle.hpp) that pins its bytes: round trips across block counts,
+// coefficient counts and segment sizes; coordinates at the ends of int32;
+// every writer refusal; every reader refusal, each made by editing one field
+// or section of a valid frame; the frame type the container writes; the
+// section rules; coordinates out of order across segments; truncation and
 // random corruption, which must fail cleanly and never read out of bounds; and
-// what an all-zero frame costs.
-// CPU-only, so these always run.
+// what an all-zero frame costs. CPU-only, so these always run.
 
 #include <algorithm>
 #include <cmath>
@@ -22,6 +22,7 @@
 
 #include "bitstream.hpp"
 #include "codec_frames.hpp"
+#include "codec_oracle.hpp"
 #include "dct_tables.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
@@ -30,6 +31,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+namespace oracle = codec_oracle;
 
 namespace {
 
@@ -60,7 +62,7 @@ bool same_kept_weights(const codec::CodecParams& a,
   return true;
 }
 
-bool same_frame(const d::Frame& a, const d::Frame& b) {
+bool same_frame(const oracle::Frame& a, const oracle::Frame& b) {
   return a.type == b.type && same_bits(a.voxel_size, b.voxel_size) &&
          same_bits(a.blocks.trunc_dist, b.blocks.trunc_dist) &&
          a.blocks.params.coefficient_count ==
@@ -73,24 +75,24 @@ bool same_frame(const d::Frame& a, const d::Frame& b) {
          a.blocks.masks == b.blocks.masks;
 }
 
-vkc::Result<d::Frame> read(const std::vector<std::uint8_t>& bytes,
-                           std::uint32_t max_blocks = 1u << 20) {
-  return d::read_frame(bytes.data(), bytes.size(), max_blocks);
+vkc::Result<oracle::Frame> read(const std::vector<std::uint8_t>& bytes,
+                                std::uint32_t max_blocks = 1u << 20) {
+  return oracle::read_frame(bytes.data(), bytes.size(), max_blocks);
 }
 
 // Write, read back, compare, and write again: the frame survives exactly and
 // re-encodes to the same bytes.
-int round_trip(const d::Frame& f, std::uint32_t segment_size) {
-  d::FrameWriteOptions opt;
+int round_trip(const oracle::Frame& f, std::uint32_t segment_size) {
+  oracle::FrameWriteOptions opt;
   opt.segment_size = segment_size;
-  vkc::Result<std::vector<std::uint8_t>> bytes = d::write_frame(f, opt);
+  vkc::Result<std::vector<std::uint8_t>> bytes = oracle::write_frame(f, opt);
   CHECK(bytes.ok());
-  vkc::Result<d::Frame> back =
+  vkc::Result<oracle::Frame> back =
       read(bytes.value(), static_cast<std::uint32_t>(f.coords.size()));
   CHECK(back.ok());
   CHECK(same_frame(f, back.value()));
   vkc::Result<std::vector<std::uint8_t>> again =
-      d::write_frame(back.value(), opt);
+      oracle::write_frame(back.value(), opt);
   CHECK(again.ok());
   CHECK(again.value() == bytes.value());
   return 0;
@@ -106,7 +108,7 @@ int round_trip_case() {
   }
   CHECK(round_trip(make_frame(40, codec::kVoxelsPerBlock, 5), 16) == 0);
   // The default segment size, and non-default steps carried bit for bit.
-  d::Frame f = make_frame(300, 32, 9);
+  oracle::Frame f = make_frame(300, 32, 9);
   f.blocks.params.quantization_scale = 0.3141f;
   for (std::size_t i = 0; i < f.blocks.params.quantization_weights.size();
        ++i) {
@@ -120,7 +122,7 @@ int round_trip_case() {
 
 // Coordinates at the ends of int32, and deltas of 2^32 - 1 on every axis.
 int extreme_coords_case() {
-  const d::Frame f = codec_frames::extreme_frame();
+  const oracle::Frame f = codec_frames::extreme_frame();
   CHECK(round_trip(f, 64) == 0);
   CHECK(round_trip(f, 1) == 0);  // every coordinate in full
   return 0;
@@ -130,10 +132,11 @@ int extreme_coords_case() {
 // together still round-trip, but no longer write these.
 int golden_case() {
   for (const codec_frames::GoldenFrame& g : codec_frames::kGoldenFrames) {
-    const d::Frame f = codec_frames::golden_frame(g);
-    d::FrameWriteOptions opt;
+    const oracle::Frame f = codec_frames::golden_frame(g);
+    oracle::FrameWriteOptions opt;
     opt.segment_size = g.segment_size;
-    const vkc::Result<std::vector<std::uint8_t>> bytes = d::write_frame(f, opt);
+    const vkc::Result<std::vector<std::uint8_t>> bytes =
+        oracle::write_frame(f, opt);
     CHECK(bytes.ok());
     const std::uint32_t content = codec_frames::content_hash(f);
     const std::uint32_t hash = vr_test::fnv1a(bytes.value());
@@ -154,12 +157,13 @@ int golden_case() {
 }
 
 int write_refusals_case() {
-  const d::Frame good = make_frame(10, 8, 3);
-  CHECK(d::write_frame(good).ok());
-  auto refused = [](const d::Frame& f, d::FrameWriteOptions opt = {}) {
-    return !d::write_frame(f, opt).ok();
+  const oracle::Frame good = make_frame(10, 8, 3);
+  CHECK(oracle::write_frame(good).ok());
+  auto refused = [](const oracle::Frame& f,
+                    oracle::FrameWriteOptions opt = {}) {
+    return !oracle::write_frame(f, opt).ok();
   };
-  d::Frame f = good;
+  oracle::Frame f = good;
   std::swap(f.coords[3], f.coords[4]);  // out of order
   CHECK(refused(f));
   f = good;
@@ -187,7 +191,7 @@ int write_refusals_case() {
   f.blocks.trunc_dist = -0.04f;
   CHECK(refused(f));
   // Segment sizes from 1 to the longest a device invocation decodes.
-  d::FrameWriteOptions sized;
+  oracle::FrameWriteOptions sized;
   sized.segment_size = 0;
   CHECK(refused(good, sized));
   sized.segment_size = kLongest + 1;
@@ -196,7 +200,7 @@ int write_refusals_case() {
   CHECK(!refused(good, sized));
   f = good;  // a type this writer does not code
   f.type = static_cast<d::FrameType>(2);
-  const vkc::Result<std::vector<std::uint8_t>> typed = d::write_frame(f);
+  const vkc::Result<std::vector<std::uint8_t>> typed = oracle::write_frame(f);
   CHECK(!typed.ok());
   CHECK(typed.status().domain() == vkc::Status::Code::Unsupported);
   // An intra frame has no reference and no modes (P-frames are
@@ -223,16 +227,16 @@ int model_layout_case() {
     std::uint32_t sum = 0;
     for (std::uint32_t m = 0; m < inter; ++m) {
       CHECK(d::frame_model_base(m, k) == sum);
-      sum += d::frame_model_alphabet(m, k);
+      sum += oracle::model_alphabet(m, k);
     }
     CHECK(d::frame_model_base(inter, k) == sum);
     // The intra models end where the mode model starts, which has one
     // symbol per mode.
     CHECK(d::frame_model_base(intra, k) ==
-          sum - d::frame_model_alphabet(intra, k));
-    CHECK(d::frame_model_alphabet(intra, k) ==
+          sum - oracle::model_alphabet(intra, k));
+    CHECK(oracle::model_alphabet(intra, k) ==
           std::uint32_t(d::BlockMode::kMotion) + 1);
-    CHECK(d::frame_model_alphabet(intra - 1, k) == 16);
+    CHECK(oracle::model_alphabet(intra - 1, k) == 16);
   }
   return 0;
 }
@@ -249,7 +253,7 @@ int assemble_refusals_case() {
   std::vector<std::vector<std::uint64_t>> counts(
       d::frame_model_count(d::FrameType::kIntra, 8));
   for (std::uint32_t m = 0; m < counts.size(); ++m) {
-    counts[m].assign(d::frame_model_alphabet(m, 8), 1);
+    counts[m].assign(oracle::model_alphabet(m, 8), 1);
   }
   good.tables = d::frame_tables(counts);
   good.segment_lengths = {4, 4, 4};
@@ -315,13 +319,13 @@ int assemble_refusals_case() {
 
 bool refused_as(const std::vector<std::uint8_t>& bytes, vkc::Status::Code code,
                 std::uint32_t max_blocks = 1u << 20) {
-  vkc::Result<d::Frame> r = read(bytes, max_blocks);
+  vkc::Result<oracle::Frame> r = read(bytes, max_blocks);
   return !r.ok() && r.status().domain() == code;
 }
 
 int header_refusals_case() {
-  const d::Frame f = make_frame(100, 16, 4);
-  const std::vector<std::uint8_t> good = d::write_frame(f).value();
+  const oracle::Frame f = make_frame(100, 16, 4);
+  const std::vector<std::uint8_t> good = oracle::write_frame(f).value();
   CHECK(read(good).ok());
   using C = vkc::Status::Code;
   std::vector<std::uint8_t> b;
@@ -404,7 +408,7 @@ int header_refusals_case() {
   b = good;
   b.push_back(0);
   CHECK(refused_as(b, C::InvalidArgument));
-  CHECK(!d::read_frame(nullptr, 64, 100).ok());
+  CHECK(!oracle::read_frame(nullptr, 64, 100).ok());
   return 0;
 }
 
@@ -412,7 +416,7 @@ int header_refusals_case() {
 // changes, and every reader refuses a type it does not decode.
 int frame_type_case() {
   const std::vector<std::uint8_t> good =
-      d::write_frame(make_frame(100, 16, 5)).value();
+      oracle::write_frame(make_frame(100, 16, 5)).value();
   const d::ParsedFrame p =
       d::parse_frame(good.data(), good.size(), 1u << 20, nullptr).value();
   CHECK(p.update_size == 0 && p.new_count == 0);  // no REFERENCE
@@ -445,13 +449,13 @@ int frame_type_case() {
   // check its type again.
   d::ParsedFrame typed = p;
   typed.header.type = static_cast<d::FrameType>(2);
-  CHECK(d::decode_frame(typed).status().domain() == C::Unsupported);
+  CHECK(oracle::decode_frame(typed).status().domain() == C::Unsupported);
   return 0;
 }
 
 int section_rules_case() {
-  const d::Frame f = make_frame(100, 16, 6);
-  const std::vector<std::uint8_t> good = d::write_frame(f).value();
+  const oracle::Frame f = make_frame(100, 16, 6);
+  const std::vector<std::uint8_t> good = oracle::write_frame(f).value();
   const std::vector<Section> s = sections_of(good);
   CHECK(s.size() == 3);
   CHECK(assemble(good, s) == good);  // the helpers are faithful
@@ -470,7 +474,7 @@ int section_rules_case() {
   // An unknown optional section is skipped; an unknown required one stops
   // the read.
   Section extra{9, 0, {1, 2, 3}};
-  vkc::Result<d::Frame> with_extra =
+  vkc::Result<oracle::Frame> with_extra =
       read(assemble(good, {s[0], extra, s[1], s[2]}));
   CHECK(with_extra.ok());
   CHECK(same_frame(f, with_extra.value()));
@@ -520,8 +524,8 @@ int section_rules_case() {
 // as a varint count of used symbols.
 int table_rules_case() {
   constexpr std::size_t kModels = 14;
-  const d::Frame f = make_frame(0, 1, 1);
-  const std::vector<std::uint8_t> good = d::write_frame(f).value();
+  const oracle::Frame f = make_frame(0, 1, 1);
+  const std::vector<std::uint8_t> good = oracle::write_frame(f).value();
   std::vector<Section> s = sections_of(good);
   CHECK(s[0].body == std::vector<std::uint8_t>(kModels, 0));
   using C = vkc::Status::Code;
@@ -563,8 +567,8 @@ int table_rules_case() {
 }
 
 // Blocks all observed with zero coefficients at @p coords, K = 1.
-d::Frame plain_frame(const std::vector<vr::Vec3i>& coords) {
-  d::Frame f = make_frame(0, 1, 1);
+oracle::Frame plain_frame(const std::vector<vr::Vec3i>& coords) {
+  oracle::Frame f = make_frame(0, 1, 1);
   f.coords = coords;
   f.blocks.masks.assign(coords.size() * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(coords.size(), 0);
@@ -575,21 +579,21 @@ d::Frame plain_frame(const std::vector<vr::Vec3i>& coords) {
 // writer makes one, so it is made by hand: x = 0x7FFFF000 becomes INT32_MAX,
 // and the next block's run step (+1) leaves int32.
 int coord_overflow_case() {
-  d::Frame f = plain_frame({{0x7FFFF000, 0, 0}, {0x7FFFF001, 0, 0}});
-  const std::vector<std::uint8_t> good = d::write_frame(f).value();
+  oracle::Frame f = plain_frame({{0x7FFFF000, 0, 0}, {0x7FFFF001, 0, 0}});
+  const std::vector<std::uint8_t> good = oracle::write_frame(f).value();
   CHECK(read(good).ok());
   std::vector<Section> s = sections_of(good);
   set_first_x_low_bits(s[2].body, 0, 0xFFF);
-  vkc::Result<d::Frame> r = read(assemble(good, s));
+  vkc::Result<oracle::Frame> r = read(assemble(good, s));
   CHECK(!r.ok());
   CHECK(r.status().message().find("outside int32") != std::string::npos);
   // The same patch one block earlier is merely a different, valid frame:
   // raw bits carry no redundancy (see codec_rans_test).
   f = plain_frame({{0x7FFFF000, 0, 0}});
-  const std::vector<std::uint8_t> one = d::write_frame(f).value();
+  const std::vector<std::uint8_t> one = oracle::write_frame(f).value();
   s = sections_of(one);
   set_first_x_low_bits(s[2].body, 0, 0xFFF);
-  vkc::Result<d::Frame> moved = read(assemble(one, s));
+  vkc::Result<oracle::Frame> moved = read(assemble(one, s));
   CHECK(moved.ok());
   CHECK(moved.value().coords[0].x == kMax32);
 
@@ -598,7 +602,7 @@ int coord_overflow_case() {
   // off INT32_MAX: a one-block frame whose header claims two reaches for the
   // never-used z-step table.
   f = plain_frame({{kMax32, 0, 0}});
-  std::vector<std::uint8_t> b = d::write_frame(f).value();
+  std::vector<std::uint8_t> b = oracle::write_frame(f).value();
   put_u32(b, 32, 2);
   r = read(b);
   CHECK(!r.ok());
@@ -611,10 +615,11 @@ int coord_overflow_case() {
 // flip there decodes cleanly: the reader must check the order itself, or a
 // duplicate reaches the inverse transform as two workgroups on one block.
 int segment_order_case() {
-  const d::Frame f = plain_frame({{4, 0, 0}, {5, 0, 0}});
-  d::FrameWriteOptions one_each;
+  const oracle::Frame f = plain_frame({{4, 0, 0}, {5, 0, 0}});
+  oracle::FrameWriteOptions one_each;
   one_each.segment_size = 1;
-  const std::vector<std::uint8_t> good = d::write_frame(f, one_each).value();
+  const std::vector<std::uint8_t> good =
+      oracle::write_frame(f, one_each).value();
   CHECK(read(good).ok());
   const std::vector<Section> s = sections_of(good);
   const std::size_t second = get_u32(s[1].body, 0);  // segment 1's offset
@@ -625,13 +630,13 @@ int segment_order_case() {
   };
   // A duplicate, and a step backwards: both refused.
   for (std::uint32_t x : {4u, 3u}) {
-    vkc::Result<d::Frame> r = with_second_x(x);
+    vkc::Result<oracle::Frame> r = with_second_x(x);
     CHECK(!r.ok());
     CHECK(r.status().message().find("does not start after") !=
           std::string::npos);
   }
   // A step forwards is only a different, valid frame.
-  vkc::Result<d::Frame> r = with_second_x(9);
+  vkc::Result<oracle::Frame> r = with_second_x(9);
   CHECK(r.ok());
   CHECK(r.value().coords[1] == vr::Vec3i(9, 0, 0));
   return 0;
@@ -640,17 +645,18 @@ int segment_order_case() {
 // Every truncation fails cleanly, and random corruption never gets the reader
 // out of bounds -- the property the sanitizer job checks on every leg.
 int corruption_case() {
-  const d::Frame small = make_frame(20, 8, 12);
-  d::FrameWriteOptions opt;
+  const oracle::Frame small = make_frame(20, 8, 12);
+  oracle::FrameWriteOptions opt;
   opt.segment_size = 4;
-  const std::vector<std::uint8_t> good = d::write_frame(small, opt).value();
+  const std::vector<std::uint8_t> good =
+      oracle::write_frame(small, opt).value();
   for (std::size_t len = 0; len < good.size(); ++len) {
-    CHECK(!d::read_frame(good.data(), len, 1000).ok());
+    CHECK(!oracle::read_frame(good.data(), len, 1000).ok());
   }
 
-  const d::Frame f = make_frame(300, 32, 13);
+  const oracle::Frame f = make_frame(300, 32, 13);
   opt.segment_size = 16;
-  const std::vector<std::uint8_t> big = d::write_frame(f, opt).value();
+  const std::vector<std::uint8_t> big = oracle::write_frame(f, opt).value();
   Lcg rng{17};
   int refused = 0;
   const int trials = 3000;
@@ -676,13 +682,13 @@ int corruption_case() {
 // state plus its first coordinate in full; every other symbol has
 // probability one and costs nothing.
 int zero_frame_cost_case() {
-  d::Frame f = make_frame(0, 32, 1);
+  oracle::Frame f = make_frame(0, 32, 1);
   for (int i = 0; i < 640; ++i) {
     f.coords.push_back(vr::Vec3i(i, 0, 0));
   }
   f.blocks.masks.assign(640 * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(640 * 32, 0);
-  const std::vector<std::uint8_t> b = d::write_frame(f).value();
+  const std::vector<std::uint8_t> b = oracle::write_frame(f).value();
   const std::vector<Section> s = sections_of(b);
   const std::size_t segments = 640 / d::kDefaultSegmentSize;
   std::printf("all-zero frame: %zu bytes for 640 blocks (payload %zu)\n",
@@ -695,7 +701,7 @@ int zero_frame_cost_case() {
   // And a frame with something to say costs far more: the zero case is not
   // passing by encoding nothing.
   const std::vector<std::uint8_t> busy =
-      d::write_frame(make_frame(640, 32, 2)).value();
+      oracle::write_frame(make_frame(640, 32, 2)).value();
   CHECK(busy.size() - header > 20 * (b.size() - header));
   return 0;
 }
