@@ -30,6 +30,7 @@
 #include "buffer_readback.hpp"
 #include "codec_fixture.hpp"
 #include "codec_frames.hpp"
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -483,7 +484,7 @@ int collision_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
 
 // @p coords into @p grid, in the order given, a few at a time and again
 // while lock races leave any out.
-vkc::Status place(vol::VoxelBlockGrid& grid,
+vkc::Status place(vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid,
                   const std::vector<vr::Vec3i>& coords) {
   const Blocks blocks = listed(coords);
   for (std::size_t first = 0; first < blocks.size(); first += 16) {
@@ -491,7 +492,8 @@ vkc::Status place(vol::VoxelBlockGrid& grid,
         std::min<std::size_t>(16, blocks.size() - first));
     std::uint32_t failed = 1;
     for (int call = 0; call < 16 && failed != 0; ++call) {
-      VKC_ASSIGN(failed, grid.map().allocate(blocks.data() + first, count));
+      VKC_ASSIGN(failed, vr_test::allocate_blocks(
+                             gpu, grid.map(), blocks.data() + first, count));
     }
     if (failed != 0) return vkc::Status::io_error("place: lock races");
   }
@@ -605,7 +607,7 @@ int diff_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
     // An empty grid, against nothing and against a frame.
     CHECK(diffs_as_std(gpu, lists, grid, {}, "nothing") == 0);
     CHECK(diffs_as_std(gpu, lists, grid, frame, "empty grid") == 0);
-    CHECK(place(grid, shuffled).ok());
+    CHECK(place(gpu, grid, shuffled).ok());
     CHECK(diffs_as_std(gpu, lists, grid, {}, "empty frame") == 0);
     CHECK(diffs_as_std(gpu, lists, grid, grid_coords, "equal") == 0);
     CHECK(diffs_as_std(gpu, lists, grid, frame, "disjoint") == 0);
@@ -650,7 +652,7 @@ int garbage_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
   std::vector<vr::Vec3i> held;
   std::vector<vr::Vec3i> frame;
   split_coords(rng, 600, 500, held, frame);
-  CHECK(place(g.value(), held).ok());
+  CHECK(place(gpu, g.value(), held).ok());
   frame.insert(frame.end(), held.begin(), held.begin() + 100);
   for (std::size_t i = frame.size(); i > 1; --i) {
     std::swap(frame[i - 1], frame[rng.below(std::uint32_t(i))]);

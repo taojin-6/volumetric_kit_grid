@@ -160,35 +160,26 @@ class VR_VOLUME_API VoxelHashMap {
   VoxelHashMap(const VoxelHashMap&) = delete;
   VoxelHashMap& operator=(const VoxelHashMap&) = delete;
 
-  /// @brief Allocate voxel blocks at the given block coordinates (the `ptr`
-  ///        field of each @ref BlockIndex is ignored -- only `coord` is read).
-  /// @param coords  The block coordinates to insert.
-  /// @param count   How many.
-  /// @return The number of allocations that failed (0 = all succeeded), or a
-  ///         non-OK `Status` if a buffer or the dispatch fails. Allocation
-  ///         re-dispatches to converge under contention; a non-zero count means
-  ///         a genuine capacity limit (chain full / heap empty) -- grow with
-  ///         @ref resize -- but read @p out_failures rather than assuming that,
-  ///         since transient lock contention can also leave a residue.
-  /// @param out_failures  Optional: receives the per-reason split (see
-  ///                      @ref AllocFailures). Untouched when null.
-  core::Result<std::uint32_t> allocate(const BlockIndex* coords,
-                                       std::uint32_t count,
-                                       AllocFailures* out_failures = nullptr);
-
-  /// @brief @ref allocate from a device buffer of @ref BlockIndex, so the
+  /// @brief Allocate voxel blocks at the block coordinates a device buffer of
+  ///        @ref BlockIndex lists, bound where its producer wrote it, so the
   ///        coordinates cross the bus neither way.
   ///
-  /// The same checks, rounds, tally and @ref AllocFailures split as the host
-  /// overload; only `coord` is read. The buffer must remain alive and
-  /// unchanged until this synchronous call returns.
+  /// Only `coord` is read; each entry's `ptr` is ignored. The buffer must
+  /// remain alive and unchanged until this synchronous call returns.
   /// @param coords  Storage buffer with known device-local memory holding at
   ///                least @p count block indices.
   /// @param count   Number of entries; zero is a no-op.
-  /// @param out_failures  As the host overload.
-  /// @return As the host overload; `Status::Code::InvalidArgument` also for
-  ///         a @p coords `StorageInput::check` refuses, or past
-  ///         `maxStorageBufferRange`.
+  /// @param out_failures  Optional: receives the per-reason split (see
+  ///                      @ref AllocFailures). Untouched when null.
+  /// @return The number of allocations that failed (0 = all succeeded), or a
+  ///         non-OK `Status`: `Status::Code::InvalidArgument` for a moved-from
+  ///         map, a @p coords `StorageInput::check` refuses, or one past
+  ///         `maxStorageBufferRange`; or a buffer or dispatch failure.
+  ///         Allocation re-dispatches to converge under contention; a
+  ///         non-zero count means a genuine capacity limit (chain full / heap
+  ///         empty) -- grow with @ref resize -- but read @p out_failures
+  ///         rather than assuming that, since transient lock contention can
+  ///         also leave a residue.
   core::Result<std::uint32_t> allocate(const core::Buffer& coords,
                                        std::uint32_t count,
                                        AllocFailures* out_failures = nullptr);
@@ -318,15 +309,20 @@ class VR_VOLUME_API VoxelHashMap {
       AllocFailures* out_failures = nullptr,
       core::StageMetrics* metrics = nullptr);
 
-  /// @brief Remove voxel blocks at the given block coordinates (only `coord` is
-  ///        read); absent coordinates are ignored. Returns each freed block to
-  ///        the heap.
+  /// @brief Remove the voxel blocks at the block coordinates a device buffer
+  ///        of @ref BlockIndex lists (only `coord` is read), returning each
+  ///        freed block to the heap; absent coordinates are ignored. The
+  ///        coordinates cross the bus neither way.
   ///
   /// Must not run concurrently with @ref allocate — the heap requires alloc and
   /// free in separate dispatches, which the fence between calls guarantees for
-  /// single-threaded use.
-  /// @param coords  The block coordinates to remove.
-  /// @param count   How many.
+  /// single-threaded use. The buffer must remain alive and unchanged until
+  /// this synchronous call returns.
+  /// @param coords  Storage buffer with known device-local memory holding at
+  ///                least @p count block indices.
+  /// @param count   Number of entries; zero is a no-op.
+  /// @param out_failures  Optional: receives the per-reason split (see
+  ///                      @ref AllocFailures). Untouched when null.
   /// @warning This frees the block index but does **not** clear the per-voxel
   ///          attribute data it addressed -- the block index does not know what
   ///          attributes, if any, a consumer declared. The free heap is LIFO,
@@ -336,34 +332,14 @@ class VR_VOLUME_API VoxelHashMap {
   ///          @ref VoxelBlockGrid::remove, which clears them first, on any grid
   ///          that carries attributes.
   /// @return The number of removals that failed (0 = all done), or a non-OK
-  ///         `Status` if a buffer or the dispatch fails. A non-zero count
-  ///         here is **not** capacity pressure. It is the sum of blocks
-  ///         removed from the table whose index the free heap refused, i.e.
-  ///         leaked capacity (@ref AllocFailures::terminal), and coords
-  ///         bucket-lock contention kept through every round
-  ///         (@ref AllocFailures::lock), which are still in the table: call
-  ///         again to remove them.
-  /// @param out_failures  Optional: receives the per-reason split (see
-  ///                      @ref AllocFailures). Untouched when null.
-  core::Result<std::uint32_t> remove(const BlockIndex* coords,
-                                     std::uint32_t count,
-                                     AllocFailures* out_failures = nullptr);
-
-  /// @brief Remove blocks from a device buffer of @ref BlockIndex without
-  ///        downloading or uploading the coordinate list.
-  ///
-  /// As with the host overload, only coordinates are read, absent coordinates
-  /// are ignored, and attributes are not cleared. The caller must zero any
-  /// attributes before removing their blocks. The buffer must remain alive
-  /// and unchanged until this synchronous call returns.
-  /// @param coords  Storage buffer with known device-local memory holding at
-  ///                least @p count block indices.
-  /// @param count   Number of entries; zero is a no-op.
-  /// @param out_failures  Optional per-reason failure counts.
-  /// @return The number of failed removals, or a non-OK `Status` for an
-  ///         invalid input, allocation failure, or failed dispatch. An
-  ///         empty, refused or zero-count call leaves @ref topology_epoch
-  ///         unchanged.
+  ///         `Status` for an invalid input (as @ref allocate refuses one), an
+  ///         allocation failure or a failed dispatch. A non-zero count here is
+  ///         **not** capacity pressure. It is the sum of blocks removed from
+  ///         the table whose index the free heap refused, i.e. leaked capacity
+  ///         (@ref AllocFailures::terminal), and coords bucket-lock contention
+  ///         kept through every round (@ref AllocFailures::lock), which are
+  ///         still in the table: call again to remove them. An empty, refused
+  ///         or zero-count call leaves @ref topology_epoch unchanged.
   core::Result<std::uint32_t> remove(const core::Buffer& coords,
                                      std::uint32_t count,
                                      AllocFailures* out_failures = nullptr);
@@ -724,9 +700,9 @@ class VR_VOLUME_API VoxelHashMap {
                                                VkDeviceSize bytes);
 
   /// Shared body of the per-element kernels (@ref allocate, @ref remove):
-  /// stage or bind @p count elements
-  /// of @p elem_size bytes at input binding (4) of @p kernel's set, then run
-  /// @p kernel over them (one thread per element) via @ref dispatch_with_retry.
+  /// bind @p count elements of @p elem_size bytes at input binding (4) of
+  /// @p kernel's set, then run @p kernel over them (one thread per element)
+  /// via @ref dispatch_with_retry.
   /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
   /// moves @ref topology_epoch once the input is accepted, and binds a zeroed
   /// flag per element at binding 6, which the kernel sets on each coord it

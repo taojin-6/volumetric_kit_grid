@@ -5,14 +5,14 @@
 // verify they are distinct, correctly-sized device buffers keyed by the block
 // pool, that the composed VoxelHashMap still allocates, that resize grows the
 // attribute arrays while preserving per-voxel data at the same block pointer,
-// that remove zeroes what it frees from a host list or a device one, and the
-// error / move paths. Runs on the real driver (MoltenVK / NVIDIA);
-// exits 0 (skip) where no device is present.
+// that remove zeroes what it frees, and the error / move paths. Runs on the
+// real driver (MoltenVK / NVIDIA); exits 0 (skip) where no device is present.
 
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -134,7 +134,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     }
   }
   vkc::Result<std::uint32_t> allocated =
-      vbg.map().allocate(cube.data(), static_cast<std::uint32_t>(cube.size()));
+      vr_test::allocate_blocks(gpu, vbg.map(), cube);
   CHECK(allocated.ok() && allocated.value() == 0);
   vkc::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
@@ -211,7 +211,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   const vr::Vec3i fresh_coord(40, 40, 40);
   vol::BlockIndex fresh{};
   fresh.coord = fresh_coord;
-  vkc::Result<std::uint32_t> fresh_alloc = vbg.map().allocate(&fresh, 1);
+  vkc::Result<std::uint32_t> fresh_alloc =
+      vr_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
   CHECK(fresh_alloc.ok() && fresh_alloc.value() == 0);
   vkc::Result<std::vector<vol::BlockIndex>> with_fresh =
       vbg.map().compact_active_blocks();
@@ -242,7 +243,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     weight_grown_data[fresh_ptr] = 5.0f;
     CHECK(put("tsdf", tsdf_grown_data) && put("weight", weight_grown_data));
 
-    vkc::Result<std::uint32_t> removed = vbg.remove(&fresh, 1);
+    vkc::Result<std::uint32_t> removed =
+        vr_test::remove_blocks(gpu, vbg, &fresh, 1);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
     tsdf_grown_data = get("tsdf");
@@ -257,7 +259,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
     // The reuse this protects against: re-allocating draws the same index back
     // (LIFO) and it reads as a fresh block rather than the removed one.
-    vkc::Result<std::uint32_t> realloc = vbg.map().allocate(&fresh, 1);
+    vkc::Result<std::uint32_t> realloc =
+        vr_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
     CHECK(realloc.ok() && realloc.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> after_reuse =
         vbg.map().compact_active_blocks();
@@ -283,7 +286,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     for (int i = 0; i < 4; ++i) {
       blocks[i].coord = quad[i];
     }
-    vkc::Result<std::uint32_t> placed = vbg.map().allocate(blocks, 4);
+    vkc::Result<std::uint32_t> placed =
+        vr_test::allocate_blocks(gpu, vbg.map(), blocks, 4);
     CHECK(placed.ok() && placed.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> live =
         vbg.map().compact_active_blocks();
@@ -301,7 +305,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
       tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
     }
     CHECK(put("tsdf", tsdf_grown_data));
-    vkc::Result<std::uint32_t> removed = vbg.remove(blocks + 1, 2);
+    vkc::Result<std::uint32_t> removed =
+        vr_test::remove_blocks(gpu, vbg, blocks + 1, 2);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
     tsdf_grown_data = get("tsdf");
@@ -314,16 +319,16 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vol::BlockIndex pair[2]{};
     pair[0].coord = vr::Vec3i(7000, 7000, 7000);
     pair[1].coord = quad[3];
-    removed = vbg.remove(pair, 2);
+    removed = vr_test::remove_blocks(gpu, vbg, pair, 2);
     CHECK(removed.ok() && removed.value() == 0);
     tsdf_grown_data = get("tsdf");
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
     CHECK(tsdf_grown_data[ptrs[3]] == 0.0f);
   }
 
-  // --- The same from a device list: zeroed and freed as from a host one,
-  // duplicates and an absent coord included, and never a live entry past the
-  // count. A refused list zeroes nothing and keeps the topology epoch.
+  // --- One device list holding duplicates and an absent coord: each listed
+  // block zeroed and freed once, and never a live entry past the count. A
+  // refused list zeroes nothing and keeps the topology epoch.
   {
     const vr::Vec3i quad[4] = {
         {60, 60, 60}, {61, 60, 60}, {60, 61, 60}, {61, 61, 60}};
@@ -331,7 +336,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     for (int i = 0; i < 4; ++i) {
       blocks[i].coord = quad[i];
     }
-    CHECK(vbg.map().allocate(blocks, 4).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, vbg.map(), blocks, 4).value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> live =
         vbg.map().compact_active_blocks();
     CHECK(live.ok());

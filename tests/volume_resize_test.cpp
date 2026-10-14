@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -123,8 +124,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   for (const vol::BlockIndex& b : a) {
     want.insert({b.coord.x, b.coord.y, b.coord.z});
   }
-  vkc::Result<std::uint32_t> alloc_a =
-      map.allocate(a.data(), static_cast<std::uint32_t>(a.size()));
+  vkc::Result<std::uint32_t> alloc_a = vr_test::allocate_blocks(gpu, map, a);
   CHECK(alloc_a.ok() && alloc_a.value() == 0);
 
   // Snapshot each block's index before growing; the rehash must preserve it
@@ -163,8 +163,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   for (const vol::BlockIndex& block : b) {
     want.insert({block.coord.x, block.coord.y, block.coord.z});
   }
-  vkc::Result<std::uint32_t> alloc_b =
-      map.allocate(b.data(), static_cast<std::uint32_t>(b.size()));
+  vkc::Result<std::uint32_t> alloc_b = vr_test::allocate_blocks(gpu, map, b);
   CHECK(alloc_b.ok() && alloc_b.value() == 0);
   vkc::Result<std::set<Coord>> both = active_set(map);
   CHECK(both.ok());
@@ -185,7 +184,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   std::uint32_t big_failed = 1;
   for (int pass = 0; pass < 8 && big_failed != 0; ++pass) {
     vkc::Result<std::uint32_t> alloc_big =
-        map.allocate(big.data(), static_cast<std::uint32_t>(big.size()));
+        vr_test::allocate_blocks(gpu, map, big);
     CHECK(alloc_big.ok());
     big_failed = alloc_big.value();
   }
@@ -242,7 +241,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
       }
     }
     CHECK(clash.size() == 5);
-    vkc::Result<std::uint32_t> placed = small.allocate(clash.data(), 5);
+    vkc::Result<std::uint32_t> placed =
+        vr_test::allocate_blocks(gpu, small, clash.data(), 5);
     CHECK(placed.ok() && placed.value() == 0);
     const vkc::Status grow = small.resize(9);
     CHECK(grow.domain() == vkc::Status::Code::OutOfMemory);

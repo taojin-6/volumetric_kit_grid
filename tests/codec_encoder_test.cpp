@@ -72,7 +72,7 @@ int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> ga = make_grid(gpu);
   CHECK(ga.ok());
   vol::VoxelBlockGrid a = std::move(ga).value();
-  CHECK(allocate(a, coords).ok());
+  CHECK(allocate(gpu, a, coords).ok());
   CHECK(write_sphere(gpu, a, s).ok());
 
   GridShape bigger;
@@ -81,7 +81,7 @@ int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
   CHECK(gb.ok());
   vol::VoxelBlockGrid b = std::move(gb).value();
   std::vector<vr::Vec3i> reversed(coords.rbegin(), coords.rend());
-  CHECK(allocate(b, reversed).ok());
+  CHECK(allocate(gpu, b, reversed).ok());
   CHECK(write_sphere(gpu, b, s).ok());
 
   vkc::Result<std::vector<vol::BlockIndex>> pa =
@@ -194,7 +194,7 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   // A list the encoder compacted itself, after an allocation, holds for the
   // next caller, and the content -- one block more, never observed -- codes
   // the same.
-  CHECK(allocate(grid, {{50, 50, 50}}).ok());
+  CHECK(allocate(gpu, grid, {{50, 50, 50}}).ok());
   vkc::StageMetrics again;
   vkc::Result<std::vector<std::uint8_t>> b = enc.encode(grid, &again);
   CHECK(b.ok() && b.value() == a.value());
@@ -246,7 +246,7 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
       {lo, 0, 0},   {hi, 0, 0},   {0, lo, 0},   {0, hi, 0},
       {0, 0, lo},   {0, 0, hi},   {lo, lo, lo}, {hi, hi, hi},
       {hi, lo, hi}, {lo, hi, lo}, {-1, hi, lo}, {lo + 1, -1, hi - 1}};
-  CHECK(allocate(grid, far).ok());
+  CHECK(allocate(gpu, grid, far).ok());
   // Observed by hand, as write_sphere's block positions overflow here.
   vkc::Result<std::vector<vol::BlockIndex>> active =
       grid.map().compact_active_blocks();

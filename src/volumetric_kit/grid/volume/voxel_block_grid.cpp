@@ -328,35 +328,6 @@ std::uint64_t VoxelBlockGrid::bytes_at(
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::remove(
-    const BlockIndex* coords, std::uint32_t count,
-    AllocFailures* out_failures) {
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelBlockGrid::remove: moved-from grid");
-  }
-  if (count == 0) {
-    return std::uint32_t{0};
-  }
-  if (coords == nullptr) {
-    return core::Status::invalid_argument(
-        "VoxelBlockGrid::remove: coords is null");
-  }
-  // Nothing to zero: the map stages the coordinates itself.
-  if (attributes_.empty()) {
-    return map_.remove(coords, count, out_failures);
-  }
-  // Staged once, for the zeroing and the map's remove alike.
-  const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(BlockIndex);
-  VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
-                                           bytes, max_storage_buffer_range_));
-  VKC_ASSIGN(const core::Buffer list,
-             core::device_storage_buffer(*allocator_, bytes));
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.upload(list, 0, coords, bytes));
-  return zero_and_remove(batch, list, count, out_failures, nullptr);
-}
-
-core::Result<std::uint32_t> VoxelBlockGrid::remove(
     const core::Buffer& coords, std::uint32_t count,
     AllocFailures* out_failures) {
   if (!valid()) {

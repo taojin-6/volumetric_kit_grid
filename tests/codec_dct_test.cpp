@@ -27,6 +27,7 @@
 #include "codec_oracle_device.hpp"
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
+#include "device_blocks.hpp"
 #include "grid_readback.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
@@ -90,14 +91,13 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(
 // Allocate blocks (i, 0, 0) for i in [0, count) and return the compacted set
 // sorted by x, so entry i is block i whatever order the compaction produced.
 vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
-    vol::VoxelBlockGrid& grid, int count) {
+    const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) {
     coords[static_cast<std::size_t>(i)].coord = vr::Vec3i(i, 0, 0);
   }
   VKC_ASSIGN(std::uint32_t failed,
-             grid.map().allocate(coords.data(),
-                                 static_cast<std::uint32_t>(coords.size())));
+             vr_test::allocate_blocks(ctx, grid.map(), coords));
   if (failed != 0) {
     return vkc::Status::invalid_argument("allocate_row: allocation failed");
   }
@@ -334,7 +334,7 @@ int forward_matches_reference_case(vkc::Device& device,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 4);
   CHECK(active.ok() && active.value().size() == 4);
   const std::vector<vol::BlockIndex>& blocks = active.value();
   const Cube content[4] = {random_cube(1), plane_cube(), sphere_cube(),
@@ -394,7 +394,7 @@ int per_basis_sequence_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   const std::vector<vol::BlockIndex>& list = active.value();
@@ -456,7 +456,7 @@ int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 4);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   Cube content[4];
@@ -506,7 +506,7 @@ int truncation_matches_reference_case(vkc::Device& device,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   const Cube content = plane_cube();
@@ -550,7 +550,7 @@ int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 cycles through: none, below the threshold, at it, well above.
@@ -624,7 +624,7 @@ int constant_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   write_block(ctx, grid, blocks[0], constant_cube(0.3), observed);
@@ -670,7 +670,7 @@ int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   Cube edge{};
@@ -721,7 +721,7 @@ int partial_block_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   // A tilted surface, normalized over a band of 4 voxels.
@@ -781,7 +781,7 @@ int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   std::vector<vol::BlockIndex> blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {
@@ -820,7 +820,8 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 10);
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      allocate_row(ctx, grid, 10);
   CHECK(active.ok() && active.value().size() == 10);
   const std::vector<vol::BlockIndex>& blocks = active.value();
   std::vector<Cube> content;
@@ -889,7 +890,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex> blocks = active.value();
   for (const vol::BlockIndex& b : blocks) {
@@ -1028,7 +1029,8 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   // refuse it.
   vol::BlockIndex gone{};
   gone.coord = blocks[0].coord;
-  vkc::Result<std::uint32_t> removed = grid.remove(&gone, 1);
+  vkc::Result<std::uint32_t> removed =
+      vr_test::remove_blocks(ctx, grid, &gone, 1);
   CHECK(removed.ok());
   CHECK(!oracle::forward(ctx, t, grid, blocks, params, out).ok());
   CHECK(!oracle::inverse(ctx, t, grid, blocks, out).ok());
@@ -1039,7 +1041,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   vol::VoxelBlockGrid grid4 = std::move(g4).value();
   std::vector<vol::BlockIndex> one(1);
   one[0].coord = vr::Vec3i(0, 0, 0);
-  CHECK(grid4.map().allocate(one.data(), 1).ok());
+  CHECK(vr_test::allocate_blocks(ctx, grid4.map(), one).ok());
   vkc::Result<std::vector<vol::BlockIndex>> active4 =
       grid4.map().compact_active_blocks();
   CHECK(active4.ok());
@@ -1051,7 +1053,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
       make_grid(device, allocator, codec::kBlockSize, false);
   CHECK(gw.ok());
   vol::VoxelBlockGrid no_weight = std::move(gw).value();
-  CHECK(no_weight.map().allocate(one.data(), 1).ok());
+  CHECK(vr_test::allocate_blocks(ctx, no_weight.map(), one).ok());
   vkc::Result<std::vector<vol::BlockIndex>> active_w =
       no_weight.map().compact_active_blocks();
   CHECK(active_w.ok());
@@ -1083,7 +1085,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 4);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 all observed; 1 none; 2 one voxel at the threshold; 3 one voxel
@@ -1139,7 +1141,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   // A list an allocation has made stale is refused.
   std::vector<vol::BlockIndex> one(1);
   one[0].coord = vr::Vec3i(9, 9, 9);
-  CHECK(grid.map().allocate(one.data(), 1).ok());
+  CHECK(vr_test::allocate_blocks(ctx, grid.map(), one).ok());
   CHECK(!t.observed(grid, list.value()).ok());
 
   // An empty list keeps nothing.
@@ -1157,7 +1159,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   for (int size : {1, 17, 3}) {
     auto resized = make_grid(device, allocator);
     CHECK(resized.ok());
-    auto row = allocate_row(resized.value(), size);
+    auto row = allocate_row(ctx, resized.value(), size);
     CHECK(row.ok());
     std::vector<float> weights = attr(ctx, resized.value(), "weight");
     for (const vol::BlockIndex& block : row.value()) {
@@ -1189,7 +1191,7 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
   auto made = make_grid(device, allocator);
   CHECK(made.ok());
   auto& grid = made.value();
-  auto active = allocate_row(grid, 17);
+  auto active = allocate_row(ctx, grid, 17);
   CHECK(active.ok());
   const auto& blocks = active.value();
   std::vector<Cube> content;
@@ -1251,7 +1253,7 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {

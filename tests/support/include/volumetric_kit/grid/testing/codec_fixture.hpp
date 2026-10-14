@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "device_blocks.hpp"
 #include "grid_readback.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
@@ -82,15 +83,14 @@ inline vkc::Result<std::vector<vol::BlockIndex>> active_sorted(
   return active;
 }
 
-inline vkc::Status allocate(vol::VoxelBlockGrid& grid,
+inline vkc::Status allocate(Gpu& gpu, vol::VoxelBlockGrid& grid,
                             const std::vector<vr::Vec3i>& coords) {
   std::vector<vol::BlockIndex> blocks(coords.size());
   for (std::size_t i = 0; i < coords.size(); ++i) {
     blocks[i].coord = coords[i];
   }
   VKC_ASSIGN(const std::uint32_t failed,
-             grid.map().allocate(blocks.data(),
-                                 static_cast<std::uint32_t>(blocks.size())));
+             vr_test::allocate_blocks(gpu, grid.map(), blocks));
   if (failed != 0) {
     return vkc::Status::out_of_memory("fixture: allocation failed");
   }
@@ -180,7 +180,7 @@ inline vkc::Result<vol::VoxelBlockGrid> sphere_grid(
   std::vector<vr::Vec3i> coords =
       band_blocks(s, shape.voxel_size, shape.trunc_dist);
   coords.insert(coords.end(), extra.begin(), extra.end());
-  VKC_TRY(allocate(grid, coords));
+  VKC_TRY(allocate(gpu, grid, coords));
   VKC_TRY(write_sphere(gpu, grid, s));
   return grid;
 }

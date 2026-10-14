@@ -41,6 +41,7 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
@@ -154,8 +155,8 @@ bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
       }
     }
   }
-  vkc::Result<std::uint32_t> failed = g.map().allocate(
-      blocks.data(), static_cast<std::uint32_t>(blocks.size()));
+  vkc::Result<std::uint32_t> failed =
+      vr_test::allocate_blocks(ctx, g.map(), blocks);
   if (!failed || failed.value() != 0) {
     return false;
   }
@@ -239,8 +240,8 @@ bool fill_dense_blocks(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
       }
     }
   }
-  vkc::Result<std::uint32_t> failed = g.map().allocate(
-      blocks.data(), static_cast<std::uint32_t>(blocks.size()));
+  vkc::Result<std::uint32_t> failed =
+      vr_test::allocate_blocks(ctx, g.map(), blocks);
   if (!failed || failed.value() != 0) {
     return false;
   }
@@ -731,7 +732,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   vol::BlockIndex single_block{};
   single_block.coord = vr::Vec3i(0, 0, 0);
   vkc::Result<std::uint32_t> single_failed =
-      one_grid.map().allocate(&single_block, 1);
+      vr_test::allocate_blocks(gpu, one_grid.map(), &single_block, 1);
   CHECK(single_failed.ok());
   CHECK(single_failed.value() == 0);
 
@@ -1336,7 +1337,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vol::VoxelBlockGrid other = std::move(other_result).value();
     vol::BlockIndex inside{};
     inside.coord = vr::Vec3i(4, 0, 0);
-    CHECK(other.map().allocate(&inside, 1).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, other.map(), &inside, 1).value() == 0);
     vkc::Result<vol::DeviceBlockList> other_list =
         other.map().compact_active_blocks_in_frusta_on_device({hi_half});
     CHECK(other_list.ok() && other_list.value().count == 1);
@@ -1347,7 +1348,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(cull_mc.extract_device(cull_grid, 0.0f, hi_list.value()).ok());
     vol::BlockIndex extra{};
     extra.coord = vr::Vec3i(kBlocks, 0, 0);
-    CHECK(cull_map.allocate(&extra, 1).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, cull_map, &extra, 1).value() == 0);
     CHECK(!cull_mc.extract_device(cull_grid, 0.0f, hi_list.value()).ok());
   }
 
@@ -1407,10 +1408,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
         }
       }
     }
-    CHECK(
-        near_grid.map()
-            .allocate(coords.data(), static_cast<std::uint32_t>(coords.size()))
-            .value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, near_grid.map(), coords).value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> live =
         near_grid.map().compact_active_blocks();
     CHECK(live.ok());
@@ -1494,7 +1492,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     // One block past the cube, never observed, so it adds no surface.
     vol::BlockIndex extra{};
     extra.coord = vr::Vec3i(kBlocks, 0, 0);
-    CHECK(list_grid.map().allocate(&extra, 1).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, list_grid.map(), &extra, 1).value() ==
+          0);
     CHECK(list_mc.value().extract_device(list_grid, 0.0f, &t).ok());
     CHECK(t.active_blocks == last.value().count + 1);
   }

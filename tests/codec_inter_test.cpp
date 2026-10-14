@@ -430,7 +430,7 @@ vkc::Result<Snapshot> oracle_decode(Gpu& gpu, const Bytes& frame) {
   VKC_ASSIGN(const oracle::Frame content,
              oracle::read_frame(frame.data(), frame.size(), kMaxBlocks));
   VKC_ASSIGN(vol::VoxelBlockGrid grid, grid_for(gpu, frame));
-  VKC_TRY(allocate(grid, content.coords));
+  VKC_TRY(allocate(gpu, grid, content.coords));
   // The grid's blocks in frame order, entry for entry with the content's.
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
   VKC_ASSIGN(std::unique_ptr<d::DctTransform> transform,

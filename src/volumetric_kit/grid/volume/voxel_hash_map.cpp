@@ -481,10 +481,10 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   if (count == 0) {
     return std::uint32_t{0};
   }
-  // Host input is staged once; a device input stays where its producer wrote
-  // it. fail_counts_ is persistent and re-zeroed per round inside
-  // dispatch_with_retry. Bound the input to the logical count and reject a
-  // range larger than one storage binding may cover.
+  // The input stays where its producer wrote it. fail_counts_ is persistent
+  // and re-zeroed per round inside dispatch_with_retry. Bound the input to
+  // the logical count and reject a range larger than one storage binding may
+  // cover.
   const VkDeviceSize input_bytes = VkDeviceSize(count) * elem_size;
   VKC_TRY(input.check(op, input_bytes));
   VKC_TRY(core::check_storage_buffer_range(op, input_bytes,
@@ -521,13 +521,6 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
         }
         return {};
       });
-}
-
-core::Result<std::uint32_t> VoxelHashMap::allocate(
-    const BlockIndex* coords, std::uint32_t count,
-    AllocFailures* out_failures) {
-  return run_input_kernel("VoxelHashMap::allocate", core::StorageInput(coords),
-                          sizeof(BlockIndex), count, allocate_, out_failures);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate(
@@ -705,14 +698,6 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
                                                  offsets.data(), offset_bytes));
         return {};
       });
-}
-
-core::Result<std::uint32_t> VoxelHashMap::remove(const BlockIndex* coords,
-                                                 std::uint32_t count,
-                                                 AllocFailures* out_failures) {
-  return run_input_kernel("VoxelHashMap::remove", core::StorageInput(coords),
-                          sizeof(BlockIndex), count, delete_, out_failures,
-                          true);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::remove(const core::Buffer& coords,

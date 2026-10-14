@@ -181,8 +181,9 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///         moved-from), or if the array no longer covers the live grid.
   core::Result<AttributeView> attribute(std::string_view name) const;
 
-  /// @brief Remove voxel blocks at the given block coordinates, clearing the
-  ///        per-voxel attribute data they held.
+  /// @brief Remove the voxel blocks at the block coordinates a device buffer
+  ///        of @ref BlockIndex lists, clearing the per-voxel attribute data
+  ///        they held; the coordinates cross the bus neither way.
   ///
   /// @ref VoxelHashMap::remove with the half it cannot do: the block index does
   /// not know what attributes a consumer declared, so it returns a freed index
@@ -196,34 +197,22 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// Each coord is found in the hash table on the device, by the kernel that
   /// zeroes its block, so the cost is the count's, not the grid's, and a
   /// coord that is not currently allocated costs nothing and clears nothing.
-  /// The blocks are zeroed before the
-  /// map's remove runs, so a block that call leaves in the table
+  /// The blocks are zeroed, then @ref VoxelHashMap::remove runs over the same
+  /// buffer: two submits. A block that call leaves in the table
   /// (@ref AllocFailures::lock) is left zeroed, reading as a freshly
-  /// allocated block until a later call removes it.
-  /// @param coords  The block coordinates to remove (only `coord` is read).
-  /// @param count   How many.
-  /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
-  /// @return What @ref VoxelHashMap::remove returns, or a non-OK `Status` if
-  ///         the grid is moved-from, @p coords is null, or the zeroing fails,
-  ///         which comes before any index is freed.
-  core::Result<std::uint32_t> remove(const BlockIndex* coords,
-                                     std::uint32_t count,
-                                     AllocFailures* out_failures = nullptr);
-
-  /// @brief @ref remove from a device buffer of @ref BlockIndex, so the
-  ///        coordinates cross the bus neither way.
-  ///
-  /// The same zeroing, then @ref VoxelHashMap::remove over the same buffer: two
-  /// submits. The input is checked first, so a refused call zeroes nothing and
-  /// leaves @ref topology_epoch as it was. The buffer must remain alive and
-  /// unchanged until this synchronous call returns.
+  /// allocated block until a later call removes it. The input is checked
+  /// first, so a refused call zeroes nothing and leaves @ref topology_epoch
+  /// as it was. The buffer must remain alive and unchanged until this
+  /// synchronous call returns.
   /// @param coords  Storage buffer with known device-local memory holding at
   ///                least @p count block indices (only `coord` is read).
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
-  /// @return As the host overload; `Status::Code::InvalidArgument` also for
-  ///         a @p coords `StorageInput::check` refuses, or past
-  ///         `maxStorageBufferRange`.
+  /// @return What @ref VoxelHashMap::remove returns, or a non-OK `Status`:
+  ///         `Status::Code::InvalidArgument` for a moved-from grid, a
+  ///         @p coords `StorageInput::check` refuses, or one past
+  ///         `maxStorageBufferRange`; or a failure of the zeroing, which comes
+  ///         before any index is freed.
   core::Result<std::uint32_t> remove(const core::Buffer& coords,
                                      std::uint32_t count,
                                      AllocFailures* out_failures = nullptr);
@@ -356,7 +345,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   // attribute a dispatch, each block found by its coord.
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
                            std::uint32_t count, core::GpuStageScope* stage);
-  // Every removal's body -- both remove overloads' and free_stale_blocks':
+  // Every removal's body -- remove's and free_stale_blocks':
   // zero the first `count` blocks `list` names, recorded into `batch` after
   // what it holds and submitted, then free them through the map. `list` is
   // the caller's to check.
