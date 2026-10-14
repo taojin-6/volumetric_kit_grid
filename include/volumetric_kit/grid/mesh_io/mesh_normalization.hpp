@@ -114,9 +114,8 @@ VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
 /// @brief Map every position of @p mesh through @p transform, in place.
 ///
 /// Indices are kept: the rotation is proper and the scale positive, so
-/// winding and orientation hold. Applying one transform to every frame of a
-/// sequence keeps a point that does not move in one place. A refusal leaves
-/// the positions unchanged, bit for bit.
+/// winding and orientation hold. A refusal leaves the positions unchanged,
+/// bit for bit.
 /// @return OK, an empty mesh included; InvalidArgument for axes that are not
 ///         a proper rotation, a non-finite origin, a scale that is not finite
 ///         and positive, a non-finite position, an output past float range,
