@@ -43,6 +43,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+#include "device_blocks.hpp"
 #include "gpu_test.hpp"
 #include "grid_readback.hpp"
 
@@ -73,8 +74,7 @@ vol::VoxelGridParams grid_params() {
 // surface crosses the volume and marching cubes emits a triangle count that
 // scales with the block count -- which is what lets the second extract outgrow
 // the arena the first one sized.
-bool fill_sphere(const vkc::Device& dev, vkc::Allocator& alloc,
-                 vol::VoxelBlockGrid& g, int blocks) {
+bool fill_sphere(const vr_test::Gpu& gpu, vol::VoxelBlockGrid& g, int blocks) {
   const int n = kBlock * blocks;
   const float centre = static_cast<float>(n - 1) * 0.5f * kH;
   const float radius = static_cast<float>(n - 1) * 0.35f * kH;
@@ -89,8 +89,8 @@ bool fill_sphere(const vkc::Device& dev, vkc::Allocator& alloc,
       }
     }
   }
-  vkc::Result<std::uint32_t> failed = g.map().allocate(
-      coords.data(), static_cast<std::uint32_t>(coords.size()));
+  vkc::Result<std::uint32_t> failed =
+      vr_test::allocate_blocks(gpu, g.map(), coords);
   if (!failed || failed.value() != 0) {
     return false;
   }
@@ -101,9 +101,9 @@ bool fill_sphere(const vkc::Device& dev, vkc::Allocator& alloc,
   }
 
   vkc::Result<std::vector<float>> tsdf =
-      vr_test::read_attribute<float>(dev, alloc, g, "tsdf");
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, g, "tsdf");
   vkc::Result<std::vector<float>> weight =
-      vr_test::read_attribute<float>(dev, alloc, g, "weight");
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, g, "weight");
   if (!tsdf || !weight) {
     return false;
   }
@@ -128,8 +128,12 @@ bool fill_sphere(const vkc::Device& dev, vkc::Allocator& alloc,
       }
     }
   }
-  return vr_test::write_attribute(dev, alloc, g, "tsdf", tsdf.value()).ok() &&
-         vr_test::write_attribute(dev, alloc, g, "weight", weight.value()).ok();
+  return vr_test::write_attribute(gpu.device, gpu.allocator, g, "tsdf",
+                                  tsdf.value())
+             .ok() &&
+         vr_test::write_attribute(gpu.device, gpu.allocator, g, "weight",
+                                  weight.value())
+             .ok();
 }
 
 // The first `count` elements of `src`, a buffer the test holds only as a
@@ -174,7 +178,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(small_result.ok());
   vol::VoxelBlockGrid small = std::move(small_result).value();
-  CHECK(fill_sphere(gpu.device, gpu.allocator, small, 2));
+  CHECK(fill_sphere(gpu, small, 2));
 
   mesh::ExtractTimings first{};
   vkc::Result<mesh::DeviceMesh> small_mesh =
@@ -206,7 +210,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(big_result.ok());
   vol::VoxelBlockGrid big = std::move(big_result).value();
-  CHECK(fill_sphere(gpu.device, gpu.allocator, big, 6));
+  CHECK(fill_sphere(gpu, big, 6));
 
   mesh::ExtractTimings second{};
   vkc::Result<mesh::DeviceMesh> big_mesh =

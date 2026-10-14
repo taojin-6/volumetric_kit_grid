@@ -75,37 +75,37 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
 
 vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
-                    const vol::BlockList& blocks,
+                    const std::vector<vol::BlockIndex>& blocks,
                     const codec::CodecParams& params, DctBlocks& out) {
   out = DctBlocks{};
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t words = d::coefficient_words(k);
-  // The list on the device, as the encoder's sort leaves it; none for a null
-  // or empty one, which the transform refuses or takes as it is.
+  const auto count = static_cast<std::uint32_t>(blocks.size());
+  // The list on the device, as the encoder's sort leaves it; none for an
+  // empty one, which the transform takes as it is.
   vkc::Buffer list;
-  if (blocks.blocks != nullptr && blocks.count != 0) {
+  if (count != 0) {
     VKC_ASSIGN(list, vr_test::upload_device_buffer(
-                         gpu.device, gpu.allocator, blocks.blocks,
-                         blocks.count * sizeof(vol::BlockIndex)));
+                         gpu.device, gpu.allocator, blocks.data(),
+                         count * sizeof(vol::BlockIndex)));
   }
   // Where the output goes, as the encoder's reference store holds it; none
   // for params the transform refuses first, or no blocks.
   vkc::Buffer mask_out;
   vkc::Buffer coefficient_out;
-  if (params.validate().ok() && blocks.count != 0) {
+  if (params.validate().ok() && count != 0) {
     VKC_ASSIGN(mask_out, vkc::device_storage_buffer(
-                             gpu.allocator, VkDeviceSize(blocks.count) *
+                             gpu.allocator, VkDeviceSize(count) *
                                                 codec::kMaskWordsPerBlock *
                                                 sizeof(std::uint32_t)));
-    VKC_ASSIGN(coefficient_out,
-               vkc::device_storage_buffer(
-                   gpu.allocator,
-                   VkDeviceSize(blocks.count) * words * sizeof(std::uint32_t)));
+    VKC_ASSIGN(coefficient_out, vkc::device_storage_buffer(
+                                    gpu.allocator, VkDeviceSize(count) * words *
+                                                       sizeof(std::uint32_t)));
   }
   std::uint32_t rejected = 0;
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   VKC_ASSIGN(const d::ResidentBlocks resident,
-             t.record_forward(batch, grid, list, blocks.count, params, mask_out,
+             t.record_forward(batch, grid, list, count, params, mask_out,
                               coefficient_out, rejected));
   const std::size_t n = resident.count;
   std::vector<std::uint32_t> packed(n * words);
@@ -134,11 +134,11 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
 }
 
 vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
-                    vol::VoxelBlockGrid& grid, const vol::BlockList& blocks,
+                    vol::VoxelBlockGrid& grid,
+                    const std::vector<vol::BlockIndex>& blocks,
                     const DctBlocks& in) {
-  const std::size_t n = blocks.count;
-  if ((n != 0 && blocks.blocks == nullptr) ||
-      in.coefficients.size() != n * in.params.coefficient_count ||
+  const std::size_t n = blocks.size();
+  if (in.coefficients.size() != n * in.params.coefficient_count ||
       in.masks.size() != n * codec::kMaskWordsPerBlock) {
     return vkc::Status::invalid_argument(
         "codec_oracle::inverse: the coefficients and masks are not the "
@@ -153,7 +153,7 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
   // The list as given, ptrs included, which the inverse must never read.
   if (n != 0) {
     VKC_ASSIGN(vkc::Buffer list, vr_test::upload_device_buffer(
-                                     gpu.device, gpu.allocator, blocks.blocks,
+                                     gpu.device, gpu.allocator, blocks.data(),
                                      n * sizeof(vol::BlockIndex)));
     r.list = std::make_unique<vkc::Buffer>(std::move(list));
     r.blocks.list = r.list.get();
@@ -186,8 +186,7 @@ vkc::Result<std::vector<std::uint8_t>> encode(
              d::DctTransform::create(gpu.device, gpu.allocator));
   Frame frame;
   frame.voxel_size = grid.grid().voxel_size;
-  VKC_TRY(forward(gpu, *t, grid, grid.block_list(observed), config.params,
-                  frame.blocks));
+  VKC_TRY(forward(gpu, *t, grid, observed, config.params, frame.blocks));
   for (const vol::BlockIndex& b : observed) frame.coords.push_back(b.coord);
   FrameWriteOptions options;
   options.segment_size = config.segment_size;

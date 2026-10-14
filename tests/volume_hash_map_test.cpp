@@ -3,11 +3,11 @@
 
 // GPU test for the sparse voxel hash map: build a VoxelHashMap, allocate a
 // known set of block coordinates, compact the active set, and verify it
-// round-trips -- including reading the raw HashEntry slots back to prove the
-// host<->shader scalar-layout ABI matches on-device (both `pos` @4 and, via a
-// second collision-forcing table, the overflow-chain `offset` @16). Also checks
-// distinct heap slots, idempotent re-alloc, clear, allocation from a device
-// list as from a host one, and move semantics. This exercises the real driver
+// round-trips -- including, on collision-forcing tables whose coords the
+// device confirms share a bucket, blocks found again only by walking their
+// overflow chain. Also checks distinct heap slots,
+// idempotent re-alloc, clear, the device-list allocate's own cases, and move
+// semantics. This exercises the real driver
 // (MoltenVK on Apple, the NVIDIA ICD on the Linux CI box); it exits 0 (skip)
 // where no device is present.
 
@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "buffer_readback.hpp"
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -40,8 +41,7 @@ namespace {
 using Coord = std::tuple<int, int, int>;
 
 // Find `n` distinct block coords that all hash to `target_bucket`, so they land
-// in one primary bucket and its collision chain. Mirrors the helper in
-// volume_diagnostics_test.cpp, and bounded for the same reason: an open
+// in one primary bucket and its collision chain. Bounded, because an open
 // `for (int x = 1; out.size() < n; ++x)` terminates only by success, so
 // changing a hash prime, a bucket count, or the fixed y/z pair turns a failing
 // test into an infinite loop with signed-overflow UB instead of a red build. A
@@ -89,10 +89,9 @@ std::set<int> active_ptrs(vol::VoxelHashMap& map) {
   return out;
 }
 
-// allocate() from a device list does what it does from a host one: duplicate,
-// present and new entries, never an entry past the count, the heap's blocks
-// back, a cached list stale only when a block is taken, the refusals, rounds
-// under contention, and the capacity split.
+// allocate() from a device list: duplicate, present and new entries, never an
+// entry past the count, the heap's blocks back, a cached list stale only when
+// a block is taken, the refusals, and rounds under contention.
 int device_allocate_case(vr_test::GpuContext& gpu,
                          const vol::VoxelGridParams& grid) {
   vkc::Result<vol::VoxelHashMap> made =
@@ -111,7 +110,7 @@ int device_allocate_case(vr_test::GpuContext& gpu,
   };
   // Two present, three new, one new twice, and a live entry past the count.
   const std::vector<vol::BlockIndex> present = {at(1, 1, 1), at(2, 1, 1)};
-  CHECK(map.allocate(present.data(), 2).value() == 0);
+  CHECK(vr_test::allocate_blocks(gpu, map, present.data(), 2).value() == 0);
   const std::vector<vol::BlockIndex> list = {
       at(1, 1, 1), at(3, 1, 1), at(4, 1, 1), at(2, 1, 1),
       at(5, 1, 1), at(4, 1, 1), at(9, 9, 9)};
@@ -139,7 +138,7 @@ int device_allocate_case(vr_test::GpuContext& gpu,
   // The heap's blocks back: removed, then allocated from the device list,
   // they take the indices they had.
   const std::set<int> ptrs_before = active_ptrs(map);
-  CHECK(map.remove(list.data() + 1, 2).value() == 0);
+  CHECK(vr_test::remove_blocks(gpu, map, list.data() + 1, 2).value() == 0);
   failed = map.allocate(device_list.value(), count);
   CHECK(failed.ok() && failed.value() == 0);
   CHECK(active_ptrs(map) == ptrs_before);
@@ -166,9 +165,9 @@ int device_allocate_case(vr_test::GpuContext& gpu,
         vkc::Status::Code::InvalidArgument);
   CHECK(map.check_device_block_list(cached.value(), "test").ok());
 
-  // Contention: seven blocks of one bucket in one call, from the host and
-  // from the device alike. Whatever lock races a round loses, a call places
-  // all seven or reports lock failures alone, which another call clears.
+  // Contention: seven blocks of one bucket in one call, on four fresh maps.
+  // Whatever lock races a round loses, a call places all seven or reports
+  // lock failures alone, which another call clears.
   vol::VoxelGridParams cg = grid;
   cg.bucket_size = 4;
   cg.num_buckets = 8;
@@ -179,15 +178,14 @@ int device_allocate_case(vr_test::GpuContext& gpu,
   CHECK(colliding.size() == 7);
   vkc::Result<vkc::Buffer> colliding_list = upload(colliding);
   CHECK(colliding_list.ok());
-  for (const bool on_device : {false, true, false, true}) {
+  for (int fresh = 0; fresh < 4; ++fresh) {
     vkc::Result<vol::VoxelHashMap> c =
         vol::VoxelHashMap::create(gpu.device, gpu.allocator, cg);
     CHECK(c.ok());
     vol::AllocFailures why{};
     for (int call = 0; call < 8; ++call) {
       vkc::Result<std::uint32_t> f =
-          on_device ? c.value().allocate(colliding_list.value(), 7, &why)
-                    : c.value().allocate(colliding.data(), 7, &why);
+          c.value().allocate(colliding_list.value(), 7, &why);
       CHECK(f.ok());
       CHECK(f.value() == 0 || (why.lock > 0 && !why.capacity_limited()));
       if (f.value() == 0) break;
@@ -195,32 +193,6 @@ int device_allocate_case(vr_test::GpuContext& gpu,
     CHECK(active_coords(c.value()).size() == 7);
   }
 
-  // Capacity: the split the host overload gives, on a table of two buckets
-  // of two -- the overflow sweep finds no free non-anchor slot (table), then,
-  // once the last block is taken, the heap is empty (heap).
-  vol::VoxelGridParams tg = grid;
-  tg.bucket_size = 2;
-  tg.num_buckets = 2;
-  tg.num_blocks = 4;
-  tg.max_chain = 8;
-  vkc::Result<vol::VoxelHashMap> t =
-      vol::VoxelHashMap::create(gpu.device, gpu.allocator, tg);
-  CHECK(t.ok());
-  const std::vector<vol::BlockIndex> b0 = coords_in_bucket(0, 2, 4);
-  const std::vector<vol::BlockIndex> b1 = coords_in_bucket(1, 2, 1);
-  CHECK(b0.size() == 4 && b1.size() == 1);
-  for (std::size_t i = 0; i < 3; ++i) {
-    CHECK(t.value().allocate(&b0[i], 1).value() == 0);
-  }
-  vkc::Result<vkc::Buffer> fourth = upload({b0[3]});
-  CHECK(fourth.ok());
-  vol::AllocFailures tf{};
-  vkc::Result<std::uint32_t> f4 = t.value().allocate(fourth.value(), 1, &tf);
-  CHECK(f4.ok() && f4.value() > 0 && tf.table > 0 && tf.heap == 0);
-  CHECK(t.value().allocate(&b1[0], 1).value() == 0);
-  vol::AllocFailures hf{};
-  vkc::Result<std::uint32_t> f6 = t.value().allocate(fourth.value(), 1, &hf);
-  CHECK(f6.ok() && f6.value() > 0 && hf.heap > 0 && hf.table == 0);
   return 0;
 }
 
@@ -262,14 +234,14 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   // Allocate; every insert should succeed.
   vkc::Result<std::uint32_t> failures =
-      map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
+      vr_test::allocate_blocks(gpu, map, coords);
   CHECK(failures.ok());
   CHECK(failures.value() == 0);
 
   // Idempotent: re-inserting the same coords allocates nothing new and fails
   // nothing (the block-exists fast path dedups).
   vkc::Result<std::uint32_t> failures2 =
-      map.allocate(coords.data(), static_cast<std::uint32_t>(coords.size()));
+      vr_test::allocate_blocks(gpu, map, coords);
   CHECK(failures2.ok() && failures2.value() == 0);
 
   // Compact: exactly the input set comes back, each block drawing a DISTINCT
@@ -315,22 +287,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(map.compact_active_blocks().ok());
   CHECK(!map.check_device_block_list(on_device.value(), "test").ok());
 
-  // Scalar-ABI round-trip: read the raw HashEntry slots. Exactly 27 are
-  // occupied, each pos is one of the inputs (proving `pos` lands at the host
-  // offset the shader wrote), and each ptr is a whole block (a multiple of
-  // voxels_per_block).
-  vkc::Result<std::vector<vol::HashEntry>> entries = map.read_entries();
-  CHECK(entries.ok());
-  int occupied = 0;
-  for (const vol::HashEntry& entry : entries.value()) {
-    if (entry.ptr != vol::kFreeEntry && entry.ptr != vol::kLockEntry) {
-      ++occupied;
-      CHECK(want.count({entry.pos.x, entry.pos.y, entry.pos.z}) == 1);
-      CHECK(entry.ptr % grid.voxels_per_block == 0);
-    }
-  }
-  CHECK(occupied == static_cast<int>(want.size()));
-
   // clear() empties the table.
   CHECK(map.clear().ok());
   vkc::Result<std::vector<vol::BlockIndex>> after_clear =
@@ -350,11 +306,11 @@ int gpu_main(vr_test::GpuContext& gpu) {
         vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
     CHECK(lmap_result.ok());
     vol::VoxelHashMap lmap = std::move(lmap_result).value();
-    CHECK(lmap.allocate(coords.data(), n).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, lmap, coords.data(), n).value() == 0);
     vkc::Result<vol::DeviceBlockList> before_remove =
         lmap.compact_active_blocks_on_device();
     CHECK(before_remove.ok() && before_remove.value().count == want.size());
-    CHECK(lmap.remove(coords.data(), 1).ok());
+    CHECK(vr_test::remove_blocks(gpu, lmap, coords.data(), 1).ok());
     CHECK(!lmap.check_device_block_list(before_remove.value(), "test").ok());
     vkc::Result<vol::DeviceBlockList> before_resize =
         lmap.compact_active_blocks_on_device();
@@ -372,12 +328,12 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vkc::Result<vol::DeviceBlockList> again =
         lmap.compact_active_blocks_on_device();
     CHECK(again.ok() && again.value().serial == fresh.value().serial);
-    CHECK(lmap.allocate(coords.data(), n).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, lmap, coords.data(), n).value() == 0);
     CHECK(!lmap.check_device_block_list(fresh.value(), "test").ok());
     vkc::Result<vol::DeviceBlockList> regrown =
         lmap.compact_active_blocks_on_device();
     CHECK(regrown.ok() && regrown.value().count == want.size());
-    CHECK(lmap.allocate(coords.data(), n).value() == 0);
+    CHECK(vr_test::allocate_blocks(gpu, lmap, coords.data(), n).value() == 0);
     CHECK(lmap.check_device_block_list(regrown.value(), "test").ok());
   }
 
@@ -386,8 +342,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // it exercises neither the overflow chain nor the HashEntry.offset field (all
   // offsets stay kNoOffset). Build a second map on a tiny table and force many
   // coords into ONE bucket so the allocator spills into the collision chain,
-  // then prove the chain round-trips -- i.e. `offset` lands at its
-  // scalar-layout byte (@16) and is traversable on-device.
+  // then prove the chain is traversable on-device.
   {
     vol::VoxelGridParams cg{};
     cg.voxel_size = 0.005f;
@@ -410,6 +365,13 @@ int gpu_main(vr_test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> cc =
         coords_in_bucket(0, cg.num_buckets, kColliding);
     CHECK(cc.size() == kColliding);
+    // The device agrees they share a bucket: a table of this shape that may
+    // not chain refuses the three past its four slots. hash_bucket chose them,
+    // so a GLSL hash drifted from it would scatter them, build no chain, and
+    // leave every check below passing.
+    vkc::Result<std::uint32_t> crefused = vr_test::chain_refusals(gpu, cg, cc);
+    CHECK(crefused.ok() &&
+          crefused.value() == kColliding - std::size_t(cg.bucket_size));
     std::set<Coord> cwant;
     for (const vol::BlockIndex& block : cc) {
       cwant.insert({block.coord.x, block.coord.y, block.coord.z});
@@ -421,7 +383,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     // build the chain deterministically one coord at a time -- exactly the
     // cross-dispatch retry the host is expected to do.
     for (const vol::BlockIndex& block : cc) {
-      vkc::Result<std::uint32_t> f = cmap.allocate(&block, 1);
+      vkc::Result<std::uint32_t> f =
+          vr_test::allocate_blocks(gpu, cmap, &block, 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -439,21 +402,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(cgot == cwant);
     CHECK(cptrs.size() == cwant.size());
 
-    // The chain is real: bucket 0's anchor (the last slot of its bucket) must
-    // carry a non-zero offset -- i.e. the surplus coords were linked through
-    // HashEntry.offset, proving that field round-trips at its scalar-layout
-    // byte (the 3x3x3 test, all offsets kNoOffset, never checks it).
-    vkc::Result<std::vector<vol::HashEntry>> centries = cmap.read_entries();
-    CHECK(centries.ok());
-    const std::size_t anchor =
-        static_cast<std::size_t>((0 + 1) * cg.bucket_size - 1);
-    CHECK(centries.value()[anchor].offset != vol::kNoOffset);
-
     // Idempotent under collisions: re-inserting the same coords must find the
     // chained ones by TRAVERSING `offset` and allocate nothing new -- if offset
     // were mis-read the chained coords would be re-inserted and the count grow.
-    vkc::Result<std::uint32_t> cfail2 =
-        cmap.allocate(cc.data(), static_cast<std::uint32_t>(cc.size()));
+    vkc::Result<std::uint32_t> cfail2 = vr_test::allocate_blocks(gpu, cmap, cc);
     CHECK(cfail2.ok() && cfail2.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> cactive2 =
         cmap.compact_active_blocks();
@@ -504,12 +456,19 @@ int gpu_main(vr_test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> deep =
         coords_in_bucket(0, pg.num_buckets, kDeepChain);
     CHECK(deep.size() == kDeepChain);
+    // The device must agree they share bucket 0, or the chain is never deep:
+    // where it may not grow, all but the bucket's eight slots are refused.
+    vkc::Result<std::uint32_t> prefused =
+        vr_test::chain_refusals(gpu, pg, deep);
+    CHECK(prefused.ok() &&
+          prefused.value() == kDeepChain - std::size_t(pg.bucket_size));
 
     // One per dispatch, as above: a single dispatch of same-bucket coords
     // contends the spin lock and legitimately reports retryable failures, which
     // would muddle what this is measuring.
     for (const vol::BlockIndex& block : deep) {
-      vkc::Result<std::uint32_t> f = pmap.allocate(&block, 1);
+      vkc::Result<std::uint32_t> f =
+          vr_test::allocate_blocks(gpu, pmap, &block, 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -531,20 +490,15 @@ int gpu_main(vr_test::GpuContext& gpu) {
     // ONE dispatch has to find every one of them by hopping the chain, so a bad
     // link re-inserts instead and the count grows.
     vkc::Result<std::uint32_t> prefail =
-        pmap.allocate(deep.data(), static_cast<std::uint32_t>(deep.size()));
+        vr_test::allocate_blocks(gpu, pmap, deep);
     CHECK(prefail.ok() && prefail.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> pactive2 =
         pmap.compact_active_blocks();
     CHECK(pactive2.ok());
     CHECK(pactive2.value().size() == kDeepChain);
 
-    vkc::Result<std::vector<vol::HashEntry>> pentries = pmap.read_entries();
-    CHECK(pentries.ok());
-    const auto panchor = static_cast<std::size_t>(pg.bucket_size - 1);
-    CHECK(pentries.value()[panchor].offset != vol::kNoOffset);
-
-    // Occupancy is readable without the O(total slots) diagnostics scan -- the
-    // cheap signal a caller needs to grow *before* it starts failing.
+    // Occupancy is a constant-time read -- the cheap signal a caller needs to
+    // grow *before* it starts failing.
     vkc::Result<float> plf = pmap.load_factor();
     CHECK(plf.ok());
     CHECK(plf.value() > 0.14f && plf.value() < 0.15f);  // 300 / 2048
@@ -578,7 +532,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     // block is left on the heap and one slot is free, but that slot is bucket
     // 1's anchor.
     for (std::size_t i = 0; i < 3; ++i) {
-      vkc::Result<std::uint32_t> f = tmap.allocate(&b0[i], 1);
+      vkc::Result<std::uint32_t> f =
+          vr_test::allocate_blocks(gpu, tmap, &b0[i], 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -590,7 +545,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vkc::Result<float> tlf = tmap.load_factor();
     CHECK(tlf.ok() && tlf.value() < 1.0f);
     vol::AllocFailures tf{};
-    vkc::Result<std::uint32_t> f4 = tmap.allocate(&b0[3], 1, &tf);
+    vkc::Result<std::uint32_t> f4 =
+        vr_test::allocate_blocks(gpu, tmap, &b0[3], 1, &tf);
     CHECK(f4.ok() && f4.value() > 0);
     CHECK(tf.table > 0);
     CHECK(tf.heap == 0);
@@ -599,7 +555,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     // Fill that last anchor through bucket 1's primary path, emptying the heap.
     std::vector<vol::BlockIndex> b1 = coords_in_bucket(1, tg.num_buckets, 1);
     CHECK(b1.size() == 1);
-    vkc::Result<std::uint32_t> f5 = tmap.allocate(&b1[0], 1);
+    vkc::Result<std::uint32_t> f5 =
+        vr_test::allocate_blocks(gpu, tmap, &b1[0], 1);
     CHECK(f5.ok() && f5.value() == 0);
     vkc::Result<float> tfull = tmap.load_factor();
     CHECK(tfull.ok() && tfull.value() == 1.0f);
@@ -612,7 +569,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     // early-out the sweep runs to exhaustion and reports `table` here, failing
     // the pair.
     vol::AllocFailures hf{};
-    vkc::Result<std::uint32_t> f6 = tmap.allocate(&b0[3], 1, &hf);
+    vkc::Result<std::uint32_t> f6 =
+        vr_test::allocate_blocks(gpu, tmap, &b0[3], 1, &hf);
     CHECK(f6.ok() && f6.value() > 0);
     CHECK(hf.heap > 0);
     CHECK(hf.table == 0);
@@ -624,7 +582,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // Move-construct: the source empties, the destination lives. A device list
   // compacted before the move is refused by the map it moved into, and the
   // moved-from map compacts nothing.
-  CHECK(map.allocate(coords.data(), n).value() == 0);
+  CHECK(vr_test::allocate_blocks(gpu, map, coords.data(), n).value() == 0);
   vkc::Result<vol::DeviceBlockList> before_move =
       map.compact_active_blocks_on_device();
   CHECK(before_move.ok() && before_move.value().count == want.size());
@@ -665,8 +623,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   std::printf(
       "recon volume hash-map test passed: allocated + compacted %zu blocks; "
-      "HashEntry scalar-layout round-trip (incl. overflow-chain offset) "
-      "matched on-device\n",
+      "chained blocks found again through their overflow chains\n",
       want.size());
   return 0;
 }

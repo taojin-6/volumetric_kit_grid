@@ -320,8 +320,8 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   for (std::size_t i = 0; i < dropped.size(); ++i) {
     dropped[i].coord = after_b.value().coords[i * 5];
   }
-  vkc::Result<std::uint32_t> removed = gb.value().remove(
-      dropped.data(), static_cast<std::uint32_t>(dropped.size()));
+  vkc::Result<std::uint32_t> removed =
+      vr_test::remove_blocks(gpu, gb.value(), dropped);
   CHECK(removed.ok() && removed.value() == 0);
   vkc::Result<Bytes> fsub = encode_with(gpu, gb.value());
   CHECK(fsub.ok());
@@ -417,7 +417,7 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   vkc::Result<vol::VoxelBlockGrid> gt = make_grid(gpu, tiny);
   CHECK(gt.ok());
   vol::VoxelBlockGrid small = std::move(gt).value();
-  CHECK(allocate(small, {{0, 0, 0}, {1, 0, 0}}).ok());
+  CHECK(allocate(gpu, small, {{0, 0, 0}, {1, 0, 0}}).ok());
   CHECK(write_sphere(gpu, small, Sphere{vr::Vec3f(0.02f, 0.02f, 0.02f), 0.02f})
             .ok());
   vkc::Result<Snapshot> small_before = snapshot(gpu, small);
@@ -469,7 +469,7 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
   for (int i = 0; i < 16; ++i) {
     coords.push_back(vr::Vec3i(i % 4, i / 4, 0));
   }
-  CHECK(allocate(src, coords).ok());
+  CHECK(allocate(gpu, src, coords).ok());
   CHECK(write_sphere(gpu, src, Sphere{vr::Vec3f(0.08f, 0.08f, 0.02f), 0.05f})
             .ok());
   vkc::Result<Snapshot> src_snap = snapshot(gpu, src);

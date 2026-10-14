@@ -27,6 +27,7 @@
 #include "codec_oracle_device.hpp"
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
+#include "device_blocks.hpp"
 #include "grid_readback.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
@@ -90,14 +91,13 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(
 // Allocate blocks (i, 0, 0) for i in [0, count) and return the compacted set
 // sorted by x, so entry i is block i whatever order the compaction produced.
 vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
-    vol::VoxelBlockGrid& grid, int count) {
+    const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) {
     coords[static_cast<std::size_t>(i)].coord = vr::Vec3i(i, 0, 0);
   }
   VKC_ASSIGN(std::uint32_t failed,
-             grid.map().allocate(coords.data(),
-                                 static_cast<std::uint32_t>(coords.size())));
+             vr_test::allocate_blocks(ctx, grid.map(), coords));
   if (failed != 0) {
     return vkc::Status::invalid_argument("allocate_row: allocation failed");
   }
@@ -334,7 +334,7 @@ int forward_matches_reference_case(vkc::Device& device,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 4);
   CHECK(active.ok() && active.value().size() == 4);
   const std::vector<vol::BlockIndex>& blocks = active.value();
   const Cube content[4] = {random_cube(1), plane_cube(), sphere_cube(),
@@ -350,8 +350,7 @@ int forward_matches_reference_case(vkc::Device& device,
     params.quantization_weights[i] = 1.0f + 0.25f * float((i * 37) % 8);
   }
   DctBlocks out;
-  CHECK(
-      oracle::forward(ctx, t, grid, grid.block_list(blocks), params, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, out).ok());
   CHECK(out.coefficients.size() == 4u * kVpb);
   CHECK(out.masks.size() == 4u * codec::kMaskWordsPerBlock);
   // The params and the band travel with the coefficients.
@@ -374,11 +373,10 @@ int forward_matches_reference_case(vkc::Device& device,
   // from every row on the way out and put back on the way in, whatever the
   // row, so each block still matches the reference both ways.
   params.coefficient_count = 35;
-  CHECK(
-      oracle::forward(ctx, t, grid, grid.block_list(blocks), params, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, out).ok());
   CHECK(out.coefficients.size() == 4u * 35u);
   CHECK(check_against_reference(out, content, 4, exact, near_half) == 0);
-  CHECK(oracle::inverse(ctx, t, grid, grid.block_list(blocks), out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
   for (int i = 0; i < 4; ++i) {
     const Cube want = reference_round_trip(content[i], params);
     CHECK(rms_diff(read_block(ctx, grid, blocks[std::size_t(i)]), want) <=
@@ -396,10 +394,10 @@ int per_basis_sequence_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
-  const vol::BlockList list = grid.block_list(active.value());
+  const std::vector<vol::BlockIndex>& list = active.value();
   Cube spectral{};
   spectral[0] = 0.47;
   spectral[1] = 1.37;
@@ -458,7 +456,7 @@ int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 4);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   Cube content[4];
@@ -474,9 +472,8 @@ int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
     params.quantization_weights[i] = 1.0f + 0.125f * float(i % 9);
   }
   DctBlocks out;
-  const vol::BlockList list = grid.block_list(blocks);
-  CHECK(oracle::forward(ctx, t, grid, list, params, out).ok());
-  CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
 
   double squared_steps = 0.0;
   for (float weight : params.quantization_weights) {
@@ -509,7 +506,7 @@ int truncation_matches_reference_case(vkc::Device& device,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   const Cube content = plane_cube();
@@ -525,7 +522,7 @@ int truncation_matches_reference_case(vkc::Device& device,
     params.coefficient_count = k;
     params.quantization_scale = codec::kMinStep;
     DctBlocks out;
-    const vol::BlockList list = grid.block_list(active.value());
+    const std::vector<vol::BlockIndex>& list = active.value();
     CHECK(oracle::forward(ctx, t, grid, list, params, out).ok());
     CHECK(out.coefficients.size() == k);
     CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
@@ -553,7 +550,7 @@ int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 cycles through: none, below the threshold, at it, well above.
@@ -566,8 +563,7 @@ int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
 
   codec::CodecParams params;
   DctBlocks out;
-  const vol::BlockList list = grid.block_list(blocks);
-  CHECK(oracle::forward(ctx, t, grid, list, params, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, out).ok());
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     const bool bit =
         ((out.masks[v / codec::kMaskWordBits] >> (v % codec::kMaskWordBits)) &
@@ -601,7 +597,7 @@ int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   }
   put(ctx, grid, "tsdf", tsdf);
   put(ctx, grid, "weight", weight);
-  CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
   tsdf = attr(ctx, grid, "tsdf");
   weight = attr(ctx, grid, "weight");
   for (std::size_t i = 0; i < 2; ++i) {
@@ -628,18 +624,17 @@ int constant_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 2);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 2);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   write_block(ctx, grid, blocks[0], constant_cube(0.3), observed);
   write_block(ctx, grid, blocks[1], constant_cube(1.0), observed);
-  const vol::BlockList list = grid.block_list(blocks);
 
   codec::CodecParams full;
   full.coefficient_count = kVpb;
   full.quantization_scale = codec::kMinStep;
   DctBlocks out;
-  CHECK(oracle::forward(ctx, t, grid, list, full, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, full, out).ok());
   for (std::size_t i = 0; i < 2; ++i) {
     for (std::uint32_t j = 1; j < kVpb; ++j) {
       CHECK(out.coefficients[i * kVpb + j] == 0);
@@ -654,9 +649,9 @@ int constant_case(vkc::Device& device, vkc::Allocator& allocator,
   codec::CodecParams dc_only;
   dc_only.coefficient_count = 1;
   dc_only.quantization_scale = 0.01f;
-  CHECK(oracle::forward(ctx, t, grid, list, dc_only, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, dc_only, out).ok());
   CHECK(out.coefficients.size() == 2);
-  CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
   const Cube back = read_block(ctx, grid, blocks[0]);
   const double tol = 0.01 / (2.0 * std::sqrt(double(kVpb))) + 1e-6;
   for (double s : back) {
@@ -675,7 +670,7 @@ int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   Cube edge{};
@@ -688,7 +683,7 @@ int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
   params.coefficient_count = 4;
   params.quantization_scale = codec::kMinStep;
   DctBlocks out;
-  const vol::BlockList list = grid.block_list(active.value());
+  const std::vector<vol::BlockIndex>& list = active.value();
   CHECK(oracle::forward(ctx, t, grid, list, params, out).ok());
   // The unclamped reconstruction does overshoot -- the premise of the case.
   Cube kept{};
@@ -726,7 +721,7 @@ int partial_block_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 1);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 1);
   CHECK(active.ok());
   const vol::BlockIndex block = active.value()[0];
   // A tilted surface, normalized over a band of 4 voxels.
@@ -749,7 +744,7 @@ int partial_block_case(vkc::Device& device, vkc::Allocator& allocator,
   params.coefficient_count = 32;
   params.quantization_scale = 0.05f;
   params.quantization_weights[0] = 5.0f;
-  const vol::BlockList list = grid.block_list(active.value());
+  const std::vector<vol::BlockIndex>& list = active.value();
   DctBlocks out;
   CHECK(oracle::forward(ctx, t, grid, list, params, out).ok());
   const Cube filled = reference_fill(fused, obs);
@@ -786,7 +781,7 @@ int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   std::vector<vol::BlockIndex> blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {
@@ -796,11 +791,10 @@ int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
   codec::CodecParams params;
   DctBlocks a;
   DctBlocks b;
-  CHECK(oracle::forward(ctx, t, grid, grid.block_list(blocks), params, a).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, a).ok());
   const std::vector<vol::BlockIndex> rotated = {blocks[2], blocks[0],
                                                 blocks[1]};
-  CHECK(
-      oracle::forward(ctx, t, grid, grid.block_list(rotated), params, b).ok());
+  CHECK(oracle::forward(ctx, t, grid, rotated, params, b).ok());
   const std::size_t k = params.coefficient_count;
   const std::size_t from[3] = {2, 0, 1};
   for (std::size_t i = 0; i < 3; ++i) {
@@ -826,7 +820,8 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 10);
+  vkc::Result<std::vector<vol::BlockIndex>> active =
+      allocate_row(ctx, grid, 10);
   CHECK(active.ok() && active.value().size() == 10);
   const std::vector<vol::BlockIndex>& blocks = active.value();
   std::vector<Cube> content;
@@ -834,7 +829,6 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
     content.push_back(random_cube(200u + std::uint32_t(i)));
     write_block(ctx, grid, blocks[i], content.back(), observed);
   }
-  const vol::BlockList list = grid.block_list(blocks);
   codec::CodecParams params;
   DctBlocks one;
   DctBlocks many;
@@ -842,7 +836,7 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   // the single run: a freed buffer VMA hands straight back still holds the
   // previous run's output, so equality alone passes a batch that wrote
   // nothing past its first entries.
-  CHECK(oracle::forward(ctx, batched, grid, list, params, many).ok());
+  CHECK(oracle::forward(ctx, batched, grid, blocks, params, many).ok());
   int exact = 0;
   int near_half = 0;
   CHECK(check_against_reference(many, content.data(), content.size(), exact,
@@ -850,12 +844,12 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   for (std::uint32_t m : many.masks) {
     CHECK(m == 0xFFFFFFFFu);
   }
-  CHECK(oracle::forward(ctx, t, grid, list, params, one).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, one).ok());
   CHECK(one.coefficients == many.coefficients);
   CHECK(one.masks == many.masks);
 
   // The inverse too: every block of the last, partial batch is written.
-  CHECK(oracle::inverse(ctx, t, grid, list, one).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, one).ok());
   std::vector<Cube> single;
   for (const vol::BlockIndex& b : blocks) {
     single.push_back(read_block(ctx, grid, b));
@@ -867,7 +861,7 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
     }
   }
   put(ctx, grid, "tsdf", tsdf);
-  CHECK(oracle::inverse(ctx, batched, grid, list, many).ok());
+  CHECK(oracle::inverse(ctx, batched, grid, blocks, many).ok());
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     CHECK(read_block(ctx, grid, blocks[i]) == single[i]);
   }
@@ -896,7 +890,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex> blocks = active.value();
   for (const vol::BlockIndex& b : blocks) {
@@ -908,21 +902,20 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   out.masks = {4, 5};
 
   // An empty list is a no-op success, and it empties the outputs.
-  CHECK(oracle::forward(ctx, t, grid, vol::BlockList{}, params, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, {}, params, out).ok());
   CHECK(out.coefficients.empty() && out.masks.empty());
   CHECK(out.trunc_dist == kTrunc);
-  CHECK(oracle::inverse(ctx, t, grid, vol::BlockList{}, out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, {}, out).ok());
 
   // Invalid params.
   codec::CodecParams bad = params;
   bad.coefficient_count = 0;
-  CHECK(!oracle::forward(ctx, t, grid, grid.block_list(blocks), bad, out).ok());
+  CHECK(!oracle::forward(ctx, t, grid, blocks, bad, out).ok());
 
   // No list with a count, and a list shorter than its count, or not a
   // storage buffer.
-  vol::BlockList null_list{nullptr, 3, grid.topology_epoch()};
-  CHECK(!oracle::forward(ctx, t, grid, null_list, params, out).ok());
   {
+    vkc::Buffer none;
     vkc::Result<vkc::Buffer> two = vr_test::upload_device_buffer(
         device, allocator, blocks.data(), 2 * sizeof(vol::BlockIndex));
     CHECK(two.ok());
@@ -939,7 +932,8 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
         3 * codec::detail::coefficient_words(params.coefficient_count) *
             sizeof(std::uint32_t));
     CHECK(masks.ok() && coefficients.ok());
-    for (const vkc::Buffer* list : {&two.value(), &transfer_only.value()}) {
+    for (const vkc::Buffer* list :
+         {&none, &two.value(), &transfer_only.value()}) {
       std::uint32_t rejected = 0;
       vkc::CommandBatch batch(device, allocator);
       const vkc::Status s =
@@ -972,16 +966,14 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   // More blocks than the heap.
   const std::vector<vol::BlockIndex> too_many(
       std::size_t(grid.grid().num_blocks) + 1, blocks[0]);
-  CHECK(!oracle::forward(ctx, t, grid, grid.block_list(too_many), params, out)
-             .ok());
+  CHECK(!oracle::forward(ctx, t, grid, too_many, params, out).ok());
 
   // Every entry is found by its coord and its ptr never read, so a ptr
   // outside the heap, negative, off a block boundary, a free slot, or another
   // block's transforms the coord's own block, and none of them can make a
   // kernel read or write where it should not.
   DctBlocks honest;
-  CHECK(oracle::forward(ctx, t, grid, grid.block_list(blocks), params, honest)
-            .ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, honest).ok());
   const std::int32_t unused = free_ptr(grid, blocks);
   CHECK(unused >= 0);
   const std::int32_t vpb = std::int32_t(kVpb);
@@ -990,8 +982,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   for (std::int32_t p : bad_ptrs) {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = p;
-    CHECK(oracle::forward(ctx, t, grid, grid.block_list(forged), params, out)
-              .ok());
+    CHECK(oracle::forward(ctx, t, grid, forged, params, out).ok());
     CHECK(out.coefficients == honest.coefficients);
     CHECK(out.masks == honest.masks);
   }
@@ -999,8 +990,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   std::vector<vol::BlockIndex> absent = blocks;
   absent[1].coord = vr::Vec3i(99, 99, 99);
   out.coefficients = {1};
-  CHECK(!oracle::forward(ctx, t, grid, grid.block_list(absent), params, out)
-             .ok());
+  CHECK(!oracle::forward(ctx, t, grid, absent, params, out).ok());
   CHECK(out.coefficients.empty());
 
   // The inverse writes nothing for such a coord, and nothing at a forged
@@ -1018,7 +1008,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
       }
     }
     put(ctx, grid, "tsdf", tsdf);
-    CHECK(!oracle::inverse(ctx, t, grid, grid.block_list(forged), honest).ok());
+    CHECK(!oracle::inverse(ctx, t, grid, forged, honest).ok());
     tsdf = attr(ctx, grid, "tsdf");
     const std::vector<float> weight = attr(ctx, grid, "weight");
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -1035,8 +1025,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   {
     DctBlocks bad_params = out;
     bad_params.params.quantization_weights[0] = 0.0f;
-    CHECK(!oracle::inverse(ctx, t, grid, grid.block_list(blocks), bad_params)
-               .ok());
+    CHECK(!oracle::inverse(ctx, t, grid, blocks, bad_params).ok());
   }
 
   // Resident blocks the inverse cannot bind: missing buffers, or ones too
@@ -1066,13 +1055,13 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   // A list compacted before a remove() names a block the grid no longer
   // holds, at a ptr still in range: its coord finds none, so both directions
   // refuse it.
-  const vol::BlockList stale = grid.block_list(blocks);
   vol::BlockIndex gone{};
   gone.coord = blocks[0].coord;
-  vkc::Result<std::uint32_t> removed = grid.remove(&gone, 1);
+  vkc::Result<std::uint32_t> removed =
+      vr_test::remove_blocks(ctx, grid, &gone, 1);
   CHECK(removed.ok());
-  CHECK(!oracle::forward(ctx, t, grid, stale, params, out).ok());
-  CHECK(!oracle::inverse(ctx, t, grid, stale, out).ok());
+  CHECK(!oracle::forward(ctx, t, grid, blocks, params, out).ok());
+  CHECK(!oracle::inverse(ctx, t, grid, blocks, out).ok());
 
   // A grid with another block size.
   vkc::Result<vol::VoxelBlockGrid> g4 = make_grid(device, allocator, 4);
@@ -1080,13 +1069,11 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   vol::VoxelBlockGrid grid4 = std::move(g4).value();
   std::vector<vol::BlockIndex> one(1);
   one[0].coord = vr::Vec3i(0, 0, 0);
-  CHECK(grid4.map().allocate(one.data(), 1).ok());
+  CHECK(vr_test::allocate_blocks(ctx, grid4.map(), one).ok());
   vkc::Result<std::vector<vol::BlockIndex>> active4 =
       grid4.map().compact_active_blocks();
   CHECK(active4.ok());
-  CHECK(!oracle::forward(ctx, t, grid4, grid4.block_list(active4.value()),
-                         params, out)
-             .ok());
+  CHECK(!oracle::forward(ctx, t, grid4, active4.value(), params, out).ok());
 
   // A grid without a weight attribute -- refused for an empty list too, before
   // anything is allocated, rather than only once there is work to bind.
@@ -1094,18 +1081,16 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
       make_grid(device, allocator, codec::kBlockSize, false);
   CHECK(gw.ok());
   vol::VoxelBlockGrid no_weight = std::move(gw).value();
-  CHECK(no_weight.map().allocate(one.data(), 1).ok());
+  CHECK(vr_test::allocate_blocks(ctx, no_weight.map(), one).ok());
   vkc::Result<std::vector<vol::BlockIndex>> active_w =
       no_weight.map().compact_active_blocks();
   CHECK(active_w.ok());
-  CHECK(!oracle::forward(ctx, t, no_weight,
-                         no_weight.block_list(active_w.value()), params, out)
-             .ok());
   CHECK(
-      !oracle::forward(ctx, t, no_weight, vol::BlockList{}, params, out).ok());
+      !oracle::forward(ctx, t, no_weight, active_w.value(), params, out).ok());
+  CHECK(!oracle::forward(ctx, t, no_weight, {}, params, out).ok());
   DctBlocks none;
   none.trunc_dist = kTrunc;
-  CHECK(!oracle::inverse(ctx, t, no_weight, vol::BlockList{}, none).ok());
+  CHECK(!oracle::inverse(ctx, t, no_weight, {}, none).ok());
   return 0;
 }
 
@@ -1128,7 +1113,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 4);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 4);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   // Block 0 all observed; 1 none; 2 one voxel at the threshold; 3 one voxel
@@ -1184,7 +1169,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   // A list an allocation has made stale is refused.
   std::vector<vol::BlockIndex> one(1);
   one[0].coord = vr::Vec3i(9, 9, 9);
-  CHECK(grid.map().allocate(one.data(), 1).ok());
+  CHECK(vr_test::allocate_blocks(ctx, grid.map(), one).ok());
   CHECK(!t.observed(grid, list.value()).ok());
 
   // An empty list keeps nothing.
@@ -1202,7 +1187,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   for (int size : {1, 17, 3}) {
     auto resized = make_grid(device, allocator);
     CHECK(resized.ok());
-    auto row = allocate_row(resized.value(), size);
+    auto row = allocate_row(ctx, resized.value(), size);
     CHECK(row.ok());
     std::vector<float> weights = attr(ctx, resized.value(), "weight");
     for (const vol::BlockIndex& block : row.value()) {
@@ -1234,7 +1219,7 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
   auto made = make_grid(device, allocator);
   CHECK(made.ok());
   auto& grid = made.value();
-  auto active = allocate_row(grid, 17);
+  auto active = allocate_row(ctx, grid, 17);
   CHECK(active.ok());
   const auto& blocks = active.value();
   std::vector<Cube> content;
@@ -1261,7 +1246,7 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
       params.quantization_weights[i] = 1.0f + 0.25f * float((i + count) % 5);
     }
     DctBlocks out;
-    const auto list = grid.block_list(prefix);
+    const std::vector<vol::BlockIndex>& list = prefix;
     CHECK(oracle::forward(ctx, t, grid, list, params, out).ok());
     CHECK(out.coefficients.size() == count * k);
     CHECK(out.masks.size() == count * codec::kMaskWordsPerBlock);
@@ -1296,16 +1281,15 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
-  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(grid, 3);
+  vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
   for (std::size_t i = 0; i < 3; ++i) {
     write_block(ctx, grid, blocks[i], random_cube(500u + std::uint32_t(i)),
                 observed);
   }
-  const vol::BlockList list = grid.block_list(blocks);
   DctBlocks out;
-  CHECK(oracle::forward(ctx, t, grid, list, codec::CodecParams{}, out).ok());
+  CHECK(oracle::forward(ctx, t, grid, blocks, codec::CodecParams{}, out).ok());
   auto changed = [&](std::size_t i) {
     return grid.map()
         .read_block_stamps()
@@ -1313,13 +1297,13 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
         .changed;
   };
 
-  CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
   const std::uint32_t first = grid.map().tick();
   for (std::size_t i = 0; i < 3; ++i) {
     CHECK(changed(i) == first);
   }
   // The same coefficients again: a tick of its own, and nothing changed.
-  CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
   CHECK(grid.map().tick() != first);
   for (std::size_t i = 0; i < 3; ++i) {
     CHECK(changed(i) == first);
@@ -1328,7 +1312,7 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   DctBlocks moved = out;
   moved.coefficients[out.params.coefficient_count] = static_cast<std::int16_t>(
       moved.coefficients[out.params.coefficient_count] + 1);
-  CHECK(oracle::inverse(ctx, t, grid, list, moved).ok());
+  CHECK(oracle::inverse(ctx, t, grid, blocks, moved).ok());
   CHECK(changed(0) == first);
   CHECK(changed(1) == grid.map().tick());
   CHECK(changed(2) == first);
