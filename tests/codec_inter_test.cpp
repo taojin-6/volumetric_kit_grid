@@ -758,6 +758,7 @@ int not_found_case(Gpu& gpu, const Spheres& s) {
 
 // InvalidArgument from checks outside the device decode -- a new block on a
 // reference block (after it), and a scale not the reference's (before it) --
+// and rows 11 and 12 judged before row 13 on a frame that fails both,
 // leaving the grid and the reference as they were.
 int invalid_case(Gpu& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
@@ -788,6 +789,17 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   }
   p.blocks = std::move(blocks);
   const Bytes on_reference = oracle::write_frame(p, sizes(1, 2)).value();
+  // That frame broken before row 13 too, where the merge still meets the
+  // new block on the reference block: one block more than survive and are
+  // new (row 12), and its first update segment corrupt (row 11).
+  Bytes miscounted = on_reference;
+  codec_frames::put_u32(miscounted, 32,
+                        codec_frames::get_u32(on_reference, 32) + 1);
+  std::vector<codec_frames::Section> t =
+      codec_frames::sections_of(on_reference);
+  t[3].body[0] = 0;
+  t[3].body[1] = 0;
+  const Bytes corrupt = codec_frames::assemble(on_reference, t);
 
   Bytes rescaled = chain[2].sent;
   codec_frames::put_f32(rescaled, 24, 0.3f);
@@ -803,6 +815,10 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   }
   CHECK(refused(gpu, dec, on_reference, g.value(), C::InvalidArgument,
                 "is on reference block") == 0);
+  CHECK(refused(gpu, dec, miscounted, g.value(), C::InvalidArgument,
+                "are new, but the frame holds") == 0);
+  CHECK(refused(gpu, dec, corrupt, g.value(), C::InvalidArgument,
+                "segment 0 is corrupt") == 0);
   CHECK(refused(gpu, dec, rescaled, g.value(), C::InvalidArgument,
                 "quantization scale is not its reference's") == 0);
   CHECK(dec.decode(chain[2].sent.data(), chain[2].sent.size(), g.value()).ok());

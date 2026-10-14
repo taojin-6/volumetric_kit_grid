@@ -619,8 +619,9 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
 
 // The reader's verdict is the first segment that fails, however many do and
 // whichever way: a corrupt first segment, the second and the last starting
-// on the segment before's end, and pairs of them -- each the oracle's code
-// and message -- and it is reset for the next frame, which reads clean.
+// before the segment before's end, the third exactly on it, and pairs of
+// them -- each the oracle's code and message -- and it is reset for the next
+// frame, which reads clean.
 int verdict_case(d::DeviceFrameReader& reader) {
   oracle::Frame row = make_frame(20, 4, 41);
   row.coords.clear();
@@ -654,6 +655,7 @@ int verdict_case(d::DeviceFrameReader& reader) {
       {"segment 0 corrupt", {{0, -1}}, "segment 0 is corrupt"},
       {"segment 1 out of order", {{1, 0}}, "segment 1 does not start after"},
       {"the last out of order", {{4, 2}}, "segment 4 does not start after"},
+      {"segment 2 on segment 1's last", {{2, 7}}, "segment 2 does not start"},
       {"1 out of order, 3 corrupt",
        {{1, 1}, {3, -1}},
        "segment 1 does not start after"},
