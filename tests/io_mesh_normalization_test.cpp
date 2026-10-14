@@ -319,6 +319,26 @@ int refusals() {
   bad_axis.axes.z[0] = kInf;
   CHECK(refused(mesh, bad_axis));
 
+  // Axes that are not a proper rotation: a reflection, a repeated axis, a
+  // scaled one. Both fits and apply refuse them; within 1e-6 is a rotation.
+  io::MeshAxes reflection;
+  reflection.z = {0, 0, -1};
+  io::MeshAxes repeated;
+  repeated.x = repeated.z = repeated.up;
+  io::MeshAxes stretched;
+  stretched.x = {2, 0, 0};
+  for (const auto& wrong : {reflection, repeated, stretched}) {
+    const auto measured = io::mesh_bounds(mesh, wrong);
+    CHECK(refused_for(io::fit_transform(measured, 1.7), "proper rotation"));
+    CHECK(refused_for(io::scale_transform(measured, 1.0), "proper rotation"));
+    auto transform = fit;
+    transform.axes = wrong;
+    CHECK(refused(mesh, transform));
+  }
+  auto nearly = axes;
+  nearly.x[0] += 1e-9;
+  CHECK(io::fit_transform(io::mesh_bounds(mesh, nearly), 1.7));
+
   // Non-finite input: the bounds turn NaN, so the fits refuse, and so does
   // apply; one such frame spoils a sequence's union for good.
   for (const float bad : {std::numeric_limits<float>::quiet_NaN(),

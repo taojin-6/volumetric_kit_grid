@@ -26,8 +26,21 @@ namespace {
 bool finite(const Vec3d& v) {
   return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
-bool finite(const MeshAxes& axes) {
-  return finite(axes.x) && finite(axes.up) && finite(axes.z);
+// Within this, the axes are a rotation: camera/geometry.cpp's tolerance.
+constexpr double kOrthonormalTolerance = 1e-6;
+
+// Orthonormal, with a positive determinant; false for a non-finite axis.
+bool proper(const MeshAxes& axes) {
+  const Vec3d* const rows[] = {&axes.x, &axes.up, &axes.z};
+  for (int a = 0; a < 3; ++a) {
+    for (int b = 0; b < 3; ++b) {
+      const double d = glm::dot(*rows[a], *rows[b]);
+      if (!(std::abs(d - (a == b ? 1.0 : 0.0)) <= kOrthonormalTolerance)) {
+        return false;
+      }
+    }
+  }
+  return glm::dot(axes.x, glm::cross(axes.up, axes.z)) > 0.0;
 }
 // A position in the rotated frame.
 Vec3d measure(const MeshAxes& axes, const Vec3d& p) {
@@ -41,6 +54,9 @@ core::Status invalid(const char* api, const char* reason) {
 // Rotate to the bounds' axes, centre X/Z, floor Y, then scale.
 core::Result<MeshTransform> place(const char* api, const MeshBounds& bounds,
                                   double metres_per_unit) {
+  if (!proper(bounds.axes)) {
+    return invalid(api, "the axes are not a proper rotation");
+  }
   for (int a = 0; a < 3; ++a) {
     if (std::isnan(bounds.min[a]) || std::isnan(bounds.max[a])) {
       return invalid(api, "a measured position is not finite");
@@ -54,7 +70,7 @@ core::Result<MeshTransform> place(const char* api, const MeshBounds& bounds,
   transform.origin = {0.5 * (bounds.min.x + bounds.max.x), bounds.min.y,
                       0.5 * (bounds.min.z + bounds.max.z)};
   transform.metres_per_unit = metres_per_unit;
-  if (!finite(transform.axes) || !finite(transform.origin)) {
+  if (!finite(transform.origin)) {
     return invalid(api, "the bounds are not finite");
   }
   return transform;
@@ -137,11 +153,13 @@ core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
 
 core::Status apply_transform(TriangleMesh& mesh,
                              const MeshTransform& transform) try {
-  if (!finite(transform.axes) || !finite(transform.origin) ||
-      !std::isfinite(transform.metres_per_unit) ||
+  if (!proper(transform.axes)) {
+    return invalid("apply_transform", "the axes are not a proper rotation");
+  }
+  if (!finite(transform.origin) || !std::isfinite(transform.metres_per_unit) ||
       !(transform.metres_per_unit > 0.0)) {
     return invalid("apply_transform",
-                   "the transform needs finite members and a positive scale");
+                   "the transform needs a finite origin and a positive scale");
   }
   std::vector<Vec3f> positions;
   positions.reserve(mesh.positions.size());

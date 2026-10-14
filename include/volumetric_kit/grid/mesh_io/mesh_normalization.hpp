@@ -29,7 +29,9 @@ namespace volumetric_kit::recon::io {
 /// @brief A right-handed orthonormal frame, its axes in input coordinates.
 ///
 /// A position p measured along it is `(x·p, up·p, z·p)`. Default-constructed,
-/// it is the input's own frame. Take any other from @ref up_axes.
+/// it is the input's own frame. Take any other from @ref up_axes: the fits and
+/// @ref apply_transform refuse axes that are not orthonormal to 1e-6 or whose
+/// determinant is not positive.
 struct MeshAxes {
   Vec3d x{1.0, 0.0, 0.0};   ///< Measures the rotated X.
   Vec3d up{0.0, 1.0, 0.0};  ///< Measures the rotated Y.
@@ -92,8 +94,9 @@ struct MeshTransform {
 ///        will place, such as the union over a sequence.
 /// @param height_m Target extent along up, in metres; finite and positive.
 /// @return The transform, or InvalidArgument for empty or non-finite bounds,
-///         a zero extent along up, a @p height_m that is not finite and
-///         positive, or a scale that is not.
+///         axes that are not a proper rotation, a zero extent along up, a
+///         @p height_m that is not finite and positive, or a scale that is
+///         not.
 VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
                                                     double height_m);
 
@@ -102,8 +105,9 @@ VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
 /// @param bounds Non-empty, finite bounds of every position the transform
 ///        will place.
 /// @param metres_per_unit Scale; finite and positive (0.001 for millimetres).
-/// @return The transform, or InvalidArgument for empty or non-finite bounds or
-///         a @p metres_per_unit that is not finite and positive.
+/// @return The transform, or InvalidArgument for empty or non-finite bounds,
+///         axes that are not a proper rotation, or a @p metres_per_unit that
+///         is not finite and positive.
 VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
                                                       double metres_per_unit);
 
@@ -113,10 +117,11 @@ VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
 /// winding and orientation hold. Applying one transform to every frame of a
 /// sequence keeps a point that does not move in one place. A refusal leaves
 /// the positions unchanged, bit for bit.
-/// @return OK; InvalidArgument for a transform with a non-finite member or a
-///         scale that is not positive, a non-finite position, an output past
-///         float range, or a height collapse: a mesh with extent along up
-///         whose outputs round to one Y; OutOfMemory for allocation failure.
+/// @return OK, an empty mesh included; InvalidArgument for axes that are not
+///         a proper rotation, a non-finite origin, a scale that is not finite
+///         and positive, a non-finite position, an output past float range,
+///         or a height collapse: a mesh with extent along up whose outputs
+///         round to one Y; OutOfMemory for allocation failure.
 VR_IO_API core::Status apply_transform(TriangleMesh& mesh,
                                        const MeshTransform& transform);
 
