@@ -10,8 +10,8 @@
 ///
 /// Internal (under src/, never installed). The forward output stays in device
 /// memory: the host reads back only the symbol counts, to build the frame's
-/// tables (@ref frame_tables), and the coded segments. Every
-/// bulk buffer is device-local and retained between frames
+/// tables (@ref frame_tables), the step layout's two totals, and the coded
+/// segments. Every bulk buffer is device-local and retained between frames
 /// (`ensure_device_scratch`); the host reaches them only through
 /// `CommandBatch`, so a discrete GPU moves the same few bytes across PCIe
 /// that unified memory would.
@@ -22,6 +22,7 @@
 
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
+#include "step_layout.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
@@ -37,14 +38,14 @@ namespace volumetric_kit::recon::codec::detail {
 /// A frame takes two batches. The caller's first batch carries the forward
 /// transform (@ref DctTransform::record_forward) and @ref record_count, which
 /// counts every model's symbols, each entry's coder steps, and what
-/// @ref check_entries refuses. After it is submitted, @ref finish makes
-/// those refusals, builds the tables on the host and
-/// places every entry's steps. The device writes each entry's steps in
-/// parallel, runs each segment's serial rANS chain over its run of them into a
-/// slot sized by its steps, packs the streams into one payload, and reads back
-/// only that payload and the segment lengths. The payload is read up to the
-/// last frame of its type's bytes per entry plus 25% with the lengths, and any
-/// rest in a second batch.
+/// @ref check_entries refuses, and lays the steps out (@ref StepLayout).
+/// After it is submitted, @ref finish makes those refusals, builds the tables
+/// on the host and sizes the coding from the layout's totals. The device
+/// writes each entry's steps in parallel, runs each segment's serial rANS
+/// chain over its run of them into a slot sized by its steps, packs the
+/// streams into one payload, and reads back only that payload and the segment
+/// lengths. The payload is read up to the last frame of its type's bytes per
+/// entry plus 25% with the lengths, and any rest in a second batch.
 ///
 /// A P-frame's entries are its stream positions (@ref ResidentBlocks): each
 /// reference entry's mode and payload, which the caller has made against the
@@ -54,7 +55,7 @@ namespace volumetric_kit::recon::codec::detail {
 ///          outlive this object. Not thread-safe: one frame at a time.
 class VR_CODEC_API DeviceFrameWriter {
  public:
-  /// @brief Build the five kernels.
+  /// @brief Build the five kernels and the step layout's.
   /// @return The writer, or a pipeline or pool failure.
   static core::Result<std::unique_ptr<DeviceFrameWriter>> create(
       core::Device& device, core::Allocator& allocator);
@@ -63,7 +64,8 @@ class VR_CODEC_API DeviceFrameWriter {
   DeviceFrameWriter(const DeviceFrameWriter&) = delete;
   DeviceFrameWriter& operator=(const DeviceFrameWriter&) = delete;
 
-  /// @brief Record the counting pass over @p blocks into @p batch.
+  /// @brief Record the counting pass over @p blocks, and the layout of the
+  ///        steps it counts, into @p batch.
   ///
   /// The counts arrive when the caller submits @p batch, which must happen
   /// before @ref finish. @p blocks must stay unchanged until then.
@@ -98,8 +100,9 @@ class VR_CODEC_API DeviceFrameWriter {
   ///         @ref check_entries';
   ///         `Status::Code::InvalidArgument` for blocks @ref record_count
   ///         did not count, a reference whose block count is not the blocks'
-  ///         reference entries, or a frame @ref assemble_frame refuses; or a
-  ///         buffer or dispatch failure.
+  ///         reference entries, coded segments that could outgrow 4 GiB, or a
+  ///         frame @ref assemble_frame refuses; or a buffer or dispatch
+  ///         failure.
   ///         `Status::Code::IoError` only if a kernel's table refused a
   ///         symbol it was counted from, which is a bug here.
   core::Result<std::vector<std::uint8_t>> finish(
@@ -124,33 +127,34 @@ class VR_CODEC_API DeviceFrameWriter {
   core::ComputeKernel gather_kernel_;
   core::DescriptorPool pool_;
 
+  // Where each entry's steps go and each segment's slot (record_count).
+  std::unique_ptr<StepLayout> layout_;
+
   // Device-local, retained and grown by ensure_device_scratch.
-  core::Buffer counts_;         // per model, per symbol
-  core::Buffer entry_steps_;    // coder steps per entry
-  core::Buffer tables_;         // per model, per symbol: cum | freq << 16
-  core::Buffer step_ends_;      // one past each entry's last step
-  core::Buffer steps_;          // every coder step: start | freq << 16
-  core::Buffer segment_steps_;  // each segment's first step, segment count + 1
-  core::Buffer slot_offsets_;   // 16-bit words, segment count + 1
-  core::Buffer slots_;          // each segment's stream, at its slot's top
-  core::Buffer lengths_;        // bytes per segment
+  core::Buffer counts_;           // per model, per symbol
+  core::Buffer entry_steps_;      // coder steps per entry
+  core::Buffer tables_;           // per model, per symbol: cum | freq << 16
+  core::Buffer steps_;            // every coder step: start | freq << 16
+  core::Buffer slots_;            // each segment's stream, at its slot's top
+  core::Buffer lengths_;          // bytes per segment
   core::Buffer payload_offsets_;  // bytes, segment count + 1
   core::Buffer payload_;
   core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
   core::Buffer failed_;       // set when a table refuses a symbol
   core::Buffer refusal_;      // what check_entries refuses: two words
 
-  // What record_count reads back at the caller's submit: the counts, at
-  // frame_model_base in a P-frame's layout, each entry's steps, and the
-  // largest mode past the alphabet and whether a written value is -32768.
+  // What record_count reads back at the caller's submit, beside the
+  // layout's totals: the counts, at frame_model_base in a P-frame's layout,
+  // and the largest mode past the alphabet and whether a written value is
+  // -32768.
   std::vector<std::uint32_t> counts_host_;
-  std::vector<std::uint32_t> steps_host_;
   std::uint32_t refusal_host_[2] = {};
   // The sizes record_count counted with (segment size 0 before any), and
   // per frame type the last frame's payload bytes per entry plus 25%, the
   // readback's prediction (0 before any).
   std::uint32_t segment_size_ = 0;
   std::uint32_t update_size_ = 0;
+  std::uint32_t entry_count_ = 0;
   std::uint32_t reference_count_ = 0;
   std::uint32_t payload_per_entry_[2] = {};
 };

@@ -58,12 +58,6 @@ std::uint32_t frame_model_base(std::uint32_t model, std::uint32_t k) {
   return model_base(model, k);
 }
 
-glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
-                               std::uint32_t u, std::uint32_t a,
-                               std::uint32_t r) {
-  return segment_range(s, m, u, a, r);
-}
-
 namespace {
 
 // --- Byte-level serialization.

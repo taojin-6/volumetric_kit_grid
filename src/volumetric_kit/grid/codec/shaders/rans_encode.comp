@@ -3,7 +3,8 @@
 
 // The device frame's coding: one invocation per segment runs the rANS encoder
 // rans.hpp describes over the segment's coder steps (rans_ops.comp), already
-// in the order it takes them, in 32-bit integer arithmetic. Words
+// in the order it takes them, in 32-bit integer arithmetic: the run from its
+// first entry's start to the start past its last (rans_layout.comp). Words
 // go down from the top of the segment's slot, so the stream lands in decode
 // order: the final state's two words, then the words last emitted first.
 
@@ -12,13 +13,14 @@
 
 layout(local_size_x = 32) in;
 
+#include "frame_models.glsl"
 #include "rans_push.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer Steps {
   uint steps[];  // start | freq << 16
 };
-layout(set = 0, binding = 1, std430) readonly buffer SegmentSteps {
-  uint segment_steps[];  // each segment's first step, segment_count + 1
+layout(set = 0, binding = 1, std430) readonly buffer Starts {
+  uint starts[];  // the steps before each entry, then their total
 };
 layout(set = 0, binding = 2, std430) readonly buffer SlotOffsets {
   uint slot_offsets[];  // in 16-bit words, segment_count + 1, each even
@@ -55,10 +57,13 @@ void main() {
   uint out16 = slot_offsets[s + 1u];  // the next free word is out16 - 1
   uint x = 1u << 16u;                 // L (rans.hpp)
   bool bad = false;
-  const uint end = segment_steps[s + 1u];
+  const uint m = pc.reference_count;
+  const uvec2 range = segment_range(s, m, pc.update_size, pc.num_entries - m,
+                                    pc.segment_size);
+  const uint end = starts[range.y];
   // Four steps a round, the next four loaded while these are coded: with
   // one chain per invocation, a load consumed at once would stall it.
-  uint at = segment_steps[s];
+  uint at = starts[range.x];
   uvec4 batch = uvec4(at < end ? steps[at] : 0u,
                       at + 1u < end ? steps[at + 1u] : 0u,
                       at + 2u < end ? steps[at + 2u] : 0u,

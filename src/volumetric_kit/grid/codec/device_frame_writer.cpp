@@ -100,6 +100,7 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
   VKC_TRY(kb.add(w.gather_kernel_, "codec_rans_gather", vr_rans_gather_comp_spv,
                  vr_rans_gather_comp_spv_size, 5, &push));
   VKC_ASSIGN(w.pool_, kb.build());
+  VKC_ASSIGN(w.layout_, StepLayout::create(device, allocator));
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   w.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
@@ -155,18 +156,18 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   }
   segment_size_ = segment_size;
   update_size_ = update_size;
+  entry_count_ = entries;
   reference_count_ = m;
   // A P-frame's layout, whose mode model comes last: an intra frame's counts
   // are its prefix.
   counts_host_.assign(
       frame_model_base(frame_model_count(FrameType::kInter, k), k), 0);
-  steps_host_.assign(entries, 0);
   refusal_host_[0] = refusal_host_[1] = 0;
   if (entries == 0) return {};
 
   const VkDeviceSize range = max_storage_buffer_range_;
   const VkDeviceSize count_bytes = counts_host_.size() * sizeof(std::uint32_t);
-  const VkDeviceSize step_bytes = steps_host_.size() * sizeof(std::uint32_t);
+  const VkDeviceSize step_bytes = VkDeviceSize(entries) * sizeof(std::uint32_t);
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, counts_,
                                       count_bytes, range, "codec.rans_counts"));
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, entry_steps_,
@@ -184,9 +185,10 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   RansPush push = walk_push(blocks, segment_size, update_size, segments);
   VKC_TRY(dispatch_items(batch, kernel, push, entries, kCountLanes,
                          max_workgroup_count_x_, stage));
+  VKC_TRY(layout_->record(batch, entry_steps_, entries, m, update_size,
+                          segment_size, stage));
   VKC_TRY(batch.readback(counts_, 0, count_bytes, counts_host_.data()));
-  VKC_TRY(batch.readback(refusal_, 0, sizeof(refusal_host_), refusal_host_));
-  return batch.readback(entry_steps_, 0, step_bytes, steps_host_.data());
+  return batch.readback(refusal_, 0, sizeof(refusal_host_), refusal_host_);
 }
 
 core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
@@ -201,10 +203,9 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   const std::uint32_t segment_size = segment_size_;
   const std::uint32_t update_size = update_size_;
   if (segment_size == 0 || k != blocks.coefficient_count ||
-      m != reference_count_ ||
+      entries != entry_count_ || m != reference_count_ ||
       counts_host_.size() !=
-          frame_model_base(frame_model_count(FrameType::kInter, k), k) ||
-      steps_host_.size() != entries) {
+          frame_model_base(frame_model_count(FrameType::kInter, k), k)) {
     return fail("finish", "these blocks were not the ones record_count saw");
   }
   const std::uint32_t a = entries - m;
@@ -261,59 +262,30 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   // encoder refuses.
   const std::vector<std::uint32_t> table_entries =
       rans_table_entries(coded.tables);
-  // The coder takes a segment's steps last first, so its entries are laid
-  // out last first, each entry's steps written down from its run's end: the
-  // segment's steps are one run in the order the coder takes them. Its slot
-  // holds at most a word per step and the final state's two, rounded up to
-  // whole 32-bit words so no two segments share one. TODO(codec): scan the
-  // steps on the device, so they need not cross the bus both ways (the
-  // 2026-10-13 rule).
-  std::vector<std::uint32_t> step_ends(entries);
-  std::vector<std::uint32_t> segment_steps(std::size_t(segments) + 1, 0);
-  std::vector<std::uint32_t> slot_offsets(std::size_t(segments) + 1, 0);
-  std::uint64_t step_total = 0;
-  std::uint64_t slot_words16 = 0;
-  for (std::uint32_t s = 0; s < segments; ++s) {
-    const glm::uvec2 range =
-        frame_segment_range(s, m, update_size, a, segment_size);
-    segment_steps[s] = static_cast<std::uint32_t>(step_total);
-    slot_offsets[s] = static_cast<std::uint32_t>(slot_words16);
-    const std::uint64_t begin = step_total;
-    for (std::uint32_t p = range.y; p-- > range.x;) {
-      step_total += steps_host_[p];
-      step_ends[p] = static_cast<std::uint32_t>(step_total);
-    }
-    slot_words16 += (step_total - begin + 3) & ~std::uint64_t{1};
-    if (step_total * 4 > std::numeric_limits<std::uint32_t>::max() ||
-        slot_words16 * 2 > std::numeric_limits<std::uint32_t>::max()) {
-      return fail("finish", "the coded segments could outgrow 4 GiB");
-    }
+  // The layout record_count made, sized from its totals, which stop where
+  // these refuse.
+  const StepLayout::Totals totals = layout_->totals();
+  const std::uint64_t step_total = totals.steps;
+  const std::uint64_t slot_words16 = totals.slot_words;
+  if (step_total * 4 > std::numeric_limits<std::uint32_t>::max() ||
+      slot_words16 * 2 > std::numeric_limits<std::uint32_t>::max()) {
+    return fail("finish", "the coded segments could outgrow 4 GiB");
   }
-  segment_steps[segments] = static_cast<std::uint32_t>(step_total);
-  slot_offsets[segments] = static_cast<std::uint32_t>(slot_words16);
 
   const VkDeviceSize range = max_storage_buffer_range_;
   const VkDeviceSize entry_bytes = table_entries.size() * sizeof(std::uint32_t);
-  const VkDeviceSize offset_bytes = slot_offsets.size() * sizeof(std::uint32_t);
+  const VkDeviceSize start_bytes =
+      (VkDeviceSize(entries) + 1) * sizeof(std::uint32_t);
+  const VkDeviceSize offset_bytes =
+      (VkDeviceSize(segments) + 1) * sizeof(std::uint32_t);
   const VkDeviceSize slot_bytes = slot_words16 * 2;
-  const VkDeviceSize step_end_bytes =
-      VkDeviceSize(entries) * sizeof(std::uint32_t);
   const VkDeviceSize step_bytes = step_total * sizeof(std::uint32_t);
   const VkDeviceSize length_bytes =
       VkDeviceSize(segments) * sizeof(std::uint32_t);
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, tables_,
                                       entry_bytes, range, "codec.rans_tables"));
-  VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, step_ends_,
-                                      step_end_bytes, range,
-                                      "codec.rans_step_ends"));
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, steps_, step_bytes,
                                       range, "codec.rans_steps"));
-  VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, segment_steps_,
-                                      offset_bytes, range,
-                                      "codec.rans_segment_steps"));
-  VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, slot_offsets_,
-                                      offset_bytes, range,
-                                      "codec.rans_slot_offsets"));
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, slots_, slot_bytes,
                                       range, "codec.rans_slots"));
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, lengths_,
@@ -327,20 +299,19 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
 
   core::CommandBatch batch(*device_, *allocator_);
   VKC_TRY(batch.upload(tables_, 0, table_entries.data(), entry_bytes));
-  VKC_TRY(batch.upload(step_ends_, 0, step_ends.data(), step_end_bytes));
-  VKC_TRY(batch.upload(segment_steps_, 0, segment_steps.data(), offset_bytes));
-  VKC_TRY(batch.upload(slot_offsets_, 0, slot_offsets.data(), offset_bytes));
   VKC_TRY(batch.zero(failed_, 0, sizeof(std::uint32_t)));
 
+  const core::Buffer& starts = layout_->starts();
+  const core::Buffer& slot_offsets = layout_->slot_offsets();
   core::ComputeKernel& ops = ops_kernel_;
   bind_walk(ops, blocks);
   ops.set.write_storage_buffer(4, tables_.handle(), 0, entry_bytes);
-  ops.set.write_storage_buffer(5, step_ends_.handle(), 0, step_end_bytes);
+  ops.set.write_storage_buffer(5, starts.handle(), 0, start_bytes);
   ops.set.write_storage_buffer(6, steps_.handle(), 0, step_bytes);
   core::ComputeKernel& encode = encode_kernel_;
   encode.set.write_storage_buffer(0, steps_.handle(), 0, step_bytes);
-  encode.set.write_storage_buffer(1, segment_steps_.handle(), 0, offset_bytes);
-  encode.set.write_storage_buffer(2, slot_offsets_.handle(), 0, offset_bytes);
+  encode.set.write_storage_buffer(1, starts.handle(), 0, start_bytes);
+  encode.set.write_storage_buffer(2, slot_offsets.handle(), 0, offset_bytes);
   encode.set.write_storage_buffer(3, slots_.handle(), 0, slot_bytes);
   encode.set.write_storage_buffer(4, lengths_.handle(), 0, length_bytes);
   encode.set.write_storage_buffer(5, failed_.handle(), 0,
@@ -351,7 +322,7 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   scan_kernel_.set.write_storage_buffer(2, gather_args_.handle(), 0,
                                         sizeof(VkDispatchIndirectCommand));
   core::ComputeKernel& gather = gather_kernel_;
-  gather.set.write_storage_buffer(0, slot_offsets_.handle(), 0, offset_bytes);
+  gather.set.write_storage_buffer(0, slot_offsets.handle(), 0, offset_bytes);
   gather.set.write_storage_buffer(1, slots_.handle(), 0, slot_bytes);
   gather.set.write_storage_buffer(2, lengths_.handle(), 0, length_bytes);
   gather.set.write_storage_buffer(3, payload_offsets_.handle(), 0,
