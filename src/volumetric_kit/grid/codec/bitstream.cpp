@@ -333,11 +333,11 @@ core::Status check_frame(const Frame& frame, const FrameWriteOptions& options) {
   const bool inter = frame.type == FrameType::kInter;
   const DctBlocks& b = frame.blocks;
   VKC_TRY(check_coding(frame.voxel_size, b.trunc_dist, b.params));
-  if (options.segment_size == 0) {
-    return bad_write("segment_size must be at least 1");
-  }
-  if (inter && options.update_size == 0) {
-    return bad_write("update_size must be at least 1");
+  VKC_TRY(
+      check_segment_size("write_frame", "segment_size", options.segment_size));
+  if (inter) {
+    VKC_TRY(
+        check_segment_size("write_frame", "update_size", options.update_size));
   }
   // M reference entries, then A blocks: an intra frame's M is 0. Stream
   // positions are u32, on the device too.
@@ -410,6 +410,14 @@ core::Status check_frame_type(FrameType type, const char* who) {
   return core::Status::unsupported(std::string(who) + ": frame type " +
                                    std::to_string(static_cast<uint>(type)) +
                                    " (only intra and P-frames are coded)");
+}
+
+core::Status check_segment_size(const char* who, const char* name,
+                                std::uint32_t size) {
+  if (size >= 1 && size <= kMaxDeviceDecodeSegmentSize) return {};
+  return core::Status::invalid_argument(
+      std::string(who) + ": " + name + " " + std::to_string(size) +
+      " is not in [1, " + std::to_string(kMaxDeviceDecodeSegmentSize) + "]");
 }
 
 core::Status check_coding(float voxel_size, float trunc_dist,
@@ -543,9 +551,8 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   // The header's fields as check_frame checks them, for the device
   // writer, which codes without a Frame.
   VKC_TRY(check_coding(frame.voxel_size, frame.trunc_dist, frame.params));
-  if (frame.segment_size == 0) {
-    return bad_write("segment_size must be at least 1");
-  }
+  VKC_TRY(
+      check_segment_size("write_frame", "segment_size", frame.segment_size));
   const std::uint64_t m = frame.reference.header.block_count;
   if (!inter) {
     const char* set = frame.reference.hash != 0 ? "reference hash"
@@ -559,8 +566,9 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
           " is not 0");
     }
   }
-  if (inter && frame.update_size == 0) {
-    return bad_write("update_size must be at least 1");
+  if (inter) {
+    VKC_TRY(
+        check_segment_size("write_frame", "update_size", frame.update_size));
   }
   // An intra frame's blocks are all new, against no reference.
   const std::uint64_t a = inter ? frame.new_count : frame.block_count;
@@ -725,9 +733,8 @@ core::Result<FrameHeader> read_frame_header(const std::uint8_t* data,
   if (core::Status s = header.params.validate(); !s.ok()) {
     return bad("invalid codec params: " + s.message());
   }
-  if (header.segment_size == 0) {
-    return bad("segment size 0");
-  }
+  VKC_TRY(
+      check_segment_size("codec frame", "segment size", header.segment_size));
   return header;
 }
 
@@ -818,9 +825,7 @@ core::Result<ParsedFrame> parse_frame(const std::uint8_t* data,
     m = rr.u32();
     u_size = rr.u32();
     a = rr.u32();
-    if (u_size == 0) {
-      return bad("update size 0");
-    }
+    VKC_TRY(check_segment_size("codec frame", "update size", u_size));
     if (a > n || n > std::uint64_t(m) + a) {
       return bad("it holds " + std::to_string(n) + " blocks, not between its " +
                  std::to_string(a) + " new blocks and those plus the " +

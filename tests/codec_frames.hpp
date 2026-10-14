@@ -272,23 +272,6 @@ inline void set_first_x_low_bits(std::vector<std::uint8_t>& payload,
                                               ((low12 >> 8) & 0x0F));
 }
 
-// A SEGMENTS body with its @p count lengths from @p first replaced by their
-// sum: the same PAYLOAD read as fewer segments.
-inline std::vector<std::uint8_t> join_lengths(
-    const std::vector<std::uint8_t>& segments, std::size_t first,
-    std::size_t count) {
-  std::uint32_t sum = 0;
-  for (std::size_t i = first; i < first + count; ++i) {
-    sum += get_u32(segments, 4 * i);
-  }
-  std::vector<std::uint8_t> out(
-      segments.begin(), segments.begin() + std::ptrdiff_t(4 * first + 4));
-  put_u32(out, 4 * first, sum);
-  out.insert(out.end(), segments.begin() + std::ptrdiff_t(4 * (first + count)),
-             segments.end());
-  return out;
-}
-
 // What assemble_frame lays a parsed frame out from: every field it reads, so
 // it writes the frame's bytes again.
 inline d::CodedFrame coded_frame(const d::ParsedFrame& p) {
@@ -690,8 +673,9 @@ struct InterCode {
   d::Frame p;
 };
 
-// The update and segment sizes: 1, 7, 64 and past every frame.
-inline constexpr std::uint32_t kInterSizes[] = {1, 7, 64, 100000};
+// The update and segment sizes: 1, 7, 64 and the longest, past every frame.
+inline constexpr std::uint32_t kInterSizes[] = {
+    1, 7, 64, codec::kMaxDeviceDecodeSegmentSize};
 
 // Every mode, at K of 1, 64 and 512, and the empty cases: no reference
 // blocks (M = 0), no new ones (A = 0), none left (N = 0), all removed with
@@ -821,7 +805,6 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   const std::uint32_t u = get_u32(s[0].body, 12);
   const std::uint32_t a = get_u32(s[0].body, 16);
   const std::uint64_t updates = d::frame_segment_count(m, u);
-  const std::uint64_t news = d::frame_segment_count(a, get_u32(b, 36));
   const std::string mode_table_name =
       "table " +
       std::to_string(
@@ -862,6 +845,13 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   e = b;
   e[7] = 1;
   bytes("reserved byte", 1, C::InvalidArgument, "reserved header byte", e);
+  e = b;
+  put_u32(e, 36, codec::kMaxDeviceDecodeSegmentSize + 1);
+  bytes("segment size past the longest", 1, C::InvalidArgument,
+        "segment size " +
+            std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1) +
+            " is not in",
+        e);
 
   sections("unknown required section", 2, C::Unsupported,
            "unknown required section 9",
@@ -894,6 +884,13 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   t = s;
   put_u32(t[0].body, 12, 0);
   sections("update size 0", 4, C::InvalidArgument, "update size 0", t);
+  t = s;
+  put_u32(t[0].body, 12, codec::kMaxDeviceDecodeSegmentSize + 1);
+  sections("update size past the longest", 4, C::InvalidArgument,
+           "update size " +
+               std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1) +
+               " is not in",
+           t);
   e = b;
   put_u32(e, 32, a - 1);
   bytes("fewer blocks than new blocks", 4, C::InvalidArgument,
@@ -902,21 +899,27 @@ inline std::vector<InterRefusal> inter_refusals(const RefusalBase& base) {
   put_u32(e, 32, m + a + 1);
   bytes("more blocks than survivors and new blocks", 4, C::InvalidArgument,
         "not between its", e);
-  // The update segments as one, so SEGMENTS still agrees.
+  // SEGMENTS, which a later check reads, cannot agree: 2^32 entries take
+  // 2^22 segments of the longest size.
   t = s;
   put_u32(t[0].body, 8, 0xFFFFFFFFu);
-  put_u32(t[0].body, 12, 0xFFFFFFFFu);
-  t[2].body = join_lengths(s[2].body, 0, updates);
   sections("M + A past 2^32 - 1", 4, C::InvalidArgument, "2^32 - 1 entries", t);
-  // What A <= N bounds: a frame of one block that names 2^22 new ones in one
-  // segment, all else in agreement, would have the reader hold 2^22 + M
-  // entries against a caller's room for one.
+  // What A <= N bounds: a frame of one block that names 2^22 new ones, all
+  // else in agreement -- 4,096 new segments of the longest size, four bytes
+  // each -- would have the reader hold 2^22 + M entries against a caller's
+  // room for one.
   e = b;
   put_u32(e, 32, 1);
-  put_u32(e, 36, 0xFFFFFFFFu);
+  put_u32(e, 36, codec::kMaxDeviceDecodeSegmentSize);
   t = sections_of(e);
   put_u32(t[0].body, 16, 1u << 22);
-  t[2].body = join_lengths(s[2].body, updates, news);
+  const std::uint64_t added =
+      d::frame_segment_count(1u << 22, codec::kMaxDeviceDecodeSegmentSize);
+  t[2].body.resize(4 * updates);
+  for (std::uint64_t i = 0; i < added; ++i) {
+    t[2].body.insert(t[2].body.end(), {4, 0, 0, 0});
+  }
+  t[3].body.resize(stream_at(updates) + 4 * added);
   {
     InterCase c = good;
     c.bytes = assemble(e, t);

@@ -33,6 +33,8 @@ namespace d = volumetric_kit::recon::codec::detail;
 
 namespace {
 
+constexpr std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
+
 using codec_frames::assemble;
 using codec_frames::get_u32;
 using codec_frames::kMax32;
@@ -97,7 +99,7 @@ int round_trip(const d::Frame& f, std::uint32_t segment_size) {
 int round_trip_case() {
   for (std::size_t n : {1u, 2u, 63u, 64u, 65u, 1000u}) {
     for (std::uint32_t k : {1u, 32u}) {
-      for (std::uint32_t r : {1u, 7u, 64u, 100000u}) {
+      for (std::uint32_t r : {1u, 7u, 64u, kLongest}) {
         CHECK(round_trip(make_frame(n, k, 1000 * n + k), r) == 0);
       }
     }
@@ -184,9 +186,14 @@ int write_refusals_case() {
   f = good;
   f.blocks.trunc_dist = -0.04f;
   CHECK(refused(f));
-  d::FrameWriteOptions zero;
-  zero.segment_size = 0;
-  CHECK(refused(good, zero));
+  // Segment sizes from 1 to the longest a device invocation decodes.
+  d::FrameWriteOptions sized;
+  sized.segment_size = 0;
+  CHECK(refused(good, sized));
+  sized.segment_size = kLongest + 1;
+  CHECK(refused(good, sized));
+  sized.segment_size = kLongest;
+  CHECK(!refused(good, sized));
   f = good;  // a type this writer does not code
   f.type = static_cast<d::FrameType>(2);
   const vkc::Result<std::vector<std::uint8_t>> typed = d::write_frame(f);
@@ -263,6 +270,13 @@ int assemble_refusals_case() {
   f = good;
   f.segment_size = 0;
   CHECK(refused(f));
+  f = good;
+  f.segment_size = kLongest + 1;
+  CHECK(d::assemble_frame(d::FrameType::kIntra, f)
+            .status()
+            .message()
+            .find("segment_size " + std::to_string(kLongest + 1)) !=
+        std::string::npos);
   f = good;
   f.tables.pop_back();
   CHECK(refused(f));
@@ -362,9 +376,18 @@ int header_refusals_case() {
       CHECK(!d::read_frame_header(b.data(), b.size()).ok());
     }
   }
+  // Segment sizes from 1 to the longest a device invocation decodes, refused
+  // off the header alone.
+  for (std::uint32_t r : {0u, kLongest + 1}) {
+    b = good;
+    put_u32(b, 36, r);
+    CHECK(refused_as(b, C::InvalidArgument));
+    CHECK(d::read_frame_header(b.data(), b.size()).status().domain() ==
+          C::InvalidArgument);
+  }
   b = good;
-  put_u32(b, 36, 0);
-  CHECK(refused_as(b, C::InvalidArgument));  // segment size
+  put_u32(b, 36, kLongest);
+  CHECK(d::read_frame_header(b.data(), b.size()).ok());
   b = good;
   put_u32(b, 40, 0x40000000u);
   CHECK(refused_as(b, C::InvalidArgument));  // section table past the end

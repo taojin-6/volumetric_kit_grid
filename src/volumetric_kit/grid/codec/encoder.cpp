@@ -3,7 +3,6 @@
 
 #include "volumetric_kit/recon/codec/encoder.hpp"
 
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -38,14 +37,8 @@ core::Result<Encoder> Encoder::create(core::Device& device,
                                       core::Allocator& allocator,
                                       const EncoderConfig& config) {
   VKC_TRY(config.params.validate());
-  if (config.segment_size == 0 ||
-      config.segment_size > kMaxDeviceDecodeSegmentSize) {
-    return core::Status::invalid_argument(
-        "Encoder: segment_size must be from 1 to " +
-        std::to_string(kMaxDeviceDecodeSegmentSize) +
-        ", the longest segment a Decoder decodes; got " +
-        std::to_string(config.segment_size));
-  }
+  VKC_TRY(detail::check_segment_size("Encoder", "segment_size",
+                                     config.segment_size));
   Encoder e;
   e.config_ = config;
   e.device_ = &device;

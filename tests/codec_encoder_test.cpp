@@ -252,7 +252,9 @@ int refusals_case(Gpu& gpu) {
       codec::Encoder::create(gpu.device, gpu.allocator, bad);
   CHECK(!long_segments.ok() &&
         long_segments.status().domain() == vkc::Status::Code::InvalidArgument &&
-        long_segments.status().message().find("longest segment") !=
+        long_segments.status().message().find(
+            "segment_size " +
+            std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1)) !=
             std::string::npos);
   bad.segment_size = codec::kMaxDeviceDecodeSegmentSize;
   CHECK(codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());

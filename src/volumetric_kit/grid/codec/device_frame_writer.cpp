@@ -131,16 +131,16 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   const std::uint32_t entries = blocks.count;
   const std::uint32_t m = blocks.reference_count;
   const std::uint32_t k = blocks.coefficient_count;
-  if (segment_size == 0) {
-    return fail("record_count", "segment_size must be at least 1");
-  }
+  VKC_TRY(check_segment_size("DeviceFrameWriter::record_count", "segment_size",
+                             segment_size));
   if (m > entries) {
     return fail("record_count", std::to_string(m) +
                                     " reference entries, more than the " +
                                     std::to_string(entries) + " entries");
   }
-  if (m != 0 && update_size == 0) {
-    return fail("record_count", "update_size must be at least 1");
+  if (m != 0) {
+    VKC_TRY(check_segment_size("DeviceFrameWriter::record_count", "update_size",
+                               update_size));
   }
   if (entries != 0 &&
       (blocks.masks == nullptr || blocks.coefficients == nullptr ||

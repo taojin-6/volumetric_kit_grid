@@ -100,12 +100,14 @@ enum class EntropyCoding {
 /// RTX 5090 broke even near 20; the 2026-10-03 encoding decision).
 inline constexpr std::uint32_t kMinDeviceEncodeSegments = 48;
 
-/// The longest segment, in entries, a @ref Decoder decodes: blocks, or a
-/// P-frame's reference entries. One invocation decodes a whole segment, at
-/// 30 to 45 us a block on Apple M5 Max and RTX 5090, and the frame sets its
-/// length; this keeps one invocation near 50 ms there, well inside a GPU
-/// watchdog's limit on a slower device. A frame with a longer segment is
-/// refused (`Status::Code::InvalidArgument`).
+/// The longest segment a frame holds, in entries: a rule of the format, so
+/// every valid frame decodes on the device. A frame's segment size (blocks)
+/// and a P-frame's update size (reference entries) are each from 1 to this;
+/// a reader refuses a frame past it, and the @ref Encoder a `segment_size`
+/// past it (`Status::Code::InvalidArgument`). One invocation decodes a whole
+/// segment, at 30 to 45 us a block on Apple M5 Max and RTX 5090; this keeps
+/// one invocation near 50 ms there, well inside a GPU watchdog's limit on a
+/// slower device.
 inline constexpr std::uint32_t kMaxDeviceDecodeSegmentSize = 1024;
 
 /// @brief What a frame is: byte 6 of its header (@ref FrameInfo::type).

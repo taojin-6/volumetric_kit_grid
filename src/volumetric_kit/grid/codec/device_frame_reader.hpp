@@ -63,9 +63,8 @@ class VR_CODEC_API DeviceFrameReader {
   ///         nothing); `Status::Code::Unsupported`, recording nothing, for a
   ///         type it does not decode (@ref check_frame_type);
   ///         `Status::Code::InvalidArgument`, before any buffer grows, for a
-  ///         segment of more than @ref kMaxDeviceDecodeSegmentSize entries or
-  ///         a buffer past `maxStorageBufferRange`; otherwise a buffer
-  ///         failure.
+  ///         size @ref check_segment_size refuses or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
   core::Result<ResidentBlocks> record_decode(
       core::CommandBatch& batch, const ParsedFrame& frame,
       core::GpuStageScope* stage = nullptr);

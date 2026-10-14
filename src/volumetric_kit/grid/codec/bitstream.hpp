@@ -33,7 +33,10 @@
 /// Sections: TABLES (the frame's frequency tables), SEGMENTS (each segment's
 /// stream length, u32), PAYLOAD (the segment streams). A segment is R
 /// consecutive blocks coded as one independent rANS stream (@ref rans.hpp);
-/// the last may be shorter. A decoder refuses an unknown section flagged
+/// the last may be shorter. R is from 1 to @ref kMaxDeviceDecodeSegmentSize,
+/// the longest segment one GPU invocation decodes, so every valid frame
+/// decodes on the device; every writer and reader holds a frame to it
+/// (@ref check_segment_size). A decoder refuses an unknown section flagged
 /// @ref kSectionRequired and skips an unknown optional one. Every other flag
 /// bit is reserved: zero in v3, and a decoder refuses a known section that
 /// sets one, since a later version may define a flag that changes how the
@@ -60,7 +63,8 @@
 /// (@ref FrameReference). A P-frame adds a REFERENCE section (id 4), required
 /// on type 1 and refused on type 0, whose 20-byte body is {u64 hash, u32 M,
 /// the reference's block count, u32 U, reference entries per update segment
-/// (at least 1), u32 A, new blocks}. N stays the decoded frame's block count:
+/// (from 1 to the same limit as R), u32 A, new blocks}. N stays the decoded
+/// frame's block count:
 /// the reference blocks that survive plus the A new ones, so
 /// A <= N <= M + A, and M + A < 2^32, since stream positions are u32. R
 /// counts new blocks per segment.
@@ -113,6 +117,7 @@
 #include "dct_blocks.hpp"
 #include "rans.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -173,6 +178,14 @@ using codec::FrameType;
 /// @return OK for an intra frame or a P-frame; otherwise
 ///         `Status::Code::Unsupported`.
 VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
+
+/// @brief The segment-size rule every writer and reader holds a frame to: R,
+///        and a P-frame's U, from 1 to @ref kMaxDeviceDecodeSegmentSize.
+/// @param who   The caller, which a refusal names.
+/// @param name  The size's name, which a refusal names too.
+/// @return OK, or `Status::Code::InvalidArgument`.
+VR_CODEC_API core::Status check_segment_size(const char* who, const char* name,
+                                             std::uint32_t size);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
@@ -251,7 +264,7 @@ struct FrameHeader {
   float trunc_dist = 0.0f;  ///< Metres; the steps are fractions of it.
   CodecParams params;       ///< K, global scale, and the kept bases' weights.
   std::uint32_t block_count = 0;    ///< Blocks the frame holds.
-  std::uint32_t segment_size = 0;   ///< Blocks per segment, at least 1.
+  std::uint32_t segment_size = 0;   ///< Blocks per segment, R.
   std::uint32_t section_count = 0;  ///< Entries in the section table.
 };
 
@@ -312,7 +325,8 @@ struct FrameWriteOptions {
 ///         @ref FrameType::kInter or a @ref BlockMode::kMotion mode;
 ///         `Status::Code::InvalidArgument` for a non-positive or non-finite
 ///         `voxel_size` / `trunc_dist`, invalid params, a segment or update
-///         size of 0, a mode count other than the reference's block count, a
+///         size that @ref check_segment_size refuses, a mode count other
+///         than the reference's block count, a
 ///         mode past @ref BlockMode::kMotion, M + A past 2^32 - 1, arrays
 ///         whose sizes disagree with the entries, coordinates not strictly
 ///         increasing, a written coefficient or residual outside ±32767, a
@@ -393,8 +407,9 @@ struct CodedFrame {
 /// @return The frame's bytes; `Status::Code::Unsupported` for a type past
 ///         @ref FrameType::kInter; or `Status::Code::InvalidArgument` for a
 ///         non-positive or non-finite `voxel_size` / `trunc_dist`, invalid
-///         params, a segment size of 0, a P-frame's update size of 0, M + A
-///         past 2^32 - 1, a block count outside [A, M + A], coding
+///         params, a segment size or a P-frame's update size that
+///         @ref check_segment_size refuses, M + A past 2^32 - 1, a block
+///         count outside [A, M + A], coding
 ///         parameters other than the reference's, reference fields set on an
 ///         intra frame, tables or segment lengths whose count the header
 ///         disagrees with, lengths that do not sum to the payload, a payload

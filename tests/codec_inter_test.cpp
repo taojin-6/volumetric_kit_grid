@@ -7,9 +7,9 @@
 // and chains of an I-frame, then P-frames -- leaving the grid exactly as the
 // CPU oracle's decode of the same content does, bit for bit, with every mode,
 // new blocks and the empty cases; a P-frame whose reference is not held
-// refused as NotFound, a frame the device cannot decode refused, and every
-// refusal and failure leaving the reference as it was. Internal headers by
-// include path; skips with no device.
+// refused as NotFound, a segment longer than the format allows refused, and
+// every refusal and failure leaving the reference as it was. Internal headers
+// by include path; skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -792,20 +792,24 @@ int moves_case(Gpu& gpu, const Spheres& s) {
   return 0;
 }
 
-// A frame the device cannot decode -- a segment of more than
-// kMaxDeviceDecodeSegmentSize entries, of new blocks or of reference entries
-// -- refused with the device's code, InvalidArgument, the grid and the
-// reference as they were; nothing decodes it on the host. Segments of
+// A frame that names a segment longer than kMaxDeviceDecodeSegmentSize -- its
+// segment size, or a P-frame's update size -- is malformed: refused before
+// any device work, with the grid and the reference as they were. Segments of
 // exactly the limit decode.
-int device_refusal_case(Gpu& gpu) {
+int segment_rule_case(Gpu& gpu) {
   constexpr std::uint32_t kLimit = codec::kMaxDeviceDecodeSegmentSize;
-  const d::Frame first = make_frame(kLimit + 1, 8, 71);
+  const d::Frame first = make_frame(kLimit, 8, 71);
   std::vector<Step> chain;
   chain.push_back(i_step(d::write_frame(first, sizes(kLimit, 1)).value()));
   const d::Frame next = successor(first, 72, 50, 300, 4);
   chain.push_back(p_step(chain[0], next, sizes(64, kLimit)));
-  const Bytes long_intra = d::write_frame(first, sizes(kLimit + 1, 1)).value();
-  const Bytes long_update = p_step(chain[0], next, sizes(64, kLimit + 1)).sent;
+  // One entry more named in the header, and in REFERENCE: the same segments.
+  Bytes long_intra = chain[0].sent;
+  codec_frames::put_u32(long_intra, 36, kLimit + 1);
+  std::vector<codec_frames::Section> s =
+      codec_frames::sections_of(chain[1].sent);
+  codec_frames::put_u32(s[0].body, 12, kLimit + 1);
+  const Bytes long_update = codec_frames::assemble(chain[1].sent, s);
 
   vkc::Result<codec::Decoder> made =
       codec::Decoder::create(gpu.device, gpu.allocator);
@@ -815,11 +819,11 @@ int device_refusal_case(Gpu& gpu) {
   const Bytes& i = chain[0].sent;
   CHECK(dec.decode(i.data(), i.size(), g.value()).ok());
   CHECK(holds(gpu, g.value(), chain[0].intra));
-  const std::string says = "segments of " + std::to_string(kLimit + 1);
+  const std::string past = std::to_string(kLimit + 1) + " is not in";
   CHECK(refused(gpu, dec, long_intra, g.value(), C::InvalidArgument,
-                says.c_str()) == 0);
+                ("segment size " + past).c_str()) == 0);
   CHECK(refused(gpu, dec, long_update, g.value(), C::InvalidArgument,
-                says.c_str()) == 0);
+                ("update size " + past).c_str()) == 0);
   // Both refusals kept the reference: the P-frame on it decodes.
   const Bytes& p = chain[1].sent;
   CHECK(dec.decode(p.data(), p.size(), g.value()).ok());
@@ -836,7 +840,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
   if (encoder_case(gpu) != 0) return 1;
-  if (device_refusal_case(gpu) != 0) return 1;
+  if (segment_rule_case(gpu) != 0) return 1;
   vkc::Result<Spheres> s = spheres(gpu);
   CHECK(s.ok());
   if (sphere_case(gpu, s.value()) != 0) return 1;

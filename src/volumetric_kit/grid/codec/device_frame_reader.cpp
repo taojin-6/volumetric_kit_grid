@@ -3,9 +3,7 @@
 
 #include "device_frame_reader.hpp"
 
-#include <algorithm>
 #include <cstring>
-#include <string>
 #include <utility>
 
 #include "rans_dispatch.hpp"
@@ -24,11 +22,6 @@ namespace {
 // The kernels' workgroup widths.
 constexpr std::uint32_t kSlotsLanes = 256;
 constexpr std::uint32_t kDecodeLanes = 1;
-
-core::Status fail(const char* op, const std::string& why) {
-  return core::Status::invalid_argument(std::string("DeviceFrameReader::") +
-                                        op + ": " + why);
-}
 
 }  // namespace
 
@@ -72,15 +65,14 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   const std::uint32_t entries = m + a;  // below 2^32 (parse_frame)
   const auto segments =
       static_cast<std::uint32_t>(frame.segment_lengths.size());
-  // One invocation decodes a whole segment, and the frame sets its length.
-  const std::uint32_t longest =
-      std::max(std::min(m, u_size), std::min(a, r_size));
-  if (longest > kMaxDeviceDecodeSegmentSize) {
-    return fail("record_decode",
-                "segments of " + std::to_string(longest) +
-                    " entries, past the " +
-                    std::to_string(kMaxDeviceDecodeSegmentSize) +
-                    " one invocation decodes within a GPU watchdog's limit");
+  // One invocation decodes a whole segment, so the rule parse_frame holds
+  // the sizes to is what bounds it; checked again, as the type is, on a
+  // caller's parsed frame.
+  VKC_TRY(check_segment_size("DeviceFrameReader::record_decode", "segment size",
+                             r_size));
+  if (inter) {
+    VKC_TRY(check_segment_size("DeviceFrameReader::record_decode",
+                               "update size", u_size));
   }
   // What check() judges the frame by, once nothing else can refuse it.
   auto adopt = [&] {

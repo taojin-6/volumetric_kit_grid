@@ -308,8 +308,8 @@ int round_trip(const d::Frame& reference, const d::Frame& target,
 }
 
 // The matrix (codec_frames.hpp): every mode, K of 1, 64 and 512, and the
-// empty cases, each at update and segment sizes of 1, 7, 64 and past the
-// frame.
+// empty cases, each at update and segment sizes of 1, 7, 64 and the
+// longest, past the frame.
 int round_trip_case() {
   std::uint64_t seen[5] = {};
   for (const codec_frames::InterCode& c : codec_frames::inter_matrix()) {
@@ -636,9 +636,19 @@ int writer_refusals_case() {
   f = good;
   f.modes.push_back(d::BlockMode::kSkip);
   CHECK(refused(f, C::InvalidArgument, "modes, one per reference block"));
-  CHECK(refused(good, C::InvalidArgument, "update_size must be", sizes(64, 0)));
-  CHECK(
-      refused(good, C::InvalidArgument, "segment_size must be", sizes(0, 64)));
+  // Sizes from 1 to the longest a device invocation decodes.
+  const std::uint32_t longest = codec::kMaxDeviceDecodeSegmentSize;
+  CHECK(refused(good, C::InvalidArgument, "update_size 0 is not in",
+                sizes(64, 0)));
+  CHECK(refused(good, C::InvalidArgument, "segment_size 0 is not in",
+                sizes(0, 64)));
+  CHECK(refused(good, C::InvalidArgument,
+                "update_size " + std::to_string(longest + 1),
+                sizes(64, longest + 1)));
+  CHECK(refused(good, C::InvalidArgument,
+                "segment_size " + std::to_string(longest + 1),
+                sizes(longest + 1, 64)));
+  CHECK(d::write_frame(good, sizes(longest, longest)).ok());
   f = good;
   f.blocks.coefficients.pop_back();
   CHECK(refused(f, C::InvalidArgument, "coefficients, got"));
@@ -711,7 +721,11 @@ int writer_refusals_case() {
   c = coded;
   c.update_size = 0;
   CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument,
-                         "update_size must be"));
+                         "update_size 0 is not in"));
+  c = coded;
+  c.update_size = longest + 1;
+  CHECK(assemble_refused(d::FrameType::kInter, c, C::InvalidArgument,
+                         "update_size " + std::to_string(longest + 1)));
   const std::string survivors = "not the survivors plus the new blocks";
   c = coded;
   c.block_count = c.new_count - 1;

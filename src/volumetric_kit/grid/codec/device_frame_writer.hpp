@@ -69,15 +69,15 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @param blocks        The entries: the forward output, or a P-frame's
   ///                      stream positions, the new blocks' coordinates
   ///                      strictly increasing in frame order.
-  /// @param segment_size  Blocks per segment, at least 1: a P-frame's new
-  ///                      blocks per segment.
+  /// @param segment_size  Blocks per segment: a P-frame's new blocks per
+  ///                      segment.
   /// @param update_size   A P-frame's reference entries per update segment,
-  ///                      at least 1 when @p blocks has any.
-  /// @return OK, or `Status::Code::InvalidArgument` for a segment size of 0,
-  ///         an update size of 0 with reference entries, more reference
-  ///         entries than entries, a buffer the entries need missing, more
-  ///         than 2^30 - 1 segments, or a buffer past
-  ///         `maxStorageBufferRange`; otherwise a buffer failure.
+  ///                      read only when @p blocks holds reference entries.
+  /// @return OK, or `Status::Code::InvalidArgument` for a size
+  ///         @ref check_segment_size refuses, more reference entries than
+  ///         entries, a buffer the entries need missing, more than 2^30 - 1
+  ///         segments, or a buffer past `maxStorageBufferRange`; otherwise a
+  ///         buffer failure.
   core::Status record_count(core::CommandBatch& batch,
                             const ResidentBlocks& blocks,
                             std::uint32_t segment_size,

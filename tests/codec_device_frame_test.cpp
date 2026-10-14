@@ -481,58 +481,39 @@ int writer_refusals_case(d::DeviceFrameWriter& writer) {
   return 0;
 }
 
-// One invocation decodes a whole segment, so the reader refuses a segment of
-// more than kMaxDeviceDecodeSegmentSize entries -- blocks, a P-frame's
-// reference entries or its new blocks -- which the host decodes, and decodes
-// one of exactly that length.
-int segment_limit_case(d::DeviceFrameReader& reader) {
+// Segments of at most kMaxDeviceDecodeSegmentSize entries are a rule of the
+// format: both writers refuse a longer segment or update size, and both
+// readers a frame that names one, with the same message, while frames at the
+// limit -- one segment of that many blocks, and one update segment of that
+// many reference entries -- are written and read alike.
+int segment_rule_case(d::DeviceFrameWriter& writer,
+                      d::DeviceFrameReader& reader) {
   constexpr std::uint32_t kLimit = codec::kMaxDeviceDecodeSegmentSize;
-  auto refused = [&reader](const Bytes& bytes,
-                           const d::FrameReference* reference) {
-    const bool host =
-        d::read_frame(bytes.data(), bytes.size(), kMaxBlocks, reference).ok();
-    const vkc::Result<d::Frame> device =
-        device_read(reader, bytes.data(), bytes.size(), reference);
-    return host && !device.ok() &&
-           device.status().domain() == C::InvalidArgument;
-  };
-  const std::vector<std::uint8_t> long_segment =
-      d::write_frame(make_frame(kLimit + 1, 1, 11), sizes(kLimit + 1, 64))
-          .value();
-  CHECK(refused(long_segment, nullptr));
-  // The header's segment size alone does not count: this frame's one
-  // segment holds kLimit blocks.
-  CHECK(same_read(reader, d::write_frame(make_frame(kLimit, 1, 11),
-                                         sizes(kLimit + 1, 64))
-                              .value()) == 0);
-
-  // kLimit + 1 reference entries, all skipped, in one update segment, and
-  // then in segments of kLimit.
-  const d::Frame many = make_frame(kLimit + 1, 1, 12);
+  const d::Frame many = make_frame(kLimit, 1, 11);
+  CHECK(same_bytes(writer, reader, many, sizes(kLimit, 64)) == 0);
   const d::FrameReference id = reference_of(d::write_frame(many).value());
   const d::Frame skips = inter_frame(id, many, many);
-  CHECK(refused(d::write_frame(skips, sizes(64, kLimit + 1)).value(), &id));
-  CHECK(same_read(reader, d::write_frame(skips, sizes(64, kLimit)).value(),
-                  &id) == 0);
-  // Nor does the block count: kLimit + 2 blocks, the one new block alone in
-  // a segment of kLimit + 1.
-  const d::Frame one_new = inter_frame(id, many, successor(many, 15, 0, 0, 1));
-  CHECK(one_new.coords.size() == 1);
-  std::string why = "not read";
-  CHECK(same_read(reader,
-                  d::write_frame(one_new, sizes(kLimit + 1, 64)).value(), &id,
-                  &why) == 0);
-  CHECK(why.empty());
-  // kLimit + 1 new blocks after a small reference, in one segment, and then
-  // kLimit of them.
-  const d::Frame few = make_frame(3, 1, 13);
-  const d::FrameReference few_id = reference_of(d::write_frame(few).value());
-  const d::Frame added =
-      inter_frame(few_id, few, successor(few, 14, 0, 0, kLimit + 1));
-  CHECK(added.coords.size() == kLimit + 1);
-  CHECK(refused(d::write_frame(added, sizes(kLimit + 1, 64)).value(), &few_id));
-  CHECK(same_read(reader, d::write_frame(added, sizes(kLimit, 64)).value(),
-                  &few_id) == 0);
+  CHECK(same_bytes(writer, reader, skips, sizes(64, kLimit)) == 0);
+  for (const d::FrameWriteOptions& o :
+       {sizes(kLimit + 1, 64), sizes(64, kLimit + 1)}) {
+    CHECK(d::write_frame(skips, o).status().domain() == C::InvalidArgument);
+    CHECK(device_write(writer, skips, o).status().domain() ==
+          C::InvalidArgument);
+  }
+
+  // One entry more named in the header, and in REFERENCE: the same segments,
+  // so the rule alone refuses them.
+  const std::string past = std::to_string(kLimit + 1) + " is not in";
+  Bytes intra = d::write_frame(many, sizes(kLimit, 64)).value();
+  codec_frames::put_u32(intra, 36, kLimit + 1);
+  std::string why;
+  CHECK(same_read(reader, intra, nullptr, &why) == 0);
+  CHECK(why.find("segment size " + past) != std::string::npos);
+  const Bytes p = d::write_frame(skips, sizes(64, kLimit)).value();
+  std::vector<codec_frames::Section> s = codec_frames::sections_of(p);
+  codec_frames::put_u32(s[0].body, 12, kLimit + 1);
+  CHECK(same_read(reader, codec_frames::assemble(p, s), &id, &why) == 0);
+  CHECK(why.find("update size " + past) != std::string::npos);
   return 0;
 }
 
@@ -641,7 +622,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (corruption_case(reader) != 0) return 1;
   if (inter_refusals_case(reader) != 0) return 1;
   if (writer_refusals_case(writer) != 0) return 1;
-  if (segment_limit_case(reader) != 0) return 1;
+  if (segment_rule_case(writer, reader) != 0) return 1;
   if (frame_type_case(reader) != 0) return 1;
   if (refusals_case(gpu.device, gpu.allocator, writer) != 0) return 1;
   std::puts("codec device frame: OK");
