@@ -478,9 +478,9 @@ int writer_refusals_case(d::DeviceFrameWriter& writer) {
     }
   }
   CHECK(oracle::write_frame(edits[2].frame).status().message() ==
-        "write_frame: mode 7 is not a mode");
+        "frame writer: mode 7 is not a mode");
   CHECK(oracle::write_frame(edits.back().frame).status().message() ==
-        "write_frame: trunc_dist must be finite and positive");
+        "frame writer: trunc_dist must be finite and positive");
   f = good;
   f.blocks.coefficients[skip * k] = low;
   CHECK(device_write(writer, f, {}).value() ==

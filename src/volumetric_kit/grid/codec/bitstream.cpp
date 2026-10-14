@@ -159,7 +159,7 @@ core::Status bad(const std::string& why) {
 }
 
 core::Status bad_write(const std::string& why) {
-  return core::Status::invalid_argument("write_frame: " + why);
+  return core::Status::invalid_argument("frame writer: " + why);
 }
 
 bool positive_finite(float f) { return std::isfinite(f) && f > 0.0f; }
@@ -302,7 +302,7 @@ core::Status check_entries(std::uint32_t largest_mode, bool motion,
   }
   if (motion) {
     return core::Status::unsupported(
-        "write_frame: the motion mode, which this writer does not code");
+        "frame writer: the motion mode, which this writer does not code");
   }
   if (out_of_range) {
     return bad_write("a coefficient or residual is outside +-" +
@@ -328,7 +328,7 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   // The header's fields, which the caller coded the segments for.
   VKC_TRY(check_coding(frame.voxel_size, frame.trunc_dist, frame.params));
   VKC_TRY(
-      check_segment_size("write_frame", "segment_size", frame.segment_size));
+      check_segment_size("frame writer", "segment_size", frame.segment_size));
   const std::uint64_t m = frame.reference.header.block_count;
   if (!inter) {
     const char* set = frame.reference.hash != 0 ? "reference hash"
@@ -344,7 +344,7 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   }
   if (inter) {
     VKC_TRY(
-        check_segment_size("write_frame", "update_size", frame.update_size));
+        check_segment_size("frame writer", "update_size", frame.update_size));
   }
   // An intra frame's blocks are all new, against no reference.
   const std::uint64_t a = inter ? frame.new_count : frame.block_count;
