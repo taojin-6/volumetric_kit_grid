@@ -42,8 +42,9 @@ void print_bounds(const char* label, const vr::io::MeshBounds& b) {
 
 vkc::Status run(const Options& opt) {
   VKC_ASSIGN(vr::io::TriangleMesh geometry, vr::io::load_mesh(opt.source.path));
+  const auto& up = *opt.source.up_vector;
   VKC_ASSIGN(const vr::io::MeshAxes axes,
-             vr::io::up_axes(*opt.source.up_vector));
+             vr::io::up_axes({up[0], up[1], up[2]}));
   const vr::io::MeshBounds input_bounds = vr::io::mesh_bounds(geometry);
   const vr::io::MeshBounds upright = vr::io::mesh_bounds(geometry, axes);
   VKC_ASSIGN(const vr::io::MeshTransform normalization,

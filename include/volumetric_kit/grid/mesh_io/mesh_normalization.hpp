@@ -12,39 +12,39 @@
 /// direction opts in. For a sequence, measure every frame along one set of
 /// axes (@ref extend_bounds), fit one @ref MeshTransform to the union, and
 /// apply it to every frame, so a point that does not move keeps its place.
-/// Host-only, with no GPU work and no Assimp.
+/// Host-only, with no GPU work and no Assimp. The source compiles without
+/// floating-point contraction, so a transform's doubles are the same on every
+/// compiler.
 
-#include <array>
 #include <cstddef>
 #include <limits>
 
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/io/export.hpp"
 #include "volumetric_kit/recon/io/triangle_mesh.hpp"
 
 namespace volumetric_kit::recon::io {
-
-/// @brief A double-precision point or direction.
-using Point3d = std::array<double, 3>;
 
 /// @brief A right-handed orthonormal frame, its axes in input coordinates.
 ///
 /// A position p measured along it is `(x·p, up·p, z·p)`. Default-constructed,
 /// it is the input's own frame. Take any other from @ref up_axes.
 struct MeshAxes {
-  Point3d x{1.0, 0.0, 0.0};   ///< Measures the rotated X.
-  Point3d up{0.0, 1.0, 0.0};  ///< Measures the rotated Y.
-  Point3d z{0.0, 0.0, 1.0};   ///< Measures the rotated Z; `x × up`.
+  Vec3d x{1.0, 0.0, 0.0};   ///< Measures the rotated X.
+  Vec3d up{0.0, 1.0, 0.0};  ///< Measures the rotated Y.
+  Vec3d z{0.0, 0.0, 1.0};   ///< Measures the rotated Z; `x × up`.
 };
 
 /// @brief The proper rotation that takes a head-up direction to +Y.
 ///
-/// `up` is normalized; `x` is the unit `up × r`, where r is +Z unless
+/// `up` is normalized after an exact power-of-two rescale, so any finite,
+/// nonzero length works; `x` is the unit `up × r`, where r is +Z unless
 /// `|up.z| >= 0.9`, then +X; and `z = x × up`. A proper rotation keeps
 /// triangle winding and the sign of volumes.
-/// @param up Head-up direction in input coordinates, any nonzero length.
+/// @param up Head-up direction in input coordinates.
 /// @return The axes, or InvalidArgument for a zero or non-finite @p up.
-VR_IO_API core::Result<MeshAxes> up_axes(const Point3d& up);
+VR_IO_API core::Result<MeshAxes> up_axes(const Vec3d& up);
 
 /// @brief Position bounds measured along a frame's axes, in source units.
 ///
@@ -53,13 +53,9 @@ VR_IO_API core::Result<MeshAxes> up_axes(const Point3d& up);
 struct MeshBounds {
   MeshAxes axes;  ///< The frame every measurement uses.
   /// Per axis, the lowest measurement so far.
-  Point3d min{std::numeric_limits<double>::infinity(),
-              std::numeric_limits<double>::infinity(),
-              std::numeric_limits<double>::infinity()};
+  Vec3d min{std::numeric_limits<double>::infinity()};
   /// Per axis, the highest measurement so far.
-  Point3d max{-std::numeric_limits<double>::infinity(),
-              -std::numeric_limits<double>::infinity(),
-              -std::numeric_limits<double>::infinity()};
+  Vec3d max{-std::numeric_limits<double>::infinity()};
 };
 
 /// @brief Measure every position of a mesh, referenced or not, along @p axes.
@@ -82,8 +78,8 @@ VR_IO_API void extend_bounds(MeshBounds& bounds, const TriangleMesh& mesh);
 /// computed in double precision and rounded to float. Default-constructed,
 /// it is the identity.
 struct MeshTransform {
-  MeshAxes axes;     ///< The rotation, its axes in input coordinates.
-  Point3d origin{};  ///< Sent to zero: rotated frame, source units.
+  MeshAxes axes;      ///< The rotation, its axes in input coordinates.
+  Vec3d origin{0.0};  ///< Sent to zero: rotated frame, source units.
   double metres_per_unit = 1.0;  ///< Scale; finite and positive.
 };
 
@@ -108,8 +104,8 @@ VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
 /// @param metres_per_unit Scale; finite and positive (0.001 for millimetres).
 /// @return The transform, or InvalidArgument for empty or non-finite bounds or
 ///         a @p metres_per_unit that is not finite and positive.
-VR_IO_API core::Result<MeshTransform> unit_transform(const MeshBounds& bounds,
-                                                     double metres_per_unit);
+VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
+                                                      double metres_per_unit);
 
 /// @brief Map every position of @p mesh through @p transform, in place.
 ///

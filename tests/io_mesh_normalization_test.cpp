@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <glm/glm.hpp>
+
 #include "test_allocation_failure.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
@@ -25,7 +27,7 @@ namespace io = volumetric_kit::recon::io;
 
 namespace {
 
-using io::Point3d;
+using volumetric_kit::recon::Vec3d;
 using Code = vkc::Status::Code;
 constexpr double kInf = std::numeric_limits<double>::infinity();
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -36,7 +38,7 @@ io::TriangleMesh tetrahedron() {
           {0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3}};
 }
 
-io::TriangleMesh shifted(io::TriangleMesh mesh, const Point3d& d) {
+io::TriangleMesh shifted(io::TriangleMesh mesh, const Vec3d& d) {
   for (auto& p : mesh.positions) {
     p.x = float(p.x + d[0]);
     p.y = float(p.y + d[1]);
@@ -51,16 +53,16 @@ bool same_bits(const io::TriangleMesh& a, const io::TriangleMesh& b) {
                      a.positions.size() * sizeof(a.positions[0])) == 0;
 }
 
-bool near(const Point3d& a, const Point3d& b, double tolerance) {
-  for (std::size_t i = 0; i < 3; ++i) {
+bool near(const Vec3d& a, const Vec3d& b, double tolerance) {
+  for (int i = 0; i < 3; ++i) {
     if (!(std::abs(a[i] - b[i]) <= tolerance)) return false;
   }
   return true;
 }
 
-bool near(const volumetric_kit::recon::Vec3f& a, const Point3d& b,
+bool near(const volumetric_kit::recon::Vec3f& a, const Vec3d& b,
           double tolerance) {
-  return near(Point3d{a.x, a.y, a.z}, b, tolerance);
+  return near(Vec3d(a), b, tolerance);
 }
 
 bool same(const io::MeshAxes& a, const io::MeshAxes& b) {
@@ -70,10 +72,6 @@ bool same(const io::MeshAxes& a, const io::MeshAxes& b) {
 bool same(const io::MeshTransform& a, const io::MeshTransform& b) {
   return same(a.axes, b.axes) && a.origin == b.origin &&
          a.metres_per_unit == b.metres_per_unit;
-}
-
-double dot(const Point3d& a, const Point3d& b) {
-  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
 io::MeshAxes oblique() { return io::up_axes({-2, 1, -3}).value(); }
@@ -94,7 +92,7 @@ int union_bounds() {
   const io::TriangleMesh c{{{-40, 3, 9}, {-38, 4, 9}, {-40, 3, 12}}, {0, 1, 2}};
   auto sequence = io::mesh_bounds(io::TriangleMesh{}, axes);
   CHECK(refused_for(io::fit_transform(sequence, 1.7), "hold no positions"));
-  CHECK(refused_for(io::unit_transform(sequence, 1.0), "hold no positions"));
+  CHECK(refused_for(io::scale_transform(sequence, 1.0), "hold no positions"));
   for (const auto* frame : {&a, &b, &c}) io::extend_bounds(sequence, *frame);
   io::TriangleMesh all;
   for (const auto* frame : {&a, &b, &c}) {
@@ -107,7 +105,7 @@ int union_bounds() {
   auto reversed = io::mesh_bounds(io::TriangleMesh{}, axes);
   for (const auto* frame : {&c, &b, &a}) io::extend_bounds(reversed, *frame);
   CHECK(reversed.min == whole.min && reversed.max == whole.max);
-  for (std::size_t axis = 0; axis < 3; ++axis) {
+  for (int axis = 0; axis < 3; ++axis) {
     double low = kInf;
     double high = -kInf;
     for (const auto* frame : {&a, &b, &c}) {
@@ -121,11 +119,9 @@ int union_bounds() {
   CHECK(sequence.min == whole.min && sequence.max == whole.max);
   // The default axes measure input coordinates as given.
   const auto given = io::mesh_bounds(a);
-  CHECK(given.min == (Point3d{10, 20, 30}) &&
-        given.max == (Point3d{12, 22, 32}));
+  CHECK(given.min == (Vec3d{10, 20, 30}) && given.max == (Vec3d{12, 22, 32}));
   const auto none = io::mesh_bounds(io::TriangleMesh{}, axes);
-  CHECK(none.min == (Point3d{kInf, kInf, kInf}) &&
-        none.max == (Point3d{-kInf, -kInf, -kInf}));
+  CHECK(none.min == Vec3d(kInf) && none.max == Vec3d(-kInf));
   return 0;
 }
 
@@ -138,14 +134,14 @@ int fit_against_unit() {
   const auto fit = io::fit_transform(bounds, 1.7);
   CHECK(fit);
   CHECK(fit.value().metres_per_unit == 1.7 / (bounds.max[1] - bounds.min[1]));
-  const auto unit = io::unit_transform(bounds, fit.value().metres_per_unit);
+  const auto unit = io::scale_transform(bounds, fit.value().metres_per_unit);
   CHECK(unit && same(unit.value(), fit.value()));
   auto by_fit = mesh;
   auto by_unit = mesh;
   CHECK(io::apply_transform(by_fit, fit.value()));
   CHECK(io::apply_transform(by_unit, unit.value()));
   CHECK(same_bits(by_fit, by_unit));
-  const auto millimetres = io::unit_transform(bounds, 0.001);
+  const auto millimetres = io::scale_transform(bounds, 0.001);
   CHECK(millimetres && same(millimetres.value().axes, axes) &&
         millimetres.value().origin == fit.value().origin &&
         millimetres.value().metres_per_unit == 0.001);
@@ -174,25 +170,22 @@ int tilted_tetrahedron() {
   const double r14 = std::sqrt(14.0);
   const double r5 = std::sqrt(5.0);
   const double r70 = std::sqrt(70.0);
-  const Point3d up{-2 / r14, 1 / r14, -3 / r14};
-  const Point3d x{1 / r5, 2 / r5, 0};
-  const Point3d z{-6 / r70, 3 / r70, 5 / r70};
+  const Vec3d up{-2 / r14, 1 / r14, -3 / r14};
+  const Vec3d x{1 / r5, 2 / r5, 0};
+  const Vec3d z{-6 / r70, 3 / r70, 5 / r70};
   CHECK(near(axes.value().up, up, 1e-15));
   CHECK(near(axes.value().x, x, 1e-15));
   CHECK(near(axes.value().z, z, 1e-15));
 
   // Upright, with a distinct extent on each axis: a base at height 0, X in
   // [−0.5, 0.5], Z in [−0.75, 0.75], the apex at height 2. Volume 1/2.
-  const Point3d upright[] = {
+  const Vec3d upright[] = {
       {-0.5, 0, -0.75}, {0.5, 0, -0.75}, {0, 0, 0.75}, {0, 2, 0}};
-  const Point3d c{10, 20, 30};
+  const Vec3d c{10, 20, 30};
   io::TriangleMesh mesh;
   for (const auto& q : upright) {
-    Point3d p{};
-    for (std::size_t i = 0; i < 3; ++i) {
-      p[i] = c[i] + q[0] * x[i] + q[1] * up[i] + q[2] * z[i];
-    }
-    mesh.positions.push_back({float(p[0]), float(p[1]), float(p[2])});
+    mesh.positions.push_back(
+        volumetric_kit::recon::Vec3f(c + q.x * x + q.y * up + q.z * z));
   }
   mesh.indices = {0, 1, 2, 0, 3, 1, 1, 3, 2, 2, 3, 0};
   const auto before = io::audit_mesh_topology(mesh);
@@ -200,7 +193,7 @@ int tilted_tetrahedron() {
   CHECK(std::abs(before.value().signed_volume - 0.5) < 1e-5);
 
   // c measured along the axes: (50/√5, −90/√14, 150/√70).
-  const Point3d rc{50 / r5, -90 / r14, 150 / r70};
+  const Vec3d rc{50 / r5, -90 / r14, 150 / r70};
   const auto bounds = io::mesh_bounds(mesh, axes.value());
   CHECK(near(bounds.min, {rc[0] - 0.5, rc[1], rc[2] - 0.75}, 1e-5));
   CHECK(near(bounds.max, {rc[0] + 0.5, rc[1] + 2, rc[2] + 0.75}, 1e-5));
@@ -230,9 +223,9 @@ int tilted_tetrahedron() {
 
   // Z-up data takes +X as the reference: x = (0, −1, 0), z = (1, 0, 0).
   const auto down = io::up_axes({0, 0, -1});
-  CHECK(down && down.value().up == (Point3d{0, 0, -1}) &&
-        down.value().x == (Point3d{0, -1, 0}) &&
-        down.value().z == (Point3d{1, 0, 0}));
+  CHECK(down && down.value().up == (Vec3d{0, 0, -1}) &&
+        down.value().x == (Vec3d{0, -1, 0}) &&
+        down.value().z == (Vec3d{1, 0, 0}));
   // The reference switches at |up.z| = 0.9: +Z gives x.z = 0, +X x.x = 0.
   const auto below = io::up_axes({0, 0.45, 0.88});  // up.z = 0.8903
   const auto above = io::up_axes({0, 0.4, 0.92});   // up.z = 0.9170
@@ -246,7 +239,7 @@ int tilted_tetrahedron() {
 // the union.
 int shifted_sequence() {
   const auto axes = oblique();
-  const Point3d d{0.5, -0.25, 1.0};  // Exact in float at these magnitudes.
+  const Vec3d d{0.5, -0.25, 1.0};  // Exact in float at these magnitudes.
   const auto first = tetrahedron();
   const auto moved = shifted(first, d);
   auto sequence = io::mesh_bounds(io::TriangleMesh{}, axes);
@@ -262,8 +255,8 @@ int shifted_sequence() {
     CHECK(io::apply_transform(a, transform));
     CHECK(io::apply_transform(b, transform));
     const double s = transform.metres_per_unit;
-    const Point3d offset{s * dot(axes.x, d), s * dot(axes.up, d),
-                         s * dot(axes.z, d)};
+    const Vec3d offset{s * glm::dot(axes.x, d), s * glm::dot(axes.up, d),
+                       s * glm::dot(axes.z, d)};
     for (std::size_t i = 0; i < a.positions.size(); ++i) {
       const auto& p = a.positions[i];
       CHECK(near(b.positions[i],
@@ -279,8 +272,8 @@ int shifted_sequence() {
 
 // Every refusal; the geometry is unchanged, bit for bit.
 int refusals() {
-  for (const Point3d& up : {Point3d{0, 0, 0}, Point3d{0, kInf, 0},
-                            Point3d{kNaN, 1, 0}, Point3d{0, 1, -kInf}}) {
+  for (const Vec3d& up : {Vec3d{0, 0, 0}, Vec3d{0, kInf, 0}, Vec3d{kNaN, 1, 0},
+                          Vec3d{0, 1, -kInf}}) {
     const auto axes = io::up_axes(up);
     CHECK(!axes && axes.status().domain() == Code::InvalidArgument);
   }
@@ -290,7 +283,7 @@ int refusals() {
   const auto bounds = io::mesh_bounds(mesh, axes);
   for (const double bad : {0.0, -1.0, kNaN, kInf, -kInf}) {
     CHECK(refused_for(io::fit_transform(bounds, bad), "height_m must be"));
-    CHECK(refused_for(io::unit_transform(bounds, bad),
+    CHECK(refused_for(io::scale_transform(bounds, bad),
                       "metres_per_unit must be"));
   }
   const auto fit = io::fit_transform(bounds, 1.7).value();
@@ -320,12 +313,12 @@ int refusals() {
     auto poisoned = tetrahedron();
     poisoned.positions[2].y = bad;
     const auto poisoned_bounds = io::mesh_bounds(poisoned, axes);
-    for (std::size_t a = 0; a < 3; ++a) {
+    for (int a = 0; a < 3; ++a) {
       CHECK(std::isnan(poisoned_bounds.min[a]) &&
             std::isnan(poisoned_bounds.max[a]));
     }
     CHECK(!io::fit_transform(poisoned_bounds, 1.7));
-    CHECK(!io::unit_transform(poisoned_bounds, 1.0));
+    CHECK(!io::scale_transform(poisoned_bounds, 1.0));
     CHECK(refused(poisoned, fit));
     auto sequence = io::mesh_bounds(io::TriangleMesh{}, axes);
     io::extend_bounds(sequence, poisoned);
@@ -339,7 +332,7 @@ int refusals() {
   for (auto& p : flat.positions) p.y = 0.0f;
   const auto level = io::mesh_bounds(flat, io::MeshAxes{});
   CHECK(!io::fit_transform(level, 1.7));
-  const auto level_unit = io::unit_transform(level, 2.0);
+  const auto level_unit = io::scale_transform(level, 2.0);
   CHECK(level_unit && io::apply_transform(flat, level_unit.value()));
   CHECK(flat.positions[1].x == 2.0f && flat.positions[1].y == 0.0f);
 
@@ -356,14 +349,14 @@ int refusals() {
   io::MeshBounds wide;
   wide.min = {0, 0, 0};
   wide.max = {kInf, 1, 1};
-  CHECK(!io::fit_transform(wide, 1.7) && !io::unit_transform(wide, 1.0));
+  CHECK(!io::fit_transform(wide, 1.7) && !io::scale_transform(wide, 1.0));
 
   // Float overflow.
-  CHECK(refused(mesh, io::unit_transform(bounds, 1e300).value()));
+  CHECK(refused(mesh, io::scale_transform(bounds, 1e300).value()));
   CHECK(refused(mesh, io::fit_transform(bounds, 1e300).value()));
   // Height collapse: a scale so small that every Y rounds to zero.
   CHECK(refused(mesh, io::fit_transform(bounds, 1e-100).value()));
-  CHECK(refused(mesh, io::unit_transform(bounds, 1e-60).value()));
+  CHECK(refused(mesh, io::scale_transform(bounds, 1e-60).value()));
   CHECK(same_bits(mesh, before));
   return 0;
 }

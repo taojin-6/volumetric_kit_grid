@@ -13,35 +13,25 @@
 #include <utility>
 #include <vector>
 
+#include <glm/glm.hpp>
+
 #include "volumetric_kit/core/base/exception_status.hpp"
+
+// CMake compiles this file with -ffp-contract=off: no multiply-add is fused,
+// so a transform's doubles do not depend on the compiler.
 
 namespace volumetric_kit::recon::io {
 namespace {
 
-Point3d point(const Vec3f& p) { return {p.x, p.y, p.z}; }
-Point3d subtract(const Point3d& a, const Point3d& b) {
-  return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
-}
-double dot(const Point3d& a, const Point3d& b) {
-  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-Point3d cross(const Point3d& a, const Point3d& b) {
-  return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
-          a[0] * b[1] - a[1] * b[0]};
-}
-Point3d unit(const Point3d& v) {
-  const double length = std::sqrt(dot(v, v));
-  return {v[0] / length, v[1] / length, v[2] / length};
-}
-bool finite(const Point3d& v) {
-  return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+bool finite(const Vec3d& v) {
+  return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 bool finite(const MeshAxes& axes) {
   return finite(axes.x) && finite(axes.up) && finite(axes.z);
 }
 // A position in the rotated frame.
-Point3d measure(const MeshAxes& axes, const Point3d& p) {
-  return {dot(axes.x, p), dot(axes.up, p), dot(axes.z, p)};
+Vec3d measure(const MeshAxes& axes, const Vec3d& p) {
+  return {glm::dot(axes.x, p), glm::dot(axes.up, p), glm::dot(axes.z, p)};
 }
 
 core::Status invalid(const char* api, const char* reason) {
@@ -51,7 +41,7 @@ core::Status invalid(const char* api, const char* reason) {
 // Rotate to the bounds' axes, centre X/Z, floor Y, then scale.
 core::Result<MeshTransform> place(const char* api, const MeshBounds& bounds,
                                   double metres_per_unit) {
-  for (std::size_t a = 0; a < 3; ++a) {
+  for (int a = 0; a < 3; ++a) {
     if (std::isnan(bounds.min[a]) || std::isnan(bounds.max[a])) {
       return invalid(api, "a measured position is not finite");
     }
@@ -61,8 +51,8 @@ core::Result<MeshTransform> place(const char* api, const MeshBounds& bounds,
   }
   MeshTransform transform;
   transform.axes = bounds.axes;
-  transform.origin = {0.5 * (bounds.min[0] + bounds.max[0]), bounds.min[1],
-                      0.5 * (bounds.min[2] + bounds.max[2])};
+  transform.origin = {0.5 * (bounds.min.x + bounds.max.x), bounds.min.y,
+                      0.5 * (bounds.min.z + bounds.max.z)};
   transform.metres_per_unit = metres_per_unit;
   if (!finite(transform.axes) || !finite(transform.origin)) {
     return invalid(api, "the bounds are not finite");
@@ -72,17 +62,23 @@ core::Result<MeshTransform> place(const char* api, const MeshBounds& bounds,
 
 }  // namespace
 
-core::Result<MeshAxes> up_axes(const Point3d& up) {
-  const double norm = dot(up, up);
-  if (!std::isfinite(norm) || !(norm > 0.0)) {
+core::Result<MeshAxes> up_axes(const Vec3d& up) {
+  const double largest =
+      std::max({std::abs(up.x), std::abs(up.y), std::abs(up.z)});
+  if (!finite(up) || !(largest > 0.0)) {
     return invalid("up_axes", "up must be finite and nonzero");
   }
+  // Scaling by a power of two is exact, and it keeps the squared length from
+  // overflowing or underflowing, so every finite, nonzero up normalizes.
+  const int exponent = std::ilogb(largest);
+  const Vec3d scaled{std::ldexp(up.x, -exponent), std::ldexp(up.y, -exponent),
+                     std::ldexp(up.z, -exponent)};
   MeshAxes axes;
-  axes.up = unit(up);
-  const Point3d reference = std::abs(axes.up[2]) < 0.9 ? Point3d{0.0, 0.0, 1.0}
-                                                       : Point3d{1.0, 0.0, 0.0};
-  axes.x = unit(cross(axes.up, reference));
-  axes.z = cross(axes.x, axes.up);
+  axes.up = glm::normalize(scaled);
+  const Vec3d reference =
+      std::abs(axes.up.z) < 0.9 ? Vec3d{0.0, 0.0, 1.0} : Vec3d{1.0, 0.0, 0.0};
+  axes.x = glm::normalize(glm::cross(axes.up, reference));
+  axes.z = glm::cross(axes.x, axes.up);
   return axes;
 }
 
@@ -96,8 +92,8 @@ MeshBounds mesh_bounds(const TriangleMesh& mesh, const MeshAxes& axes) {
 void extend_bounds(MeshBounds& bounds, const TriangleMesh& mesh) {
   constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
   for (const auto& position : mesh.positions) {
-    const Point3d r = measure(bounds.axes, point(position));
-    for (std::size_t a = 0; a < 3; ++a) {
+    const Vec3d r = measure(bounds.axes, Vec3d(position));
+    for (int a = 0; a < 3; ++a) {
       // NaN stays: std::min and std::max return their first argument when
       // a comparison with it is false.
       if (!std::isfinite(r[a])) {
@@ -116,7 +112,7 @@ core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
     return invalid("fit_transform", "height_m must be finite and positive");
   }
   VKC_ASSIGN(MeshTransform transform, place("fit_transform", bounds, 0.0));
-  const double extent = bounds.max[1] - bounds.min[1];
+  const double extent = bounds.max.y - bounds.min.y;
   if (!(extent > 0.0)) {
     return invalid("fit_transform", "zero extent along up");
   }
@@ -130,13 +126,13 @@ core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
   return transform;
 }
 
-core::Result<MeshTransform> unit_transform(const MeshBounds& bounds,
-                                           double metres_per_unit) {
+core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
+                                            double metres_per_unit) {
   if (!std::isfinite(metres_per_unit) || !(metres_per_unit > 0.0)) {
-    return invalid("unit_transform",
+    return invalid("scale_transform",
                    "metres_per_unit must be finite and positive");
   }
-  return place("unit_transform", bounds, metres_per_unit);
+  return place("scale_transform", bounds, metres_per_unit);
 }
 
 core::Status apply_transform(TriangleMesh& mesh,
@@ -155,9 +151,9 @@ core::Status apply_transform(TriangleMesh& mesh,
   float placed_low = std::numeric_limits<float>::infinity();
   float placed_high = -placed_low;
   for (const auto& position : mesh.positions) {
-    const Point3d r = measure(transform.axes, point(position));
-    Point3d placed{};
-    for (std::size_t a = 0; a < 3; ++a) {
+    const Vec3d r = measure(transform.axes, Vec3d(position));
+    Vec3d placed{0.0};
+    for (int a = 0; a < 3; ++a) {
       if (!std::isfinite(r[a])) {
         return invalid("apply_transform", "a position is not finite");
       }
@@ -167,9 +163,9 @@ core::Status apply_transform(TriangleMesh& mesh,
         return invalid("apply_transform", "output overflows float");
       }
     }
-    positions.push_back({float(placed[0]), float(placed[1]), float(placed[2])});
-    low = std::min(low, r[1]);
-    high = std::max(high, r[1]);
+    positions.push_back(Vec3f(placed));
+    low = std::min(low, r.y);
+    high = std::max(high, r.y);
     placed_low = std::min(placed_low, positions.back().y);
     placed_high = std::max(placed_high, positions.back().y);
   }
@@ -215,12 +211,10 @@ core::Result<MeshTopology> audit_mesh_topology(const TriangleMesh& mesh) try {
     const auto c = mesh.indices[t + 2];
     parents[root(b)] = root(a);
     parents[root(c)] = root(a);
-    const auto ab =
-        subtract(point(mesh.positions[b]), point(mesh.positions[a]));
-    const auto ac =
-        subtract(point(mesh.positions[c]), point(mesh.positions[a]));
-    const auto area = cross(ab, ac);
-    if (!(dot(area, area) > 0.0)) ++result.degenerate_triangles;
+    const Vec3d pa(mesh.positions[a]);
+    const Vec3d area = glm::cross(Vec3d(mesh.positions[b]) - pa,
+                                  Vec3d(mesh.positions[c]) - pa);
+    if (!(glm::dot(area, area) > 0.0)) ++result.degenerate_triangles;
     for (std::size_t e = 0; e < 3; ++e) {
       const auto from = mesh.indices[t + e];
       const auto to = mesh.indices[t + (e + 1) % 3];
@@ -243,11 +237,11 @@ core::Result<MeshTopology> audit_mesh_topology(const TriangleMesh& mesh) try {
     const auto c = mesh.indices[t + 2];
     // Translate to one component vertex to avoid cancellation far from origin.
     const auto component = root(a);
-    const auto origin = point(mesh.positions[component]);
-    const auto p = subtract(point(mesh.positions[a]), origin);
-    const auto q = subtract(point(mesh.positions[b]), origin);
-    const auto r = subtract(point(mesh.positions[c]), origin);
-    volumes[component] += dot(p, cross(q, r)) / 6.0;
+    const Vec3d origin(mesh.positions[component]);
+    const Vec3d p = Vec3d(mesh.positions[a]) - origin;
+    const Vec3d q = Vec3d(mesh.positions[b]) - origin;
+    const Vec3d r = Vec3d(mesh.positions[c]) - origin;
+    volumes[component] += glm::dot(p, glm::cross(q, r)) / 6.0;
   }
   result.components = volumes.size();
   for (const auto& volume : volumes) {
