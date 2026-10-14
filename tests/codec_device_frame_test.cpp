@@ -501,12 +501,14 @@ int segment_rule_case(d::DeviceFrameWriter& writer,
   const d::FrameReference id = reference_of(oracle::write_frame(many).value());
   const oracle::Frame skips = inter_frame(id, many, many);
   CHECK(same_bytes(writer, reader, skips, sizes(64, kLimit)) == 0);
+  // The device writer refuses at the count, before it records any.
   for (const oracle::FrameWriteOptions& o :
        {sizes(kLimit + 1, 64), sizes(64, kLimit + 1)}) {
     CHECK(oracle::write_frame(skips, o).status().domain() ==
           C::InvalidArgument);
-    CHECK(device_write(writer, skips, o).status().domain() ==
-          C::InvalidArgument);
+    const vkc::Status device = device_write(writer, skips, o).status();
+    CHECK(device.domain() == C::InvalidArgument);
+    CHECK(device.message().rfind("DeviceFrameWriter::record_count: ", 0) == 0);
   }
 
   // One entry more named in the header, and in REFERENCE: the same segments,
@@ -525,11 +527,18 @@ int segment_rule_case(d::DeviceFrameWriter& writer,
   return 0;
 }
 
-// The reader refuses a parsed frame of a type past the P-frame, which the
-// oracle's decode_frame refuses too, recording nothing.
-int frame_type_case(d::DeviceFrameReader& reader) {
+// The reader checks a caller's parsed frame again, recording nothing for one
+// it refuses: a type past the P-frame, which the oracle's decode_frame
+// refuses too, and a segment or update size past the rule, which one
+// invocation could not decode.
+int parsed_frame_case(d::DeviceFrameReader& reader) {
   const oracle::Frame reference = make_frame(100, 16, 12);
   const Bytes intra = oracle::write_frame(reference).value();
+  const d::FrameReference id = reference_of(intra);
+  const Bytes p =
+      oracle::write_frame(
+          inter_frame(id, reference, successor(reference, 13, 100, 300, 20)))
+          .value();
   CHECK(same_read(reader, intra) == 0);
   auto decoded = [&reader] {
     std::vector<vr::Vec3i> coords;
@@ -540,20 +549,48 @@ int frame_type_case(d::DeviceFrameReader& reader) {
   };
   const std::vector<vr::Vec3i> before = decoded();
   CHECK(before == reference.coords);
-  d::ParsedFrame typed =
-      d::parse_frame(intra.data(), intra.size(), kMaxBlocks, nullptr).value();
+  auto refused = [&](const d::ParsedFrame& parsed, C code,
+                     const std::string& says) {
+    vkc::CommandBatch batch(*g_device, *g_allocator);
+    const vkc::Status s = reader.record_decode(batch, parsed).status();
+    if (s.domain() != code || s.message().rfind(says, 0) != 0) {
+      std::fprintf(stderr, "%s: %s\n", says.c_str(),
+                   s.ok() ? "not refused" : s.message().c_str());
+      return 1;
+    }
+    CHECK(batch.submit().ok());
+    CHECK(decoded() == before);
+    return 0;
+  };
+  auto parsed = [](const Bytes& bytes, const d::FrameReference* held) {
+    return d::parse_frame(bytes.data(), bytes.size(), kMaxBlocks, held).value();
+  };
+
+  d::ParsedFrame typed = parsed(intra, nullptr);
   typed.header.type = static_cast<d::FrameType>(2);
   CHECK(oracle::decode_frame(typed).status().domain() == C::Unsupported);
-  vkc::CommandBatch batch(*g_device, *g_allocator);
-  CHECK(reader.record_decode(batch, typed).status().domain() == C::Unsupported);
-  CHECK(batch.submit().ok());
-  CHECK(decoded() == before);
+  CHECK(refused(typed, C::Unsupported,
+                "DeviceFrameReader::record_decode: frame type 2") == 0);
+  const std::string past =
+      std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1) + " is not in";
+  for (const Bytes* frame : {&intra, &p}) {
+    d::ParsedFrame longer = parsed(*frame, frame == &p ? &id : nullptr);
+    longer.header.segment_size = codec::kMaxDeviceDecodeSegmentSize + 1;
+    CHECK(refused(longer, C::InvalidArgument,
+                  "DeviceFrameReader::record_decode: segment size " + past) ==
+          0);
+  }
+  d::ParsedFrame longer = parsed(p, &id);
+  longer.update_size = codec::kMaxDeviceDecodeSegmentSize + 1;
+  CHECK(refused(longer, C::InvalidArgument,
+                "DeviceFrameReader::record_decode: update size " + past) == 0);
   return 0;
 }
 
 // The writer's own refusals: entries it cannot walk -- more reference
-// entries than entries, or without the modes or list they need -- each
-// counting nothing, so finish refuses, rather than coding stale steps; a
+// entries than entries, or without the modes or list they need -- and a
+// segment or update size past the rule, each counting nothing, so finish
+// refuses, rather than coding stale steps; a
 // finish whose blocks have another reference count than were counted;
 // reference entries without an update size; and a reference that does not
 // hold the blocks' reference entries, or none for blocks that have them.
@@ -590,6 +627,11 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(fresh.value()->record_count(batch, blocks, 64, 64).domain() ==
           C::InvalidArgument);
   }
+  const std::uint32_t over = codec::kMaxDeviceDecodeSegmentSize + 1;
+  CHECK(fresh.value()->record_count(batch, r.blocks, over, 64).domain() ==
+        C::InvalidArgument);
+  CHECK(fresh.value()->record_count(batch, r.blocks, 64, over).domain() ==
+        C::InvalidArgument);
   CHECK(batch.submit().ok());
   CHECK(uncounted(finish(*fresh.value(), r.blocks, p.reference)));
 
@@ -632,7 +674,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (inter_refusals_case(reader) != 0) return 1;
   if (writer_refusals_case(writer) != 0) return 1;
   if (segment_rule_case(writer, reader) != 0) return 1;
-  if (frame_type_case(reader) != 0) return 1;
+  if (parsed_frame_case(reader) != 0) return 1;
   if (refusals_case(gpu.device, gpu.allocator, writer) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;
