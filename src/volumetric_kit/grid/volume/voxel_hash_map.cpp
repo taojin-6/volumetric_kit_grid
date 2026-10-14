@@ -1086,20 +1086,6 @@ core::Result<std::vector<BlockStamp>> VoxelHashMap::read_block_stamps() const {
   return out;
 }
 
-core::Result<std::vector<HashEntry>> VoxelHashMap::read_entries() {
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelHashMap::read_entries: moved-from map");
-  }
-  const std::uint32_t total = total_entries();
-  std::vector<HashEntry> entries(total);
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.readback(entries_, 0, VkDeviceSize(total) * sizeof(HashEntry),
-                         entries.data()));
-  VKC_TRY(batch.submit());
-  return entries;
-}
-
 core::Result<float> VoxelHashMap::load_factor() const {
   if (!valid()) {
     return core::Status::invalid_argument(
@@ -1109,74 +1095,6 @@ core::Result<float> VoxelHashMap::load_factor() const {
   // num_buckets > 0, and their product is num_blocks).
   return 1.0f -
          static_cast<float>(heap_free_) / static_cast<float>(grid_.num_blocks);
-}
-
-core::Result<HashDiagnostics> VoxelHashMap::diagnostics() {
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelHashMap::diagnostics: moved-from map");
-  }
-  // The table and the device's own heap counter in one batch -- not the
-  // host copy load_factor() reads, so this is what can catch that copy stale.
-  std::vector<HashEntry> entries(total_entries());
-  std::uint32_t heap_free = 0;
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.readback(entries_, 0,
-                         VkDeviceSize(entries.size()) * sizeof(HashEntry),
-                         entries.data()));
-  VKC_TRY(batch.readback(heap_counter_, 0, sizeof(heap_free), &heap_free));
-  VKC_TRY(batch.submit());
-
-  const int num_buckets = grid_.num_buckets;
-  const int bucket_size = grid_.bucket_size;
-  const int total_slots = static_cast<int>(total_entries());
-
-  HashDiagnostics diag;
-  diag.heap_free_count = static_cast<std::int32_t>(heap_free);
-  diag.total_blocks = grid_.num_blocks;
-
-  // One pass per bucket: count active primary slots, then walk the collision
-  // chain from the anchor (last slot of the bucket) counting its length + the
-  // active overflow slots on it. Host port of computeDiagnostics.
-  for (int bucket = 0; bucket < num_buckets; ++bucket) {
-    const int start = bucket * bucket_size;
-    for (int i = 0; i < bucket_size; ++i) {
-      const int ptr = entries[start + i].ptr;
-      if (ptr != kFreeEntry && ptr != kLockEntry) {
-        ++diag.active_count;
-      }
-    }
-    const int anchor = (bucket + 1) * bucket_size - 1;
-    int chain_length = 0;
-    int curr = anchor;
-    for (int hop = 0; hop < grid_.max_chain; ++hop) {
-      const int off = entries[curr].offset;
-      if (off == kNoOffset) {
-        break;
-      }
-      // offset is relative to the anchor and may be negative; wrap into range.
-      const long long raw = static_cast<long long>(anchor) + off;
-      const int next =
-          static_cast<int>(((raw % total_slots) + total_slots) % total_slots);
-      ++chain_length;
-      const int ptr = entries[next].ptr;
-      if (ptr != kFreeEntry && ptr != kLockEntry) {
-        ++diag.overflow_count;
-      }
-      curr = next;
-    }
-    diag.max_chain_length = std::max(diag.max_chain_length, chain_length);
-  }
-
-  if (total_slots > 0) {
-    diag.load_factor =
-        static_cast<float>(diag.active_count) / static_cast<float>(total_slots);
-  }
-  if (diag.total_blocks > 0) {
-    diag.heap_utilization = 1.0f - static_cast<float>(heap_free) /
-                                       static_cast<float>(diag.total_blocks);
-  }
-  return diag;
 }
 
 }  // namespace volumetric_kit::recon::volume

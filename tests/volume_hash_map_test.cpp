@@ -3,11 +3,10 @@
 
 // GPU test for the sparse voxel hash map: build a VoxelHashMap, allocate a
 // known set of block coordinates, compact the active set, and verify it
-// round-trips -- including reading the raw HashEntry slots back to prove the
-// host<->shader scalar-layout ABI matches on-device (both `pos` @4 and, via a
-// second collision-forcing table, the overflow-chain `offset` @16). Also checks
-// distinct heap slots, idempotent re-alloc, clear, the device-list allocate's
-// own cases, and move semantics. This exercises the real driver
+// round-trips -- including, on collision-forcing tables, blocks found again
+// only by walking their overflow chain. Also checks distinct heap slots,
+// idempotent re-alloc, clear, the device-list allocate's own cases, and move
+// semantics. This exercises the real driver
 // (MoltenVK on Apple, the NVIDIA ICD on the Linux CI box); it exits 0 (skip)
 // where no device is present.
 
@@ -41,8 +40,7 @@ namespace {
 using Coord = std::tuple<int, int, int>;
 
 // Find `n` distinct block coords that all hash to `target_bucket`, so they land
-// in one primary bucket and its collision chain. Mirrors the helper in
-// volume_diagnostics_test.cpp, and bounded for the same reason: an open
+// in one primary bucket and its collision chain. Bounded, because an open
 // `for (int x = 1; out.size() < n; ++x)` terminates only by success, so
 // changing a hash prime, a bucket count, or the fixed y/z pair turns a failing
 // test into an infinite loop with signed-overflow UB instead of a red build. A
@@ -288,22 +286,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(map.compact_active_blocks().ok());
   CHECK(!map.check_device_block_list(on_device.value(), "test").ok());
 
-  // Scalar-ABI round-trip: read the raw HashEntry slots. Exactly 27 are
-  // occupied, each pos is one of the inputs (proving `pos` lands at the host
-  // offset the shader wrote), and each ptr is a whole block (a multiple of
-  // voxels_per_block).
-  vkc::Result<std::vector<vol::HashEntry>> entries = map.read_entries();
-  CHECK(entries.ok());
-  int occupied = 0;
-  for (const vol::HashEntry& entry : entries.value()) {
-    if (entry.ptr != vol::kFreeEntry && entry.ptr != vol::kLockEntry) {
-      ++occupied;
-      CHECK(want.count({entry.pos.x, entry.pos.y, entry.pos.z}) == 1);
-      CHECK(entry.ptr % grid.voxels_per_block == 0);
-    }
-  }
-  CHECK(occupied == static_cast<int>(want.size()));
-
   // clear() empties the table.
   CHECK(map.clear().ok());
   vkc::Result<std::vector<vol::BlockIndex>> after_clear =
@@ -359,8 +341,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // it exercises neither the overflow chain nor the HashEntry.offset field (all
   // offsets stay kNoOffset). Build a second map on a tiny table and force many
   // coords into ONE bucket so the allocator spills into the collision chain,
-  // then prove the chain round-trips -- i.e. `offset` lands at its
-  // scalar-layout byte (@16) and is traversable on-device.
+  // then prove the chain is traversable on-device.
   {
     vol::VoxelGridParams cg{};
     cg.voxel_size = 0.005f;
@@ -412,16 +393,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
     }
     CHECK(cgot == cwant);
     CHECK(cptrs.size() == cwant.size());
-
-    // The chain is real: bucket 0's anchor (the last slot of its bucket) must
-    // carry a non-zero offset -- i.e. the surplus coords were linked through
-    // HashEntry.offset, proving that field round-trips at its scalar-layout
-    // byte (the 3x3x3 test, all offsets kNoOffset, never checks it).
-    vkc::Result<std::vector<vol::HashEntry>> centries = cmap.read_entries();
-    CHECK(centries.ok());
-    const std::size_t anchor =
-        static_cast<std::size_t>((0 + 1) * cg.bucket_size - 1);
-    CHECK(centries.value()[anchor].offset != vol::kNoOffset);
 
     // Idempotent under collisions: re-inserting the same coords must find the
     // chained ones by TRAVERSING `offset` and allocate nothing new -- if offset
@@ -512,13 +483,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(pactive2.ok());
     CHECK(pactive2.value().size() == kDeepChain);
 
-    vkc::Result<std::vector<vol::HashEntry>> pentries = pmap.read_entries();
-    CHECK(pentries.ok());
-    const auto panchor = static_cast<std::size_t>(pg.bucket_size - 1);
-    CHECK(pentries.value()[panchor].offset != vol::kNoOffset);
-
-    // Occupancy is readable without the O(total slots) diagnostics scan -- the
-    // cheap signal a caller needs to grow *before* it starts failing.
+    // Occupancy is a constant-time read -- the cheap signal a caller needs to
+    // grow *before* it starts failing.
     vkc::Result<float> plf = pmap.load_factor();
     CHECK(plf.ok());
     CHECK(plf.value() > 0.14f && plf.value() < 0.15f);  // 300 / 2048
@@ -643,8 +609,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   std::printf(
       "recon volume hash-map test passed: allocated + compacted %zu blocks; "
-      "HashEntry scalar-layout round-trip (incl. overflow-chain offset) "
-      "matched on-device\n",
+      "chained blocks found again through their overflow chains\n",
       want.size());
   return 0;
 }

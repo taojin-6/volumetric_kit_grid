@@ -96,14 +96,17 @@ int gpu_main(vr_test::GpuContext& gpu) {
     return vr_test::write_attribute(gpu.device, gpu.allocator, vbg, name, data)
         .ok();
   };
-  // load_factor() reads a host copy of the heap counter, and diagnostics()
-  // the device's own: the two agree after every call that moves it.
+  // load_factor() reads a host copy of the heap counter, which every allocate
+  // and remove round reads back from the device's own: after each call that
+  // moves the counter, the heap's blocks out agree with the table's blocks.
   const auto heap_agrees = [&]() {
     vkc::Result<float> lf = vbg.map().load_factor();
-    vkc::Result<vol::HashDiagnostics> d = vbg.map().diagnostics();
-    return lf.ok() && d.ok() &&
-           lf.value() == 1.0f - static_cast<float>(d.value().heap_free_count) /
-                                    static_cast<float>(d.value().total_blocks);
+    vkc::Result<std::vector<vol::BlockIndex>> live =
+        vbg.map().compact_active_blocks();
+    const auto total = static_cast<float>(vbg.grid().num_blocks);
+    return lf.ok() && live.ok() &&
+           lf.value() ==
+               1.0f - (total - static_cast<float>(live.value().size())) / total;
   };
   std::vector<float> tsdf_data = get("tsdf");
   std::vector<float> weight_data = get("weight");
@@ -214,6 +217,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<std::uint32_t> fresh_alloc =
       vr_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
   CHECK(fresh_alloc.ok() && fresh_alloc.value() == 0);
+  CHECK(heap_agrees());  // the rebuilt heap's device counter, read back
   vkc::Result<std::vector<vol::BlockIndex>> with_fresh =
       vbg.map().compact_active_blocks();
   CHECK(with_fresh.ok() && with_fresh.value().size() == before_count + 1);

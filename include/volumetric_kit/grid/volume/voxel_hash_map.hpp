@@ -30,18 +30,6 @@
 
 namespace volumetric_kit::recon::volume {
 
-/// @brief On-demand occupancy + health statistics for a @ref VoxelHashMap,
-///        computed by @ref VoxelHashMap::diagnostics.
-struct HashDiagnostics {
-  std::int32_t active_count = 0;      ///< Occupied hash slots.
-  std::int32_t overflow_count = 0;    ///< Active slots in collision chains.
-  std::int32_t max_chain_length = 0;  ///< Longest collision chain, in hops.
-  std::int32_t heap_free_count = 0;   ///< Free blocks left on the heap.
-  std::int32_t total_blocks = 0;      ///< Block capacity (grid `num_blocks`).
-  float load_factor = 0.0f;           ///< `active_count / total slots`.
-  float heap_utilization = 0.0f;      ///< `1 - heap_free / total_blocks`.
-};
-
 /// @brief Why a dispatch's failures failed -- the per-reason split behind the
 ///        single count @ref VoxelHashMap::allocate and friends return.
 ///
@@ -126,9 +114,8 @@ struct DeviceBlockList {
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
 /// byte-for-byte. Covers init, allocate-from-coords / -depth / -triangles,
-/// remove, compact / compact-in-frusta, diagnostics, and an
-/// **index-preserving** @ref resize (the GPU rehash that keeps each block's
-/// `ptr`).
+/// remove, compact / compact-in-frusta, and an **index-preserving**
+/// @ref resize (the GPU rehash that keeps each block's `ptr`).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -267,6 +254,8 @@ class VR_VOLUME_API VoxelHashMap {
       AllocFailures* out_failures = nullptr,
       core::StageMetrics* metrics = nullptr);
 
+  // TODO(volume): the candidate count is a host pass over the triangles, as
+  // in tsdf's MeshIntegrator (the 2026-10-13 volume block-list entry's Next).
   /// @brief Allocate the voxel blocks a triangle mesh's truncation band covers.
   ///
   /// A block is allocated when its centre lies within `trunc_dist` plus the
@@ -344,6 +333,8 @@ class VR_VOLUME_API VoxelHashMap {
                                      std::uint32_t count,
                                      AllocFailures* out_failures = nullptr);
 
+  // TODO(volume): a bulk readback; its callers are the remesh-report example
+  // and resize's snapshot (the 2026-10-13 volume block-list entry's Next).
   /// @brief Compact every active block into a host vector of @ref BlockIndex.
   /// @param metrics  Optional `StageMetrics` collecting an `"active set"`
   ///                 row -- host and device. Named with @ref
@@ -453,16 +444,6 @@ class VR_VOLUME_API VoxelHashMap {
   ///         `Status::Code::OutOfMemory` if the re-insert overflows.
   core::Status resize(std::int32_t new_num_buckets);
 
-  /// @brief Read the raw hash-entry slots back to the host.
-  ///
-  /// Low-level / diagnostic: exposes the on-device @ref HashEntry array (all
-  /// slots, including free ones) so callers can inspect the table or verify the
-  /// host<->shader layout. @ref compact_active_blocks is the normal way to get
-  /// the active set.
-  /// @return All hash-entry slots (length `num_buckets * bucket_size`), or a
-  ///         non-OK `Status` if the map is moved-from.
-  core::Result<std::vector<HashEntry>> read_entries();
-
   /// @brief The device hash-entry array, for a kernel that resolves blocks by
   ///        coordinate itself instead of being handed a host-built table.
   ///
@@ -511,19 +492,15 @@ class VR_VOLUME_API VoxelHashMap {
   /// The complement of the free-block heap, `1 - heap_free / num_blocks`, taken
   /// from the host's copy of the heap counter, which every call that moves the
   /// counter reads back in its own submit -- so this costs no dispatch. It
-  /// is also the fraction of hash slots in use -- the same quantity
-  /// @ref HashDiagnostics::load_factor reports, derived from the heap counter
-  /// instead of a slot scan -- because @ref VoxelGridParams::validate forces
+  /// is also the fraction of hash slots in use, derived from the heap counter
+  /// instead of a slot scan, because @ref VoxelGridParams::validate forces
   /// `num_blocks == bucket_size * num_buckets` and every occupied slot holds
   /// exactly one heap block.
   ///
-  /// This is what lets a caller **grow before it fails**. @ref diagnostics
-  /// reports the same number alongside chain health, but scans every slot on
-  /// the host (1.5M at the example defaults) and so cannot run per frame; and
-  /// growing only once @ref AllocFailures::capacity_limited fires means the map
-  /// necessarily spends time at the occupancy where collision chains are
-  /// longest and every insert is slowest. Grow at @ref kGrowThreshold rather
-  /// than at the cliff.
+  /// This is what lets a caller **grow before it fails**: growing only once
+  /// @ref AllocFailures::capacity_limited fires means the map necessarily
+  /// spends time at the occupancy where collision chains are longest and every
+  /// insert is slowest. Grow at @ref kGrowThreshold rather than at the cliff.
   /// @return The occupancy in `[0, 1]`, or a non-OK `Status` if the map is
   ///         moved-from.
   core::Result<float> load_factor() const;
@@ -542,15 +519,6 @@ class VR_VOLUME_API VoxelHashMap {
   /// guidance @ref load_factor gives right above it -- and neither side is
   /// obviously the wrong one to a reader who sees only one.
   static constexpr float kGrowThreshold = 0.7f;
-
-  /// @brief Compute occupancy + health statistics (active / overflow / chain
-  ///        length + heap utilization).
-  ///
-  /// A host-side scan of the entries, read back whole, plus the device's heap
-  /// counter -- O(total slots), so call it for inspection/logging, not per
-  /// frame. A GPU-side scan is a perf follow-up for very large tables.
-  /// @return The statistics, or a non-OK `Status` (e.g. moved-from map).
-  core::Result<HashDiagnostics> diagnostics();
 
   /// @brief A token identifying this table's *current* block-index assignment:
   ///        it changes whenever a block stops being live (@ref remove, @ref
@@ -605,6 +573,8 @@ class VR_VOLUME_API VoxelHashMap {
   ///        @ref remove, @ref clear and @ref create zero a slot's record, and
   ///        @ref resize keeps each where it is.
   const core::Buffer& stamps_buffer() const noexcept { return stamps_; }
+  // TODO(volume): a bulk readback; its callers are the remesh-report example
+  // and the iOS scanner (the 2026-10-13 volume block-list entry's Next).
   /// @brief Every block slot's record, read back; the iOS scanner reads its
   ///        `changed` ticks through this.
   core::Result<std::vector<BlockStamp>> read_block_stamps() const;

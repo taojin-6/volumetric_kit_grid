@@ -52,6 +52,7 @@
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/volume/frustum.hpp"
+#include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -579,11 +580,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // every other suite too.
   //
   // Production is the overflow case (a full 50-entry bucket chains, with
-  // max_chain 128, and HashDiagnostics::overflow_count exists precisely
-  // because buckets fill), so mesh the SAME field through a table shaped to
-  // spill: 2-entry buckets make the last slot of each bucket its chain anchor,
-  // so a bucket holding two coords already pushes one into the chain. The block
-  // set, the field and therefore the surface are identical -- only the table
+  // max_chain 128), so mesh the SAME field through a table shaped to spill:
+  // 2-entry buckets over 512, where some bucket draws more coords than its
+  // two slots, and the rest must chain. The block set, the field and
+  // therefore the surface are identical -- only the table
   // geometry differs -- so the mesh must match the reference triangle for
   // triangle. Under the mutation above it comes back short and returns
   // Status::ok, which is the failure mode this exists to catch: surface
@@ -599,12 +599,22 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   // The fixture only tests what it exercises, so assert that it spills before
   // trusting what it proves -- otherwise a later change to the hash or to these
-  // numbers turns this case vacuous without failing.
-  vkc::Result<vol::HashDiagnostics> chained_diag =
-      chained_grid.map().diagnostics();
-  CHECK(chained_diag.ok());
-  CHECK(chained_diag.value().overflow_count > 0);
-  CHECK(chained_diag.value().max_chain_length > 0);
+  // numbers turns this case vacuous without failing. A bucket that draws more
+  // coords than it has slots chains the rest, whatever else the table holds.
+  {
+    std::map<std::uint32_t, std::int32_t> per_bucket;
+    std::int32_t fullest = 0;
+    for (int cz = 0; cz < kBlocks; ++cz) {
+      for (int cy = 0; cy < kBlocks; ++cy) {
+        for (int cx = 0; cx < kBlocks; ++cx) {
+          fullest = std::max(
+              fullest, ++per_bucket[vol::hash_bucket(vr::Vec3i(cx, cy, cz),
+                                                     chained_gp.num_buckets)]);
+        }
+      }
+    }
+    CHECK(fullest > chained_gp.bucket_size);
+  }
 
   vkc::Result<mesh::Mesh> chained_mesh_result =
       extractor.extract_host(chained_grid, 0.0f);

@@ -83,6 +83,23 @@ vkc::Result<std::set<Coord>> active_set(vol::VoxelHashMap& map) {
   return out;
 }
 
+// Whether @p map's occupancy is @p live blocks of its heap. load_factor() reads
+// the host copy of the heap counter, which every allocation round reads back
+// from the device's own.
+bool occupancy_is(const vol::VoxelHashMap& map, std::size_t live) {
+  const auto total = static_cast<float>(map.grid().num_blocks);
+  vkc::Result<float> lf = map.load_factor();
+  return lf.ok() &&
+         lf.value() == 1.0f - (total - static_cast<float>(live)) / total;
+}
+
+// Whether no two of @p ptrs are the same block.
+bool distinct_ptrs(const std::map<Coord, std::int32_t>& ptrs) {
+  std::set<std::int32_t> seen;
+  for (const auto& entry : ptrs) seen.insert(entry.second);
+  return seen.size() == ptrs.size();
+}
+
 // Each active block's coordinate -> its voxel-array pointer (BlockIndex::ptr).
 vkc::Result<std::map<Coord, std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
   vkc::Result<std::vector<vol::BlockIndex>> active =
@@ -151,12 +168,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(ptrs_after.value() == ptrs_before.value());
 
   // The heap was rebuilt to exclude the preserved indices: free blocks = the
-  // new capacity minus the live set (so a later allocation never reuses a live
-  // one).
-  vkc::Result<vol::HashDiagnostics> diag = map.diagnostics();
-  CHECK(diag.ok());
-  CHECK(diag.value().heap_free_count ==
-        static_cast<std::int32_t>(1024 * 8 - a.size()));
+  // new capacity minus the live set, so a later allocation never reuses a live
+  // one. The rebuild's own count first; the allocations below read the
+  // device's back, and hand out no index twice.
+  CHECK(occupancy_is(map, a.size()));
 
   // The grown table still allocates: cube B, disjoint from A.
   std::vector<vol::BlockIndex> b = cube(20, 20, 20);
@@ -169,6 +184,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(both.ok());
   CHECK(both.value() == want);
   CHECK(both.value().size() == 54);
+  CHECK(occupancy_is(map, 54));
 
   // Prove the buffers actually grew, not just the grid metadata: fill well past
   // the ORIGINAL 2048-block capacity (256 buckets x 8), which the un-grown heap
@@ -193,6 +209,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(grown.ok());
   CHECK(grown.value() == want);
   CHECK(grown.value().size() == 54 + 3375);
+  vkc::Result<std::map<Coord, std::int32_t>> grown_ptrs = active_ptrs(map);
+  CHECK(grown_ptrs.ok() && distinct_ptrs(grown_ptrs.value()));
 
   // resize refuses a non-growing count.
   CHECK(map.resize(1024).domain() == vkc::Status::Code::InvalidArgument);
@@ -216,8 +234,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   // A grow whose rehash cannot place the blocks rolls back. Five blocks in
   // five buckets of 8 all land in one bucket of 9, where two slots and a chain
-  // of two hold four. The map is as it was, and so is the heap counter,
-  // including the host copy load_factor() reads.
+  // of two hold four. The map is as it was, and so is the heap counter, the
+  // host copy load_factor() reads and the device's own.
   {
     vol::VoxelGridParams tight = map.grid();
     tight.bucket_size = 2;
@@ -249,9 +267,24 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(small.grid().num_buckets == 8);
     vkc::Result<std::set<Coord>> kept = active_set(small);
     CHECK(kept.ok() && kept.value().size() == 5);
-    vkc::Result<vol::HashDiagnostics> d = small.diagnostics();
-    CHECK(d.ok() && d.value().heap_free_count == 16 - 5);
-    CHECK(small.load_factor().value() == 5.0f / 16.0f);
+    CHECK(occupancy_is(small, 5));
+    // The device's counter rolled back too: a sixth block, in a bucket of its
+    // own, takes the next free index and reads the counter back.
+    vol::BlockIndex sixth{};
+    for (int i = 0; i < 4096; ++i) {
+      const vr::Vec3i c(i % 64, i / 64, 1);
+      if (old_buckets.count(vol::hash_bucket(c, 8)) == 0) {
+        sixth.coord = c;
+        break;
+      }
+    }
+    CHECK(old_buckets.count(vol::hash_bucket(sixth.coord, 8)) == 0);
+    vkc::Result<std::uint32_t> placed_sixth =
+        vr_test::allocate_blocks(gpu, small, &sixth, 1);
+    CHECK(placed_sixth.ok() && placed_sixth.value() == 0);
+    CHECK(occupancy_is(small, 6));
+    vkc::Result<std::map<Coord, std::int32_t>> six = active_ptrs(small);
+    CHECK(six.ok() && six.value().size() == 6 && distinct_ptrs(six.value()));
   }
 
   std::printf(
