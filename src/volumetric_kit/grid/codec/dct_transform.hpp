@@ -50,8 +50,8 @@ struct DctTransformConfig {
 /// @brief Blocks where the device holds them: @ref count entries of masks
 ///        and coefficients, and their block list, in the layout the kernels
 ///        write. Borrowed from what produced them -- the transform's
-///        @ref DctTransform::record_forward or the device frame reader -- and
-///        valid until that object's next call.
+///        @ref DctTransform::record_forward, the device frame reader or the
+///        reference store -- and valid until that object's next call.
 ///
 /// A P-frame's entries are its stream positions (bitstream.hpp): its
 /// @ref reference_count reference entries, each with its mode, then its new
@@ -62,7 +62,7 @@ struct ResidentBlocks {
   const core::Buffer* list = nullptr;
   const core::Buffer* masks =
       nullptr;  ///< `kMaskWordsPerBlock` words an entry.
-  /// Two int16 a word, coefficient 2p low; `(K + 1) / 2` words an entry.
+  /// Two int16 a word, coefficient 2p low; @ref coefficient_words an entry.
   const core::Buffer* coefficients = nullptr;
   /// A P-frame's mode for each reference entry, a u32 each
   /// (`frame_models.glsl`'s `kMode*`); null without reference entries.
@@ -189,6 +189,10 @@ class VR_CODEC_API DctTransform {
   /// @brief Reconstruct every block in @p blocks from its coefficients and
   ///        mask, overwriting its `tsdf` and `weight`.
   ///
+  /// TODO(codec): only the tests call this, the CPU oracle's inverse among
+  /// them, with coefficients from the host; it moves under tests/ with the
+  /// host reader.
+  ///
   /// The list must be duplicate-free (unchecked -- a repeat is two workgroups
   /// writing one block).
   /// @param grid    As @ref forward, written in place.
@@ -207,17 +211,22 @@ class VR_CODEC_API DctTransform {
                        const volume::BlockList& blocks, const DctBlocks& in,
                        core::GpuStageScope* stage = nullptr);
 
-  /// @brief @ref inverse from blocks the device holds (the device frame
-  ///        reader's), bound where they are rather than uploaded.
+  /// @brief @ref inverse from blocks the device holds (the reference store's
+  ///        apply output), bound where they are rather than uploaded, and
+  ///        recorded into the caller's @p batch after what it already holds
+  ///        -- that apply -- and submitted with it, so the two share one
+  ///        submit.
   ///
   /// The list must be duplicate-free, and the coefficients made against the
-  /// grid's `trunc_dist` (both unchecked: the reader decoded them from a
-  /// frame whose order and header the caller checked).
+  /// grid's `trunc_dist` (both unchecked: they come from a frame whose order
+  /// and header the caller checked).
+  /// @param batch  Holding what the inverse reads; submitted here once the
+  ///               checks pass (a refusal submits nothing).
   /// @return As @ref inverse, and `Status::Code::InvalidArgument` for
   ///         buffers missing or smaller than @p in's count needs, or a
   ///         P-frame's entries, which are not yet its blocks.
-  core::Status inverse(volume::VoxelBlockGrid& grid, const ResidentBlocks& in,
-                       const CodecParams& params,
+  core::Status inverse(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+                       const ResidentBlocks& in, const CodecParams& params,
                        core::GpuStageScope* stage = nullptr);
 
   /// @brief The entries of @p list whose block holds an observed voxel

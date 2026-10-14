@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// A decoded frame's blocks, made from its reference and its payload: one
+// workgroup per block, in frame order, each writing the block's mask and
+// coefficients into the reference store's spare (reference_store.hpp). Its
+// ApplySource (bitstream.hpp) says where the block comes from:
+//   keep    reference e and payload e: the mask XOR the reference's, and each
+//           coefficient the reference's plus its residual, mod 2^16;
+//   skip    reference e alone: the reference block as it is;
+//   zero, a new block, an intra frame's block: the payload alone.
+// An absent side reads as zero, so one formula serves all three. Integer
+// only, so a P-frame decodes to exactly what the intra frame of the same
+// content does, on any device. An odd K's pad half-word is written 0.
+
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+// Mirrors kMaskWordsPerBlock (codec_params.hpp) and kNoSource
+// (bitstream.hpp).
+const uint kMaskWords = 16u;
+const uint kNoSource = 0xFFFFFFFFu;
+
+// Mirrors ApplyPush in reference_store.cpp.
+layout(push_constant, std430) uniform Push {
+  uint block_base;         // first block this dispatch covers
+  uint num_blocks;         // N, the frame's blocks
+  uint coefficient_count;  // K
+}
+pc;
+
+// Mirrors ApplySource in bitstream.hpp.
+struct ApplySource {
+  uint reference;
+  uint payload;
+};
+
+layout(set = 0, binding = 0, scalar) readonly buffer Sources {
+  ApplySource sources[];  // one a block, in frame order
+};
+layout(set = 0, binding = 1, std430) readonly buffer ReferenceMasks {
+  uint reference_masks[];  // kMaskWords an entry
+};
+layout(set = 0, binding = 2, std430) readonly buffer ReferenceCoefficients {
+  uint reference_coefficients[];  // two int16 a word, (K + 1) / 2 an entry
+};
+layout(set = 0, binding = 3, std430) readonly buffer PayloadMasks {
+  uint payload_masks[];
+};
+layout(set = 0, binding = 4, std430) readonly buffer PayloadCoefficients {
+  uint payload_coefficients[];
+};
+layout(set = 0, binding = 5, std430) writeonly buffer Masks {
+  uint masks[];
+};
+layout(set = 0, binding = 6, std430) writeonly buffer Coefficients {
+  uint coefficients[];
+};
+
+// Each 16-bit half of a and b added mod 2^16: a carry out of the low half
+// is dropped, not carried into the high one.
+uint add_halves(uint a, uint b) {
+  return ((a + b) & 0xFFFFu) | (((a >> 16u) + (b >> 16u)) << 16u);
+}
+
+void main() {
+  const uint block = pc.block_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup.
+  if (block >= pc.num_blocks) {
+    return;
+  }
+  const ApplySource s = sources[block];
+  const bool from_reference = s.reference != kNoSource;
+  const bool from_payload = s.payload != kNoSource;
+  const uint words = (pc.coefficient_count + 1u) / 2u;  // coefficient_words
+  // The last word's high half is an odd K's pad.
+  const uint last = (pc.coefficient_count & 1u) != 0u ? 0xFFFFu : 0xFFFFFFFFu;
+  // The mask's words, then the coefficients', a lane each.
+  for (uint i = gl_LocalInvocationIndex; i < kMaskWords + words;
+       i += gl_WorkGroupSize.x) {
+    if (i < kMaskWords) {
+      const uint r =
+          from_reference ? reference_masks[s.reference * kMaskWords + i] : 0u;
+      const uint p =
+          from_payload ? payload_masks[s.payload * kMaskWords + i] : 0u;
+      masks[block * kMaskWords + i] = r ^ p;
+    } else {
+      const uint w = i - kMaskWords;
+      const uint r =
+          from_reference ? reference_coefficients[s.reference * words + w]
+                         : 0u;
+      const uint p =
+          from_payload ? payload_coefficients[s.payload * words + w] : 0u;
+      coefficients[block * words + w] =
+          add_halves(r, p) & (w + 1u == words ? last : 0xFFFFFFFFu);
+    }
+  }
+}

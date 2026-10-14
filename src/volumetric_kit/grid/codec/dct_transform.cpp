@@ -97,11 +97,10 @@ core::Status fail(const char* op, const std::string& why) {
                                         ": " + why);
 }
 
-// The device's coefficients are two to a word, each entry starting a word of
-// its own (coefficient_words in dct_common.glsl), so an odd K pads each entry
-// by one; the host's are K to an entry.
+// The int16 an entry takes on the device (coefficient_words); the host's are
+// K to an entry.
 std::size_t padded_count(std::uint32_t k) {
-  return (std::size_t(k) + 1) / 2 * 2;
+  return std::size_t(coefficient_words(k)) * 2;
 }
 
 }  // namespace
@@ -491,7 +490,8 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
   return run_inverse(batch, grid, views, resident, in.params, stage);
 }
 
-core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
+core::Status DctTransform::inverse(core::CommandBatch& batch,
+                                   volume::VoxelBlockGrid& grid,
                                    const ResidentBlocks& in,
                                    const CodecParams& params,
                                    core::GpuStageScope* stage) {
@@ -513,7 +513,7 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
                                std::to_string(grid.grid().num_blocks) + ")");
   }
   if (in.count == 0) {
-    return {};
+    return batch.submit();
   }
   // Bound where they are, so each must hold the entries the kernel reads.
   const VkDeviceSize n = in.count;
@@ -525,7 +525,6 @@ core::Status DctTransform::inverse(volume::VoxelBlockGrid& grid,
     return fail("inverse", "the resident buffers do not hold " +
                                std::to_string(in.count) + " blocks");
   }
-  core::CommandBatch batch(*device_, *allocator_);
   return run_inverse(batch, grid, views, in, params, stage);
 }
 

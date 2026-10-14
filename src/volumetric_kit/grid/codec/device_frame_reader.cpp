@@ -58,8 +58,8 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
 core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
     core::CommandBatch& batch, const ParsedFrame& frame,
     core::GpuStageScope* stage) {
-  VKC_TRY(check_frame_type(frame.header.type, FrameType::kInter,
-                           "DeviceFrameReader::record_decode"));
+  VKC_TRY(
+      check_frame_type(frame.header.type, "DeviceFrameReader::record_decode"));
   const FrameType type = frame.header.type;
   const bool inter = type == FrameType::kInter;
   const std::uint32_t n = frame.header.block_count;
@@ -118,7 +118,7 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   const VkDeviceSize mask_bytes =
       VkDeviceSize(entries) * kMaskWordsPerBlock * sizeof(std::uint32_t);
   const VkDeviceSize coeff_bytes =
-      VkDeviceSize(entries) * ((k + 1) / 2) * sizeof(std::uint32_t);
+      VkDeviceSize(entries) * coefficient_words(k) * sizeof(std::uint32_t);
   const VkDeviceSize mode_bytes = VkDeviceSize(m) * sizeof(std::uint32_t);
   const VkDeviceSize fault_bytes =
       VkDeviceSize(segments) * sizeof(std::uint32_t);

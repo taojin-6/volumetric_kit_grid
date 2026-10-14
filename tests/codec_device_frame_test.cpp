@@ -19,6 +19,7 @@
 
 #include "bitstream.hpp"
 #include "codec_frames.hpp"
+#include "codec_resident.hpp"
 #include "device_frame_reader.hpp"
 #include "device_frame_writer.hpp"
 #include "test_check.hpp"
@@ -38,6 +39,7 @@ using codec_frames::inter_frame;
 using codec_frames::Lcg;
 using codec_frames::make_frame;
 using codec_frames::reference_of;
+using codec_frames::Resident;
 using codec_frames::successor;
 using C = vkc::Status::Code;
 using Bytes = std::vector<std::uint8_t>;
@@ -50,17 +52,6 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 vkc::Device* g_device = nullptr;
 vkc::Allocator* g_allocator = nullptr;
 
-// `bytes` in a new device storage buffer.
-vkc::Result<std::unique_ptr<vkc::Buffer>> upload(const void* bytes,
-                                                 VkDeviceSize size) {
-  VKC_ASSIGN(vkc::Buffer buffer,
-             vkc::device_storage_buffer(*g_allocator, size));
-  vkc::CommandBatch batch(*g_device, *g_allocator);
-  VKC_TRY(batch.upload(buffer, 0, bytes, size));
-  VKC_TRY(batch.submit());
-  return std::make_unique<vkc::Buffer>(std::move(buffer));
-}
-
 d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
   d::FrameWriteOptions o;
   o.segment_size = r;
@@ -69,60 +60,10 @@ d::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
 }
 
 // A host frame's entries in device buffers, as the encoder holds the
-// transform's output: a P-frame's modes, its payloads at their stream
-// positions, and its new blocks.
-struct Resident {
-  d::ResidentBlocks blocks;
-  std::unique_ptr<vkc::Buffer> list, masks, coefficients, modes;
-};
-
+// transform's output.
 vkc::Result<Resident> resident(const d::Frame& frame) {
-  const auto m = static_cast<std::uint32_t>(frame.modes.size());
-  const auto a = static_cast<std::uint32_t>(frame.coords.size());
-  const std::uint32_t entries = m + a;
-  const std::uint32_t k = frame.blocks.params.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
-  Resident r;
-  r.blocks.count = entries;
-  r.blocks.reference_count = m;
-  r.blocks.coefficient_count = k;
-  if (entries != 0) {
-    // Two int16 a word, each entry starting a word of its own.
-    std::vector<std::uint32_t> packed(std::size_t(entries) * words, 0);
-    for (std::uint32_t p = 0; p < entries; ++p) {
-      for (std::uint32_t j = 0; j < k; ++j) {
-        const auto v = static_cast<std::uint16_t>(
-            frame.blocks.coefficients[std::size_t(p) * k + j]);
-        packed[std::size_t(p) * words + j / 2] |= std::uint32_t(v)
-                                                  << (16 * (j & 1));
-      }
-    }
-    VKC_ASSIGN(r.masks,
-               upload(frame.blocks.masks.data(),
-                      frame.blocks.masks.size() * sizeof(std::uint32_t)));
-    VKC_ASSIGN(r.coefficients,
-               upload(packed.data(), packed.size() * sizeof(std::uint32_t)));
-    r.blocks.masks = r.masks.get();
-    r.blocks.coefficients = r.coefficients.get();
-  }
-  if (a != 0) {
-    std::vector<vr::volume::BlockIndex> entries_of(a);
-    for (std::uint32_t q = 0; q < a; ++q) entries_of[q].coord = frame.coords[q];
-    VKC_ASSIGN(r.list,
-               upload(entries_of.data(),
-                      entries_of.size() * sizeof(vr::volume::BlockIndex)));
-    r.blocks.list = r.list.get();
-  }
-  if (m != 0) {
-    std::vector<std::uint32_t> words_of(m);
-    for (std::uint32_t e = 0; e < m; ++e) {
-      words_of[e] = static_cast<std::uint32_t>(frame.modes[e]);
-    }
-    VKC_ASSIGN(r.modes, upload(words_of.data(),
-                               words_of.size() * sizeof(std::uint32_t)));
-    r.blocks.modes = r.modes.get();
-  }
-  return r;
+  return codec_frames::resident({*g_device, *g_allocator}, frame.blocks,
+                                frame.modes, frame.coords);
 }
 
 // The device writer's bytes for a host frame: its entries uploaded, counted
@@ -150,7 +91,7 @@ vkc::Result<d::Frame> device_read(d::DeviceFrameReader& reader,
   VKC_ASSIGN(const d::ParsedFrame parsed,
              d::parse_frame(data, size, max_blocks, reference));
   const std::uint32_t k = parsed.header.params.coefficient_count;
-  const std::uint32_t words = (k + 1) / 2;
+  const std::uint32_t words = d::coefficient_words(k);
   d::Frame frame;
   frame.type = parsed.header.type;
   frame.voxel_size = parsed.header.voxel_size;

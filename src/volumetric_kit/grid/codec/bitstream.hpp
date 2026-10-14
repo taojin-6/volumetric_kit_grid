@@ -165,20 +165,14 @@ VR_CODEC_API glm::uvec2 frame_segment_range(std::uint32_t s, std::uint32_t m,
                                             std::uint32_t u, std::uint32_t a,
                                             std::uint32_t r);
 
-/// What a frame is: byte 6 of its header. @ref write_frame and the readers
-/// refuse a type they do not code (@ref check_frame_type).
-enum class FrameType : std::uint8_t {
-  kIntra = 0,  ///< Self-contained: decodes with no reference frame.
-  kInter = 1,  ///< A P-frame: decodes against its reference frame.
-};
+/// What a frame is (codec_params.hpp): byte 6 of its header.
+using codec::FrameType;
 
 /// @brief The type check @ref write_frame and every reader make.
-/// @param newest  The last type the caller codes: every type up to it is.
-/// @param who     The caller, which a refusal names.
-/// @return OK for a type up to @p newest; otherwise
+/// @param who  The caller, which a refusal names.
+/// @return OK for an intra frame or a P-frame; otherwise
 ///         `Status::Code::Unsupported`.
-VR_CODEC_API core::Status check_frame_type(FrameType type, FrameType newest,
-                                           const char* who);
+VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
@@ -408,7 +402,11 @@ struct CodedFrame {
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame);
 
-/// @brief Parse and decode a frame.
+/// @brief Parse and decode a frame on the host: the tests' oracle for the
+///        device reader, which is what the `Decoder` decodes with.
+///
+/// TODO(codec): the host reader (this and @ref decode_frame) has no library
+/// caller; it moves under tests/.
 ///
 /// Reads nothing outside `[data, data + size)`, whatever the bytes say.
 /// @param data        The frame.
@@ -532,7 +530,8 @@ static_assert(sizeof(ApplySource) == 8 &&
                   offsetof(ApplySource, payload) == 4,
               "ApplySource is two u32, as the apply kernel reads it");
 
-/// @brief A decoded P-frame's blocks in the frame's order.
+/// @brief A decoded frame's blocks in the frame's order, a P-frame's or an
+///        intra frame's.
 struct MergedFrame {
   /// The frame's N coordinates, strictly increasing: the grid's block set,
   /// and the next reference's coordinates.
@@ -543,7 +542,8 @@ struct MergedFrame {
 
 /// @brief Merge a P-frame's surviving reference entries with its new blocks
 ///        (@ref merge_by_coord): keep gives {e, e}, skip {e, none}, zero
-///        {none, e}, new block q {none, M + q}, and remove nothing.
+///        {none, e}, new block q {none, M + q}, and remove nothing. An intra
+///        frame's blocks are new blocks on an empty reference.
 /// @param reference  The reference's M coordinates, strictly increasing.
 /// @param modes      The P-frame's M modes.
 /// @param added      Its A new coordinates, strictly increasing.

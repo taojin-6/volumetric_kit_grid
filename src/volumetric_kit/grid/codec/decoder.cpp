@@ -10,7 +10,8 @@
 #include "bitstream.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_reader.hpp"
-#include "entropy_choice.hpp"
+#include "frame_hash.hpp"
+#include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -47,9 +48,8 @@ core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
                                         std::size_t size) {
   VKC_ASSIGN(const detail::FrameHeader header,
              detail::read_frame_header(data, size));
-  VKC_TRY(detail::check_frame_type(header.type, detail::FrameType::kIntra,
-                                   "read_frame_info"));
   FrameInfo info;
+  info.type = header.type;
   info.voxel_size = header.voxel_size;
   info.trunc_dist = header.trunc_dist;
   info.block_count = header.block_count;
@@ -65,38 +65,15 @@ Decoder& Decoder::operator=(Decoder&& other) noexcept = default;
 bool Decoder::valid() const noexcept { return transform_ != nullptr; }
 
 core::Result<Decoder> Decoder::create(core::Device& device,
-                                      core::Allocator& allocator,
-                                      const DecoderConfig& config) {
+                                      core::Allocator& allocator) {
   Decoder d;
-  d.config_ = config;
   d.device_ = &device;
   d.allocator_ = &allocator;
   VKC_ASSIGN(d.transform_, detail::DctTransform::create(device, allocator));
-  // kAuto builds the reader at its first device frame, which a small scene
-  // never reaches.
-  if (config.entropy == EntropyCoding::kDevice) VKC_TRY(d.ensure_reader());
+  VKC_ASSIGN(d.reader_, detail::DeviceFrameReader::create(device, allocator));
+  VKC_ASSIGN(d.store_, detail::ReferenceStore::create(device, allocator));
   VKC_ASSIGN(d.gpu_timer_, core::GpuTimer::create(device));
   return d;
-}
-
-core::Status Decoder::ensure_reader() {
-  if (reader_ != nullptr) return {};
-  // A build that failed fails again, so it is tried once.
-  if (!reader_failure_.ok()) return reader_failure_;
-  core::Result<std::unique_ptr<detail::DeviceFrameReader>> reader =
-      detail::DeviceFrameReader::create(*device_, *allocator_);
-  if (!reader.ok()) return reader_failure_ = reader.status();
-  reader_ = std::move(reader).value();
-  return {};
-}
-
-core::Result<detail::ResidentBlocks> Decoder::decode_on_device(
-    const detail::ParsedFrame& frame, core::GpuStageScope& stage) {
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_ASSIGN(const detail::ResidentBlocks resident,
-             reader_->record_decode(batch, frame, &stage));
-  VKC_TRY(batch.submit());
-  return resident;
 }
 
 core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
@@ -140,8 +117,6 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // never mistaken for one the grid is too small for.
   VKC_ASSIGN(const detail::FrameHeader header,
              detail::read_frame_header(data, size));
-  VKC_TRY(detail::check_frame_type(header.type, detail::FrameType::kIntra,
-                                   "Decoder::decode"));
   if (header.voxel_size != gp.voxel_size ||
       header.trunc_dist != gp.trunc_dist) {
     return fail("the frame's geometry (voxel_size " +
@@ -151,87 +126,83 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                 std::to_string(gp.trunc_dist) +
                 "); build the grid from read_frame_info");
   }
-  // The frame's blocks in frame order, and their coefficients and masks:
-  // on the host, or where the device decoded them.
-  std::vector<volume::BlockIndex> host_coords;
-  detail::DctBlocks host_blocks;
-  detail::ResidentBlocks resident;
-  bool on_device = false;
+  const bool inter = header.type == FrameType::kInter;
+  // The frame's new blocks, and its payload by stream position where the
+  // device decoded it; a P-frame's modes stay the reader's.
+  std::vector<Vec3i> added;
+  detail::ResidentBlocks payload;
   {
-    // The whole frame, entropy-decoded: a corrupt one is refused here, with
-    // the grid untouched. The heap bounds the block count the reader will
-    // allocate for, so a frame the grid cannot hold is refused here too.
+    // The whole frame, entropy-decoded, a P-frame against the reference
+    // held: a corrupt one, or one on another reference, is refused here,
+    // with the grid untouched. The heap bounds the block count the reader
+    // will allocate for, so a frame the grid cannot hold is refused here too;
+    // a frame the device cannot hold is refused as the reader refuses it.
     core::StageScope read(metrics, "  ..rans decode");
-    auto too_big = [](const core::Status& s) {
-      return s.domain() != core::Status::Code::OutOfMemory
-                 ? s
-                 : core::Status::out_of_memory(
-                       "Decoder::decode: " + s.message() +
-                       " (the grid's num_blocks); grow it with "
-                       "VoxelBlockGrid::resize and decode again");
-    };
     core::Result<detail::ParsedFrame> parsed = detail::parse_frame(
-        data, size, static_cast<std::uint32_t>(gp.num_blocks), nullptr);
-    if (!parsed.ok()) return too_big(parsed.status());
-    const std::size_t segments = parsed.value().segment_lengths.size();
-    // kAuto decodes on the host whatever the device cannot: a frame it
-    // cannot hold, or every frame once its kernels failed to build.
-    if (detail::codes_on_device(config_.entropy, segments,
-                                kMinDeviceDecodeSegments) &&
-        ensure_reader().ok()) {
-      core::Result<detail::ResidentBlocks> r =
-          decode_on_device(parsed.value(), stage);
-      if (r.ok()) {
-        VKC_TRY(reader_->check());
-        resident = r.value();
-        on_device = true;
-      } else if (!detail::retry_on_host(config_.entropy, r.status())) {
-        return r.status();
-      }
+        data, size, static_cast<std::uint32_t>(gp.num_blocks), store_->held());
+    if (!parsed.ok()) {
+      const core::Status& s = parsed.status();
+      if (s.domain() != core::Status::Code::OutOfMemory) return s;
+      return core::Status::out_of_memory(
+          "Decoder::decode: " + s.message() +
+          " (the grid's num_blocks); grow it with VoxelBlockGrid::resize and "
+          "decode again");
     }
-    if (!on_device) {
-      core::Result<detail::Frame> r =
-          detail::decode_frame(std::move(parsed).value());
-      if (!r.ok()) return too_big(r.status());
-      detail::Frame frame = std::move(r).value();
-      host_coords.resize(frame.coords.size());
-      for (std::size_t b = 0; b < host_coords.size(); ++b) {
-        host_coords[b].coord = frame.coords[b];
-      }
-      host_blocks = std::move(frame.blocks);
+    core::CommandBatch batch(*device_, *allocator_);
+    VKC_ASSIGN(payload, reader_->record_decode(batch, parsed.value(), &stage));
+    VKC_TRY(batch.submit());
+    VKC_TRY(reader_->check());
+    added.reserve(reader_->blocks().size());
+    for (const volume::BlockIndex& b : reader_->blocks()) {
+      added.push_back(b.coord);
     }
   }
-  const std::vector<volume::BlockIndex>& frame_blocks =
-      on_device ? reader_->blocks() : host_coords;
-  // Nor can the inverse's maxStorageBufferRange checks refuse once the grid
-  // starts to change. The frame fits the heap, so every buffer it binds --
-  // K <= 512 coefficients and 16 mask words and one list entry per block, 20
-  // bytes of hash entry per slot -- is at most the 4-byte tsdf array, which
-  // VoxelBlockGrid::create / resize bound to that limit and attribute()
-  // confirmed above covers the live grid.
 
-  // --- Make the grid's block set the frame's. -----------------------------
-  // A merge of two sorted lists: what the grid holds that the frame lacks is
-  // removed (VoxelBlockGrid::remove zeroes it, so a later reuse of its slot
-  // starts fresh), and what the frame holds that the grid lacks is allocated.
-  // Blocks in both are kept in their slots, and their tsdf/weight are
-  // rewritten in full below, so nothing of the previous frame survives in
-  // them.
+  // --- The frame's blocks, and the grid's block set made the frame's. ----
   VKC_ASSIGN(std::vector<volume::BlockIndex> current,
              grid.map().compact_active_blocks(metrics));
+  detail::MergedFrame frame;
   {
     core::StageScope apply(metrics, "  ..apply");
+    // The frame's blocks in frame order, and where each comes from: a
+    // P-frame's surviving reference blocks merged with its new ones, an
+    // intra frame's from its payload alone. The last refusal, a new block on
+    // a reference block, is made here, before the grid changes.
+    const std::vector<Vec3i> no_reference;
+    VKC_ASSIGN(frame,
+               detail::merge_frame(inter ? store_->coords() : no_reference,
+                                   reader_->modes(), added));
+    // Then room on the device for its N blocks, before the grid changes:
+    // the store's spare, list and sources. Each, like every buffer the
+    // inverse binds -- K <= 512 coefficients and 16 mask words a block, 20
+    // bytes of hash entry a slot -- is at most the 4-byte tsdf array once
+    // the frame fits the heap, and VoxelBlockGrid::create / resize bound
+    // that array to maxStorageBufferRange (attribute() confirmed it covers
+    // the live grid), so no range check refuses once the grid starts to
+    // change. A P-frame's reader bound its M + A entries itself: a fresh
+    // grid sized from N does not bound M.
+    VKC_TRY(store_->reserve(static_cast<std::uint32_t>(frame.coords.size()),
+                            header.params.coefficient_count));
+
+    // A merge of two sorted lists: what the grid holds that the frame lacks
+    // is removed (VoxelBlockGrid::remove zeroes it, so a later reuse of its
+    // slot starts fresh), and what the frame holds that the grid lacks is
+    // allocated. Blocks in both are kept in their slots, and their
+    // tsdf/weight are rewritten in full below, so nothing of the previous
+    // frame survives in them.
     detail::sort_by_coord(current);
     std::vector<volume::BlockIndex> gone;
     std::vector<volume::BlockIndex> missing;
     VKC_TRY(detail::merge_by_coord(
         current.size(),
         [&](std::size_t i) -> const Vec3i& { return current[i].coord; },
-        frame_blocks.size(),
-        [&](std::size_t j) -> const Vec3i& { return frame_blocks[j].coord; },
+        frame.coords.size(),
+        [&](std::size_t j) -> const Vec3i& { return frame.coords[j]; },
         [&](std::size_t i, std::size_t j) {
           if (j == detail::kAbsent) gone.push_back(current[i]);
-          if (i == detail::kAbsent) missing.push_back(frame_blocks[j]);
+          if (i == detail::kAbsent) {
+            missing.push_back(volume::BlockIndex{frame.coords[j], 0});
+          }
           return core::Status{};
         }));
     for (int round = 0; !gone.empty(); ++round) {
@@ -270,7 +241,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
         return core::Status::out_of_memory(
             "Decoder::decode: the grid's hash table cannot place " +
             std::to_string(failed) + " of the frame's " +
-            std::to_string(frame_blocks.size()) +
+            std::to_string(frame.coords.size()) +
             " blocks; grow it with VoxelBlockGrid::resize and decode again");
       }
       if (round + 1 == kRounds) {
@@ -279,17 +250,24 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     }
   }
 
-  // --- The frame's blocks, in the frame's order, reconstructed. -----------
-  // By coordinate alone: the inverse finds each block in the hash table, so
+  // --- The frame's blocks, made and reconstructed in one submit. ---------
+  // Each from the reference and the payload, into the store's spare; then
+  // by coordinate alone: the inverse finds each block in the hash table, so
   // the slots the allocation drew need not be read back, and a frame block
   // the grid does not hold -- a grid changed under this call -- is refused
   // there rather than written.
-  core::StageScope inverse(metrics, "  ..inverse");
-  if (on_device) {
-    return transform_->inverse(grid, resident, header.params, &stage);
+  {
+    core::StageScope inverse(metrics, "  ..inverse");
+    core::CommandBatch batch(*device_, *allocator_);
+    VKC_ASSIGN(const detail::ResidentBlocks blocks,
+               store_->record_apply(batch, payload, frame.sources, frame.coords,
+                                    &stage));
+    VKC_TRY(transform_->inverse(batch, grid, blocks, header.params, &stage));
   }
-  return transform_->inverse(grid, grid.block_list(frame_blocks), host_blocks,
-                             &stage);
+  // Only a decode that succeeded moves the reference.
+  store_->commit(detail::FrameReference{detail::frame_hash(data, size), header},
+                 std::move(frame.coords));
+  return {};
 }
 
 }  // namespace volumetric_kit::recon::codec
