@@ -137,6 +137,9 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     VKC_TRY(batch.submit());
     VKC_TRY(
         detail::DctTransform::check_rejected("forward", rejected, observed));
+    // TODO(codec): count a P-frame in the forward's submit, as an I-frame is,
+    // from the device's M + A: an indirect count dispatch and StepLayout's
+    // segment counts read on the device. One fence wait less a P-frame.
     if (reference != nullptr) {
       VKC_ASSIGN(entries, store_->diffed());
       core::CommandBatch count(*device_, *allocator_);
