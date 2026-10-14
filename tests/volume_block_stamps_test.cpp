@@ -17,6 +17,7 @@
 #include <tuple>
 #include <vector>
 
+#include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -99,7 +100,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   // Tick 1: three blocks, requested now and never weighted.
   const vol::BlockIndex three[] = {at(0), at(1), at(2)};
-  CHECK(map.allocate(three, 3).ok());
+  CHECK(vr_test::allocate_blocks(gpu, map, three, 3).ok());
   auto slot = slots(grid);
   CHECK(slot.ok() && slot.value().size() == 3);
   const std::uint32_t a = slot.value()[Coord{0, 0, 0}];
@@ -133,7 +134,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // The block pass, freeing nothing at this age.
   auto kept = grid.free_stale_blocks(1000);
   CHECK(kept.ok() && kept.value() == 0);
-  CHECK(map.allocate(&three[2], 1).ok());
+  CHECK(vr_test::allocate_blocks(gpu, map, &three[2], 1).ok());
   st = map.read_block_stamps();
   CHECK(st.ok());
   CHECK(st.value()[a].requested == 1 && st.value()[a].weighted == 3);
@@ -251,8 +252,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   for (const int count : {7, 120, 3}) {
     std::vector<vol::BlockIndex> coords;
     for (int i = 0; i < count; ++i) coords.push_back(at(1000 + i));
-    auto placed =
-        map.allocate(coords.data(), static_cast<std::uint32_t>(count));
+    auto placed = vr_test::allocate_blocks(gpu, map, coords.data(),
+                                           static_cast<std::uint32_t>(count));
     CHECK(placed.ok() && placed.value() == 0);
     map.advance_tick();
     map.advance_tick();
@@ -270,7 +271,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   const vol::AttributeSpec no_weight[] = {{"tsdf", sizeof(float)}};
   auto bare = vol::VoxelBlockGrid::create(dev, alloc, params(), no_weight, 1);
   CHECK(bare.ok());
-  CHECK(bare->map().allocate(three, 1).ok());
+  CHECK(vr_test::allocate_blocks(gpu, bare->map(), three, 1).ok());
   CHECK(bare->free_stale_blocks(1).status().domain() ==
         vkc::Status::Code::InvalidArgument);
 
