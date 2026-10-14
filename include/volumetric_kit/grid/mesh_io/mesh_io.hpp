@@ -7,25 +7,13 @@
 /// @brief Static triangle geometry imported through the optional Assimp
 /// backend.
 
-#include <cstdint>
 #include <string>
-#include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/io/assimp_export.hpp"
+#include "volumetric_kit/recon/io/triangle_mesh.hpp"
 
 namespace volumetric_kit::recon::io {
-
-/// @brief Owned, indexed triangle geometry in the imported scene's coordinates.
-///
-/// Positions do not implicitly carry metre units. Asset formats and importers
-/// may define their own unit or axis conventions; the caller chooses any
-/// further conversion. Normals, UVs, materials and textures are not retained.
-struct TriangleMesh {
-  std::vector<Vec3f> positions;  ///< Finite positions after node transforms.
-  std::vector<std::uint32_t> indices;  ///< Three in-range indices per triangle.
-};
 
 /// @brief Load a static asset as one owned triangle mesh.
 ///
@@ -47,12 +35,12 @@ struct TriangleMesh {
 ///
 /// @param path Asset path without embedded NUL; sidecar files resolve relative
 ///             to this file.
-/// @return Owned geometry on success; InvalidArgument for an empty path,
-///         malformed geometry or an invalid transform on a mesh instance;
-///         NotFound for a missing file; Unsupported for animation, skinning,
-///         morphs or non-triangle primitives; IoError for import/read failures;
-///         OutOfMemory for allocation failure or geometry exceeding 32-bit
-///         indexing.
+/// @return Owned geometry on success, its positions finite and after node
+///         transforms; InvalidArgument for an empty path, malformed geometry
+///         or an invalid transform on a mesh instance; NotFound for a missing
+///         file; Unsupported for animation, skinning, morphs or non-triangle
+///         primitives; IoError for import/read failures; OutOfMemory for
+///         allocation failure or geometry exceeding 32-bit indexing.
 VR_IO_ASSIMP_API core::Result<TriangleMesh> load_mesh(const std::string& path);
 
 }  // namespace volumetric_kit::recon::io
