@@ -114,7 +114,8 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 ///          nothing else may modify the grid during one.
 class VR_CODEC_API Decoder {
  public:
-  /// @brief Build the kernels: the rANS decoder's, the apply's and the
+  /// @brief Build the kernels: the rANS decoder's, the block lists' (the
+  ///        merge's and the grid diff's among them), the apply's and the
   ///        inverse transform's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
@@ -139,11 +140,11 @@ class VR_CODEC_API Decoder {
   /// the grid's heap against its block count. A refusal there leaves @p grid
   /// exactly as it was. A failure **after** the grid starts to change -- the
   /// hash table cannot place every block, its bucket locks keep losing races,
-  /// or a dispatch fails -- leaves it valid but holding **neither** frame:
-  /// blocks the two frames share still hold the previous frame's voxels, and
-  /// blocks new to this one are empty, so it is not worth meshing. The next
-  /// successful decode restores it exactly, since each decode starts from
-  /// whatever the grid holds.
+  /// a dispatch fails, or an internal fault -- leaves it valid but holding
+  /// **neither** frame: blocks the two frames share still hold the previous
+  /// frame's voxels, and blocks new to this one are empty, so it is not worth
+  /// meshing. The next successful decode restores it exactly, since each
+  /// decode starts from whatever the grid holds.
   /// @param data     The frame.
   /// @param size     Its exact length.
   /// @param grid     The grid to decode into: 4-byte float `tsdf` and
@@ -179,7 +180,10 @@ class VR_CODEC_API Decoder {
   ///         grid that is moved-from, has another block size or geometry,
   ///         lacks a float `tsdf` / `weight`, or declares any other
   ///         attribute, or a grid whose free heap refuses a removed block
-  ///         (its accounting was already broken, which nothing here mends);
+  ///         (its accounting was already broken, which nothing here mends),
+  ///         or, after the grid changed, an internal fault: a block's source
+  ///         outside the reference or payload bound (a bug, never a sound
+  ///         frame's);
   ///         `Status::Code::OutOfMemory` when the grid is too small for
   ///         the frame -- fewer block slots (`num_blocks`) than the frame has
   ///         blocks, or a hash table that cannot place them all -- which

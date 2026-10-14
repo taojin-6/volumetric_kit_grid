@@ -65,8 +65,8 @@ struct EncoderConfig {
 ///          outlive this object. Not thread-safe: one call at a time.
 class VR_CODEC_API Encoder {
  public:
-  /// @brief Build the kernels: the forward transform's and the rANS
-  ///        coder's.
+  /// @brief Build the kernels: the forward transform's, the block lists'
+  ///        (the sort's among them) and the rANS coder's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
