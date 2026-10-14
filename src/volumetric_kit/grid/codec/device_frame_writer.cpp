@@ -265,7 +265,9 @@ core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
   // out last first, each entry's steps written down from its run's end: the
   // segment's steps are one run in the order the coder takes them. Its slot
   // holds at most a word per step and the final state's two, rounded up to
-  // whole 32-bit words so no two segments share one.
+  // whole 32-bit words so no two segments share one. TODO(codec): scan the
+  // steps on the device, so they need not cross the bus both ways (the
+  // 2026-10-13 rule).
   std::vector<std::uint32_t> step_ends(entries);
   std::vector<std::uint32_t> segment_steps(std::size_t(segments) + 1, 0);
   std::vector<std::uint32_t> slot_offsets(std::size_t(segments) + 1, 0);

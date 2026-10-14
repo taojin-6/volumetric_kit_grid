@@ -76,7 +76,8 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   }
   // Then into the order the frame requires. The hash table's order is
   // whatever the allocate atomics left, so sorting is also what makes the
-  // same content give the same bytes.
+  // same content give the same bytes. TODO(codec): sort on the device, so the
+  // observed list need not cross the bus both ways (the 2026-10-13 rule).
   {
     core::StageScope sort(metrics, "  ..sort");
     detail::sort_by_coord(blocks);

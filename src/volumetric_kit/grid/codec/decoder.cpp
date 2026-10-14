@@ -189,7 +189,8 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     // slot starts fresh), and what the frame holds that the grid lacks is
     // allocated. Blocks in both are kept in their slots, and their
     // tsdf/weight are rewritten in full below, so nothing of the previous
-    // frame survives in them.
+    // frame survives in them. TODO(codec): merge on the device, so neither
+    // list crosses the bus (the 2026-10-13 rule).
     detail::sort_by_coord(current);
     std::vector<volume::BlockIndex> gone;
     std::vector<volume::BlockIndex> missing;
