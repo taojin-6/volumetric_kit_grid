@@ -52,7 +52,6 @@
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 #include "volumetric_kit/recon/volume/frustum.hpp"
-#include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -138,14 +137,8 @@ bool write_attributes(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
              .ok();
 }
 
-// Allocate the full kBlocks^3 cube of blocks, then write the sphere SDF (at the
-// given @p weight) and, when requested, the gradient colour into every voxel of
-// every allocated block, addressed by the compacted BlockIndex::ptr + local. A
-// colour attribute left unwritten (with_color = false on a grid that carries
-// one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
-// false on any device error.
-bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
-                      bool with_color, float weight_value = 1.0f) {
+// The full kBlocks^3 cube of block coordinates every sparse grid here holds.
+std::vector<vol::BlockIndex> cube_blocks() {
   std::vector<vol::BlockIndex> blocks;
   for (int cz = 0; cz < kBlocks; ++cz) {
     for (int cy = 0; cy < kBlocks; ++cy) {
@@ -156,6 +149,18 @@ bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
       }
     }
   }
+  return blocks;
+}
+
+// Allocate the cube_blocks(), then write the sphere SDF (at the given
+// @p weight) and, when requested, the gradient colour into every voxel of
+// every allocated block, addressed by the compacted BlockIndex::ptr + local. A
+// colour attribute left unwritten (with_color = false on a grid that carries
+// one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
+// false on any device error.
+bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+                      bool with_color, float weight_value = 1.0f) {
+  const std::vector<vol::BlockIndex> blocks = cube_blocks();
   vkc::Result<std::uint32_t> failed =
       vr_test::allocate_blocks(ctx, g.map(), blocks);
   if (!failed || failed.value() != 0) {
@@ -599,22 +604,12 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   // The fixture only tests what it exercises, so assert that it spills before
   // trusting what it proves -- otherwise a later change to the hash or to these
-  // numbers turns this case vacuous without failing. A bucket that draws more
-  // coords than it has slots chains the rest, whatever else the table holds.
-  {
-    std::map<std::uint32_t, std::int32_t> per_bucket;
-    std::int32_t fullest = 0;
-    for (int cz = 0; cz < kBlocks; ++cz) {
-      for (int cy = 0; cy < kBlocks; ++cy) {
-        for (int cx = 0; cx < kBlocks; ++cx) {
-          fullest = std::max(
-              fullest, ++per_bucket[vol::hash_bucket(vr::Vec3i(cx, cy, cz),
-                                                     chained_gp.num_buckets)]);
-        }
-      }
-    }
-    CHECK(fullest > chained_gp.bucket_size);
-  }
+  // numbers turns this case vacuous without failing. Asked on the device: a
+  // table of this shape that may not chain refuses a block only where its
+  // bucket's slots are full, which is where this one had to chain it.
+  vkc::Result<std::uint32_t> refused =
+      vr_test::chain_refusals(gpu, chained_gp, cube_blocks());
+  CHECK(refused.ok() && refused.value() > 0);
 
   vkc::Result<mesh::Mesh> chained_mesh_result =
       extractor.extract_host(chained_grid, 0.0f);

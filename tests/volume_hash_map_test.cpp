@@ -3,8 +3,9 @@
 
 // GPU test for the sparse voxel hash map: build a VoxelHashMap, allocate a
 // known set of block coordinates, compact the active set, and verify it
-// round-trips -- including, on collision-forcing tables, blocks found again
-// only by walking their overflow chain. Also checks distinct heap slots,
+// round-trips -- including, on collision-forcing tables whose coords the
+// device confirms share a bucket, blocks found again only by walking their
+// overflow chain. Also checks distinct heap slots,
 // idempotent re-alloc, clear, the device-list allocate's own cases, and move
 // semantics. This exercises the real driver
 // (MoltenVK on Apple, the NVIDIA ICD on the Linux CI box); it exits 0 (skip)
@@ -364,6 +365,13 @@ int gpu_main(vr_test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> cc =
         coords_in_bucket(0, cg.num_buckets, kColliding);
     CHECK(cc.size() == kColliding);
+    // The device agrees they share a bucket: a table of this shape that may
+    // not chain refuses the three past its four slots. hash_bucket chose them,
+    // so a GLSL hash drifted from it would scatter them, build no chain, and
+    // leave every check below passing.
+    vkc::Result<std::uint32_t> crefused = vr_test::chain_refusals(gpu, cg, cc);
+    CHECK(crefused.ok() &&
+          crefused.value() == kColliding - std::size_t(cg.bucket_size));
     std::set<Coord> cwant;
     for (const vol::BlockIndex& block : cc) {
       cwant.insert({block.coord.x, block.coord.y, block.coord.z});
@@ -448,6 +456,12 @@ int gpu_main(vr_test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> deep =
         coords_in_bucket(0, pg.num_buckets, kDeepChain);
     CHECK(deep.size() == kDeepChain);
+    // The device must agree they share bucket 0, or the chain is never deep:
+    // where it may not grow, all but the bucket's eight slots are refused.
+    vkc::Result<std::uint32_t> prefused =
+        vr_test::chain_refusals(gpu, pg, deep);
+    CHECK(prefused.ok() &&
+          prefused.value() == kDeepChain - std::size_t(pg.bucket_size));
 
     // One per dispatch, as above: a single dispatch of same-bucket coords
     // contends the spin lock and legitimately reports retryable failures, which

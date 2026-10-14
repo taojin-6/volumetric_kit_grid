@@ -15,6 +15,7 @@
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace vr_test {
@@ -92,6 +93,29 @@ inline vkc::Result<std::uint32_t> remove_blocks(
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
   return remove_blocks(gpu, grid, coords.data(),
                        static_cast<std::uint32_t>(coords.size()), out_failures);
+}
+
+// How many of `coords` a fresh map of `grid`'s table shape refuses for chain
+// room when its chains may not grow (max_chain 1), each coord allocated in a
+// call of its own so no lock race enters the count. Coords that share a
+// bucket on the device fill its slots and the rest are refused, so this is the
+// device's own word on which coords collide -- what a chain fixture chosen by
+// the host's hash_bucket rests on, and what a GLSL hash drifted from that
+// mirror would change.
+inline vkc::Result<std::uint32_t> chain_refusals(
+    const Gpu& gpu, volumetric_kit::recon::volume::VoxelGridParams grid,
+    const std::vector<volumetric_kit::recon::volume::BlockIndex>& coords) {
+  grid.max_chain = 1;
+  VKC_ASSIGN(volumetric_kit::recon::volume::VoxelHashMap map,
+             volumetric_kit::recon::volume::VoxelHashMap::create(
+                 gpu.device, gpu.allocator, grid));
+  std::uint32_t refused = 0;
+  for (const volumetric_kit::recon::volume::BlockIndex& coord : coords) {
+    volumetric_kit::recon::volume::AllocFailures why{};
+    VKC_TRY(allocate_blocks(gpu, map, &coord, 1, &why).status());
+    refused += why.chain;
+  }
+  return refused;
 }
 
 }  // namespace vr_test
