@@ -315,6 +315,18 @@ int refusals() {
     CHECK(refused_for(io::scale_transform(bounds, bad),
                       "metres_per_unit must be"));
   }
+  // A scale that would place the bounds past float range, which
+  // apply_transform would refuse, is refused by the fit; just inside, taken.
+  const double extent = bounds.max.y - bounds.min.y;
+  CHECK(refused_for(io::fit_transform(bounds, 1e39), "past float range"));
+  CHECK(refused_for(io::scale_transform(bounds, 1e39 / extent),
+                    "past float range"));
+  CHECK(io::fit_transform(bounds, 1e38));
+  {
+    auto big = mesh;
+    const auto near_max = io::scale_transform(bounds, 1e38 / extent);
+    CHECK(near_max && io::apply_transform(big, near_max.value()));
+  }
   const auto fit = io::fit_transform(bounds, 1.7).value();
   auto refused = [&](io::TriangleMesh& geometry,
                      const io::MeshTransform& transform) {
@@ -403,9 +415,13 @@ int refusals() {
   wide.max = {kInf, 1, 1};
   CHECK(!io::fit_transform(wide, 1.7) && !io::scale_transform(wide, 1.0));
 
-  // Float overflow.
-  CHECK(refused(mesh, io::scale_transform(bounds, 1e300).value()));
-  CHECK(refused(mesh, io::fit_transform(bounds, 1e300).value()));
+  // Float overflow: the fits refuse such a scale, and apply_transform a
+  // transform made by hand.
+  CHECK(refused_for(io::scale_transform(bounds, 1e300), "past float range"));
+  CHECK(refused_for(io::fit_transform(bounds, 1e300), "past float range"));
+  auto huge = fit;
+  huge.metres_per_unit = 1e300;
+  CHECK(refused(mesh, huge));
   // Nothing to place is not a refusal: an empty frame stays empty.
   io::TriangleMesh nothing;
   CHECK(io::apply_transform(nothing, fit) && nothing.positions.empty());

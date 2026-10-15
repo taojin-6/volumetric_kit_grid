@@ -96,8 +96,9 @@ struct MeshTransform {
 /// @param height_m Target extent along up, in metres; finite and positive.
 /// @return The transform, or InvalidArgument for empty or non-finite bounds,
 ///         axes that are not a proper rotation, a zero extent along up, a
-///         @p height_m that is not finite and positive, or a scale that is
-///         not.
+///         @p height_m that is not finite and positive, a scale that is not,
+///         or bounds it would place past float range, which
+///         @ref apply_transform would refuse.
 VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
                                                     double height_m);
 
@@ -107,8 +108,9 @@ VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
 ///        will place.
 /// @param metres_per_unit Scale; finite and positive (0.001 for millimetres).
 /// @return The transform, or InvalidArgument for empty or non-finite bounds,
-///         axes that are not a proper rotation, or a @p metres_per_unit that
-///         is not finite and positive.
+///         axes that are not a proper rotation, a @p metres_per_unit that
+///         is not finite and positive, or bounds it would place past float
+///         range.
 VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
                                                       double metres_per_unit);
 

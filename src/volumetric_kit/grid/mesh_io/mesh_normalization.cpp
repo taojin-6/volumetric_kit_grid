@@ -105,6 +105,23 @@ core::Result<MeshTransform> place(const char* api, const MeshBounds& bounds,
   return transform;
 }
 
+// The bounds' corners placed as apply_transform places a position: if they
+// land in float range, so does every position they bound.
+core::Status check_range(const char* api, const MeshBounds& bounds,
+                         const MeshTransform& transform) {
+  for (int a = 0; a < 3; ++a) {
+    for (const double r : {bounds.min[a], bounds.max[a]}) {
+      const double placed =
+          (r - transform.origin[a]) * transform.metres_per_unit;
+      if (!std::isfinite(placed) ||
+          std::abs(placed) > std::numeric_limits<float>::max()) {
+        return invalid(api, "the bounds would be placed past float range");
+      }
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 core::Result<MeshAxes> up_axes(const Vec3d& up) {
@@ -168,6 +185,7 @@ core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
                    "height_m over the extent along up is not a finite, "
                    "positive scale");
   }
+  VKC_TRY(check_range("fit_transform", bounds, transform));
   return transform;
 }
 
@@ -177,7 +195,10 @@ core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
     return invalid("scale_transform",
                    "metres_per_unit must be finite and positive");
   }
-  return place("scale_transform", bounds, metres_per_unit);
+  VKC_ASSIGN(MeshTransform transform,
+             place("scale_transform", bounds, metres_per_unit));
+  VKC_TRY(check_range("scale_transform", bounds, transform));
+  return transform;
 }
 
 core::Status apply_transform(TriangleMesh& mesh,
