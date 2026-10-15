@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Geometry-only mesh -> TSDF -> codec -> marching cubes evaluation. The source
-// file is never changed. The scenario's head-up direction and height place the
-// imported mesh in metres through io's opt-in normalization helpers.
+// Geometry-only mesh sequence -> TSDF -> codec -> marching cubes evaluation.
+// The source files are never changed. The scenario's head-up direction and
+// height or unit place every frame in metres through one transform fitted to
+// the whole range, with io's opt-in normalization helpers.
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <optional>
+#include <string>
 
 #include "codec_config.hpp"
 #include "codec_stream.hpp"
@@ -14,18 +19,17 @@
 #include "config.hpp"
 #include "geometry_mesh.hpp"
 #include "grid_layout.hpp"
+#include "mesh_sequence.hpp"
 #include "stage_table.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
-#include "volumetric_kit/recon/io/mesh_io.hpp"
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
-#include "volumetric_kit/recon/volume/grid_growth.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -35,61 +39,33 @@ namespace {
 
 using Options = vr_example::config::Config;
 
-void print_bounds(const char* label, const vr::io::MeshBounds& b) {
-  std::printf("%s: x [%.9g, %.9g], y [%.9g, %.9g], z [%.9g, %.9g]\n", label,
-              b.min[0], b.max[0], b.min[1], b.max[1], b.min[2], b.max[2]);
-}
-
 vkc::Status run(const Options& opt) {
-  VKC_ASSIGN(vr::io::TriangleMesh geometry, vr::io::load_mesh(opt.source.path));
-  const auto& up = *opt.source.up_vector;
-  VKC_ASSIGN(const vr::io::MeshAxes axes,
-             vr::io::up_axes({up[0], up[1], up[2]}));
-  const vr::io::MeshBounds input_bounds = vr::io::mesh_bounds(geometry);
-  const vr::io::MeshBounds upright = vr::io::mesh_bounds(geometry, axes);
-  VKC_ASSIGN(const vr::io::MeshTransform normalization,
-             vr::io::fit_transform(upright, opt.source.height_m));
-  VKC_TRY(vr::io::apply_transform(geometry, normalization));
-  // Audited after normalization, on the float metres the conversion reads,
-  // so a triangle that collapses in the conversion counts as degenerate.
-  VKC_ASSIGN(const auto topology, vr::io::audit_mesh_topology(geometry));
-  std::printf(
-      "mesh: %zu vertices, %zu triangles; geometry only, physical scale "
-      "set by source.height_m\n",
-      geometry.positions.size(), geometry.indices.size() / 3);
-  print_bounds("input bounds (source units)", input_bounds);
-  std::printf(
-      "head-up (input coordinates): (%.9g, %.9g, %.9g); projected height %.12g "
-      "source units\n",
-      axes.up[0], axes.up[1], axes.up[2], upright.max[1] - upright.min[1]);
-  std::printf(
-      "normalization: %.12g metres/source-unit; rotate head-up to +Y, centre "
-      "X/Z, feet at Y=0\n",
-      normalization.metres_per_unit);
-  print_bounds("normalized bounds (metres)", vr::io::mesh_bounds(geometry));
-  std::printf(
-      "indexed topology: %zu edges, %zu boundary, %zu nonmanifold, %zu "
-      "inconsistently oriented; "
-      "%zu degenerate triangles, %zu components (%zu nonpositive signed "
-      "volumes); "
-      "signed volume %.12g cubic metres; self-intersections not checked\n",
-      topology.edges, topology.boundary_edges, topology.nonmanifold_edges,
-      topology.inconsistent_edges, topology.degenerate_triangles,
-      topology.components, topology.nonpositive_components,
-      topology.signed_volume);
-  const mesh::Mesh input = vr_example::geometry_mesh(geometry);
-  if (!opt.output.prefix.empty()) {
-    VKC_TRY(vr::io::write_ply(opt.output.prefix + "_input.ply", input));
+  const bool inspect = opt.codec.inspect_only;
+  const bool is_signed =
+      opt.source.sdf_mode == vr_example::config::SdfMode::Signed;
+  const float trunc = opt.fusion.truncation_m;
+  const vr::volume::VoxelGridParams grid =
+      vr_example::example_grid_params(opt.fusion.voxel_size_m, trunc, 1024);
+  // Before any GPU work, and before the first pass loads every frame: a
+  // step the codec or the conversion refuses costs neither.
+  vr::codec::EncoderConfig config;
+  vr::tsdf::MeshSdfParams sdf;
+  if (!inspect) {
+    VKC_ASSIGN(config, vr_example::encoder_config(opt.codec));
+    VKC_ASSIGN(sdf, vr_example::mesh_sdf_config(opt.source, grid));
   }
-  if (opt.codec.inspect_only) return {};
-  // Before any GPU work: a step the codec refuses costs none.
-  VKC_ASSIGN(const vr::codec::EncoderConfig config,
-             vr_example::encoder_config(opt.codec));
-  if (opt.source.sdf_mode == vr_example::config::SdfMode::Signed &&
-      !topology.supports_signed()) {
-    return vkc::Status::invalid_argument(
-        "indexed topology does not support signed mode; repair the mesh or "
-        "choose source.sdf_mode=shell");
+  VKC_ASSIGN(const vr_example::MeshSequence sequence,
+             vr_example::MeshSequence::open(opt));
+  sequence.print();
+  VKC_ASSIGN(const std::string placement,
+             vr::io::encode_transform(sequence.transform()));
+  if (inspect) {
+    VKC_ASSIGN(const vr_example::MeshFrame last,
+               vr_example::inspect_frames(sequence));
+    vr_example::print_frame(last);
+    if (opt.output.prefix.empty()) return {};
+    return vr::io::write_ply(opt.output.prefix + "_input.ply",
+                             vr_example::geometry_mesh(last.mesh));
   }
 
   VKC_ASSIGN(vkc::Instance instance, vkc::Instance::create({}));
@@ -99,76 +75,71 @@ vkc::Status run(const Options& opt) {
              vkc::Device::create(instance, gpu, vr::device_requirements()));
   VKC_ASSIGN(vkc::Allocator allocator,
              vkc::Allocator::create(instance.handle(), device));
-  const float trunc = opt.fusion.truncation_m;
   const vr::volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                              {"weight", sizeof(float)}};
   VKC_ASSIGN(
       vr::volume::VoxelBlockGrid volume,
-      vr::volume::VoxelBlockGrid::create(
-          device, allocator,
-          vr_example::example_grid_params(opt.fusion.voxel_size_m, trunc, 1024),
-          attrs, 2));
-  VKC_TRY(volume.clear());
-  const auto vertices = std::uint32_t(geometry.positions.size());
-  const auto triangles = std::uint32_t(geometry.indices.size() / 3);
-  // Grow only for a capacity limit. Lost bucket-lock races leave a residue
-  // over a table with room, which a retry places: the mesh integrator refuses
-  // a band with a block missing.
-  for (int contended = 0;;) {
-    vr::volume::AllocFailures failures;
-    VKC_ASSIGN(const auto failed,
-               volume.map().allocate_from_triangles(
-                   geometry.positions.data(), vertices, geometry.indices.data(),
-                   triangles, &failures));
-    if (failed == 0) break;
-    if (!failures.capacity_limited()) {
-      if (++contended == 5) {
-        return vkc::Status::io_error(
-            "mesh allocation kept losing bucket-lock races");
-      }
-      continue;
-    }
-    VKC_TRY(vr::volume::grow_grid(volume));
-  }
+      vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2));
   VKC_ASSIGN(vr::tsdf::MeshIntegrator integrator,
              vr::tsdf::MeshIntegrator::create(device, allocator));
+  VKC_ASSIGN(mesh::MarchingCubes extractor,
+             mesh::MarchingCubes::create(device, allocator));
+  // Made before any frame is converted or written, so a rerun onto an
+  // existing stream is refused before any work.
+  VKC_ASSIGN(
+      vr_example::CodecStream stream,
+      vr_example::CodecStream::create(device, allocator, config,
+                                      vr_example::codec_outputs(opt.output),
+                                      "codec_mesh", placement));
+  std::printf("codec: K %u, table %s, quantization scale %.6g\n",
+              config.params.coefficient_count,
+              vr_example::quantization_name(opt.codec.quantization_table),
+              double(config.params.quantization_scale));
+
   vkc::StageMetrics conversion;
-  VKC_ASSIGN(const auto stats,
-             integrator.integrate(volume, geometry.positions.data(), vertices,
-                                  geometry.indices.data(), triangles,
-                                  vr_example::mesh_sdf_config(opt.source),
-                                  &conversion));
+  std::size_t defective = 0;
+  std::optional<vr_example::CodedFrame> last;
+  for (std::uint32_t n = sequence.first(), i = 0; i < sequence.count();
+       ++i, ++n) {
+    last.reset();  // one frame's geometry held at a time
+    VKC_ASSIGN(last, vr_example::code_frame(sequence, n, volume, integrator,
+                                            sdf, stream, &conversion));
+    const std::string defects =
+        vr_example::topology_defects(last->frame.topology);
+    if (defects.empty()) continue;
+    ++defective;
+    std::printf("frame %u: %s; coded %s\n", n, defects.c_str(),
+                is_signed ? "signed (source.allow_holes)" : "as a shell");
+  }
+  VKC_TRY(stream.finish());
+  const auto& stats = last->stats;
   std::printf(
-      "mesh -> TSDF: %s mode, %.6g m voxels, %.6g m truncation; "
-      "%u triangles, %u blocks, %u bin entries, %u dispatches\n",
-      opt.source.sdf_mode == vr_example::config::SdfMode::Signed
-          ? "signed closest-face"
-          : "shell",
-      double(opt.fusion.voxel_size_m), double(trunc), stats.triangles,
-      stats.blocks, stats.bin_entries, stats.dispatches);
-  if (opt.source.sdf_mode == vr_example::config::SdfMode::Shell) {
+      "mesh -> TSDF: %s mode, %.6g m voxels, %.6g m truncation; %u "
+      "frame(s), %zu with topology defects; last: %u triangles, %u blocks, "
+      "%u bin entries, %u dispatches\n",
+      is_signed ? "signed closest-face" : "shell",
+      double(opt.fusion.voxel_size_m), double(trunc), sequence.count(),
+      defective, stats.triangles, stats.blocks, stats.bin_entries,
+      stats.dispatches);
+  if (!is_signed) {
     std::printf(
         "shell half-thickness: %.6g m; input comparison includes intentional "
         "shell offset\n",
         double(opt.source.shell_voxels * opt.fusion.voxel_size_m));
   }
-  vr_example::print_stage_rows("mesh conversion", conversion, 1, 2);
-  VKC_ASSIGN(mesh::MarchingCubes extractor,
-             mesh::MarchingCubes::create(device, allocator));
-  VKC_ASSIGN(vr_example::CodecStream stream,
-             vr_example::CodecStream::create(
-                 device, allocator, config,
-                 vr_example::codec_outputs(opt.output), "codec_mesh"));
-  std::printf("codec: K %u, table %s, quantization scale %.6g\n",
-              config.params.coefficient_count,
-              vr_example::quantization_name(opt.codec.quantization_table),
-              double(config.params.quantization_scale));
-  VKC_TRY(stream.code(volume, 0, 0));
-  VKC_TRY(stream.finish());
-  stream.report(30.0, 0);  // One mesh frame, not a measured sequence bitrate.
+  vr_example::print_stage_rows("mesh conversion, per frame", conversion,
+                               sequence.count(), 2);
+  // A single mesh is no measured sequence: it has no bitrate.
+  stream.report(vr_example::kNominalFps, sequence.count() > 1 ? 1 : 0);
+
+  // The last frame's surfaces, written first so a comparison that refuses a
+  // mesh still leaves them to look at.
+  vr_example::print_frame(last->frame);
+  const mesh::Mesh input = vr_example::geometry_mesh(last->frame.mesh);
   VKC_ASSIGN(const mesh::Mesh source, extractor.extract_host(volume));
   VKC_ASSIGN(const mesh::Mesh decoded, extractor.extract_host(stream.player()));
   if (!opt.output.prefix.empty()) {
+    VKC_TRY(vr::io::write_ply(opt.output.prefix + "_input.ply", input));
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_source.ply", source));
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_decoded.ply", decoded));
   }
@@ -184,9 +155,9 @@ vkc::Status run(const Options& opt) {
   VKC_ASSIGN(const auto codec_error, source_reference.compare(decoded));
   VKC_ASSIGN(const auto total_error, input_reference.compare(decoded));
   std::printf(
-      "surface triangles: %zu normalized input, %zu uncompressed TSDF, %zu "
-      "decoded\n",
-      input.triangle_count(), source.triangle_count(),
+      "surface triangles, frame %u: %zu normalized input, %zu uncompressed "
+      "TSDF, %zu decoded\n",
+      last->frame.number, input.triangle_count(), source.triangle_count(),
       decoded.triangle_count());
   std::printf(
       "conversion: uncompressed TSDF surface against normalized input:\n");

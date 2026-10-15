@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 #include "codec_config.hpp"
 #include "replica_config.hpp"
@@ -36,6 +37,7 @@ int main() {
       {"fuse_replica", cfg::Application::FuseReplica},
       {"codec_replica", cfg::Application::CodecReplica},
       {"codec_mesh", cfg::Application::CodecMesh},
+      {"codec_mesh_sequence", cfg::Application::CodecMesh},
       {"fuse_orbbec", cfg::Application::FuseOrbbec},
       {"stream_orbbec", cfg::Application::FuseOrbbec},
       {"readback_orbbec", cfg::Application::FuseOrbbec},
@@ -58,6 +60,29 @@ int main() {
           (example.application == cfg::Application::RigViewer));
     CHECK(loaded->output.csv.empty() && loaded->output.stream.empty());
   }
+
+  // The single-mesh template stays one frame; the sequence's codes Rafa2's
+  // frames 1-150 in an 8-voxel band, holes admitted.
+  const auto single =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_mesh.json",
+                cfg::Application::CodecMesh);
+  CHECK(single && single->run.first == 0 && single->run.frames == 1);
+  const auto sequence =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_mesh_sequence.json",
+                cfg::Application::CodecMesh);
+  CHECK(sequence);
+  CHECK(sequence->source.path ==
+        (std::filesystem::path(VR_CONFIG_FIXTURES) / "data" / "Rafa2_obj" /
+         "Frame_%05d_textured.obj")
+            .lexically_normal()
+            .string());
+  CHECK(sequence->run.first == 1 && sequence->run.frames == 150);
+  CHECK(sequence->fusion.voxel_size_m == 0.005F &&
+        sequence->fusion.truncation_m == 0.04F);
+  CHECK(sequence->source.height_m == 1.7 &&
+        sequence->source.metres_per_unit == 0.0);
+  CHECK(sequence->source.allow_holes && !sequence->codec.sweep &&
+        sequence->output.prefix.empty());
 
   const auto readback =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/readback_orbbec.json",
@@ -152,10 +177,37 @@ int main() {
   })",
                                cfg::Application::CodecMesh);
   CHECK(mesh);
-  const auto sdf = vr_example::mesh_sdf_config(mesh.value().source);
-  CHECK(sdf.mode == vr::tsdf::MeshSdfMode::Shell && sdf.shell_voxels == 2.F);
+  const auto grid = [](const cfg::Fusion& fusion) {
+    return vr_example::example_grid_params(fusion.voxel_size_m,
+                                           fusion.truncation_m, 1024);
+  };
+  const auto sdf =
+      vr_example::mesh_sdf_config(mesh.value().source, grid(mesh->fusion));
+  CHECK(sdf.ok());
+  CHECK(sdf->mode == vr::tsdf::MeshSdfMode::Shell && sdf->shell_voxels == 2.F);
   CHECK(mesh.value().source.up_vector.has_value());
   CHECK((*mesh.value().source.up_vector)[0] < -0.9);
+  // Core loads any positive shell; the conversion's bound is recon's, with
+  // the truncation the scenario resolves: 5 voxels is refused within the
+  // default 4-voxel band and taken within an 8-voxel one.
+  for (const auto& [truncation, accepted] :
+       {std::pair{"", false}, std::pair{R"(, "truncation_m": 0.04)", true}}) {
+    const auto thick =
+        cfg::parse(std::string(R"({"version": 1, "operation": "codec",
+            "source": {"kind": "mesh", "path": "person.obj", "height_m": 1.7,
+                       "up_axis": "y", "sdf_mode": "shell",
+                       "shell_voxels": 5.0},
+            "fusion": {"voxel_size_m": 0.005)") +
+                       truncation + "}}",
+                   cfg::Application::CodecMesh);
+    CHECK(thick);
+    const auto shell =
+        vr_example::mesh_sdf_config(thick->source, grid(thick->fusion));
+    CHECK(shell.ok() == accepted);
+    CHECK(accepted ||
+          (shell.status().domain() == vkc::Status::Code::InvalidArgument &&
+           shell.status().message().find("shell_voxels") != std::string::npos));
+  }
 
 #ifdef VR_TEST_ORBBEC_CONFIG
   const auto live = cfg::parse(R"({

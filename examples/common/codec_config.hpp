@@ -54,15 +54,19 @@ inline CodecOutputs codec_outputs(const config::Output& output) {
   return {output.csv, output.stream};
 }
 
-/// @return Runtime SDF parameters copied from core's validated mesh source.
-inline volumetric_kit::recon::tsdf::MeshSdfParams mesh_sdf_config(
-    const config::Source& source) {
+/// @return Runtime SDF parameters from core's validated mesh source, or
+///         InvalidArgument from `MeshSdfParams::validate` against @p grid:
+///         the shell's bound, which core leaves to the mesh conversion.
+inline volumetric_kit::core::Result<volumetric_kit::recon::tsdf::MeshSdfParams>
+mesh_sdf_config(const config::Source& source,
+                const volumetric_kit::recon::volume::VoxelGridParams& grid) {
   namespace tsdf = volumetric_kit::recon::tsdf;
   tsdf::MeshSdfParams result;
   result.mode = source.sdf_mode == config::SdfMode::Signed
                     ? tsdf::MeshSdfMode::Signed
                     : tsdf::MeshSdfMode::Shell;
   result.shell_voxels = source.shell_voxels;
+  VKC_TRY(result.validate(grid));
   return result;
 }
 
