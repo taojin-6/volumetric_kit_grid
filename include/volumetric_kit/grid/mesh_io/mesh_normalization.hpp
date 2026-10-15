@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <string>
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -123,6 +124,37 @@ VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
 ///         round to one Y; OutOfMemory for allocation failure.
 VR_IO_API core::Status apply_transform(TriangleMesh& mesh,
                                        const MeshTransform& transform);
+
+/// @brief The length of @ref encode_transform's bytes.
+inline constexpr std::size_t kTransformBytes = 112;
+
+/// @brief A @ref MeshTransform as bytes: what a `.vrst` Geometry track's
+///        params hold (stream/session.hpp), so a player can place decoded
+///        geometry back in the source's coordinates.
+///
+/// Little-endian, @ref kTransformBytes long; each binary64 is stored bit for
+/// bit:
+///
+/// @code
+///   offset  size  field
+///        0     4  tag "VRMT"
+///        4     4  version (1)
+///        8    72  axes x, up, z: 9 binary64, each axis's x, y, z
+///       80    24  origin: 3 binary64
+///      104     8  metres_per_unit: binary64
+/// @endcode
+/// @return The bytes; InvalidArgument for a transform @ref apply_transform
+///         refuses; OutOfMemory for allocation failure.
+VR_IO_API core::Result<std::string> encode_transform(
+    const MeshTransform& transform);
+
+/// @brief Read @ref encode_transform's bytes back, bit for bit.
+/// @return The transform; InvalidArgument for bytes that are not
+///         @ref kTransformBytes long or do not start with "VRMT", or a
+///         transform @ref apply_transform refuses; Unsupported for a version
+///         other than 1.
+VR_IO_API core::Result<MeshTransform> decode_transform(
+    const std::string& bytes);
 
 /// @brief Indexed edge and connected-component audit; not a self-intersection
 ///        test.

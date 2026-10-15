@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -49,6 +50,34 @@ Vec3d measure(const MeshAxes& axes, const Vec3d& p) {
 
 core::Status invalid(const char* api, const char* reason) {
   return core::Status::invalid_argument(std::string(api) + ": " + reason);
+}
+
+// What apply_transform, and so a stored transform, needs.
+core::Status check_transform(const char* api, const MeshTransform& transform) {
+  if (!proper(transform.axes)) {
+    return invalid(api, "the axes are not a proper rotation");
+  }
+  if (!finite(transform.origin) || !std::isfinite(transform.metres_per_unit) ||
+      !(transform.metres_per_unit > 0.0)) {
+    return invalid(api,
+                   "the transform needs a finite origin and a positive scale");
+  }
+  return {};
+}
+
+constexpr char kTransformTag[4] = {'V', 'R', 'M', 'T'};
+constexpr std::uint32_t kTransformVersion = 1;
+
+// Little-endian words, whatever the host's order.
+void put_word(std::string& out, std::uint64_t word, int bytes) {
+  for (int i = 0; i < bytes; ++i) out.push_back(char((word >> (8 * i)) & 0xff));
+}
+std::uint64_t get_word(const std::string& in, std::size_t at, int bytes) {
+  std::uint64_t word = 0;
+  for (int i = 0; i < bytes; ++i) {
+    word |= std::uint64_t(std::uint8_t(in[at + std::size_t(i)])) << (8 * i);
+  }
+  return word;
 }
 
 // Rotate to the bounds' axes, centre X/Z, floor Y, then scale.
@@ -153,14 +182,7 @@ core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
 
 core::Status apply_transform(TriangleMesh& mesh,
                              const MeshTransform& transform) try {
-  if (!proper(transform.axes)) {
-    return invalid("apply_transform", "the axes are not a proper rotation");
-  }
-  if (!finite(transform.origin) || !std::isfinite(transform.metres_per_unit) ||
-      !(transform.metres_per_unit > 0.0)) {
-    return invalid("apply_transform",
-                   "the transform needs a finite origin and a positive scale");
-  }
+  VKC_TRY(check_transform("apply_transform", transform));
   std::vector<Vec3f> positions;
   positions.reserve(mesh.positions.size());
   // The extent along up before and after, for the collapse check.
@@ -195,6 +217,58 @@ core::Status apply_transform(TriangleMesh& mesh,
   return {};
 } catch (...) {
   return core::exception_status("apply_transform",
+                                core::Status::Code::InvalidArgument);
+}
+
+core::Result<std::string> encode_transform(const MeshTransform& transform) try {
+  VKC_TRY(check_transform("encode_transform", transform));
+  std::string out(kTransformTag, sizeof kTransformTag);
+  out.reserve(kTransformBytes);
+  put_word(out, kTransformVersion, 4);
+  const double values[13] = {
+      transform.axes.x.x,       transform.axes.x.y,  transform.axes.x.z,
+      transform.axes.up.x,      transform.axes.up.y, transform.axes.up.z,
+      transform.axes.z.x,       transform.axes.z.y,  transform.axes.z.z,
+      transform.origin.x,       transform.origin.y,  transform.origin.z,
+      transform.metres_per_unit};
+  for (const double value : values) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof bits);
+    put_word(out, bits, 8);
+  }
+  return out;
+} catch (...) {
+  return core::exception_status("encode_transform",
+                                core::Status::Code::InvalidArgument);
+}
+
+core::Result<MeshTransform> decode_transform(const std::string& bytes) try {
+  if (bytes.size() != kTransformBytes ||
+      bytes.compare(0, sizeof kTransformTag, kTransformTag,
+                    sizeof kTransformTag) != 0) {
+    return invalid("decode_transform",
+                   "expected the 112 bytes of a VRMT transform");
+  }
+  const auto version = std::uint32_t(get_word(bytes, 4, 4));
+  if (version != kTransformVersion) {
+    return core::Status::unsupported("decode_transform: version " +
+                                     std::to_string(version));
+  }
+  double values[13];
+  for (std::size_t i = 0; i < 13; ++i) {
+    const std::uint64_t bits = get_word(bytes, 8 + 8 * i, 8);
+    std::memcpy(&values[i], &bits, sizeof bits);
+  }
+  MeshTransform transform;
+  transform.axes.x = {values[0], values[1], values[2]};
+  transform.axes.up = {values[3], values[4], values[5]};
+  transform.axes.z = {values[6], values[7], values[8]};
+  transform.origin = {values[9], values[10], values[11]};
+  transform.metres_per_unit = values[12];
+  VKC_TRY(check_transform("decode_transform", transform));
+  return transform;
+} catch (...) {
+  return core::exception_status("decode_transform",
                                 core::Status::Code::InvalidArgument);
 }
 
