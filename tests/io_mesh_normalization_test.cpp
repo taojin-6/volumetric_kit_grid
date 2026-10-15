@@ -668,10 +668,12 @@ int stored_transform() {
   auto tag = good;
   tag[3] = 'X';
   CHECK(refused_for(io::decode_transform(tag), "112 bytes"));
-  auto version = good;
-  version[4] = 2;
-  const auto later = io::decode_transform(version);
-  CHECK(!later && later.status().domain() == Code::Unsupported);
+  for (const char v : {char(0), char(2)}) {
+    auto version = good;
+    version[4] = v;
+    const auto other = io::decode_transform(version);
+    CHECK(!other && other.status().domain() == Code::Unsupported);
+  }
   auto scale = good;
   for (std::size_t i = 104; i < 112; ++i) scale[i] = 0;
   CHECK(refused_for(io::decode_transform(scale), "positive scale"));

@@ -5,12 +5,14 @@
 // OBJ frames. On the host: the frame-number pattern and its refusals; every
 // file checked before any load; one transform fitted to the whole range, so
 // a vertex that does not move keeps its place, where frame 1 alone would fit
-// wrong; a plain path placed as one mesh was before; signed mode's rule and
-// source.allow_holes, refused before any GPU work; inspection over a range.
-// On a device: each frame converted into a cleared grid, and code_frame's
-// records -- set the frame's number, pts that number at 30 fps, seq from 0,
-// each payload what a fresh encoder makes of the frame alone, the transform
-// in the track's params. The device part skips with no device.
+// wrong; a plain path placed as one mesh was before; a % in the scenario's
+// directory, escaped, read as written; signed mode's rule and
+// source.allow_holes, refused before any GPU work; inspection over a range
+// and its counts. On a device: each frame converted into a cleared grid, and
+// code_frame's records -- set the frame's number, pts that number at 30 fps,
+// seq from 0, each payload what a fresh encoder makes of the frame alone, the
+// transform in the track's params -- and its own audit and allow_holes. The
+// device part skips with no device.
 
 #include <cmath>
 #include <cstdint>
@@ -130,14 +132,19 @@ int patterns() {
       {"seq_%02d/mesh.obj", 3, "seq_03/mesh.obj"},
       {"plain.obj", 9, "plain.obj"},
       {"50%%.obj", 9, "50%.obj"},
+      // Core escapes the scenario's directory, so a % in it reads as itself.
+      {"pct/50%%off/cube.obj", 9, "pct/50%off/cube.obj"},
+      {"pct/take%%d/mesh.obj", 3, "pct/take%d/mesh.obj"},
+      {"pct/take%%d/m_%02d.obj", 3, "pct/take%d/m_03.obj"},
   };
   for (const auto& e : expanded) {
     const vkc::Result<std::string> path =
         vr_example::numbered_path(e.pattern, e.number);
     CHECK(path.ok() && *path == e.path);
   }
-  for (const char* bad : {"a_%d_%d.obj", "%02d_%d", "%s", "%5d", "%-5d", "%0d",
-                          "%010d", "%05", "%", "x%", "%%%", "%ld", "%u"}) {
+  for (const char* bad :
+       {"a_%d_%d.obj", "%02d_%d", "%s", "%5d", "%-5d", "%0d", "%00d", "%010d",
+        "%05", "%", "x%", "%%%", "%ld", "%u", "pct/50%off/cube.obj"}) {
     CHECK(refused(vr_example::numbered_path(bad, 1).status(),
                   Code::InvalidArgument, "source.path"));
   }
@@ -250,9 +257,11 @@ int one_transform(const vr_test::Scratch& scratch) {
   CHECK(by_unit.ok() && same(scaled->transform(), *by_unit));
 
   // Inspection makes the second pass on the host and returns the last frame.
-  vkc::Result<vr_example::MeshFrame> last =
+  vkc::Result<vr_example::Inspection> inspected =
       vr_example::inspect_frames(sequence);
-  CHECK(last.ok() && last->number == 6 && same_bits(last->mesh, placed[2]));
+  CHECK(inspected.ok() && inspected->last.number == 6 &&
+        same_bits(inspected->last.mesh, placed[2]));
+  CHECK(inspected->open == 0 && inspected->refused == 0);
   return 0;
 }
 
@@ -346,9 +355,57 @@ int signed_rule(const vr_test::Scratch& scratch) {
   }
   CHECK(vr_example::topology_defects(sequence->load(2)->topology) ==
         "4 boundary edges");
-  vkc::Result<vr_example::MeshFrame> last =
+  // One open frame signed mode takes with allow_holes, one it refuses.
+  vkc::Result<vr_example::Inspection> inspected =
       vr_example::inspect_frames(*sequence);
-  CHECK(last.ok() && last->number == 3);
+  CHECK(inspected.ok() && inspected->last.number == 3);
+  CHECK(inspected->open == 1 && inspected->refused == 1);
+  return 0;
+}
+
+// A % in the scenario's directory, escaped as core escapes it: the plain
+// path in "50%off" and the frames in "take%d" are read as written, and never
+// as take0's.
+int escaped_directory(const vr_test::Scratch& scratch) {
+  const fs::path base = scratch.path / "pct";
+  for (const char* dir : {"50%off", "take%d", "take0"}) {
+    CHECK(fs::create_directories(base / dir));
+  }
+  CHECK(write_obj(base / "50%off" / "cube.obj", cube({0, 0, 0}, 0.5f)));
+  CHECK(write_obj(base / "take%d" / "m_01.obj", cube({0, 0, 0}, 0.5f)));
+  CHECK(write_obj(base / "take%d" / "m_02.obj", cube({0, 0, 0}, 0.5f)));
+  CHECK(write_obj(base / "take0" / "m_01.obj", cube({0, 0, 0}, 2.0f)));
+  const std::string escaped = [&base] {
+    std::string text;
+    for (const char c : base.string())
+      text += c == '%' ? "%%" : std::string(1, c);
+    return text;
+  }();
+  const auto open_as = [](const std::string& path, int first, int frames) {
+    vkc::Result<cfg::Config> settings = cfg::parse(
+        R"({"version": 1, "operation": "codec",
+            "source": {"kind": "mesh", "path": "unused.obj",
+                       "metres_per_unit": 1, "up_axis": "y"}})",
+        cfg::Application::CodecMesh);
+    if (!settings.ok())
+      return vkc::Result<vr_example::MeshSequence>(settings.status());
+    settings->source.path = path;
+    settings->run.first = first;
+    settings->run.frames = frames;
+    return vr_example::MeshSequence::open(*settings);
+  };
+  vkc::Result<vr_example::MeshSequence> plain =
+      open_as(escaped + "/50%%off/cube.obj", 0, 1);
+  CHECK(plain.ok() &&
+        plain->path(0) == (base / "50%off" / "cube.obj").string());
+  vkc::Result<vr_example::MeshSequence> takes =
+      open_as(escaped + "/take%%d/m_%02d.obj", 1, 2);
+  CHECK(takes.ok());
+  CHECK(takes->path(1) == (base / "take%d" / "m_01.obj").string());
+  // The unit cube's frames, not take0's 4-unit one.
+  vkc::Result<vr_example::MeshFrame> frame = takes->load(1);
+  CHECK(frame.ok());
+  for (const Vec3f& p : frame->mesh.positions) CHECK(p.y <= 1.0f);
   return 0;
 }
 
@@ -527,8 +584,9 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     CHECK(more.ok() && *more);
     CHECK(record.info.track == 0 && record.info.key);
     CHECK(record.info.set == n && record.info.seq == i);
-    CHECK(record.info.pts_ns ==
-          vr_example::frame_pts_ns(n, vr_example::kNominalFps));
+    // 30 fps, from frame 0 at 0, to the nearest ns.
+    const std::uint64_t pts[] = {166'666'667, 200'000'000, 233'333'333};
+    CHECK(record.info.pts_ns == pts[i]);
     CHECK(reader.read(record, &payload).ok());
     // The frame alone, in a fresh grid, through a fresh encoder.
     vkc::Result<vr_example::MeshFrame> frame = sequence->load(n);
@@ -588,6 +646,45 @@ int refused_once_placed(vr_test::GpuContext& gpu,
   return 0;
 }
 
+// The second pass applies allow_holes too: code_frame codes an open cube when
+// the scenario allows holes, and refuses it, coding nothing, when it does not
+// (opened for inspection, so the first pass let it through).
+int holes_in_code_frame(vr_test::GpuContext& gpu,
+                        const vr_test::Scratch& scratch) {
+  const fs::path dir = scratch.path / "holes_gpu";
+  CHECK(fs::create_directory(dir));
+  io::TriangleMesh open = cube({0.05f, 0.0f, 0.0f}, 0.06f);
+  open.indices.resize(open.indices.size() - 6);  // the +x face
+  CHECK(write_obj(dir / "h_1.obj", open));
+  vkc::Status coded[2];
+  std::size_t rows[2] = {};
+  for (int allowed = 0; allowed < 2; ++allowed) {
+    vkc::Result<cfg::Config> settings =
+        scenario(dir, "h_%d.obj",
+                 std::string(R"(, "metres_per_unit": 1)") +
+                     (allowed ? R"(, "allow_holes": true)" : ""),
+                 std::string(R"(, "run": {"first": 1})") +
+                     (allowed ? "" : R"(, "codec": {"inspect_only": true})"));
+    CHECK(settings.ok());
+    vkc::Result<vr_example::MeshSequence> sequence =
+        vr_example::MeshSequence::open(*settings);
+    vkc::Result<vr_example::CodecStream> coder =
+        vr_example::CodecStream::create(gpu.device, gpu.allocator, {});
+    vkc::Result<ts::MeshIntegrator> integrator =
+        ts::MeshIntegrator::create(gpu.device, gpu.allocator);
+    vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
+    CHECK(sequence.ok() && coder.ok() && integrator.ok() && grid.ok());
+    coded[allowed] = vr_example::code_frame(*sequence, 1, *grid, *integrator,
+                                            {}, *coder, nullptr)
+                         .status();
+    rows[allowed] = coder->rows().size();
+  }
+  CHECK(refused(coded[0], Code::InvalidArgument, "source.allow_holes"));
+  CHECK(rows[0] == 0);
+  CHECK(coded[1].ok() && rows[1] == 1);
+  return 0;
+}
+
 // A plain path codes as one frame: set 0 at pts 0, seq 0.
 int single_record(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   const fs::path dir = scratch.path / "one";
@@ -629,6 +726,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(records(gpu, scratch) == 0);
   CHECK(single_record(gpu, scratch) == 0);
   CHECK(refused_once_placed(gpu, scratch) == 0);
+  CHECK(holes_in_code_frame(gpu, scratch) == 0);
   std::puts("example_mesh_sequence: OK");
   return 0;
 }
@@ -643,5 +741,6 @@ int main() {
   CHECK(single_mesh(scratch) == 0);
   CHECK(signed_rule(scratch) == 0);
   CHECK(placed_audit_decides(scratch) == 0);
+  CHECK(escaped_directory(scratch) == 0);
   return vr_test::run_on_gpu(gpu_main);
 }

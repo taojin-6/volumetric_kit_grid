@@ -60,12 +60,12 @@ vkc::Status run(const Options& opt) {
   VKC_ASSIGN(const std::string placement,
              vr::io::encode_transform(sequence.transform()));
   if (inspect) {
-    VKC_ASSIGN(const vr_example::MeshFrame last,
+    VKC_ASSIGN(const vr_example::Inspection inspected,
                vr_example::inspect_frames(sequence));
-    vr_example::print_frame(last);
+    vr_example::print_frame(inspected.last);
     if (opt.output.prefix.empty()) return {};
     return vr::io::write_ply(opt.output.prefix + "_input.ply",
-                             vr_example::geometry_mesh(last.mesh));
+                             vr_example::geometry_mesh(inspected.last.mesh));
   }
 
   VKC_ASSIGN(vkc::Instance instance, vkc::Instance::create({}));
@@ -85,7 +85,7 @@ vkc::Status run(const Options& opt) {
   VKC_ASSIGN(mesh::MarchingCubes extractor,
              mesh::MarchingCubes::create(device, allocator));
   // Made before any frame is converted or written, so a rerun onto an
-  // existing stream is refused before any work.
+  // existing stream is refused before any conversion or output.
   VKC_ASSIGN(
       vr_example::CodecStream stream,
       vr_example::CodecStream::create(device, allocator, config,

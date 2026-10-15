@@ -58,6 +58,9 @@ execute_process(
 if(NOT result EQUAL 0 OR NOT output MATCHES "mesh: frames 1..2 of .*2 frame")
   message(FATAL_ERROR "The run failed: ${result}: ${output}${error}")
 endif()
+if(NOT output MATCHES "Mbit/s at 30.0 coded frames/s")
+  message(FATAL_ERROR "A sequence has a bitrate at 30 fps: ${output}")
+endif()
 file(STRINGS "${WORK_DIR}/out/run.csv" rows)
 list(LENGTH rows count)
 list(GET rows 1 first)
@@ -77,4 +80,19 @@ foreach(ply input source decoded)
     message(FATAL_ERROR "No ${ply} PLY: ${output}")
   endif()
 endforeach()
+# A single mesh is no measured sequence: it has no bitrate.
+file(
+  WRITE "${WORK_DIR}/one.json"
+  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_01.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"fusion\":{\"voxel_size_m\":0.02}}\n"
+)
+execute_process(
+  COMMAND "${PROGRAM}" --config "${WORK_DIR}/one.json"
+  RESULT_VARIABLE result
+  OUTPUT_VARIABLE output
+  ERROR_VARIABLE error)
+if(NOT result EQUAL 0
+   OR NOT output MATCHES "stream: 1 frames coded"
+   OR output MATCHES "Mbit/s")
+  message(FATAL_ERROR "The single mesh: ${result}: ${output}${error}")
+endif()
 file(REMOVE_RECURSE "${WORK_DIR}")

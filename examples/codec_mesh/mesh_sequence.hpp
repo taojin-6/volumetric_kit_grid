@@ -8,6 +8,7 @@
 ///        metres by one transform fitted to the whole range, each converted
 ///        into a cleared grid and coded as one record (@ref code_frame).
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -52,12 +53,14 @@ class MeshSequence {
   ///
   /// The first pass loads each frame, measures it along
   /// `source.up_vector`'s axes, audits it on its own coordinates and drops
-  /// it, so memory does not grow with the range. The audit's counts do not
-  /// change under the transform, so unless `codec.inspect_only`, a frame
-  /// signed mode cannot use is refused here (@ref admit), before any GPU
-  /// work. One transform is fitted to the union of the frames' bounds:
+  /// it, so memory does not grow with the range. In exact arithmetic a
+  /// proper similarity changes none of the audit's counts, so unless
+  /// `codec.inspect_only`, a frame signed mode cannot use is refused here
+  /// (@ref admit), before any GPU work; rounding can still make a placed
+  /// triangle degenerate or a volume's sign change, which @ref load's audit
+  /// decides. One transform is fitted to the union of the frames' bounds:
   /// `io::fit_transform` to `source.height_m`, or `io::scale_transform` by
-  /// `source.metres_per_unit`.
+  /// `source.metres_per_unit`, which refuse a placement past float range.
   /// @return The sequence; before any load, InvalidArgument for a malformed
   ///         pattern, for `run.first` above 0 or `run.frames` above 1 with no
   ///         number in `source.path` (naming the key), or for a frame's file
@@ -115,11 +118,19 @@ std::string topology_defects(const vr::io::MeshTopology& topology);
 /// @brief Print a frame's size and its full topology audit.
 void print_frame(const MeshFrame& frame);
 
+/// @brief What @ref inspect_frames found.
+struct Inspection {
+  MeshFrame last;           ///< The last frame, placed.
+  std::size_t open = 0;     ///< Frames signed mode takes with allow_holes.
+  std::size_t refused = 0;  ///< Frames signed mode refuses either way.
+};
+
 /// @brief `codec.inspect_only`'s second pass, on the host alone: every frame
 ///        loaded, placed and audited as a run that codes would, a line for
-///        each with a defect and whether signed mode takes it, then a count.
-/// @return The last frame, or the first error.
-vkc::Result<MeshFrame> inspect_frames(const MeshSequence& sequence);
+///        each with a defect and whether signed mode takes it, then the
+///        counts.
+/// @return What it found, or the first error.
+vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence);
 
 /// @brief Convert @p mesh into @p grid alone: clear the grid, so no block of
 ///        an earlier frame stays, allocate the mesh's band, growing the grid

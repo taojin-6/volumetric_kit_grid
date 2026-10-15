@@ -251,25 +251,23 @@ void print_frame(const MeshFrame& frame) {
       t.signed_volume);
 }
 
-vkc::Result<MeshFrame> inspect_frames(const MeshSequence& sequence) {
-  std::size_t open = 0;
-  std::size_t refused = 0;
-  MeshFrame frame;
+vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence) {
+  Inspection result;
   for (std::uint32_t n = sequence.first(), i = 0; i < sequence.count();
        ++i, ++n) {
-    VKC_ASSIGN(frame, sequence.load(n));
-    const std::string defects = topology_defects(frame.topology);
+    VKC_ASSIGN(result.last, sequence.load(n));
+    const std::string defects = topology_defects(result.last.topology);
     if (defects.empty()) continue;
-    const bool holes = frame.topology.supports_signed(true);
-    ++(holes ? open : refused);
+    const bool holes = result.last.topology.supports_signed(true);
+    ++(holes ? result.open : result.refused);
     std::printf("frame %u: %s; signed mode %s\n", n, defects.c_str(),
                 holes ? "needs source.allow_holes" : "refuses it");
   }
   std::printf(
       "inspection: %u frame(s); %zu open, which signed mode takes with "
       "source.allow_holes; %zu it refuses\n",
-      sequence.count(), open, refused);
-  return frame;
+      sequence.count(), result.open, result.refused);
+  return result;
 }
 
 vkc::Result<vr::tsdf::MeshIntegrateStats> convert_frame(
