@@ -31,19 +31,12 @@ inline const char* quantization_name(config::QuantizationTable table) {
 
 /// @return Runtime encoder settings: core's values, and the weights of its
 ///         `quantization_table` (@ref apply_quantization_table); or
-///         InvalidArgument for `entropy` `host`, since the codec codes on the
-///         device (`auto` and `device` are the same), or from
-///         `CodecParams::validate` for a kept coefficient's step outside the
-///         codec's bounds, which core leaves to the codec.
+///         InvalidArgument from `CodecParams::validate` for a kept
+///         coefficient's step outside the codec's bounds, which core leaves
+///         to the codec.
 inline volumetric_kit::core::Result<volumetric_kit::recon::codec::EncoderConfig>
 encoder_config(const config::Codec& settings) {
   namespace codec = volumetric_kit::recon::codec;
-  // TODO(codec): core drops codec.entropy with its next config change; until
-  // then recon, which owns the codec's rules, refuses the host.
-  if (settings.entropy == config::Entropy::Host) {
-    return volumetric_kit::core::Status::invalid_argument(
-        "codec.entropy: host is not a choice; the codec codes on the device");
-  }
   codec::EncoderConfig result;
   result.params.coefficient_count = settings.coefficient_count;
   result.params.quantization_scale = settings.quantization_scale;

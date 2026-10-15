@@ -105,8 +105,8 @@ int main() {
       cfg::parse(R"({
     "version": 1, "operation": "codec", "source": {"kind": "dataset", "path": "room0"},
     "codec": {"coefficient_count": 128, "quantization_scale": 0.3,
-              "quantization_table": "radial", "entropy": "device",
-              "segment_size": 32, "encode_every": 0, "sweep": true},
+              "quantization_table": "radial", "segment_size": 32,
+              "encode_every": 0, "sweep": true},
     "output": {"csv": "results/rows.csv", "stream": "../streams/room0.vrst"}
   })",
                  cfg::Application::CodecReplica, "/tmp/scenarios");
@@ -128,14 +128,11 @@ int main() {
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
 
   // Steps out of the codec's bounds load, and the codec refuses them: too
-  // fine everywhere, or too coarse at radial's highest frequency. So does
-  // coding on the host, which the codec does not: auto and device are the
-  // same.
+  // fine everywhere, or too coarse at radial's highest frequency.
   for (const char* codec_section :
        {R"({"quantization_scale": 0.0001})",
         R"({"quantization_table": "radial", "coefficient_count": 512,
-            "quantization_scale": 4})",
-        R"({"entropy": "host"})"}) {
+            "quantization_scale": 4})"}) {
     const auto out_of_bounds =
         cfg::parse(std::string(R"({"version": 1, "operation": "codec",
                         "source": {"kind": "dataset", "path": "room0"},
@@ -147,15 +144,6 @@ int main() {
     CHECK(!refused.ok() &&
           refused.status().domain() == vkc::Status::Code::InvalidArgument);
   }
-  const auto automatic = cfg::parse(
-      R"({"version": 1, "operation": "codec",
-          "source": {"kind": "dataset", "path": "room0"},
-          "codec": {"entropy": "auto", "segment_size": 32}})",
-      cfg::Application::CodecReplica);
-  CHECK(automatic);
-  const auto from_auto = vr_example::encoder_config(automatic->codec);
-  CHECK(from_auto.ok() && from_auto->segment_size == 32);
-
   const auto mesh = cfg::parse(R"({
     "version": 1, "operation": "codec",
     "source": {"kind": "mesh", "path": "person.obj", "height_m": 1.7,
