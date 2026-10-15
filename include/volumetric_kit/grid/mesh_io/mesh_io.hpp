@@ -15,6 +15,15 @@
 
 namespace volumetric_kit::recon::io {
 
+/// @brief What @ref load_mesh checks of a path before it reads anything, for
+///        a caller that checks every file of a sequence before loading the
+///        first: a usable path naming an existing regular file.
+/// @param path Asset path.
+/// @return OK; InvalidArgument for an empty path, one with an embedded NUL,
+///         or one that is not a regular file; NotFound for a missing file;
+///         IoError when its status cannot be read.
+VR_IO_ASSIMP_API core::Status check_mesh_file(const std::string& path);
+
 /// @brief Load a static asset as one owned triangle mesh.
 ///
 /// Assimp selects the file importer and triangulates polygon faces. All node
@@ -36,9 +45,9 @@ namespace volumetric_kit::recon::io {
 /// @param path Asset path without embedded NUL; sidecar files resolve relative
 ///             to this file.
 /// @return Owned geometry on success, its positions finite and after node
-///         transforms; InvalidArgument for an empty path, malformed geometry
-///         or an invalid transform on a mesh instance; NotFound for a missing
-///         file; Unsupported for animation, skinning, morphs or non-triangle
+///         transforms; @ref check_mesh_file's error; InvalidArgument for
+///         malformed geometry or an invalid transform on a mesh instance;
+///         Unsupported for animation, skinning, morphs or non-triangle
 ///         primitives; IoError for import/read failures; OutOfMemory for
 ///         allocation failure or geometry exceeding 32-bit indexing.
 VR_IO_ASSIMP_API core::Result<TriangleMesh> load_mesh(const std::string& path);

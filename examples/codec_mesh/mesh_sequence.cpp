@@ -4,9 +4,7 @@
 #include "mesh_sequence.hpp"
 
 #include <cstdio>
-#include <filesystem>
 #include <string>
-#include <system_error>
 #include <utility>
 
 #include "volumetric_kit/core/base/check.hpp"
@@ -70,26 +68,6 @@ std::string expand(const Pattern& pattern, std::uint32_t number) {
   return pattern.head + digits + pattern.tail;
 }
 
-// What io::load_mesh answers for a file it cannot read, asked of every frame
-// before any is loaded.
-vkc::Status check_file(const std::string& path) {
-  std::error_code error;
-  const auto status = std::filesystem::status(path, error);
-  if (error == std::errc::no_such_file_or_directory ||
-      (!error && !std::filesystem::exists(status))) {
-    return vkc::Status::not_found("source.path: missing frame file " + path);
-  }
-  if (error) {
-    return vkc::Status::io_error("source.path: " + path + ": " +
-                                 error.message());
-  }
-  if (!std::filesystem::is_regular_file(status)) {
-    return vkc::Status::invalid_argument("source.path: not a regular file: " +
-                                         path);
-  }
-  return {};
-}
-
 std::string frame_name(std::uint32_t number, const std::string& path) {
   return "frame " + std::to_string(number) + " (" + path + ")";
 }
@@ -141,7 +119,8 @@ vkc::Result<MeshSequence> MeshSequence::open(const config::Config& settings) {
   sequence.by_height_ = !(source.metres_per_unit > 0.0);
   for (int i = 0; i < run.frames; ++i) {
     std::string path = expand(pattern, sequence.first_ + std::uint32_t(i));
-    VKC_TRY(check_file(path));
+    const vkc::Status file = io::check_mesh_file(path);
+    if (!file.ok()) return file.with_context("source.path");
     sequence.paths_.push_back(std::move(path));
   }
 
