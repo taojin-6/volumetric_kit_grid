@@ -42,7 +42,9 @@ struct VR_CODEC_API EncoderConfig {
   /// from 1 to @ref kMaxDeviceDecodeSegmentSize: as @ref segment_size is for
   /// its new blocks, smaller segments give the device more parallelism, at a
   /// little more size (each segment costs a 4-byte length and its stream's
-  /// 4-byte final state). An I-frame has no update segments.
+  /// 4-byte final state); 256 would save about 4% of a stream at a period of
+  /// 30 and code its P-frames 20-140% slower (the 2026-10-16 decision). An
+  /// I-frame has no update segments.
   std::uint32_t update_size = 64;
   /// Frames from one I-frame to the next, at least 1. At 1, the default,
   /// every frame is an I-frame; at N, an I-frame and N - 1 P-frames

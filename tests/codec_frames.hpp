@@ -578,8 +578,8 @@ inline Merged merge_oracle(const std::vector<vr::Vec3i>& reference,
 // --- The worked example. ----------------------------------------------------
 //
 // bitstream.hpp's 161-byte P-frame, which every writer, the oracle or the
-// device, writes and every reader reads as the format says. Frozen with type
-// 1, as the golden P-frames are.
+// device, writes and every reader reads as the format says. It freezes with
+// type 1, as the golden P-frames do.
 
 // Its reference: a = (0,0,0) and b = (4,0,0), K = 1, voxel 1 cm, band 4 cm,
 // scale 0.2, weight 1.
@@ -742,9 +742,11 @@ inline std::vector<InterCode> inter_matrix() {
 
 // --- Golden P-frames. -------------------------------------------------------
 //
-// Type 1's bytes, pinned as kGoldenFrames pins type 0's, under the same rule:
-// each row a P-frame against a golden I-frame row's frame, whose bytes its
-// REFERENCE names by frame_hash, so a row's hash pins frame_hash's bytes too.
+// Type 1's bytes, pinned as kGoldenFrames pins type 0's: each row a P-frame
+// against a golden I-frame row's frame, whose bytes its REFERENCE names by
+// frame_hash, so a row's hash pins frame_hash's bytes too. The golden rule
+// binds them from type 1's freeze (DECISIONS, 2026-10-16); until then only a
+// change to type 1's format may change them.
 
 struct GoldenInterFrame {
   std::size_t reference;  // its reference: a row of kGoldenFrames

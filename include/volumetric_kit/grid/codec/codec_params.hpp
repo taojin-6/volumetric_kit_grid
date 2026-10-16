@@ -88,7 +88,7 @@ enum class FrameType : std::uint8_t {
   /// A P-frame: decodes against the frame its @ref Decoder decoded before
   /// it, its reference, as the @ref Encoder coded it against the frame it
   /// returned before (@ref EncoderConfig::intra_period). Experimental: its
-  /// bytes may change until golden P-frames freeze them.
+  /// bytes may change until it is frozen (the 2026-10-16 decision).
   kInter = 1,
 };
 
