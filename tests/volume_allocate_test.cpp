@@ -170,12 +170,15 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // non-degenerate (a wrong fx/fy/cx/cy or a transposed cam_to_world changes
   // the world point, unlike a principal-point pixel under identity where it
   // cancels to (0,0,depth)). The pose lands the blocks at a negative Y,
-  // exercising the negative-bias voxel->block floor.
+  // exercising the negative-bias voxel->block floor. fx and fy, and cx and cy,
+  // differ by enough to move the band: the kernel packs them as
+  // vec4(fx, fy, cx, cy), and swapping either pair changes the blocks, which
+  // the host checks below.
   vr::DepthCameraParams cam{};
-  cam.fx = 100.0f;
-  cam.fy = 120.0f;  // fx != fy, so a swapped focal length is caught
-  cam.cx = 1.5f;
-  cam.cy = 1.5f;
+  cam.fx = 40.0f;
+  cam.fy = 120.0f;
+  cam.cx = 2.5f;
+  cam.cy = 0.5f;
   cam.min_depth = 0.1f;
   cam.max_depth = 10.0f;
   cam.width = 4;
@@ -204,13 +207,23 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // want = the union of every valid pixel's band, unprojected on the HOST (so
   // the shader's unprojection is what's under test, not just the band
   // dilation).
-  std::set<Coord> depth_want;
-  for (std::uint32_t v = 0; v < cam.height; ++v) {
-    for (std::uint32_t u = 0; u < cam.width; ++u) {
-      insert_cube(grid, unproject_to_block(cam, grid, u, v, kDepth),
-                  depth_want);
+  const auto band_of = [&](const vr::DepthCameraParams& c) {
+    std::set<Coord> want;
+    for (std::uint32_t v = 0; v < c.height; ++v) {
+      for (std::uint32_t u = 0; u < c.width; ++u) {
+        insert_cube(grid, unproject_to_block(c, grid, u, v, kDepth), want);
+      }
     }
-  }
+    return want;
+  };
+  const std::set<Coord> depth_want = band_of(cam);
+  // The frame tells the packing apart: swapped focal lengths, or a swapped
+  // principal point, would allocate other blocks.
+  vr::DepthCameraParams swapped_f = cam;
+  std::swap(swapped_f.fx, swapped_f.fy);
+  vr::DepthCameraParams swapped_c = cam;
+  std::swap(swapped_c.cx, swapped_c.cy);
+  CHECK(band_of(swapped_f) != depth_want && band_of(swapped_c) != depth_want);
 
   std::set<Coord> depth_got;
   if (collect_active(map, depth_got) != 0) return 1;
