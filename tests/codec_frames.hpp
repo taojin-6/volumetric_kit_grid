@@ -140,7 +140,8 @@ inline oracle::Frame extreme_frame() {
   return f;
 }
 
-// What a frame holds, hashed: coordinates, masks and coefficients.
+// What a frame holds, hashed: coordinates, masks and coefficients, then a
+// P-frame's modes (none for an intra frame).
 inline std::uint32_t content_hash(const oracle::Frame& f) {
   std::vector<std::uint32_t> words;
   for (const vr::Vec3i& c : f.coords) {
@@ -152,6 +153,7 @@ inline std::uint32_t content_hash(const oracle::Frame& f) {
   for (std::int16_t c : f.blocks.coefficients) {
     words.push_back(static_cast<std::uint16_t>(c));
   }
+  for (d::BlockMode m : f.modes) words.push_back(std::uint32_t(m));
   return vr_test::fnv1a(words);
 }
 
@@ -160,8 +162,9 @@ inline std::uint32_t content_hash(const oracle::Frame& f) {
 // The v3 bytes every writer, the oracle or the device, writes for these
 // frames on every machine: what pins the format, where a round trip would pass
 // a writer and a reader changed together. `content` pins the fixture, so a
-// failure says which changed. A new kFrameVersion brings new values; nothing
-// else may.
+// failure says which changed. A new frame type adds rows; nothing else changes
+// a value (a new kFrameVersion is a new format, with goldens of its own). The
+// P-frames' rows are kGoldenInterFrames, below.
 static_assert(d::kFrameVersion == 3, "the golden frames are v3's");
 
 struct GoldenFrame {
@@ -575,8 +578,8 @@ inline Merged merge_oracle(const std::vector<vr::Vec3i>& reference,
 // --- The worked example. ----------------------------------------------------
 //
 // bitstream.hpp's 161-byte P-frame, which every writer, the oracle or the
-// device, writes and every reader reads as the format says. Pinned as the
-// example; it may change until golden P-frames freeze type 1.
+// device, writes and every reader reads as the format says. Frozen with type
+// 1, as the golden P-frames are.
 
 // Its reference: a = (0,0,0) and b = (4,0,0), K = 1, voxel 1 cm, band 4 cm,
 // scale 0.2, weight 1.
@@ -735,6 +738,121 @@ inline std::vector<InterCode> inter_matrix() {
     }
   }
   return out;
+}
+
+// --- Golden P-frames. -------------------------------------------------------
+//
+// Type 1's bytes, pinned as kGoldenFrames pins type 0's, under the same rule:
+// each row a P-frame against a golden I-frame row's frame, whose bytes its
+// REFERENCE names by frame_hash, so a row's hash pins frame_hash's bytes too.
+
+struct GoldenInterFrame {
+  std::size_t reference;  // its reference: a row of kGoldenFrames
+  // Reference entry e's mode is modes[e % length]: k keep, s skip, z zero,
+  // r remove.
+  const char* modes;
+  // New blocks, spread through the reference's; beside extreme_frame(), the
+  // first of extreme_additions().
+  std::size_t added;
+  std::uint32_t segment_size;  // R
+  std::uint32_t update_size;   // U
+  std::uint32_t content;       // content_hash of the P-frame
+  std::size_t size;            // its bytes
+  std::uint32_t hash;          // vr_test::fnv1a of them
+};
+
+// The default K and sizes, every mode, over many update segments and new
+// blocks spread through the reference's; an odd K with a partial last
+// segment of each kind; and new blocks at int32's extremes, every entry and
+// new block a segment of its own.
+inline constexpr GoldenInterFrame kGoldenInterFrames[] = {
+    {0, "ksskzsrkss", 90, 64, 64, 0x052306f8u, 13258, 0x29a5d3b8u},
+    {2, "kszrk", 10, 7, 6, 0x27d4f104u, 1594, 0xd9d8517eu},
+    {4, "kszrks", 4, 1, 1, 0xf9c23845u, 544, 0x14f3ba59u},
+};
+
+// New blocks at int32's extremes, none of extreme_frame()'s: just after its
+// first block, past the ends of y and z, and just before its last.
+inline std::vector<vr::Vec3i> extreme_additions() {
+  return {{kMin32 + 1, kMin32, kMin32},
+          {kMax32, kMax32, kMin32},
+          {kMin32, kMin32, kMax32},
+          {kMax32 - 1, kMax32, kMax32}};
+}
+
+// Golden P row @p g's frames: its reference row's frame; the target, that
+// frame with each entry changed as the row's mode says -- a keep's first
+// coefficient by 1, about one in eight of the rest by up to 2, and now and
+// then a mask word; a zero's payload anew; a remove's gone -- and its new
+// blocks; and the P-frame coding the target with those modes.
+inline InterCode golden_inter_code(const GoldenInterFrame& g) {
+  const GoldenFrame& row = kGoldenFrames[g.reference];
+  const oracle::Frame reference = golden_frame(row);
+  oracle::FrameWriteOptions options;
+  options.segment_size = row.segment_size;
+  const d::FrameReference id =
+      reference_of(oracle::write_frame(reference, options).value());
+  const std::uint32_t k = reference.blocks.params.coefficient_count;
+  const std::size_t length = std::strlen(g.modes);
+  Lcg rng{0x601du};
+  std::map<vr::Vec3i, Payload, ZyxLess> blocks;
+  std::map<std::size_t, d::BlockMode> modes;
+  for (std::size_t e = 0; e < reference.coords.size(); ++e) {
+    const char mode = g.modes[e % length];
+    if (mode == 'r') continue;
+    Payload p = payload_at(reference.blocks, e);
+    if (mode == 'k') {
+      for (std::uint32_t j = 0; j < k; ++j) {
+        const int step = j == 0              ? 1
+                         : rng.below(8) == 0 ? int(rng.below(5)) - 2
+                                             : 0;
+        const int up = p.q[j] + step;
+        p.q[j] = static_cast<std::int16_t>(
+            up > codec::kMaxQuantizedMagnitude ||
+                    up < -codec::kMaxQuantizedMagnitude
+                ? p.q[j] - step
+                : up);
+      }
+      if (rng.below(4) == 0) {
+        p.mask[rng.below(codec::kMaskWordsPerBlock)] ^= rng.next() | 1u;
+      }
+    } else if (mode == 'z') {
+      for (std::int16_t& q : p.q) {
+        q = static_cast<std::int16_t>(int(rng.below(201)) - 100);
+      }
+      slab_mask(rng, p.mask.data());
+    }
+    modes.emplace(e, mode == 'k'   ? d::BlockMode::kKeep
+                     : mode == 'z' ? d::BlockMode::kZero
+                                   : d::BlockMode::kSkip);
+    blocks.emplace(reference.coords[e], std::move(p));
+  }
+  const oracle::Frame fresh = make_frame(g.added, k, row.seed ^ 0x5eedu);
+  std::vector<vr::Vec3i> added = fresh.coords;
+  if (row.extreme) {
+    const std::vector<vr::Vec3i> extremes = extreme_additions();
+    added.assign(extremes.begin(), extremes.begin() + std::ptrdiff_t(g.added));
+  }
+  std::set<vr::Vec3i, ZyxLess> taken(reference.coords.begin(),
+                                     reference.coords.end());
+  for (std::size_t i = 0; i < added.size(); ++i) {
+    vr::Vec3i c = added[i];
+    while (taken.count(c) != 0) c.z += 1000;  // away from the reference
+    taken.insert(c);
+    blocks.emplace(c, payload_at(fresh.blocks, i));
+  }
+  oracle::Frame target;
+  target.voxel_size = reference.voxel_size;
+  target.blocks.params = reference.blocks.params;
+  target.blocks.trunc_dist = reference.blocks.trunc_dist;
+  for (const auto& [c, p] : blocks) {
+    target.coords.push_back(c);
+    append_payload(target.blocks, p);
+  }
+  oracle::Frame p = inter_frame(id, reference, target, modes);
+  return {
+      "golden P-frame on row " + std::to_string(g.reference) + ", " + g.modes,
+      reference, std::move(target), std::move(p)};
 }
 
 // --- The P-frame refusals. --------------------------------------------------
