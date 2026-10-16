@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 #include "codec_config.hpp"
 #include "replica_config.hpp"
@@ -36,6 +37,7 @@ int main() {
       {"fuse_replica", cfg::Application::FuseReplica},
       {"codec_replica", cfg::Application::CodecReplica},
       {"codec_mesh", cfg::Application::CodecMesh},
+      {"codec_mesh_sequence", cfg::Application::CodecMesh},
       {"fuse_orbbec", cfg::Application::FuseOrbbec},
       {"stream_orbbec", cfg::Application::FuseOrbbec},
       {"readback_orbbec", cfg::Application::FuseOrbbec},
@@ -58,6 +60,29 @@ int main() {
           (example.application == cfg::Application::RigViewer));
     CHECK(loaded->output.csv.empty() && loaded->output.stream.empty());
   }
+
+  // The single-mesh template stays one frame; the sequence's codes Rafa2's
+  // frames 1-150 in an 8-voxel band, holes admitted.
+  const auto single =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_mesh.json",
+                cfg::Application::CodecMesh);
+  CHECK(single && single->run.first == 0 && single->run.frames == 1);
+  const auto sequence =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_mesh_sequence.json",
+                cfg::Application::CodecMesh);
+  CHECK(sequence);
+  CHECK(sequence->source.path ==
+        (std::filesystem::path(VR_CONFIG_FIXTURES) / "data" / "Rafa2_obj" /
+         "Frame_%05d_textured.obj")
+            .lexically_normal()
+            .string());
+  CHECK(sequence->run.first == 1 && sequence->run.frames == 150);
+  CHECK(sequence->fusion.voxel_size_m == 0.005F &&
+        sequence->fusion.truncation_m == 0.04F);
+  CHECK(sequence->source.height_m == 1.7 &&
+        sequence->source.metres_per_unit == 0.0);
+  CHECK(sequence->source.allow_holes && !sequence->codec.sweep &&
+        sequence->output.prefix.empty());
 
   const auto readback =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/readback_orbbec.json",
@@ -105,8 +130,8 @@ int main() {
       cfg::parse(R"({
     "version": 1, "operation": "codec", "source": {"kind": "dataset", "path": "room0"},
     "codec": {"coefficient_count": 128, "quantization_scale": 0.3,
-              "quantization_table": "radial", "entropy": "device",
-              "segment_size": 32, "encode_every": 0, "sweep": true},
+              "quantization_table": "radial", "segment_size": 32,
+              "encode_every": 0, "sweep": true},
     "output": {"csv": "results/rows.csv", "stream": "../streams/room0.vrst"}
   })",
                  cfg::Application::CodecReplica, "/tmp/scenarios");
@@ -121,21 +146,47 @@ int main() {
   CHECK(encoder->params.quantization_weights[2] == 1.5F);
   CHECK(encoder->params.quantization_weights[1 + 8 * 2 + 64 * 3] == 2.75F);
   CHECK(encoder->segment_size == 32);
+  CHECK(encoder->intra_period == 1);
   // The outputs, relative to the scenario's directory.
   const vr_example::CodecOutputs outputs =
       vr_example::codec_outputs(encoded.value().output);
   CHECK(outputs.csv == "/tmp/scenarios/results/rows.csv");
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
 
+  // Core accepts a period for both codec profiles. Until the examples write
+  // P-frame records, they must refuse a requested period instead of silently
+  // keeping the encoder's all-intra default.
+  for (const auto& [source_json, application] :
+       {std::pair{R"({"kind": "dataset", "path": "room0"})",
+                  cfg::Application::CodecReplica},
+        std::pair{R"({"kind": "mesh", "path": "shape.obj",
+                      "metres_per_unit": 1, "up_axis": "y"})",
+                  cfg::Application::CodecMesh}}) {
+    for (const char* period : {"1", "8", "4294967295"}) {
+      const auto settings = cfg::parse(
+          std::string(R"({"version": 1, "operation": "codec",
+                                    "source": )") +
+              source_json + R"(, "codec": {"intra_period": )" + period + "}}",
+          application);
+      CHECK(settings);
+      const auto configured = vr_example::encoder_config(settings->codec);
+      if (std::string(period) == "1") {
+        CHECK(configured.ok() && configured->intra_period == 1);
+      } else {
+        CHECK(!configured.ok() && configured.status().domain() ==
+                                      vkc::Status::Code::InvalidArgument);
+        CHECK(configured.status().message().find("codec.intra_period") !=
+              std::string::npos);
+      }
+    }
+  }
+
   // Steps out of the codec's bounds load, and the codec refuses them: too
-  // fine everywhere, or too coarse at radial's highest frequency. So does
-  // coding on the host, which the codec does not: auto and device are the
-  // same.
+  // fine everywhere, or too coarse at radial's highest frequency.
   for (const char* codec_section :
        {R"({"quantization_scale": 0.0001})",
         R"({"quantization_table": "radial", "coefficient_count": 512,
-            "quantization_scale": 4})",
-        R"({"entropy": "host"})"}) {
+            "quantization_scale": 4})"}) {
     const auto out_of_bounds =
         cfg::parse(std::string(R"({"version": 1, "operation": "codec",
                         "source": {"kind": "dataset", "path": "room0"},
@@ -147,15 +198,6 @@ int main() {
     CHECK(!refused.ok() &&
           refused.status().domain() == vkc::Status::Code::InvalidArgument);
   }
-  const auto automatic = cfg::parse(
-      R"({"version": 1, "operation": "codec",
-          "source": {"kind": "dataset", "path": "room0"},
-          "codec": {"entropy": "auto", "segment_size": 32}})",
-      cfg::Application::CodecReplica);
-  CHECK(automatic);
-  const auto from_auto = vr_example::encoder_config(automatic->codec);
-  CHECK(from_auto.ok() && from_auto->segment_size == 32);
-
   const auto mesh = cfg::parse(R"({
     "version": 1, "operation": "codec",
     "source": {"kind": "mesh", "path": "person.obj", "height_m": 1.7,
@@ -164,10 +206,37 @@ int main() {
   })",
                                cfg::Application::CodecMesh);
   CHECK(mesh);
-  const auto sdf = vr_example::mesh_sdf_config(mesh.value().source);
-  CHECK(sdf.mode == vr::tsdf::MeshSdfMode::Shell && sdf.shell_voxels == 2.F);
+  const auto grid = [](const cfg::Fusion& fusion) {
+    return vr_example::example_grid_params(fusion.voxel_size_m,
+                                           fusion.truncation_m, 1024);
+  };
+  const auto sdf =
+      vr_example::mesh_sdf_config(mesh.value().source, grid(mesh->fusion));
+  CHECK(sdf.ok());
+  CHECK(sdf->mode == vr::tsdf::MeshSdfMode::Shell && sdf->shell_voxels == 2.F);
   CHECK(mesh.value().source.up_vector.has_value());
   CHECK((*mesh.value().source.up_vector)[0] < -0.9);
+  // Core loads any positive shell; the conversion's bound is recon's, with
+  // the truncation the scenario resolves: 5 voxels is refused within the
+  // default 4-voxel band and taken within an 8-voxel one.
+  for (const auto& [truncation, accepted] :
+       {std::pair{"", false}, std::pair{R"(, "truncation_m": 0.04)", true}}) {
+    const auto thick =
+        cfg::parse(std::string(R"({"version": 1, "operation": "codec",
+            "source": {"kind": "mesh", "path": "person.obj", "height_m": 1.7,
+                       "up_axis": "y", "sdf_mode": "shell",
+                       "shell_voxels": 5.0},
+            "fusion": {"voxel_size_m": 0.005)") +
+                       truncation + "}}",
+                   cfg::Application::CodecMesh);
+    CHECK(thick);
+    const auto shell =
+        vr_example::mesh_sdf_config(thick->source, grid(thick->fusion));
+    CHECK(shell.ok() == accepted);
+    CHECK(accepted ||
+          (shell.status().domain() == vkc::Status::Code::InvalidArgument &&
+           shell.status().message().find("shell_voxels") != std::string::npos));
+  }
 
 #ifdef VR_TEST_ORBBEC_CONFIG
   const auto live = cfg::parse(R"({

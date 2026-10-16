@@ -110,7 +110,10 @@ namespace volumetric_kit::recon::stream {
 enum class TrackKind : std::uint16_t {
   /// One codec frame per record, exactly what `codec::Encoder::encode`
   /// returned; a key record is an intra frame. The track has no width,
-  /// height, sensor or params: the frame's own header says what it is.
+  /// height or sensor: the frame's own header says what it is. Its params
+  /// are empty, or the bytes of `io::encode_transform`
+  /// (io/mesh_normalization.hpp): the transform that placed a mesh source in
+  /// metres.
   Geometry = 1,
 };
 
@@ -142,7 +145,7 @@ struct Track {
   std::uint32_t width = 0;   ///< Picture width; 0 when not pictures.
   std::uint32_t height = 0;  ///< Picture height; 0 when not pictures.
   std::string sensor;        ///< The sensor's id, or empty.
-  std::string params;        ///< What the kind defines; empty for Geometry.
+  std::string params;        ///< What the kind defines (@ref TrackKind).
 };
 
 /// @brief What a session header holds.

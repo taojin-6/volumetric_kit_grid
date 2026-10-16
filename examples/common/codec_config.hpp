@@ -31,18 +31,18 @@ inline const char* quantization_name(config::QuantizationTable table) {
 
 /// @return Runtime encoder settings: core's values, and the weights of its
 ///         `quantization_table` (@ref apply_quantization_table); or
-///         InvalidArgument for `entropy` `host`, since the codec codes on the
-///         device (`auto` and `device` are the same), or from
-///         `CodecParams::validate` for a kept coefficient's step outside the
-///         codec's bounds, which core leaves to the codec.
+///         InvalidArgument from `CodecParams::validate` for a kept
+///         coefficient's step outside the codec's bounds, which core leaves
+///         to the codec, or for `codec.intra_period` other than 1 until the
+///         examples support P-frame records.
 inline volumetric_kit::core::Result<volumetric_kit::recon::codec::EncoderConfig>
 encoder_config(const config::Codec& settings) {
   namespace codec = volumetric_kit::recon::codec;
-  // TODO(codec): core drops codec.entropy with its next config change; until
-  // then recon, which owns the codec's rules, refuses the host.
-  if (settings.entropy == config::Entropy::Host) {
+  // TODO(examples): C5b maps the period and writes record keys from FrameInfo.
+  if (settings.intra_period != 1) {
     return volumetric_kit::core::Status::invalid_argument(
-        "codec.entropy: host is not a choice; the codec codes on the device");
+        "codec.intra_period: only 1 is supported until the examples support "
+        "P-frame records");
   }
   codec::EncoderConfig result;
   result.params.coefficient_count = settings.coefficient_count;
@@ -61,15 +61,19 @@ inline CodecOutputs codec_outputs(const config::Output& output) {
   return {output.csv, output.stream};
 }
 
-/// @return Runtime SDF parameters copied from core's validated mesh source.
-inline volumetric_kit::recon::tsdf::MeshSdfParams mesh_sdf_config(
-    const config::Source& source) {
+/// @return Runtime SDF parameters from core's validated mesh source, or
+///         InvalidArgument from `MeshSdfParams::validate` against @p grid:
+///         the shell's bound, which core leaves to the mesh conversion.
+inline volumetric_kit::core::Result<volumetric_kit::recon::tsdf::MeshSdfParams>
+mesh_sdf_config(const config::Source& source,
+                const volumetric_kit::recon::volume::VoxelGridParams& grid) {
   namespace tsdf = volumetric_kit::recon::tsdf;
   tsdf::MeshSdfParams result;
   result.mode = source.sdf_mode == config::SdfMode::Signed
                     ? tsdf::MeshSdfMode::Signed
                     : tsdf::MeshSdfMode::Shell;
   result.shell_voxels = source.shell_voxels;
+  VKC_TRY(result.validate(grid));
   return result;
 }
 

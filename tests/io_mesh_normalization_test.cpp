@@ -315,6 +315,18 @@ int refusals() {
     CHECK(refused_for(io::scale_transform(bounds, bad),
                       "metres_per_unit must be"));
   }
+  // A scale that would place the bounds past float range, which
+  // apply_transform would refuse, is refused by the fit; just inside, taken.
+  const double extent = bounds.max.y - bounds.min.y;
+  CHECK(refused_for(io::fit_transform(bounds, 1e39), "past float range"));
+  CHECK(refused_for(io::scale_transform(bounds, 1e39 / extent),
+                    "past float range"));
+  CHECK(io::fit_transform(bounds, 1e38));
+  {
+    auto big = mesh;
+    const auto near_max = io::scale_transform(bounds, 1e38 / extent);
+    CHECK(near_max && io::apply_transform(big, near_max.value()));
+  }
   const auto fit = io::fit_transform(bounds, 1.7).value();
   auto refused = [&](io::TriangleMesh& geometry,
                      const io::MeshTransform& transform) {
@@ -403,9 +415,13 @@ int refusals() {
   wide.max = {kInf, 1, 1};
   CHECK(!io::fit_transform(wide, 1.7) && !io::scale_transform(wide, 1.0));
 
-  // Float overflow.
-  CHECK(refused(mesh, io::scale_transform(bounds, 1e300).value()));
-  CHECK(refused(mesh, io::fit_transform(bounds, 1e300).value()));
+  // Float overflow: the fits refuse such a scale, and apply_transform a
+  // transform made by hand.
+  CHECK(refused_for(io::scale_transform(bounds, 1e300), "past float range"));
+  CHECK(refused_for(io::fit_transform(bounds, 1e300), "past float range"));
+  auto huge = fit;
+  huge.metres_per_unit = 1e300;
+  CHECK(refused(mesh, huge));
   // Nothing to place is not a refusal: an empty frame stays empty.
   io::TriangleMesh nothing;
   CHECK(io::apply_transform(nothing, fit) && nothing.positions.empty());
@@ -617,6 +633,65 @@ int topology() {
   return 0;
 }
 
+// A transform round-trips through its stored bytes bit for bit, in a fixed
+// little-endian layout; bytes that are not one are refused, and so is a
+// transform apply_transform would refuse, either way.
+int stored_transform() {
+  const auto fit =
+      io::fit_transform(io::mesh_bounds(tetrahedron(), oblique()), 1.7).value();
+  const auto bytes = io::encode_transform(fit);
+  CHECK(bytes && bytes->size() == io::kTransformBytes);
+  const auto back = io::decode_transform(*bytes);
+  CHECK(back && same(back.value(), fit));
+  // The identity: the tag, version 1, then each binary64 low byte first.
+  const auto identity = io::encode_transform({});
+  CHECK(identity);
+  std::string expected = std::string("VRMT\x01\x00\x00\x00", 8);
+  for (const double v : {1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 0., 0., 1.}) {
+    const std::uint64_t bits = v == 1.0 ? 0x3FF0000000000000u : 0u;
+    for (int i = 0; i < 8; ++i) expected.push_back(char(bits >> (8 * i)));
+  }
+  CHECK(identity.value() == expected);
+  // Every bit of every double is kept: a negative zero, a subnormal, the
+  // last bit of a scale.
+  auto exact = fit;
+  exact.origin = {-0.0, 4.9406564584124654e-324, std::nextafter(1.0, 2.0)};
+  exact.metres_per_unit = std::nextafter(fit.metres_per_unit, 0.0);
+  const auto kept = io::decode_transform(io::encode_transform(exact).value());
+  CHECK(kept && std::signbit(kept.value().origin.x) &&
+        same(kept.value(), exact));
+
+  const std::string& good = bytes.value();
+  CHECK(refused_for(io::decode_transform(good.substr(0, 111)), "112 bytes"));
+  CHECK(refused_for(io::decode_transform(good + '\0'), "112 bytes"));
+  CHECK(refused_for(io::decode_transform(""), "112 bytes"));
+  auto tag = good;
+  tag[3] = 'X';
+  CHECK(refused_for(io::decode_transform(tag), "112 bytes"));
+  for (const char v : {char(0), char(2)}) {
+    auto version = good;
+    version[4] = v;
+    const auto other = io::decode_transform(version);
+    CHECK(!other && other.status().domain() == Code::Unsupported);
+  }
+  auto scale = good;
+  for (std::size_t i = 104; i < 112; ++i) scale[i] = 0;
+  CHECK(refused_for(io::decode_transform(scale), "positive scale"));
+  auto mirrored = good;
+  mirrored[15] = char(mirrored[15] ^ 0x80);  // x's x changes sign
+  CHECK(refused_for(io::decode_transform(mirrored), "proper rotation"));
+  auto flat = fit;
+  flat.metres_per_unit = 0.0;
+  CHECK(refused_for(io::encode_transform(flat), "positive scale"));
+  auto skew = fit;
+  skew.axes.z = -skew.axes.z;
+  CHECK(refused_for(io::encode_transform(skew), "proper rotation"));
+  auto lost = fit;
+  lost.origin.y = kNaN;
+  CHECK(refused_for(io::encode_transform(lost), "finite origin"));
+  return 0;
+}
+
 // An allocation failure is OutOfMemory, and apply leaves the geometry alone.
 int out_of_memory() {
   auto mesh = tetrahedron();
@@ -650,7 +725,7 @@ int out_of_memory() {
 int main() {
   for (const auto test :
        {union_bounds, fit_against_unit, tilted_tetrahedron, shifted_sequence,
-        refusals, topology, out_of_memory}) {
+        refusals, topology, stored_transform, out_of_memory}) {
     if (test() != 0) return 1;
   }
   std::puts("mesh normalization tests passed");

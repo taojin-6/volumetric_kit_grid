@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "operation": "codec",
+  "source": {
+    "kind": "mesh",
+    "path": "data/Rafa2_obj/Frame_%05d_textured.obj",
+    "height_m": 1.7,
+    "up_vector": [
+      -0.9120591159,
+      0.0661250017,
+      -0.4046920474
+    ],
+    "allow_holes": true
+  },
+  "run": {
+    "first": 1,
+    "frames": 150
+  },
+  "fusion": {
+    "voxel_size_m": 0.005,
+    "truncation_m": 0.04
+  }
+}

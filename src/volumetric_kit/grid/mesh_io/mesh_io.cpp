@@ -82,17 +82,7 @@ core::Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
 }
 
 core::Result<TriangleMesh> import_mesh(const std::string& path) {
-  VKC_TRY(core::check_path("load_mesh", path));
-  std::error_code error;
-  const auto file = std::filesystem::status(path, error);
-  if (error == std::errc::no_such_file_or_directory ||
-      (!error && !std::filesystem::exists(file))) {
-    return core::Status::not_found("load_mesh: missing file: " + path);
-  }
-  if (error) return core::Status::io_error("load_mesh: " + error.message());
-  if (!std::filesystem::is_regular_file(file)) {
-    return core::Status::invalid_argument("load_mesh: expected a regular file");
-  }
+  VKC_TRY(check_mesh_file(path));
 
   Assimp::Importer importer;
   // Keep source coordinates: Collada and FBX importers otherwise apply the
@@ -214,6 +204,27 @@ core::Result<TriangleMesh> import_mesh(const std::string& path) {
 }
 
 }  // namespace
+
+core::Status check_mesh_file(const std::string& path) try {
+  VKC_TRY(core::check_path("check_mesh_file", path));
+  std::error_code error;
+  const auto file = std::filesystem::status(path, error);
+  if (error == std::errc::no_such_file_or_directory ||
+      (!error && !std::filesystem::exists(file))) {
+    return core::Status::not_found("check_mesh_file: missing file: " + path);
+  }
+  if (error) {
+    return core::Status::io_error("check_mesh_file: " + path + ": " +
+                                  error.message());
+  }
+  if (!std::filesystem::is_regular_file(file)) {
+    return core::Status::invalid_argument(
+        "check_mesh_file: not a regular file: " + path);
+  }
+  return {};
+} catch (...) {
+  return core::exception_status("check_mesh_file", core::Status::Code::IoError);
+}
 
 core::Result<TriangleMesh> load_mesh(const std::string& path) {
   try {
