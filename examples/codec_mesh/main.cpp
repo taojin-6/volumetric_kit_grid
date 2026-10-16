@@ -91,10 +91,9 @@ vkc::Status run(const Options& opt) {
       vr_example::CodecStream::create(device, allocator, config,
                                       vr_example::codec_outputs(opt.output),
                                       "codec_mesh", placement));
-  std::printf("codec: K %u, table %s, quantization scale %.6g\n",
-              config.params.coefficient_count,
-              vr_example::quantization_name(opt.codec.quantization_table),
-              double(config.params.quantization_scale));
+  std::printf(
+      "codec: %s\n",
+      vr_example::codec_settings(config, opt.codec.quantization_table).c_str());
 
   vkc::StageMetrics conversion;
   std::size_t defective = 0;

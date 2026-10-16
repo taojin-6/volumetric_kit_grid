@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Tao Jin
 
 // The integration boundary: core-validated settings reach the runtime options
-// unchanged, and the codec checks the steps core leaves to it. No file
-// assets, device or camera are opened.
+// unchanged, and the codec checks the steps and sizes core leaves to it; the
+// codec sweep codes every row intra. No file assets, device or camera are
+// opened.
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <utility>
 
 #include "codec_config.hpp"
+#include "codec_sweep.hpp"
 #include "replica_config.hpp"
 #ifdef VR_TEST_ORBBEC_CONFIG
 #include "orbbec_config.hpp"
@@ -131,7 +133,8 @@ int main() {
     "version": 1, "operation": "codec", "source": {"kind": "dataset", "path": "room0"},
     "codec": {"coefficient_count": 128, "quantization_scale": 0.3,
               "quantization_table": "radial", "segment_size": 32,
-              "encode_every": 0, "sweep": true},
+              "update_size": 128, "intra_period": 30, "encode_every": 0,
+              "sweep": true},
     "output": {"csv": "results/rows.csv", "stream": "../streams/room0.vrst"}
   })",
                  cfg::Application::CodecReplica, "/tmp/scenarios");
@@ -146,38 +149,85 @@ int main() {
   CHECK(encoder->params.quantization_weights[2] == 1.5F);
   CHECK(encoder->params.quantization_weights[1 + 8 * 2 + 64 * 3] == 2.75F);
   CHECK(encoder->segment_size == 32);
-  CHECK(encoder->intra_period == 1);
+  CHECK(encoder->update_size == 128 && encoder->intra_period == 30);
+  CHECK(
+      vr_example::codec_settings(*encoder, encoded->codec.quantization_table) ==
+      "K 128, table radial, scale 0.3; segments of 32 blocks, update "
+      "segments of 128 entries; an I-frame every 30 frames");
+  // The sweep times repeated encodes of one grid: every row intra, with the
+  // scenario's sizes and the row's params.
+  const auto row =
+      vr_example::sweep_encoder_config(*encoder, {"band", 84, 0.4F});
+  CHECK(row.ok() && row->intra_period == 1);
+  CHECK(row->segment_size == 32 && row->update_size == 128);
+  CHECK(row->params.coefficient_count == 84 &&
+        row->params.quantization_scale == 0.4F);
+  CHECK(row->params.quantization_weights[1] == 1.25F);  // band's, (1, 0, 0)
+  CHECK(!vr_example::sweep_encoder_config(*encoder, {"none", 84, 0.4F}).ok());
   // The outputs, relative to the scenario's directory.
   const vr_example::CodecOutputs outputs =
       vr_example::codec_outputs(encoded.value().output);
   CHECK(outputs.csv == "/tmp/scenarios/results/rows.csv");
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
 
-  // Core accepts a period for both codec profiles. Until the examples write
-  // P-frame records, they must refuse a requested period instead of silently
-  // keeping the encoder's all-intra default.
+  // Both codec profiles: the period as given, and with P-frames the update
+  // size as given, or the encoder's own for core's 0, up to the format's
+  // longest segment.
+  const vr::codec::EncoderConfig defaults;
   for (const auto& [source_json, application] :
        {std::pair{R"({"kind": "dataset", "path": "room0"})",
                   cfg::Application::CodecReplica},
         std::pair{R"({"kind": "mesh", "path": "shape.obj",
                       "metres_per_unit": 1, "up_axis": "y"})",
                   cfg::Application::CodecMesh}}) {
-    for (const char* period : {"1", "8", "4294967295"}) {
-      const auto settings = cfg::parse(
-          std::string(R"({"version": 1, "operation": "codec",
-                                    "source": )") +
-              source_json + R"(, "codec": {"intra_period": )" + period + "}}",
-          application);
+    const auto with_codec = [&, source = source_json,
+                             app = application](const std::string& codec_json) {
+      return cfg::parse(std::string(R"({"version": 1, "operation": "codec",
+                                        "source": )") +
+                            source + R"(, "codec": )" + codec_json + "}",
+                        app);
+    };
+    const auto unset = with_codec("{}");
+    CHECK(unset);
+    const auto plain = vr_example::encoder_config(unset->codec);
+    CHECK(plain.ok() && plain->intra_period == 1 &&
+          plain->update_size == defaults.update_size);
+    CHECK(vr_example::codec_settings(*plain, unset->codec.quantization_table) ==
+          "K 64, table uniform, scale 0.2; segments of 64 blocks; every frame "
+          "intra");
+    for (const std::uint32_t period : {1u, 8u, 4294967295u}) {
+      const auto settings =
+          with_codec(R"({"intra_period": )" + std::to_string(period) + "}");
       CHECK(settings);
       const auto configured = vr_example::encoder_config(settings->codec);
-      if (std::string(period) == "1") {
-        CHECK(configured.ok() && configured->intra_period == 1);
-      } else {
+      CHECK(configured.ok() && configured->intra_period == period);
+    }
+    for (const std::uint32_t size :
+         {0u, 1u, 5u, vr::codec::kMaxDeviceDecodeSegmentSize,
+          vr::codec::kMaxDeviceDecodeSegmentSize + 1}) {
+      const auto settings =
+          with_codec(R"({"intra_period": 2, "update_size": )" +
+                     std::to_string(size) + "}");
+      CHECK(settings);
+      const auto configured = vr_example::encoder_config(settings->codec);
+      if (size > vr::codec::kMaxDeviceDecodeSegmentSize) {
         CHECK(!configured.ok() && configured.status().domain() ==
                                       vkc::Status::Code::InvalidArgument);
-        CHECK(configured.status().message().find("codec.intra_period") !=
-              std::string::npos);
+        CHECK(configured.status().message().find(
+                  "update_size " + std::to_string(size)) != std::string::npos);
+      } else {
+        CHECK(configured.ok() && configured->update_size ==
+                                     (size == 0 ? defaults.update_size : size));
       }
+    }
+    // No P-frame uses an update size at a period of 1, so core refuses one
+    // given there, even 0: such a scenario maps only to the encoder's own.
+    for (const char* codec_json :
+         {R"({"update_size": 16})",
+          R"({"intra_period": 1, "update_size": 0})"}) {
+      const auto refused = with_codec(codec_json);
+      CHECK(!refused && refused.status().message().find("codec.update_size") !=
+                            std::string::npos);
     }
   }
 
