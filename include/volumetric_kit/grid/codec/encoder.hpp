@@ -134,10 +134,10 @@ class VR_CODEC_API Encoder {
   /// The frame is an I-frame when it is the first, when
   /// @ref EncoderConfig::intra_period frames have been coded since the last
   /// I-frame, after @ref force_intra, when @p grid's `voxel_size` or
-  /// `trunc_dist` is not the reference's, or when the reference holds no
-  /// block (an I-frame is then the smaller); otherwise a P-frame. A frame
-  /// returned becomes the reference and counts toward the period; a refusal
-  /// changes neither.
+  /// `trunc_dist` is not the reference's, when the reference holds no block,
+  /// or when @p grid has no observed block (an I-frame is then the smaller);
+  /// otherwise a P-frame. A frame returned becomes the reference and counts
+  /// toward the period; a refusal changes neither.
   /// @param grid     A grid with 4-byte float `tsdf` and `weight` attributes
   ///                 and `block_size` 8. Its blocks and voxels are read,
   ///                 never written; the reference is non-const only because

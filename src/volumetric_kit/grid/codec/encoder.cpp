@@ -98,13 +98,16 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
 
   // A P-frame codes against the frame returned last, unless the rules on
   // encode() make this an I-frame. The encoder's params never change, so of
-  // the coding parameters only the grid's geometry can differ.
+  // the coding parameters only the grid's geometry can differ. When either
+  // side holds no block, an I-frame is the smaller: an empty reference leaves
+  // nothing to predict, and an empty grid would cost a remove for every
+  // reference entry, 8 bytes an update segment.
   const volume::VoxelGridParams& gp = grid.grid();
   const CodecParams& params = config_.params;
   const detail::FrameReference* reference = store_->held();
   if (reference != nullptr &&
       (force_intra_ || gop_position_ == 0 ||
-       reference->header.block_count == 0 ||
+       reference->header.block_count == 0 || observed == 0 ||
        detail::coding_difference(reference->header, gp.voxel_size,
                                  gp.trunc_dist, params) != nullptr)) {
     reference = nullptr;

@@ -7,9 +7,9 @@
 // blocks in; blocks with no observed voxel are left out; its stage rows; its
 // refusals (a segment or update segment longer than the format allows and an
 // intra period of 0 among them, each as EncoderConfig::validate refuses it)
-// and its moves; and its frame types -- an I-frame first, every
-// period, after force_intra(), on a geometry change and after a frame of no
-// blocks, a P-frame otherwise -- a refusal keeping the reference and the
+// and its moves; and its frame types -- an I-frame first, every period,
+// after force_intra(), on a geometry change, for a grid of no blocks and
+// after one, a P-frame otherwise -- a refusal keeping the reference and the
 // period's count, and a chain repeated by a fresh encoder. Decoding is
 // codec_decoder_test's, and a P-frame's bytes codec_inter_test's. Skips with
 // no device.
@@ -411,9 +411,9 @@ int period_case(Gpu& gpu) {
 
 // Each rule that makes an I-frame, at a period of 3: the first frame, the
 // period, force_intra(), a grid of another voxel size or of another
-// trunc_dist alone -- and the grid after each, against that one -- and a
-// reference of no blocks; a P-frame otherwise, costing the same rows as an
-// I-frame.
+// trunc_dist alone -- and the grid after each, against that one -- a grid of
+// no blocks after one of some, and a reference of no blocks, whatever the
+// grid; a P-frame otherwise, costing the same rows as an I-frame.
 int intra_rules_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;
@@ -451,8 +451,9 @@ int intra_rules_case(Gpu& gpu) {
       {&a.value(), false, I},      // and back
       {&w.value(), false, I},      // another trunc_dist
       {&a.value(), false, I},      // and back
-      {&empty.value(), false, P},  // every block removed
-      {&a.value(), false, I},      // a reference of no blocks
+      {&empty.value(), false, I},  // a grid of no blocks
+      {&empty.value(), false, I},  // a reference of no blocks
+      {&a.value(), false, I},      // and a grid of some
       {&b.value(), false, P},      //
   };
   int i = 0;
