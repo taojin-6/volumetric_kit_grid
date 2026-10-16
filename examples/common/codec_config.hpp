@@ -33,10 +33,17 @@ inline const char* quantization_name(config::QuantizationTable table) {
 ///         `quantization_table` (@ref apply_quantization_table); or
 ///         InvalidArgument from `CodecParams::validate` for a kept
 ///         coefficient's step outside the codec's bounds, which core leaves
-///         to the codec.
+///         to the codec, or for `codec.intra_period` other than 1 until the
+///         examples support P-frame records.
 inline volumetric_kit::core::Result<volumetric_kit::recon::codec::EncoderConfig>
 encoder_config(const config::Codec& settings) {
   namespace codec = volumetric_kit::recon::codec;
+  // TODO(examples): C5b maps the period and writes record keys from FrameInfo.
+  if (settings.intra_period != 1) {
+    return volumetric_kit::core::Status::invalid_argument(
+        "codec.intra_period: only 1 is supported until the examples support "
+        "P-frame records");
+  }
   codec::EncoderConfig result;
   result.params.coefficient_count = settings.coefficient_count;
   result.params.quantization_scale = settings.quantization_scale;

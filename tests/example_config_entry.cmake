@@ -79,6 +79,35 @@ if(program_name STREQUAL "codec_mesh")
   file(WRITE "${WORK_DIR}/vertices.obj" "v 0 0 0\nv 1 0 0\n")
   file(WRITE "${WORK_DIR}/flat.obj" "v 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n")
 
+  # A literal % in the scenario directory must survive config::load. The take0
+  # decoy is closed; the intended mesh is open, so checking the inspection
+  # counts also catches silently selecting the wrong file.
+  file(MAKE_DIRECTORY "${WORK_DIR}/take0")
+  configure_file("${WORK_DIR}/t_01.obj" "${WORK_DIR}/take0/shape.obj" COPYONLY)
+  foreach(directory "50%off" "take%d")
+    file(MAKE_DIRECTORY "${WORK_DIR}/${directory}")
+    configure_file("${WORK_DIR}/open_01.obj"
+                   "${WORK_DIR}/${directory}/shape.obj" COPYONLY)
+    file(
+      WRITE "${WORK_DIR}/${directory}/inspect.json"
+      "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"shape.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"codec\":{\"inspect_only\":true}}\n"
+    )
+    execute_process(
+      COMMAND "${PROGRAM}" --config "${WORK_DIR}/${directory}/inspect.json"
+      WORKING_DIRECTORY "${WORK_DIR}/elsewhere"
+      RESULT_VARIABLE result
+      OUTPUT_VARIABLE output
+      ERROR_VARIABLE error)
+    if(NOT result EQUAL 0 OR NOT output MATCHES
+                             "inspection: 1 frame.s.; 1 open")
+      message(
+        SEND_ERROR
+          "Mesh scenario under ${directory}: ${result}: ${output}${error}")
+    endif()
+    file(REMOVE_RECURSE "${WORK_DIR}/${directory}")
+  endforeach()
+  file(REMOVE_RECURSE "${WORK_DIR}/take0")
+
   # A numbered range is inspected on the host, every frame, and counted; a
   # missing frame, a malformed pattern and a range on a plain path are refused.
   set(mesh_source
@@ -123,6 +152,7 @@ if(program_name STREQUAL "codec_mesh")
     "open|\"height_m\":1.7,\"path\":\"open_%02d.obj\"},\"run\":{\"first\":1}}|source.allow_holes"
     "shell|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"shell_voxels\":5,\"path\":\"t_01.obj\"}}|shell_voxels"
     "codec_step|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"quantization_scale\":1e-30}}|CodecParams"
+    "intra_period|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"intra_period\":8}}|codec.intra_period"
     "empty|\"height_m\":1.7,\"path\":\"empty.obj\"}}|empty.obj"
     "vertices|\"height_m\":1.7,\"path\":\"vertices.obj\"}}|vertices.obj"
     "flat|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"path\":\"flat.obj\"}}|zero extent along up"

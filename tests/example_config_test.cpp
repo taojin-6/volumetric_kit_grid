@@ -146,11 +146,40 @@ int main() {
   CHECK(encoder->params.quantization_weights[2] == 1.5F);
   CHECK(encoder->params.quantization_weights[1 + 8 * 2 + 64 * 3] == 2.75F);
   CHECK(encoder->segment_size == 32);
+  CHECK(encoder->intra_period == 1);
   // The outputs, relative to the scenario's directory.
   const vr_example::CodecOutputs outputs =
       vr_example::codec_outputs(encoded.value().output);
   CHECK(outputs.csv == "/tmp/scenarios/results/rows.csv");
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
+
+  // Core accepts a period for both codec profiles. Until the examples write
+  // P-frame records, they must refuse a requested period instead of silently
+  // keeping the encoder's all-intra default.
+  for (const auto& [source_json, application] :
+       {std::pair{R"({"kind": "dataset", "path": "room0"})",
+                  cfg::Application::CodecReplica},
+        std::pair{R"({"kind": "mesh", "path": "shape.obj",
+                      "metres_per_unit": 1, "up_axis": "y"})",
+                  cfg::Application::CodecMesh}}) {
+    for (const char* period : {"1", "8", "4294967295"}) {
+      const auto settings = cfg::parse(
+          std::string(R"({"version": 1, "operation": "codec",
+                                    "source": )") +
+              source_json + R"(, "codec": {"intra_period": )" + period + "}}",
+          application);
+      CHECK(settings);
+      const auto configured = vr_example::encoder_config(settings->codec);
+      if (std::string(period) == "1") {
+        CHECK(configured.ok() && configured->intra_period == 1);
+      } else {
+        CHECK(!configured.ok() && configured.status().domain() ==
+                                      vkc::Status::Code::InvalidArgument);
+        CHECK(configured.status().message().find("codec.intra_period") !=
+              std::string::npos);
+      }
+    }
+  }
 
   // Steps out of the codec's bounds load, and the codec refuses them: too
   // fine everywhere, or too coarse at radial's highest frequency.

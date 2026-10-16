@@ -6,12 +6,12 @@
 // file checked before any load; one transform fitted to the whole range, so
 // a vertex that does not move keeps its place, where frame 1 alone would fit
 // wrong; a plain path placed as one mesh was before; a % in the scenario's
-// directory, escaped, read as written; signed mode's rule and
-// source.allow_holes, refused before any GPU work; inspection over a range
-// and its counts. On a device: each frame converted into a cleared grid, and
-// code_frame's records -- set the frame's number, pts that number at 30 fps,
-// seq from 0, each payload what a fresh encoder makes of the frame alone, the
-// transform in the track's params -- and its own audit and allow_holes. The
+// directory, resolved through config::load, read as written; signed mode's
+// rule and source.allow_holes, refused before any GPU work; inspection over a
+// range and its counts. On a device: each frame converted into a cleared grid,
+// and code_frame's records -- set the frame's number, pts that number at 30
+// fps, seq from 0, each payload what a fresh encoder makes of the frame alone,
+// the transform in the track's params -- and its own audit and allow_holes. The
 // device part skips with no device.
 
 #include <cmath>
@@ -363,49 +363,58 @@ int signed_rule(const vr_test::Scratch& scratch) {
   return 0;
 }
 
-// A % in the scenario's directory, escaped as core escapes it: the plain
-// path in "50%off" and the frames in "take%d" are read as written, and never
-// as take0's.
+// Load real scenarios beneath literal % directories. Plain and numbered
+// paths must select their own meshes, including when take0 holds a decoy.
 int escaped_directory(const vr_test::Scratch& scratch) {
   const fs::path base = scratch.path / "pct";
-  for (const char* dir : {"50%off", "take%d", "take0"}) {
-    CHECK(fs::create_directories(base / dir));
+  CHECK(fs::create_directories(base / "take0"));
+  for (const char* file : {"shape.obj", "m_01.obj", "m_02.obj"}) {
+    CHECK(write_obj(base / "take0" / file, cube({0, 0, 0}, 2.0f)));
   }
-  CHECK(write_obj(base / "50%off" / "cube.obj", cube({0, 0, 0}, 0.5f)));
-  CHECK(write_obj(base / "take%d" / "m_01.obj", cube({0, 0, 0}, 0.5f)));
-  CHECK(write_obj(base / "take%d" / "m_02.obj", cube({0, 0, 0}, 0.5f)));
-  CHECK(write_obj(base / "take0" / "m_01.obj", cube({0, 0, 0}, 2.0f)));
-  const std::string escaped = [&base] {
-    std::string text;
-    for (const char c : base.string())
-      text += c == '%' ? "%%" : std::string(1, c);
-    return text;
-  }();
-  const auto open_as = [](const std::string& path, int first, int frames) {
-    vkc::Result<cfg::Config> settings = cfg::parse(
-        R"({"version": 1, "operation": "codec",
-            "source": {"kind": "mesh", "path": "unused.obj",
-                       "metres_per_unit": 1, "up_axis": "y"}})",
-        cfg::Application::CodecMesh);
-    if (!settings.ok())
-      return vkc::Result<vr_example::MeshSequence>(settings.status());
-    settings->source.path = path;
-    settings->run.first = first;
-    settings->run.frames = frames;
-    return vr_example::MeshSequence::open(*settings);
-  };
-  vkc::Result<vr_example::MeshSequence> plain =
-      open_as(escaped + "/50%%off/cube.obj", 0, 1);
-  CHECK(plain.ok() &&
-        plain->path(0) == (base / "50%off" / "cube.obj").string());
-  vkc::Result<vr_example::MeshSequence> takes =
-      open_as(escaped + "/take%%d/m_%02d.obj", 1, 2);
-  CHECK(takes.ok());
-  CHECK(takes->path(1) == (base / "take%d" / "m_01.obj").string());
-  // The unit cube's frames, not take0's 4-unit one.
-  vkc::Result<vr_example::MeshFrame> frame = takes->load(1);
-  CHECK(frame.ok());
-  for (const Vec3f& p : frame->mesh.positions) CHECK(p.y <= 1.0f);
+  for (const char* name : {"50%off", "take%d"}) {
+    const fs::path dir = base / name;
+    CHECK(fs::create_directory(dir));
+    for (const char* file : {"shape.obj", "m_01.obj", "m_02.obj"}) {
+      CHECK(write_obj(dir / file, cube({0, 0, 0}, 0.5f)));
+    }
+    for (const bool numbered : {false, true}) {
+      const fs::path config_path = dir / "inspect.json";
+      {
+        std::ofstream out(config_path);
+        out << R"({"version": 1, "operation": "codec",
+            "source": {"kind": "mesh", "path": ")"
+            << (numbered ? "m_%02d.obj" : "shape.obj")
+            << R"(", "metres_per_unit": 1, "up_axis": "y"},
+            "codec": {"inspect_only": true})"
+            << (numbered ? R"(, "run": {"first": 1, "frames": 2})" : "")
+            << "}\n";
+        out.close();
+        CHECK(bool(out));
+      }
+      const vkc::Result<cfg::Config> settings =
+          cfg::load(config_path.string(), cfg::Application::CodecMesh);
+      CHECK(settings.ok());
+      const vkc::Result<vr_example::MeshSequence> sequence =
+          vr_example::MeshSequence::open(*settings);
+      if (!sequence.ok())
+        std::fprintf(stderr, "%s: %s\n", config_path.string().c_str(),
+                     sequence.status().message().c_str());
+      CHECK(sequence.ok());
+      CHECK(sequence->first() == (numbered ? 1u : 0u));
+      CHECK(sequence->count() == (numbered ? 2u : 1u));
+      for (std::uint32_t n = sequence->first(); n <= sequence->last(); ++n) {
+        const char* file =
+            numbered ? (n == 1 ? "m_01.obj" : "m_02.obj") : "shape.obj";
+        CHECK(sequence->path(n) == (dir / file).string());
+        const vkc::Result<vr_example::MeshFrame> frame = sequence->load(n);
+        CHECK(frame.ok() && frame->number == n);
+        float top = 0.0f;
+        for (const Vec3f& p : frame->mesh.positions) top = std::max(top, p.y);
+        // The unit cube, never take0's four-unit decoy.
+        CHECK(std::abs(top - 1.0f) < 1e-6f);
+      }
+    }
+  }
   return 0;
 }
 
