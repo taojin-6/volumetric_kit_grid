@@ -20,12 +20,27 @@
 namespace volumetric_kit::recon::codec {
 namespace {
 
-// The public default restates the frame's, which the installed header cannot
-// name; this is what keeps the two one number.
+// The public defaults restate the frame's, which the installed header cannot
+// name; this is what keeps each pair one number.
 static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
               "EncoderConfig's default segment size is the frame's");
+static_assert(EncoderConfig{}.update_size == detail::kDefaultUpdateSize,
+              "EncoderConfig's default update size is the frame's");
 
 }  // namespace
+
+core::Status EncoderConfig::validate() const {
+  VKC_TRY(params.validate());
+  VKC_TRY(detail::check_segment_size("EncoderConfig", "segment_size",
+                                     segment_size));
+  VKC_TRY(
+      detail::check_segment_size("EncoderConfig", "update_size", update_size));
+  if (intra_period == 0) {
+    return core::Status::invalid_argument(
+        "EncoderConfig: intra_period 0; 1 makes every frame an I-frame");
+  }
+  return {};
+}
 
 Encoder::Encoder() = default;
 Encoder::~Encoder() = default;
@@ -40,13 +55,7 @@ void Encoder::force_intra() noexcept { force_intra_ = true; }
 core::Result<Encoder> Encoder::create(core::Device& device,
                                       core::Allocator& allocator,
                                       const EncoderConfig& config) {
-  VKC_TRY(config.params.validate());
-  VKC_TRY(detail::check_segment_size("Encoder", "segment_size",
-                                     config.segment_size));
-  if (config.intra_period == 0) {
-    return core::Status::invalid_argument(
-        "Encoder: intra_period 0; 1 makes every frame an I-frame");
-  }
+  VKC_TRY(config.validate());
   Encoder e;
   e.config_ = config;
   e.device_ = &device;
@@ -132,7 +141,7 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
                                   &stage));
     } else {
       VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
-                                    detail::kDefaultUpdateSize, &stage));
+                                    config_.update_size, &stage));
     }
     VKC_TRY(batch.submit());
     VKC_TRY(
@@ -144,7 +153,7 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
       VKC_ASSIGN(entries, store_->diffed());
       core::CommandBatch count(*device_, *allocator_);
       VKC_TRY(writer_->record_count(count, entries, config_.segment_size,
-                                    detail::kDefaultUpdateSize, &stage));
+                                    config_.update_size, &stage));
       VKC_TRY(count.submit());
     }
   }

@@ -29,7 +29,7 @@ class ReferenceStore;
 }  // namespace detail
 
 /// @brief How an @ref Encoder codes a frame.
-struct EncoderConfig {
+struct VR_CODEC_API EncoderConfig {
   /// Coefficients kept per block and their quantization steps.
   CodecParams params;
   /// Blocks per independently coded segment, from 1 to
@@ -38,12 +38,27 @@ struct EncoderConfig {
   /// a little more size (each segment restates its first coordinate); the
   /// default costs 2-3% of a frame.
   std::uint32_t segment_size = 64;
+  /// A P-frame's reference entries per independently coded update segment,
+  /// from 1 to @ref kMaxDeviceDecodeSegmentSize: as @ref segment_size is for
+  /// its new blocks, smaller segments give the device more parallelism, at a
+  /// little more size (each segment costs a 4-byte length and its stream's
+  /// 4-byte final state). An I-frame has no update segments.
+  std::uint32_t update_size = 64;
   /// Frames from one I-frame to the next, at least 1. At 1, the default,
   /// every frame is an I-frame; at N, an I-frame and N - 1 P-frames
   /// (@ref FrameType::kInter, experimental) take turns; a period past the
   /// stream's length codes P-frames after the first frame for as long as
   /// the rules on @ref Encoder::encode allow.
   std::uint32_t intra_period = 1;
+
+  /// @brief Check every field against what the @ref Encoder takes: what
+  ///        @ref Encoder::create checks first, and what a caller checks
+  ///        before any GPU work.
+  /// @return OK, or `Status::invalid_argument` naming the field: invalid
+  ///         @ref params (@ref CodecParams::validate), a @ref segment_size or
+  ///         @ref update_size of 0 or past @ref kMaxDeviceDecodeSegmentSize,
+  ///         or an @ref intra_period of 0.
+  core::Status validate() const;
 };
 
 /// @brief Encodes a @ref volume::VoxelBlockGrid's geometry as frames -- the
@@ -99,10 +114,10 @@ class VR_CODEC_API Encoder {
   ///                   this object).
   /// @param config     How frames are coded.
   /// @return The encoder, holding no reference, or
-  ///         `Status::Code::InvalidArgument` for invalid `config.params`, a
-  ///         `segment_size` of 0 or past @ref kMaxDeviceDecodeSegmentSize, or
-  ///         an `intra_period` of 0; otherwise a pipeline or allocation
-  ///         failure: a device whose kernels do not build has no encoder.
+  ///         `Status::Code::InvalidArgument` for a @p config that
+  ///         @ref EncoderConfig::validate refuses; otherwise a pipeline or
+  ///         allocation failure: a device whose kernels do not build has no
+  ///         encoder.
   static core::Result<Encoder> create(core::Device& device,
                                       core::Allocator& allocator,
                                       const EncoderConfig& config = {});

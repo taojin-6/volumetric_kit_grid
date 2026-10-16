@@ -985,8 +985,8 @@ struct Coded {
 
 // Encode @p grid with @p enc and hold the bytes to the oracle's: an I-frame
 // to the oracle's intra frame of the grid, a P-frame to the oracle's writer
-// over encoder_frame against the chain's last frame, at U =
-// kDefaultUpdateSize. Appends the frame to @p chain.
+// over encoder_frame against the chain's last frame, at @p config's sizes.
+// Appends the frame to @p chain.
 int encode_checked(Gpu& gpu, codec::Encoder& enc,
                    const codec::EncoderConfig& config,
                    vol::VoxelBlockGrid& grid, std::vector<Coded>& chain) {
@@ -1005,7 +1005,7 @@ int encode_checked(Gpu& gpu, codec::Encoder& enc,
     const Coded& prev = chain.back();
     oracle::FrameWriteOptions options;
     options.segment_size = config.segment_size;
-    options.update_size = d::kDefaultUpdateSize;
+    options.update_size = config.update_size;
     vkc::Result<Bytes> want = oracle::write_frame(
         codec_frames::encoder_frame(reference_of(prev.sent), prev.content,
                                     content.value()),
@@ -1040,10 +1040,10 @@ codec::FrameType type_of(const Bytes& frame) {
 }
 
 // A sphere that moves and grows beside one that stays: chains at period 4
-// and open-ended, at an odd K in segments of 3 and at the defaults, every
-// frame the oracle's bytes, every P-frame decoding to its I-frame's grid;
-// and among the P-frames every mode the encoder chooses but motion, and new
-// blocks.
+// and open-ended, at an odd K in segments of 3 and update segments of 5 and
+// at the defaults, every frame the oracle's bytes, every P-frame decoding to
+// its I-frame's grid; and among the P-frames every mode the encoder chooses
+// but motion, and new blocks.
 int encoder_chain_case(Gpu& gpu) {
   for (const std::uint32_t period : {4u, ~0u}) {
     for (const bool odd : {true, false}) {
@@ -1052,6 +1052,7 @@ int encoder_chain_case(Gpu& gpu) {
       if (odd) {
         config.params.coefficient_count = 37;
         config.segment_size = 3;
+        config.update_size = 5;
       }
       vkc::Result<codec::Encoder> enc =
           codec::Encoder::create(gpu.device, gpu.allocator, config);
