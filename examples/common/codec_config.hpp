@@ -6,6 +6,9 @@
 /// @file examples/common/codec_config.hpp
 /// @brief Map the core's validated codec and mesh settings to runtime types.
 
+#include <cstdio>
+#include <string>
+
 #include "codec_quantization.hpp"
 #include "codec_stream.hpp"
 #include "config.hpp"
@@ -29,29 +32,45 @@ inline const char* quantization_name(config::QuantizationTable table) {
   return "unknown";
 }
 
-/// @return Runtime encoder settings: core's values, and the weights of its
+/// @return Runtime encoder settings: core's values, a `codec.update_size`
+///         of 0 (core's default, and all it admits at an intra period of 1)
+///         being the encoder's own, and the weights of its
 ///         `quantization_table` (@ref apply_quantization_table); or
-///         InvalidArgument from `CodecParams::validate` for a kept
-///         coefficient's step outside the codec's bounds, which core leaves
-///         to the codec, or for `codec.intra_period` other than 1 until the
-///         examples support P-frame records.
+///         InvalidArgument from `EncoderConfig::validate` for what core
+///         leaves to the codec: a kept coefficient's step outside its
+///         bounds, or a segment or update size past its longest.
 inline volumetric_kit::core::Result<volumetric_kit::recon::codec::EncoderConfig>
 encoder_config(const config::Codec& settings) {
   namespace codec = volumetric_kit::recon::codec;
-  // TODO(examples): C5b maps the period and writes record keys from FrameInfo.
-  if (settings.intra_period != 1) {
-    return volumetric_kit::core::Status::invalid_argument(
-        "codec.intra_period: only 1 is supported until the examples support "
-        "P-frame records");
-  }
   codec::EncoderConfig result;
   result.params.coefficient_count = settings.coefficient_count;
   result.params.quantization_scale = settings.quantization_scale;
   VKC_TRY(apply_quantization_table(
       result.params, quantization_name(settings.quantization_table)));
   result.segment_size = settings.segment_size;
-  VKC_TRY(result.params.validate());
+  if (settings.update_size != 0) result.update_size = settings.update_size;
+  result.intra_period = settings.intra_period;
+  VKC_TRY(result.validate());
   return result;
+}
+
+/// @return How @p config codes, as the codec examples print it: K, the
+///         quantization @p table and scale, the segment size, and the intra
+///         period, above 1 with the update size its P-frames use.
+inline std::string codec_settings(
+    const volumetric_kit::recon::codec::EncoderConfig& config,
+    config::QuantizationTable table) {
+  char text[128];
+  std::snprintf(text, sizeof text,
+                "K %u, table %s, scale %.6g; segments of %u blocks",
+                config.params.coefficient_count, quantization_name(table),
+                double(config.params.quantization_scale), config.segment_size);
+  const std::string settings = text;
+  if (config.intra_period == 1) return settings + "; every frame intra";
+  std::snprintf(text, sizeof text,
+                ", update segments of %u entries; an I-frame every %u frames",
+                config.update_size, config.intra_period);
+  return settings + text;
 }
 
 /// @return Where a codec stream writes besides its report: core's

@@ -53,6 +53,22 @@ inline std::vector<SweepConfig> sweep_configs() {
   return c;
 }
 
+/// @return The encoder settings sweep row @p cfg runs: @p base's, with
+///         @p cfg's coefficient count, scale and table, and an intra period
+///         of 1, since a row times repeated encodes of one grid, which a
+///         P-frame would code as skips; or InvalidArgument for an unknown
+///         table (@ref apply_quantization_table).
+inline vkc::Result<vr::codec::EncoderConfig> sweep_encoder_config(
+    const vr::codec::EncoderConfig& base, const SweepConfig& cfg) {
+  vr::codec::EncoderConfig ec = base;
+  ec.params = vr::codec::CodecParams{};
+  ec.params.coefficient_count = cfg.k;
+  ec.params.quantization_scale = cfg.scale;
+  VKC_TRY(apply_quantization_table(ec.params, cfg.family));
+  ec.intra_period = 1;
+  return ec;
+}
+
 /// @brief Run the sweep over @p source against @p reference (its mesh,
 ///        indexed once), and print the table.
 ///
@@ -67,8 +83,8 @@ inline std::vector<SweepConfig> sweep_configs() {
 /// counts the vertices past it -- floaters -- and `cov>r` the source
 /// vertices with no decoded surface within it -- holes.
 ///
-/// @param base    The command line's configuration: each row keeps its
-///                encoder's segment size, and sets the params.
+/// @param base    The scenario's configuration, which each row adapts
+///                (@ref sweep_encoder_config).
 /// @param player  The grid to decode into: a stream's player, already built
 ///                for this geometry (it grows if a frame needs it).
 inline vkc::Status run_codec_sweep(vkc::Device& device,
@@ -99,11 +115,8 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
       "acc max", "acc>r", "cov rms", "cov>r", "F", "enc ms", "dec ms",
       "enc gpu", "dec gpu");
   for (const SweepConfig& cfg : sweep_configs()) {
-    vr::codec::EncoderConfig ec = base;
-    ec.params = vr::codec::CodecParams{};
-    ec.params.coefficient_count = cfg.k;
-    ec.params.quantization_scale = cfg.scale;
-    VKC_TRY(apply_quantization_table(ec.params, cfg.family));
+    VKC_ASSIGN(const vr::codec::EncoderConfig ec,
+               sweep_encoder_config(base, cfg));
     VKC_ASSIGN(vr::codec::Encoder enc,
                vr::codec::Encoder::create(device, allocator, ec));
     VKC_ASSIGN(const Bytes warm, enc.encode(source));

@@ -277,8 +277,8 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   return 0;
 }
 
-// The golden frames: the device writes their pinned bytes, so every machine
-// writes the same frame, and reads them as the oracle does.
+// The golden frames, intra and P: the device writes their pinned bytes, so
+// every machine writes the same frame, and reads them as the oracle does.
 int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   for (const codec_frames::GoldenFrame& g : codec_frames::kGoldenFrames) {
     const vkc::Result<Bytes> bytes = device_write(
@@ -287,6 +287,17 @@ int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
     CHECK(bytes.value().size() == g.size);
     CHECK(vr_test::fnv1a(bytes.value()) == g.hash);
     CHECK(same_read(reader, bytes.value()) == 0);
+  }
+  for (const codec_frames::GoldenInterFrame& g :
+       codec_frames::kGoldenInterFrames) {
+    const oracle::Frame p = codec_frames::golden_inter_code(g).p;
+    CHECK(codec_frames::content_hash(p) == g.content);
+    const vkc::Result<Bytes> bytes =
+        device_write(writer, p, sizes(g.segment_size, g.update_size));
+    CHECK(bytes.ok());
+    CHECK(bytes.value().size() == g.size);
+    CHECK(vr_test::fnv1a(bytes.value()) == g.hash);
+    CHECK(same_read(reader, bytes.value(), &p.reference) == 0);
   }
   return 0;
 }

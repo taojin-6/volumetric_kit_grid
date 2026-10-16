@@ -152,7 +152,7 @@ if(program_name STREQUAL "codec_mesh")
     "open|\"height_m\":1.7,\"path\":\"open_%02d.obj\"},\"run\":{\"first\":1}}|source.allow_holes"
     "shell|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"shell_voxels\":5,\"path\":\"t_01.obj\"}}|shell_voxels"
     "codec_step|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"quantization_scale\":1e-30}}|CodecParams"
-    "intra_period|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"intra_period\":8}}|codec.intra_period"
+    "update_size|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"intra_period\":2,\"update_size\":1025}}|update_size 1025"
     "empty|\"height_m\":1.7,\"path\":\"empty.obj\"}}|empty.obj"
     "vertices|\"height_m\":1.7,\"path\":\"vertices.obj\"}}|vertices.obj"
     "flat|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"path\":\"flat.obj\"}}|zero extent along up"

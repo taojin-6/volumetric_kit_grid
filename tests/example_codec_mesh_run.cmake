@@ -4,8 +4,9 @@
 # codec_mesh on a device, in the order it works: the stream is made after the
 # GPU setup and before any frame is converted or written, so a rerun onto an
 # existing stream is refused with nothing converted, no PLY or CSV written and
-# the file left as it was. Then a two-frame run codes frames 1 and 2. Skips with
-# no Vulkan device unless VKC_REQUIRE_VULKAN_DEVICE is set.
+# the file left as it was. Then a two-frame run at a period of 2 codes frame 1
+# as an I-frame and frame 2 as a P-frame, and a single mesh has no bitrate.
+# Skips with no Vulkan device unless VKC_REQUIRE_VULKAN_DEVICE is set.
 
 file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${WORK_DIR}/out")
@@ -21,7 +22,7 @@ foreach(frame_apex "1;0.06" "2;0.08")
 endforeach()
 file(
   WRITE "${WORK_DIR}/run.json"
-  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_%02d.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"run\":{\"first\":1,\"frames\":2},\"fusion\":{\"voxel_size_m\":0.02},\"output\":{\"prefix\":\"out/run\",\"stream\":\"out/run.vrst\",\"csv\":\"out/run.csv\"}}\n"
+  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_%02d.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"run\":{\"first\":1,\"frames\":2},\"fusion\":{\"voxel_size_m\":0.02},\"codec\":{\"intra_period\":2,\"update_size\":16},\"output\":{\"prefix\":\"out/run\",\"stream\":\"out/run.vrst\",\"csv\":\"out/run.csv\"}}\n"
 )
 
 file(WRITE "${WORK_DIR}/out/run.vrst" "earlier")
@@ -58,6 +59,13 @@ execute_process(
 if(NOT result EQUAL 0 OR NOT output MATCHES "mesh: frames 1..2 of .*2 frame")
   message(FATAL_ERROR "The run failed: ${result}: ${output}${error}")
 endif()
+# The scenario's period and update size reach the encoder: frame 1 an I-frame,
+# frame 2 a P-frame on it, and the report a GOP's bitrate.
+if(NOT output MATCHES "update segments of 16 entries; an I-frame every 2 frames"
+   OR NOT output MATCHES "GOP of 2: [0-9.]+ Mbit/s"
+   OR NOT output MATCHES "1 I-frames: .*1 P-frames: ")
+  message(FATAL_ERROR "The period did not reach the encoder: ${output}")
+endif()
 if(NOT output MATCHES "Mbit/s at 30.0 coded frames/s")
   message(FATAL_ERROR "A sequence has a bitrate at 30 fps: ${output}")
 endif()
@@ -66,9 +74,9 @@ list(LENGTH rows count)
 list(GET rows 1 first)
 list(GET rows 2 second)
 if(NOT count EQUAL 3
-   OR NOT first MATCHES "^1,"
-   OR NOT second MATCHES "^2,")
-  message(FATAL_ERROR "Expected frames 1 and 2 in the CSV: ${rows}")
+   OR NOT first MATCHES "^1,I,"
+   OR NOT second MATCHES "^2,P,")
+  message(FATAL_ERROR "Expected I-frame 1 and P-frame 2 in the CSV: ${rows}")
 endif()
 # The Geometry track's params hold the transform: "VRMT", version 1.
 file(READ "${WORK_DIR}/out/run.vrst" stream HEX)

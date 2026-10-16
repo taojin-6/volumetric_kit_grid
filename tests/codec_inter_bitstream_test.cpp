@@ -5,7 +5,8 @@
 // through the CPU oracle (codec_oracle.hpp) that pins its bytes: the
 // reference hash's known answers; the worked example, built by hand, read and
 // written byte for byte; round trips of every mode across K, update and
-// segment sizes and the empty cases; I -> P -> P chains on real hashes against
+// segment sizes and the empty cases; the golden P-frames' pinned bytes;
+// I -> P -> P chains on real hashes against
 // an independent model (codec_frames.hpp); every reader refusal, each one
 // edit from a valid P-frame, with its code and message, in the order of the
 // reader's stages; every writer refusal, with its code and message; and
@@ -27,6 +28,7 @@
 #include "codec_frames.hpp"
 #include "codec_oracle.hpp"
 #include "codec_oracle_rans.hpp"
+#include "fnv1a.hpp"
 #include "frame_hash.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
@@ -323,6 +325,43 @@ int round_trip_case() {
               static_cast<unsigned long long>(seen[3]));
   for (std::size_t mode = 0; mode < 4; ++mode) CHECK(seen[mode] > 0);
   CHECK(seen[4] == 0);
+  return 0;
+}
+
+// The golden P-frames' bytes (codec_frames.hpp), which pin type 1 -- and,
+// through each REFERENCE, frame_hash -- as the golden frames pin type 0: a
+// writer and a reader changed together still round-trip, but no longer
+// write these. Each row holds every mode and new blocks, and the second a
+// partial last segment of each kind.
+int golden_case() {
+  for (const codec_frames::GoldenInterFrame& g :
+       codec_frames::kGoldenInterFrames) {
+    const codec_frames::InterCode c = codec_frames::golden_inter_code(g);
+    Bytes bytes;
+    CHECK(round_trip(c.reference, c.target, c.p,
+                     sizes(g.segment_size, g.update_size), &bytes) == 0);
+    const std::uint32_t content = codec_frames::content_hash(c.p);
+    const std::uint32_t hash = vr_test::fnv1a(bytes);
+    if (content != g.content || bytes.size() != g.size || hash != g.hash) {
+      std::fprintf(stderr,
+                   "%s, R %u, U %u: content 0x%08xu, %zu bytes, hash "
+                   "0x%08xu\n",
+                   c.what.c_str(), g.segment_size, g.update_size, content,
+                   bytes.size(), hash);
+    }
+    CHECK(content == g.content);
+    CHECK(bytes.size() == g.size);
+    CHECK(hash == g.hash);
+    std::size_t seen[5] = {};
+    for (const d::BlockMode mode : c.p.modes) ++seen[std::size_t(mode)];
+    for (std::size_t mode = 0; mode < 4; ++mode) CHECK(seen[mode] > 0);
+    CHECK(c.p.coords.size() == g.added && g.added > 0);
+  }
+  const codec_frames::GoldenInterFrame& partial =
+      codec_frames::kGoldenInterFrames[1];
+  const codec_frames::InterCode c = codec_frames::golden_inter_code(partial);
+  CHECK(c.p.modes.size() % partial.update_size != 0);
+  CHECK(c.p.coords.size() % partial.segment_size != 0);
   return 0;
 }
 
@@ -691,6 +730,7 @@ int main() {
   if (hash_case() != 0) return 1;
   if (worked_example_case() != 0) return 1;
   if (round_trip_case() != 0) return 1;
+  if (golden_case() != 0) return 1;
   if (chain_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   if (writer_refusals_case() != 0) return 1;

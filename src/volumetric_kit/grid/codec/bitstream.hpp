@@ -62,17 +62,16 @@
 /// version 1 sent a partial mask as 64 bytes through one table and a sign as
 /// a field of its own.
 ///
-/// **P-frames** (type 1, experimental: its bytes may change until golden
-/// P-frames freeze it) code a frame against its reference, the frame decoded
-/// before it, named by @ref frame_hash of the reference's exact bytes
-/// (@ref FrameReference). A P-frame adds a REFERENCE section (id 4), required
-/// on type 1 and refused on type 0, whose 20-byte body is {u64 hash, u32 M,
-/// the reference's block count, u32 U, reference entries per update segment
-/// (from 1 to the same limit as R), u32 A, new blocks}. N stays the decoded
-/// frame's block count:
-/// the reference blocks that survive plus the A new ones, so
-/// A <= N <= M + A, and M + A < 2^32, since stream positions are u32. R
-/// counts new blocks per segment.
+/// **P-frames** (type 1, experimental: its bytes may change until it is
+/// frozen, the 2026-10-16 decision) code a frame against its reference, the
+/// frame decoded before it, named by @ref frame_hash of the reference's exact
+/// bytes (@ref FrameReference). A P-frame adds a REFERENCE section (id 4),
+/// required on type 1 and refused on type 0, whose 20-byte body is {u64 hash,
+/// u32 M, the reference's block count, u32 U, reference entries per update
+/// segment (from 1 to the same limit as R), u32 A, new blocks}. N stays the
+/// decoded frame's block count: the reference blocks that survive plus the A
+/// new ones, so A <= N <= M + A, and M + A < 2^32, since stream positions are
+/// u32. R counts new blocks per segment.
 ///
 /// `frame_segment_count(M, U)` update segments come first, then
 /// `frame_segment_count(A, R)` new-block segments, their lengths in SEGMENTS
@@ -149,8 +148,8 @@ inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// Blocks per segment by default: @ref EncoderConfig::segment_size's, whose
 /// doc gives its cost.
 inline constexpr std::uint32_t kDefaultSegmentSize = 64;
-/// A P-frame's reference entries per update segment unless the writer is
-/// told otherwise.
+/// A P-frame's reference entries per update segment by default:
+/// @ref EncoderConfig::update_size's, whose doc gives its cost.
 inline constexpr std::uint32_t kDefaultUpdateSize = 64;
 /// The most segments a frame holds: SEGMENTS' u32 length bounds it.
 inline constexpr std::uint64_t kMaxFrameSegments =

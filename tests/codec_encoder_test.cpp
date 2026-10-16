@@ -5,10 +5,11 @@
 // the CPU oracle's -- its blocks sorted on the host -- blocks at int32's
 // extremes included, and independent of the order the hash table holds the
 // blocks in; blocks with no observed voxel are left out; its stage rows; its
-// refusals (a segment longer than the format allows and an intra period of 0
-// among them) and its moves; and its frame types -- an I-frame first, every
-// period, after force_intra(), on a geometry change and after a frame of no
-// blocks, a P-frame otherwise -- a refusal keeping the reference and the
+// refusals (a segment or update segment longer than the format allows and an
+// intra period of 0 among them, each as EncoderConfig::validate refuses it)
+// and its moves; and its frame types -- an I-frame first, every period,
+// after force_intra(), on a geometry change, for a grid of no blocks and
+// after one, a P-frame otherwise -- a refusal keeping the reference and the
 // period's count, and a chain repeated by a fresh encoder. Decoding is
 // codec_decoder_test's, and a P-frame's bytes codec_inter_test's. Skips with
 // no device.
@@ -291,23 +292,36 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
+// What EncoderConfig::validate refuses, create refuses, with the same
+// message, naming the field: a segment or update size of 0 or one the
+// Decoder cannot decode, and the longest it can accepted, for either.
+int sizes_case(Gpu& gpu) {
+  const std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
+  for (const bool update : {false, true}) {
+    const char* name = update ? "update_size " : "segment_size ";
+    for (const std::uint32_t size : {0u, kLongest + 1, kLongest}) {
+      codec::EncoderConfig config;
+      (update ? config.update_size : config.segment_size) = size;
+      const vkc::Status checked = config.validate();
+      const vkc::Result<codec::Encoder> made =
+          codec::Encoder::create(gpu.device, gpu.allocator, config);
+      CHECK(checked.ok() == made.ok());
+      if (size == kLongest) {
+        CHECK(checked.ok());
+        continue;
+      }
+      CHECK(checked.domain() == vkc::Status::Code::InvalidArgument &&
+            made.status().message() == checked.message());
+      CHECK(checked.message().find(name + std::to_string(size)) !=
+            std::string::npos);
+    }
+  }
+  CHECK(codec::EncoderConfig{}.validate().ok());
+  return 0;
+}
+
 int refusals_case(Gpu& gpu) {
   codec::EncoderConfig bad;
-  bad.segment_size = 0;
-  CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
-  // Segments the Decoder cannot decode; the longest it can is accepted.
-  bad.segment_size = codec::kMaxDeviceDecodeSegmentSize + 1;
-  const vkc::Result<codec::Encoder> long_segments =
-      codec::Encoder::create(gpu.device, gpu.allocator, bad);
-  CHECK(!long_segments.ok() &&
-        long_segments.status().domain() == vkc::Status::Code::InvalidArgument &&
-        long_segments.status().message().find(
-            "segment_size " +
-            std::to_string(codec::kMaxDeviceDecodeSegmentSize + 1)) !=
-            std::string::npos);
-  bad.segment_size = codec::kMaxDeviceDecodeSegmentSize;
-  CHECK(codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
-  bad = codec::EncoderConfig{};
   bad.params.coefficient_count = 0;
   CHECK(!codec::Encoder::create(gpu.device, gpu.allocator, bad).ok());
   bad = codec::EncoderConfig{};
@@ -397,9 +411,9 @@ int period_case(Gpu& gpu) {
 
 // Each rule that makes an I-frame, at a period of 3: the first frame, the
 // period, force_intra(), a grid of another voxel size or of another
-// trunc_dist alone -- and the grid after each, against that one -- and a
-// reference of no blocks; a P-frame otherwise, costing the same rows as an
-// I-frame.
+// trunc_dist alone -- and the grid after each, against that one -- a grid of
+// no blocks after one of some, and a reference of no blocks, whatever the
+// grid; a P-frame otherwise, costing the same rows as an I-frame.
 int intra_rules_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;
@@ -437,8 +451,9 @@ int intra_rules_case(Gpu& gpu) {
       {&a.value(), false, I},      // and back
       {&w.value(), false, I},      // another trunc_dist
       {&a.value(), false, I},      // and back
-      {&empty.value(), false, P},  // every block removed
-      {&a.value(), false, I},      // a reference of no blocks
+      {&empty.value(), false, I},  // a grid of no blocks
+      {&empty.value(), false, I},  // a reference of no blocks
+      {&a.value(), false, I},      // and a grid of some
       {&b.value(), false, P},      //
   };
   int i = 0;
@@ -542,6 +557,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (device_list_case(gpu, enc) != 0) return 1;
   if (oracle_case(gpu) != 0) return 1;
   if (extremes_case(gpu, enc) != 0) return 1;
+  if (sizes_case(gpu) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;
   if (period_case(gpu) != 0) return 1;

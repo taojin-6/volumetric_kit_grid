@@ -985,8 +985,8 @@ struct Coded {
 
 // Encode @p grid with @p enc and hold the bytes to the oracle's: an I-frame
 // to the oracle's intra frame of the grid, a P-frame to the oracle's writer
-// over encoder_frame against the chain's last frame, at U =
-// kDefaultUpdateSize. Appends the frame to @p chain.
+// over encoder_frame against the chain's last frame, at @p config's sizes.
+// Appends the frame to @p chain.
 int encode_checked(Gpu& gpu, codec::Encoder& enc,
                    const codec::EncoderConfig& config,
                    vol::VoxelBlockGrid& grid, std::vector<Coded>& chain) {
@@ -1005,7 +1005,7 @@ int encode_checked(Gpu& gpu, codec::Encoder& enc,
     const Coded& prev = chain.back();
     oracle::FrameWriteOptions options;
     options.segment_size = config.segment_size;
-    options.update_size = d::kDefaultUpdateSize;
+    options.update_size = config.update_size;
     vkc::Result<Bytes> want = oracle::write_frame(
         codec_frames::encoder_frame(reference_of(prev.sent), prev.content,
                                     content.value()),
@@ -1040,10 +1040,10 @@ codec::FrameType type_of(const Bytes& frame) {
 }
 
 // A sphere that moves and grows beside one that stays: chains at period 4
-// and open-ended, at an odd K in segments of 3 and at the defaults, every
-// frame the oracle's bytes, every P-frame decoding to its I-frame's grid;
-// and among the P-frames every mode the encoder chooses but motion, and new
-// blocks.
+// and open-ended, at an odd K in segments of 3 and update segments of 5 and
+// at the defaults, every frame the oracle's bytes, every P-frame decoding to
+// its I-frame's grid; and among the P-frames every mode the encoder chooses
+// but motion, and new blocks.
 int encoder_chain_case(Gpu& gpu) {
   for (const std::uint32_t period : {4u, ~0u}) {
     for (const bool odd : {true, false}) {
@@ -1052,6 +1052,7 @@ int encoder_chain_case(Gpu& gpu) {
       if (odd) {
         config.params.coefficient_count = 37;
         config.segment_size = 3;
+        config.update_size = 5;
       }
       vkc::Result<codec::Encoder> enc =
           codec::Encoder::create(gpu.device, gpu.allocator, config);
@@ -1157,10 +1158,11 @@ vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
 
 // What the diff chooses, each from one edit of a reference frame: an
 // unchanged grid all skip; one block changed, one entry that is not; a mask
-// changed alone, keep with residuals of 0; a block gone and one added; an
-// empty grid, every entry removed, and the frame after it an I-frame; and
-// new content against unrelated content zero, a small change keep. Every
-// frame is the oracle's, and the prices agree.
+// changed alone, keep with residuals of 0; a block gone and one added; new
+// content against unrelated content zero, a small change keep; and an empty
+// grid an I-frame, smaller than the P-frame removing every entry, and the
+// frame after it an I-frame too. Every frame is the oracle's, and the prices
+// agree.
 int diff_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 1000;
@@ -1254,14 +1256,25 @@ int diff_case(Gpu& gpu) {
   CHECK(mode_of.at(vr::Vec3i(0, 2, 0)) == d::BlockMode::kZero);
   CHECK(mode_of.at(vr::Vec3i(-4, 1, 7)) == d::BlockMode::kKeep);
 
-  // Every block gone: N = 0, all removed; then M = 0, so an I-frame.
-  CHECK(next(Content{}, p));
-  CHECK(count(p, d::BlockMode::kRemove) == p.modes.size() && p.coords.empty() &&
-        !p.modes.empty());
-  CHECK(
-      codec::read_frame_info(chain.back().sent.data(), chain.back().sent.size())
-          .value()
-          .block_count == 0);
+  // Every block gone: an I-frame of no blocks, where a P-frame would remove
+  // every entry; then, on that empty reference, an I-frame again.
+  vkc::Result<vol::VoxelBlockGrid> none = content_grid(gpu, Content{});
+  CHECK(none.ok());
+  CHECK(encode_checked(gpu, enc, config, none.value(), chain) == 0);
+  const Coded& empty = chain.back();
+  CHECK(type_of(empty.sent) == codec::FrameType::kIntra);
+  CHECK(codec::read_frame_info(empty.sent.data(), empty.sent.size())
+            .value()
+            .block_count == 0);
+  const Coded& last = chain[chain.size() - 2];
+  oracle::FrameWriteOptions options;
+  options.segment_size = config.segment_size;
+  options.update_size = config.update_size;
+  const vkc::Result<Bytes> removing = oracle::write_frame(
+      codec_frames::encoder_frame(reference_of(last.sent), last.content,
+                                  empty.content),
+      options);
+  CHECK(removing.ok() && empty.sent.size() < removing.value().size());
   vkc::Result<vol::VoxelBlockGrid> again = content_grid(gpu, base);
   CHECK(again.ok());
   CHECK(encode_checked(gpu, enc, config, again.value(), chain) == 0);
