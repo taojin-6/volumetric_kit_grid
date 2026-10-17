@@ -26,7 +26,7 @@ namespace volumetric_kit::recon::mesh {
 /// is byte-identical to this POD (position @0, normal @12, tangent @24,
 /// uv0 @40, color @48, 64 B), so the host reads the vertex buffer back with a
 /// plain `memcpy` -- the same one-struct-across-CPU/GLSL discipline the volume
-/// tier applies to @ref volume::HashEntry (the 2026-07-05 ABI). The
+/// tier applies to @ref volume::BlockIndex (the 2026-07-05 ABI). The
 /// `static_assert`s below pin the host packing; the GLSL mirror keeps its
 /// `layout(scalar)` definition in lockstep.
 ///

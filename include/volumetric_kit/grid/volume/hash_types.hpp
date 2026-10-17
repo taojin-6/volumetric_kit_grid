@@ -10,19 +10,8 @@
 /// `static_assert`'d sizes and offsets. `BlockIndex` and `BlockStamp` cross
 /// the host/device boundary -- a compacted list, a coordinate list a caller
 /// uploads, the stamps read back -- so a layout drift there is a silent
-/// corruption bug, made a compile error on the host side. `HashEntry` never
-/// reaches the host: it documents the device table's layout, which
-/// `volume/shaders/hash_common.glsl` mirrors, and sizes
-/// @ref VoxelHashMap::entries_buffer_size.
-///
-/// The layout here is the C/CUDA layout (a bare `Vec3i` packs to 12 B, so
-/// `HashEntry` is 20 B with `pos` at offset 4). The GLSL side reads these via
-/// **scalar block layout** (`GL_EXT_scalar_block_layout`; Vulkan 1.2 core,
-/// MoltenVK-supported), under which the shader struct is byte-identical to this
-/// one. A naive `std430` block does *not* match -- `std430` 16-byte-aligns a
-/// three-component vector, placing `pos` at offset 16 and spanning 32 B. The
-/// `static_assert`s below guard only the host side; the shader keeps its
-/// `layout(scalar)` definition in lockstep (see the gotchas in DESIGN.md).
+/// corruption bug, made a compile error on the host side. The shaders read
+/// them through scalar block layout, not `std430` (the gotchas in DESIGN.md).
 ///
 /// The sparse-hashing scheme (a hash table of block coordinates into a heap of
 /// fixed-size voxel blocks) keeps memory proportional to the observed surface
@@ -36,17 +25,6 @@
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 
 namespace volumetric_kit::recon::volume {
-
-/// Hash-table entry -- one per slot in the table.
-struct HashEntry {
-  std::int32_t ptr;     ///< Voxel-block pointer, or an allocated/free flag.
-  Vec3i pos;            ///< Block coordinate (signed, 32-bit per axis).
-  std::int32_t offset;  ///< Collision offset for linked-list chaining.
-};
-static_assert(sizeof(HashEntry) == 20, "HashEntry must be 20 bytes");
-static_assert(offsetof(HashEntry, ptr) == 0, "HashEntry layout drift");
-static_assert(offsetof(HashEntry, pos) == 4, "HashEntry layout drift");
-static_assert(offsetof(HashEntry, offset) == 16, "HashEntry layout drift");
 
 /// Active-block reference used in compacted block lists.
 struct BlockIndex {

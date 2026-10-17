@@ -16,6 +16,8 @@
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
+#include "hash.hpp"
+
 namespace volumetric_kit::recon::volume {
 
 /// The map's grid-sized buffers, in bytes, for one grid.

@@ -1172,9 +1172,8 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   //
   // Bound with its real size rather than VK_WHOLE_SIZE, and range-checked: this
   // is the one binding in the extract whose buffer ANOTHER tier sized
-  // (num_buckets * bucket_size * sizeof(HashEntry), doubled by every
-  // VoxelHashMap::resize), so the mesh tier cannot reason about it the way it
-  // does about its own arena.
+  // (an entry a slot, doubled by every VoxelHashMap::resize), so the mesh tier
+  // cannot reason about it the way it does about its own arena.
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
   VKC_TRY(core::check_storage_buffer_range(
       (std::string(entry) + ": hash entries").c_str(), entries_bytes,

@@ -3,12 +3,12 @@
 
 # --- recon_volume: Tier 2 ---------------------------------------------------
 # The sparse voxel hash map: the POD data model (hash_types.hpp,
-# voxel_grid.hpp), the host coordinate/hash math (voxel_coords.hpp, hash.hpp),
-# and the host VoxelHashMap that owns the device buffers + compute pipelines and
-# dispatches the GLSL hash kernels (init / allocate-from-coords / compact). Now
-# a compiled STATIC library (was header-only) since VoxelHashMap + its embedded
-# shaders landed. Depends only on recon_core, per the strict left-to-right tier
-# rule.
+# voxel_grid.hpp), the host coordinate math (voxel_coords.hpp), and the host
+# VoxelHashMap that owns the device buffers + compute pipelines and dispatches
+# the GLSL hash kernels (init / allocate-from-coords / compact). The table's
+# internal layout (hash.hpp) stays under src/. Now a compiled STATIC library
+# (was header-only) since VoxelHashMap + its embedded shaders landed. Depends
+# only on recon_core, per the strict left-to-right tier rule.
 include(GenerateExportHeader)
 include(GNUInstallDirs)
 

@@ -112,7 +112,7 @@ struct DeviceBlockList {
 /// Built on the `core` compute foundation (`Allocator`, `Buffer`,
 /// `ComputePipeline`, `Device::submit_single_time`). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
-/// the host @ref HashEntry / @ref BlockIndex and their shader mirrors agree
+/// the host @ref BlockIndex / @ref BlockStamp and their shader mirrors agree
 /// byte-for-byte. Covers init, allocate-from-coords / -depth / -triangles,
 /// remove, compact / compact-in-frusta, and an **index-preserving**
 /// @ref resize (the GPU rehash that keeps each block's `ptr`).
@@ -451,10 +451,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// neighbourhood of N blocks otherwise pays an O(N) serial host pass of
   /// coordinate lookups plus an upload -- 102 ms of a 133 ms mesh extract at
   /// 107k blocks, measured on an M5 iPad Pro -- to hand the GPU a table it
-  /// could have built itself in parallel. `volume/shaders/hash_lookup.glsl` is
-  /// the read-only traversal to bind this with; it mirrors `find_block` and
-  /// takes the table shape (`num_buckets` / `bucket_size` / `max_chain`) as
-  /// arguments.
+  /// could have built itself in parallel. It is for recon's own kernels: the
+  /// entry layout and the GLSL that reads it are internal
+  /// (`volume/shaders/hash_lookup.glsl` is the read-only traversal, mirroring
+  /// `find_block` and taking the table shape as arguments).
   ///
   /// @warning Read-only, and only safe while **nothing is mutating the table**
   /// --
@@ -478,10 +478,10 @@ class VR_VOLUME_API VoxelHashMap {
   ///
   /// Pair it with @ref entries_buffer: bind the range rather than
   /// `VK_WHOLE_SIZE` so the consumer can check it against the device's
-  /// `maxStorageBufferRange` first. That limit matters here -- the table is
-  /// `num_buckets * bucket_size * sizeof(HashEntry)` and @ref resize doubles
-  /// `num_buckets`, while Vulkan guarantees only 2^27 (128 MiB), which is what
-  /// Android-class drivers report and no driver this repo tests on does.
+  /// `maxStorageBufferRange` first. That limit matters here -- the table holds
+  /// an entry a slot and @ref resize doubles `num_buckets`, while Vulkan
+  /// guarantees only 2^27 (128 MiB), which is what Android-class drivers
+  /// report and no driver this repo tests on does.
   /// @return The size in bytes, or 0 on a moved-from map (so the pair stays
   ///         consistent: a null handle never carries a non-zero range).
   VkDeviceSize entries_buffer_size() const noexcept;
@@ -639,13 +639,13 @@ class VR_VOLUME_API VoxelHashMap {
   bool holds(const DeviceBlockList& list) const noexcept;
 
   /// Record what @p dispatches records each round, re-dispatching while the
-  /// shared `fail_counts_[kFailTotal]` tally is
+  /// shared `fail_counts_` tally's retryable slot is
   /// non-zero, to converge past transient same-bucket lock contention, until
   /// only capacity failures are left, a capacity limit stops progress, or the
   /// rounds run out. Re-zeroes the tally
   /// each round. The shared tail of every allocate/remove kernel.
-  /// Non-retryable failures (`kFailTerminal`) are accumulated across rounds and
-  /// added to the returned count; @p out_failures, when non-null, receives the
+  /// The tally's non-retryable slot is accumulated across rounds and added to
+  /// the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
   /// A dispatch given a stage collects one span per round; they accumulate
   /// under its one label, which is the honest total for a frame that genuinely
