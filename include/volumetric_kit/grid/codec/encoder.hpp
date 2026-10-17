@@ -38,14 +38,17 @@ struct VR_CODEC_API EncoderConfig {
   /// a little more size (each segment restates its first coordinate); the
   /// default costs 2-3% of a frame.
   std::uint32_t segment_size = 64;
-  /// A P-frame's reference entries per independently coded update segment,
-  /// from 1 to @ref kMaxDeviceDecodeSegmentSize: as @ref segment_size is for
-  /// its new blocks, smaller segments give the device more parallelism, at a
-  /// little more size (each segment costs a 4-byte length and its stream's
-  /// 4-byte final state); 256 would save about 4% of a stream at a period of
-  /// 30 and code its P-frames 20-140% slower (the 2026-10-16 decision). An
-  /// I-frame has no update segments.
-  std::uint32_t update_size = 64;
+  /// A P-frame's reference entries per independently coded update segment:
+  /// 0, the default, takes @ref segment_size, which gives a P-frame at least
+  /// as many segments as its reference has coded intra, at any segment size
+  /// (the 2026-10-17 decision); otherwise 1 to
+  /// @ref kMaxDeviceDecodeSegmentSize. As @ref segment_size is for its new
+  /// blocks, smaller segments give the device more parallelism, at a little
+  /// more size (each segment costs a 4-byte length and its stream's 4-byte
+  /// final state); at a @ref segment_size of 64, 256 against 64 would save
+  /// about 4% of a stream at a period of 30 and code its P-frames 20-140%
+  /// slower (the 2026-10-16 decision). An I-frame has no update segments.
+  std::uint32_t update_size = 0;
   /// Frames from one I-frame to the next, at least 1. At 1, the default,
   /// every frame is an I-frame; at N, an I-frame and N - 1 P-frames
   /// (@ref FrameType::kInter, experimental) take turns; a period past the
@@ -53,13 +56,20 @@ struct VR_CODEC_API EncoderConfig {
   /// the rules on @ref Encoder::encode allow.
   std::uint32_t intra_period = 1;
 
+  /// @brief The update segment size a P-frame of this config codes with.
+  /// @return @ref update_size, or @ref segment_size when @ref update_size is
+  ///         0: what @ref validate checks and @ref Encoder::create keeps.
+  constexpr std::uint32_t resolved_update_size() const noexcept {
+    return update_size != 0 ? update_size : segment_size;
+  }
+
   /// @brief Check every field against what the @ref Encoder takes: what
   ///        @ref Encoder::create checks first, and what a caller checks
   ///        before any GPU work.
   /// @return OK, or `Status::invalid_argument` naming the field: invalid
-  ///         @ref params (@ref CodecParams::validate), a @ref segment_size or
-  ///         @ref update_size of 0 or past @ref kMaxDeviceDecodeSegmentSize,
-  ///         or an @ref intra_period of 0.
+  ///         @ref params (@ref CodecParams::validate), a @ref segment_size of
+  ///         0, a @ref segment_size or nonzero @ref update_size past
+  ///         @ref kMaxDeviceDecodeSegmentSize, or an @ref intra_period of 0.
   core::Status validate() const;
 };
 

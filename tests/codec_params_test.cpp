@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Host-only tests for the codec tier: CodecParams validation, and the two
-// tables the DCT is defined by. CPU-only, so these always run.
+// Host-only tests for the codec tier: CodecParams validation, EncoderConfig's
+// sizes, and the two tables the DCT is defined by. CPU-only, so these always
+// run.
 //
 // The tables get independent checks because the GPU test's reference is BUILT
 // from them: a wrong zigzag order or basis would be reproduced by both sides of
@@ -15,12 +16,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <string>
 
 #include "dct_tables.hpp"
 #include "fnv1a.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/recon/codec/encoder.hpp"
 
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 using codec::kVoxelsPerBlock;
 using codec::detail::kBasisSize;
@@ -115,6 +119,55 @@ int params_validate_case() {
   return 0;
 }
 
+// EncoderConfig's sizes: an update size of 0, the default, takes the segment
+// size, whatever it is; a nonzero one wins; and validate names the field it
+// refuses, the segment size first.
+int encoder_sizes_case() {
+  // The default config's P-frames keep their update segments of 64.
+  static_assert(codec::EncoderConfig{}.resolved_update_size() == 64,
+                "the default config's update size is 64");
+  const std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
+  for (const std::uint32_t r : {1u, 16u, 64u, kLongest}) {
+    codec::EncoderConfig config;
+    config.segment_size = r;
+    CHECK(config.update_size == 0);
+    CHECK(config.resolved_update_size() == r);
+    CHECK(config.validate().ok());
+  }
+  codec::EncoderConfig config;
+  config.segment_size = 16;
+  for (const std::uint32_t u : {1u, 5u, 64u, kLongest}) {
+    config.update_size = u;
+    CHECK(config.resolved_update_size() == u);
+    CHECK(config.validate().ok());
+  }
+  config.segment_size = kLongest;
+  config.update_size = 1;
+  CHECK(config.resolved_update_size() == 1);
+  CHECK(config.validate().ok());
+
+  struct Refusal {
+    std::uint32_t r;
+    std::uint32_t u;
+    std::string named;
+  };
+  const std::string over = std::to_string(kLongest + 1);
+  for (const Refusal& c : {Refusal{16, kLongest + 1, "update_size " + over},
+                           Refusal{0, 0, "segment_size 0"},
+                           Refusal{kLongest + 1, 0, "segment_size " + over}}) {
+    codec::EncoderConfig bad;
+    bad.segment_size = c.r;
+    bad.update_size = c.u;
+    const vkc::Status s = bad.validate();
+    CHECK(s.domain() == vkc::Status::Code::InvalidArgument);
+    CHECK(s.message().find("EncoderConfig: " + c.named + " is not in [1, " +
+                           std::to_string(kLongest) + "]") !=
+          std::string::npos);
+    CHECK(c.u != 0 || s.message().find("update_size") == std::string::npos);
+  }
+  return 0;
+}
+
 int basis_case() {
   const std::array<double, kBasisSize> b = codec::detail::dct_basis<double>();
   // Orthonormal: B * B^T = I.
@@ -189,8 +242,9 @@ int zigzag_case() {
 
 int main() {
   if (params_validate_case() != 0) return 1;
+  if (encoder_sizes_case() != 0) return 1;
   if (basis_case() != 0) return 1;
   if (zigzag_case() != 0) return 1;
-  std::printf("codec params + tables: OK\n");
+  std::printf("codec params, encoder sizes + tables: OK\n");
   return 0;
 }

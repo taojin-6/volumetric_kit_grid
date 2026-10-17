@@ -148,9 +148,6 @@ inline constexpr std::uint16_t kSectionKnownFlags = kSectionRequired;
 /// Blocks per segment by default: @ref EncoderConfig::segment_size's, whose
 /// doc gives its cost.
 inline constexpr std::uint32_t kDefaultSegmentSize = 64;
-/// A P-frame's reference entries per update segment by default:
-/// @ref EncoderConfig::update_size's, whose doc gives its cost.
-inline constexpr std::uint32_t kDefaultUpdateSize = 64;
 /// The most segments a frame holds: SEGMENTS' u32 length bounds it.
 inline constexpr std::uint64_t kMaxFrameSegments =
     std::numeric_limits<std::uint32_t>::max() / 4;
