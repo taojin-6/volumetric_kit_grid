@@ -76,6 +76,11 @@ static_assert(std::is_trivially_copyable_v<VoxelGridParams>,
 static_assert(std::is_standard_layout_v<VoxelGridParams>,
               "VoxelGridParams must be standard-layout");
 
+/// A default `bucket_size`: hash entries per bucket. Callers may choose others.
+inline constexpr std::int32_t kDefaultBucketSize = 8;
+/// A default `max_chain`: longest collision chain. Callers may choose others.
+inline constexpr std::int32_t kDefaultMaxChain = 128;
+
 inline core::Status VoxelGridParams::validate() const {
   // Positivity alone admits infinity; <= 0 alone also admits NaN. Neither can
   // reach the coordinate math or the float-to-int truncation-radius conversion.

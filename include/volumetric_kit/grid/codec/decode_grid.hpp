@@ -23,10 +23,10 @@ namespace volumetric_kit::recon::codec {
 ///
 /// The grid is what @ref Decoder::decode takes: the frame's `voxel_size` and
 /// `trunc_dist` (@ref read_frame_info), 8^3-voxel blocks, and 4-byte float
-/// `tsdf` and `weight` alone. Its blocks hash into buckets of 8 entries, a
-/// heap slot each, with chains of up to 128, and it has
-/// `ceil(2 * block_count / 8)` buckets, at least 1024: the frame fills at
-/// most half its heap.
+/// `tsdf` and `weight` alone. Its hash table has the default layout
+/// (@ref volume::kDefaultBucketSize, @ref volume::kDefaultMaxChain), a heap
+/// slot per entry, and `ceil(2 * block_count / kDefaultBucketSize)` buckets,
+/// at least 1024: the frame fills at most half its heap.
 /// @param device     The compute device (must outlive the grid).
 /// @param allocator  The allocator its buffers come from (must outlive the
 ///                   grid).

@@ -3,14 +3,15 @@
 
 // Coordinate-math tests for the sparse voxel grid: world <-> voxel <-> block
 // round-trips, the negative-coordinate block-indexing bias (the subtle part),
-// round-half-to-even tie-breaking, the truncation-band width, and params
-// validation (including the NaN floats an `x <= 0` guard would admit). Pure
-// host math -- no device -- so it always runs.
+// round-half-to-even tie-breaking, the truncation-band width, params
+// validation (including the NaN floats an `x <= 0` guard would admit), and the
+// default hash layout. Pure host math -- no device -- so it always runs.
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <type_traits>
 
 #include "test_check.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -109,6 +110,20 @@ int main() {
   bad = grid;
   bad.voxels_per_block = 511;  // != 8^3, a stale precomputed value.
   CHECK(!bad.validate().ok());
+
+  // --- The default hash layout, pinned: a change is deliberate. It validates;
+  // the params keep no member defaults, so a zero-initialised set stays
+  // refused.
+  static_assert(vol::kDefaultBucketSize == 8 && vol::kDefaultMaxChain == 128,
+                "the default hash layout");
+  static_assert(std::is_trivially_default_constructible_v<vol::VoxelGridParams>,
+                "VoxelGridParams keeps no member defaults");
+  vol::VoxelGridParams layout = grid;
+  layout.bucket_size = vol::kDefaultBucketSize;
+  layout.num_blocks = vol::kDefaultBucketSize * layout.num_buckets;
+  layout.max_chain = vol::kDefaultMaxChain;
+  CHECK(layout.validate().ok());
+  CHECK(!vol::VoxelGridParams{}.validate().ok());
 
   // --- validate() must not be defeated by the arithmetic it validates with.
   // Each of these passed before the products were bounded/widened, and each
