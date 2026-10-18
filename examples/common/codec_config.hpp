@@ -32,9 +32,7 @@ inline const char* quantization_name(config::QuantizationTable table) {
   return "unknown";
 }
 
-/// @return Runtime encoder settings: core's values, a `codec.update_size`
-///         of 0 (core's default, and all it admits at an intra period of 1)
-///         being the encoder's own, and the weights of its
+/// @return Runtime encoder settings: core's values, and the weights of its
 ///         `quantization_table` (@ref apply_quantization_table); or
 ///         InvalidArgument from `EncoderConfig::validate` for what core
 ///         leaves to the codec: a kept coefficient's step outside its
@@ -48,7 +46,7 @@ encoder_config(const config::Codec& settings) {
   VKC_TRY(apply_quantization_table(
       result.params, quantization_name(settings.quantization_table)));
   result.segment_size = settings.segment_size;
-  if (settings.update_size != 0) result.update_size = settings.update_size;
+  result.update_size = settings.update_size;
   result.intra_period = settings.intra_period;
   VKC_TRY(result.validate());
   return result;
@@ -69,7 +67,7 @@ inline std::string codec_settings(
   if (config.intra_period == 1) return settings + "; every frame intra";
   std::snprintf(text, sizeof text,
                 ", update segments of %u entries; an I-frame every %u frames",
-                config.update_size, config.intra_period);
+                config.resolved_update_size(), config.intra_period);
   return settings + text;
 }
 

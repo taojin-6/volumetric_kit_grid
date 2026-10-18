@@ -12,7 +12,8 @@
 // than the format allows refused, every refusal and failure leaving the
 // reference as it was, and the device buffers grown and shrunk frame to
 // frame. Encoding: every frame of the Encoder's chains the CPU oracle's
-// bytes, its P-frames priced as the oracle prices them; each of the diff's
+// bytes, its P-frames priced as the oracle prices them and coded in update
+// segments of the segment size, or of an update size set; each of the diff's
 // choices from one edit of a frame; a difference of 32768 coded zero, in
 // either half of a coefficient word; and the diff's refusals. Internal
 // headers by include path; skips with no device.
@@ -1005,7 +1006,7 @@ int encode_checked(Gpu& gpu, codec::Encoder& enc,
     const Coded& prev = chain.back();
     oracle::FrameWriteOptions options;
     options.segment_size = config.segment_size;
-    options.update_size = config.update_size;
+    options.update_size = config.resolved_update_size();
     vkc::Result<Bytes> want = oracle::write_frame(
         codec_frames::encoder_frame(reference_of(prev.sent), prev.content,
                                     content.value()),
@@ -1039,11 +1040,20 @@ codec::FrameType type_of(const Bytes& frame) {
   return codec::read_frame_info(frame.data(), frame.size()).value().type;
 }
 
-// A sphere that moves and grows beside one that stays: chains at period 4
-// and open-ended, at an odd K in segments of 3 and update segments of 5 and
-// at the defaults, every frame the oracle's bytes, every P-frame decoding to
-// its I-frame's grid; and among the P-frames every mode the encoder chooses
-// but motion, and new blocks.
+// A sphere that moves and grows beside one that stays, at step @p t.
+vkc::Result<vol::VoxelBlockGrid> moving_spheres(Gpu& gpu, int t) {
+  const Sphere moving{
+      vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
+      0.09f + 0.006f * float(t)};
+  return two_sphere_grid(gpu, moving,
+                         Sphere{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f});
+}
+
+// The moving spheres in chains at period 4 and open-ended, at an odd K in
+// segments of 3 and update segments of 5 and at the defaults: every frame
+// the oracle's bytes, every P-frame decoding to its I-frame's grid; and
+// among the P-frames every mode the encoder chooses but motion, and new
+// blocks.
 int encoder_chain_case(Gpu& gpu) {
   for (const std::uint32_t period : {4u, ~0u}) {
     for (const bool odd : {true, false}) {
@@ -1064,12 +1074,7 @@ int encoder_chain_case(Gpu& gpu) {
       vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
       CHECK(player.ok());
       for (int t = 0; t < 7; ++t) {
-        const Sphere moving{
-            vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
-            0.09f + 0.006f * float(t)};
-        const Sphere still{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
-        vkc::Result<vol::VoxelBlockGrid> g =
-            two_sphere_grid(gpu, moving, still);
+        vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
         CHECK(g.ok());
         CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
         const bool intra = t == 0 || (period == 4 && t == 4);
@@ -1090,6 +1095,51 @@ int encoder_chain_case(Gpu& gpu) {
       CHECK(all.modes[std::size_t(d::BlockMode::kMotion)] == 0);
       CHECK(all.added > 0);
     }
+  }
+  return 0;
+}
+
+// The update size: left at 0, a P-frame's update segments take the segment
+// size, whatever it is; set, they take it. The moving spheres' first two
+// frames, an I-frame and a P-frame: each the oracle's bytes at the config's
+// sizes, the P-frame's REFERENCE carrying the U expected, and the chain
+// decoding to the second grid's I-frame.
+int default_update_size_case(Gpu& gpu) {
+  const std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
+  struct Sizes {
+    std::uint32_t segment_size;
+    std::uint32_t update_size;
+    std::uint32_t coded;  // the U the P-frame must carry
+  };
+  for (const Sizes& s : {Sizes{1, 0, 1}, Sizes{16, 0, 16}, Sizes{64, 0, 64},
+                         Sizes{kLongest, 0, kLongest}, Sizes{16, 5, 5},
+                         Sizes{16, kLongest, kLongest}}) {
+    codec::EncoderConfig config;
+    config.intra_period = 2;
+    config.segment_size = s.segment_size;
+    config.update_size = s.update_size;
+    vkc::Result<codec::Encoder> enc =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    vkc::Result<codec::Decoder> dec =
+        codec::Decoder::create(gpu.device, gpu.allocator);
+    vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
+    CHECK(enc.ok() && dec.ok() && player.ok());
+    std::vector<Coded> chain;
+    for (int t = 0; t < 2; ++t) {
+      vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
+      CHECK(g.ok());
+      CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
+      const Bytes& f = chain.back().sent;
+      CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
+    }
+    CHECK(type_of(chain[0].sent) == codec::FrameType::kIntra);
+    CHECK(type_of(chain[1].sent) == codec::FrameType::kInter);
+    const d::FrameReference id = reference_of(chain[0].sent);
+    const Bytes& p = chain[1].sent;
+    vkc::Result<d::ParsedFrame> parsed =
+        d::parse_frame(p.data(), p.size(), kMaxBlocks, &id);
+    CHECK(parsed.ok() && parsed.value().update_size == s.coded);
+    CHECK(holds(gpu, player.value(), chain[1].intra));
   }
   return 0;
 }
@@ -1269,7 +1319,7 @@ int diff_case(Gpu& gpu) {
   const Coded& last = chain[chain.size() - 2];
   oracle::FrameWriteOptions options;
   options.segment_size = config.segment_size;
-  options.update_size = config.update_size;
+  options.update_size = config.resolved_update_size();
   const vkc::Result<Bytes> removing = oracle::write_frame(
       codec_frames::encoder_frame(reference_of(last.sent), last.content,
                                   empty.content),
@@ -1410,6 +1460,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (scratch_case(gpu, s.value()) != 0) return 1;
   if (moves_case(gpu, s.value()) != 0) return 1;
   if (encoder_chain_case(gpu) != 0) return 1;
+  if (default_update_size_case(gpu) != 0) return 1;
   if (diff_case(gpu) != 0) return 1;
   if (wrap_case(gpu, 0) != 0) return 1;
   if (wrap_case(gpu, 3) != 0) return 1;

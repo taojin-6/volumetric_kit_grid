@@ -64,8 +64,9 @@ struct Frame {
 struct FrameWriteOptions {
   // R: blocks per segment, a P-frame's new blocks per segment.
   std::uint32_t segment_size = d::kDefaultSegmentSize;
-  // U: a P-frame's reference entries per update segment.
-  std::uint32_t update_size = d::kDefaultUpdateSize;
+  // U: a P-frame's reference entries per update segment; the Encoder's
+  // default config's U, its R.
+  std::uint32_t update_size = d::kDefaultSegmentSize;
 };
 
 // A frame's bytes; or Unsupported for a type past a P-frame or a motion mode;

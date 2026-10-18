@@ -171,8 +171,8 @@ int main() {
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
 
   // Both codec profiles: the period as given, and with P-frames the update
-  // size as given, or the encoder's own for core's 0, up to the format's
-  // longest segment.
+  // size as given, core's 0 included, up to the format's longest segment;
+  // left out, the P-frames' update segments are the segment size, as printed.
   const vr::codec::EncoderConfig defaults;
   for (const auto& [source_json, application] :
        {std::pair{R"({"kind": "dataset", "path": "room0"})",
@@ -216,12 +216,20 @@ int main() {
         CHECK(configured.status().message().find(
                   "update_size " + std::to_string(size)) != std::string::npos);
       } else {
-        CHECK(configured.ok() && configured->update_size ==
-                                     (size == 0 ? defaults.update_size : size));
+        CHECK(configured.ok() && configured->update_size == size);
       }
     }
+    const auto segments =
+        with_codec(R"({"segment_size": 16, "intra_period": 30})");
+    CHECK(segments);
+    const auto by_segment = vr_example::encoder_config(segments->codec);
+    CHECK(by_segment.ok() && by_segment->resolved_update_size() == 16);
+    CHECK(vr_example::codec_settings(*by_segment,
+                                     segments->codec.quantization_table) ==
+          "K 64, table uniform, scale 0.2; segments of 16 blocks, update "
+          "segments of 16 entries; an I-frame every 30 frames");
     // No P-frame uses an update size at a period of 1, so core refuses one
-    // given there, even 0: such a scenario maps only to the encoder's own.
+    // given there, even 0: such a scenario maps only to the encoder's default.
     for (const char* codec_json :
          {R"({"update_size": 16})",
           R"({"intra_period": 1, "update_size": 0})"}) {

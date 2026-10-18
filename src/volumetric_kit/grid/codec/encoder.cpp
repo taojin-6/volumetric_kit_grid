@@ -20,12 +20,10 @@
 namespace volumetric_kit::recon::codec {
 namespace {
 
-// The public defaults restate the frame's, which the installed header cannot
-// name; this is what keeps each pair one number.
+// The public default restates the frame's, which the installed header cannot
+// name; this is what keeps the pair one number.
 static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
               "EncoderConfig's default segment size is the frame's");
-static_assert(EncoderConfig{}.update_size == detail::kDefaultUpdateSize,
-              "EncoderConfig's default update size is the frame's");
 
 }  // namespace
 
@@ -33,8 +31,8 @@ core::Status EncoderConfig::validate() const {
   VKC_TRY(params.validate());
   VKC_TRY(detail::check_segment_size("EncoderConfig", "segment_size",
                                      segment_size));
-  VKC_TRY(
-      detail::check_segment_size("EncoderConfig", "update_size", update_size));
+  VKC_TRY(detail::check_segment_size("EncoderConfig", "update_size",
+                                     resolved_update_size()));
   if (intra_period == 0) {
     return core::Status::invalid_argument(
         "EncoderConfig: intra_period 0; 1 makes every frame an I-frame");
@@ -58,6 +56,7 @@ core::Result<Encoder> Encoder::create(core::Device& device,
   VKC_TRY(config.validate());
   Encoder e;
   e.config_ = config;
+  e.config_.update_size = config.resolved_update_size();
   e.device_ = &device;
   e.allocator_ = &allocator;
   VKC_ASSIGN(e.transform_, detail::DctTransform::create(device, allocator));

@@ -293,28 +293,39 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
 }
 
 // What EncoderConfig::validate refuses, create refuses, with the same
-// message, naming the field: a segment or update size of 0 or one the
-// Decoder cannot decode, and the longest it can accepted, for either.
+// message, naming the field: a segment size of 0, or a segment or update
+// size the Decoder cannot decode; a segment size of 0 is named before the
+// update size of 0 that would take it. The longest either can be is
+// accepted, and an update size of 0, the segment size's.
 int sizes_case(Gpu& gpu) {
   const std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
-  for (const bool update : {false, true}) {
-    const char* name = update ? "update_size " : "segment_size ";
-    for (const std::uint32_t size : {0u, kLongest + 1, kLongest}) {
-      codec::EncoderConfig config;
-      (update ? config.update_size : config.segment_size) = size;
-      const vkc::Status checked = config.validate();
-      const vkc::Result<codec::Encoder> made =
-          codec::Encoder::create(gpu.device, gpu.allocator, config);
-      CHECK(checked.ok() == made.ok());
-      if (size == kLongest) {
-        CHECK(checked.ok());
-        continue;
-      }
-      CHECK(checked.domain() == vkc::Status::Code::InvalidArgument &&
-            made.status().message() == checked.message());
-      CHECK(checked.message().find(name + std::to_string(size)) !=
-            std::string::npos);
+  const std::string over = std::to_string(kLongest + 1);
+  struct Sizes {
+    std::uint32_t segment_size;
+    std::uint32_t update_size;
+    std::string refusal;  // empty when accepted
+  };
+  for (const Sizes& c :
+       {Sizes{0, 0, "segment_size 0"},
+        Sizes{kLongest + 1, 0, "segment_size " + over}, Sizes{kLongest, 0, ""},
+        Sizes{64, kLongest + 1, "update_size " + over}, Sizes{64, 0, ""},
+        Sizes{64, kLongest, ""}}) {
+    codec::EncoderConfig config;
+    config.segment_size = c.segment_size;
+    config.update_size = c.update_size;
+    const vkc::Status checked = config.validate();
+    const vkc::Result<codec::Encoder> made =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(checked.ok() == made.ok());
+    if (c.refusal.empty()) {
+      CHECK(checked.ok());
+      continue;
     }
+    CHECK(checked.domain() == vkc::Status::Code::InvalidArgument &&
+          made.status().message() == checked.message());
+    CHECK(checked.message().find(c.refusal) != std::string::npos);
+    CHECK(c.update_size != 0 ||
+          checked.message().find("update_size") == std::string::npos);
   }
   CHECK(codec::EncoderConfig{}.validate().ok());
   return 0;
