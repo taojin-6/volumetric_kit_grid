@@ -52,8 +52,8 @@ struct FrameInfo {
 ///
 /// What a player calls on its first frame to build a grid of the geometry the
 /// stream carries (`voxel_size`, `trunc_dist`, `block_size` 8, and room for
-/// `block_count` blocks), before it can @ref Decoder::decode anything.
-/// No entropy payload is read.
+/// `block_count` blocks), before it can @ref Decoder::decode anything;
+/// @ref make_decode_grid builds that grid. No entropy payload is read.
 /// @param data  The frame (at least its complete header: 44 bytes plus four
 ///              per kept coefficient).
 /// @param size  Bytes available at @p data.
@@ -187,7 +187,8 @@ class VR_CODEC_API Decoder {
   ///         `Status::Code::OutOfMemory` when the grid is too small for
   ///         the frame -- fewer block slots (`num_blocks`) than the frame has
   ///         blocks, or a hash table that cannot place them all -- which
-  ///         @ref volume::VoxelBlockGrid::resize and decoding again recovers;
+  ///         @ref volume::VoxelBlockGrid::resize and decoding again recovers
+  ///         (@ref decode_growing does both);
   ///         `Status::Code::IoError` only when bucket-lock contention
   ///         outlasts the retries over a table with room (decode again; a
   ///         resize would not help); otherwise a buffer or
