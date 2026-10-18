@@ -142,6 +142,7 @@ class VR_CODEC_API DeviceFrameWriter {
   core::Buffer gather_args_;  // the gather's dispatch, which the scan sizes
   core::Buffer failed_;       // set when a table refuses a symbol
   core::Buffer refusal_;      // what check_entries refuses: two words
+  core::Buffer surplus_;      // the entries past the frame's (StepLayout)
 
   // What record_count reads back at the caller's submit, beside the
   // layout's totals: the counts, at frame_model_base in a P-frame's layout,

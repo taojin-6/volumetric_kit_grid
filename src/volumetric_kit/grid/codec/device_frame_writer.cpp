@@ -110,6 +110,11 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(w.failed_.handle()),
                          "codec.rans_failed");
+  VKC_ASSIGN(w.surplus_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(w.surplus_.handle()),
+                         "codec.rans_surplus");
   VKC_ASSIGN(w.refusal_,
              core::device_storage_buffer(allocator, sizeof(w.refusal_host_)));
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
@@ -175,6 +180,7 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
                                       "codec.rans_entry_steps"));
   VKC_TRY(batch.zero(counts_, 0, count_bytes));
   VKC_TRY(batch.zero(refusal_, 0, sizeof(refusal_host_)));
+  VKC_TRY(batch.zero(surplus_, 0, sizeof(std::uint32_t)));
 
   core::ComputeKernel& kernel = count_kernel_;
   bind_walk(kernel, blocks);
@@ -185,8 +191,8 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   RansPush push = walk_push(blocks, segment_size, update_size, segments);
   VKC_TRY(dispatch_items(batch, kernel, push, entries, kCountLanes,
                          max_workgroup_count_x_, stage));
-  VKC_TRY(layout_->record(batch, entry_steps_, entries, m, update_size,
-                          segment_size, stage));
+  VKC_TRY(layout_->record(batch, entry_steps_, surplus_, entries, m,
+                          update_size, segment_size, stage));
   VKC_TRY(batch.readback(counts_, 0, count_bytes, counts_host_.data()));
   return batch.readback(refusal_, 0, sizeof(refusal_host_), refusal_host_);
 }
