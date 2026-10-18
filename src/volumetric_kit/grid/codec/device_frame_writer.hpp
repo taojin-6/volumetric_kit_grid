@@ -10,11 +10,11 @@
 ///
 /// Internal (under src/, never installed). The forward output stays in device
 /// memory: the host reads back only the symbol counts, to build the frame's
-/// tables (@ref frame_tables), the step layout's two totals, and the coded
-/// segments. Every bulk buffer is device-local and retained between frames
-/// (`ensure_device_scratch`); the host reaches them only through
-/// `CommandBatch`, so a discrete GPU moves the same few bytes across PCIe
-/// that unified memory would.
+/// tables (@ref frame_tables), the step layout's two totals, a P-frame's
+/// survivor count, and the coded segments. Every bulk buffer is device-local
+/// and retained between frames (`ensure_device_scratch`); the host reaches
+/// them only through `CommandBatch`, so a discrete GPU moves the same few
+/// bytes across PCIe that unified memory would.
 
 #include <cstdint>
 #include <memory>
@@ -50,6 +50,10 @@ namespace volumetric_kit::recon::codec::detail {
 /// A P-frame's entries are its stream positions (@ref ResidentBlocks): each
 /// reference entry's mode and payload, which the caller has made against the
 /// reference (a keep entry's XOR mask and residuals), then its new blocks.
+/// Its count is recorded into its diff's batch, over the bounded entries
+/// @ref ReferenceStore::record_diff returns: the count and the layout take
+/// the survivors off the bound on the device, and @ref finish reads them
+/// back, so the host learns the new blocks' count only after the submit.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
@@ -71,16 +75,18 @@ class VR_CODEC_API DeviceFrameWriter {
   /// before @ref finish. @p blocks must stay unchanged until then.
   /// @param blocks        The entries: the forward output, or a P-frame's
   ///                      stream positions, the new blocks' coordinates
-  ///                      strictly increasing in frame order.
+  ///                      strictly increasing in frame order; or the
+  ///                      bounded entries of a P-frame's diff, whose ranks
+  ///                      the count reads its surplus from.
   /// @param segment_size  Blocks per segment: a P-frame's new blocks per
   ///                      segment.
   /// @param update_size   A P-frame's reference entries per update segment,
   ///                      read only when @p blocks holds reference entries.
   /// @return OK, or `Status::Code::InvalidArgument` for a size
   ///         @ref check_segment_size refuses, more reference entries than
-  ///         entries, a buffer the entries need missing, more than 2^30 - 1
-  ///         segments, or a buffer past `maxStorageBufferRange`; otherwise a
-  ///         buffer failure.
+  ///         entries, a buffer the entries need missing (a bounded set's
+  ///         ranks among them), more than 2^30 - 1 segments, or a buffer
+  ///         past `maxStorageBufferRange`; otherwise a buffer failure.
   core::Status record_count(core::CommandBatch& batch,
                             const ResidentBlocks& blocks,
                             std::uint32_t segment_size,
@@ -89,7 +95,7 @@ class VR_CODEC_API DeviceFrameWriter {
 
   /// @brief Code the frame @ref record_count counted, at the sizes it
   ///        counted with, and lay it out.
-  /// @param blocks      The same entries @ref record_count was given.
+  /// @param counted     The same entries @ref record_count was given.
   /// @param voxel_size  The grid's voxel edge, metres.
   /// @param trunc_dist  The grid's `trunc_dist`, which the coefficients are
   ///                    fractions of.
@@ -99,14 +105,15 @@ class VR_CODEC_API DeviceFrameWriter {
   /// @return The frame's bytes; @ref check_coding's refusals, then
   ///         @ref check_entries';
   ///         `Status::Code::InvalidArgument` for blocks @ref record_count
-  ///         did not count, a reference whose block count is not the blocks'
-  ///         reference entries, coded segments that could outgrow 4 GiB, or a
-  ///         frame @ref assemble_frame refuses; or a buffer or dispatch
-  ///         failure.
+  ///         did not count, a bounded set's survivor count past its
+  ///         reference entries or its blocks (a bug, never a frame's), a
+  ///         reference whose block count is not the blocks' reference
+  ///         entries, coded segments that could outgrow 4 GiB, or a frame
+  ///         @ref assemble_frame refuses; or a buffer or dispatch failure.
   ///         `Status::Code::IoError` only if a kernel's table refused a
   ///         symbol it was counted from, which is a bug here.
   core::Result<std::vector<std::uint8_t>> finish(
-      const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
+      const ResidentBlocks& counted, float voxel_size, float trunc_dist,
       const CodecParams& params, const FrameReference* reference,
       core::GpuStageScope* stage = nullptr);
 
@@ -146,17 +153,19 @@ class VR_CODEC_API DeviceFrameWriter {
 
   // What record_count reads back at the caller's submit, beside the
   // layout's totals: the counts, at frame_model_base in a P-frame's layout,
-  // and the largest mode past the alphabet and whether a written value is
-  // -32768.
+  // the largest mode past the alphabet and whether a written value is
+  // -32768, and a bounded frame's surplus (0 otherwise).
   std::vector<std::uint32_t> counts_host_;
   std::uint32_t refusal_host_[2] = {};
-  // The sizes record_count counted with (segment size 0 before any), and
-  // per frame type the last frame's payload bytes per entry plus 25%, the
-  // readback's prediction (0 before any).
+  std::uint32_t surplus_host_ = 0;
+  // The sizes and entries record_count counted with (segment size 0 before
+  // any), and per frame type the last frame's payload bytes per entry plus
+  // 25%, the readback's prediction (0 before any).
   std::uint32_t segment_size_ = 0;
   std::uint32_t update_size_ = 0;
   std::uint32_t entry_count_ = 0;
   std::uint32_t reference_count_ = 0;
+  bool bounded_ = false;
   std::uint32_t payload_per_entry_[2] = {};
 };
 

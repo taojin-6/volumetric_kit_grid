@@ -165,7 +165,7 @@ class VR_CODEC_API Encoder {
   ///                 (finding the blocks with an observed voxel),
   ///                 `"  ..forward"` (sorting them, the transform, a
   ///                 P-frame's diff against the reference, and the symbol
-  ///                 count: one batch, and a second for a P-frame's count)
+  ///                 count: one batch)
   ///                 and `"  ..rans encode"` (coding and laying out the
   ///                 frame).
   ///                 Named apart from the

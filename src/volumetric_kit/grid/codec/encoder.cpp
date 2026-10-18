@@ -116,11 +116,11 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   // table's order is whatever the allocate atomics left, so sorting is also
   // what makes the same content give the same bytes -- and through the
   // forward, into the reference store's spare: the frame the decoder will
-  // hold, which this one holds too once it returns the frame. An I-frame's
-  // symbols are counted in the same batch. A P-frame's entries are coded
-  // against the reference there too, and since only the device knows how
-  // many blocks are new, counted in a second batch. Only counts cross before
-  // the coding.
+  // hold, which this one holds too once it returns the frame. A P-frame's
+  // entries are coded against the reference there too, bounded at M plus
+  // the frame's blocks since only the device knows how many are new; the
+  // count takes the survivors off on the device. Either frame's symbols are
+  // counted in the same batch, and only counts cross before the coding.
   std::uint32_t rejected = 0;
   detail::ResidentBlocks entries;
   {
@@ -139,25 +139,15 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
                    batch, grid, *frame.list, observed, params, *frame.masks,
                    *frame.coefficients, rejected, &stage));
     if (reference != nullptr) {
-      VKC_TRY(store_->record_diff(batch, observed, params.coefficient_count,
-                                  &stage));
-    } else {
-      VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
-                                    config_.update_size, &stage));
+      VKC_ASSIGN(entries,
+                 store_->record_diff(batch, observed, params.coefficient_count,
+                                     &stage));
     }
+    VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
+                                  config_.update_size, &stage));
     VKC_TRY(batch.submit());
     VKC_TRY(
         detail::DctTransform::check_rejected("forward", rejected, observed));
-    // TODO(codec): count a P-frame in the forward's submit, as an I-frame is,
-    // from the device's M + A: an indirect count dispatch and StepLayout's
-    // segment counts read on the device. One fence wait less a P-frame.
-    if (reference != nullptr) {
-      VKC_ASSIGN(entries, store_->diffed());
-      core::CommandBatch count(*device_, *allocator_);
-      VKC_TRY(writer_->record_count(count, entries, config_.segment_size,
-                                    config_.update_size, &stage));
-      VKC_TRY(count.submit());
-    }
   }
   std::vector<std::uint8_t> bytes;
   {

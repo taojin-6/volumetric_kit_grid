@@ -51,6 +51,8 @@ constexpr VkDeviceSize kEntryBytes = sizeof(volume::BlockIndex);
 constexpr VkDeviceSize kWordBytes = sizeof(std::uint32_t);
 constexpr VkDeviceSize kMaskBytes = kMaskWordsPerBlock * sizeof(std::uint32_t);
 static_assert(kMaskWordsPerBlock == 16, "inter_apply.comp's kMaskWords is 16");
+// survivor_ranks.comp's verdict and survivor count.
+constexpr VkDeviceSize kSurvivorBytes = 2 * kWordBytes;
 
 // Bytes of one entry's coefficients, as the transform reads them.
 VkDeviceSize coefficient_bytes(std::uint32_t k) {
@@ -125,7 +127,7 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
       {s.modes_, kWordBytes, "codec.diff_modes"},
       {s.ranks_, kWordBytes, "codec.diff_ranks"},
       {s.added_, kEntryBytes, "codec.diff_added"},
-      {s.survivors_, sizeof(s.survivors_host_), "codec.diff_survivors"},
+      {s.survivors_, kSurvivorBytes, "codec.diff_survivors"},
   };
   for (const First& f : first) {
     VKC_TRY(core::ensure_device_scratch(device, allocator, f.buffer, f.bytes,
@@ -244,11 +246,9 @@ core::Status ReferenceStore::check_apply() const {
   return {};
 }
 
-core::Status ReferenceStore::record_diff(core::CommandBatch& batch,
-                                         std::uint32_t n, std::uint32_t k,
-                                         core::GpuStageScope* stage) {
-  diff_m_ = diff_n_ = diff_k_ = 0;
-  survivors_host_[0] = survivors_host_[1] = 0;
+core::Result<ResidentBlocks> ReferenceStore::record_diff(
+    core::CommandBatch& batch, std::uint32_t n, std::uint32_t k,
+    core::GpuStageScope* stage) {
   if (!held_) return fail("record_diff", "no reference is held");
   const std::uint32_t held_k = reference_.header.params.coefficient_count;
   if (k != held_k) {
@@ -317,10 +317,8 @@ core::Status ReferenceStore::record_diff(core::CommandBatch& batch,
   const core::DescriptorSet& ranks = ranks_kernel_.set;
   ranks.write_storage_buffer(0, modes_.handle(), 0, range(m, kWordBytes));
   ranks.write_storage_buffer(1, ranks_.handle(), 0, rank_bytes);
-  ranks.write_storage_buffer(2, survivors_.handle(), 0,
-                             sizeof(survivors_host_));
+  ranks.write_storage_buffer(2, survivors_.handle(), 0, kSurvivorBytes);
 
-  VKC_TRY(batch.zero(survivors_, 0, sizeof(survivors_host_)));
   DiffPush push;
   push.reference_count = m;
   push.target_count = n;
@@ -334,31 +332,16 @@ core::Status ReferenceStore::record_diff(core::CommandBatch& batch,
   push.pass = 1;
   VKC_TRY(dispatch_items(batch, diff_kernel_, push, n, kDiffLanes,
                          max_workgroup_count_x_, stage));
-  VKC_TRY(
-      batch.readback(survivors_, 0, sizeof(survivors_host_), survivors_host_));
-  diff_m_ = m;
-  diff_n_ = n;
-  diff_k_ = k;
-  return {};
-}
-
-core::Result<ResidentBlocks> ReferenceStore::diffed() const {
-  const std::uint32_t survivors = survivors_host_[1];
-  if (survivors > diff_m_ || survivors > diff_n_) {
-    return fail("diffed", std::to_string(survivors) + " survivors of " +
-                              std::to_string(diff_m_) +
-                              " reference entries and " +
-                              std::to_string(diff_n_) + " blocks");
-  }
   ResidentBlocks out;
   out.list = &added_;
   out.masks = &diff_masks_;
   out.coefficients = &diff_coefficients_;
   out.modes = &modes_;
   out.ranks = &ranks_;
-  out.count = diff_m_ + (diff_n_ - survivors);
-  out.coefficient_count = diff_k_;
-  out.reference_count = diff_m_;
+  out.count = static_cast<std::uint32_t>(entries);
+  out.coefficient_count = k;
+  out.reference_count = m;
+  out.bounded = true;
   return out;
 }
 

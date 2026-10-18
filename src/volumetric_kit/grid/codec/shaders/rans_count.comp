@@ -3,7 +3,9 @@
 
 // The device frame's pass 1: every model's symbol counts, each entry's coder
 // steps, which rans_layout.comp lays out, and what check_entries refuses
-// (bitstream.hpp). One invocation per entry.
+// (bitstream.hpp). One invocation per position of num_entries, which a
+// bounded P-frame's surplus takes the survivors off (counted_entries): a
+// position past the frame's returns.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -23,6 +25,9 @@ layout(set = 0, binding = 6, std430) buffer Refusal {
   uint largest_mode;  // the largest mode past the alphabet, else 0
   uint out_of_range;  // nonzero when a written value is -32768
 };
+layout(set = 0, binding = 7, std430) readonly buffer Surplus {
+  uint surplus;  // the entries past the frame's (counted_entries)
+};
 
 uint g_steps = 0u;
 
@@ -35,7 +40,7 @@ void sink_bits(uint value, uint bits) { g_steps += (bits + 11u) / 12u; }
 
 void main() {
   const uint p = pc.item_base + gl_GlobalInvocationID.x;
-  if (p >= pc.num_entries) return;
+  if (p >= counted_entries(surplus)) return;
   walk_entry(p);
   steps[p] = g_steps;
   if (g_bad_mode != 0u) atomicMax(largest_mode, g_bad_mode);

@@ -12,10 +12,11 @@
 // than the format allows refused, every refusal and failure leaving the
 // reference as it was, and the device buffers grown and shrunk frame to
 // frame. Encoding: every frame of the Encoder's chains the CPU oracle's
-// bytes, its P-frames priced as the oracle prices them and coded in update
-// segments of the segment size, or of an update size set; each of the diff's
-// choices from one edit of a frame; a difference of 32768 coded zero, in
-// either half of a coefficient word; and the diff's refusals. Internal
+// bytes, its P-frames priced as the oracle prices them, counted in the
+// diff's batch, and coded in update segments of the segment size, or of an
+// update size set; each of the diff's choices from one edit of a frame; a
+// difference of 32768 coded zero, in either half of a coefficient word; and
+// the diff's refusals and bounded entries, counted in its batch. Internal
 // headers by include path; skips with no device.
 
 #include <algorithm>
@@ -36,6 +37,7 @@
 #include "codec_oracle_device.hpp"
 #include "codec_oracle_encode.hpp"
 #include "dct_transform.hpp"
+#include "device_frame_writer.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
@@ -208,8 +210,10 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
   }
   d::FrameReference id;
   id.hash = hash;
+  id.header.voxel_size = kVoxel;
+  id.header.trunc_dist = r.trunc_dist;
+  id.header.params = r.params;
   id.header.block_count = static_cast<std::uint32_t>(m);
-  id.header.params.coefficient_count = k;
   store.commit(id);
   return 0;
 }
@@ -1405,37 +1409,58 @@ int wrap_case(Gpu& gpu, std::uint32_t j) {
 }
 
 // What the diff refuses before it records: no reference held, a K not the
-// reference's, more blocks than reserved; and the entries it leaves.
+// reference's, more blocks than reserved; and the entries it leaves, which
+// the device frame writer counts in the diff's batch: a frame of no blocks,
+// bounded at M, every entry removed, written as the oracle's P-frame.
 int diff_refusals_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
       d::ReferenceStore::create(gpu.device, gpu.allocator);
-  CHECK(made.ok());
+  vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> writer =
+      d::DeviceFrameWriter::create(gpu.device, gpu.allocator);
+  CHECK(made.ok() && writer.ok());
   d::ReferenceStore& store = *made.value();
   auto refused = [&](std::uint32_t n, std::uint32_t k, const char* says) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s = store.record_diff(batch, n, k);
+    const vkc::Status s = store.record_diff(batch, n, k).status();
     return !s.ok() && s.domain() == C::InvalidArgument &&
            s.message().find(says) != std::string::npos;
   };
   CHECK(refused(0, 8, "no reference is held"));
   Lcg rng{37};
-  CHECK(commit_intra(gpu, store, random_entries(5, 8, rng), 3) == 0);
+  const oracle::DctBlocks held = random_entries(5, 8, rng);
+  CHECK(commit_intra(gpu, store, held, 3) == 0);
   CHECK(store.reserve(4, 8).ok());
   CHECK(refused(4, 9, "a frame at K 9 on a reference at K 8"));
   CHECK(refused(1000, 8, "1000 blocks, more than were reserved"));
-  // A frame of no blocks: every entry removed, nothing new.
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  CHECK(store.record_diff(batch, 0, 8).ok());
-  CHECK(batch.submit().ok());
-  vkc::Result<d::ResidentBlocks> entries = store.diffed();
+  vkc::Result<d::ResidentBlocks> entries = store.record_diff(batch, 0, 8);
   CHECK(entries.ok() && entries.value().count == 5 &&
-        entries.value().reference_count == 5);
+        entries.value().reference_count == 5 && entries.value().bounded);
+  const oracle::FrameWriteOptions sizes;
+  CHECK(writer.value()
+            ->record_count(batch, entries.value(), sizes.segment_size,
+                           sizes.update_size)
+            .ok());
+  CHECK(batch.submit().ok());
   vkc::Result<std::vector<std::uint32_t>> modes =
       vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
                                         *entries.value().modes, 5);
   CHECK(modes.ok() &&
         modes.value() == std::vector<std::uint32_t>(
                              5, std::uint32_t(d::BlockMode::kRemove)));
+  oracle::Frame removed;
+  removed.type = d::FrameType::kInter;
+  removed.voxel_size = kVoxel;
+  removed.reference = *store.held();
+  removed.modes.assign(5, d::BlockMode::kRemove);
+  removed.blocks.params = held.params;
+  removed.blocks.trunc_dist = held.trunc_dist;
+  removed.blocks.masks.assign(5 * codec::kMaskWordsPerBlock, 0);
+  removed.blocks.coefficients.assign(5 * 8, 0);
+  vkc::Result<Bytes> written = writer.value()->finish(
+      entries.value(), kVoxel, held.trunc_dist, held.params, store.held());
+  CHECK(written.ok() &&
+        written.value() == oracle::write_frame(removed, sizes).value());
   CHECK(store.held()->hash == 3);
   return 0;
 }

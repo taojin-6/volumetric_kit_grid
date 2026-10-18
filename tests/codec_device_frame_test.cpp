@@ -2,9 +2,11 @@
 // Copyright (c) 2026 Tao Jin
 
 // The device frame writer and reader against the CPU oracle's: every frame
-// the writer writes, intra or P, must be oracle::write_frame's, byte for byte,
-// or be refused as it refuses it, and every frame the reader reads must
-// decode to oracle::read_frame's entries or be refused as it refuses it, with
+// the writer writes, intra or P -- a P-frame from its exact entries and from
+// bounded ones, as the reference store's diff leaves them, with garbage past
+// them -- must be oracle::write_frame's, byte for byte, or be refused as it
+// refuses it, and every frame the reader reads must decode to
+// oracle::read_frame's entries or be refused as it refuses it, with
 // the same code and message -- the test the 2026-09-26 decision set for the
 // GPU coder -- the reader's verdict naming the first failing segment however
 // many fail, and its survivor ranks an exclusive scan. Skips where no device
@@ -17,7 +19,10 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -65,18 +70,23 @@ oracle::FrameWriteOptions sizes(std::uint32_t r, std::uint32_t u) {
 }
 
 // A host frame's entries in device buffers, as the encoder holds the
-// transform's output.
-vkc::Result<Resident> resident(const oracle::Frame& frame) {
+// transform's output; with @p tail, bounded as its diff leaves a P-frame's
+// (oracle::resident).
+vkc::Result<Resident> resident(
+    const oracle::Frame& frame,
+    std::optional<std::uint32_t> tail = std::nullopt) {
   return oracle::resident({*g_device, *g_allocator}, frame.blocks, frame.modes,
-                          frame.coords);
+                          frame.coords, 0, tail);
 }
 
 // The device writer's bytes for a host frame: its entries uploaded, counted
-// and finished, as the encoder does with the transform's output.
-vkc::Result<Bytes> device_write(d::DeviceFrameWriter& writer,
-                                const oracle::Frame& frame,
-                                const oracle::FrameWriteOptions& options) {
-  VKC_ASSIGN(const Resident r, resident(frame));
+// and finished, as the encoder does with the transform's output, or with
+// @p tail as it does with a P-frame's diff.
+vkc::Result<Bytes> device_write(
+    d::DeviceFrameWriter& writer, const oracle::Frame& frame,
+    const oracle::FrameWriteOptions& options,
+    std::optional<std::uint32_t> tail = std::nullopt) {
+  VKC_ASSIGN(const Resident r, resident(frame, tail));
   vkc::CommandBatch batch(*g_device, *g_allocator);
   VKC_TRY(writer.record_count(batch, r.blocks, options.segment_size,
                               options.update_size));
@@ -84,6 +94,17 @@ vkc::Result<Bytes> device_write(d::DeviceFrameWriter& writer,
   return writer.finish(
       r.blocks, frame.voxel_size, frame.blocks.trunc_dist, frame.blocks.params,
       frame.type == d::FrameType::kInter ? &frame.reference : nullptr);
+}
+
+// The garbage tails a bounded frame of @p m reference entries is written
+// with: 0, 1, 7 and M positions, at most M, since no more survive.
+std::set<std::uint32_t> tails(std::size_t m) {
+  std::set<std::uint32_t> out;
+  for (const std::size_t g :
+       {std::size_t(0), std::size_t(1), std::size_t(7), m}) {
+    if (g <= m) out.insert(static_cast<std::uint32_t>(g));
+  }
+  return out;
 }
 
 // The device reader's decode of a frame, read back as the oracle's: a skip or
@@ -193,32 +214,40 @@ int same_read(d::DeviceFrameReader& reader, const Bytes& bytes,
   return 0;
 }
 
-// The oracle's frame and the device's, for one frame and its sizes, and the
-// device's decode of it.
+// The oracle's frame and the device's, for one frame and its sizes -- a
+// P-frame also written bounded, at every tail -- and the device's decode of
+// it.
 int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
                const oracle::Frame& frame,
                const oracle::FrameWriteOptions& options) {
+  const bool inter = frame.type == d::FrameType::kInter;
   const vkc::Result<Bytes> expected = oracle::write_frame(frame, options);
-  const vkc::Result<Bytes> device = device_write(writer, frame, options);
   CHECK(expected.ok());
-  if (!device.ok()) {
-    std::fprintf(stderr, "device write: %s\n",
-                 device.status().message().c_str());
+  std::vector<std::optional<std::uint32_t>> writes = {std::nullopt};
+  if (inter) {
+    for (const std::uint32_t g : tails(frame.modes.size())) writes.push_back(g);
   }
-  CHECK(device.ok());
-  if (device.value() != expected.value()) {
-    std::fprintf(stderr,
-                 "differs: %zu modes, %zu blocks, K %u, R %u, U %u (%zu vs %zu "
-                 "bytes)\n",
-                 frame.modes.size(), frame.coords.size(),
-                 frame.blocks.params.coefficient_count, options.segment_size,
-                 options.update_size, device.value().size(),
-                 expected.value().size());
+  for (const std::optional<std::uint32_t>& tail : writes) {
+    const vkc::Result<Bytes> device =
+        device_write(writer, frame, options, tail);
+    if (!device.ok()) {
+      std::fprintf(stderr, "device write: %s\n",
+                   device.status().message().c_str());
+    }
+    CHECK(device.ok());
+    if (device.value() != expected.value()) {
+      std::fprintf(stderr,
+                   "differs: %zu modes, %zu blocks, K %u, R %u, U %u, tail %d "
+                   "(%zu vs %zu bytes)\n",
+                   frame.modes.size(), frame.coords.size(),
+                   frame.blocks.params.coefficient_count, options.segment_size,
+                   options.update_size, tail ? int(*tail) : -1,
+                   device.value().size(), expected.value().size());
+    }
+    CHECK(device.value() == expected.value());
   }
-  CHECK(device.value() == expected.value());
-  return same_read(
-      reader, expected.value(),
-      frame.type == d::FrameType::kInter ? &frame.reference : nullptr);
+  return same_read(reader, expected.value(),
+                   inter ? &frame.reference : nullptr);
 }
 
 int matches_oracle_case(d::DeviceFrameWriter& writer,
@@ -245,7 +274,8 @@ int matches_oracle_case(d::DeviceFrameWriter& writer,
 
 // P-frames: the worked example's pinned bytes, at U = 1 too; the matrix
 // (codec_frames.hpp) at every update and segment size, every mode, K and
-// empty case among them; and a P-frame of no entries at all.
+// empty case among them, each written bounded too; one writer alternating
+// exact and bounded entries; and a P-frame of no entries at all.
 int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   const d::FrameReference example = reference_of(
       oracle::write_frame(codec_frames::example_reference()).value());
@@ -257,7 +287,9 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   CHECK(same_bytes(writer, reader, p, sizes(64, 1)) == 0);
 
   int written = 0;
-  for (const codec_frames::InterCode& c : codec_frames::inter_matrix()) {
+  const std::vector<codec_frames::InterCode> matrix =
+      codec_frames::inter_matrix();
+  for (const codec_frames::InterCode& c : matrix) {
     for (std::uint32_t u : codec_frames::kInterSizes) {
       for (std::uint32_t r : codec_frames::kInterSizes) {
         if (same_bytes(writer, reader, c.p, sizes(r, u)) != 0) {
@@ -270,6 +302,19 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   }
   std::printf("P-frames: the worked example and %d of the matrix\n", written);
 
+  // On one writer: exact, bounded, exact, then bounded at another tail,
+  // each the oracle's bytes, so no frame's surplus outlives it.
+  const oracle::Frame& every = matrix.front().p;  // every mode, K 1
+  const auto m = static_cast<std::uint32_t>(every.modes.size());
+  CHECK(every.coords.size() > 7 && m > 7);
+  const Bytes want = oracle::write_frame(every, sizes(7, 7)).value();
+  const std::optional<std::uint32_t> exact;
+  for (const std::optional<std::uint32_t>& tail :
+       {exact, std::optional<std::uint32_t>(7), exact,
+        std::optional<std::uint32_t>(m)}) {
+    CHECK(device_write(writer, every, sizes(7, 7), tail).value() == want);
+  }
+
   // M = 0, A = 0: REFERENCE and an empty mode table, no segment.
   const oracle::Frame empty = make_frame(0, 8, 1);
   const d::FrameReference id = reference_of(oracle::write_frame(empty).value());
@@ -278,7 +323,8 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
 }
 
 // The golden frames, intra and P: the device writes their pinned bytes, so
-// every machine writes the same frame, and reads them as the oracle does.
+// every machine writes the same frame, a P-frame from its bounded entries
+// too, at every tail, and reads them as the oracle does.
 int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   for (const codec_frames::GoldenFrame& g : codec_frames::kGoldenFrames) {
     const vkc::Result<Bytes> bytes = device_write(
@@ -298,6 +344,13 @@ int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
     CHECK(bytes.value().size() == g.size);
     CHECK(vr_test::fnv1a(bytes.value()) == g.hash);
     CHECK(same_read(reader, bytes.value(), &p.reference) == 0);
+    for (const std::uint32_t tail : tails(p.modes.size())) {
+      const vkc::Result<Bytes> bounded =
+          device_write(writer, p, sizes(g.segment_size, g.update_size), tail);
+      CHECK(bounded.ok());
+      CHECK(bounded.value().size() == g.size);
+      CHECK(vr_test::fnv1a(bounded.value()) == g.hash);
+    }
   }
   return 0;
 }
@@ -493,16 +546,27 @@ int writer_refusals_case(d::DeviceFrameWriter& writer) {
   f.blocks.trunc_dist = -1.0f;
   f.blocks.coefficients[keep * k + 3] = low;
   edits.push_back({"trunc_dist -1, and a -32768", C::InvalidArgument, f});
+  // Each written exact, and bounded past a tail whose -32768s a count over
+  // the bound would flag.
+  auto writes = [](const oracle::Frame& frame) {
+    return std::vector<std::optional<std::uint32_t>>{
+        std::nullopt, static_cast<std::uint32_t>(
+                          std::min<std::size_t>(7, frame.modes.size()))};
+  };
   for (const Edit& e : edits) {
     const vkc::Result<Bytes> expected = oracle::write_frame(e.frame);
-    const vkc::Result<Bytes> device = device_write(writer, e.frame, {});
-    if (expected.ok() || device.ok() || expected.status().domain() != e.code ||
-        device.status().domain() != e.code ||
-        expected.status().message() != device.status().message()) {
-      std::fprintf(stderr, "%s: oracle %s; device %s\n", e.what,
-                   expected.ok() ? "OK" : expected.status().message().c_str(),
-                   device.ok() ? "OK" : device.status().message().c_str());
-      return 1;
+    for (const std::optional<std::uint32_t>& tail : writes(e.frame)) {
+      const vkc::Result<Bytes> device = device_write(writer, e.frame, {}, tail);
+      if (expected.ok() || device.ok() ||
+          expected.status().domain() != e.code ||
+          device.status().domain() != e.code ||
+          expected.status().message() != device.status().message()) {
+        std::fprintf(stderr, "%s, tail %d: oracle %s; device %s\n", e.what,
+                     tail ? int(*tail) : -1,
+                     expected.ok() ? "OK" : expected.status().message().c_str(),
+                     device.ok() ? "OK" : device.status().message().c_str());
+        return 1;
+      }
     }
   }
   CHECK(oracle::write_frame(edits[2].frame).status().message() ==
@@ -511,8 +575,10 @@ int writer_refusals_case(d::DeviceFrameWriter& writer) {
         "frame writer: trunc_dist must be finite and positive");
   f = good;
   f.blocks.coefficients[skip * k] = low;
-  CHECK(device_write(writer, f, {}).value() ==
-        oracle::write_frame(good).value());
+  for (const std::optional<std::uint32_t>& tail : writes(f)) {
+    CHECK(device_write(writer, f, {}, tail).value() ==
+          oracle::write_frame(good).value());
+  }
   return 0;
 }
 
@@ -730,13 +796,14 @@ int ranks_case(d::DeviceFrameReader& reader) {
 }
 
 // The writer's own refusals: entries it cannot walk -- more reference
-// entries than entries, or without the modes or list they need -- and a
-// segment or update size past the rule, each counting nothing, so finish
-// refuses, rather than coding stale steps; a
-// finish whose blocks have another entry or reference count than were
-// counted;
-// reference entries without an update size; and a reference that does not
-// hold the blocks' reference entries, or none for blocks that have them.
+// entries than entries, or without the modes or list they need, or bounded
+// without ranks -- and a segment or update size past the rule, each counting
+// nothing, so finish refuses, rather than coding stale steps; a finish whose
+// blocks have another entry or reference count than were counted, or are
+// exact where bounded ones were counted or the reverse; a bounded set's
+// survivors past its reference entries or its blocks; reference entries
+// without an update size; and a reference that does not hold the blocks'
+// reference entries, or none for blocks that have them.
 int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
                   d::DeviceFrameWriter& writer) {
   const oracle::Frame reference = make_frame(20, 8, 61);
@@ -770,6 +837,14 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(fresh.value()->record_count(batch, blocks, 64, 64).domain() ==
           C::InvalidArgument);
   }
+  d::ResidentBlocks unranked = r.blocks;
+  unranked.bounded = true;
+  const vkc::Status no_ranks =
+      fresh.value()->record_count(batch, unranked, 64, 64);
+  CHECK(no_ranks.domain() == C::InvalidArgument &&
+        no_ranks.message() ==
+            "DeviceFrameWriter::record_count: the entries lack a buffer they "
+            "need");
   const std::uint32_t over = codec::kMaxDeviceDecodeSegmentSize + 1;
   CHECK(fresh.value()->record_count(batch, r.blocks, over, 64).domain() ==
         C::InvalidArgument);
@@ -793,6 +868,52 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   d::FrameReference shorter = p.reference;
   shorter.header.block_count -= 1;
   CHECK(uncounted(finish(writer, fewer, shorter)));
+
+  // Bounded entries counted and exact ones finished, and the reverse: the
+  // same count, so only the bound tells them apart.
+  const Resident bounded = resident(p, 0u).value();
+  CHECK(bounded.blocks.count == r.blocks.count);
+  for (const auto& [counted_blocks, finished_blocks] :
+       {std::pair(&bounded.blocks, &r.blocks),
+        std::pair(&r.blocks, &bounded.blocks)}) {
+    vkc::CommandBatch b(*g_device, *g_allocator);
+    CHECK(writer.record_count(b, *counted_blocks, 64, 64).ok());
+    CHECK(b.submit().ok());
+    CHECK(uncounted(finish(writer, *finished_blocks, p.reference)));
+  }
+
+  // Ranks naming more survivors than the reference entries (a tail of
+  // M + 1) or than the frame's blocks (word M planted at A + 1 over no
+  // tail): the count clamps them, and finish refuses either.
+  const std::uint32_t m = r.blocks.reference_count;
+  const std::uint32_t a = r.blocks.count - m;
+  CHECK(a + 1 <= m);
+  auto survivors_refused = [&](const Resident& planted, std::uint32_t s,
+                               std::uint32_t blocks) {
+    vkc::CommandBatch b(*g_device, *g_allocator);
+    CHECK(writer.record_count(b, planted.blocks, 64, 64).ok());
+    CHECK(b.submit().ok());
+    const vkc::Result<Bytes> written =
+        finish(writer, planted.blocks, p.reference);
+    const std::string says = "DeviceFrameWriter::finish: " + std::to_string(s) +
+                             " survivors of " + std::to_string(m) +
+                             " reference entries and " +
+                             std::to_string(blocks) + " blocks";
+    if (written.ok() || written.status().domain() != C::InvalidArgument ||
+        written.status().message() != says) {
+      std::fprintf(
+          stderr, "%s: %s\n", says.c_str(),
+          written.ok() ? "not refused" : written.status().message().c_str());
+      return 1;
+    }
+    return 0;
+  };
+  CHECK(survivors_refused(resident(p, m + 1).value(), m + 1, a + m + 1) == 0);
+  const Resident past_blocks = resident(p, 0u).value();
+  CHECK(vr_test::write_back(*g_device, *g_allocator, *past_blocks.ranks,
+                            std::vector<std::uint32_t>(m + 1, a + 1))
+            .ok());
+  CHECK(survivors_refused(past_blocks, a + 1, a) == 0);
 
   CHECK(device_write(writer, p, sizes(64, 0)).status().domain() ==
         C::InvalidArgument);

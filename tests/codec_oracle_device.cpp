@@ -4,8 +4,10 @@
 #include "codec_oracle_device.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
+#include "codec_frames.hpp"
 #include "codec_oracle_encode.hpp"
 #include "grid_readback.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -32,7 +34,8 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
                                const DctBlocks& entries,
                                const std::vector<d::BlockMode>& modes,
                                const std::vector<vr::Vec3i>& coords,
-                               std::uint16_t pad) {
+                               std::uint16_t pad,
+                               std::optional<std::uint32_t> tail) {
   const auto upload =
       [&gpu](const void* bytes,
              VkDeviceSize size) -> vkc::Result<std::unique_ptr<vkc::Buffer>> {
@@ -40,23 +43,53 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
                                        gpu.device, gpu.allocator, bytes, size));
     return std::make_unique<vkc::Buffer>(std::move(buffer));
   };
+  // The bound's garbage past the frame's entries, which no count may read.
+  const auto m = static_cast<std::uint32_t>(modes.size());
+  DctBlocks bound;
+  std::vector<vr::Vec3i> bound_coords;
+  std::vector<std::uint32_t> ranks;
+  if (tail) {
+    codec_frames::Lcg rng{0x7a11u + *tail};
+    const std::uint32_t k = entries.params.coefficient_count;
+    bound = entries;
+    bound_coords = coords;
+    for (std::uint32_t i = 0; i < *tail; ++i) {
+      for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
+        bound.masks.push_back(rng.next());
+      }
+      for (std::uint32_t j = 0; j < k; ++j) {
+        bound.coefficients.push_back(
+            j == i % k ? std::numeric_limits<std::int16_t>::min()
+                       : static_cast<std::int16_t>(rng.next()));
+      }
+      bound_coords.emplace_back(int(rng.next()), int(rng.next()),
+                                int(rng.next()));
+    }
+    ranks.resize(std::size_t(m) + 1);
+    for (std::uint32_t& word : ranks) word = rng.next();
+    ranks[m] = *tail;
+  }
+  const DctBlocks& all = tail ? bound : entries;
+  const std::vector<vr::Vec3i>& all_coords = tail ? bound_coords : coords;
   Resident r;
-  r.blocks.count = static_cast<std::uint32_t>(entries.masks.size() /
-                                              codec::kMaskWordsPerBlock);
-  r.blocks.reference_count = static_cast<std::uint32_t>(modes.size());
-  r.blocks.coefficient_count = entries.params.coefficient_count;
+  r.blocks.count =
+      static_cast<std::uint32_t>(all.masks.size() / codec::kMaskWordsPerBlock);
+  r.blocks.reference_count = m;
+  r.blocks.coefficient_count = all.params.coefficient_count;
   if (r.blocks.count != 0) {
-    const std::vector<std::uint32_t> packed = pack(entries, pad);
-    VKC_ASSIGN(r.masks, upload(entries.masks.data(),
-                               entries.masks.size() * sizeof(std::uint32_t)));
+    const std::vector<std::uint32_t> packed = pack(all, pad);
+    VKC_ASSIGN(r.masks, upload(all.masks.data(),
+                               all.masks.size() * sizeof(std::uint32_t)));
     VKC_ASSIGN(r.coefficients,
                upload(packed.data(), packed.size() * sizeof(std::uint32_t)));
     r.blocks.masks = r.masks.get();
     r.blocks.coefficients = r.coefficients.get();
   }
-  if (!coords.empty()) {
-    std::vector<vol::BlockIndex> list(coords.size());
-    for (std::size_t q = 0; q < coords.size(); ++q) list[q].coord = coords[q];
+  if (!all_coords.empty()) {
+    std::vector<vol::BlockIndex> list(all_coords.size());
+    for (std::size_t q = 0; q < all_coords.size(); ++q) {
+      list[q].coord = all_coords[q];
+    }
     VKC_ASSIGN(r.list,
                upload(list.data(), list.size() * sizeof(vol::BlockIndex)));
     r.blocks.list = r.list.get();
@@ -69,6 +102,12 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
     VKC_ASSIGN(r.modes,
                upload(words.data(), words.size() * sizeof(std::uint32_t)));
     r.blocks.modes = r.modes.get();
+  }
+  if (tail) {
+    VKC_ASSIGN(r.ranks,
+               upload(ranks.data(), ranks.size() * sizeof(std::uint32_t)));
+    r.blocks.ranks = r.ranks.get();
+    r.blocks.bounded = true;
   }
   return r;
 }
