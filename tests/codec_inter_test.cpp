@@ -1040,11 +1040,20 @@ codec::FrameType type_of(const Bytes& frame) {
   return codec::read_frame_info(frame.data(), frame.size()).value().type;
 }
 
-// A sphere that moves and grows beside one that stays: chains at period 4
-// and open-ended, at an odd K in segments of 3 and update segments of 5 and
-// at the defaults, every frame the oracle's bytes, every P-frame decoding to
-// its I-frame's grid; and among the P-frames every mode the encoder chooses
-// but motion, and new blocks.
+// A sphere that moves and grows beside one that stays, at step @p t.
+vkc::Result<vol::VoxelBlockGrid> moving_spheres(Gpu& gpu, int t) {
+  const Sphere moving{
+      vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
+      0.09f + 0.006f * float(t)};
+  return two_sphere_grid(gpu, moving,
+                         Sphere{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f});
+}
+
+// The moving spheres in chains at period 4 and open-ended, at an odd K in
+// segments of 3 and update segments of 5 and at the defaults: every frame
+// the oracle's bytes, every P-frame decoding to its I-frame's grid; and
+// among the P-frames every mode the encoder chooses but motion, and new
+// blocks.
 int encoder_chain_case(Gpu& gpu) {
   for (const std::uint32_t period : {4u, ~0u}) {
     for (const bool odd : {true, false}) {
@@ -1065,12 +1074,7 @@ int encoder_chain_case(Gpu& gpu) {
       vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
       CHECK(player.ok());
       for (int t = 0; t < 7; ++t) {
-        const Sphere moving{
-            vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
-            0.09f + 0.006f * float(t)};
-        const Sphere still{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
-        vkc::Result<vol::VoxelBlockGrid> g =
-            two_sphere_grid(gpu, moving, still);
+        vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
         CHECK(g.ok());
         CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
         const bool intra = t == 0 || (period == 4 && t == 4);
@@ -1096,7 +1100,7 @@ int encoder_chain_case(Gpu& gpu) {
 }
 
 // The update size: left at 0, a P-frame's update segments take the segment
-// size, whatever it is; set, they take it. The two-sphere grid's first two
+// size, whatever it is; set, they take it. The moving spheres' first two
 // frames, an I-frame and a P-frame: each the oracle's bytes at the config's
 // sizes, the P-frame's REFERENCE carrying the U expected, and the chain
 // decoding to the second grid's I-frame.
@@ -1122,11 +1126,7 @@ int default_update_size_case(Gpu& gpu) {
     CHECK(enc.ok() && dec.ok() && player.ok());
     std::vector<Coded> chain;
     for (int t = 0; t < 2; ++t) {
-      const Sphere moving{
-          vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
-          0.09f + 0.006f * float(t)};
-      const Sphere still{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
-      vkc::Result<vol::VoxelBlockGrid> g = two_sphere_grid(gpu, moving, still);
+      vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
       CHECK(g.ok());
       CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
       const Bytes& f = chain.back().sent;

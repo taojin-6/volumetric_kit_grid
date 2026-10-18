@@ -229,7 +229,7 @@ int main() {
           "K 64, table uniform, scale 0.2; segments of 16 blocks, update "
           "segments of 16 entries; an I-frame every 30 frames");
     // No P-frame uses an update size at a period of 1, so core refuses one
-    // given there, even 0: such a scenario maps only to the encoder's own.
+    // given there, even 0: such a scenario maps only to the encoder's default.
     for (const char* codec_json :
          {R"({"update_size": 16})",
           R"({"intra_period": 1, "update_size": 0})"}) {
