@@ -46,9 +46,10 @@ VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
 /// `Status::Code::OutOfMemory`, the decoder's word for a grid too small,
 /// grows @p grid once (@ref volume::grow_grid) to twice its buckets or the
 /// frame's @ref make_decode_grid buckets, whichever is more, and decodes
-/// again. Growing a grid @ref make_decode_grid built leaves the frame at
-/// most half its heap, so a second `OutOfMemory` there is the device's own,
-/// out of memory for the decode's buffers, and is returned.
+/// again; it is returned the second time. The first can also be the
+/// device's own, out of memory for the decode's buffers, which the grow does
+/// not cure. Growing a grid @ref make_decode_grid built leaves the frame at
+/// most half its heap, so there the second is always the device's.
 /// `Status::Code::IoError`, bucket-lock contention that outlasted the
 /// decoder's own rounds, decodes again, twice at most. Any other error is
 /// returned as the decoder gave it, `Status::Code::NotFound` for a P-frame
@@ -63,8 +64,9 @@ VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
 ///                 @ref Decoder::decode gives, of the attempt that succeeds
 ///                 alone, so a frame that grew the grid is timed as one
 ///                 decode; the grow is not timed. `nullptr` measures nothing.
-/// @return OK; the last decode's error; or @ref volume::grow_grid's, such as
-///         `Status::Code::OutOfMemory` at the grid's ceiling.
+/// @return OK; the last decode's error; @ref volume::grow_grid's, such as
+///         `Status::Code::OutOfMemory` at the grid's ceiling; or
+///         `Status::Code::OutOfMemory` for a host allocation failure.
 VR_CODEC_API core::Status decode_growing(Decoder& decoder,
                                          const std::uint8_t* frame,
                                          std::size_t size,

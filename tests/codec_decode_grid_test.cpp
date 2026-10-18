@@ -189,7 +189,8 @@ int second_out_of_memory_case(Gpu& gpu, const Frames& f) {
   return 0;
 }
 
-// A grid the frames fit is never grown: an I-frame and a P-frame on it.
+// A grid the frames fit is never grown: an I-frame, timed, and a P-frame
+// with no metrics, the default.
 int fits_case(Gpu& gpu) {
   const Sphere a{vr::Vec3f(0.0f), 0.08f};
   const Sphere b{vr::Vec3f(0.02f, 0.0f, 0.0f), 0.08f};
@@ -212,14 +213,14 @@ int fits_case(Gpu& gpu) {
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(grid.ok() && dec.ok());
   const std::int32_t buckets = grid->grid().num_buckets;
-  for (const Bytes* frame : {&*intra, &*inter}) {
-    vkc::StageMetrics metrics;
-    CHECK(codec::decode_growing(*dec, frame->data(), frame->size(), *grid,
-                                &metrics)
-              .ok());
-    CHECK(grid->grid().num_buckets == buckets);
-    CHECK(has_row(metrics, "codec decode") && has_row(metrics, "  ..inverse"));
-  }
+  vkc::StageMetrics metrics;
+  CHECK(
+      codec::decode_growing(*dec, intra->data(), intra->size(), *grid, &metrics)
+          .ok());
+  CHECK(grid->grid().num_buckets == buckets);
+  CHECK(has_row(metrics, "codec decode") && has_row(metrics, "  ..inverse"));
+  CHECK(codec::decode_growing(*dec, inter->data(), inter->size(), *grid).ok());
+  CHECK(grid->grid().num_buckets == buckets);
   return 0;
 }
 
