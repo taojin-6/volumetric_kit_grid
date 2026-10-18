@@ -163,9 +163,10 @@ inline std::uint32_t content_hash(const oracle::Frame& f) {
 // frames on every machine: what pins the format, where a round trip would pass
 // a writer and a reader changed together. `content` pins the fixture, so a
 // failure says which changed. A new frame type adds rows; nothing else changes
-// a value (a new kFrameVersion is a new format, with goldens of its own). The
-// rule binds these rows, the P-frames' (kGoldenInterFrames) and the worked
-// example (example_bytes), all below.
+// a value (a new kFrameVersion is a new format, with goldens of its own).
+// Type 1's rows (kGoldenInterFrames) and its worked example (example_bytes),
+// both below, follow type 1's freeze instead (DECISIONS, 2026-10-17): they
+// change only on purpose, in a PR that amends the freeze.
 static_assert(d::kFrameVersion == 3, "the golden frames are v3's");
 
 struct GoldenFrame {
@@ -579,8 +580,8 @@ inline Merged merge_oracle(const std::vector<vr::Vec3i>& reference,
 // --- The worked example. ----------------------------------------------------
 //
 // The format's 161-byte P-frame, which every writer, the oracle or the device,
-// writes and every reader reads as the format says; the golden rule (above)
-// binds it.
+// writes and every reader reads as the format says; it changes only as type
+// 1's golden rows do (the golden rule, above).
 
 // Its reference: a = (0,0,0) and b = (4,0,0), K = 1, voxel 1 cm, band 4 cm,
 // scale 0.2, weight 1.
@@ -745,8 +746,8 @@ inline std::vector<InterCode> inter_matrix() {
 //
 // Type 1's bytes, pinned as kGoldenFrames pins type 0's: each row a P-frame
 // against a golden I-frame row's frame, whose bytes its REFERENCE names by
-// frame_hash, so a row's hash pins frame_hash's bytes too. The golden rule
-// (above) binds them (DECISIONS, the 2026-10-17 freeze).
+// frame_hash, so a row's hash pins frame_hash's bytes too. They change only on
+// purpose (the golden rule, above).
 
 struct GoldenInterFrame {
   std::size_t reference;  // its reference: a row of kGoldenFrames
