@@ -62,9 +62,8 @@
 /// version 1 sent a partial mask as 64 bytes through one table and a sign as
 /// a field of its own.
 ///
-/// **P-frames** (type 1, experimental: its bytes may change until it is
-/// frozen, the 2026-10-16 decision) code a frame against its reference, the
-/// frame decoded before it, named by @ref frame_hash of the reference's exact
+/// **P-frames** (type 1) code a frame against its reference, the frame
+/// decoded before it, named by @ref frame_hash of the reference's exact
 /// bytes (@ref FrameReference). A P-frame adds a REFERENCE section (id 4),
 /// required on type 1 and refused on type 0, whose 20-byte body is {u64 hash,
 /// u32 M, the reference's block count, u32 U, reference entries per update

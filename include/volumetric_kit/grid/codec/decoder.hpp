@@ -85,10 +85,10 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// attribute's previous values (a `color`, say) under the new geometry, and
 /// nothing could tell which blocks those were.
 ///
-/// A P-frame (@ref FrameType::kInter, experimental) decodes against the last
-/// frame this decoder decoded, its reference, which the decoder keeps on the
-/// device as it decoded it -- quantized coefficients, masks and block list,
-/// never rebuilt from a grid -- so it decodes into any grid of its geometry,
+/// A P-frame (@ref FrameType::kInter) decodes against the last frame this
+/// decoder decoded, its reference, which the decoder keeps on the device as
+/// it decoded it -- quantized coefficients, masks and block list, never
+/// rebuilt from a grid -- so it decodes into any grid of its geometry,
 /// a fresh one included, to exactly the blocks an intra frame of the same
 /// content decodes to. Every decode that succeeds, intra or P, makes its
 /// frame the reference; one refused or failed keeps the reference it had, so

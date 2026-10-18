@@ -19,5 +19,8 @@
   "fusion": {
     "voxel_size_m": 0.005,
     "truncation_m": 0.04
+  },
+  "codec": {
+    "intra_period": 30
   }
 }

@@ -63,12 +63,16 @@ int main() {
     CHECK(loaded->output.csv.empty() && loaded->output.stream.empty());
   }
 
-  // The single-mesh template stays one frame; the sequence's codes Rafa2's
-  // frames 1-150 in an 8-voxel band, holes admitted.
+  // The single-mesh template stays one frame, every frame intra; the
+  // sequence's codes Rafa2's frames 1-150 in an 8-voxel band, holes admitted.
+  // The two sequences' templates code at period 30 with U = R, as the freeze
+  // measured them (DECISIONS, the 2026-10-17 freeze): codec_replica every
+  // frame, then its sweep.
   const auto single =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_mesh.json",
                 cfg::Application::CodecMesh);
   CHECK(single && single->run.first == 0 && single->run.frames == 1);
+  CHECK(single->codec.intra_period == 1);
   const auto sequence =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_mesh_sequence.json",
                 cfg::Application::CodecMesh);
@@ -85,6 +89,17 @@ int main() {
         sequence->source.metres_per_unit == 0.0);
   CHECK(sequence->source.allow_holes && !sequence->codec.sweep &&
         sequence->output.prefix.empty());
+  const auto replica =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_replica.json",
+                cfg::Application::CodecReplica);
+  CHECK(replica && replica->codec.encode_every == 1 && replica->codec.sweep);
+  for (const cfg::Config* coded : {&sequence.value(), &replica.value()}) {
+    CHECK(coded->codec.intra_period == 30 && coded->codec.update_size == 0);
+    const auto encoder = vr_example::encoder_config(coded->codec);
+    CHECK(encoder.ok() && encoder->intra_period == 30);
+    CHECK(encoder->segment_size == 64 &&
+          encoder->resolved_update_size() == encoder->segment_size);
+  }
 
   const auto readback =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/readback_orbbec.json",
