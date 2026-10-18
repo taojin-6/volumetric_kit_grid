@@ -121,6 +121,8 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   // the frame's blocks since only the device knows how many are new; the
   // count takes the survivors off on the device. Either frame's symbols are
   // counted in the same batch, and only counts cross before the coding.
+  // TODO(codec): trim a P-frame's host overhead at small R, where its encode
+  // is still slower than intra's (DECISIONS, the 2026-10-17 freeze).
   std::uint32_t rejected = 0;
   detail::ResidentBlocks entries;
   {
