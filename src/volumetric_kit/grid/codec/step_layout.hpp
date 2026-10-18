@@ -37,6 +37,12 @@ namespace volumetric_kit::recon::codec::detail {
 /// `scan.glsl`, recorded into the batch that counted the steps; only their
 /// two totals come back, which size the coding's buffers.
 ///
+/// The kernel takes N on the device: the entries it is given less a surplus
+/// word, so a bounded P-frame's count (@ref ResidentBlocks::bounded) lays
+/// out in the same batch as its diff. Its segments follow from N, and it
+/// writes both totals to a buffer of their own, which the host reads at a
+/// place it knows before the submit.
+///
 /// Every buffer is device-local and retained, grown as a call needs
 /// (`ensure_device_scratch`).
 ///
@@ -77,7 +83,12 @@ class VR_CODEC_API StepLayout {
   ///                         at most 2^20 each (an entry of the grammar
   ///                         takes at most 1,685), so no sum past the step
   ///                         total's stop wraps; read, never written.
-  /// @param entries          N: the frame's entries, every stream position.
+  /// @param surplus          A buffer whose first u32 is how many of
+  ///                         @p entries are past the frame's, clamped to
+  ///                         its new blocks: 0, or a bounded P-frame's
+  ///                         survivors; read, never written.
+  /// @param entries          N, or a bound on it: every stream position
+  ///                         @p steps holds.
   /// @param reference_count  M: its reference entries.
   /// @param update_size      U: reference entries an update segment, read
   ///                         only when M is nonzero.
@@ -88,15 +99,19 @@ class VR_CODEC_API StepLayout {
   /// @return OK, recording nothing for no entries (totals 0); or
   ///         `Status::Code::InvalidArgument` for a size
   ///         @ref check_segment_size refuses, more reference entries than
-  ///         entries, a @p steps `StorageInput::check` refuses, or a buffer
-  ///         past `maxStorageBufferRange`; otherwise a buffer failure.
+  ///         entries, a @p steps or @p surplus `StorageInput::check`
+  ///         refuses, or a buffer past `maxStorageBufferRange`; otherwise a
+  ///         buffer failure.
   core::Status record(core::CommandBatch& batch, const core::Buffer& steps,
-                      std::uint32_t entries, std::uint32_t reference_count,
-                      std::uint32_t update_size, std::uint32_t segment_size,
+                      const core::Buffer& surplus, std::uint32_t entries,
+                      std::uint32_t reference_count, std::uint32_t update_size,
+                      std::uint32_t segment_size,
                       core::GpuStageScope* stage = nullptr);
 
   /// @return What the last @ref record read back, once its batch ran.
-  Totals totals() const noexcept { return Totals{totals_[0], totals_[1]}; }
+  Totals totals() const noexcept {
+    return Totals{totals_host_[0], totals_host_[1]};
+  }
   /// @return E, once the batch ran: the steps before each entry in stream
   ///         order, N of them, then their total at N.
   const core::Buffer& starts() const noexcept { return starts_; }
@@ -118,10 +133,11 @@ class VR_CODEC_API StepLayout {
   core::DescriptorPool pool_;
 
   // Device-local, retained.
-  core::Buffer starts_;        // N + 1
-  core::Buffer slot_offsets_;  // segment count + 1
-  // starts_' and slot_offsets_' last words, read back.
-  std::uint32_t totals_[2] = {};
+  core::Buffer starts_;        // N + 1, of the bound
+  core::Buffer slot_offsets_;  // segment count + 1, of the bound
+  core::Buffer totals_;        // starts_[N] and slot_offsets_[S]
+  // totals_, read back.
+  std::uint32_t totals_host_[2] = {};
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

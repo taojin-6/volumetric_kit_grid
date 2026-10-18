@@ -157,26 +157,24 @@ class VR_CODEC_API ReferenceStore {
   /// survivor ranks; then each block the reference lacks its place among
   /// the new blocks, its coordinate and its payload (the kernel has the
   /// rules and the price that picks zero over keep). The frame's blocks must
-  /// be strictly increasing, as the encoder's sort leaves them. Reads back 8
-  /// bytes, the survivor count, which @ref diffed needs.
+  /// be strictly increasing, as the encoder's sort leaves them. Reads
+  /// nothing back: only the device knows how many blocks are new.
   /// @param batch  The batch to record into; submitted by the caller.
   /// @param n      The frame's blocks.
   /// @param k      Their K, the held reference's.
   /// @param stage  As @ref record_apply.
-  /// @return OK; `Status::Code::InvalidArgument` for no reference held, a K
+  /// @return The P-frame's entries by stream position once @p batch has
+  ///         run, valid until the next call, bounded
+  ///         (@ref ResidentBlocks::bounded): M + @p n of them, of which the
+  ///         device frame writer, counting in the same batch, takes off the
+  ///         `ranks[M]` survivors to leave M + A. Or
+  ///         `Status::Code::InvalidArgument` for no reference held, a K
   ///         other than its, more blocks than @ref reserve made room for,
   ///         more than 2^32 - 1 entries, or a buffer past
   ///         `maxStorageBufferRange`; otherwise a buffer failure.
-  core::Status record_diff(core::CommandBatch& batch, std::uint32_t n,
-                           std::uint32_t k,
-                           core::GpuStageScope* stage = nullptr);
-
-  /// @return After the last @ref record_diff's batch has run, the P-frame's
-  ///         M + A entries by stream position, as the device frame writer
-  ///         codes them, valid until the next @ref record_diff; or
-  ///         `Status::Code::InvalidArgument` for a survivor count past the
-  ///         reference's or the frame's blocks (a bug, never a frame's).
-  core::Result<ResidentBlocks> diffed() const;
+  core::Result<ResidentBlocks> record_diff(
+      core::CommandBatch& batch, std::uint32_t n, std::uint32_t k,
+      core::GpuStageScope* stage = nullptr);
 
   /// @brief Hold the spare as the reference: the only call that changes
   ///        @ref held and @ref reference_list.
@@ -219,7 +217,7 @@ class VR_CODEC_API ReferenceStore {
   // The diff's P-frame entries: masks and coefficients by stream position,
   // a mode a reference entry, the survivor ranks (M + 1), the new blocks'
   // list, and the ranks' two words (survivor_ranks.comp's verdict layout,
-  // the survivor count second).
+  // the survivor count second), which nothing reads back.
   core::Buffer diff_masks_;
   core::Buffer diff_coefficients_;
   core::Buffer modes_;
@@ -231,12 +229,6 @@ class VR_CODEC_API ReferenceStore {
   FrameReference reference_;
   // What the last apply's batch read back of faults_.
   std::uint32_t faults_host_ = 0;
-  // The last diff's M, blocks and K, and what its batch read back of
-  // survivors_.
-  std::uint32_t diff_m_ = 0;
-  std::uint32_t diff_n_ = 0;
-  std::uint32_t diff_k_ = 0;
-  std::uint32_t survivors_host_[2] = {};
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

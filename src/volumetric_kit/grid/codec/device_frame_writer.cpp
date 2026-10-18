@@ -90,7 +90,7 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
   push.size = sizeof(RansPush);
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(w.count_kernel_, "codec_rans_count", vr_rans_count_comp_spv,
-                 vr_rans_count_comp_spv_size, 7, &push));
+                 vr_rans_count_comp_spv_size, 8, &push));
   VKC_TRY(kb.add(w.ops_kernel_, "codec_rans_ops", vr_rans_ops_comp_spv,
                  vr_rans_ops_comp_spv_size, 7, &push));
   VKC_TRY(kb.add(w.encode_kernel_, "codec_rans_encode", vr_rans_encode_comp_spv,
@@ -110,6 +110,11 @@ core::Result<std::unique_ptr<DeviceFrameWriter>> DeviceFrameWriter::create(
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(w.failed_.handle()),
                          "codec.rans_failed");
+  VKC_ASSIGN(w.surplus_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(w.surplus_.handle()),
+                         "codec.rans_surplus");
   VKC_ASSIGN(w.refusal_,
              core::device_storage_buffer(allocator, sizeof(w.refusal_host_)));
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
@@ -146,9 +151,11 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   if (entries != 0 &&
       (blocks.masks == nullptr || blocks.coefficients == nullptr ||
        (entries > m && blocks.list == nullptr) ||
-       (m != 0 && blocks.modes == nullptr))) {
+       (m != 0 && blocks.modes == nullptr) ||
+       (blocks.bounded && blocks.ranks == nullptr))) {
     return fail("record_count", "the entries lack a buffer they need");
   }
+  // The bound's, for bounded entries, which the frame's never exceed.
   const std::uint64_t segments = frame_segment_count(m, update_size) +
                                  frame_segment_count(entries - m, segment_size);
   if (segments > kMaxFrameSegments) {
@@ -158,11 +165,13 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   update_size_ = update_size;
   entry_count_ = entries;
   reference_count_ = m;
+  bounded_ = blocks.bounded;
   // A P-frame's layout, whose mode model comes last: an intra frame's counts
   // are its prefix.
   counts_host_.assign(
       frame_model_base(frame_model_count(FrameType::kInter, k), k), 0);
   refusal_host_[0] = refusal_host_[1] = 0;
+  surplus_host_ = 0;
   if (entries == 0) return {};
 
   const VkDeviceSize range = max_storage_buffer_range_;
@@ -175,6 +184,13 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
                                       "codec.rans_entry_steps"));
   VKC_TRY(batch.zero(counts_, 0, count_bytes));
   VKC_TRY(batch.zero(refusal_, 0, sizeof(refusal_host_)));
+  // The surplus the count and the layout take off: a bounded frame's
+  // survivors, which its bound counts twice -- copied, since binding the
+  // ranks at word M would break minStorageBufferOffsetAlignment -- else 0.
+  VKC_TRY(blocks.bounded ? batch.copy(*blocks.ranks,
+                                      VkDeviceSize(m) * sizeof(std::uint32_t),
+                                      surplus_, 0, sizeof(std::uint32_t))
+                         : batch.zero(surplus_, 0, sizeof(std::uint32_t)));
 
   core::ComputeKernel& kernel = count_kernel_;
   bind_walk(kernel, blocks);
@@ -182,32 +198,51 @@ core::Status DeviceFrameWriter::record_count(core::CommandBatch& batch,
   kernel.set.write_storage_buffer(5, entry_steps_.handle(), 0, step_bytes);
   kernel.set.write_storage_buffer(6, refusal_.handle(), 0,
                                   sizeof(refusal_host_));
+  kernel.set.write_storage_buffer(7, surplus_.handle(), 0,
+                                  sizeof(std::uint32_t));
   RansPush push = walk_push(blocks, segment_size, update_size, segments);
   VKC_TRY(dispatch_items(batch, kernel, push, entries, kCountLanes,
                          max_workgroup_count_x_, stage));
-  VKC_TRY(layout_->record(batch, entry_steps_, entries, m, update_size,
-                          segment_size, stage));
+  VKC_TRY(layout_->record(batch, entry_steps_, surplus_, entries, m,
+                          update_size, segment_size, stage));
   VKC_TRY(batch.readback(counts_, 0, count_bytes, counts_host_.data()));
+  if (blocks.bounded) {
+    VKC_TRY(batch.readback(surplus_, 0, sizeof(surplus_host_), &surplus_host_));
+  }
   return batch.readback(refusal_, 0, sizeof(refusal_host_), refusal_host_);
 }
 
 core::Result<std::vector<std::uint8_t>> DeviceFrameWriter::finish(
-    const ResidentBlocks& blocks, float voxel_size, float trunc_dist,
+    const ResidentBlocks& counted, float voxel_size, float trunc_dist,
     const CodecParams& params, const FrameReference* reference,
     core::GpuStageScope* stage) {
   // Every writer's refusals in their order: the coding parameters first.
   VKC_TRY(check_coding(voxel_size, trunc_dist, params));
-  const std::uint32_t entries = blocks.count;
-  const std::uint32_t m = blocks.reference_count;
+  const std::uint32_t m = counted.reference_count;
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t segment_size = segment_size_;
   const std::uint32_t update_size = update_size_;
-  if (segment_size == 0 || k != blocks.coefficient_count ||
-      entries != entry_count_ || m != reference_count_ ||
+  if (segment_size == 0 || k != counted.coefficient_count ||
+      counted.count != entry_count_ || m != reference_count_ ||
+      counted.bounded != bounded_ ||
       counts_host_.size() !=
           frame_model_base(frame_model_count(FrameType::kInter, k), k)) {
     return fail("finish", "these blocks were not the ones record_count saw");
   }
+  // A bounded frame's entries: the bound less its survivors, which the
+  // device took off as it counted; at most M, and at most its blocks.
+  ResidentBlocks blocks = counted;
+  if (counted.bounded) {
+    const std::uint32_t frame_blocks = counted.count - m;
+    if (surplus_host_ > std::min(m, frame_blocks)) {
+      return fail("finish", std::to_string(surplus_host_) + " survivors of " +
+                                std::to_string(m) + " reference entries and " +
+                                std::to_string(frame_blocks) + " blocks");
+    }
+    blocks.count -= surplus_host_;
+    blocks.bounded = false;
+  }
+  const std::uint32_t entries = blocks.count;
   const std::uint32_t a = entries - m;
   const FrameType type =
       reference != nullptr ? FrameType::kInter : FrameType::kIntra;

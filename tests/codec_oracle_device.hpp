@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "buffer_readback.hpp"
@@ -34,18 +35,22 @@ std::vector<std::uint32_t> pack(const DctBlocks& b, std::uint16_t pad = 0);
 // Resident's blocks still point at them.
 struct Resident {
   d::ResidentBlocks blocks;
-  std::unique_ptr<vkc::Buffer> list, masks, coefficients, modes;
+  std::unique_ptr<vkc::Buffer> list, masks, coefficients, modes, ranks;
 };
 
 // @p entries uploaded by stream position, packed with @p pad: the first
 // `modes.size()` a P-frame's reference entries, with @p modes, then the new
 // blocks, whose @p coords go in the list -- as the device frame reader leaves
-// a frame's, and as the device frame writer reads the transform's.
-vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
-                               const DctBlocks& entries,
-                               const std::vector<d::BlockMode>& modes = {},
-                               const std::vector<vr::Vec3i>& coords = {},
-                               std::uint16_t pad = 0);
+// a frame's, and as the device frame writer reads the transform's. With
+// @p tail, bounded as the reference store's diff leaves a P-frame's
+// (ResidentBlocks::bounded): *tail positions past them of garbage -- random
+// masks, coefficients with -32768 among them, coordinates out of order --
+// and ranks whose word M is *tail, the rest garbage.
+vkc::Result<Resident> resident(
+    const vr_test::Gpu& gpu, const DctBlocks& entries,
+    const std::vector<d::BlockMode>& modes = {},
+    const std::vector<vr::Vec3i>& coords = {}, std::uint16_t pad = 0,
+    std::optional<std::uint32_t> tail = std::nullopt);
 
 // @p t's forward output over @p blocks, uploaded as the device list it takes,
 // read back, K coefficients to an entry; DctTransform::record_forward's

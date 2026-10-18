@@ -8,7 +8,9 @@
 // 64 and 512, segments of 1 to 1,024 blocks, int32's coordinate extremes,
 // the worked example and C2's P-frame matrix at every update and segment
 // size, every mode among them -- and for any steps up to the bound, at every
-// mix of update and new-block segments. The step total stops at the first
+// mix of update and new-block segments; each also as a bounded P-frame's
+// count leaves it, garbage past N that the surplus word takes off, and a
+// surplus past the new blocks clamped. The step total stops at the first
 // value whose steps reach 4 GiB, also after more steps than a u32 holds, and
 // is exact one step below it. Then the refusals, which record nothing.
 // Internal headers through the oracle library. Skips without a device.
@@ -17,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,6 +31,7 @@
 #include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 
 #include "gpu_test.hpp"
@@ -59,18 +63,28 @@ struct Laid {
   d::StepLayout::Totals totals;
 };
 
+// @p steps laid out by the device, followed by @p tail's past them with
+// @p surplus as the surplus word, as a bounded P-frame's count leaves them;
+// read back as far as @p steps' own layout reaches.
 vkc::Result<Laid> device_layout(vr_test::Gpu& gpu, d::StepLayout& layout,
                                 const Steps& steps, std::uint32_t m,
-                                std::uint32_t u, std::uint32_t r) {
+                                std::uint32_t u, std::uint32_t r,
+                                const Steps& tail, std::uint32_t surplus) {
   const auto n = static_cast<std::uint32_t>(steps.size());
+  Steps bound = steps;
+  bound.insert(bound.end(), tail.begin(), tail.end());
   vkc::Buffer input;
-  if (n != 0) {
+  if (!bound.empty()) {
     VKC_ASSIGN(input, vr_test::upload_device_buffer(
-                          gpu.device, gpu.allocator, steps.data(),
-                          steps.size() * sizeof(std::uint32_t)));
+                          gpu.device, gpu.allocator, bound.data(),
+                          bound.size() * sizeof(std::uint32_t)));
   }
+  VKC_ASSIGN(const vkc::Buffer word,
+             vr_test::upload_device_buffer(gpu.device, gpu.allocator, &surplus,
+                                           sizeof(surplus)));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_TRY(layout.record(batch, input, n, m, u, r));
+  VKC_TRY(layout.record(batch, input, word,
+                        static_cast<std::uint32_t>(bound.size()), m, u, r));
   VKC_TRY(batch.submit());
   Laid out;
   out.totals = layout.totals();
@@ -92,14 +106,17 @@ bool same(const std::vector<A>& a, const std::vector<B>& b) {
                     [](A x, B y) { return std::uint64_t(x) == y; });
 }
 
-// @p steps laid out on the device as the oracle lays them out: every start
-// and slot offset, each offset even, and both totals; or, for a total at the
-// cap or past it, the step total at the cap.
+// @p steps laid out on the device as the oracle lays them out, whatever
+// @p tail and @p surplus follow them (device_layout): every start and slot
+// offset, each offset even, and both totals; or, for a total at the cap or
+// past it, the step total at the cap.
 int lays_out_as_oracle(vr_test::Gpu& gpu, d::StepLayout& layout,
                        const Steps& steps, std::uint32_t m, std::uint32_t u,
-                       std::uint32_t r, const std::string& what) {
+                       std::uint32_t r, const std::string& what,
+                       const Steps& tail = {}, std::uint32_t surplus = 0) {
   const oracle::StepLayout expected = oracle::step_layout(steps, m, u, r);
-  const vkc::Result<Laid> got = device_layout(gpu, layout, steps, m, u, r);
+  const vkc::Result<Laid> got =
+      device_layout(gpu, layout, steps, m, u, r, tail, surplus);
   if (!got.ok()) {
     std::fprintf(stderr, "%s: %s\n", what.c_str(),
                  got.status().message().c_str());
@@ -122,12 +139,32 @@ int lays_out_as_oracle(vr_test::Gpu& gpu, d::StepLayout& layout,
   }
   if (!ok) {
     std::fprintf(stderr,
-                 "%s: N %zu, M %u, U %u, R %u: device totals %u / %u, oracle "
-                 "%llu / %llu\n",
-                 what.c_str(), steps.size(), m, u, r, g.totals.steps,
-                 g.totals.slot_words, static_cast<unsigned long long>(total),
+                 "%s: N %zu, M %u, U %u, R %u, tail %zu, surplus %u: device "
+                 "totals %u / %u, oracle %llu / %llu\n",
+                 what.c_str(), steps.size(), m, u, r, tail.size(), surplus,
+                 g.totals.steps, g.totals.slot_words,
+                 static_cast<unsigned long long>(total),
                  static_cast<unsigned long long>(expected.slot_offsets.back()));
     return 1;
+  }
+  return 0;
+}
+
+// @p steps laid out as the oracle lays them out, alone and as a bounded
+// P-frame's count leaves them (ResidentBlocks::bounded): g steps of garbage
+// past them, each up to the bound, with surplus g, for g of 1, 7 and M.
+int lays_out_bounded(vr_test::Gpu& gpu, d::StepLayout& layout,
+                     const Steps& steps, std::uint32_t m, std::uint32_t u,
+                     std::uint32_t r, const std::string& what) {
+  Lcg rng{steps.size() * 7 + m};
+  for (const std::uint32_t g : std::set<std::uint32_t>{0, 1, 7, m}) {
+    Steps tail(g);
+    for (std::uint32_t& s : tail) s = rng.below(kMaxSteps + 1);
+    if (lays_out_as_oracle(gpu, layout, steps, m, u, r,
+                           what + ", " + std::to_string(g) + " past it", tail,
+                           g) != 0) {
+      return 1;
+    }
   }
   return 0;
 }
@@ -137,8 +174,8 @@ int frame_lays_out(vr_test::Gpu& gpu, d::StepLayout& layout,
                    const oracle::Frame& frame, std::uint32_t u, std::uint32_t r,
                    const std::string& what) {
   const auto m = static_cast<std::uint32_t>(frame.modes.size());
-  return lays_out_as_oracle(gpu, layout, oracle::entry_steps(frame, r), m,
-                            m != 0 ? u : 0, r, what);
+  return lays_out_bounded(gpu, layout, oracle::entry_steps(frame, r), m,
+                          m != 0 ? u : 0, r, what);
 }
 
 // Intra frames on and off the chunks, every K, segments of 1 to 1,024, and
@@ -201,8 +238,8 @@ int steps_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
     for (std::uint32_t m : {0u, n / 3, n}) {
       for (std::uint32_t u : sizes) {
         for (std::uint32_t r : sizes) {
-          CHECK(lays_out_as_oracle(gpu, layout, steps, m, m != 0 ? u : 0, r,
-                                   "random") == 0);
+          CHECK(lays_out_bounded(gpu, layout, steps, m, m != 0 ? u : 0, r,
+                                 "random") == 0);
         }
       }
     }
@@ -256,15 +293,53 @@ int cap_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
   return 0;
 }
 
+// A surplus past the new blocks, which no frame has: the device clamps it,
+// laying out the M reference entries alone, and with none of them nothing,
+// so every read stays inside the bound.
+int clamp_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
+  Lcg rng{53};
+  Steps reference(100);
+  Steps added(200);
+  for (std::uint32_t& s : reference) s = rng.below(kGrammarSteps + 1);
+  for (std::uint32_t& s : added) s = rng.below(kGrammarSteps + 1);
+  for (const std::uint32_t surplus :
+       {201u, 300u, std::numeric_limits<std::uint32_t>::max()}) {
+    CHECK(lays_out_as_oracle(gpu, layout, reference, 100, 7, 64,
+                             "the reference entries", added, surplus) == 0);
+    CHECK(lays_out_as_oracle(gpu, layout, Steps{}, 0, 0, 64, "nothing", added,
+                             surplus) == 0);
+  }
+  return 0;
+}
+
 // What record refuses, recording nothing: a segment or update size past the
-// rule, more reference entries than entries, and steps the input does not
-// hold. No entries records nothing and resets the totals.
+// rule, more reference entries than entries, and steps or a surplus word the
+// input does not hold. No entries records nothing and resets the totals.
 int refusals_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
   const Steps steps(100, 9);
   vkc::Result<vkc::Buffer> input =
       vr_test::upload_device_buffer(gpu.device, gpu.allocator, steps.data(),
                                     steps.size() * sizeof(std::uint32_t));
-  CHECK(input.ok());
+  const std::uint32_t zero = 0;
+  vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+      gpu.device, gpu.allocator, &zero, sizeof(zero));
+  vkc::Result<vkc::Buffer> half_word =
+      vkc::device_storage_buffer(gpu.allocator, 2);
+  CHECK(input.ok() && word.ok() && half_word.ok());
+  auto refused = [&](std::uint32_t n, std::uint32_t m, std::uint32_t u,
+                     std::uint32_t r, const vkc::Buffer& surplus,
+                     const char* says) {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    const vkc::Status s =
+        layout.record(batch, input.value(), surplus, n, m, u, r);
+    if (s.domain() != C::InvalidArgument || s.message().rfind(says, 0) != 0) {
+      std::fprintf(stderr, "%s: %s\n", says,
+                   s.ok() ? "not refused" : s.message().c_str());
+      return 1;
+    }
+    CHECK(batch.submit().ok());
+    return 0;
+  };
   const std::uint32_t over = codec::kMaxDeviceDecodeSegmentSize + 1;
   struct Refusal {
     std::uint32_t n, m, u, r;
@@ -280,16 +355,10 @@ int refusals_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
       {101, 0, 0, 64, "StepLayout::record: the steps"},
   };
   for (const Refusal& f : refusals) {
-    vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s =
-        layout.record(batch, input.value(), f.n, f.m, f.u, f.r);
-    if (s.domain() != C::InvalidArgument || s.message().rfind(f.says, 0) != 0) {
-      std::fprintf(stderr, "%s: %s\n", f.says,
-                   s.ok() ? "not refused" : s.message().c_str());
-      return 1;
-    }
-    CHECK(batch.submit().ok());
+    CHECK(refused(f.n, f.m, f.u, f.r, word.value(), f.says) == 0);
   }
+  CHECK(refused(100, 0, 0, 64, half_word.value(),
+                "StepLayout::record: the surplus") == 0);
   CHECK(lays_out_as_oracle(gpu, layout, steps, 0, 0, 64, "after refusals") ==
         0);
   CHECK(layout.totals().steps == 900);
@@ -306,6 +375,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (frames_case(gpu, layout) != 0) return 1;
   if (steps_case(gpu, layout) != 0) return 1;
   if (cap_case(gpu, layout) != 0) return 1;
+  if (clamp_case(gpu, layout) != 0) return 1;
   if (refusals_case(gpu, layout) != 0) return 1;
   std::puts("codec step layout: OK");
   return 0;

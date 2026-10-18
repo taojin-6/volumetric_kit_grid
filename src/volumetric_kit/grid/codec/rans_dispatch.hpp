@@ -26,7 +26,9 @@ namespace volumetric_kit::recon::codec::detail {
 /// Mirrors `Push` in rans_push.glsl.
 struct RansPush {
   std::uint32_t item_base = 0;
-  std::uint32_t num_entries = 0;  ///< M + A, every stream position.
+  /// M + A, every stream position; or for the count and layout a bound
+  /// whose surplus they bind (`counted_entries`).
+  std::uint32_t num_entries = 0;
   std::uint32_t coefficient_count = 0;
   std::uint32_t segment_size = 0;
   std::uint32_t segment_count = 0;

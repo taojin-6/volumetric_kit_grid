@@ -74,13 +74,19 @@ struct ResidentBlocks {
   /// A P-frame's mode for each reference entry, a u32 each
   /// (`frame_models.glsl`'s `kMode*`); null without reference entries.
   const core::Buffer* modes = nullptr;
-  /// The device frame reader's: for each reference entry e, and at e = M,
-  /// how many of the entries before it survive, a u32 each; null elsewhere.
+  /// The device frame reader's and the reference store's diff: for each
+  /// reference entry e, and at e = M, how many of the entries before it
+  /// survive, a u32 each; null elsewhere.
   const core::Buffer* ranks = nullptr;
   std::uint32_t count = 0;
   std::uint32_t coefficient_count = 0;  ///< K.
   /// M, the entries before the blocks: 0 for an intra frame.
   std::uint32_t reference_count = 0;
+  /// Set only by @ref ReferenceStore::record_diff: @ref count bounds the
+  /// entries at M plus every block of the frame, of which `ranks[M]`
+  /// survive and are not new, so the frame's entries are the first
+  /// `count - ranks[M]`.
+  bool bounded = false;
 };
 
 /// @brief The forward and inverse block DCT, as two GLSL compute kernels, and
