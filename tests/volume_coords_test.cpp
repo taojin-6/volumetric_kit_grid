@@ -100,8 +100,8 @@ int main() {
   CHECK(vol::truncation_blocks(wide) == 1);
 
   // --- VoxelGridParams::validate: this set is valid; a zero bucket count
-  // (which would make hash_bucket divide by zero) is rejected, as is a stale
-  // precomputed field.
+  // (which would make the spatial hash divide by zero) is rejected, as is a
+  // stale precomputed field.
   CHECK(grid.validate().ok());
   vol::VoxelGridParams bad = grid;
   bad.num_buckets = 0;

@@ -20,12 +20,13 @@
 
 #include "buffer_readback.hpp"
 #include "device_blocks.hpp"
+#include "hash.hpp"
 #include "test_check.hpp"
+#include "volume_hash_oracle.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
@@ -57,7 +58,7 @@ std::vector<vol::BlockIndex> coords_in_bucket(int target_bucket,
     for (int y = 1; y < 64 && out.size() < n; ++y) {
       for (int z = 1; z < 64 && out.size() < n; ++z) {
         const vr::Vec3i c(x, y, z);
-        if (static_cast<int>(vol::hash_bucket(c, num_buckets)) ==
+        if (static_cast<int>(vr_test::hash_bucket(c, num_buckets)) ==
             target_bucket) {
           vol::BlockIndex block{};
           block.coord = c;
@@ -366,7 +367,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
         coords_in_bucket(0, cg.num_buckets, kColliding);
     CHECK(cc.size() == kColliding);
     // The device agrees they share a bucket: a table of this shape that may
-    // not chain refuses the three past its four slots. hash_bucket chose them,
+    // not chain refuses the three past its four slots. The oracle chose them,
     // so a GLSL hash drifted from it would scatter them, build no chain, and
     // leave every check below passing.
     vkc::Result<std::uint32_t> crefused = vr_test::chain_refusals(gpu, cg, cc);

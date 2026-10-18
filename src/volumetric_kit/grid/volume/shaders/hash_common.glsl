@@ -3,18 +3,18 @@
 
 // Shared definitions for the voxel-hash compute kernels: the device struct
 // layouts (scalar block layout, byte-identical to the host POD structs in
-// volume/hash_types.hpp and volume/voxel_grid.hpp), the hash-table constants,
-// the push-constant block, and the spatial hash. #included by hash_init.comp,
-// hash_allocate_coords.comp, hash_compact.comp, and hash_delete_coords.comp.
+// volume/hash_types.hpp, volume/voxel_grid.hpp and the internal
+// volume/hash.hpp), the hash-table constants, the push-constant block, and the
+// spatial hash.
 //
 // Buffer bindings and the SSBO-touching helpers are NOT here: GLSL buffer blocks
 // are global and cannot be passed to functions, so each kernel declares only the
 // buffers it uses, and the lock/allocate helpers live in the allocate kernel
 // that needs them; the heap helpers, which delete shares, in hash_heap.glsl.
 //
-// A kernel OUTSIDE the volume tier reaches this through hash_lookup.glsl, which
-// wants the struct layouts, the constants and computeHashPos but has push
-// constants of its own -- so the `pc` block below is opt-out via
+// A kernel with push constants of its own -- another tier's, or one that
+// reaches this through hash_lookup.glsl -- still wants the struct layouts, the
+// constants and computeHashPos, so the `pc` block below is opt-out via
 // VR_HASH_COMMON_NO_PUSH_CONSTANTS. Everything else is shared unconditionally,
 // which is the point: a second copy of these constants would compile clean, pass
 // spirv-val, and resolve neighbours from the wrong bucket the moment one of them
@@ -54,7 +54,7 @@ struct BlockIndex {
 
 #include "block_stamp.glsl"
 
-// --- Hash-table constants (mirror volume/hash.hpp). ---
+// --- Slot sentinels: their one definition; no host code reads a slot. ---
 const int kFreeEntry = -1;
 const int kLockEntry = -2;
 const int kNoOffset = 0;
@@ -80,8 +80,8 @@ const int kMaxSpinRetries = 128;
 // allocate_in_overflow, which fixes the cost instead.
 
 // --- Fail-count slots. A host/device ABI (VoxelHashMap::dispatch_with_retry
-// reads them), so they live here beside the other shared constants rather than
-// in one kernel's header.
+// reads them), mirrored by volume/hash.hpp, so they live here beside the other
+// shared constants rather than in one kernel's header.
 //
 // [0..3] mirror hash_ops.metal and are **retryable**: the host re-dispatches
 // while any remain, because the element that failed is still unprocessed and
@@ -116,7 +116,8 @@ layout(push_constant, scalar) uniform PushConstants {
 } pc;
 #endif
 
-// Spatial hash: block coordinate -> bucket index (mirrors volume/hash.hpp).
+// Spatial hash: block coordinate -> bucket index (host oracle:
+// tests/volume_hash_oracle.hpp).
 uint computeHashPos(ivec3 block, int num_buckets) {
   uint h = (uint(block.x) * kHashPrimeX) ^ (uint(block.y) * kHashPrimeY) ^
            (uint(block.z) * kHashPrimeZ);

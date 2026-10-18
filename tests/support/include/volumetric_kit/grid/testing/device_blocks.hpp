@@ -100,8 +100,8 @@ inline vkc::Result<std::uint32_t> remove_blocks(
 // call of its own so no lock race enters the count. Coords that share a
 // bucket on the device fill its slots and the rest are refused, so this is the
 // device's own word on which coords collide -- what a chain fixture chosen by
-// the host's hash_bucket rests on, and what a GLSL hash drifted from that
-// mirror would change.
+// the tests' hash oracle (volume_hash_oracle.hpp) rests on, and what a GLSL
+// hash drifted from it would change.
 inline vkc::Result<std::uint32_t> chain_refusals(
     const Gpu& gpu, volumetric_kit::recon::volume::VoxelGridParams grid,
     const std::vector<volumetric_kit::recon::volume::BlockIndex>& coords) {

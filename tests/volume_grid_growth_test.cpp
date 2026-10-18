@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "device_blocks.hpp"
+#include "hash.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"

@@ -42,7 +42,7 @@ struct VoxelGridParams {
   /// @brief Check that every field is a usable value the helpers can trust.
   ///
   /// The coordinate and hash helpers treat these parameters as preconditions --
-  /// e.g. @ref hash_bucket divides by `num_buckets`, so a zero bucket count is
+  /// e.g. the spatial hash divides by `num_buckets`, so a zero bucket count is
   /// undefined. Validate a user-built set once here at configuration time
   /// rather than per-call on the device hot path.
   /// The two precomputed fields (`voxels_per_block`, `num_blocks`) are checked

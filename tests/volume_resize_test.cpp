@@ -19,12 +19,12 @@
 
 #include "device_blocks.hpp"
 #include "test_check.hpp"
+#include "volume_hash_oracle.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
@@ -251,8 +251,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     std::set<std::uint32_t> old_buckets;
     for (int i = 0; i < 4096 && clash.size() < 5; ++i) {
       const vr::Vec3i c(i % 64, i / 64, 0);
-      if (vol::hash_bucket(c, 9) == 0 &&
-          old_buckets.insert(vol::hash_bucket(c, 8)).second) {
+      if (vr_test::hash_bucket(c, 9) == 0 &&
+          old_buckets.insert(vr_test::hash_bucket(c, 8)).second) {
         vol::BlockIndex block{};
         block.coord = c;
         clash.push_back(block);
@@ -273,12 +273,12 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vol::BlockIndex sixth{};
     for (int i = 0; i < 4096; ++i) {
       const vr::Vec3i c(i % 64, i / 64, 1);
-      if (old_buckets.count(vol::hash_bucket(c, 8)) == 0) {
+      if (old_buckets.count(vr_test::hash_bucket(c, 8)) == 0) {
         sixth.coord = c;
         break;
       }
     }
-    CHECK(old_buckets.count(vol::hash_bucket(sixth.coord, 8)) == 0);
+    CHECK(old_buckets.count(vr_test::hash_bucket(sixth.coord, 8)) == 0);
     vkc::Result<std::uint32_t> placed_sixth =
         vr_test::allocate_blocks(gpu, small, &sixth, 1);
     CHECK(placed_sixth.ok() && placed_sixth.value() == 0);
