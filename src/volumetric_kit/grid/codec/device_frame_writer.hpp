@@ -52,8 +52,9 @@ namespace volumetric_kit::recon::codec::detail {
 /// reference (a keep entry's XOR mask and residuals), then its new blocks.
 /// Its count is recorded into its diff's batch, over the bounded entries
 /// @ref ReferenceStore::record_diff returns: the count and the layout take
-/// the survivors off the bound on the device, and @ref finish reads them
-/// back, so the host learns the new blocks' count only after the submit.
+/// the survivors off the bound on the device, @ref record_count reads their
+/// count back with the symbol counts, and @ref finish takes it off, so the
+/// host learns the new blocks' count only after the submit.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
