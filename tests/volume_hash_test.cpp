@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The tests' spatial-hash oracle (volume_hash_oracle.hpp): bucket range, three
-// locked known values (one per prime), and a weak distribution sanity check.
+// The tests' spatial-hash oracle (volume_hash_oracle.hpp): bucket range, locked
+// known values (one per prime, one that combines them), and a weak distribution
+// sanity check.
 // Pure host math -- no device -- so it always runs.
 
 #include <cstdint>
@@ -37,6 +38,9 @@ int main() {
   CHECK(vr_test::hash_bucket(vr::Vec3i(1, 0, 0), kBuckets) == 26093u);
   CHECK(vr_test::hash_bucket(vr::Vec3i(0, 1, 0), kBuckets) == 29669u);
   CHECK(vr_test::hash_bucket(vr::Vec3i(0, 0, 1), kBuckets) == 2791u);
+  // All three axes pin how the products combine: their XOR is 28855119, so
+  // 25119; a sum would give 28553.
+  CHECK(vr_test::hash_bucket(vr::Vec3i(1, 1, 1), kBuckets) == 25119u);
 
   // --- Weak distribution sanity: a diagonal line of coordinates must not all
   // collide into one bucket.
