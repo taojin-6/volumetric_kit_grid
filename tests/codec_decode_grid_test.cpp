@@ -72,11 +72,18 @@ vkc::Result<Frames> make_frames(Gpu& gpu) {
   return f;
 }
 
+// make_decode_grid's documented floor, and the most blocks it holds at half
+// its heap.
+constexpr std::int32_t kMinBuckets = 1024;
+constexpr std::uint32_t kMinBucketBlocks =
+    kMinBuckets * vol::kDefaultBucketSize / 2;
+
 // The buckets make_decode_grid documents: twice the blocks, at least 1024.
 std::int32_t decode_buckets(std::uint32_t blocks) {
   constexpr std::int32_t kBucket = vol::kDefaultBucketSize;
   return std::max(
-      std::int32_t((2 * std::int64_t(blocks) + kBucket - 1) / kBucket), 1024);
+      std::int32_t((2 * std::int64_t(blocks) + kBucket - 1) / kBucket),
+      kMinBuckets);
 }
 
 bool has_row(const vkc::StageMetrics& m, const char* name) {
@@ -91,8 +98,8 @@ bool has_row(const vkc::StageMetrics& m, const char* name) {
 // least 1024, float tsdf and weight alone, and no block yet; a frame decodes
 // into it.
 int make_grid_case(Gpu& gpu, const Frames& f) {
-  CHECK(f.small_blocks > 32 && f.small_blocks < 4096);
-  CHECK(f.large_blocks > 4096);
+  CHECK(f.small_blocks > 32 && f.small_blocks < kMinBucketBlocks);
+  CHECK(f.large_blocks > kMinBucketBlocks);
   struct Want {
     const Bytes* frame;
     float voxel;
@@ -100,7 +107,7 @@ int make_grid_case(Gpu& gpu, const Frames& f) {
     std::int32_t buckets;
   };
   const Want wants[] = {
-      {&f.small, kSmallVoxel, kSmallTrunc, 1024},
+      {&f.small, kSmallVoxel, kSmallTrunc, kMinBuckets},
       {&f.large, kVoxel, kTrunc, decode_buckets(f.large_blocks)},
   };
   for (const Want& want : wants) {

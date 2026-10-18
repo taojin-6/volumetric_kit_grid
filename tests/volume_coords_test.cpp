@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <type_traits>
 
 #include "test_check.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -111,9 +112,12 @@ int main() {
   CHECK(!bad.validate().ok());
 
   // --- The default hash layout, pinned: a change is deliberate. It validates;
-  // a zero-initialised set has no defaults and stays refused.
+  // the params keep no member defaults, so a zero-initialised set stays
+  // refused.
   static_assert(vol::kDefaultBucketSize == 8 && vol::kDefaultMaxChain == 128,
                 "the default hash layout");
+  static_assert(std::is_trivially_default_constructible_v<vol::VoxelGridParams>,
+                "VoxelGridParams keeps no member defaults");
   vol::VoxelGridParams layout = grid;
   layout.bucket_size = vol::kDefaultBucketSize;
   layout.num_blocks = vol::kDefaultBucketSize * layout.num_buckets;
