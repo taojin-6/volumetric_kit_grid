@@ -164,7 +164,8 @@ inline std::uint32_t content_hash(const oracle::Frame& f) {
 // a writer and a reader changed together. `content` pins the fixture, so a
 // failure says which changed. A new frame type adds rows; nothing else changes
 // a value (a new kFrameVersion is a new format, with goldens of its own). The
-// P-frames' rows are kGoldenInterFrames, below.
+// rule binds these rows, the P-frames' (kGoldenInterFrames) and the worked
+// example (example_bytes), all below.
 static_assert(d::kFrameVersion == 3, "the golden frames are v3's");
 
 struct GoldenFrame {
@@ -577,9 +578,9 @@ inline Merged merge_oracle(const std::vector<vr::Vec3i>& reference,
 
 // --- The worked example. ----------------------------------------------------
 //
-// bitstream.hpp's 161-byte P-frame, which every writer, the oracle or the
-// device, writes and every reader reads as the format says. It freezes with
-// type 1, as the golden P-frames do.
+// The format's 161-byte P-frame, which every writer, the oracle or the device,
+// writes and every reader reads as the format says; the golden rule (above)
+// binds it.
 
 // Its reference: a = (0,0,0) and b = (4,0,0), K = 1, voxel 1 cm, band 4 cm,
 // scale 0.2, weight 1.
@@ -745,8 +746,7 @@ inline std::vector<InterCode> inter_matrix() {
 // Type 1's bytes, pinned as kGoldenFrames pins type 0's: each row a P-frame
 // against a golden I-frame row's frame, whose bytes its REFERENCE names by
 // frame_hash, so a row's hash pins frame_hash's bytes too. The golden rule
-// binds them from type 1's freeze (DECISIONS, 2026-10-16); until then only a
-// change to type 1's format may change them.
+// (above) binds them (DECISIONS, the 2026-10-17 freeze).
 
 struct GoldenInterFrame {
   std::size_t reference;  // its reference: a row of kGoldenFrames

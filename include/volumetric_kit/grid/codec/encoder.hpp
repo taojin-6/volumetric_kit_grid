@@ -51,9 +51,9 @@ struct VR_CODEC_API EncoderConfig {
   std::uint32_t update_size = 0;
   /// Frames from one I-frame to the next, at least 1. At 1, the default,
   /// every frame is an I-frame; at N, an I-frame and N - 1 P-frames
-  /// (@ref FrameType::kInter, experimental) take turns; a period past the
-  /// stream's length codes P-frames after the first frame for as long as
-  /// the rules on @ref Encoder::encode allow.
+  /// (@ref FrameType::kInter) take turns; a period past the stream's length
+  /// codes P-frames after the first frame for as long as the rules on
+  /// @ref Encoder::encode allow.
   std::uint32_t intra_period = 1;
 
   /// @brief The update segment size a P-frame of this config codes with.
@@ -90,9 +90,9 @@ struct VR_CODEC_API EncoderConfig {
 /// @ref EncoderConfig::intra_period of 1 any frame, and above it the same
 /// chain of grids, from a fresh encoder or after the same I-frame.
 ///
-/// A P-frame (@ref FrameType::kInter, experimental) codes a frame against
-/// the last one @ref encode returned, its reference, which the encoder keeps
-/// on the device as it coded it -- quantized coefficients, masks and block
+/// A P-frame (@ref FrameType::kInter) codes a frame against the last one
+/// @ref encode returned, its reference, which the encoder keeps on the
+/// device as it coded it -- quantized coefficients, masks and block
 /// list -- so the reference is the one a @ref Decoder holds after decoding
 /// that frame: each block is skipped when unchanged, kept as residuals
 /// against the reference, recoded in full, or removed, and blocks the
