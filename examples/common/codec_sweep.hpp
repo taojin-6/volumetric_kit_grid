@@ -17,6 +17,7 @@
 #include "codec_stream.hpp"
 #include "stage_table.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
@@ -96,7 +97,6 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
                                    vr::volume::VoxelBlockGrid& player) {
   VKC_ASSIGN(vr::codec::Decoder dec,
              vr::codec::Decoder::create(device, allocator));
-  int grows = 0;
   const float tau = reference.options().fscore_threshold;
   if (tau > 0.0f) {
     std::printf(
@@ -120,7 +120,7 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
     VKC_ASSIGN(vr::codec::Encoder enc,
                vr::codec::Encoder::create(device, allocator, ec));
     VKC_ASSIGN(const Bytes warm, enc.encode(source));
-    VKC_TRY(decode_growing(dec, warm, player, nullptr, &grows));
+    VKC_TRY(vr::codec::decode_growing(dec, warm.data(), warm.size(), player));
 
     vkc::StageMetrics enc_rows;
     vkc::StageMetrics dec_rows;
@@ -128,7 +128,8 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
     Bytes frame;
     for (int repeat = 0; repeat < kTimedRounds; ++repeat) {
       VKC_ASSIGN(frame, enc.encode(source, &enc_rows));
-      VKC_TRY(decode_growing(dec, frame, player, &dec_rows, &grows));
+      VKC_TRY(vr::codec::decode_growing(dec, frame.data(), frame.size(), player,
+                                        &dec_rows));
     }
     VKC_ASSIGN(const vr::codec::FrameInfo info,
                vr::codec::read_frame_info(frame.data(), frame.size()));

@@ -13,6 +13,7 @@
 
 #include "codec_config.hpp"
 #include "codec_sweep.hpp"
+#include "grid_layout.hpp"
 #include "replica_config.hpp"
 #ifdef VR_TEST_ORBBEC_CONFIG
 #include "orbbec_config.hpp"

@@ -28,8 +28,10 @@
 
 #include "codec_fixture.hpp"
 #include "gpu_test.hpp"
+#include "grid_layout.hpp"
 #include "mesh_sequence.hpp"
 #include "scratch_dir.hpp"
+#include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/io/mesh_io.hpp"
@@ -613,8 +615,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     // player held after it.
     vkc::Result<codec::Decoder> dec =
         codec::Decoder::create(gpu.device, gpu.allocator);
-    vkc::Result<vol::VoxelBlockGrid> alone =
-        vr_example::player_grid(gpu.device, gpu.allocator, payload);
+    vkc::Result<vol::VoxelBlockGrid> alone = codec::make_decode_grid(
+        gpu.device, gpu.allocator, payload.data(), payload.size());
     CHECK(dec.ok() && alone.ok());
     CHECK(dec->decode(payload.data(), payload.size(), *alone).ok());
     vkc::Result<std::vector<vol::BlockIndex>> decoded =

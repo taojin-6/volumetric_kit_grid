@@ -4,17 +4,18 @@
 # --- recon_codec: the per-frame TSDF geometry codec --------------------------
 # Encodes a grid's active blocks as an intra frame, or a P-frame against the
 # frame coded before it, and decodes either back into a VoxelBlockGrid (the
-# 2026-09-26 decision). Public: CodecParams, and the Encoder and Decoder built
-# on the private pieces (encoder.cpp, decoder.cpp) -- the DctTransform (the GLSL
-# forward/inverse 8^3 DCT that turns a block list into quantized coefficients
-# plus an observed mask, and back), the rANS tables (rans.hpp, header-only), the
-# frame's layout, parsing and checks (bitstream.cpp; the 2026-09-27 decisions),
-# its device coders and their step layout (step_layout.cpp), the block lists'
-# sort, merge and grid diff (block_lists.cpp), and the reference a P-frame is
-# coded and decoded against (reference_store.cpp). Links recon_volume ALONE --
-# it reads a grid's tsdf/weight and re-creates blocks through the map, and needs
-# neither the integrator that produced the field nor the mesher that consumes
-# the decoded one.
+# 2026-09-26 decision). Public: CodecParams, the player's grid and its growth
+# (decode_grid.cpp), and the Encoder and Decoder built on the private pieces
+# (encoder.cpp, decoder.cpp) -- the DctTransform (the GLSL forward/inverse 8^3
+# DCT that turns a block list into quantized coefficients plus an observed mask,
+# and back), the rANS tables (rans.hpp, header-only), the frame's layout,
+# parsing and checks (bitstream.cpp; the 2026-09-27 decisions), its device
+# coders and their step layout (step_layout.cpp), the block lists' sort, merge
+# and grid diff (block_lists.cpp), and the reference a P-frame is coded and
+# decoded against (reference_store.cpp). Links recon_volume ALONE -- it reads a
+# grid's tsdf/weight and re-creates blocks through the map, and needs neither
+# the integrator that produced the field nor the mesher that consumes the
+# decoded one.
 include(GenerateExportHeader)
 include(GNUInstallDirs)
 
@@ -29,6 +30,7 @@ target_sources(
           block_lists.cpp
           codec_params.cpp
           dct_transform.cpp
+          decode_grid.cpp
           decoder.cpp
           device_frame_reader.cpp
           device_frame_writer.cpp
