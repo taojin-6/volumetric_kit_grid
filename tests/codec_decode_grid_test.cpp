@@ -74,7 +74,9 @@ vkc::Result<Frames> make_frames(Gpu& gpu) {
 
 // The buckets make_decode_grid documents: twice the blocks, at least 1024.
 std::int32_t decode_buckets(std::uint32_t blocks) {
-  return std::max(std::int32_t((2 * std::int64_t(blocks) + 7) / 8), 1024);
+  constexpr std::int32_t kBucket = vol::kDefaultBucketSize;
+  return std::max(
+      std::int32_t((2 * std::int64_t(blocks) + kBucket - 1) / kBucket), 1024);
 }
 
 bool has_row(const vkc::StageMetrics& m, const char* name) {
@@ -84,8 +86,8 @@ bool has_row(const vkc::StageMetrics& m, const char* name) {
   return false;
 }
 
-// The grid from a frame's header: its geometry exactly, 8^3 blocks, buckets
-// of 8 with a slot each and chains of 128, twice the blocks' buckets at
+// The grid from a frame's header: its geometry exactly, 8^3 blocks, the
+// default hash layout with a slot per entry, twice the blocks' buckets at
 // least 1024, float tsdf and weight alone, and no block yet; a frame decodes
 // into it.
 int make_grid_case(Gpu& gpu, const Frames& f) {
@@ -99,7 +101,7 @@ int make_grid_case(Gpu& gpu, const Frames& f) {
   };
   const Want wants[] = {
       {&f.small, kSmallVoxel, kSmallTrunc, 1024},
-      {&f.large, kVoxel, kTrunc, std::int32_t((2 * f.large_blocks + 7) / 8)},
+      {&f.large, kVoxel, kTrunc, decode_buckets(f.large_blocks)},
   };
   for (const Want& want : wants) {
     vkc::Result<vol::VoxelBlockGrid> grid = codec::make_decode_grid(
@@ -108,8 +110,10 @@ int make_grid_case(Gpu& gpu, const Frames& f) {
     const vol::VoxelGridParams& gp = grid->grid();
     CHECK(gp.voxel_size == want.voxel && gp.trunc_dist == want.trunc);
     CHECK(gp.block_size == 8 && gp.voxels_per_block == 512);
-    CHECK(gp.bucket_size == 8 && gp.num_buckets == want.buckets);
-    CHECK(gp.num_blocks == 8 * want.buckets && gp.max_chain == 128);
+    CHECK(gp.bucket_size == vol::kDefaultBucketSize &&
+          gp.num_buckets == want.buckets);
+    CHECK(gp.num_blocks == vol::kDefaultBucketSize * want.buckets &&
+          gp.max_chain == vol::kDefaultMaxChain);
     CHECK(grid->attribute_count() == 2);
     for (const char* name : {"tsdf", "weight"}) {
       vkc::Result<vol::AttributeView> view = grid->attribute(name);

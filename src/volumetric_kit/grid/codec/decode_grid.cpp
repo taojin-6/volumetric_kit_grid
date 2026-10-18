@@ -15,9 +15,7 @@
 namespace volumetric_kit::recon::codec {
 namespace {
 
-// The grid's hash layout: entries, and heap slots, per bucket; chain length.
-constexpr std::int32_t kBucketSize = 8;
-constexpr std::int32_t kMaxChain = 128;
+// The grid's fewest buckets.
 constexpr std::int32_t kMinBuckets = 1024;
 // Decodes again after the decoder's IoError, its lock contention.
 constexpr int kContendedRetries = 2;
@@ -26,11 +24,10 @@ constexpr int kContendedRetries = 2;
 // slot count fits an int32_t; no grid holds that many blocks anyway, which
 // VoxelBlockGrid::create and grow_grid refuse.
 std::int32_t decode_buckets(std::uint32_t blocks) {
-  const std::int64_t need =
-      (2 * std::int64_t(blocks) + kBucketSize - 1) / kBucketSize;
+  constexpr std::int32_t kBucket = volume::kDefaultBucketSize;
+  const std::int64_t need = (2 * std::int64_t(blocks) + kBucket - 1) / kBucket;
   return std::int32_t(std::clamp<std::int64_t>(
-      need, kMinBuckets,
-      std::numeric_limits<std::int32_t>::max() / kBucketSize));
+      need, kMinBuckets, std::numeric_limits<std::int32_t>::max() / kBucket));
 }
 
 }  // namespace
@@ -44,10 +41,10 @@ core::Result<volume::VoxelBlockGrid> make_decode_grid(
   grid.block_size = kBlockSize;
   grid.voxels_per_block = std::int32_t(kVoxelsPerBlock);
   grid.trunc_dist = info.trunc_dist;
-  grid.bucket_size = kBucketSize;
+  grid.bucket_size = volume::kDefaultBucketSize;
   grid.num_buckets = decode_buckets(info.block_count);
-  grid.num_blocks = kBucketSize * grid.num_buckets;
-  grid.max_chain = kMaxChain;
+  grid.num_blocks = grid.bucket_size * grid.num_buckets;
+  grid.max_chain = volume::kDefaultMaxChain;
   const volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                          {"weight", sizeof(float)}};
   return volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2);
