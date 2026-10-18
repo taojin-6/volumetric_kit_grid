@@ -35,7 +35,8 @@ namespace volumetric_kit::recon::codec {
 /// @param size       Bytes available at @p frame.
 /// @return The grid, empty; @ref read_frame_info's refusal of the header; or
 ///         @ref volume::VoxelBlockGrid::create's error, an allocation failure
-///         included.
+///         included. Host allocation failures, including header diagnostics,
+///         return `Status::Code::OutOfMemory`.
 VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
     core::Device& device, core::Allocator& allocator, const std::uint8_t* frame,
     std::size_t size);
@@ -64,9 +65,13 @@ VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
 ///                 @ref Decoder::decode gives, of the attempt that succeeds
 ///                 alone, so a frame that grew the grid is timed as one
 ///                 decode; the grow is not timed. `nullptr` measures nothing.
+///                 If aggregating the successful attempt runs out of host
+///                 memory, the prior metrics stay unchanged and the decode
+///                 still returns OK: its reference has already committed.
 /// @return OK; the last decode's error; @ref volume::grow_grid's, such as
 ///         `Status::Code::OutOfMemory` at the grid's ceiling; or
-///         `Status::Code::OutOfMemory` for a host allocation failure.
+///         `Status::Code::OutOfMemory` for a host allocation failure before
+///         the decode succeeds.
 VR_CODEC_API core::Status decode_growing(Decoder& decoder,
                                          const std::uint8_t* frame,
                                          std::size_t size,

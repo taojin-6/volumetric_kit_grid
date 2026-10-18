@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <utility>
 
+#include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/recon/volume/grid_growth.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
@@ -35,7 +37,7 @@ std::int32_t decode_buckets(std::uint32_t blocks) {
 
 core::Result<volume::VoxelBlockGrid> make_decode_grid(
     core::Device& device, core::Allocator& allocator, const std::uint8_t* frame,
-    std::size_t size) {
+    std::size_t size) try {
   VKC_ASSIGN(const FrameInfo info, read_frame_info(frame, size));
   volume::VoxelGridParams grid{};
   grid.voxel_size = info.voxel_size;
@@ -49,6 +51,9 @@ core::Result<volume::VoxelBlockGrid> make_decode_grid(
   const volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                          {"weight", sizeof(float)}};
   return volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("make_decode_grid",
+                                core::Status::Code::OutOfMemory);
 }
 
 core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
@@ -61,7 +66,17 @@ core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
     const core::Status s = decoder.decode(
         frame, size, grid, metrics != nullptr ? &attempt : nullptr);
     if (s.ok()) {
-      if (metrics != nullptr) metrics->merge(attempt);
+      if (metrics != nullptr) {
+        try {
+          core::StageMetrics merged = *metrics;
+          merged.merge(attempt);
+          *metrics = std::move(merged);
+        } catch (const std::bad_alloc&) {
+          // The decoder already committed its reference. Dropping this
+          // attempt's diagnostics must not turn that success into a failure
+          // the caller would retry; keep the caller's previous rows intact.
+        }
+      }
       return s;
     }
     if (s.domain() == core::Status::Code::OutOfMemory) {
@@ -76,7 +91,8 @@ core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
     }
   }
 } catch (const std::bad_alloc&) {
-  return core::Status::out_of_memory("decode_growing: host allocation failed");
+  return core::exception_status("decode_growing",
+                                core::Status::Code::OutOfMemory);
 }
 
 }  // namespace volumetric_kit::recon::codec
