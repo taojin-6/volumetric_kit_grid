@@ -99,8 +99,9 @@ enum class ExchangeOutcome {
 /// - **A taken mesh the consumer cannot commit yet is parked**, retried every
 ///   frame, and covered by no mark until it is committed. A newer mesh is not
 ///   taken meanwhile, so at most one is held uncommitted.
-/// - **An empty mesh is committed as "draw nothing"**, without the bindable
-///   check: it holds a slot like any other, and may name null buffers.
+/// - **An empty mesh is handed to the commit with its payload**, and draws
+///   nothing once committed. It skips the bindable check: it holds a slot
+///   like any other, and may name null buffers.
 /// - **A mesh that cannot be bound latches** the exchange: nothing more is
 ///   taken, so the producer stops extracting rather than walking the ring
 ///   through undrawable generations.
@@ -196,9 +197,9 @@ class MeshExchange {
   /// not the frame will draw: the release does not depend on drawing. It then
   /// holds @ref live for @p slot until @p slot is retired again.
   ///
-  /// A mesh taken now or parked earlier is committed as follows: an empty one
-  /// at once; one that cannot be bound is refused, which latches; any other
-  /// once @p commit accepts it, and parked when it does not.
+  /// A mesh taken now or parked earlier that is not empty and cannot be bound
+  /// is refused, which latches. Any other is committed once @p commit accepts
+  /// it, and parked when it does not.
   ///
   /// @p commit runs after the take, outside the exchange's lock, so the
   /// producer may be extracting and publishing the next mesh meanwhile.
@@ -208,7 +209,9 @@ class MeshExchange {
   /// @param commit  `bool(const DeviceMesh&, Payload&)`: make what the mesh
   ///                is drawn with (its atlas, from the payload, which it may
   ///                move from) and return `true`, or return `false` to keep
-  ///                the mesh parked and the live one drawn.
+  ///                the mesh parked and the live one drawn. It is called for
+  ///                an empty mesh too, which needs nothing made and may name
+  ///                null buffers.
   /// @return What happened to the mesh taken or parked.
   template <typename Commit>
   ExchangeOutcome begin_frame(std::uint32_t slot, Commit&& commit) {
@@ -228,10 +231,10 @@ class MeshExchange {
     if (took) collected_.notify_all();
     ExchangeOutcome outcome = ExchangeOutcome::kNone;
     if (parked_.has_value()) {
-      if (parked_->mesh.empty()) {
-        live_ = parked_->mesh;
-        outcome = ExchangeOutcome::kCommitted;
-      } else if (const char* why = unbindable_reason(parked_->mesh, config_)) {
+      const char* why = parked_->mesh.empty()
+                            ? nullptr
+                            : unbindable_reason(parked_->mesh, config_);
+      if (why != nullptr) {
         refused_ = why;
         outcome = ExchangeOutcome::kRefused;
       } else if (commit(std::as_const(parked_->mesh), parked_->payload)) {
