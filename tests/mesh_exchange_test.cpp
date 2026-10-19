@@ -342,8 +342,8 @@ int test_parked_take_is_never_released() {
 }
 
 // An extract that meshed nothing, on a slot never sized, names null buffers.
-// It skips the bindable check but not the commit, which gets its payload, is
-// committed as "draw nothing", and the exchange goes on taking meshes.
+// It skips the bindable check but not the commit, which gets its payload; it
+// is committed as "draw nothing", and the exchange goes on taking meshes.
 int test_empty_mesh_draws_nothing() {
   rmesh::MeshExchange<Tag> exchange(two_frames());
   FakeRing ring(3);

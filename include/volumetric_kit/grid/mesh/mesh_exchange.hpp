@@ -99,9 +99,9 @@ enum class ExchangeOutcome {
 /// - **A taken mesh the consumer cannot commit yet is parked**, retried every
 ///   frame, and covered by no mark until it is committed. A newer mesh is not
 ///   taken meanwhile, so at most one is held uncommitted.
-/// - **An empty mesh is handed to the commit with its payload**, and draws
-///   nothing once committed. It skips the bindable check: it holds a slot
-///   like any other, and may name null buffers.
+/// - **An empty mesh is handed to the commit with its payload**, skips the
+///   bindable check, and draws nothing once committed; it holds a slot like
+///   any other.
 /// - **A mesh that cannot be bound latches** the exchange: nothing more is
 ///   taken, so the producer stops extracting rather than walking the ring
 ///   through undrawable generations.
@@ -210,8 +210,9 @@ class MeshExchange {
   ///                is drawn with (its atlas, from the payload, which it may
   ///                move from) and return `true`, or return `false` to keep
   ///                the mesh parked and the live one drawn. It is called for
-  ///                an empty mesh too, which needs nothing made and may name
-  ///                null buffers.
+  ///                an empty mesh too, which may name null buffers and needs
+  ///                nothing made: return `false` for one only while its
+  ///                payload cannot be applied yet.
   /// @return What happened to the mesh taken or parked.
   template <typename Commit>
   ExchangeOutcome begin_frame(std::uint32_t slot, Commit&& commit) {
