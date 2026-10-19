@@ -6,11 +6,12 @@
 // beside the producer and sees only its own mesh's payload; a generation is
 // released once no frame in flight or live mesh holds it; a parked take is
 // never released, so no extract reclaims its slot; an empty mesh with null
-// buffers is committed as "draw nothing" and the exchange keeps going; an
-// unbindable mesh latches; the producer's bounded wait; generations at the top
-// of the range; and a seeded run of producer and consumer steps, failures
-// included, in which no slot the consumer holds is ever reclaimed and the ring
-// never stalls. Host only: no device.
+// buffers skips the bindable check but not the commit, which gets its payload
+// and may park it, and once committed draws nothing; an unbindable mesh
+// latches; the producer's bounded wait; generations at the top of the range;
+// and a seeded run of producer and consumer steps, failures included, in
+// which no slot the consumer holds is ever reclaimed and the ring never
+// stalls. Host only: no device.
 
 #include <algorithm>
 #include <atomic>
@@ -341,22 +342,23 @@ int test_parked_take_is_never_released() {
 }
 
 // An extract that meshed nothing, on a slot never sized, names null buffers.
-// It is committed as "draw nothing" without the bindable check or the commit,
-// and the exchange goes on taking meshes.
+// It skips the bindable check but not the commit, which gets its payload; it
+// is committed as "draw nothing", and the exchange goes on taking meshes.
 int test_empty_mesh_draws_nothing() {
   rmesh::MeshExchange<Tag> exchange(two_frames());
   FakeRing ring(3);
-  int commits = 0;
+  std::vector<std::uint64_t> committed;
   auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
-    ++commits;
-    return tag_matches(mesh, payload);
+    if (!tag_matches(mesh, payload)) return false;
+    committed.push_back(*payload);
+    return true;
   };
   auto empty = ring.extract(0);
   CHECK(empty.has_value() && empty->empty() && !empty->valid());
   empty->sharing_mode = VK_SHARING_MODE_EXCLUSIVE;  // unchecked when empty
-  exchange.publish(*empty, nullptr);
+  exchange.publish(*empty, tag(*empty));
   CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
-  CHECK(commits == 0);
+  CHECK(committed == std::vector<std::uint64_t>{empty->generation});
   CHECK(exchange.refused() == nullptr);
   CHECK(exchange.live().generation == empty->generation);
   CHECK(exchange.live().empty());
@@ -366,13 +368,92 @@ int test_empty_mesh_draws_nothing() {
   CHECK(g2.has_value());
   exchange.publish(*g2, tag(*g2));
   CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kCommitted);
-  CHECK(commits == 1);
+  CHECK(committed.size() == 2 && committed[1] == g2->generation);
   CHECK(exchange.live().generation == g2->generation);
 
   // The empty mesh's slot is released like any other.
   CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kNone);
   CHECK(exchange.release_and_may_publish(ring));
   CHECK(ring.released() == empty->generation);
+  return 0;
+}
+
+// An empty mesh after a drawn one: the commit gets its payload, so what a
+// consumer shows beside the mesh (a player's frame) moves on with it, and it
+// becomes the live mesh, drawing nothing. The drawn one is released once the
+// frames that drew it retire.
+int test_empty_mesh_replaces_a_drawn_one() {
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(3);
+  std::uint64_t shown = 0;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    if (!tag_matches(mesh, payload)) return false;
+    shown = *payload;
+    return true;
+  };
+  const auto g1 = ring.extract(4);
+  exchange.publish(*g1, tag(*g1));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kNone);
+  CHECK(shown == g1->generation);
+
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g2 = ring.extract(0);
+  CHECK(g2.has_value() && g2->empty());
+  exchange.publish(*g2, tag(*g2));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(shown == g2->generation);
+  CHECK(exchange.live().generation == g2->generation);
+  CHECK(exchange.live().empty());
+
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK(ring.released() == 0);  // slot 1's frame still draws g1
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kNone);
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK(ring.released() == g1->generation);
+  return 0;
+}
+
+// An empty mesh whose commit says not yet is parked like any other: retried
+// every frame, covered by no mark, and holding newer meshes back, until the
+// commit accepts it with its payload.
+int test_empty_mesh_parks() {
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(3);
+  bool ready = false;
+  int calls = 0;
+  std::uint64_t shown = 0;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    ++calls;
+    if (!ready || !tag_matches(mesh, payload)) return false;
+    shown = *payload;
+    return true;
+  };
+  const auto empty = ring.extract(0);
+  CHECK(empty.has_value() && empty->empty());
+  exchange.publish(*empty, tag(*empty));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kParked);
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kParked);
+  CHECK(calls == 2);
+  CHECK(exchange.live().generation == 0);
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK(ring.released() < empty->generation);
+
+  const auto g2 = ring.extract(4);
+  CHECK(g2.has_value());
+  exchange.publish(*g2, tag(*g2));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kParked);
+  CHECK(!exchange.release_and_may_publish(ring));
+  CHECK(ring.released() < empty->generation);
+
+  ready = true;
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kCommitted);
+  CHECK(shown == empty->generation);
+  CHECK(exchange.live().generation == empty->generation);
+  CHECK(exchange.live().empty());
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(shown == g2->generation);
+  CHECK(exchange.live().generation == g2->generation);
   return 0;
 }
 
@@ -474,10 +555,12 @@ int test_generations_at_top_of_range() {
 // that fail, frames skipped (a minimized window) and extracts forced over an
 // uncollected mesh. After every step, every generation the consumer holds --
 // drawn by a frame in flight, live, or parked -- is still in its slot, and
-// every commit pairs a mesh with its own payload. Then, with the failures
-// gone, the producer keeps publishing: the ring never stalls.
+// every commit, an empty mesh's included, pairs a mesh with its own payload
+// and may park it. Then, with the failures gone, the producer keeps
+// publishing: the ring never stalls.
 int test_seeded_run() {
   constexpr std::uint32_t kFrames = 2;
+  std::size_t empty_parks = 0;
   for (std::uint32_t seed = 1; seed <= 500; ++seed) {
     std::mt19937 random(seed);
     auto chance = [&](int percent) {
@@ -495,6 +578,7 @@ int test_seeded_run() {
       mismatched = mismatched || !tag_matches(mesh, payload);
       if (!healthy && chance(30)) {
         parked = mesh.generation;
+        empty_parks += mesh.empty() ? 1 : 0;
         return false;
       }
       parked = 0;
@@ -528,6 +612,7 @@ int test_seeded_run() {
     }
     CHECK(published_healthy > 20);
   }
+  CHECK(empty_parks > 0);
   return 0;
 }
 
@@ -540,6 +625,8 @@ int main() {
   if (const int rc = test_release_mark()) return rc;
   if (const int rc = test_parked_take_is_never_released()) return rc;
   if (const int rc = test_empty_mesh_draws_nothing()) return rc;
+  if (const int rc = test_empty_mesh_replaces_a_drawn_one()) return rc;
+  if (const int rc = test_empty_mesh_parks()) return rc;
   if (const int rc = test_unbindable_mesh_latches()) return rc;
   if (const int rc = test_wait_collected()) return rc;
   if (const int rc = test_generations_at_top_of_range()) return rc;
