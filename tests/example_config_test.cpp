@@ -58,11 +58,11 @@ int main() {
       std::fprintf(stderr, "%s: %s\n", example.file,
                    loaded.status().message().c_str());
     CHECK(loaded);
-    // Classic unless the rig viewer's; codec_orbbec alone writes codec rows
-    // and frames.
-    CHECK(loaded->fusion.dynamic ==
-          (example.application == cfg::Application::RigViewer));
+    // codec_orbbec alone writes codec rows and frames; it and the rig viewer
+    // fuse Dynamic, the rest Classic.
     const bool coded = std::string(example.file) == "codec_orbbec";
+    CHECK(loaded->fusion.dynamic ==
+          (coded || example.application == cfg::Application::RigViewer));
     CHECK(loaded->output.csv.empty() != coded &&
           loaded->output.stream.empty() != coded);
   }
@@ -127,14 +127,15 @@ int main() {
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/fuse_orbbec.json",
                 cfg::Application::FuseOrbbec);
   CHECK(fusion && !fusion->diagnostics.readback);
-  CHECK(fusion->fusion.accumulate);
-  // The rig coded set by set at 1 cm, each set its own reconstruction, at
-  // the codec templates' period; its outputs beside the scenario.
+  // The rig coded set by set at 1 cm, fused Dynamic and freeing stale blocks
+  // every 30 sets as rig_viewer does, at the codec templates' period; its
+  // outputs beside the scenario.
   const auto coding =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/codec_orbbec.json",
                 cfg::Application::FuseOrbbec);
   CHECK(coding && coding->operation == cfg::Operation::Fuse);
-  CHECK(!coding->fusion.accumulate && coding->fusion.voxel_size_m == 0.01F);
+  CHECK(coding->fusion.voxel_size_m == 0.01F &&
+        coding->fusion.free_after == 30 && coding->fusion.max_weight == 20.F);
   CHECK(coding->codec.intra_period == 30 && !coding->codec.sweep);
   const auto results = std::filesystem::path(VR_CONFIG_FIXTURES) / "results";
   CHECK(coding->output.stream ==
@@ -142,7 +143,7 @@ int main() {
   CHECK(coding->output.csv ==
         (results / "rig_frames.csv").lexically_normal().string());
   CHECK(coding->output.path ==
-        (results / "rig_last_set.ply").lexically_normal().string());
+        (results / "rig_end.ply").lexically_normal().string());
 
   const auto dataset =
       cfg::parse(R"({
