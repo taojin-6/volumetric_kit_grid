@@ -25,7 +25,8 @@ struct ClientOptions {
   /// No byte for this long, counted from @ref StreamClient::connect (the
   /// name lookup and the TCP connect included), ends the connection with
   /// `Status::Code::IoError`: a sender that stalled, or a path that died (the
-  /// VPN dropped).
+  /// VPN dropped). @ref StreamClient::next judges it after reading what has
+  /// come, so a caller back late keeps a sender that kept sending.
   std::chrono::milliseconds idle_limit{10'000};
 };
 

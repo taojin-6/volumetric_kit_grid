@@ -200,20 +200,21 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
     if (!s.failure.ok()) return s.failure;
     const Clock::time_point deadline =
         Clock::now() + std::max(wait, std::chrono::milliseconds{0});
-    // At least one step, so a wait of 0 still reads what has come; then the
-    // deadline ends the loop, though bytes keep coming, and the parser keeps
-    // a part chunk for the next call.
+    // At least one step, so a wait of 0 still reads what has come, and a
+    // caller back late reads what came meanwhile before the idle limit is
+    // judged; then the deadline ends the loop, though bytes keep coming, and
+    // the parser keeps a part chunk for the next call.
     for (bool stepped = false;; stepped = true) {
       core::Result<bool> got = s.parser.next(record, payload);
       if (!got.ok()) return s.fail(std::move(got).status());
       if (*got) return true;
-      if (stepped && Clock::now() >= deadline) return false;
       const Clock::time_point idle = s.last_byte + s.options.idle_limit;
-      if (Clock::now() >= idle) {
+      if (stepped && Clock::now() >= idle) {
         return s.fail(core::Status::io_error(
             s.api + ": no byte for " +
             std::to_string(s.options.idle_limit.count()) + " ms"));
       }
+      if (stepped && Clock::now() >= deadline) return false;
       core::Status moved = s.step(std::min(deadline, idle));
       if (!moved.ok()) return s.fail(std::move(moved));
     }
