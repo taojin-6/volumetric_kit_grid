@@ -10,16 +10,18 @@
 // returns false in about 20 ms, and within 500 ms while chunks it skips flood
 // in; next(0 ms) alone connects and reads, a 230 KB record already in the
 // socket in one call; idle_limit counts from connect, against a listener that
-// sends nothing and one whose queue is full, and then from the last byte,
-// judged after reading what came while the caller was away;
+// sends nothing and a port whose connects never finish, and then from the
+// last byte, judged after reading what came while the caller was away;
 // milliseconds::max() as idle_limit or wait is never; localhost reaches a
-// 127.0.0.1 server; and an empty host, port 0 or an idle_limit of 0 or less is
-// refused. Each error reads "StreamClient: 127.0.0.1:<port>: <reason>", the
+// 127.0.0.1 server, and clients destroyed mid-lookup leave it to end alone;
+// and an empty host, port 0 or an idle_limit of 0 or less is refused. Each
+// error reads "StreamClient: 127.0.0.1:<port>: <reason>", the
 // address in it once, with the stage the idle limit ended in as its reason,
 // and is returned again by every later call.
 
 #include <fcntl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -462,6 +464,38 @@ int localhost_case() {
   return 0;
 }
 
+// Clients of localhost destroyed while their lookups run, half before any
+// next and half after next(0), leave the lookups to end alone: a lookup
+// writing to a client gone would fail, under ASan and TSan or on its mutex.
+// Every core is kept busy meanwhile, so a lookup's thread waits to run.
+int abandoned_lookup_case() {
+  const std::uint16_t port = net::closed_port();
+  CHECK(port != 0);
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> busy;
+  for (unsigned i = 0; i < std::max(2u, std::thread::hardware_concurrency());
+       ++i) {
+    busy.emplace_back([&stop] {
+      while (!stop) {
+      }
+    });
+  }
+  bool made = true;  // checked once the busy threads are joined
+  for (int i = 0; i < 60 && made; ++i) {
+    auto client = net::connect(port, {}, "localhost");
+    made = client != nullptr;
+    if (made && i % 2 == 1) {
+      Got got;
+      made = client->next(0ms, &got.record, &got.payload).ok();
+    }
+  }
+  stop = true;
+  for (std::thread& t : busy) t.join();
+  CHECK(made);
+  std::this_thread::sleep_for(200ms);  // the lookups end meanwhile
+  return 0;
+}
+
 int refusals_case() {
   CHECK(networking::StreamClient::connect("", 47801).status().domain() ==
         Code::InvalidArgument);
@@ -495,6 +529,7 @@ int main() {
   if (late_caller_case() != 0) return 1;
   if (never_case() != 0) return 1;
   if (localhost_case() != 0) return 1;
+  if (abandoned_lookup_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::puts("networking client: OK");
   return 0;
