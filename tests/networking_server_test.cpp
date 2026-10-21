@@ -15,11 +15,11 @@
 // refusal logged at Warning and the next at Info, and a client refused there
 // is told it may have been; peers reset before they are accepted are dropped
 // with no Warning while a viewer joins; a viewer that leaves never fails
-// publish; the writer's refusals send nothing, and start
-// refuses (a stall_limit of 0 or less among them); the destructor returns
-// within 1 s with no viewers, idle ones and a stalled one; and 100 SIGUSR1 to
-// a no-op handler leave the stream whole. Every test that publishes first
-// waits for the viewer's session.
+// publish; the writer's refusals send nothing, and so does a payload over the
+// parser's cap; start refuses (a stall_limit of 0 or less among them); the
+// destructor returns within 1 s with no viewers, idle ones and a stalled one;
+// and 100 SIGUSR1 to a no-op handler leave the stream whole. Every test that
+// publishes first waits for the viewer's session.
 
 #include <pthread.h>
 #include <signal.h>
@@ -732,6 +732,20 @@ int rules_case() {
   networking::ServerOptions taken = local;
   taken.port = server->port();
   CHECK(start(session, taken) == Code::IoError);
+
+  // A payload over the parser's cap, which no client reads, is refused
+  // though the GOP limit is raised past it, with nothing changed: the same
+  // seq is published after.
+  networking::ServerOptions wide;
+  wide.max_gop_bytes = std::uint64_t{256} << 20;
+  auto big = net::serve(session, wide);
+  CHECK(big != nullptr);
+  constexpr auto kOver =
+      static_cast<std::size_t>(stream::ChunkParser::kMaxBodyBytes) + 1;
+  const auto huge = std::make_unique<std::uint8_t[]>(kOver);
+  CHECK(big->publish(vrst::info(0, true, 0, 0), huge.get(), kOver).domain() ==
+        Code::InvalidArgument);
+  CHECK(big->publish(vrst::info(0, true, 0, 0), payload.data(), 64).ok());
   return 0;
 }
 

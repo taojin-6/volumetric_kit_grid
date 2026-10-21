@@ -344,6 +344,13 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
   constexpr std::string_view kApi = "StreamServer::publish";
   Impl& s = *impl_;
   try {
+    if (size > stream::ChunkParser::kMaxBodyBytes) {
+      return core::Status::invalid_argument(
+          std::string(kApi) + ": a payload of " + std::to_string(size) +
+          " bytes, above the " +
+          std::to_string(stream::ChunkParser::kMaxBodyBytes) +
+          " a viewer reads");
+    }
     core::Result<stream::ChunkEncoder::RecordFraming> framed =
         s.encoder.frame(info, data, size);
     if (!framed.ok()) return std::move(framed).status().with_context(kApi);

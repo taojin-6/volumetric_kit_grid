@@ -110,7 +110,9 @@ class VR_NETWORKING_API StreamServer {
   /// @param data  The payload; may be null when @p size is 0.
   /// @param size  The payload's bytes.
   /// @return OK, with viewers or none; `Status::Code::InvalidArgument` for a
-  ///         record breaking the rules, with nothing sent;
+  ///         record breaking the rules, or a payload over
+  ///         `stream::ChunkParser::kMaxBodyBytes` (64 MiB), which no viewer
+  ///         reads, with nothing sent;
   ///         `Status::Code::OutOfMemory` when it cannot be copied, which
   ///         drops it and every record until the next key, as an overflow
   ///         does. Never a viewer's failure.
