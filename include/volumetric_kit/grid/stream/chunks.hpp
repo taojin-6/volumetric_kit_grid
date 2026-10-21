@@ -106,8 +106,8 @@ class VR_STREAM_API ChunkEncoder {
 /// **What is skipped.** A chunk of another tag (`INDX` and `TAIL`, a
 /// finished file's footer, included) and a `RECD` setting a flag this
 /// version does not know are skipped by their size, once checked, so a
-/// whole file, finished or not, parses. Nothing resyncs: after a failure,
-/// every call returns it again.
+/// whole file whose chunks are within the limits above parses, finished or
+/// not. Nothing resyncs: after a failure, every call returns it again.
 ///
 /// **Memory.** @ref feed copies its bytes. The parser holds the chunk it is
 /// reading and what was fed after it: about one chunk, when it is fed a piece

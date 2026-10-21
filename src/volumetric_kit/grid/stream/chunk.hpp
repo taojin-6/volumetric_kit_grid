@@ -178,6 +178,12 @@ bool header_crc_ok(const std::uint8_t* header, std::uint32_t h);
 bool decode_chunk(const std::uint8_t* header, std::uint32_t h,
                   std::uint32_t tracks, Chunk* out);
 
+// Whether `c` is a `RECD` setting only the flags this version knows; one
+// setting another is skipped (stream/session.hpp).
+inline bool known_record(const Chunk& c) {
+  return c.tag == kRecordTag && (c.flags & ~kKeyFlag) == 0;
+}
+
 // The session header's H, from its first 8 bytes at `header`:
 // InvalidArgument unless they start with `VRST` and H is a header size of at
 // least 56 within `available`.
