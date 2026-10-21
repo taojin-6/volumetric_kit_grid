@@ -25,7 +25,9 @@
 #include <utility>
 #include <vector>
 
+#include "codec_fixture.hpp"
 #include "codec_oracle_device.hpp"
+#include "codec_oracle_encode.hpp"
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
 #include "device_blocks.hpp"
@@ -1275,6 +1277,54 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   return 0;
 }
 
+// The true-SDF passes keep the host rule's blocks and write its cut set
+// whether the active list runs in one dispatch or in chunks of 3 or 7
+// blocks: a curtain cut across block faces, and a speck kept by the near
+// rule alone.
+int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
+  vr_test::Gpu ctx{device, allocator};
+  const codec_fixture::Curtain curtain{
+      codec_fixture::Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, true};
+  vkc::Result<vol::VoxelBlockGrid> g =
+      codec_fixture::curtain_grid(ctx, curtain);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vkc::Result<codec_oracle::SurfaceSet> set =
+      codec_oracle::surface_set(ctx, grid);
+  CHECK(set.ok());
+  const codec_oracle::SurfaceSet& host = set.value();
+  CHECK(host.cut_across_faces > 0 && host.near_only_blocks > 0);
+  vkc::Result<vol::DeviceBlockList> list =
+      grid.map().compact_active_blocks_on_device();
+  CHECK(list.ok() && list.value().count > 7);
+  for (const std::uint32_t chunk : {0u, 3u, 7u}) {
+    vkc::Result<std::unique_ptr<DctTransform>> made =
+        DctTransform::create(device, allocator);
+    CHECK(made.ok());
+    DctTransform& chunked = *made.value();
+    vr::detail::set_test_groups_per_dispatch(chunk);
+    vkc::Result<std::uint32_t> n = chunked.observed(grid, list.value(), true);
+    vr::detail::set_test_groups_per_dispatch(0);
+    CHECK(n.ok() && n.value() == host.blocks.size());
+    vkc::Result<std::vector<vol::BlockIndex>> kept =
+        vr_test::read_back<vol::BlockIndex>(device, allocator,
+                                            chunked.observed_list(), n.value());
+    CHECK(kept.ok());
+    std::sort(kept.value().begin(), kept.value().end(),
+              [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
+                return vol::coord_less(a.coord, b.coord);
+              });
+    for (std::size_t i = 0; i < host.blocks.size(); ++i) {
+      CHECK(kept.value()[i].coord == host.blocks[i].coord);
+    }
+    vkc::Result<std::vector<std::uint32_t>> cut =
+        vr_test::read_back<std::uint32_t>(device, allocator, chunked.cut_set(),
+                                          host.cut.size());
+    CHECK(cut.ok() && cut.value() == host.cut);
+  }
+  return 0;
+}
+
 // Reuse scratch through count/K growth, shrink, odd padding and an empty
 // transform. Coefficients and inverse output must still match the independent
 // CPU reference; inverse must not touch a retained list's obsolete suffix.
@@ -1450,6 +1500,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (observed_case(dev, alloc, *chunked.value()) != 0) return 1;
   if (scratch_reuse_case(dev, alloc, *chunked.value()) != 0) return 1;
   vr::detail::set_test_groups_per_dispatch(0);
+  if (surface_chunks_case(dev, alloc) != 0) return 1;
   if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
   std::printf("codec DctTransform: OK\n");
   return 0;

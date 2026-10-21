@@ -775,9 +775,18 @@ int stale_cut_case(Gpu& gpu) {
   CHECK(cut.ok());
   vkc::Result<Snapshot> with_cuts = decoded(gpu, cut.value());
   CHECK(with_cuts.ok() && unobserved(with_cuts.value()) > 0);
+  vkc::Result<std::vector<vol::BlockIndex>> before = active_sorted(grid);
   CHECK(grid.clear().ok());
   CHECK(allocate(gpu, grid, union_blocks({curtain.sphere}, wide_band())).ok());
   CHECK(write_sphere(gpu, grid, curtain.sphere).ok());
+  vkc::Result<std::vector<vol::BlockIndex>> after = active_sorted(grid);
+  CHECK(before.ok() && after.ok() &&
+        coords_of(before.value()) == coords_of(after.value()));
+  bool moved = false;
+  for (std::size_t i = 0; i < after.value().size(); ++i) {
+    moved = moved || before.value()[i].ptr != after.value()[i].ptr;
+  }
+  CHECK(moved);  // the premise: the blocks sit in other slots
   vkc::Result<Bytes> clean = enc.value().encode(grid);
   vkc::Result<Bytes> oracle =
       codec_oracle::encode(gpu, grid, true_sdf_config());

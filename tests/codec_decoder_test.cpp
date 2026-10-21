@@ -880,7 +880,8 @@ std::vector<TrueSdfSetting> true_sdf_settings() {
 // decode on the Decoder as any frame does: every voxel of every decoded
 // block observed, since the band holds them all and nothing in a true
 // distance is cut, and the mesh on the truth within the defaults' bounds,
-// its triangles the source's -- no block a surface cell needs is left out.
+// with about the source's triangle count (surface_blocks_case in
+// codec_encoder_test pins the exact block set).
 int true_sdf_decode_case(Gpu& gpu, codec::Decoder& dec) {
   const Union truth{Sphere{vr::Vec3f(0.0f, 0.02f, 0.0f), 0.12f},
                     Sphere{vr::Vec3f(0.33f, 0.0f, 0.0f), 0.05f}};
