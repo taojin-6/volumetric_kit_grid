@@ -79,8 +79,9 @@ struct ResidentBlocks {
   bool bounded = false;
 };
 
-/// @brief The forward and inverse block DCT, as two GLSL compute kernels, and
-///        a third that finds the blocks holding an observed voxel.
+/// @brief The forward and inverse block DCT, as two GLSL compute kernels, a
+///        third that finds the blocks to code, and the true SDF passes before
+///        it (`EncoderConfig::true_sdf`).
 ///
 /// One workgroup of `kEdge^2` (64) invocations per listed block; each owns one
 /// `kEdge`-voxel line per separable pass. The forward kernel reads `weight`,
@@ -120,8 +121,9 @@ struct ResidentBlocks {
 /// writer codes it), and the inverse reads its input where the reference
 /// store's apply wrote it, in the caller's batch too; each reads back its
 /// reject count alone, and the observed filter its count and reject tally.
-/// The observed list grows when needed and remains allocated for later
-/// calls. The coefficients travel two to a word, 16 bits each.
+/// The observed list, the cut set and the keep flags grow when needed and
+/// remain allocated for later calls. The coefficients travel two to a word,
+/// 16 bits each.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -161,6 +163,11 @@ class VR_CODEC_API DctTransform {
   ///                      words go, an odd K's pad half 0; must outlive the
   ///                      output.
   /// @param rejected      Written at submit; must outlive it.
+  /// @param cut           Optional cut set, one bit per voxel of the grid's
+  ///                      heap (slot s at bit s % 32 of word s / 32), whose
+  ///                      set voxels are coded as unobserved
+  ///                      (`EncoderConfig::true_sdf`); must outlive the
+  ///                      submit. `nullptr` reads none.
   /// @param stage         Optional scope the caller's stage row is open
   ///                      under; the dispatches record their device spans
   ///                      into it. `nullptr` times nothing.
@@ -171,13 +178,15 @@ class VR_CODEC_API DctTransform {
   ///         size, a non-positive `trunc_dist`, or lacks a float `tsdf` /
   ///         `weight`; more entries than the grid's block heap; a @p list
   ///         `StorageInput::check` refuses for them; output buffers smaller
-  ///         than they need; or a buffer that would exceed
-  ///         `maxStorageBufferRange`. Otherwise a buffer failure.
+  ///         than they need; a @p cut smaller than the grid's heap; or a
+  ///         buffer that would exceed `maxStorageBufferRange`. Otherwise a
+  ///         buffer failure.
   core::Result<ResidentBlocks> record_forward(
       core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
       const core::Buffer& list, std::uint32_t count, const CodecParams& params,
       const core::Buffer& masks, const core::Buffer& coefficients,
-      std::uint32_t& rejected, core::GpuStageScope* stage = nullptr);
+      std::uint32_t& rejected, const core::Buffer* cut = nullptr,
+      core::GpuStageScope* stage = nullptr);
 
   /// @return The refusal for @p rejected entries of @p count the kernels
   ///         found no block for, or OK when there are none.
@@ -213,18 +222,25 @@ class VR_CODEC_API DctTransform {
 
   /// @brief Gather the entries of @p list whose block holds an observed
   ///        voxel (`weight >= volume::kObservedWeight`) into
-  ///        @ref observed_list, in unspecified order.
+  ///        @ref observed_list, in unspecified order -- or, with @p true_sdf,
+  ///        those `EncoderConfig::true_sdf` codes, its cut set left in
+  ///        @ref cut_set.
   ///
   /// What the encoder keeps, found before the forward transform rather than
   /// after it. This reads each block's weights alone and appends only observed
   /// entries to a device list; only the count and the reject tally come back.
-  /// The encoder sorts the entries by coordinate on the device before
-  /// transforming them, so append order cannot affect bytes.
-  /// @param grid   As @ref record_forward.
-  /// @param list   The map's own active list, bound where it is
-  ///               (@ref
-  ///               volume::VoxelHashMap::compact_active_blocks_on_device).
-  /// @param stage  As @ref record_forward.
+  /// With @p true_sdf, two passes over the list come first in the same batch:
+  /// the cut, then the flags of the blocks holding a corner of a cell kept,
+  /// which the append then takes instead. The encoder sorts the entries by
+  /// coordinate on the device before transforming them, so append order
+  /// cannot affect bytes.
+  /// @param grid      As @ref record_forward.
+  /// @param list      The map's own active list, bound where it is
+  ///                  (@ref
+  ///                  volume::VoxelHashMap::compact_active_blocks_on_device).
+  /// @param true_sdf  Whether to keep the blocks `EncoderConfig::true_sdf`
+  ///                  codes.
+  /// @param stage     As @ref record_forward.
   /// @return How many entries @ref observed_list holds;
   ///         `Status::Code::InvalidArgument` for a list
   ///         @ref volume::VoxelHashMap::check_device_block_list refuses, a
@@ -232,6 +248,7 @@ class VR_CODEC_API DctTransform {
   ///         `maxStorageBufferRange`; otherwise a buffer or dispatch failure.
   core::Result<std::uint32_t> observed(const volume::VoxelBlockGrid& grid,
                                        const volume::DeviceBlockList& list,
+                                       bool true_sdf,
                                        core::GpuStageScope* stage = nullptr);
 
   /// @return The last @ref observed call's entries, `volume::BlockIndex`
@@ -239,6 +256,11 @@ class VR_CODEC_API DctTransform {
   const core::Buffer& observed_list() const noexcept {
     return observed_blocks_;
   }
+
+  /// @return The cut set of the last @ref observed call with `true_sdf` and
+  ///         a non-empty list, laid out as @ref record_forward takes it, valid
+  ///         until the next such call.
+  const core::Buffer& cut_set() const noexcept { return cut_; }
 
  private:
   DctTransform() = default;
@@ -249,6 +271,15 @@ class VR_CODEC_API DctTransform {
     volume::AttributeView weight;
   };
 
+  /// What `EncoderConfig::true_sdf` adds to a call: the switch, the cut set
+  /// bound, the transform's own unless the caller's, and the passes: the
+  /// surface kernel's two (cut, then keep), each kernel's one otherwise.
+  struct TrueSdf {
+    bool on = false;
+    const core::Buffer* cut = nullptr;
+    std::uint32_t passes = 1;
+  };
+
   /// The grid / params checks both directions share, all taken before
   /// anything is allocated, and for an empty list too.
   core::Result<GridViews> check_inputs(const char* op,
@@ -256,15 +287,17 @@ class VR_CODEC_API DctTransform {
                                        const CodecParams& params) const;
 
   /// Bind the call's buffers and record @p kernel over the @p count entries
-  /// of @p list into @p batch, a workgroup an entry, the reject count zeroed
-  /// first.
-  /// @p coefficients may be null for the kernel that reads none.
+  /// of @p list into @p batch, a workgroup an entry, once per pass of
+  /// @p true_sdf (a batch takes no set rewritten after a dispatch), the
+  /// reject count zeroed first. @p coefficients and @p masks may be null for
+  /// a kernel that reads none.
   core::Status record(core::CommandBatch& batch, core::ComputeKernel& kernel,
                       const volume::VoxelBlockGrid& grid,
                       const GridViews& views, VkBuffer list,
                       std::uint32_t count, const CodecParams& params,
                       VkBuffer coefficients, VkBuffer masks,
-                      VkDeviceSize masks_bytes, core::GpuStageScope* stage);
+                      VkDeviceSize masks_bytes, const TrueSdf& true_sdf,
+                      core::GpuStageScope* stage);
   /// Grow @p buffer if needed, retaining it for later calls
   /// (`ensure_device_scratch`).
   core::Status ensure_scratch(core::Buffer& buffer, VkDeviceSize bytes,
@@ -279,12 +312,13 @@ class VR_CODEC_API DctTransform {
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // The kernels share one layout shape (ten storage buffers + the push range)
-  // and one pool. Declared before pool_ and tables_, so those are destroyed
-  // first -- the kernels' sets are freed with the pool.
+  // The kernels share one layout shape (twelve storage buffers + the push
+  // range) and one pool. Declared before pool_ and tables_, so those are
+  // destroyed first -- the kernels' sets are freed with the pool.
   core::ComputeKernel forward_kernel_;
   core::ComputeKernel inverse_kernel_;
   core::ComputeKernel observed_kernel_;
+  core::ComputeKernel surface_kernel_;
   core::DescriptorPool pool_;
   // The basis + zigzag tables (binding 3), uploaded once.
   core::Buffer tables_;
@@ -297,6 +331,11 @@ class VR_CODEC_API DctTransform {
   // Scratch stays alive between calls; each binding uses its logical range,
   // not the retained capacity. No allocation when a call fits it.
   core::Buffer observed_blocks_;
+  // The true SDF passes' cut set (binding 10, a bit a voxel slot) and keep
+  // flags (binding 11, a word a block slot), sized to the grid's heap and
+  // zeroed in each observed() batch that uses them.
+  core::Buffer cut_;
+  core::Buffer keep_;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

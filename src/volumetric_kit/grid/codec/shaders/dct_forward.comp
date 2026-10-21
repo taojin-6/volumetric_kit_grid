@@ -10,7 +10,8 @@
 // (CodecParams::validate keeps the step coarse enough that the clamp never
 // engages on in-range input), two to a word (see coefficient_words). Also
 // pack the observed mask: bit v % 32 of word v / 32 is set where voxel v's
-// weight >= observed_weight.
+// weight >= observed_weight -- and, with pc.true_sdf, its bit in the cut set
+// is clear: a cut voxel is coded as unobserved.
 //
 // Re-implements the prior engine's computeDCTKernel (compute_dct.cu) with one
 // lane per line instead of one thread per voxel -- see dct_common.glsl. Output
@@ -35,6 +36,10 @@ layout(set = 0, binding = VR_DCT_BINDING_COEFFICIENTS, scalar) writeonly buffer
 layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) writeonly buffer
     Masks {
   uint masks[];
+};
+// Read only with pc.true_sdf (see dct_common.glsl).
+layout(set = 0, binding = VR_DCT_BINDING_CUT, scalar) readonly buffer Cut {
+  uint cut[];
 };
 
 shared uint s_mask[kMaskWords];
@@ -125,8 +130,12 @@ void main() {
   uint line_bits = 0u;
   for (uint x = 0u; x < kEdge; ++x) {
     uint v = x_line_base(lane) + x;
-    bool obs = weight[voxel_base + v] >= pc.observed_weight;
-    s_work[v] = obs ? tsdf[voxel_base + v] * inv_trunc : 0.0;
+    uint slot = voxel_base + v;
+    bool obs = weight[slot] >= pc.observed_weight &&
+               (pc.true_sdf == 0u ||
+                ((cut[slot / kMaskWordBits] >> (slot % kMaskWordBits)) & 1u) ==
+                    0u);
+    s_work[v] = obs ? tsdf[slot] * inv_trunc : 0.0;
     s_known[v] = obs ? 1u : 0u;
     if (obs) {
       line_bits |= 1u << x;

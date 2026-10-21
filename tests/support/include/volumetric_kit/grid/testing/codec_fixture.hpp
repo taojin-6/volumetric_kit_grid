@@ -176,23 +176,86 @@ inline vkc::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
   return write_field(gpu, grid, [&s](const vr::Vec3f& p) { return s.sdf(p); });
 }
 
+// The band blocks of every sphere in @p spheres, each coordinate once.
+inline std::vector<vr::Vec3i> union_blocks(const std::vector<Sphere>& spheres,
+                                           const GridShape& shape = {}) {
+  std::vector<vr::Vec3i> coords;
+  for (const Sphere& s : spheres) {
+    for (const vr::Vec3i& c :
+         band_blocks(s, shape.voxel_size, shape.trunc_dist)) {
+      if (std::find(coords.begin(), coords.end(), c) == coords.end()) {
+        coords.push_back(c);
+      }
+    }
+  }
+  return coords;
+}
+
 // A grid holding the union of two spheres, @p a and @p b, each's band blocks
 // allocated and the nearer surface's distance written: one sphere that
 // moves beside one that stays, as a chain of frames.
-inline vkc::Result<vol::VoxelBlockGrid> two_sphere_grid(Gpu& gpu,
-                                                        const Sphere& a,
-                                                        const Sphere& b) {
-  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
-  std::vector<vr::Vec3i> coords = band_blocks(a);
-  for (const vr::Vec3i& c : band_blocks(b)) {
-    if (std::find(coords.begin(), coords.end(), c) == coords.end()) {
-      coords.push_back(c);
-    }
-  }
-  VKC_TRY(allocate(gpu, grid, coords));
+inline vkc::Result<vol::VoxelBlockGrid> two_sphere_grid(
+    Gpu& gpu, const Sphere& a, const Sphere& b, const GridShape& shape = {}) {
+  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
+  VKC_TRY(allocate(gpu, grid, union_blocks({a, b}, shape)));
   VKC_TRY(write_field(gpu, grid, [&a, &b](const vr::Vec3f& p) {
     return std::min(a.sdf(p), b.sdf(p));
   }));
+  return grid;
+}
+
+// --- True signed distances (EncoderConfig::true_sdf). ----------------------
+
+// A band of 16 voxels, past kTrueSdfBandVoxels, as the mesh templates code.
+inline GridShape wide_band() {
+  GridShape s;
+  s.trunc_dist = 16 * kVoxel;
+  return s;
+}
+
+// A speck: a sphere of 0.3 voxels centred in the cell at the shared corner of
+// blocks (b - 1, b - 1, b - 1) to (b, b, b). No voxel is inside it, so no
+// cell's sign changes, but that cell's 8 corners lie 0.57 voxels out: only
+// the near rule keeps those 8 blocks.
+inline Sphere speck(int b) {
+  const float c = (8.0f * float(b) - 0.5f) * kVoxel;
+  return Sphere{vr::Vec3f(c, c, c), 0.3f * kVoxel};
+}
+
+// A sphere's distance with a curtain: negated in a slab more than 20 mm out
+// (x past the centre, y within 17.5 mm of the centre's plus slab_y), the
+// sheet a mesh's closest-face sign leaves past a hole's rim. Every sign flip
+// of the sheet lies 20 mm or more from zero, past the cut distance; the
+// slab's faces lie inside blocks, so cells cut across block faces. With
+// with_speck, a speck far from both.
+struct Curtain {
+  Sphere sphere;
+  bool with_speck = true;
+  float slab_y = 0.0f;
+  float sdf(const vr::Vec3f& p) const {
+    const float d = sphere.sdf(p);
+    const vr::Vec3f q = p - sphere.centre;
+    const float field =
+        d > 0.02f && q.x > 0.0f && std::fabs(q.y - slab_y) < 0.0175f ? -d : d;
+    return with_speck ? std::min(field, speck(10).sdf(p)) : field;
+  }
+  std::vector<vr::Vec3i> blocks(const GridShape& shape) const {
+    return with_speck ? union_blocks({sphere, speck(10)}, shape)
+                      : union_blocks({sphere}, shape);
+  }
+};
+
+// The curtain's blocks allocated in @p order (reversed when false), in a
+// grid of @p shape, and its field written.
+inline vkc::Result<vol::VoxelBlockGrid> curtain_grid(
+    Gpu& gpu, const Curtain& c, const GridShape& shape = wide_band(),
+    bool in_order = true) {
+  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
+  std::vector<vr::Vec3i> coords = c.blocks(shape);
+  if (!in_order) std::reverse(coords.begin(), coords.end());
+  VKC_TRY(allocate(gpu, grid, coords));
+  VKC_TRY(
+      write_field(gpu, grid, [&c](const vr::Vec3f& p) { return c.sdf(p); }));
   return grid;
 }
 

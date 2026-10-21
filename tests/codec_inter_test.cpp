@@ -16,8 +16,10 @@
 // diff's batch, and coded in update segments of the segment size, or of an
 // update size set; each of the diff's choices from one edit of a frame; a
 // difference of 32768 coded zero, in either half of a coefficient word; and
-// the diff's refusals and bounded entries, counted in its batch. Internal
-// headers by include path; skips with no device.
+// the diff's refusals and bounded entries, counted in its batch; and with
+// EncoderConfig::true_sdf, a moving curtain's chain, its partial masks
+// changing frame to frame. Internal headers by include path; skips with no
+// device.
 
 #include <algorithm>
 #include <cmath>
@@ -1087,6 +1089,96 @@ int encoder_chain_case(Shared& gpu) {
   return 0;
 }
 
+// A curtain that moves and grows with its sphere, its slab sliding across
+// it, beside a sphere that stays, at a 16-voxel band, at step @p t.
+vkc::Result<vol::VoxelBlockGrid> moving_curtain(Gpu& gpu, int t) {
+  const Curtain moving{
+      Sphere{vr::Vec3f(0.013f + 0.01f * float(t), -0.007f + 0.003f * float(t),
+                       0.004f - 0.004f * float(t)),
+             0.09f + 0.006f * float(t)},
+      false, 0.011f * float(t)};
+  const Sphere still{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
+  const GridShape shape = wide_band();
+  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
+  VKC_TRY(allocate(gpu, grid, union_blocks({moving.sphere, still}, shape)));
+  VKC_TRY(write_field(gpu, grid, [&](const vr::Vec3f& p) {
+    return std::min(moving.sdf(p), still.sdf(p));
+  }));
+  return grid;
+}
+
+// Whether a block's 16 mask words are all ones.
+bool full_mask(const std::uint32_t* mask) {
+  return std::all_of(mask, mask + codec::kMaskWordsPerBlock,
+                     [](std::uint32_t w) { return w == ~0u; });
+}
+
+// With true_sdf, the moving curtain's open-ended chain: every frame the
+// oracle's bytes, its blocks and cuts by the host rule, every P-frame
+// decoding to its I-frame's grid; among the P-frames keep, skip, remove and
+// new blocks, keep entries whose cut voxels changed (a non-empty XOR mask),
+// and blocks whose mask went from full to partial and back.
+int true_sdf_chain_case(Shared& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = ~0u;
+  config.true_sdf = true;
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu, wide_band());
+  CHECK(enc.ok() && player.ok());
+  std::vector<Coded> chain;
+  Census all;
+  std::size_t changed_keeps = 0;
+  std::size_t to_partial = 0;
+  std::size_t to_full = 0;
+  for (int t = 0; t < 7; ++t) {
+    vkc::Result<vol::VoxelBlockGrid> g = moving_curtain(gpu, t);
+    CHECK(g.ok());
+    CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
+    CHECK(type_of(chain.back().sent) ==
+          (t == 0 ? codec::FrameType::kIntra : codec::FrameType::kInter));
+    const Bytes& f = chain.back().sent;
+    CHECK(gpu.dec.decode(f.data(), f.size(), player.value()).ok());
+    CHECK(holds(gpu, player.value(), chain.back().intra));
+    if (t == 0) continue;
+    const Census c = census_of(chain);
+    for (std::size_t m = 0; m < 5; ++m) all.modes[m] += c.modes[m];
+    all.added += c.added;
+    const Coded& prev = chain[chain.size() - 2];
+    const d::FrameReference id = reference_of(prev.sent);
+    const oracle::Frame p =
+        oracle::read_frame(f.data(), f.size(), kMaxBlocks, &id).value();
+    for (std::size_t e = 0; e < p.modes.size(); ++e) {
+      const std::uint32_t* x = &p.blocks.masks[e * codec::kMaskWordsPerBlock];
+      changed_keeps += p.modes[e] == d::BlockMode::kKeep &&
+                               std::any_of(x, x + codec::kMaskWordsPerBlock,
+                                           [](std::uint32_t w) { return w; })
+                           ? 1
+                           : 0;
+    }
+    const oracle::Frame& before = prev.content;
+    const oracle::Frame& now = chain.back().content;
+    for (std::size_t i = 0; i < now.coords.size(); ++i) {
+      const auto at =
+          std::find(before.coords.begin(), before.coords.end(), now.coords[i]);
+      if (at == before.coords.end()) continue;
+      const std::size_t j = std::size_t(at - before.coords.begin());
+      const bool was =
+          full_mask(&before.blocks.masks[j * codec::kMaskWordsPerBlock]);
+      const bool is =
+          full_mask(&now.blocks.masks[i * codec::kMaskWordsPerBlock]);
+      to_partial += was && !is ? 1 : 0;
+      to_full += !was && is ? 1 : 0;
+    }
+  }
+  CHECK(all.modes[std::size_t(d::BlockMode::kKeep)] > 0);
+  CHECK(all.modes[std::size_t(d::BlockMode::kSkip)] > 0);
+  CHECK(all.modes[std::size_t(d::BlockMode::kRemove)] > 0);
+  CHECK(all.added > 0);
+  CHECK(changed_keeps > 0 && to_partial > 0 && to_full > 0);
+  return 0;
+}
+
 // The update size: left at 0, a P-frame's update segments take the segment
 // size, whatever it is; set, they take it. The moving spheres' first two
 // frames, an I-frame and a P-frame: each the oracle's bytes at the config's
@@ -1474,6 +1566,7 @@ int gpu_main(vr_test::GpuContext& context) {
   if (scratch_case(gpu, s.value()) != 0) return 1;
   if (moves_case(gpu, s.value()) != 0) return 1;
   if (encoder_chain_case(gpu) != 0) return 1;
+  if (true_sdf_chain_case(gpu) != 0) return 1;
   if (default_update_size_case(gpu) != 0) return 1;
   if (diff_case(gpu) != 0) return 1;
   if (wrap_case(gpu, 0) != 0) return 1;

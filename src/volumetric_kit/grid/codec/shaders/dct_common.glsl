@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Shared by dct_forward.comp, dct_inverse.comp and dct_observed.comp: the
-// push-constant block, the block list, the basis + zigzag table buffer, the
-// block lookup, the shared-memory work cube, the one separable 8-point line
-// transform both directions are made of, and the packing of two quantized
-// coefficients to a word.
+// Shared by dct_forward.comp, dct_inverse.comp, dct_observed.comp and
+// dct_surface.comp: the push-constant block, the block list, the basis +
+// zigzag table buffer, the block lookup, the shared-memory work cube, the one
+// separable 8-point line transform both directions are made of, and the
+// packing of two quantized coefficients to a word.
 //
 // ONE WORKGROUP OF kLanes (64) INVOCATIONS PER BLOCK, each owning one kEdge-voxel
 // line per pass. A separable 8^3 transform is three passes of 64 independent
@@ -51,6 +51,11 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 #define VR_DCT_BINDING_REJECTED 7
 #define VR_DCT_BINDING_STAMPS 8
 #define VR_DCT_BINDING_QUANTIZATION 9
+// EncoderConfig::true_sdf's scratch (dct_surface.comp): the cut set, one bit
+// per voxel of the grid's heap (slot s at bit s % 32 of word s / 32), and the
+// keep flags, one word per block slot.
+#define VR_DCT_BINDING_CUT 10
+#define VR_DCT_BINDING_KEEP 11
 
 // BlockIndex and the read-only hash lookup from the volume tier (one
 // definition, not a mirror -- see hash_lookup.glsl), which brings hash_common
@@ -59,7 +64,7 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 #include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
-// layout places each at its host offset (44 bytes).
+// layout places each at its host offset (60 bytes).
 layout(push_constant, scalar) uniform PushConstants {
   uint item_base;          // first list entry this dispatch covers
   uint num_blocks;         // entries in the whole list
@@ -73,6 +78,11 @@ layout(push_constant, scalar) uniform PushConstants {
   int max_chain;
   int max_quantized;       // the clamp on a quantized coefficient
   uint tick;               // the map's tick, which the inverse stamps with
+  uint true_sdf;           // EncoderConfig::true_sdf: the forward reads the
+                           // cut set, the observed filter the keep flags
+  uint surface_pass;       // dct_surface.comp's: 0 cuts, 1 keeps
+  float cut_distance;      // metres; a far corner of a sign-change cell is cut
+  float near_distance;     // metres; a corner this near keeps its cell
 }
 pc;
 

@@ -10,7 +10,12 @@
 // and its moves; and its frame types -- an I-frame first, every period,
 // after force_intra(), on a geometry change, for a grid of no blocks and
 // after one, a P-frame otherwise -- a refusal keeping the reference and the
-// period's count, and a chain repeated by a fresh encoder. Decoding is
+// period's count, and a chain repeated by a fresh encoder. With
+// EncoderConfig::true_sdf: the oracle's bytes, its blocks and cut set found
+// by the host rule -- cuts across block faces, partial masks, blocks the near
+// rule alone keeps, and none of a true distance cut -- the same bytes
+// whatever the hash table's order or heap, its scratch rebound as the heap
+// grows and cleared between frames, and the same rows. Decoding is
 // codec_decoder_test's, and a P-frame's bytes codec_inter_test's. Skips with
 // no device.
 
@@ -28,8 +33,10 @@
 #include "grid_readback.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/volume/grid_growth.hpp"
 
 #include "gpu_test.hpp"
 
@@ -178,6 +185,20 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   vol::VoxelBlockGrid moved = std::move(grid);
   CHECK(!enc.encode(grid, &refused).ok());  // NOLINT(bugprone-use-after-move)
   CHECK(find_row(refused, "codec encode") != nullptr);
+
+  // true_sdf's passes are inside "  ..observed": the same rows.
+  codec::EncoderConfig config;
+  config.true_sdf = true;
+  vkc::Result<codec::Encoder> t =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<vol::VoxelBlockGrid> wide = sphere_grid(gpu, s, wide_band());
+  CHECK(t.ok() && wide.ok());
+  vkc::StageMetrics tm;
+  CHECK(t.value().encode(wide.value(), &tm).ok());
+  CHECK(tm.rows().size() == m.rows().size());
+  for (std::size_t i = 0; i < m.rows().size(); ++i) {
+    CHECK(std::strcmp(tm.rows()[i].name, m.rows()[i].name) == 0);
+  }
   return 0;
 }
 
@@ -242,7 +263,8 @@ int oracle_case(Gpu& gpu) {
 
 // Blocks at int32's extremes on every axis, beside a sphere's: the device
 // sort orders them as the oracle's std::sort does, and the frame's deltas span
-// the whole range, so the bytes are still the oracle's.
+// the whole range, so the bytes are still the oracle's -- with true_sdf too,
+// whose neighbours there wrap around int32 on the device and in the oracle.
 int extremes_case(Gpu& gpu, codec::Encoder& enc) {
   const Sphere s{vr::Vec3f(0.0f), 0.05f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
@@ -289,6 +311,14 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<codec::FrameInfo> info =
       codec::read_frame_info(frame.value().data(), frame.value().size());
   CHECK(info.ok() && info.value().block_count > far.size());
+  codec::EncoderConfig config;
+  config.true_sdf = true;
+  vkc::Result<codec::Encoder> t =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  CHECK(t.ok());
+  frame = t.value().encode(grid);
+  oracle = codec_oracle::encode(gpu, grid, config);
+  CHECK(frame.ok() && oracle.ok() && frame.value() == oracle.value());
   return 0;
 }
 
@@ -556,6 +586,207 @@ int repeat_case(Gpu& gpu) {
   return 0;
 }
 
+// --- EncoderConfig::true_sdf. ------------------------------------------------
+
+// Off the grid, so the curtain's slab faces lie inside blocks.
+Curtain test_curtain(bool with_speck = true) {
+  return Curtain{Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, with_speck};
+}
+
+codec::EncoderConfig true_sdf_config() {
+  codec::EncoderConfig config;
+  config.true_sdf = true;
+  return config;
+}
+
+// The block ceiling decoded() gives the player's helpers: far past any
+// fixture's.
+constexpr std::uint32_t kMaxBlocks = 1u << 20;
+
+// A frame decoded as a player decodes it, into a grid its header builds.
+vkc::Result<Snapshot> decoded(Gpu& gpu, const Bytes& frame) {
+  VKC_ASSIGN(vol::VoxelBlockGrid grid,
+             codec::make_decode_grid(gpu.device, gpu.allocator, frame.data(),
+                                     frame.size(), kMaxBlocks));
+  VKC_ASSIGN(codec::Decoder dec,
+             codec::Decoder::create(gpu.device, gpu.allocator));
+  VKC_TRY(
+      codec::decode_growing(dec, frame.data(), frame.size(), grid, kMaxBlocks));
+  return snapshot(gpu, grid);
+}
+
+// The voxels of a decoded grid's blocks that their masks leave unobserved.
+std::size_t unobserved(const Snapshot& s) {
+  return std::size_t(std::count(s.weight.begin(), s.weight.end(), 0.0f));
+}
+
+std::vector<vr::Vec3i> coords_of(const std::vector<vol::BlockIndex>& blocks) {
+  std::vector<vr::Vec3i> out;
+  for (const vol::BlockIndex& b : blocks) out.push_back(b.coord);
+  return out;
+}
+
+// The Encoder writes the CPU oracle's bytes, its blocks and cut set found by
+// the host rule, for a curtain and a speck at a 16-voxel band, at an odd K,
+// for the default and a finer segmentation and the longest segments. The
+// premises: the curtain is cut, across block faces too; the speck's 8 blocks
+// are kept by the near rule alone; fewer blocks are coded than observed; and
+// coded blocks hold cut voxels, coded unobserved.
+int true_sdf_oracle_case(Gpu& gpu) {
+  vkc::Result<vol::VoxelBlockGrid> g = curtain_grid(gpu, test_curtain());
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  vkc::Result<codec_oracle::SurfaceSet> set =
+      codec_oracle::surface_set(gpu, grid);
+  CHECK(set.ok());
+  const codec_oracle::SurfaceSet& host = set.value();
+  CHECK(host.cut_voxels > 0 && host.cut_across_faces > 0);
+  CHECK(host.near_only_blocks >= 8);
+  CHECK(!host.blocks.empty() && host.blocks.size() < host.observed_blocks);
+  Bytes last;
+  for (std::uint32_t segment_size :
+       {64u, 3u, codec::kMaxDeviceDecodeSegmentSize}) {
+    codec::EncoderConfig config = true_sdf_config();
+    config.params.coefficient_count = 37;
+    config.segment_size = segment_size;
+    vkc::Result<codec::Encoder> enc =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(enc.ok());
+    vkc::Result<Bytes> frame = enc.value().encode(grid);
+    vkc::Result<Bytes> oracle = codec_oracle::encode(gpu, grid, config);
+    CHECK(frame.ok() && oracle.ok());
+    CHECK(frame.value() == oracle.value());
+    last = std::move(frame).value();
+  }
+  vkc::Result<Snapshot> out = decoded(gpu, last);
+  CHECK(out.ok());
+  CHECK(out.value().coords == coords_of(host.blocks));
+  CHECK(unobserved(out.value()) > 0);
+  std::printf(
+      "true SDF curtain: %zu of %zu observed blocks coded, %zu by the near "
+      "rule alone; %zu voxels cut, %zu across block faces, %zu in coded "
+      "blocks\n",
+      host.blocks.size(), host.observed_blocks, host.near_only_blocks,
+      host.cut_voxels, host.cut_across_faces, unobserved(out.value()));
+  return 0;
+}
+
+// On a true distance -- two spheres' union and a speck -- the frame codes
+// the host rule's blocks, fewer than are observed, the speck's by the near
+// rule alone, and cuts nothing: every voxel of a coded block decodes
+// observed.
+int surface_blocks_case(Gpu& gpu) {
+  const Sphere a{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  const Sphere b{vr::Vec3f(0.31f, 0.0f, 0.0f), 0.05f};
+  const GridShape shape = wide_band();
+  vkc::Result<vol::VoxelBlockGrid> g = make_grid(gpu, shape);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid grid = std::move(g).value();
+  CHECK(allocate(gpu, grid, union_blocks({a, b, speck(10)}, shape)).ok());
+  CHECK(write_field(gpu, grid, [&](const vr::Vec3f& p) {
+          return std::min({a.sdf(p), b.sdf(p), speck(10).sdf(p)});
+        }).ok());
+  vkc::Result<codec_oracle::SurfaceSet> set =
+      codec_oracle::surface_set(gpu, grid);
+  CHECK(set.ok());
+  const codec_oracle::SurfaceSet& host = set.value();
+  CHECK(host.cut_voxels == 0 && host.near_only_blocks >= 8);
+  CHECK(host.blocks.size() < host.observed_blocks);
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, true_sdf_config());
+  CHECK(enc.ok());
+  vkc::Result<Bytes> frame = enc.value().encode(grid);
+  CHECK(frame.ok());
+  vkc::Result<Snapshot> out = decoded(gpu, frame.value());
+  CHECK(out.ok());
+  CHECK(out.value().coords == coords_of(host.blocks));
+  CHECK(unobserved(out.value()) == 0);
+  return 0;
+}
+
+// The same curtain in two grids whose hash tables hold it differently --
+// allocated in opposite orders into tables of different sizes -- codes to
+// the same bytes, again and again.
+int true_sdf_order_case(Gpu& gpu) {
+  GridShape bigger = wide_band();
+  bigger.num_buckets = 2048;
+  vkc::Result<vol::VoxelBlockGrid> a = curtain_grid(gpu, test_curtain());
+  vkc::Result<vol::VoxelBlockGrid> b =
+      curtain_grid(gpu, test_curtain(), bigger, false);
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, true_sdf_config());
+  CHECK(a.ok() && b.ok() && enc.ok());
+  vkc::Result<std::vector<vol::BlockIndex>> pa =
+      a.value().map().compact_active_blocks();
+  vkc::Result<std::vector<vol::BlockIndex>> pb =
+      b.value().map().compact_active_blocks();
+  CHECK(pa.ok() && pb.ok() && pa.value().size() == pb.value().size());
+  bool any_differs = false;
+  for (std::size_t i = 0; i < pa.value().size(); ++i) {
+    any_differs = any_differs ||
+                  !(pa.value()[i].coord == pb.value()[i].coord) ||
+                  pa.value()[i].ptr != pb.value()[i].ptr;
+  }
+  CHECK(any_differs);  // the premise: the tables really do differ
+  vkc::Result<Bytes> fa = enc.value().encode(a.value());
+  vkc::Result<Bytes> fb = enc.value().encode(b.value());
+  vkc::Result<Bytes> again = enc.value().encode(a.value());
+  CHECK(fa.ok() && fb.ok() && again.ok());
+  CHECK(fa.value() == fb.value() && again.value() == fa.value());
+  return 0;
+}
+
+// One encoder across a heap that grows between frames: the scratch the
+// passes regrow is bound afresh, so each frame is the oracle's, and the
+// same content the same bytes.
+int true_sdf_heap_case(Gpu& gpu) {
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, true_sdf_config());
+  vkc::Result<vol::VoxelBlockGrid> g = curtain_grid(gpu, test_curtain());
+  CHECK(enc.ok() && g.ok());
+  vol::VoxelBlockGrid& grid = g.value();
+  const std::int32_t slots = grid.grid().num_blocks;
+  Bytes first;
+  for (int grown = 0; grown < 3; ++grown) {
+    if (grown != 0) CHECK(vol::grow_grid(grid).ok());
+    vkc::Result<Bytes> frame = enc.value().encode(grid);
+    vkc::Result<Bytes> oracle =
+        codec_oracle::encode(gpu, grid, true_sdf_config());
+    CHECK(frame.ok() && oracle.ok() && frame.value() == oracle.value());
+    if (grown == 0) first = frame.value();
+    CHECK(frame.value() == first);
+  }
+  CHECK(grid.grid().num_blocks >= 4 * slots);  // the premise: it grew
+  return 0;
+}
+
+// One encoder, a frame with cuts, then a frame without any on the same grid
+// cleared and allocated again -- its slots now other blocks': no cut and no
+// kept block of the first frame reaches the second, which is the oracle's
+// and codes every voxel of its blocks observed.
+int stale_cut_case(Gpu& gpu) {
+  const Curtain curtain = test_curtain(false);
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, true_sdf_config());
+  vkc::Result<vol::VoxelBlockGrid> g = curtain_grid(gpu, curtain);
+  CHECK(enc.ok() && g.ok());
+  vol::VoxelBlockGrid& grid = g.value();
+  vkc::Result<Bytes> cut = enc.value().encode(grid);
+  CHECK(cut.ok());
+  vkc::Result<Snapshot> with_cuts = decoded(gpu, cut.value());
+  CHECK(with_cuts.ok() && unobserved(with_cuts.value()) > 0);
+  CHECK(grid.clear().ok());
+  CHECK(allocate(gpu, grid, union_blocks({curtain.sphere}, wide_band())).ok());
+  CHECK(write_sphere(gpu, grid, curtain.sphere).ok());
+  vkc::Result<Bytes> clean = enc.value().encode(grid);
+  vkc::Result<Bytes> oracle =
+      codec_oracle::encode(gpu, grid, true_sdf_config());
+  CHECK(clean.ok() && oracle.ok() && clean.value() == oracle.value());
+  vkc::Result<Snapshot> none = decoded(gpu, clean.value());
+  CHECK(none.ok() && unobserved(none.value()) == 0);
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<codec::Encoder> made =
       codec::Encoder::create(gpu.device, gpu.allocator);
@@ -575,6 +806,11 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (intra_rules_case(gpu) != 0) return 1;
   if (refusal_keeps_chain_case(gpu) != 0) return 1;
   if (repeat_case(gpu) != 0) return 1;
+  if (true_sdf_oracle_case(gpu) != 0) return 1;
+  if (surface_blocks_case(gpu) != 0) return 1;
+  if (true_sdf_order_case(gpu) != 0) return 1;
+  if (true_sdf_heap_case(gpu) != 0) return 1;
+  if (stale_cut_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");
   return 0;
 }

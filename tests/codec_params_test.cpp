@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only tests for the codec tier: CodecParams validation, EncoderConfig's
-// sizes, and the two tables the DCT is defined by. CPU-only, so these always
-// run.
+// sizes and its true_sdf switch, and the two tables the DCT is defined by.
+// CPU-only, so these always run.
 //
 // The tables get independent checks because the GPU test's reference is BUILT
 // from them: a wrong zigzag order or basis would be reproduced by both sides of
@@ -168,6 +168,21 @@ int encoder_sizes_case() {
   return 0;
 }
 
+// EncoderConfig::true_sdf is off by default, validate takes it either way,
+// and the band it names is ceil(1 + 8 sqrt(3)) voxels.
+int true_sdf_case() {
+  static_assert(!codec::EncoderConfig{}.true_sdf,
+                "the default config codes under the observed mask");
+  codec::EncoderConfig config;
+  for (const bool on : {false, true}) {
+    config.true_sdf = on;
+    CHECK(config.validate().ok());
+  }
+  CHECK(codec::kTrueSdfBandVoxels ==
+        std::uint32_t(std::ceil(1.0 + 8.0 * std::sqrt(3.0))));
+  return 0;
+}
+
 int basis_case() {
   const std::array<double, kBasisSize> b = codec::detail::dct_basis<double>();
   // Orthonormal: B * B^T = I.
@@ -243,6 +258,7 @@ int zigzag_case() {
 int main() {
   if (params_validate_case() != 0) return 1;
   if (encoder_sizes_case() != 0) return 1;
+  if (true_sdf_case() != 0) return 1;
   if (basis_case() != 0) return 1;
   if (zigzag_case() != 0) return 1;
   std::printf("codec params, encoder sizes + tables: OK\n");

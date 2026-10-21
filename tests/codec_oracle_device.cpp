@@ -4,7 +4,11 @@
 #include "codec_oracle_device.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <limits>
+#include <map>
+#include <optional>
 #include <utility>
 
 #include "codec_frames.hpp"
@@ -115,7 +119,8 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
 vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
-                    const codec::CodecParams& params, DctBlocks& out) {
+                    const codec::CodecParams& params, DctBlocks& out,
+                    const vkc::Buffer* cut) {
   out = DctBlocks{};
   const std::uint32_t k = params.coefficient_count;
   const std::uint32_t words = d::coefficient_words(k);
@@ -145,7 +150,7 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   VKC_ASSIGN(const d::ResidentBlocks resident,
              t.record_forward(batch, grid, list, count, params, mask_out,
-                              coefficient_out, rejected));
+                              coefficient_out, rejected, cut));
   const std::size_t n = resident.count;
   std::vector<std::uint32_t> packed(n * words);
   std::vector<std::uint32_t> masks(n * codec::kMaskWordsPerBlock);
@@ -201,6 +206,147 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
   return t.inverse(batch, grid, r.blocks, in.params);
 }
 
+namespace {
+
+// A cell's corner c (bit 0 x, 1 y, 2 z) of the cell anchored at local
+// (x, y, z): the octant of the 2x2x2 neighbourhood holding it, and its local
+// index there.
+struct Corner {
+  int octant;
+  std::uint32_t local;
+};
+
+Corner corner(int x, int y, int z, int c) {
+  const int cx = x + (c & 1), cy = y + ((c >> 1) & 1), cz = z + ((c >> 2) & 1);
+  return {(cx >> 3) | ((cy >> 3) << 1) | ((cz >> 3) << 2),
+          std::uint32_t((cx & 7) + 8 * (cy & 7) + 64 * (cz & 7))};
+}
+
+// The coordinate @p o steps past @p c, wrapping as the device's int addition
+// does at int32's extremes.
+vr::Vec3i step(const vr::Vec3i& c, int o) {
+  const auto wrap = [](std::int32_t v, int d) {
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(v) +
+                                     static_cast<std::uint32_t>(d));
+  };
+  return vr::Vec3i(wrap(c.x, o & 1), wrap(c.y, (o >> 1) & 1),
+                   wrap(c.z, (o >> 2) & 1));
+}
+
+}  // namespace
+
+vkc::Result<SurfaceSet> surface_set(const vr_test::Gpu& gpu,
+                                    vol::VoxelBlockGrid& grid) {
+  VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
+             grid.map().compact_active_blocks());
+  VKC_ASSIGN(
+      const std::vector<float> tsdf,
+      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VKC_ASSIGN(const std::vector<float> weight,
+             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                            "weight"));
+  const auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
+    return d::coord_less(a, b);
+  };
+  std::map<vr::Vec3i, std::int64_t, decltype(less)> slot_of(less);
+  for (const vol::BlockIndex& b : active) slot_of[b.coord] = b.ptr;
+  // The rule's distances, metres: past sqrt(3) voxels a corner of a crossing
+  // cannot lie, and within one voxel a corner keeps its cell.
+  const float voxel = grid.grid().voxel_size;
+  const float tau = std::fma(std::sqrt(3.0f), voxel, 1e-6f);
+  const float near = voxel;
+  const std::size_t voxels =
+      std::size_t(grid.grid().num_blocks) * codec::kVoxelsPerBlock;
+  std::vector<std::uint8_t> cut(voxels, 0);
+  std::vector<std::uint8_t> across(voxels, 0);
+  std::map<std::int64_t, std::pair<bool, bool>> kept;  // slot: sign, near
+
+  // One walk over every cell anchored in an active block: the corners'
+  // voxel slots, or false when a corner is unallocated or unobserved -- or,
+  // with @p uncut, cut.
+  const auto cells = [&](bool uncut, const auto& visit) {
+    for (const vol::BlockIndex& b : active) {
+      std::int64_t nb[8];
+      for (int o = 0; o < 8; ++o) {
+        const auto it = slot_of.find(step(b.coord, o));
+        nb[o] = it == slot_of.end() ? -1 : it->second;
+      }
+      for (int z = 0; z < 8; ++z) {
+        for (int y = 0; y < 8; ++y) {
+          for (int x = 0; x < 8; ++x) {
+            std::size_t at[8];
+            int octant[8];
+            bool ok = true;
+            for (int c = 0; c < 8 && ok; ++c) {
+              const Corner k = corner(x, y, z, c);
+              ok = nb[k.octant] >= 0;
+              if (!ok) break;
+              at[c] = std::size_t(nb[k.octant]) + k.local;
+              octant[c] = k.octant;
+              ok = weight[at[c]] >= vol::kObservedWeight &&
+                   !(uncut && cut[at[c]] != 0);
+            }
+            if (!ok) continue;
+            int inside = 0;
+            for (int c = 0; c < 8; ++c) inside += tsdf[at[c]] < 0.0f ? 1 : 0;
+            visit(at, octant, nb, inside != 0 && inside != 8);
+          }
+        }
+      }
+    }
+  };
+  // The cut, from the field as it stands: no cut changes another cell.
+  cells(false, [&](const std::size_t* at, const int* octant,
+                   const std::int64_t*, bool flips) {
+    bool far = false;
+    for (int c = 0; c < 8; ++c) far = far || std::fabs(tsdf[at[c]]) > tau;
+    if (!flips || !far) return;
+    for (int c = 0; c < 8; ++c) {
+      if (std::fabs(tsdf[at[c]]) <= tau) continue;
+      cut[at[c]] = 1;
+      if (octant[c] != 0) across[at[c]] = 1;
+    }
+  });
+  // Then every block holding a corner of a cell with no corner cut, whose
+  // sign changes or that has a corner within one voxel of zero.
+  cells(true, [&](const std::size_t* at, const int* octant,
+                  const std::int64_t* nb, bool flips) {
+    bool close = false;
+    for (int c = 0; c < 8; ++c) close = close || std::fabs(tsdf[at[c]]) < near;
+    if (!flips && !close) return;
+    for (int c = 0; c < 8; ++c) {
+      std::pair<bool, bool>& k = kept[nb[octant[c]]];
+      k.first = k.first || flips;
+      k.second = true;
+    }
+  });
+
+  SurfaceSet out;
+  out.cut.assign(voxels / 32, 0u);
+  for (std::size_t v = 0; v < voxels; ++v) {
+    if (cut[v] == 0) continue;
+    out.cut[v / 32] |= 1u << (v % 32);
+    ++out.cut_voxels;
+    out.cut_across_faces += across[v];
+  }
+  for (const vol::BlockIndex& b : active) {
+    const auto first = weight.begin() + std::ptrdiff_t(b.ptr);
+    if (std::any_of(first, first + codec::kVoxelsPerBlock,
+                    [](float w) { return w >= vol::kObservedWeight; })) {
+      ++out.observed_blocks;
+    }
+    const auto k = kept.find(b.ptr);
+    if (k == kept.end()) continue;
+    out.blocks.push_back(b);
+    out.near_only_blocks += k->second.first ? 0 : 1;
+  }
+  std::sort(out.blocks.begin(), out.blocks.end(),
+            [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
+              return d::coord_less(a.coord, b.coord);
+            });
+  return out;
+}
+
 vkc::Result<std::vector<std::uint8_t>> encode(
     const vr_test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
     const codec::EncoderConfig& config) {
@@ -210,12 +356,21 @@ vkc::Result<std::vector<std::uint8_t>> encode(
              vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
                                        "weight", active));
   std::vector<vol::BlockIndex> observed;
-  for (const vol::BlockIndex& b : active) {
-    const auto first = weight.values.begin() +
-                       std::ptrdiff_t(std::size_t(b.ptr) - weight.first);
-    if (std::any_of(first, first + codec::kVoxelsPerBlock,
-                    [](float w) { return w >= vol::kObservedWeight; })) {
-      observed.push_back(b);
+  std::optional<vkc::Buffer> cut;
+  if (config.true_sdf) {
+    VKC_ASSIGN(SurfaceSet set, surface_set(gpu, grid));
+    observed = std::move(set.blocks);
+    VKC_ASSIGN(cut, vr_test::upload_device_buffer(
+                        gpu.device, gpu.allocator, set.cut.data(),
+                        set.cut.size() * sizeof(std::uint32_t)));
+  } else {
+    for (const vol::BlockIndex& b : active) {
+      const auto first = weight.values.begin() +
+                         std::ptrdiff_t(std::size_t(b.ptr) - weight.first);
+      if (std::any_of(first, first + codec::kVoxelsPerBlock,
+                      [](float w) { return w >= vol::kObservedWeight; })) {
+        observed.push_back(b);
+      }
     }
   }
   std::sort(observed.begin(), observed.end(),
@@ -224,7 +379,8 @@ vkc::Result<std::vector<std::uint8_t>> encode(
             });
   Frame frame;
   frame.voxel_size = grid.grid().voxel_size;
-  VKC_TRY(forward(gpu, t, grid, observed, config.params, frame.blocks));
+  VKC_TRY(forward(gpu, t, grid, observed, config.params, frame.blocks,
+                  cut ? &*cut : nullptr));
   for (const vol::BlockIndex& b : observed) frame.coords.push_back(b.coord);
   FrameWriteOptions options;
   options.segment_size = config.segment_size;

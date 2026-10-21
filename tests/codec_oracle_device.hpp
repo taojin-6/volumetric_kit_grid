@@ -54,12 +54,14 @@ vkc::Result<Resident> resident(
     std::optional<std::uint32_t> tail = std::nullopt);
 
 // @p t's forward output over @p blocks, uploaded as the device list it takes,
-// read back, K coefficients to an entry; DctTransform::record_forward's
-// refusals, or its reject count's, leaving @p out empty.
+// read back, K coefficients to an entry, with @p cut, if given, as its cut
+// set; DctTransform::record_forward's refusals, or its reject count's,
+// leaving @p out empty.
 vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
-                    const codec::CodecParams& params, DctBlocks& out);
+                    const codec::CodecParams& params, DctBlocks& out,
+                    const vkc::Buffer* cut = nullptr);
 
 // @p in's blocks, the entries of @p blocks as given (ptrs included),
 // reconstructed into @p grid by @p t's inverse; InvalidArgument for sizes
