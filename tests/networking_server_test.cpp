@@ -645,7 +645,9 @@ int max_viewers_case() {
 // Peers that connect and reset before the accept thread takes them (macOS
 // then fails the accepted socket's first setsockopt) are dropped quietly: no
 // Warning, and a viewer joining while they come gets its session. Served
-// ones end at once, and 64 slots keep any from being refused.
+// ones end at once, and 64 slots keep any from being refused. They come in
+// bursts the listener's queue (8) holds, 5 ms apart, since Linux drops a SYN
+// to a full queue, and a connect then waits a second to send it again.
 int reset_before_accept_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -657,12 +659,15 @@ int reset_before_accept_case() {
   std::atomic<int> resets{0};
   std::thread resetter([&] {
     while (!stop) {
-      vkc::UniqueFd fd = net::connect_loopback(server->port());
-      if (!fd.valid()) continue;
-      const linger hard{1, 0};
-      (void)::setsockopt(fd.get(), SOL_SOCKET, SO_LINGER, &hard, sizeof hard);
-      fd.reset();
-      ++resets;
+      for (int i = 0; i < 8; ++i) {
+        vkc::UniqueFd fd = net::connect_loopback(server->port());
+        if (!fd.valid()) continue;
+        const linger hard{1, 0};
+        (void)::setsockopt(fd.get(), SOL_SOCKET, SO_LINGER, &hard, sizeof hard);
+        fd.reset();
+        ++resets;
+      }
+      std::this_thread::sleep_for(5ms);
     }
   });
   const Clock::time_point flooding = Clock::now() + 2s;
