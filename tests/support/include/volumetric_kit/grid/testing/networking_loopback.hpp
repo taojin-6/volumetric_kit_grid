@@ -227,6 +227,20 @@ inline bool next_within(networking::StreamClient& client, Got* got,
   }
 }
 
+// Whether the client reads the sender's end, IoError, within `timeout`, with
+// no record before it.
+inline bool wait_end(networking::StreamClient& client,
+                     std::chrono::milliseconds timeout = 5s) {
+  const Clock::time_point end = Clock::now() + timeout;
+  stream::Record record;
+  Bytes payload;
+  for (;;) {
+    const vkc::Result<bool> got = client.next(10ms, &record, &payload);
+    if (!got.ok()) return got.status().domain() == vkc::Status::Code::IoError;
+    if (*got || Clock::now() >= end) return false;
+  }
+}
+
 // A record's seq and key, with a payload made from its seq.
 inline stream::RecordInfo record_info(std::uint64_t seq, bool key) {
   return vrst::info(0, key, 1'000'000 * seq, seq);

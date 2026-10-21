@@ -596,15 +596,7 @@ int teardown_case() {
   CHECK(net::wait_session(*a));
   CHECK(net::wait_session(*b));
   CHECK(within_1s([&] { idle.reset(); }));
-  for (auto* client : {a.get(), b.get()}) {
-    stream::Record record;
-    Bytes payload;
-    vkc::Result<bool> got = false;
-    for (int i = 0; i < 100 && got.ok() && !*got; ++i) {
-      got = client->next(10ms, &record, &payload);
-    }
-    CHECK(!got.ok() && got.status().domain() == Code::IoError);
-  }
+  for (auto* client : {a.get(), b.get()}) CHECK(net::wait_end(*client, 1s));
 
   Captured log;
   const LogCapture capture(&log);
