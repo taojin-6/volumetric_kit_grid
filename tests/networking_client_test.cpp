@@ -16,8 +16,9 @@
 // 127.0.0.1 server, and clients destroyed mid-lookup leave it to end alone;
 // and an empty host, port 0 or an idle_limit of 0 or less is refused. Each
 // error reads "StreamClient: 127.0.0.1:<port>: <reason>", the
-// address in it once, with the stage the idle limit ended in as its reason,
-// and is returned again by every later call.
+// address in it once, with the stage the idle limit ended in as its reason;
+// it closes the connection, as a sender sees, and is returned again by every
+// later call.
 
 #include <fcntl.h>
 
@@ -76,7 +77,8 @@ vkc::Result<bool> settle(networking::StreamClient& client, Got* got) {
 
 // The error a client gets from `bytes`, the connection left open, its message
 // the client's prefix and the parser's reason; the same error from the call
-// after.
+// after; and the client's end of the connection closed, which the sender
+// reads.
 Code error_from(const Bytes& bytes) {
   Sender sender;
   auto client = net::connect(sender.listener.port);
@@ -96,6 +98,10 @@ Code error_from(const Bytes& bytes) {
       again.status().message() != first.status().message()) {
     return Code::Ok;
   }
+  Bytes rest;
+  bool closed = false;
+  net::read_upto(sender.peer.get(), 1, 2s, &rest, &closed);
+  if (!closed) return Code::Ok;
   return first.status().domain();
 }
 

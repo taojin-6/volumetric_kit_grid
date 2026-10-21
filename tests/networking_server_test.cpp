@@ -4,7 +4,8 @@
 // StreamServer and StreamClient on loopback (127.0.0.1, port 0): a raw
 // viewer's bytes are StreamWriter's file for the same session and records,
 // less its footer; a client reads the session, then every record's info,
-// payload and file offset; a viewer joining gets the GOP from its key, and
+// payload and file offset; a viewer that sends bytes still gets every record;
+// a viewer joining gets the GOP from its key, and
 // before any key nothing; a viewer that stops reading in the first key while
 // 3 GOPs of 1 MiB records are published gets that key whole, then the newest
 // GOP whole, with every publish back at once; a GOP past
@@ -18,19 +19,25 @@
 // publish; the writer's refusals send nothing, and so does a payload over the
 // parser's cap; start refuses (a stall_limit of 0 or less among them); the
 // destructor returns within 1 s with no viewers, idle ones and a stalled one;
-// and 100 SIGUSR1 to a no-op handler leave the stream whole. Every test that
-// publishes first waits for the viewer's session.
+// the threads of viewers that ended are joined as they go, the address space
+// back near its start after 300; and 100 SIGUSR1 to a no-op handler leave
+// the stream whole. Every test that publishes first waits for the viewer's
+// session.
 
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,6 +46,15 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define VR_TEST_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define VR_TEST_SANITIZED 1
+#endif
 
 #include "networking_loopback.hpp"
 #include "scratch_dir.hpp"
@@ -133,6 +149,30 @@ std::string peer_name(int fd) {
   return "127.0.0.1:" + std::to_string(net::local_port(fd));
 }
 
+// The records a raw viewer gets, each chunk passing its CRCs: from `wire`,
+// what it has read, then from `fd` until the record of seq `last`, within
+// 10 s.
+int drain(int fd, const Bytes& wire, std::uint64_t last,
+          std::vector<Got>* got) {
+  stream::ChunkParser parser;
+  CHECK(parser.feed(wire.data(), wire.size()).ok());
+  const Clock::time_point end = Clock::now() + 10s;
+  while ((got->empty() || got->back().record.info.seq < last) &&
+         Clock::now() < end) {
+    Got g;
+    const vkc::Result<bool> r = parser.next(&g.record, &g.payload);
+    CHECK(r.ok());
+    if (*r) {
+      got->push_back(std::move(g));
+      continue;
+    }
+    Bytes more;
+    net::read_upto(fd, std::size_t{1} << 20, 100ms, &more);
+    CHECK(parser.feed(more.data(), more.size()).ok());
+  }
+  return 0;
+}
+
 // --- The wire.
 // ----------------------------------------------------------------
 
@@ -212,6 +252,39 @@ int round_trip_case(const std::string& dir) {
     CHECK(got.payload == r.payload);
     CHECK(got.record.size == r.payload.size());
     CHECK(got.record.offset == file.records[i].offset);
+  }
+  return 0;
+}
+
+// What a viewer sends is read and dropped: one that sends 64 KiB mid-stream
+// gets every record.
+int viewer_sends_case() {
+  constexpr std::uint64_t kRecords = 20;
+  const stream::Session session = net::geometry_session();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port());
+  CHECK(viewer.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
+    if (seq == kRecords / 2) {
+      CHECK(net::send_bytes(viewer.get(), Bytes(64 << 10, 0x55)));
+    }
+    const Bytes payload = net::record_payload(seq, 1000);
+    CHECK(server
+              ->publish(net::record_info(seq, seq == 0), payload.data(),
+                        payload.size())
+              .ok());
+  }
+  std::vector<Got> got;
+  CHECK(drain(viewer.get(), wire, kRecords - 1, &got) == 0);
+  CHECK(got.size() == kRecords);
+  for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
+    CHECK(got[seq].record.info.seq == seq);
+    CHECK(got[seq].payload == net::record_payload(seq, 1000));
   }
   return 0;
 }
@@ -327,30 +400,14 @@ int newest_key_wins_case() {
   net::read_upto(viewer.get(), header + 56, 5s, &wire);  // the key's header
   CHECK(wire.size() == header + 56);
   for (std::uint64_t seq = 1; seq < kRecords; ++seq) CHECK(publish(seq));
-
-  stream::ChunkParser parser;
-  CHECK(parser.feed(wire.data(), wire.size()).ok());
-  std::vector<stream::RecordInfo> got;
-  const Clock::time_point end = Clock::now() + 10s;
-  while ((got.empty() || got.back().seq + 1 < kRecords) && Clock::now() < end) {
-    stream::Record record;
-    Bytes payload;
-    const vkc::Result<bool> r = parser.next(&record, &payload);
-    CHECK(r.ok());
-    if (*r) {
-      CHECK(payload == net::record_payload(record.info.seq, kSize));
-      got.push_back(record.info);
-      continue;
-    }
-    Bytes more;
-    net::read_upto(viewer.get(), kSize, 100ms, &more);
-    CHECK(parser.feed(more.data(), more.size()).ok());
-  }
+  std::vector<Got> got;
+  CHECK(drain(viewer.get(), wire, kRecords - 1, &got) == 0);
   CHECK(got.size() == 1 + kGop);
-  CHECK(got[0].seq == 0 && got[0].key);
-  for (std::uint64_t k = 0; k < kGop; ++k) {
-    CHECK(got[1 + k].seq == kRecords - kGop + k);
-    CHECK(got[1 + k].key == (k == 0));
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    const std::uint64_t seq = i == 0 ? 0 : kRecords - kGop + i - 1;
+    CHECK(got[i].record.info.seq == seq);
+    CHECK(got[i].record.info.key == (seq % kGop == 0));
+    CHECK(got[i].payload == net::record_payload(seq, kSize));
   }
   return 0;
 }
@@ -818,6 +875,70 @@ int teardown_case() {
   return 0;
 }
 
+// The process's address space, in bytes, or 0 when it cannot be read.
+std::uint64_t address_space() {
+#ifdef __APPLE__
+  mach_task_basic_info_data_t info{};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info),
+                  &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return info.virtual_size;
+#else
+  std::ifstream statm("/proc/self/statm");
+  std::uint64_t pages = 0;
+  statm >> pages;
+  return pages * static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+#endif
+}
+
+// The threads of viewers that ended are joined as they go, not when the
+// server does: after 300 viewers join and leave one by one, the address
+// space is back within 4 MiB of where it was after the first 20. A thread
+// never joined keeps its stack (8 MiB on Linux) or, on macOS, about 34 KiB,
+// and neither shows in a thread count. A viewer's thread sees its end within
+// a poll slice, so 64 slots, and one refused tries again. Not under ASan or
+// TSan, which keep freed memory a while.
+int reaping_case() {
+#ifndef VR_TEST_SANITIZED
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.max_viewers = 64;
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const std::size_t header = net::session_chunk(session).size();
+  const auto join_and_leave = [&](int viewers) {
+    for (int joined = 0, tries = 0; joined < viewers; ++tries) {
+      if (tries == 20 * viewers) return false;
+      const vkc::UniqueFd viewer = net::connect_loopback(server->port());
+      Bytes got;
+      net::read_upto(viewer.get(), header, 5s, &got);
+      joined += got.size() == header;
+      std::this_thread::sleep_for(got.size() == header ? 1ms : 5ms);
+    }
+    return true;
+  };
+  CHECK(join_and_leave(20));
+  std::this_thread::sleep_for(100ms);  // five poll slices: the 20 are joined
+  const std::uint64_t before = address_space();
+  CHECK(before > 0);
+  CHECK(join_and_leave(300));
+  std::uint64_t after = address_space();
+  const Clock::time_point end = Clock::now() + 2s;
+  while (after >= before + (4 << 20) && Clock::now() < end) {
+    std::this_thread::sleep_for(20ms);
+    after = address_space();
+  }
+  std::printf(
+      "reaping: %+lld KiB after 300 viewers\n",
+      (static_cast<long long>(after) - static_cast<long long>(before)) / 1024);
+  CHECK(after < before + (4 << 20));
+#endif
+  return 0;
+}
+
 // --- Signals.
 // -----------------------------------------------------------------
 
@@ -898,6 +1019,7 @@ int main() {
   const std::string dir = scratch.path.string();
   if (wire_is_the_file_case(dir) != 0) return 1;
   if (round_trip_case(dir) != 0) return 1;
+  if (viewer_sends_case() != 0) return 1;
   if (join_case() != 0) return 1;
   if (newest_key_wins_case() != 0) return 1;
   if (gop_limit_case() != 0) return 1;
@@ -909,6 +1031,7 @@ int main() {
   if (leaving_viewer_case() != 0) return 1;
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;
+  if (reaping_case() != 0) return 1;
   if (signals_case() != 0) return 1;
   std::puts("networking server: OK");
   return 0;
