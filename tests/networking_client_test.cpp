@@ -6,14 +6,19 @@
 // header claiming 1 GiB is refused before any of its body comes (a RECD's or
 // another tag's OutOfMemory, a VRST's InvalidArgument); a corrupt body is
 // InvalidArgument; the end after whole records is IoError once they are all
-// read; next(20 ms) with nothing returns false in about 20 ms, and within
-// 500 ms while chunks it skips flood in; next(0 ms) alone connects and reads,
-// a 230 KB record already in the socket in one call; idle_limit counts from
-// connect, against a listener that sends nothing, and then from the last
-// byte, judged after reading what came while the caller was away;
+// read, and an end before the session says so; next(20 ms) with nothing
+// returns false in about 20 ms, and within 500 ms while chunks it skips flood
+// in; next(0 ms) alone connects and reads, a 230 KB record already in the
+// socket in one call; idle_limit counts from connect, against a listener that
+// sends nothing and one whose queue is full, and then from the last byte,
+// judged after reading what came while the caller was away;
 // milliseconds::max() as idle_limit or wait is never; localhost reaches a
 // 127.0.0.1 server; and an empty host, port 0 or an idle_limit of 0 or less is
-// refused. Each error is returned again by every later call.
+// refused. Each error reads "StreamClient: 127.0.0.1:<port>: <reason>", the
+// address in it once, with the stage the idle limit ended in as its reason,
+// and is returned again by every later call.
+
+#include <fcntl.h>
 
 #include <atomic>
 #include <chrono>
@@ -67,8 +72,9 @@ vkc::Result<bool> settle(networking::StreamClient& client, Got* got) {
   }
 }
 
-// The error a client gets from `bytes`, the connection left open; the same
-// error from the call after.
+// The error a client gets from `bytes`, the connection left open, its message
+// the client's prefix and the parser's reason; the same error from the call
+// after.
 Code error_from(const Bytes& bytes) {
   Sender sender;
   auto client = net::connect(sender.listener.port);
@@ -78,7 +84,11 @@ Code error_from(const Bytes& bytes) {
   }
   Got got;
   const vkc::Result<bool> first = settle(*client, &got);
-  if (first.ok()) return Code::Ok;
+  if (first.ok() ||
+      net::client_reason(first.status().message(), sender.listener.port)
+              .rfind("ChunkParser: ", 0) != 0) {
+    return Code::Ok;
+  }
   const vkc::Result<bool> again = client->next(0ms, &got.record, &got.payload);
   if (again.ok() || again.status().domain() != first.status().domain() ||
       again.status().message() != first.status().message()) {
@@ -106,8 +116,8 @@ int refused_case() {
   Got got;
   const vkc::Result<bool> r = settle(*client, &got);
   CHECK(!r.ok() && r.status().domain() == Code::IoError);
-  CHECK(r.status().message().find("127.0.0.1:" + std::to_string(port)) !=
-        std::string::npos);
+  CHECK(net::client_reason(r.status().message(), port)
+            .rfind("cannot connect: ", 0) == 0);
   const vkc::Result<bool> again = client->next(0ms, &got.record, &got.payload);
   CHECK(!again.ok() && again.status().message() == r.status().message());
   return 0;
@@ -168,7 +178,25 @@ int end_case() {
     }
     const vkc::Result<bool> r = settle(*client, &got);
     CHECK(!r.ok() && r.status().domain() == Code::IoError);
+    CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+          "the sender closed the connection");
   }
+  return 0;
+}
+
+// A sender that closes before the session, as one serving its most viewers
+// does, is told from one that ended.
+int closed_before_session_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  sender.peer.reset();
+  Got got;
+  const vkc::Result<bool> r = settle(*client, &got);
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+        "the sender closed the connection before its session (it may "
+        "already serve its most viewers)");
   return 0;
 }
 
@@ -264,7 +292,8 @@ int zero_wait_case() {
 }
 
 // idle_limit counts from connect: a listener that sends nothing ends the
-// connection after it; so does one that sends the session, then nothing.
+// connection after it, as connected with no session; so does one that sends
+// the session, then nothing, as no byte.
 int idle_case() {
   networking::ClientOptions options;
   options.idle_limit = 300ms;
@@ -286,7 +315,53 @@ int idle_case() {
     CHECK(!r.ok() && r.status().domain() == Code::IoError);
     CHECK(took >= 300ms && took < 2s);
     CHECK(client->session() == nullptr || session);
+    CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+          (session ? "no byte for 300 ms"
+                   : "connected, but no session within 300 ms"));
   }
+  return 0;
+}
+
+// A connect that never finishes ends at idle_limit as a connect, not as a
+// sender that stalled. macOS drops a SYN to a socket bound and not listening,
+// which Linux refuses; Linux drops one to a listener whose queue is full,
+// which macOS resets. So the port is bound, on Linux listening with a queue
+// of one, and connected to until a connect does not finish.
+int connect_within_case() {
+  vkc::UniqueFd listener(::socket(AF_INET, SOCK_STREAM, 0));
+  const sockaddr_in a = net::loopback(0);
+  CHECK(listener.valid() &&
+        ::bind(listener.get(), reinterpret_cast<const sockaddr*>(&a),
+               sizeof a) == 0);
+#ifndef __APPLE__
+  CHECK(::listen(listener.get(), 0) == 0);
+#endif
+  const std::uint16_t port = net::local_port(listener.get());
+  std::vector<vkc::UniqueFd> queued;
+  bool full = false;
+  for (int i = 0; i < 64 && !full; ++i) {
+    vkc::UniqueFd fd(::socket(AF_INET, SOCK_STREAM, 0));
+    CHECK(fd.valid() && ::fcntl(fd.get(), F_SETFL, O_NONBLOCK) == 0);
+    const sockaddr_in to = net::loopback(port);
+    (void)::connect(fd.get(), reinterpret_cast<const sockaddr*>(&to),
+                    sizeof to);
+    pollfd p{fd.get(), POLLOUT, 0};
+    full = ::poll(&p, 1, 100) == 0;
+    queued.push_back(std::move(fd));
+  }
+  CHECK(full);
+  networking::ClientOptions options;
+  options.idle_limit = 300ms;
+  const Clock::time_point start = Clock::now();
+  auto client = net::connect(port, options);
+  CHECK(client != nullptr);
+  Got got;
+  const vkc::Result<bool> r = settle(*client, &got);
+  const auto took = Clock::now() - start;
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  CHECK(took >= 300ms && took < 2s);
+  CHECK(net::client_reason(r.status().message(), port) ==
+        "cannot connect within 300 ms");
   return 0;
 }
 
@@ -317,6 +392,8 @@ int idle_from_last_byte_case() {
   const auto quiet = Clock::now() - last;
   CHECK(!r.ok() && r.status().domain() == Code::IoError);
   CHECK(quiet >= 300ms && quiet < 2s);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+        "no byte for 300 ms");
   return 0;
 }
 
@@ -408,10 +485,12 @@ int main() {
   if (huge_header_case() != 0) return 1;
   if (corrupt_body_case() != 0) return 1;
   if (end_case() != 0) return 1;
+  if (closed_before_session_case() != 0) return 1;
   if (wait_case() != 0) return 1;
   if (flood_case() != 0) return 1;
   if (zero_wait_case() != 0) return 1;
   if (idle_case() != 0) return 1;
+  if (connect_within_case() != 0) return 1;
   if (idle_from_last_byte_case() != 0) return 1;
   if (late_caller_case() != 0) return 1;
   if (never_case() != 0) return 1;

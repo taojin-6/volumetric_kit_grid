@@ -518,6 +518,18 @@ int max_viewers_case() {
   CHECK(eof && bytes.empty());
   CHECK(log.wait_for("refused viewer " + peer_name(third.get()), "2 viewers",
                      2s));
+  // A client refused there is told it may have been.
+  auto refused = net::connect(server->port());
+  CHECK(refused != nullptr);
+  Got got;
+  vkc::Result<bool> r = false;
+  for (int i = 0; i < 500 && r.ok() && !*r; ++i) {
+    r = refused->next(10ms, &got.record, &got.payload);
+  }
+  CHECK(!r.ok() &&
+        net::client_reason(r.status().message(), server->port()) ==
+            "the sender closed the connection before its session (it may "
+            "already serve its most viewers)");
 
   first.reset();
   const std::size_t header = net::session_chunk(session).size();

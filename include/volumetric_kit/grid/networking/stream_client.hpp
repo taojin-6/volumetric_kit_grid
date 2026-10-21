@@ -41,6 +41,18 @@ struct ClientOptions {
 /// `NotFound`). Its receive buffer is 256 KiB, set before the connect, so a
 /// reader that falls behind hides little from the server's drop rule.
 ///
+/// **Messages.** Every error @ref next returns reads
+/// `"StreamClient: <host>:<port>: <reason>"`, the host and port as given to
+/// @ref connect, and the reason never names them again: a caller showing the
+/// address drops the prefix. The reasons: "cannot look up the name: …" and
+/// "cannot connect: …" with the system's words; past the idle limit, the
+/// stage it ended: "the lookup gave no answer within N ms", "cannot connect
+/// within N ms", "connected, but no session within N ms" or "no byte for
+/// N ms"; "the sender closed the connection", with " before its session (it
+/// may already serve its most viewers)" when none had come; a failed check's
+/// `stream::ChunkParser` message; or a socket call's ("cannot receive: …").
+/// @ref connect's own refusals read `"StreamClient::connect: <reason>"`.
+///
 /// @code
 /// VKC_ASSIGN(auto client, networking::StreamClient::connect(
 ///                             "192.168.21.217", networking::kDefaultPort));

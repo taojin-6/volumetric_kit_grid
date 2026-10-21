@@ -118,7 +118,7 @@ core::Result<std::vector<Address>> resolve(std::string_view api,
                                                              ::freeaddrinfo);
   if (error != 0) {
     const std::string why =
-        std::string(api) + ": cannot look up " + host + ": " +
+        std::string(api) + ": cannot look up the name: " +
         (error == EAI_SYSTEM ? std::generic_category().message(system_error)
                              : std::string(::gai_strerror(error)));
     if (error == EAI_NONAME) return core::Status::not_found(why);
@@ -135,8 +135,8 @@ core::Result<std::vector<Address>> resolve(std::string_view api,
     addresses.push_back(address);
   }
   if (addresses.empty()) {
-    return core::Status::not_found(std::string(api) + ": " + host +
-                                   " has no address for TCP");
+    return core::Status::not_found(std::string(api) +
+                                   ": the name has no IPv4 address for TCP");
   }
   return addresses;
 }
@@ -218,21 +218,18 @@ core::Result<core::UniqueFd> start_connect(std::string_view api,
   const int error = errno;  // before the message's allocations
   // Interrupted, a non-blocking connect goes on as one in progress does.
   if (!*connected && error != EINPROGRESS && error != EINTR) {
-    return failure(api, "cannot connect to " + to_string(address), error);
+    return failure(api, "cannot connect", error);
   }
   return fd;
 }
 
-core::Status finish_connect(std::string_view api, int fd,
-                            const Address& address) {
+core::Status finish_connect(std::string_view api, int fd) {
   int error = 0;
   socklen_t size = sizeof error;
   if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0) {
     error = errno;
   }
-  if (error != 0) {
-    return failure(api, "cannot connect to " + to_string(address), error);
-  }
+  if (error != 0) return failure(api, "cannot connect", error);
   return {};
 }
 

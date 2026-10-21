@@ -65,7 +65,7 @@ bool parse_ipv4(const std::string& host, std::uint16_t port, Address* out);
 
 // Every IPv4 address `host` resolves to for TCP (getaddrinfo), with `port`.
 // Blocks for as long as the resolver takes. NotFound for a name that does not
-// resolve; IoError for a lookup that fails otherwise.
+// resolve; IoError for a lookup that fails otherwise; `api` names the host.
 core::Result<std::vector<Address>> resolve(std::string_view api,
                                            const std::string& host,
                                            std::uint16_t port);
@@ -88,16 +88,15 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
                                          Address* peer);
 
 // A socket, its receive buffer kReceiveBuffer, connecting to `address`
-// without waiting: `*connected` says whether it
-// already has, else poll it writable and call finish_connect.
+// without waiting: `*connected` says whether it already has, else poll it
+// writable and call finish_connect. `api` names the address.
 core::Result<core::UniqueFd> start_connect(std::string_view api,
                                            const Address& address,
                                            bool* connected);
 
-// The outcome of the connect to `address` start_connect began on `fd`, once
-// it polls writable.
-core::Status finish_connect(std::string_view api, int fd,
-                            const Address& address);
+// The outcome of the connect start_connect began on `fd`, once it polls
+// writable.
+core::Status finish_connect(std::string_view api, int fd);
 
 // Wait up to `timeout` for `events` on `fd` (poll): the events that came, 0
 // when none did.

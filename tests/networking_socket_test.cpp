@@ -94,8 +94,7 @@ int connect_pair(Connected* c) {
     const vkc::Result<short> ready =
         detail::wait_for("test", c->client.get(), POLLOUT, 2000ms);
     CHECK(ready.ok() && (*ready & POLLOUT) != 0);
-    CHECK(detail::finish_connect("test", c->client.get(), loopback(c->port))
-              .ok());
+    CHECK(detail::finish_connect("test", c->client.get()).ok());
   }
   CHECK(detail::wait_for("test", c->listener.get(), POLLIN, 2000ms).ok());
   vkc::Result<vkc::UniqueFd> accepted =
