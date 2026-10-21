@@ -83,7 +83,8 @@ core::Result<std::uint16_t> bound_port(std::string_view api, int fd);
 
 // The next connection waiting on `listener`, set up to send (TCP_NODELAY,
 // TCP_NOTSENT_LOWAT at kSendLowWater), and its peer; an empty fd when none
-// is waiting, or one failed before it was taken.
+// is waiting, or one failed before it was taken or cannot be set up, which
+// is closed.
 core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
                                          Address* peer);
 

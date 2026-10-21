@@ -13,8 +13,9 @@
 // Linux one that takes too few for its socket to poll writable within it is
 // not; connection max_viewers + 1 is closed before any byte, the first such
 // refusal logged at Warning and the next at Info, and a client refused there
-// is told it may have been; a viewer that leaves never fails publish; the
-// writer's refusals send nothing, and start
+// is told it may have been; peers reset before they are accepted are dropped
+// with no Warning while a viewer joins; a viewer that leaves never fails
+// publish; the writer's refusals send nothing, and start
 // refuses (a stall_limit of 0 or less among them); the destructor returns
 // within 1 s with no viewers, idle ones and a stalled one; and 100 SIGUSR1 to
 // a no-op handler leave the stream whole. Every test that publishes first
@@ -569,6 +570,56 @@ int max_viewers_case() {
   return 0;
 }
 
+// Peers that connect and reset before the accept thread takes them (macOS
+// then fails the accepted socket's first setsockopt) are dropped quietly: no
+// Warning, and a viewer joining while they come gets its session. Served
+// ones end at once, and 64 slots keep any from being refused.
+int reset_before_accept_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  networking::ServerOptions options;
+  options.max_viewers = 64;
+  auto server = net::serve(net::geometry_session(), options);
+  CHECK(server != nullptr);
+  std::atomic<bool> stop{false};
+  std::atomic<int> resets{0};
+  std::thread resetter([&] {
+    while (!stop) {
+      vkc::UniqueFd fd = net::connect_loopback(server->port());
+      if (!fd.valid()) continue;
+      const linger hard{1, 0};
+      (void)::setsockopt(fd.get(), SOL_SOCKET, SO_LINGER, &hard, sizeof hard);
+      fd.reset();
+      ++resets;
+    }
+  });
+  const Clock::time_point flooding = Clock::now() + 2s;
+  while (resets < 100 && Clock::now() < flooding) {
+    std::this_thread::sleep_for(5ms);
+  }
+  // As a player does, a viewer the kernel turned away tries again.
+  bool joined = false;
+  const Clock::time_point end = Clock::now() + 5s;
+  while (!joined && Clock::now() < end) {
+    auto client = net::connect(server->port());
+    joined = client != nullptr && net::wait_session(*client, 1s);
+  }
+  stop = true;
+  resetter.join();
+  CHECK(resets >= 100);
+  CHECK(joined);
+  {
+    const std::lock_guard<std::mutex> lock(log.mutex);
+    for (const Captured::Line& line : log.lines) {
+      if (line.level == vkc::LogLevel::Warning) {
+        std::fprintf(stderr, "warned: %s\n", line.text.c_str());
+      }
+    }
+  }
+  CHECK(log.count("", "", vkc::LogLevel::Warning) == 0);
+  return 0;
+}
+
 // Viewers that leave mid-stream, by a close or a reset, never fail publish,
 // and the one that stays gets every record.
 int leaving_viewer_case() {
@@ -825,6 +876,7 @@ int main() {
   if (stall_never_case() != 0) return 1;
   if (slow_viewer_case() != 0) return 1;
   if (max_viewers_case() != 0) return 1;
+  if (reset_before_accept_case() != 0) return 1;
   if (leaving_viewer_case() != 0) return 1;
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;

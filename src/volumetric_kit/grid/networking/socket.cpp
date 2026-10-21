@@ -191,6 +191,12 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
         case ENETDOWN:
         case ENETUNREACH:
         case EHOSTUNREACH:
+#ifdef EHOSTDOWN
+        case EHOSTDOWN:
+#endif
+#ifdef ENONET
+        case ENONET:
+#endif
         case ENOPROTOOPT:
         case EOPNOTSUPP:
           return core::UniqueFd();
@@ -198,11 +204,17 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
           return failure(api, "cannot accept", errno);
       }
     }
-    VKC_TRY(prepare(api, fd.get()));
-    VKC_TRY(set_option(api, fd.get(), IPPROTO_TCP, TCP_NODELAY, 1,
-                       "cannot set TCP_NODELAY"));
-    VKC_TRY(set_option(api, fd.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT,
-                       kSendLowWater, "cannot set TCP_NOTSENT_LOWAT"));
+    // One that cannot be set up failed after it was queued, as macOS shows
+    // one its peer reset (EINVAL at the first setsockopt): it goes too.
+    if (!prepare(api, fd.get()).ok() ||
+        !set_option(api, fd.get(), IPPROTO_TCP, TCP_NODELAY, 1,
+                    "cannot set TCP_NODELAY")
+             .ok() ||
+        !set_option(api, fd.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT,
+                    kSendLowWater, "cannot set TCP_NOTSENT_LOWAT")
+             .ok()) {
+      return core::UniqueFd();
+    }
     return fd;
   }
 }
