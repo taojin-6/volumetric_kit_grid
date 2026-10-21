@@ -20,9 +20,9 @@
 // parser's cap; start refuses (a stall_limit of 0 or less among them); the
 // destructor returns within 1 s with no viewers, idle ones and a stalled one;
 // the threads of viewers that ended are joined as they go, the address space
-// back near its start after 300; and 100 SIGUSR1 to a no-op handler leave
-// the stream whole. Every test that publishes first waits for the viewer's
-// session.
+// (on macOS, its stacks) back near its start after 300; and 100 SIGUSR1 to a
+// no-op handler leave the stream whole. Every test that publishes first waits
+// for the viewer's session.
 
 #include <pthread.h>
 #include <signal.h>
@@ -30,6 +30,7 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 #ifdef __GLIBC__
 #include <malloc.h>
@@ -884,17 +885,26 @@ int teardown_case() {
 }
 
 #ifndef VR_TEST_SANITIZED
-// The process's address space, in bytes, or 0 when it cannot be read.
+// The address space a thread never joined would grow, in bytes, or 0 when it
+// cannot be read: on macOS the regions tagged as stacks, as malloc maps a
+// 4 MiB region whenever a thread finds none of its own; elsewhere all of it.
 std::uint64_t address_space() {
 #ifdef __APPLE__
-  mach_task_basic_info_data_t info{};
-  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-  if (::task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  reinterpret_cast<task_info_t>(&info),
-                  &count) != KERN_SUCCESS) {
-    return 0;
+  std::uint64_t stacks = 0;
+  for (mach_vm_address_t address = 0;;) {
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (::mach_vm_region_recurse(
+            mach_task_self(), &address, &size, &depth,
+            reinterpret_cast<vm_region_recurse_info_t>(&info),
+            &count) != KERN_SUCCESS) {
+      return stacks;  // past the last region
+    }
+    if (info.user_tag == VM_MEMORY_STACK) stacks += size;
+    address += size;
   }
-  return info.virtual_size;
 #else
   std::ifstream statm("/proc/self/statm");
   std::uint64_t pages = 0;
@@ -906,13 +916,13 @@ std::uint64_t address_space() {
 
 // The threads of viewers that ended are joined as they go, not when the
 // server does: after 300 viewers join and leave one by one, the address
-// space is back within 4 MiB of where it was after the first 20. A thread
-// never joined keeps its stack (8 MiB on Linux) or, on macOS, about 34 KiB,
-// and neither shows in a thread count. A viewer's thread sees its end within
-// a poll slice, so 64 slots, and one refused tries again. glibc gives a
-// thread that finds malloc busy an arena of its own, 64 MiB of address space
-// kept, so no new one is made meanwhile. Not under ASan or TSan, which keep
-// freed memory a while.
+// space (on macOS, its stacks) is back within 4 MiB of where it was after
+// the first 20. A thread never joined keeps its stack (8 MiB on Linux) or,
+// on macOS, 32 KiB of it, and neither shows in a thread count. A viewer's
+// thread sees its end within a poll slice, so 64 slots, and one refused
+// tries again. glibc gives a thread that finds malloc busy an arena of its
+// own, 64 MiB of address space kept, so no new one is made meanwhile. Not
+// under ASan or TSan, which keep freed memory a while.
 int reaping_case() {
 #ifndef VR_TEST_SANITIZED
 #ifdef __GLIBC__
