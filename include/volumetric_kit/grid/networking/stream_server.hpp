@@ -34,7 +34,7 @@ struct ServerOptions {
   /// record until the next key: the viewers freeze until it.
   std::uint64_t max_gop_bytes = std::uint64_t{64} << 20;
   /// A viewer that takes no byte for this long, with bytes waiting for it, is
-  /// closed: a peer that vanished.
+  /// closed: a peer that vanished. A byte its end acknowledges is taken.
   std::chrono::milliseconds stall_limit{10'000};
 };
 

@@ -9,11 +9,13 @@
 // records are published gets whole chunks, a key after every jump and the
 // newest GOP whole, with every publish back at once; a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
-// is closed after stall_limit; connection max_viewers + 1 is closed before
-// any byte; a viewer that leaves never fails publish; the writer's refusals
-// send nothing; the destructor returns within 1 s with no viewers, idle ones
-// and a stalled one; and 100 SIGUSR1 to a no-op handler leave the stream
-// whole. Every test that publishes first waits for the viewer's session.
+// is closed after stall_limit, and on Linux one that takes too few for its
+// socket to poll writable within it is not; connection max_viewers + 1 is
+// closed before any byte; a viewer that leaves never fails publish; the
+// writer's refusals send nothing; the destructor returns within 1 s with no
+// viewers, idle ones and a stalled one; and 100 SIGUSR1 to a no-op handler
+// leave the stream whole. Every test that publishes first waits for the
+// viewer's session.
 
 #include <pthread.h>
 #include <signal.h>
@@ -421,6 +423,47 @@ int stall_limit_case() {
   return 0;
 }
 
+// A viewer that keeps taking bytes, though too slowly for its socket to poll
+// writable within stall_limit (300 ms), is not closed: 1 KiB every 10 ms
+// through a 4 KiB receive buffer, while 256 KiB records come for 2 s. Under
+// the low-water mark again takes 64 KiB, 640 ms at this rate. Linux only:
+// macOS's loopback ignores the small buffer and, behind a reader this slow,
+// acknowledges in bursts seconds apart.
+int slow_viewer_case() {
+#ifdef __linux__
+  Captured log;
+  const LogCapture capture(&log);
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.stall_limit = 300ms;
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd slow = net::connect_loopback(server->port(), 4096);
+  CHECK(slow.valid());
+  Bytes taken;
+  net::read_upto(slow.get(), net::session_chunk(session).size(), 5s, &taken);
+  CHECK(taken.size() == net::session_chunk(session).size());
+  const std::string name = peer_name(slow.get());
+  CHECK(log.wait_for(name, "joined", 2s));
+
+  const Clock::time_point start = Clock::now();
+  for (std::uint64_t seq = 0; Clock::now() - start < 2s; ++seq) {
+    const Bytes payload = net::record_payload(seq, 256 << 10);
+    CHECK(server
+              ->publish(net::record_info(seq, seq % 30 == 0), payload.data(),
+                        payload.size())
+              .ok());
+    const std::size_t before = taken.size();
+    bool eof = false;
+    net::read_upto(slow.get(), before + 1024, 1s, &taken, &eof);
+    CHECK(!eof && taken.size() == before + 1024);
+    std::this_thread::sleep_for(10ms);
+  }
+  CHECK(!log.has(name, "took no byte"));
+#endif
+  return 0;
+}
+
 // Connection max_viewers + 1 is closed before any byte; once a viewer leaves,
 // a new one is served.
 int max_viewers_case() {
@@ -708,6 +751,7 @@ int main() {
   if (newest_key_wins_case() != 0) return 1;
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
+  if (slow_viewer_case() != 0) return 1;
   if (max_viewers_case() != 0) return 1;
   if (leaving_viewer_case() != 0) return 1;
   if (rules_case() != 0) return 1;

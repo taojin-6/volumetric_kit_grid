@@ -93,6 +93,10 @@ core::Result<short> wait_for(std::string_view api, int fd, short events,
 core::Result<std::size_t> send_some(std::string_view api, int fd,
                                     const std::uint8_t* data, std::size_t size);
 
+// The bytes sent on `fd` that its peer has not acknowledged, unsent ones
+// included: SO_NWRITE on Apple, SIOCOUTQ elsewhere.
+core::Result<std::size_t> unacknowledged(std::string_view api, int fd);
+
 // What one receive found.
 struct Received {
   std::size_t bytes = 0;  // read; 0 when none had come
