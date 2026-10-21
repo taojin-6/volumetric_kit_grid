@@ -36,6 +36,22 @@ inline constexpr int kSendLowWater = 128 << 10;
 // it: what a reader that falls behind can hide from the sender's drop rule.
 inline constexpr int kReceiveBuffer = 256 << 10;
 
+// `from` + `limit`, saturating: a limit past the clock's end, as
+// milliseconds::max() ("never"), gives that end; one of 0 or less, `from`.
+inline std::chrono::steady_clock::time_point after(
+    std::chrono::steady_clock::time_point from,
+    std::chrono::milliseconds limit) {
+  using Clock = std::chrono::steady_clock;
+  if (limit <= std::chrono::milliseconds{0}) return from;
+  // Compared in milliseconds: the limit in the clock's nanoseconds may not
+  // fit.
+  if (limit >= std::chrono::floor<std::chrono::milliseconds>(
+                   Clock::time_point::max() - from)) {
+    return Clock::time_point::max();
+  }
+  return from + limit;
+}
+
 // An IPv4 socket address. A StreamServer listens on IPv4 alone, so a client
 // tries no other family: an IPv6 address could only be refused, or stall a
 // connect where IPv6 is broken.
@@ -49,7 +65,7 @@ bool parse_ipv4(const std::string& host, std::uint16_t port, Address* out);
 
 // Every IPv4 address `host` resolves to for TCP (getaddrinfo), with `port`.
 // Blocks for as long as the resolver takes. NotFound for a name that does not
-// resolve; IoError for a lookup that fails otherwise.
+// resolve; IoError for a lookup that fails otherwise; `api` names the host.
 core::Result<std::vector<Address>> resolve(std::string_view api,
                                            const std::string& host,
                                            std::uint16_t port);
@@ -67,21 +83,21 @@ core::Result<std::uint16_t> bound_port(std::string_view api, int fd);
 
 // The next connection waiting on `listener`, set up to send (TCP_NODELAY,
 // TCP_NOTSENT_LOWAT at kSendLowWater), and its peer; an empty fd when none
-// is waiting, or one failed before it was taken.
+// is waiting, or one failed before it was taken or cannot be set up, which
+// is closed.
 core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
                                          Address* peer);
 
 // A socket, its receive buffer kReceiveBuffer, connecting to `address`
-// without waiting: `*connected` says whether it
-// already has, else poll it writable and call finish_connect.
+// without waiting: `*connected` says whether it already has, else poll it
+// writable and call finish_connect. `api` names the address.
 core::Result<core::UniqueFd> start_connect(std::string_view api,
                                            const Address& address,
                                            bool* connected);
 
-// The outcome of the connect to `address` start_connect began on `fd`, once
-// it polls writable.
-core::Status finish_connect(std::string_view api, int fd,
-                            const Address& address);
+// The outcome of the connect start_connect began on `fd`, once it polls
+// writable.
+core::Status finish_connect(std::string_view api, int fd);
 
 // Wait up to `timeout` for `events` on `fd` (poll): the events that came, 0
 // when none did.

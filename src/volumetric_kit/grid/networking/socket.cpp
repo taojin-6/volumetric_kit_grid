@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <system_error>
 
@@ -117,7 +118,7 @@ core::Result<std::vector<Address>> resolve(std::string_view api,
                                                              ::freeaddrinfo);
   if (error != 0) {
     const std::string why =
-        std::string(api) + ": cannot look up " + host + ": " +
+        std::string(api) + ": cannot look up the name: " +
         (error == EAI_SYSTEM ? std::generic_category().message(system_error)
                              : std::string(::gai_strerror(error)));
     if (error == EAI_NONAME) return core::Status::not_found(why);
@@ -134,8 +135,9 @@ core::Result<std::vector<Address>> resolve(std::string_view api,
     addresses.push_back(address);
   }
   if (addresses.empty()) {
-    return core::Status::not_found(std::string(api) + ": " + host +
-                                   " has no address for TCP");
+    return core::Status::not_found(
+        std::string(api) +
+        ": cannot look up the name: no IPv4 address for TCP");
   }
   return addresses;
 }
@@ -190,6 +192,12 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
         case ENETDOWN:
         case ENETUNREACH:
         case EHOSTUNREACH:
+#ifdef EHOSTDOWN
+        case EHOSTDOWN:
+#endif
+#ifdef ENONET
+        case ENONET:
+#endif
         case ENOPROTOOPT:
         case EOPNOTSUPP:
           return core::UniqueFd();
@@ -197,11 +205,17 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
           return failure(api, "cannot accept", errno);
       }
     }
-    VKC_TRY(prepare(api, fd.get()));
-    VKC_TRY(set_option(api, fd.get(), IPPROTO_TCP, TCP_NODELAY, 1,
-                       "cannot set TCP_NODELAY"));
-    VKC_TRY(set_option(api, fd.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT,
-                       kSendLowWater, "cannot set TCP_NOTSENT_LOWAT"));
+    // One that cannot be set up failed after it was queued, as macOS shows
+    // one its peer reset (EINVAL at the first setsockopt): it goes too.
+    if (!prepare(api, fd.get()).ok() ||
+        !set_option(api, fd.get(), IPPROTO_TCP, TCP_NODELAY, 1,
+                    "cannot set TCP_NODELAY")
+             .ok() ||
+        !set_option(api, fd.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT,
+                    kSendLowWater, "cannot set TCP_NOTSENT_LOWAT")
+             .ok()) {
+      return core::UniqueFd();
+    }
     return fd;
   }
 }
@@ -217,37 +231,36 @@ core::Result<core::UniqueFd> start_connect(std::string_view api,
   const int error = errno;  // before the message's allocations
   // Interrupted, a non-blocking connect goes on as one in progress does.
   if (!*connected && error != EINPROGRESS && error != EINTR) {
-    return failure(api, "cannot connect to " + to_string(address), error);
+    return failure(api, "cannot connect", error);
   }
   return fd;
 }
 
-core::Status finish_connect(std::string_view api, int fd,
-                            const Address& address) {
+core::Status finish_connect(std::string_view api, int fd) {
   int error = 0;
   socklen_t size = sizeof error;
   if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0) {
     error = errno;
   }
-  if (error != 0) {
-    return failure(api, "cannot connect to " + to_string(address), error);
-  }
+  if (error != 0) return failure(api, "cannot connect", error);
   return {};
 }
 
 core::Result<short> wait_for(std::string_view api, int fd, short events,
                              std::chrono::milliseconds timeout) {
   using Clock = std::chrono::steady_clock;
-  const Clock::time_point deadline = Clock::now() + timeout;
+  const Clock::time_point deadline = after(Clock::now(), timeout);
   for (;;) {
     pollfd p{fd, events, 0};
     const auto left =
         std::chrono::ceil<std::chrono::milliseconds>(deadline - Clock::now());
-    const int n = ::poll(
-        &p, 1, static_cast<int>(std::max<std::int64_t>(left.count(), 0)));
+    // A poll waits at most INT_MAX ms (24 days), then the next goes on.
+    const std::int64_t ms = std::clamp<std::int64_t>(
+        left.count(), 0, std::numeric_limits<int>::max());
+    const int n = ::poll(&p, 1, static_cast<int>(ms));
     if (n > 0) return p.revents;
-    if (n == 0) return short{0};
-    if (errno != EINTR) return failure(api, "cannot poll", errno);
+    if (n == 0 && Clock::now() >= deadline) return short{0};
+    if (n < 0 && errno != EINTR) return failure(api, "cannot poll", errno);
   }
 }
 

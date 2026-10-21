@@ -6,13 +6,24 @@
 // header claiming 1 GiB is refused before any of its body comes (a RECD's or
 // another tag's OutOfMemory, a VRST's InvalidArgument); a corrupt body is
 // InvalidArgument; the end after whole records is IoError once they are all
-// read; next(20 ms) with nothing returns false in about 20 ms, and within
-// 500 ms while chunks it skips flood in; next(0 ms) alone connects and reads,
-// a record already in the socket in one call; idle_limit counts from connect,
-// against a listener that sends nothing; localhost reaches a 127.0.0.1
-// server; and an empty host or port 0 is refused. Each error is returned
-// again by every later call.
+// read, and an end before the session says so; next(20 ms) with nothing
+// returns false in about 20 ms, and within 500 ms while chunks it skips flood
+// in; next(0 ms) alone connects and reads, a 230 KB record already in the
+// socket in one call; idle_limit counts from connect, against a listener that
+// sends nothing and a port whose connects never finish, and then from the
+// last byte, judged after taking what came while the caller was away (bytes,
+// a connect's end or its refusal);
+// milliseconds::max() as idle_limit or wait is never; localhost reaches a
+// 127.0.0.1 server, and clients destroyed mid-lookup leave it to end alone;
+// and an empty host, port 0 or an idle_limit of 0 or less is refused. Each
+// error reads "StreamClient: 127.0.0.1:<port>: <reason>", the
+// address in it once, with the stage the idle limit ended in as its reason;
+// it closes the connection, as a sender sees, and is returned again by every
+// later call.
 
+#include <fcntl.h>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -65,8 +76,10 @@ vkc::Result<bool> settle(networking::StreamClient& client, Got* got) {
   }
 }
 
-// The error a client gets from `bytes`, the connection left open; the same
-// error from the call after.
+// The error a client gets from `bytes`, the connection left open, its message
+// the client's prefix and the parser's reason; the same error from the call
+// after; and the client's end of the connection closed, which the sender
+// reads.
 Code error_from(const Bytes& bytes) {
   Sender sender;
   auto client = net::connect(sender.listener.port);
@@ -76,12 +89,20 @@ Code error_from(const Bytes& bytes) {
   }
   Got got;
   const vkc::Result<bool> first = settle(*client, &got);
-  if (first.ok()) return Code::Ok;
+  if (first.ok() ||
+      net::client_reason(first.status().message(), sender.listener.port)
+              .rfind("ChunkParser: ", 0) != 0) {
+    return Code::Ok;
+  }
   const vkc::Result<bool> again = client->next(0ms, &got.record, &got.payload);
   if (again.ok() || again.status().domain() != first.status().domain() ||
       again.status().message() != first.status().message()) {
     return Code::Ok;
   }
+  Bytes rest;
+  bool closed = false;
+  net::read_upto(sender.peer.get(), 1, 2s, &rest, &closed);
+  if (!closed) return Code::Ok;
   return first.status().domain();
 }
 
@@ -104,8 +125,8 @@ int refused_case() {
   Got got;
   const vkc::Result<bool> r = settle(*client, &got);
   CHECK(!r.ok() && r.status().domain() == Code::IoError);
-  CHECK(r.status().message().find("127.0.0.1:" + std::to_string(port)) !=
-        std::string::npos);
+  CHECK(net::client_reason(r.status().message(), port)
+            .rfind("cannot connect: ", 0) == 0);
   const vkc::Result<bool> again = client->next(0ms, &got.record, &got.payload);
   CHECK(!again.ok() && again.status().message() == r.status().message());
   return 0;
@@ -134,10 +155,27 @@ int huge_header_case() {
   return 0;
 }
 
+// A corrupt body is InvalidArgument; so is one after a whole record, sent at
+// once, which is read first, the failure found once the record is taken.
 int corrupt_body_case() {
   Bytes record = vrst::record(0, 1, 0, 0, stream::kNoSet, vrst::pattern(64, 1));
   record[56 + 10] ^= 0x20;
   CHECK(error_from(concat({session_bytes(), record})) == Code::InvalidArgument);
+
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  const Bytes whole =
+      vrst::record(0, 1, 0, 0, stream::kNoSet, vrst::pattern(64, 2));
+  CHECK(net::send_bytes(sender.peer.get(),
+                        concat({session_bytes(), whole, record})));
+  Got got;
+  vkc::Result<bool> r = settle(*client, &got);
+  CHECK(r.ok() && *r && got.record.info.seq == 0);
+  r = settle(*client, &got);
+  CHECK(!r.ok() && r.status().domain() == Code::InvalidArgument);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port)
+            .rfind("ChunkParser: ", 0) == 0);
   return 0;
 }
 
@@ -166,7 +204,25 @@ int end_case() {
     }
     const vkc::Result<bool> r = settle(*client, &got);
     CHECK(!r.ok() && r.status().domain() == Code::IoError);
+    CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+          "the sender closed the connection");
   }
+  return 0;
+}
+
+// A sender that closes before the session, as one serving its most viewers
+// does, is told from one that ended.
+int closed_before_session_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  sender.peer.reset();
+  Got got;
+  const vkc::Result<bool> r = settle(*client, &got);
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+        "the sender closed the connection before its session (it may "
+        "already serve its most viewers)");
   return 0;
 }
 
@@ -235,7 +291,8 @@ int flood_case() {
 }
 
 // next(0 ms) alone moves: a client calling only it connects and reads a
-// record; and one call returns a record already whole in the socket.
+// record; and one call returns a key-sized record (230 KB) already whole in
+// the socket.
 int zero_wait_case() {
   Sender sender;
   auto client = net::connect(sender.listener.port);
@@ -253,7 +310,7 @@ int zero_wait_case() {
   CHECK(r.ok() && *r && got.record.info.seq == 0);
   CHECK(net::send_bytes(
       sender.peer.get(),
-      vrst::record(0, 0, 1, 1, stream::kNoSet, vrst::pattern(1000, 8))));
+      vrst::record(0, 0, 1, 1, stream::kNoSet, vrst::pattern(230'000, 8))));
   std::this_thread::sleep_for(200ms);  // on loopback, in the socket by now
   r = client->next(0ms, &got.record, &got.payload);
   CHECK(r.ok() && *r && got.record.info.seq == 1);
@@ -261,7 +318,8 @@ int zero_wait_case() {
 }
 
 // idle_limit counts from connect: a listener that sends nothing ends the
-// connection after it; so does one that sends the session, then nothing.
+// connection after it, as connected with no session; so does one that sends
+// the session, then nothing, as no byte.
 int idle_case() {
   networking::ClientOptions options;
   options.idle_limit = 300ms;
@@ -283,7 +341,174 @@ int idle_case() {
     CHECK(!r.ok() && r.status().domain() == Code::IoError);
     CHECK(took >= 300ms && took < 2s);
     CHECK(client->session() == nullptr || session);
+    CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+          (session ? "no byte for 300 ms"
+                   : "connected, but no session within 300 ms"));
   }
+  return 0;
+}
+
+// A connect that never finishes ends at idle_limit as a connect, not as a
+// sender that stalled. macOS drops a SYN to a socket bound and not listening,
+// which Linux refuses; Linux drops one to a listener whose queue is full,
+// which macOS resets. So the port is bound, on Linux listening with a queue
+// of one, and connected to until a connect does not finish.
+int connect_within_case() {
+  vkc::UniqueFd listener(::socket(AF_INET, SOCK_STREAM, 0));
+  const sockaddr_in a = net::loopback(0);
+  CHECK(listener.valid() &&
+        ::bind(listener.get(), reinterpret_cast<const sockaddr*>(&a),
+               sizeof a) == 0);
+#ifndef __APPLE__
+  CHECK(::listen(listener.get(), 0) == 0);
+#endif
+  const std::uint16_t port = net::local_port(listener.get());
+  std::vector<vkc::UniqueFd> queued;
+  bool full = false;
+  for (int i = 0; i < 64 && !full; ++i) {
+    vkc::UniqueFd fd(::socket(AF_INET, SOCK_STREAM, 0));
+    CHECK(fd.valid() && ::fcntl(fd.get(), F_SETFL, O_NONBLOCK) == 0);
+    const sockaddr_in to = net::loopback(port);
+    (void)::connect(fd.get(), reinterpret_cast<const sockaddr*>(&to),
+                    sizeof to);
+    pollfd p{fd.get(), POLLOUT, 0};
+    full = ::poll(&p, 1, 100) == 0;
+    queued.push_back(std::move(fd));
+  }
+  CHECK(full);
+  networking::ClientOptions options;
+  options.idle_limit = 300ms;
+  const Clock::time_point start = Clock::now();
+  auto client = net::connect(port, options);
+  CHECK(client != nullptr);
+  Got got;
+  const vkc::Result<bool> r = settle(*client, &got);
+  const auto took = Clock::now() - start;
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  CHECK(took >= 300ms && took < 2s);
+  CHECK(net::client_reason(r.status().message(), port) ==
+        "cannot connect within 300 ms");
+  return 0;
+}
+
+// idle_limit counts from the last byte: a record every 50 ms for 1 s keeps a
+// client whose limit is 300 ms; once they stop, it ends 300 ms to 2 s after
+// the last.
+int idle_from_last_byte_case() {
+  networking::ClientOptions options;
+  options.idle_limit = 300ms;
+  Sender sender;
+  auto client = net::connect(sender.listener.port, options);
+  CHECK(client != nullptr && sender.take(*client));
+  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+  const Bytes payload = vrst::pattern(100, 5);
+  Got got;
+  const Clock::time_point start = Clock::now();
+  Clock::time_point last = start;
+  for (std::uint64_t seq = 0; Clock::now() - start < 1s; ++seq) {
+    CHECK(net::send_bytes(
+        sender.peer.get(),
+        vrst::record(0, seq == 0 ? 1 : 0, seq, seq, stream::kNoSet, payload)));
+    last = Clock::now();
+    const vkc::Result<bool> r = settle(*client, &got);
+    CHECK(r.ok() && *r && got.record.info.seq == seq);
+    std::this_thread::sleep_for(50ms);
+  }
+  const vkc::Result<bool> r = settle(*client, &got);
+  const auto quiet = Clock::now() - last;
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  CHECK(quiet >= 300ms && quiet < 2s);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port) ==
+        "no byte for 300 ms");
+  return 0;
+}
+
+// A caller back late takes what came meanwhile before it judges idle_limit,
+// a client whose limit is 300 ms not called for 500 ms: a record every
+// 100 ms, the first of which next(0) returns; a connect that ended, the
+// session and a record sent at once, which next(0) returns, or the call
+// after the one that ends the connect; and a refused connect, which the
+// error names.
+int late_caller_case() {
+  networking::ClientOptions options;
+  options.idle_limit = 300ms;
+  const Bytes payload = vrst::pattern(100, 6);
+  {
+    Sender sender;
+    auto client = net::connect(sender.listener.port, options);
+    CHECK(client != nullptr && sender.take(*client));
+    CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+    CHECK(net::wait_session(*client));
+    for (std::uint64_t seq = 0; seq < 5; ++seq) {
+      std::this_thread::sleep_for(100ms);
+      CHECK(net::send_bytes(sender.peer.get(),
+                            vrst::record(0, seq == 0 ? 1 : 0, seq, seq,
+                                         stream::kNoSet, payload)));
+    }
+    Got got;
+    const vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
+    CHECK(r.ok() && *r && got.record.info.seq == 0);
+  }
+  {
+    Sender sender;  // whose take makes one next(0), starting the connect
+    auto client = net::connect(sender.listener.port, options);
+    CHECK(client != nullptr && sender.take(*client));
+    CHECK(net::send_bytes(
+        sender.peer.get(),
+        concat({session_bytes(),
+                vrst::record(0, 1, 0, 0, stream::kNoSet, payload)})));
+    std::this_thread::sleep_for(500ms);
+    Got got;
+    vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
+    if (r.ok() && !*r) r = client->next(0ms, &got.record, &got.payload);
+    CHECK(r.ok() && *r && got.record.info.seq == 0);
+  }
+  {
+    const std::uint16_t port = net::closed_port();
+    CHECK(port != 0);
+    auto client = net::connect(port, options);
+    CHECK(client != nullptr);
+    Got got;
+    vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
+    CHECK(r.ok() && !*r);
+    std::this_thread::sleep_for(500ms);
+    for (int i = 0; i < 3 && r.ok(); ++i) {
+      r = client->next(0ms, &got.record, &got.payload);
+    }
+    CHECK(!r.ok() && net::client_reason(r.status().message(), port)
+                             .rfind("cannot connect: ", 0) == 0);
+  }
+  return 0;
+}
+
+// milliseconds::max() means never: as idle_limit it never ends a connection
+// to a sender that sends nothing, and as next's wait it waits until a record
+// comes, 100 ms later.
+int never_case() {
+  constexpr std::chrono::milliseconds kNever = std::chrono::milliseconds::max();
+  networking::ClientOptions options;
+  options.idle_limit = kNever;
+  Sender sender;
+  auto client = net::connect(sender.listener.port, options);
+  CHECK(client != nullptr && sender.take(*client));
+  Got got;
+  for (int i = 0; i < 3; ++i) {
+    const vkc::Result<bool> r = client->next(50ms, &got.record, &got.payload);
+    CHECK(r.ok() && !*r);
+  }
+  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+  std::thread later([&] {
+    std::this_thread::sleep_for(100ms);
+    (void)net::send_bytes(
+        sender.peer.get(),
+        vrst::record(0, 1, 0, 0, stream::kNoSet, vrst::pattern(64, 9)));
+  });
+  const Clock::time_point start = Clock::now();
+  const vkc::Result<bool> r = client->next(kNever, &got.record, &got.payload);
+  const auto took = Clock::now() - start;
+  later.join();
+  CHECK(r.ok() && *r && got.record.info.seq == 0);
+  CHECK(took >= 50ms);
   return 0;
 }
 
@@ -297,11 +522,50 @@ int localhost_case() {
   return 0;
 }
 
+// Clients of localhost destroyed while their lookups run, half before any
+// next and half after next(0), leave the lookups to end alone: a lookup
+// writing to a client gone would fail, under ASan and TSan or on its mutex.
+// Every core is kept busy meanwhile, so a lookup's thread waits to run.
+int abandoned_lookup_case() {
+  const std::uint16_t port = net::closed_port();
+  CHECK(port != 0);
+  std::atomic<bool> stop{false};
+  std::vector<std::thread> busy;
+  for (unsigned i = 0; i < std::max(2u, std::thread::hardware_concurrency());
+       ++i) {
+    busy.emplace_back([&stop] {
+      while (!stop) {
+      }
+    });
+  }
+  bool made = true;  // checked once the busy threads are joined
+  for (int i = 0; i < 60 && made; ++i) {
+    auto client = net::connect(port, {}, "localhost");
+    made = client != nullptr;
+    if (made && i % 2 == 1) {
+      Got got;
+      made = client->next(0ms, &got.record, &got.payload).ok();
+    }
+  }
+  stop = true;
+  for (std::thread& t : busy) t.join();
+  CHECK(made);
+  std::this_thread::sleep_for(200ms);  // the lookups end meanwhile
+  return 0;
+}
+
 int refusals_case() {
   CHECK(networking::StreamClient::connect("", 47801).status().domain() ==
         Code::InvalidArgument);
   CHECK(networking::StreamClient::connect("127.0.0.1", 0).status().domain() ==
         Code::InvalidArgument);
+  for (const std::chrono::milliseconds limit : {0ms, -1ms}) {
+    networking::ClientOptions options;
+    options.idle_limit = limit;
+    CHECK(networking::StreamClient::connect("127.0.0.1", 47801, options)
+              .status()
+              .domain() == Code::InvalidArgument);
+  }
   return 0;
 }
 
@@ -313,11 +577,17 @@ int main() {
   if (huge_header_case() != 0) return 1;
   if (corrupt_body_case() != 0) return 1;
   if (end_case() != 0) return 1;
+  if (closed_before_session_case() != 0) return 1;
   if (wait_case() != 0) return 1;
   if (flood_case() != 0) return 1;
   if (zero_wait_case() != 0) return 1;
   if (idle_case() != 0) return 1;
+  if (connect_within_case() != 0) return 1;
+  if (idle_from_last_byte_case() != 0) return 1;
+  if (late_caller_case() != 0) return 1;
+  if (never_case() != 0) return 1;
   if (localhost_case() != 0) return 1;
+  if (abandoned_lookup_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::puts("networking client: OK");
   return 0;

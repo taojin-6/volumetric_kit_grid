@@ -4,35 +4,61 @@
 // StreamServer and StreamClient on loopback (127.0.0.1, port 0): a raw
 // viewer's bytes are StreamWriter's file for the same session and records,
 // less its footer; a client reads the session, then every record's info,
-// payload and file offset; a viewer joining gets the GOP from its key, and
-// before any key nothing; a viewer that does not read while 3 GOPs of 1 MiB
-// records are published gets whole chunks, a key after every jump and the
-// newest GOP whole, with every publish back at once; a GOP past
+// payload and file offset; a viewer that sends bytes still gets every record;
+// a viewer joining gets the GOP from its key, and
+// before any key nothing; a viewer that stops reading in the first key while
+// 3 GOPs of 1 MiB records are published gets that key whole, then the newest
+// GOP whole, with every publish back at once; a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
-// is closed after stall_limit, and on Linux one that takes too few for its
-// socket to poll writable within it is not; connection max_viewers + 1 is
-// closed before any byte; a viewer that leaves never fails publish; the
-// writer's refusals send nothing; the destructor returns within 1 s with no
-// viewers, idle ones and a stalled one; and 100 SIGUSR1 to a no-op handler
-// leave the stream whole. Every test that publishes first waits for the
-// viewer's session.
+// is closed after stall_limit, never when it is milliseconds::max(), and on
+// Linux one that takes too few for its socket to poll writable within it is
+// not; connection max_viewers + 1 is closed before any byte, the first such
+// refusal logged at Warning and the next at Info, and a client refused there
+// is told it may have been; peers reset before they are accepted are dropped
+// with no Warning while a viewer joins; a viewer that leaves never fails
+// publish; the writer's refusals send nothing, and so does a payload over the
+// parser's cap; start refuses (a stall_limit of 0 or less among them); the
+// destructor returns within 1 s with no viewers, idle ones and a stalled one;
+// the threads of viewers that ended are joined as they go, the address space
+// (on macOS, its stacks) back near its start after 300; and 100 SIGUSR1 to a
+// no-op handler leave the stream whole. Every test that publishes first waits
+// for the viewer's session.
 
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define VR_TEST_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define VR_TEST_SANITIZED 1
+#endif
 
 #include "networking_loopback.hpp"
 #include "scratch_dir.hpp"
@@ -76,18 +102,27 @@ std::vector<Published> some_records() {
 
 // What a log handler saw, for the tests that read the server's log.
 struct Captured {
+  struct Line {
+    vkc::LogLevel level;
+    std::string text;
+  };
   std::mutex mutex;
-  std::vector<std::string> lines;
+  std::vector<Line> lines;
 
-  bool has(std::string_view a, std::string_view b = {}) {
+  // The lines holding `a` and `b`, at `level` when one is given.
+  std::size_t count(std::string_view a, std::string_view b = {},
+                    std::optional<vkc::LogLevel> level = {}) {
     const std::lock_guard<std::mutex> lock(mutex);
-    for (const std::string& line : lines) {
-      if (line.find(a) != std::string::npos &&
-          line.find(b) != std::string::npos) {
-        return true;
-      }
+    std::size_t n = 0;
+    for (const Line& line : lines) {
+      n += line.text.find(a) != std::string::npos &&
+           line.text.find(b) != std::string::npos &&
+           (!level || line.level == *level);
     }
-    return false;
+    return n;
+  }
+  bool has(std::string_view a, std::string_view b = {}) {
+    return count(a, b) > 0;
   }
   bool wait_for(std::string_view a, std::string_view b,
                 std::chrono::milliseconds timeout) {
@@ -103,11 +138,11 @@ struct Captured {
 // Installs a handler that keeps every line, until it goes.
 struct LogCapture {
   explicit LogCapture(Captured* into) {
-    vkc::set_log_handler(
-        [into](vkc::LogLevel, std::string_view, std::string_view message) {
-          const std::lock_guard<std::mutex> lock(into->mutex);
-          into->lines.emplace_back(message);
-        });
+    vkc::set_log_handler([into](vkc::LogLevel level, std::string_view,
+                                std::string_view message) {
+      const std::lock_guard<std::mutex> lock(into->mutex);
+      into->lines.push_back({level, std::string(message)});
+    });
   }
   ~LogCapture() { vkc::set_log_handler({}); }
   LogCapture(const LogCapture&) = delete;
@@ -116,6 +151,30 @@ struct LogCapture {
 
 std::string peer_name(int fd) {
   return "127.0.0.1:" + std::to_string(net::local_port(fd));
+}
+
+// The records a raw viewer gets, each chunk passing its CRCs: from `wire`,
+// what it has read, then from `fd` until the record of seq `last`, within
+// 10 s.
+int drain(int fd, const Bytes& wire, std::uint64_t last,
+          std::vector<Got>* got) {
+  stream::ChunkParser parser;
+  CHECK(parser.feed(wire.data(), wire.size()).ok());
+  const Clock::time_point end = Clock::now() + 10s;
+  while ((got->empty() || got->back().record.info.seq < last) &&
+         Clock::now() < end) {
+    Got g;
+    const vkc::Result<bool> r = parser.next(&g.record, &g.payload);
+    CHECK(r.ok());
+    if (*r) {
+      got->push_back(std::move(g));
+      continue;
+    }
+    Bytes more;
+    net::read_upto(fd, std::size_t{1} << 20, 100ms, &more);
+    CHECK(parser.feed(more.data(), more.size()).ok());
+  }
+  return 0;
 }
 
 // --- The wire.
@@ -201,6 +260,39 @@ int round_trip_case(const std::string& dir) {
   return 0;
 }
 
+// What a viewer sends is read and dropped: one that sends 64 KiB mid-stream
+// gets every record.
+int viewer_sends_case() {
+  constexpr std::uint64_t kRecords = 20;
+  const stream::Session session = net::geometry_session();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port());
+  CHECK(viewer.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
+    if (seq == kRecords / 2) {
+      CHECK(net::send_bytes(viewer.get(), Bytes(64 << 10, 0x55)));
+    }
+    const Bytes payload = net::record_payload(seq, 1000);
+    CHECK(server
+              ->publish(net::record_info(seq, seq == 0), payload.data(),
+                        payload.size())
+              .ok());
+  }
+  std::vector<Got> got;
+  CHECK(drain(viewer.get(), wire, kRecords - 1, &got) == 0);
+  CHECK(got.size() == kRecords);
+  for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
+    CHECK(got[seq].record.info.seq == seq);
+    CHECK(got[seq].payload == net::record_payload(seq, 1000));
+  }
+  return 0;
+}
+
 // --- Joining.
 // -----------------------------------------------------------------
 
@@ -280,48 +372,47 @@ int join_case() {
 // ---------------------------------------------------------
 
 // A viewer that stops reading while 3 GOPs of 1 MiB records are published,
-// then drains: whole chunks (each passes its CRCs), seq rising, a key after
-// every jump, the newest GOP whole and some of the stream skipped; every
-// publish returned at once.
+// then drains, gets the first key whole, then the newest GOP whole, each
+// chunk passing its CRCs; every publish returned at once. The raw viewer
+// reads the first key's header before the rest is published, so the server
+// is sending it then, and under the low-water mark the kernel holds well
+// under 1 MiB of a viewer that does not read: the key is under way, however
+// late its thread ran, until the viewer drains.
 int newest_key_wins_case() {
   constexpr std::uint64_t kGop = 4;
   constexpr std::uint64_t kRecords = 3 * kGop;
+  constexpr std::size_t kSize = 1 << 20;
   const stream::Session session = net::geometry_session();
   auto server = net::serve(session);
   CHECK(server != nullptr);
-  auto client = net::connect(server->port());
-  CHECK(client != nullptr);
-  CHECK(net::wait_session(*client));
-  for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
-    const Bytes payload = net::record_payload(seq, 1 << 20);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port(), 4096);
+  CHECK(viewer.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  const auto publish = [&](std::uint64_t seq) {
+    const Bytes payload = net::record_payload(seq, kSize);
     const Clock::time_point start = Clock::now();
-    CHECK(server
-              ->publish(net::record_info(seq, seq % kGop == 0), payload.data(),
-                        payload.size())
-              .ok());
-    CHECK(Clock::now() - start < 1s);
-  }
-  std::vector<stream::RecordInfo> got;
-  for (Got g; got.empty() || got.back().seq + 1 < kRecords;) {
-    CHECK(net::next_within(*client, &g));
-    CHECK(g.payload == net::record_payload(g.record.info.seq, 1 << 20));
-    got.push_back(g.record.info);
-  }
-  CHECK(got.front().seq == 0 && got.front().key);
-  for (std::size_t i = 1; i < got.size(); ++i) {
-    CHECK(got[i].seq > got[i - 1].seq);
-    if (got[i].seq != got[i - 1].seq + 1) CHECK(got[i].key);
-  }
-  CHECK(got.size() >= kGop);
-  for (std::uint64_t k = 0; k < kGop; ++k) {
-    CHECK(got[got.size() - kGop + k].seq == kRecords - kGop + k);
-  }
-  // Under the low-water mark the kernel holds well under 1 MiB of a viewer
-  // that does not read, so the first key was still under way when the rest
-  // came: it is finished, then the newest GOP follows.
+    return server
+               ->publish(net::record_info(seq, seq % kGop == 0), payload.data(),
+                         payload.size())
+               .ok() &&
+           Clock::now() - start < 1s;
+  };
+  CHECK(publish(0));
+  net::read_upto(viewer.get(), header + 56, 5s, &wire);  // the key's header
+  CHECK(wire.size() == header + 56);
+  for (std::uint64_t seq = 1; seq < kRecords; ++seq) CHECK(publish(seq));
+  std::vector<Got> got;
+  CHECK(drain(viewer.get(), wire, kRecords - 1, &got) == 0);
   CHECK(got.size() == 1 + kGop);
-  std::printf("newest key wins: got %zu of %llu records\n", got.size(),
-              static_cast<unsigned long long>(kRecords));
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    const std::uint64_t seq = i == 0 ? 0 : kRecords - kGop + i - 1;
+    CHECK(got[i].record.info.seq == seq);
+    CHECK(got[i].record.info.key == (seq % kGop == 0));
+    CHECK(got[i].payload == net::record_payload(seq, kSize));
+  }
   return 0;
 }
 
@@ -423,6 +514,36 @@ int stall_limit_case() {
   return 0;
 }
 
+// A stall_limit of milliseconds::max() is never: a viewer that takes no byte
+// while 4 records of 1 MiB wait for it stays for 500 ms, 25 poll slices.
+int stall_never_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.stall_limit = std::chrono::milliseconds::max();
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd stalled = net::connect_loopback(server->port(), 4096);
+  CHECK(stalled.valid());
+  Bytes header;
+  net::read_upto(stalled.get(), net::session_chunk(session).size(), 5s,
+                 &header);
+  CHECK(header.size() == net::session_chunk(session).size());
+  const std::string name = peer_name(stalled.get());
+  CHECK(log.wait_for(name, "joined", 2s));
+  for (std::uint64_t seq = 0; seq < 4; ++seq) {
+    const Bytes payload = net::record_payload(seq, 1 << 20);
+    CHECK(server
+              ->publish(net::record_info(seq, seq == 0), payload.data(),
+                        payload.size())
+              .ok());
+  }
+  std::this_thread::sleep_for(500ms);
+  CHECK(!log.has(name, " closed: ") && !log.has(name, " failed: "));
+  return 0;
+}
+
 // A viewer that keeps taking bytes, though too slowly for its socket to poll
 // writable within stall_limit (300 ms), is not closed: 1 KiB every 10 ms
 // through a 4 KiB receive buffer, while 256 KiB records come for 2 s. Under
@@ -487,6 +608,28 @@ int max_viewers_case() {
   CHECK(eof && bytes.empty());
   CHECK(log.wait_for("refused viewer " + peer_name(third.get()), "2 viewers",
                      2s));
+  // A client refused there is told it may have been.
+  auto refused = net::connect(server->port());
+  CHECK(refused != nullptr);
+  Got got;
+  vkc::Result<bool> r = false;
+  for (int i = 0; i < 500 && r.ok() && !*r; ++i) {
+    r = refused->next(10ms, &got.record, &got.payload);
+  }
+  CHECK(!r.ok() &&
+        net::client_reason(r.status().message(), server->port()) ==
+            "the sender closed the connection before its session (it may "
+            "already serve its most viewers)");
+  // The first refusal at Warning, which the default sink prints; the next,
+  // within 10 s of it, at Info.
+  const Clock::time_point counted = Clock::now() + 2s;
+  while (log.count("refused viewer ") < 2 && Clock::now() < counted) {
+    std::this_thread::sleep_for(5ms);
+  }
+  CHECK(log.count("refused viewer ", peer_name(third.get()),
+                  vkc::LogLevel::Warning) == 1);
+  CHECK(log.count("refused viewer ", "", vkc::LogLevel::Warning) == 1);
+  CHECK(log.count("refused viewer ", "", vkc::LogLevel::Info) == 1);
 
   first.reset();
   const std::size_t header = net::session_chunk(session).size();
@@ -500,6 +643,61 @@ int max_viewers_case() {
     if (!served) std::this_thread::sleep_for(10ms);
   }
   CHECK(served);
+  return 0;
+}
+
+// Peers that connect and reset before the accept thread takes them (macOS
+// then fails the accepted socket's first setsockopt) are dropped quietly: no
+// Warning, and a viewer joining while they come gets its session. Served
+// ones end at once, and 64 slots keep any from being refused. They come in
+// bursts the listener's queue (8) holds, 5 ms apart, since Linux drops a SYN
+// to a full queue, and a connect then waits a second to send it again.
+int reset_before_accept_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  networking::ServerOptions options;
+  options.max_viewers = 64;
+  auto server = net::serve(net::geometry_session(), options);
+  CHECK(server != nullptr);
+  std::atomic<bool> stop{false};
+  std::atomic<int> resets{0};
+  std::thread resetter([&] {
+    while (!stop) {
+      for (int i = 0; i < 8; ++i) {
+        vkc::UniqueFd fd = net::connect_loopback(server->port());
+        if (!fd.valid()) continue;
+        const linger hard{1, 0};
+        (void)::setsockopt(fd.get(), SOL_SOCKET, SO_LINGER, &hard, sizeof hard);
+        fd.reset();
+        ++resets;
+      }
+      std::this_thread::sleep_for(5ms);
+    }
+  });
+  const Clock::time_point flooding = Clock::now() + 2s;
+  while (resets < 100 && Clock::now() < flooding) {
+    std::this_thread::sleep_for(5ms);
+  }
+  // As a player does, a viewer the kernel turned away tries again.
+  bool joined = false;
+  const Clock::time_point end = Clock::now() + 5s;
+  while (!joined && Clock::now() < end) {
+    auto client = net::connect(server->port());
+    joined = client != nullptr && net::wait_session(*client, 1s);
+  }
+  stop = true;
+  resetter.join();
+  CHECK(resets >= 100);
+  CHECK(joined);
+  {
+    const std::lock_guard<std::mutex> lock(log.mutex);
+    for (const Captured::Line& line : log.lines) {
+      if (line.level == vkc::LogLevel::Warning) {
+        std::fprintf(stderr, "warned: %s\n", line.text.c_str());
+      }
+    }
+  }
+  CHECK(log.count("", "", vkc::LogLevel::Warning) == 0);
   return 0;
 }
 
@@ -607,9 +805,28 @@ int rules_case() {
   networking::ServerOptions none = local;
   none.max_viewers = 0;
   CHECK(start(session, none) == Code::InvalidArgument);
+  for (const std::chrono::milliseconds limit : {0ms, -1ms}) {
+    networking::ServerOptions instant = local;
+    instant.stall_limit = limit;
+    CHECK(start(session, instant) == Code::InvalidArgument);
+  }
   networking::ServerOptions taken = local;
   taken.port = server->port();
   CHECK(start(session, taken) == Code::IoError);
+
+  // A payload over the parser's cap, which no client reads, is refused
+  // though the GOP limit is raised past it, with nothing changed: the same
+  // seq is published after.
+  networking::ServerOptions wide;
+  wide.max_gop_bytes = std::uint64_t{256} << 20;
+  auto big = net::serve(session, wide);
+  CHECK(big != nullptr);
+  constexpr auto kOver =
+      static_cast<std::size_t>(stream::ChunkParser::kMaxBodyBytes) + 1;
+  const auto huge = std::make_unique<std::uint8_t[]>(kOver);
+  CHECK(big->publish(vrst::info(0, true, 0, 0), huge.get(), kOver).domain() ==
+        Code::InvalidArgument);
+  CHECK(big->publish(vrst::info(0, true, 0, 0), payload.data(), 64).ok());
   return 0;
 }
 
@@ -656,6 +873,86 @@ int teardown_case() {
   }
   std::this_thread::sleep_for(100ms);  // its socket full, mid-chunk
   CHECK(within_1s([&] { busy.reset(); }));
+  return 0;
+}
+
+#ifndef VR_TEST_SANITIZED
+// The address space a thread never joined would grow, in bytes, or 0 when it
+// cannot be read: on macOS the regions tagged as stacks, as malloc maps a
+// 4 MiB region whenever a thread finds none of its own; elsewhere all of it.
+std::uint64_t address_space() {
+#ifdef __APPLE__
+  std::uint64_t stacks = 0;
+  for (mach_vm_address_t address = 0;;) {
+    mach_vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (::mach_vm_region_recurse(
+            mach_task_self(), &address, &size, &depth,
+            reinterpret_cast<vm_region_recurse_info_t>(&info),
+            &count) != KERN_SUCCESS) {
+      return stacks;  // past the last region
+    }
+    if (info.user_tag == VM_MEMORY_STACK) stacks += size;
+    address += size;
+  }
+#else
+  std::ifstream statm("/proc/self/statm");
+  std::uint64_t pages = 0;
+  statm >> pages;
+  return pages * static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+#endif
+}
+#endif
+
+// The threads of viewers that ended are joined as they go, not when the
+// server does: after 300 viewers join and leave one by one, the address
+// space (on macOS, its stacks) is back within 4 MiB of where it was after
+// the first 20. A thread never joined keeps its stack (8 MiB on Linux) or,
+// on macOS, 32 KiB of it, and neither shows in a thread count. A viewer's
+// thread sees its end within a poll slice, so 64 slots, and one refused
+// tries again. glibc gives a thread that finds malloc busy an arena of its
+// own, 64 MiB of address space kept, so no new one is made meanwhile. Not
+// under ASan or TSan, which keep freed memory a while.
+int reaping_case() {
+#ifndef VR_TEST_SANITIZED
+#ifdef __GLIBC__
+  CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
+#endif
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.max_viewers = 64;
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const std::size_t header = net::session_chunk(session).size();
+  const auto join_and_leave = [&](int viewers) {
+    for (int joined = 0, tries = 0; joined < viewers; ++tries) {
+      if (tries == 20 * viewers) return false;
+      const vkc::UniqueFd viewer = net::connect_loopback(server->port());
+      Bytes got;
+      net::read_upto(viewer.get(), header, 5s, &got);
+      joined += got.size() == header;
+      std::this_thread::sleep_for(got.size() == header ? 1ms : 5ms);
+    }
+    return true;
+  };
+  CHECK(join_and_leave(20));
+  std::this_thread::sleep_for(100ms);  // five poll slices: the 20 are joined
+  const std::uint64_t before = address_space();
+  CHECK(before > 0);
+  CHECK(join_and_leave(300));
+  std::uint64_t after = address_space();
+  const Clock::time_point end = Clock::now() + 2s;
+  while (after >= before + (4 << 20) && Clock::now() < end) {
+    std::this_thread::sleep_for(20ms);
+    after = address_space();
+  }
+  std::printf(
+      "reaping: %+lld KiB after 300 viewers\n",
+      (static_cast<long long>(after) - static_cast<long long>(before)) / 1024);
+  CHECK(after < before + (4 << 20));
+#endif
   return 0;
 }
 
@@ -739,15 +1036,19 @@ int main() {
   const std::string dir = scratch.path.string();
   if (wire_is_the_file_case(dir) != 0) return 1;
   if (round_trip_case(dir) != 0) return 1;
+  if (viewer_sends_case() != 0) return 1;
   if (join_case() != 0) return 1;
   if (newest_key_wins_case() != 0) return 1;
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
+  if (stall_never_case() != 0) return 1;
   if (slow_viewer_case() != 0) return 1;
   if (max_viewers_case() != 0) return 1;
+  if (reset_before_accept_case() != 0) return 1;
   if (leaving_viewer_case() != 0) return 1;
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;
+  if (reaping_case() != 0) return 1;
   if (signals_case() != 0) return 1;
   std::puts("networking server: OK");
   return 0;

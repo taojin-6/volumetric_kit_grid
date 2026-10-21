@@ -27,14 +27,21 @@ struct ServerOptions {
   std::string host;
   /// The port; 0 takes a free one, which @ref StreamServer::port names.
   std::uint16_t port = kDefaultPort;
-  /// Viewers served at once; a connection past them is closed at accept.
+  /// Viewers served at once, first come: a connection past them is closed at
+  /// accept, the first such refusal and then one in 10 s at most logged at
+  /// Warning. With no authentication, any host reaching the port can take a
+  /// slot, and keeps it until it leaves or stalls (@ref stall_limit).
   std::size_t max_viewers = 4;
   /// The most one GOP (a key record and every record after it) may hold. A
   /// record that would pass it is dropped with the whole GOP, and so is every
   /// record until the next key: the viewers freeze until it.
   std::uint64_t max_gop_bytes = std::uint64_t{64} << 20;
   /// A viewer that takes no byte for this long, with bytes waiting for it, is
-  /// closed: a peer that vanished. A byte its end acknowledges is taken.
+  /// closed: a peer that vanished. A byte its end acknowledges is taken, so a
+  /// slow reader keeps its slot while its end acknowledges a byte within the
+  /// limit (one behind a large receive buffer may not), as does one with
+  /// nothing waiting (before the first key, or while nothing is published).
+  /// Positive; `milliseconds::max()` is never.
   std::chrono::milliseconds stall_limit{10'000};
 };
 
@@ -79,8 +86,9 @@ class VR_NETWORKING_API StreamServer {
   ///                 `stream::StreamWriter::create` takes, of one track.
   /// @param options  Where and how it serves.
   /// @return The server; `Status::Code::InvalidArgument` for a session the
-  ///         writer would refuse, a host that is not numeric IPv4, or a
-  ///         `max_viewers` of 0; `Status::Code::Unsupported` for more than
+  ///         writer would refuse, a host that is not numeric IPv4, a
+  ///         `max_viewers` of 0 or a `stall_limit` of 0 or less;
+  ///         `Status::Code::Unsupported` for more than
   ///         one track; `Status::Code::IoError` for a port that cannot be
   ///         bound (in use) or a thread that cannot start;
   ///         `Status::Code::OutOfMemory` when the session's chunk cannot be
@@ -103,7 +111,9 @@ class VR_NETWORKING_API StreamServer {
   /// @param data  The payload; may be null when @p size is 0.
   /// @param size  The payload's bytes.
   /// @return OK, with viewers or none; `Status::Code::InvalidArgument` for a
-  ///         record breaking the rules, with nothing sent;
+  ///         record breaking the rules, or a payload over
+  ///         `stream::ChunkParser::kMaxBodyBytes` (64 MiB), which no viewer
+  ///         reads, with nothing sent;
   ///         `Status::Code::OutOfMemory` when it cannot be copied, which
   ///         drops it and every record until the next key, as an overflow
   ///         does. Never a viewer's failure.
