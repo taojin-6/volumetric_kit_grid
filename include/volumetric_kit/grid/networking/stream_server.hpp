@@ -37,10 +37,11 @@ struct ServerOptions {
   /// record until the next key: the viewers freeze until it.
   std::uint64_t max_gop_bytes = std::uint64_t{64} << 20;
   /// A viewer that takes no byte for this long, with bytes waiting for it, is
-  /// closed: a peer that vanished. A byte its end acknowledges is taken, so
-  /// one that reads, however slowly, keeps its slot, as does one with nothing
-  /// waiting (before the first key, or while nothing is published). Positive;
-  /// `milliseconds::max()` is never.
+  /// closed: a peer that vanished. A byte its end acknowledges is taken, so a
+  /// slow reader keeps its slot while its end acknowledges a byte within the
+  /// limit (one behind a large receive buffer may not), as does one with
+  /// nothing waiting (before the first key, or while nothing is published).
+  /// Positive; `milliseconds::max()` is never.
   std::chrono::milliseconds stall_limit{10'000};
 };
 
