@@ -58,11 +58,12 @@ int main() {
       std::fprintf(stderr, "%s: %s\n", example.file,
                    loaded.status().message().c_str());
     CHECK(loaded);
-    // codec_orbbec alone writes codec rows and frames; it and the rig viewer
-    // fuse Dynamic, the rest Classic.
+    // codec_orbbec alone writes codec rows and frames; every live example
+    // fuses Dynamic, by core's default, the rest Classic.
     const bool coded = std::string(example.file) == "codec_orbbec";
-    CHECK(loaded->fusion.dynamic ==
-          (coded || example.application == cfg::Application::RigViewer));
+    const bool live = example.application == cfg::Application::FuseOrbbec ||
+                      example.application == cfg::Application::RigViewer;
+    CHECK(loaded->fusion.dynamic == live);
     CHECK(loaded->output.csv.empty() != coded &&
           loaded->output.stream.empty() != coded);
   }
