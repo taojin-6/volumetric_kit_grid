@@ -27,15 +27,20 @@ struct ServerOptions {
   std::string host;
   /// The port; 0 takes a free one, which @ref StreamServer::port names.
   std::uint16_t port = kDefaultPort;
-  /// Viewers served at once; a connection past them is closed at accept.
+  /// Viewers served at once, first come: a connection past them is closed at
+  /// accept, the first such refusal and then one in 10 s at most logged at
+  /// Warning. With no authentication, any host reaching the port can take a
+  /// slot, and keeps it until it leaves or stalls (@ref stall_limit).
   std::size_t max_viewers = 4;
   /// The most one GOP (a key record and every record after it) may hold. A
   /// record that would pass it is dropped with the whole GOP, and so is every
   /// record until the next key: the viewers freeze until it.
   std::uint64_t max_gop_bytes = std::uint64_t{64} << 20;
   /// A viewer that takes no byte for this long, with bytes waiting for it, is
-  /// closed: a peer that vanished. A byte its end acknowledges is taken.
-  /// Positive; `milliseconds::max()` is never.
+  /// closed: a peer that vanished. A byte its end acknowledges is taken, so
+  /// one that reads, however slowly, keeps its slot, as does one with nothing
+  /// waiting (before the first key, or while nothing is published). Positive;
+  /// `milliseconds::max()` is never.
   std::chrono::milliseconds stall_limit{10'000};
 };
 

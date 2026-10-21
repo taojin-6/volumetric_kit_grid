@@ -11,8 +11,10 @@
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
 // is closed after stall_limit, never when it is milliseconds::max(), and on
 // Linux one that takes too few for its socket to poll writable within it is
-// not; connection max_viewers + 1 is closed before any byte; a viewer that
-// leaves never fails publish; the writer's refusals send nothing, and start
+// not; connection max_viewers + 1 is closed before any byte, the first such
+// refusal logged at Warning and the next at Info, and a client refused there
+// is told it may have been; a viewer that leaves never fails publish; the
+// writer's refusals send nothing, and start
 // refuses (a stall_limit of 0 or less among them); the destructor returns
 // within 1 s with no viewers, idle ones and a stalled one; and 100 SIGUSR1 to
 // a no-op handler leave the stream whole. Every test that publishes first
@@ -25,10 +27,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -77,18 +81,27 @@ std::vector<Published> some_records() {
 
 // What a log handler saw, for the tests that read the server's log.
 struct Captured {
+  struct Line {
+    vkc::LogLevel level;
+    std::string text;
+  };
   std::mutex mutex;
-  std::vector<std::string> lines;
+  std::vector<Line> lines;
 
-  bool has(std::string_view a, std::string_view b = {}) {
+  // The lines holding `a` and `b`, at `level` when one is given.
+  std::size_t count(std::string_view a, std::string_view b = {},
+                    std::optional<vkc::LogLevel> level = {}) {
     const std::lock_guard<std::mutex> lock(mutex);
-    for (const std::string& line : lines) {
-      if (line.find(a) != std::string::npos &&
-          line.find(b) != std::string::npos) {
-        return true;
-      }
+    std::size_t n = 0;
+    for (const Line& line : lines) {
+      n += line.text.find(a) != std::string::npos &&
+           line.text.find(b) != std::string::npos &&
+           (!level || line.level == *level);
     }
-    return false;
+    return n;
+  }
+  bool has(std::string_view a, std::string_view b = {}) {
+    return count(a, b) > 0;
   }
   bool wait_for(std::string_view a, std::string_view b,
                 std::chrono::milliseconds timeout) {
@@ -104,11 +117,11 @@ struct Captured {
 // Installs a handler that keeps every line, until it goes.
 struct LogCapture {
   explicit LogCapture(Captured* into) {
-    vkc::set_log_handler(
-        [into](vkc::LogLevel, std::string_view, std::string_view message) {
-          const std::lock_guard<std::mutex> lock(into->mutex);
-          into->lines.emplace_back(message);
-        });
+    vkc::set_log_handler([into](vkc::LogLevel level, std::string_view,
+                                std::string_view message) {
+      const std::lock_guard<std::mutex> lock(into->mutex);
+      into->lines.push_back({level, std::string(message)});
+    });
   }
   ~LogCapture() { vkc::set_log_handler({}); }
   LogCapture(const LogCapture&) = delete;
@@ -530,6 +543,16 @@ int max_viewers_case() {
         net::client_reason(r.status().message(), server->port()) ==
             "the sender closed the connection before its session (it may "
             "already serve its most viewers)");
+  // The first refusal at Warning, which the default sink prints; the next,
+  // within 10 s of it, at Info.
+  const Clock::time_point counted = Clock::now() + 2s;
+  while (log.count("refused viewer ") < 2 && Clock::now() < counted) {
+    std::this_thread::sleep_for(5ms);
+  }
+  CHECK(log.count("refused viewer ", peer_name(third.get()),
+                  vkc::LogLevel::Warning) == 1);
+  CHECK(log.count("refused viewer ", "", vkc::LogLevel::Warning) == 1);
+  CHECK(log.count("refused viewer ", "", vkc::LogLevel::Info) == 1);
 
   first.reset();
   const std::size_t header = net::session_chunk(session).size();

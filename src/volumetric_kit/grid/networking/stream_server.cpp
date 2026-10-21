@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -30,6 +31,8 @@ constexpr std::uint8_t kZeros[8] = {};
 // What a viewer thread reads at a time of the bytes a viewer sends, which it
 // drops.
 constexpr std::size_t kDrainBytes = 4096;
+// The least time between two refusals logged at Warning; the rest go at Info.
+constexpr std::chrono::seconds kRefusalWarningEvery{10};
 
 // recon's log_message, from a thread or a catch no exception may leave.
 // Viewers come and go at Info, which the core's default sink drops.
@@ -88,6 +91,8 @@ struct StreamServer::Impl {
   std::atomic<bool> stop{false};  // set under the mutex
 
   std::list<Viewer> viewers;  // the accept thread's, then the destructor's
+  // The accept thread's: when a refusal was last logged at Warning.
+  std::optional<Clock::time_point> refusal_warned;
   std::thread acceptor;
 };
 
@@ -131,9 +136,15 @@ void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
   }
   if (serving >= options.max_viewers) {
     fd.reset();  // closed at accept: the viewer sees its end before any byte
-    log_at(core::LogLevel::Info, std::string(kServer) + ": refused viewer " +
-                                     name + ": " + std::to_string(serving) +
-                                     " viewers already");
+    // At Warning, which the default sink prints, so the owner sees why a
+    // viewer gets nothing: the first refusal, then one in 10 s at most.
+    const Clock::time_point now = Clock::now();
+    const bool warn =
+        !refusal_warned || now - *refusal_warned >= kRefusalWarningEvery;
+    if (warn) refusal_warned = now;
+    log_at(warn ? core::LogLevel::Warning : core::LogLevel::Info,
+           std::string(kServer) + ": refused viewer " + name + ": " +
+               std::to_string(serving) + " viewers already");
     return;
   }
   // Nothing from here to its thread's start throws but that start, which is
