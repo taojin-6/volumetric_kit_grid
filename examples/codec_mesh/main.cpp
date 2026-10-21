@@ -6,7 +6,6 @@
 // height or unit place every frame in metres through one transform fitted to
 // the whole range, with io's opt-in normalization helpers.
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -142,10 +141,8 @@ vkc::Status run(const Options& opt) {
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_source.ply", source));
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_decoded.ply", decoded));
   }
-  eval::CompareOptions compare;
-  compare.reach = std::max(trunc, 0.02f);
-  compare.stride = 4;
-  compare.fscore_threshold = 0.5f * opt.fusion.voxel_size_m;
+  const eval::CompareOptions compare =
+      vr_example::codec_compare_options(opt.fusion.voxel_size_m, trunc);
   VKC_ASSIGN(const eval::ReferenceMesh input_reference,
              eval::ReferenceMesh::create(input, compare));
   VKC_ASSIGN(const eval::ReferenceMesh source_reference,
