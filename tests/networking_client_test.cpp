@@ -9,9 +9,9 @@
 // read; next(20 ms) with nothing returns false in about 20 ms, and within
 // 500 ms while chunks it skips flood in; next(0 ms) alone connects and reads,
 // a 230 KB record already in the socket in one call; idle_limit counts from
-// connect, against a listener that sends nothing; localhost reaches a
-// 127.0.0.1 server; and an empty host or port 0 is refused. Each error is
-// returned again by every later call.
+// connect, against a listener that sends nothing, and then from the last
+// byte; localhost reaches a 127.0.0.1 server; and an empty host or port 0 is
+// refused. Each error is returned again by every later call.
 
 #include <atomic>
 #include <chrono>
@@ -288,6 +288,36 @@ int idle_case() {
   return 0;
 }
 
+// idle_limit counts from the last byte: a record every 50 ms for 1 s keeps a
+// client whose limit is 300 ms; once they stop, it ends 300 ms to 2 s after
+// the last.
+int idle_from_last_byte_case() {
+  networking::ClientOptions options;
+  options.idle_limit = 300ms;
+  Sender sender;
+  auto client = net::connect(sender.listener.port, options);
+  CHECK(client != nullptr && sender.take(*client));
+  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+  const Bytes payload = vrst::pattern(100, 5);
+  Got got;
+  const Clock::time_point start = Clock::now();
+  Clock::time_point last = start;
+  for (std::uint64_t seq = 0; Clock::now() - start < 1s; ++seq) {
+    CHECK(net::send_bytes(
+        sender.peer.get(),
+        vrst::record(0, seq == 0 ? 1 : 0, seq, seq, stream::kNoSet, payload)));
+    last = Clock::now();
+    const vkc::Result<bool> r = settle(*client, &got);
+    CHECK(r.ok() && *r && got.record.info.seq == seq);
+    std::this_thread::sleep_for(50ms);
+  }
+  const vkc::Result<bool> r = settle(*client, &got);
+  const auto quiet = Clock::now() - last;
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  CHECK(quiet >= 300ms && quiet < 2s);
+  return 0;
+}
+
 // localhost reaches a server on 127.0.0.1, through the lookup's thread.
 int localhost_case() {
   auto server = net::serve(net::geometry_session());
@@ -318,6 +348,7 @@ int main() {
   if (flood_case() != 0) return 1;
   if (zero_wait_case() != 0) return 1;
   if (idle_case() != 0) return 1;
+  if (idle_from_last_byte_case() != 0) return 1;
   if (localhost_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::puts("networking client: OK");
