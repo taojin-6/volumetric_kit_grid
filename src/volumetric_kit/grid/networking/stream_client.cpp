@@ -55,8 +55,9 @@ struct StreamClient::Impl {
         buffer(kReceiveBytes) {}
 
   // Make one move toward the next record, waiting no later than `deadline`:
-  // the lookup's end, the next address's connect, or a receive.
-  core::Status step(Clock::time_point deadline);
+  // the lookup's end, the next address's connect, or a receive. True when
+  // it moved: the lookup taken, a connect started or ended, or bytes read.
+  core::Result<bool> step(Clock::time_point deadline);
   // The idle limit's failure, naming the stage it ended: the lookup, the
   // connect, the session or the stream.
   core::Status idle_failure() const;
@@ -78,18 +79,18 @@ struct StreamClient::Impl {
   core::Status failure;
 };
 
-core::Status StreamClient::Impl::step(Clock::time_point deadline) {
+core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
   if (lookup) {
     std::unique_lock<std::mutex> lock(lookup->mutex);
     if (!lookup->done_cv.wait_until(lock, deadline,
                                     [&] { return lookup->done; })) {
-      return {};
+      return false;
     }
     if (!lookup->failure.ok()) return lookup->failure;
     addresses = std::move(lookup->addresses);
     lock.unlock();
     lookup.reset();
-    return {};
+    return true;
   }
   if (!fd.valid()) {
     if (tried == addresses.size()) {
@@ -100,27 +101,27 @@ core::Status StreamClient::Impl::step(Clock::time_point deadline) {
         detail::start_connect(api, addresses[tried++], &connected);
     if (!started.ok()) {
       refused = std::move(started).status();
-      return {};
+      return true;
     }
     fd = std::move(started).value();
-    return {};
+    return true;
   }
   if (!connected) {
     VKC_ASSIGN(const short ready,
                detail::wait_for(api, fd.get(), POLLOUT, until(deadline)));
-    if (ready == 0) return {};
+    if (ready == 0) return false;
     core::Status done = detail::finish_connect(api, fd.get());
     if (!done.ok()) {
       refused = std::move(done);
       fd.reset();
-      return {};
+      return true;
     }
     connected = true;
-    return {};
+    return true;
   }
   VKC_ASSIGN(const short ready,
              detail::wait_for(api, fd.get(), POLLIN, until(deadline)));
-  if (ready == 0) return {};
+  if (ready == 0) return false;
   VKC_ASSIGN(const detail::Received got,
              detail::receive_some(api, fd.get(), buffer.data(), buffer.size()));
   if (got.closed) {
@@ -131,9 +132,10 @@ core::Status StreamClient::Impl::step(Clock::time_point deadline) {
              ? " before its session (it may already serve its most viewers)"
              : ""));
   }
-  if (got.bytes == 0) return {};
+  if (got.bytes == 0) return false;
   last_byte = Clock::now();
-  return parser.feed(buffer.data(), got.bytes).with_context(api);
+  VKC_TRY(parser.feed(buffer.data(), got.bytes).with_context(api));
+  return true;
 }
 
 core::Status StreamClient::Impl::idle_failure() const {
@@ -226,20 +228,24 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
   try {
     if (!s.failure.ok()) return s.failure;
     const Clock::time_point deadline = detail::after(Clock::now(), wait);
-    // At least one step, so a wait of 0 still reads what has come, and a
-    // caller back late reads what came meanwhile before the idle limit is
-    // judged; then the deadline ends the loop, though bytes keep coming, and
-    // the parser keeps a part chunk for the next call.
-    for (bool stepped = false;; stepped = true) {
+    // At least one step, so a wait of 0 still reads what has come. The idle
+    // limit is judged only after a step that moved nothing, so a caller back
+    // late first takes what came meanwhile: the lookup's answer, the
+    // connect's end or bytes. The deadline ends the loop, though bytes keep
+    // coming, and the parser keeps a part chunk for the next call.
+    for (bool stepped = false, moved = false;; stepped = true) {
       core::Result<bool> got = s.parser.next(record, payload);
       if (!got.ok()) return s.fail(std::move(got).status().with_context(s.api));
       if (*got) return true;
       const Clock::time_point idle =
           detail::after(s.last_byte, s.options.idle_limit);
-      if (stepped && Clock::now() >= idle) return s.fail(s.idle_failure());
+      if (stepped && !moved && Clock::now() >= idle) {
+        return s.fail(s.idle_failure());
+      }
       if (stepped && Clock::now() >= deadline) return false;
-      core::Status moved = s.step(std::min(deadline, idle));
-      if (!moved.ok()) return s.fail(std::move(moved));
+      core::Result<bool> progress = s.step(std::min(deadline, idle));
+      if (!progress.ok()) return s.fail(std::move(progress).status());
+      moved = *progress;
     }
   } catch (...) {
     // Saved and returned, each by its own call: a copy may find no memory.

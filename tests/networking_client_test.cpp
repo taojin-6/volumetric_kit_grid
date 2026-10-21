@@ -11,7 +11,8 @@
 // in; next(0 ms) alone connects and reads, a 230 KB record already in the
 // socket in one call; idle_limit counts from connect, against a listener that
 // sends nothing and a port whose connects never finish, and then from the
-// last byte, judged after reading what came while the caller was away;
+// last byte, judged after taking what came while the caller was away (bytes,
+// a connect's end or its refusal);
 // milliseconds::max() as idle_limit or wait is never; localhost reaches a
 // 127.0.0.1 server, and clients destroyed mid-lookup leave it to end alone;
 // and an empty host, port 0 or an idle_limit of 0 or less is refused. Each
@@ -422,27 +423,61 @@ int idle_from_last_byte_case() {
   return 0;
 }
 
-// A caller back late reads what came meanwhile before it judges idle_limit: a
-// record every 100 ms while a client whose limit is 300 ms is not called for
-// 500 ms, then next(0) returns the first.
+// A caller back late takes what came meanwhile before it judges idle_limit,
+// a client whose limit is 300 ms not called for 500 ms: a record every
+// 100 ms, the first of which next(0) returns; a connect that ended, the
+// session and a record sent at once, which next(0) returns, or the call
+// after the one that ends the connect; and a refused connect, which the
+// error names.
 int late_caller_case() {
   networking::ClientOptions options;
   options.idle_limit = 300ms;
-  Sender sender;
-  auto client = net::connect(sender.listener.port, options);
-  CHECK(client != nullptr && sender.take(*client));
-  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
-  CHECK(net::wait_session(*client));
   const Bytes payload = vrst::pattern(100, 6);
-  for (std::uint64_t seq = 0; seq < 5; ++seq) {
-    std::this_thread::sleep_for(100ms);
+  {
+    Sender sender;
+    auto client = net::connect(sender.listener.port, options);
+    CHECK(client != nullptr && sender.take(*client));
+    CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+    CHECK(net::wait_session(*client));
+    for (std::uint64_t seq = 0; seq < 5; ++seq) {
+      std::this_thread::sleep_for(100ms);
+      CHECK(net::send_bytes(sender.peer.get(),
+                            vrst::record(0, seq == 0 ? 1 : 0, seq, seq,
+                                         stream::kNoSet, payload)));
+    }
+    Got got;
+    const vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
+    CHECK(r.ok() && *r && got.record.info.seq == 0);
+  }
+  {
+    Sender sender;  // whose take makes one next(0), starting the connect
+    auto client = net::connect(sender.listener.port, options);
+    CHECK(client != nullptr && sender.take(*client));
     CHECK(net::send_bytes(
         sender.peer.get(),
-        vrst::record(0, seq == 0 ? 1 : 0, seq, seq, stream::kNoSet, payload)));
+        concat({session_bytes(),
+                vrst::record(0, 1, 0, 0, stream::kNoSet, payload)})));
+    std::this_thread::sleep_for(500ms);
+    Got got;
+    vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
+    if (r.ok() && !*r) r = client->next(0ms, &got.record, &got.payload);
+    CHECK(r.ok() && *r && got.record.info.seq == 0);
   }
-  Got got;
-  const vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
-  CHECK(r.ok() && *r && got.record.info.seq == 0);
+  {
+    const std::uint16_t port = net::closed_port();
+    CHECK(port != 0);
+    auto client = net::connect(port, options);
+    CHECK(client != nullptr);
+    Got got;
+    vkc::Result<bool> r = client->next(0ms, &got.record, &got.payload);
+    CHECK(r.ok() && !*r);
+    std::this_thread::sleep_for(500ms);
+    for (int i = 0; i < 3 && r.ok(); ++i) {
+      r = client->next(0ms, &got.record, &got.payload);
+    }
+    CHECK(!r.ok() && net::client_reason(r.status().message(), port)
+                             .rfind("cannot connect: ", 0) == 0);
+  }
   return 0;
 }
 
