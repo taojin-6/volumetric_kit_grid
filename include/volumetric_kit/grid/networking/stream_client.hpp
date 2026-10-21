@@ -84,7 +84,9 @@ class VR_NETWORKING_API StreamClient {
   /// @brief Wait up to @p wait for the next record, finishing the lookup and
   ///        the connect first. Each address is tried in turn; any connect
   ///        error moves to the next.
-  /// @param wait          The longest to wait; 0 takes only what has come.
+  /// @param wait          The longest to wait: however fast bytes come, a
+  ///                      call ends within it and one receive (64 KiB) more.
+  ///                      0 takes only what has come.
   /// @param[out] record   Its header. Its `offset` is the chunk's offset in
   ///                      the bytes received, as in the file they would make.
   /// @param[out] payload  Its payload, resized to fit.

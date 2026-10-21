@@ -54,9 +54,8 @@ struct StreamClient::Impl {
         buffer(kReceiveBytes) {}
 
   // Make one move toward the next record, waiting no later than `deadline`:
-  // the lookup's end, the next address's connect, or a receive. True when
-  // something moved.
-  core::Result<bool> step(Clock::time_point deadline);
+  // the lookup's end, the next address's connect, or a receive.
+  core::Status step(Clock::time_point deadline);
   // Close the connection and save `status`, which every later call returns.
   core::Status fail(core::Status status);
 
@@ -75,18 +74,18 @@ struct StreamClient::Impl {
   core::Status failure;
 };
 
-core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
+core::Status StreamClient::Impl::step(Clock::time_point deadline) {
   if (lookup) {
     std::unique_lock<std::mutex> lock(lookup->mutex);
     if (!lookup->done_cv.wait_until(lock, deadline,
                                     [&] { return lookup->done; })) {
-      return false;
+      return {};
     }
     if (!lookup->failure.ok()) return lookup->failure;
     addresses = std::move(lookup->addresses);
     lock.unlock();
     lookup.reset();
-    return true;
+    return {};
   }
   if (!fd.valid()) {
     if (tried == addresses.size()) {
@@ -97,37 +96,36 @@ core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
         detail::start_connect(api, addresses[tried++], &connected);
     if (!started.ok()) {
       refused = std::move(started).status();
-      return true;
+      return {};
     }
     fd = std::move(started).value();
-    return true;
+    return {};
   }
   if (!connected) {
     VKC_ASSIGN(const short ready,
                detail::wait_for(api, fd.get(), POLLOUT, until(deadline)));
-    if (ready == 0) return false;
+    if (ready == 0) return {};
     core::Status done =
         detail::finish_connect(api, fd.get(), addresses[tried - 1]);
     if (!done.ok()) {
       refused = std::move(done);
       fd.reset();
-      return true;
+      return {};
     }
     connected = true;
-    return true;
+    return {};
   }
   VKC_ASSIGN(const short ready,
              detail::wait_for(api, fd.get(), POLLIN, until(deadline)));
-  if (ready == 0) return false;
+  if (ready == 0) return {};
   VKC_ASSIGN(const detail::Received got,
              detail::receive_some(api, fd.get(), buffer.data(), buffer.size()));
   if (got.closed) {
     return core::Status::io_error(api + ": the sender closed the connection");
   }
-  if (got.bytes == 0) return false;
+  if (got.bytes == 0) return {};
   last_byte = Clock::now();
-  VKC_TRY(parser.feed(buffer.data(), got.bytes));
-  return true;
+  return parser.feed(buffer.data(), got.bytes);
 }
 
 core::Status StreamClient::Impl::fail(core::Status status) {
@@ -201,19 +199,22 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
     if (!s.failure.ok()) return s.failure;
     const Clock::time_point deadline =
         Clock::now() + std::max(wait, std::chrono::milliseconds{0});
-    for (;;) {
+    // At least one step, so a wait of 0 still reads what has come; then the
+    // deadline ends the loop, though bytes keep coming, and the parser keeps
+    // a part chunk for the next call.
+    for (bool stepped = false;; stepped = true) {
       core::Result<bool> got = s.parser.next(record, payload);
       if (!got.ok()) return s.fail(std::move(got).status());
       if (*got) return true;
+      if (stepped && Clock::now() >= deadline) return false;
       const Clock::time_point idle = s.last_byte + s.options.idle_limit;
       if (Clock::now() >= idle) {
         return s.fail(core::Status::io_error(
             s.api + ": no byte for " +
             std::to_string(s.options.idle_limit.count()) + " ms"));
       }
-      core::Result<bool> moved = s.step(std::min(deadline, idle));
-      if (!moved.ok()) return s.fail(std::move(moved).status());
-      if (!*moved && Clock::now() >= deadline) return false;
+      core::Status moved = s.step(std::min(deadline, idle));
+      if (!moved.ok()) return s.fail(std::move(moved));
     }
   } catch (...) {
     // Saved and returned, each by its own call: a copy may find no memory.

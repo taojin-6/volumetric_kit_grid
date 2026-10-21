@@ -6,17 +6,21 @@
 // header claiming 1 GiB is refused before any of its body comes (a RECD's or
 // another tag's OutOfMemory, a VRST's InvalidArgument); a corrupt body is
 // InvalidArgument; the end after whole records is IoError once they are all
-// read; next(20 ms) with nothing returns false in about 20 ms; idle_limit
-// counts from connect, against a listener that sends nothing; localhost
-// reaches a 127.0.0.1 server; and an empty host or port 0 is refused. Each
-// error is returned again by every later call.
+// read; next(20 ms) with nothing returns false in about 20 ms, and within
+// 500 ms while chunks it skips flood in; next(0 ms) alone connects and reads,
+// a record already in the socket in one call; idle_limit counts from connect,
+// against a listener that sends nothing; localhost reaches a 127.0.0.1
+// server; and an empty host or port 0 is refused. Each error is returned
+// again by every later call.
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "networking_loopback.hpp"
@@ -187,6 +191,75 @@ int wait_case() {
   return 0;
 }
 
+// Chunks the client skips, sent faster than it parses them, never hold next
+// past its wait: each next(20 ms) returns false within 500 ms while they come
+// for 2 s.
+int flood_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+  CHECK(net::wait_session(*client));
+  // Records setting flag bit 1, which this version does not know, with a
+  // 64-byte body, sent 1024 at a time.
+  const Bytes one =
+      vrst::record(0, 2, 0, 0, stream::kNoSet, vrst::pattern(64, 3));
+  Bytes skipped;
+  for (int i = 0; i < 1024; ++i) {
+    skipped.insert(skipped.end(), one.begin(), one.end());
+  }
+  std::atomic<bool> stop{false};
+  std::atomic<bool> ended{false};
+  const Clock::time_point end = Clock::now() + 2s;
+  std::thread flood([&] {
+    while (!stop && Clock::now() < end &&
+           net::send_bytes(sender.peer.get(), skipped)) {
+    }
+    ended = true;
+  });
+  // Checked once the flood is joined.
+  bool prompt = true;
+  Got got;
+  for (int i = 0; i < 5; ++i) {
+    const Clock::time_point start = Clock::now();
+    const vkc::Result<bool> r = client->next(20ms, &got.record, &got.payload);
+    prompt = prompt && r.ok() && !*r && Clock::now() - start < 500ms;
+  }
+  stop = true;
+  // Read on until the flood ends, so a send under way finishes.
+  while (!ended && client->next(10ms, &got.record, &got.payload).ok()) {
+  }
+  flood.join();
+  CHECK(prompt);
+  return 0;
+}
+
+// next(0 ms) alone moves: a client calling only it connects and reads a
+// record; and one call returns a record already whole in the socket.
+int zero_wait_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  CHECK(net::send_bytes(
+      sender.peer.get(),
+      concat({session_bytes(), vrst::record(0, 1, 0, 0, stream::kNoSet,
+                                            vrst::pattern(1000, 7))})));
+  Got got;
+  vkc::Result<bool> r = false;
+  const Clock::time_point end = Clock::now() + 5s;
+  while (r.ok() && !*r && Clock::now() < end) {
+    r = client->next(0ms, &got.record, &got.payload);
+  }
+  CHECK(r.ok() && *r && got.record.info.seq == 0);
+  CHECK(net::send_bytes(
+      sender.peer.get(),
+      vrst::record(0, 0, 1, 1, stream::kNoSet, vrst::pattern(1000, 8))));
+  std::this_thread::sleep_for(200ms);  // on loopback, in the socket by now
+  r = client->next(0ms, &got.record, &got.payload);
+  CHECK(r.ok() && *r && got.record.info.seq == 1);
+  return 0;
+}
+
 // idle_limit counts from connect: a listener that sends nothing ends the
 // connection after it; so does one that sends the session, then nothing.
 int idle_case() {
@@ -241,6 +314,8 @@ int main() {
   if (corrupt_body_case() != 0) return 1;
   if (end_case() != 0) return 1;
   if (wait_case() != 0) return 1;
+  if (flood_case() != 0) return 1;
+  if (zero_wait_case() != 0) return 1;
   if (idle_case() != 0) return 1;
   if (localhost_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
