@@ -85,12 +85,13 @@ class VR_NETWORKING_API StreamClient {
   ///        the connect first. Each address is tried in turn; any connect
   ///        error moves to the next.
   /// @param wait          The longest to wait: however fast bytes come, a
-  ///                      call ends within it and one receive (64 KiB) more.
-  ///                      0 takes only what has come.
+  ///                      call ends within it and one receive (up to
+  ///                      256 KiB) more. 0 takes only that receive of what
+  ///                      has come.
   /// @param[out] record   Its header. Its `offset` is the chunk's offset in
   ///                      the bytes received, as in the file they would make.
   /// @param[out] payload  Its payload, resized to fit.
-  /// @return `true` with a record; `false` when none came within @p wait;
+  /// @return `true` with a record; `false` when none was whole by then;
   ///         `Status::Code::NotFound` for a name that does not resolve;
   ///         `Status::Code::IoError` for a lookup that fails otherwise, a
   ///         connection refused at every address, reset or closed, or idle

@@ -8,10 +8,10 @@
 // InvalidArgument; the end after whole records is IoError once they are all
 // read; next(20 ms) with nothing returns false in about 20 ms, and within
 // 500 ms while chunks it skips flood in; next(0 ms) alone connects and reads,
-// a record already in the socket in one call; idle_limit counts from connect,
-// against a listener that sends nothing; localhost reaches a 127.0.0.1
-// server; and an empty host or port 0 is refused. Each error is returned
-// again by every later call.
+// a 230 KB record already in the socket in one call; idle_limit counts from
+// connect, against a listener that sends nothing; localhost reaches a
+// 127.0.0.1 server; and an empty host or port 0 is refused. Each error is
+// returned again by every later call.
 
 #include <atomic>
 #include <chrono>
@@ -235,7 +235,8 @@ int flood_case() {
 }
 
 // next(0 ms) alone moves: a client calling only it connects and reads a
-// record; and one call returns a record already whole in the socket.
+// record; and one call returns a key-sized record (230 KB) already whole in
+// the socket.
 int zero_wait_case() {
   Sender sender;
   auto client = net::connect(sender.listener.port);
@@ -253,7 +254,7 @@ int zero_wait_case() {
   CHECK(r.ok() && *r && got.record.info.seq == 0);
   CHECK(net::send_bytes(
       sender.peer.get(),
-      vrst::record(0, 0, 1, 1, stream::kNoSet, vrst::pattern(1000, 8))));
+      vrst::record(0, 0, 1, 1, stream::kNoSet, vrst::pattern(230'000, 8))));
   std::this_thread::sleep_for(200ms);  // on loopback, in the socket by now
   r = client->next(0ms, &got.record, &got.payload);
   CHECK(r.ok() && *r && got.record.info.seq == 1);

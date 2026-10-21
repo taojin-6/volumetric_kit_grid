@@ -23,8 +23,9 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr std::string_view kClient = "StreamClient";
-// What one receive reads at most.
-constexpr std::size_t kReceiveBytes = 64 << 10;
+// What one receive reads at most: as much as the receive buffer, so one
+// next(0) takes a key (about 230 KB) already in the socket.
+constexpr std::size_t kReceiveBytes = detail::kReceiveBuffer;
 
 std::chrono::milliseconds until(Clock::time_point when) {
   return std::max(
