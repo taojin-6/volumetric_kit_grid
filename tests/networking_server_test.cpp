@@ -850,13 +850,16 @@ int teardown_case() {
 
   auto idle = net::serve(session);
   CHECK(idle != nullptr);
-  auto a = net::connect(idle->port());
-  auto b = net::connect(idle->port());
+  const std::uint16_t port = idle->port();
+  auto a = net::connect(port);
+  auto b = net::connect(port);
   CHECK(a != nullptr && b != nullptr);
   CHECK(net::wait_session(*a));
   CHECK(net::wait_session(*b));
   CHECK(within_1s([&] { idle.reset(); }));
-  for (auto* client : {a.get(), b.get()}) CHECK(net::wait_end(*client, 1s));
+  for (auto* client : {a.get(), b.get()}) {
+    CHECK(net::wait_end(*client, port, 1s));
+  }
 
   Captured log;
   const LogCapture capture(&log);
