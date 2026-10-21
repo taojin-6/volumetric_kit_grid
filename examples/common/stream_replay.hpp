@@ -29,11 +29,11 @@ class ReplayLoop {
   using Clock = std::chrono::steady_clock;
 
   /// @brief The loop over @p reader's track @p track: its records from its
-  ///        first key on, in file order; a span the reader finds damaged is
-  ///        left out.
+  ///        first key the reader finds undamaged on, in file order; a span
+  ///        the reader finds damaged is left out.
   /// @return The loop; `InvalidArgument` for a track the session lacks;
-  ///         `NotFound` for a track with no key; the reader's `IoError` or
-  ///         `OutOfMemory`.
+  ///         `NotFound` for a track with no undamaged key; the reader's
+  ///         `IoError` or `OutOfMemory`.
   static vkc::Result<ReplayLoop> create(const vr::stream::StreamReader& reader,
                                         std::uint16_t track = 0) {
     VKC_ASSIGN(vr::stream::Position pos, reader.key(track, 0));
@@ -52,13 +52,15 @@ class ReplayLoop {
         continue;  // damage: pos is past it
       }
       if (!*more) break;
-      if (record.info.track == track) loop.records_.push_back(record);
+      // From a key read whole: what follows a damaged one lacks its key.
+      if (record.info.track == track &&
+          (record.info.key || !loop.records_.empty())) {
+        loop.records_.push_back(record);
+      }
     }
     if (loop.records_.empty()) {
-      return vkc::Status::not_found("ReplayLoop: track " +
-                                    std::to_string(track) +
-                                    "'s first key is damaged, and no record "
-                                    "follows it");
+      return vkc::Status::not_found("ReplayLoop: every key of track " +
+                                    std::to_string(track) + " is damaged");
     }
     std::uint64_t least = loop.records_.front().info.pts_ns;
     std::uint64_t most = least;

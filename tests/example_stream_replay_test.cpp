@@ -7,7 +7,8 @@
 // three passes in a row; dues following the pts gaps, a pass one mean step
 // after the last; a lone record paced by the track's rate; a record with a
 // damaged header or a flag this version does not know left out, and an
-// allocation failure reading past the damage refused; and a track with no
+// allocation failure reading past the damage refused; a damaged first key
+// left out with the P-frames after it; and a track with no key, no undamaged
 // key, or none at all, refused. Host-only.
 
 #include <chrono>
@@ -197,6 +198,37 @@ int damage_case(const std::string& dir) {
   return 0;
 }
 
+// A finished file's key whose header fails its CRC, which its footer still
+// lists: the loop starts at the next key read whole, and without one is
+// refused.
+int damaged_key_case(const std::string& dir) {
+  std::vector<stream::RecordInfo> infos;
+  for (std::uint64_t seq = 0; seq < 4; ++seq) {
+    infos.push_back(vrst::info(0, seq % 2 == 0, seq * kStep, seq));
+  }
+  const std::string first = dir + "/first_key.vrst";
+  CHECK(write(first, infos));
+  vrst::Bytes file = vr_test::read_bytes(first);
+  const std::vector<vrst::ChunkAt> chunks = vrst::chunks(file);  // VRST first
+  CHECK(chunks[1].tag == "RECD" && chunks[3].tag == "RECD");
+  file = vrst::flipped(file, chunks[1].offset + 26, 0);
+  CHECK(vrst::write_bytes(first, file));
+  const auto later = reader_of(first);
+  CHECK(later != nullptr && later->recovery().finished);
+  vkc::Result<vr_example::ReplayLoop> loop =
+      vr_example::ReplayLoop::create(*later);
+  CHECK(loop.ok() && loop->records().size() == 2 &&
+        loop->records()[0].info.seq == 2);
+
+  const std::string both = dir + "/both_keys.vrst";
+  CHECK(vrst::write_bytes(both, vrst::flipped(file, chunks[3].offset + 26, 0)));
+  const auto none = reader_of(both);
+  CHECK(none != nullptr && none->recovery().finished);
+  CHECK(vr_example::ReplayLoop::create(*none).status().domain() ==
+        Code::NotFound);
+  return 0;
+}
+
 int refusals_case(const std::string& dir) {
   const std::string path = dir + "/no_key.vrst";
   CHECK(write(path, {vrst::info(0, false, 0, 0), vrst::info(0, false, 1, 1)}));
@@ -217,6 +249,7 @@ int main() {
   if (loop_case(dir) != 0) return 1;
   if (lone_record_case(dir) != 0) return 1;
   if (damage_case(dir) != 0) return 1;
+  if (damaged_key_case(dir) != 0) return 1;
   if (refusals_case(dir) != 0) return 1;
   std::puts("stream replay: OK");
   return 0;
