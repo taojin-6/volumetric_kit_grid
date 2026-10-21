@@ -74,8 +74,9 @@ struct VR_CODEC_API EncoderConfig {
   ///
   /// Every voxel of those blocks lies within @ref kTrueSdfBandVoxels voxels
   /// of the zero level, so a grid observed that far out codes every mask as
-  /// all ones but the cuts, and decodes to weight 1 on every other voxel of
-  /// a coded block; a narrower band leaves the voxels past it unobserved.
+  /// all ones but the cuts, and every voxel of a coded block but the cuts
+  /// decodes with weight 1; a narrower band leaves the voxels past it
+  /// unobserved.
   /// @warning Only for a true distance: fused depth has crossings with
   ///          corners past `sqrt(3)` voxels, which the cut would erase.
   bool true_sdf = false;
