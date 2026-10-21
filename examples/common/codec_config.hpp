@@ -102,11 +102,13 @@ inline volumetric_kit::core::Status check_true_sdf_band(
   const bool shell = sdf.mode == tsdf::MeshSdfMode::Shell;
   const double least = double(codec::kTrueSdfBandVoxels) +
                        (shell ? double(sdf.shell_voxels) : 0.0);
+  // A relative margin: two floats' ratio can fall just short of a whole band
+  // (0.06 m of 4 mm voxels is 14.999999).
   const double band = double(grid.trunc_dist) / double(grid.voxel_size);
-  if (band + 1e-6 >= least) return {};
+  if (band >= least * (1.0 - 1e-4)) return {};
   char text[256];
   std::snprintf(text, sizeof text,
-                "fusion.truncation_m %.6g m is %.4g voxels; a mesh codes as a "
+                "fusion.truncation_m %.6g m is %.6g voxels; a mesh codes as a "
                 "true SDF in at least %.6g voxels (%.6g m)%s",
                 double(grid.trunc_dist), band, least,
                 least * double(grid.voxel_size),

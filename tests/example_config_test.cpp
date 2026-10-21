@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "codec_config.hpp"
@@ -106,8 +107,6 @@ int main() {
   for (const cfg::Config* mesh : {&single.value(), &sequence.value()}) {
     CHECK(mesh->fusion.voxel_size_m == 0.005F &&
           mesh->fusion.truncation_m == 0.08F);
-    CHECK(mesh->fusion.truncation_m / mesh->fusion.voxel_size_m >=
-          float(vr::codec::kTrueSdfBandVoxels));
     CHECK(mesh->codec.coefficient_count == 56 &&
           mesh->codec.quantization_scale == 0.040877F);
   }
@@ -383,6 +382,37 @@ int main() {
     CHECK(accepted ||
           (shell.status().domain() == vkc::Status::Code::InvalidArgument &&
            shell.status().message().find("shell_voxels") != std::string::npos));
+  }
+
+  // The true-SDF band: a whole 15 voxels is taken at every voxel size from 1
+  // to 50 mm, though two floats' ratio can fall short of it (0.06 m of 4 mm
+  // voxels), and 14 refused; shell mode adds the half-thickness. Both mesh
+  // templates pass.
+  vr::tsdf::MeshSdfParams solid;
+  vr::tsdf::MeshSdfParams shelled;
+  shelled.mode = vr::tsdf::MeshSdfMode::Shell;
+  shelled.shell_voxels = 2.F;
+  for (int mm = 1; mm <= 50; ++mm) {
+    const auto band = [mm](int voxels) {
+      return vr_example::example_grid_params(float(mm / 1000.0),
+                                             float(voxels * mm / 1000.0), 1024);
+    };
+    CHECK(vr_example::check_true_sdf_band(solid, band(15)).ok());
+    CHECK(vr_example::check_true_sdf_band(shelled, band(17)).ok());
+    for (const auto& [sdf, voxels, least] :
+         {std::tuple{&solid, 14, "at least 15 voxels"},
+          std::tuple{&shelled, 16, "at least 17 voxels"}}) {
+      const vkc::Status refused =
+          vr_example::check_true_sdf_band(*sdf, band(voxels));
+      CHECK(refused.domain() == vkc::Status::Code::InvalidArgument &&
+            refused.message().find(least) != std::string::npos);
+    }
+  }
+  for (const cfg::Config* mesh : {&single.value(), &sequence.value()}) {
+    const auto sdf =
+        vr_example::mesh_sdf_config(mesh->source, grid(mesh->fusion));
+    CHECK(sdf.ok() &&
+          vr_example::check_true_sdf_band(*sdf, grid(mesh->fusion)).ok());
   }
 
 #ifdef VR_TEST_ORBBEC_CONFIG
