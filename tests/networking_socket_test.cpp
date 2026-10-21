@@ -6,10 +6,11 @@
 // read back (non-blocking and close-on-exec on every one, the listener's
 // SO_REUSEADDR, the accepted sender's TCP_NODELAY and 128 KiB
 // TCP_NOTSENT_LOWAT, the client's 256 KiB receive buffer, SO_NOSIGPIPE on
-// Apple); a send to a closed peer failing rather than raising SIGPIPE; a
-// wait interrupted by a signal going on to its end; the end and an empty
-// receive told apart; numeric IPv4 parsed, anything else not; and localhost
-// resolved to IPv4 alone.
+// Apple); a send to a closed peer failing rather than raising SIGPIPE; the
+// bytes a peer has not acknowledged, none, then all it has not taken in, then
+// none once it has read them; a wait interrupted by a signal going on to its
+// end; the end and an empty receive told apart; numeric IPv4 parsed, anything
+// else not; and localhost resolved to IPv4 alone.
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -17,6 +18,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -172,6 +174,71 @@ int send_receive_case() {
   return 0;
 }
 
+// The bytes `fd` has received and not read (FIONREAD).
+std::size_t unread(int fd) {
+  int bytes = 0;
+  if (::ioctl(fd, FIONREAD, &bytes) != 0) return 0;
+  return static_cast<std::size_t>(bytes);
+}
+
+// What the peer has not acknowledged: none on a new connection; with a peer
+// that does not read, what was sent less what the peer holds, and not none;
+// none once the peer has read it all.
+int unacknowledged_case() {
+  Connected c;
+  CHECK(connect_pair(&c) == 0);
+  vkc::Result<std::size_t> held =
+      detail::unacknowledged("test", c.accepted.get());
+  CHECK(held.ok() && *held == 0);
+  // Sent until the socket takes no more, even after a pause: past what the
+  // peer can hold.
+  const std::vector<std::uint8_t> bytes(std::size_t{1} << 20, 7);
+  std::size_t sent = 0;
+  const Clock::time_point end = Clock::now() + 2s;
+  for (bool took = true; took && Clock::now() < end;) {
+    took = false;
+    for (;;) {
+      const vkc::Result<std::size_t> n = detail::send_some(
+          "test", c.accepted.get(), bytes.data(), bytes.size());
+      CHECK(n.ok());
+      if (*n == 0) break;
+      sent += *n;
+      took = true;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  // The peer may acknowledge late: wait until the two sides agree.
+  const Clock::time_point settled = Clock::now() + 2s;
+  for (;;) {
+    held = detail::unacknowledged("test", c.accepted.get());
+    CHECK(held.ok());
+    if (*held + unread(c.client.get()) == sent || Clock::now() >= settled) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  CHECK(*held > 0 && *held + unread(c.client.get()) == sent);
+
+  std::vector<std::uint8_t> buffer(std::size_t{1} << 16);
+  std::size_t taken = 0;
+  const Clock::time_point drained = Clock::now() + 5s;
+  while (taken < sent && Clock::now() < drained) {
+    CHECK(detail::wait_for("test", c.client.get(), POLLIN, 100ms).ok());
+    const vkc::Result<detail::Received> got = detail::receive_some(
+        "test", c.client.get(), buffer.data(), buffer.size());
+    CHECK(got.ok() && !got->closed);
+    taken += got->bytes;
+  }
+  CHECK(taken == sent);
+  const Clock::time_point acked = Clock::now() + 2s;
+  do {
+    held = detail::unacknowledged("test", c.accepted.get());
+    CHECK(held.ok());
+  } while (*held != 0 && Clock::now() < acked);
+  CHECK(*held == 0);
+  return 0;
+}
+
 void nothing(int) {}
 
 // A wait a signal interrupts (a handler without SA_RESTART, as poll is never
@@ -231,6 +298,7 @@ int addresses_case() {
 int main() {
   if (settings_case() != 0) return 1;
   if (send_receive_case() != 0) return 1;
+  if (unacknowledged_case() != 0) return 1;
   if (interrupted_wait_case() != 0) return 1;
   if (addresses_case() != 0) return 1;
   std::puts("networking socket: OK");

@@ -9,9 +9,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>  // IWYU pragma: keep (ssize_t on Linux)
 #include <unistd.h>
+#ifndef __APPLE__
+#include <linux/sockios.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -257,6 +261,18 @@ core::Result<std::size_t> send_some(std::string_view api, int fd,
     if (errno == EAGAIN || errno == EWOULDBLOCK) return std::size_t{0};
     return failure(api, "cannot send", errno);
   }
+}
+
+core::Result<std::size_t> unacknowledged(std::string_view api, int fd) {
+  int bytes = 0;
+#ifdef __APPLE__
+  socklen_t size = sizeof bytes;
+  const int failed = ::getsockopt(fd, SOL_SOCKET, SO_NWRITE, &bytes, &size);
+#else
+  const int failed = ::ioctl(fd, SIOCOUTQ, &bytes);
+#endif
+  if (failed != 0) return failure(api, "cannot read the send queue", errno);
+  return static_cast<std::size_t>(std::max(bytes, 0));
 }
 
 core::Result<Received> receive_some(std::string_view api, int fd,

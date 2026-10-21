@@ -32,7 +32,8 @@ class ReplayLoop {
   ///        first key on, in file order; a span the reader finds damaged is
   ///        left out.
   /// @return The loop; `InvalidArgument` for a track the session lacks;
-  ///         `NotFound` for a track with no key; the reader's `IoError`.
+  ///         `NotFound` for a track with no key; the reader's `IoError` or
+  ///         `OutOfMemory`.
   static vkc::Result<ReplayLoop> create(const vr::stream::StreamReader& reader,
                                         std::uint16_t track = 0) {
     VKC_ASSIGN(vr::stream::Position pos, reader.key(track, 0));
@@ -41,7 +42,11 @@ class ReplayLoop {
       vr::stream::Record record;
       const vkc::Result<bool> more = reader.next(&pos, &record);
       if (!more.ok()) {
-        if (more.status().domain() == vkc::Status::Code::IoError) {
+        // Only damage leaves pos past it; anything else is the loop's
+        // failure, as an allocation's, which may leave pos where it was.
+        const vkc::Status::Code code = more.status().domain();
+        if (code != vkc::Status::Code::InvalidArgument &&
+            code != vkc::Status::Code::Unsupported) {
           return more.status();
         }
         continue;  // damage: pos is past it

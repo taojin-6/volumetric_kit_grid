@@ -217,6 +217,8 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
   detail::GopLog::Cursor cursor;
   // When the viewer last took a byte, or its socket could take one.
   Clock::time_point taking = Clock::now();
+  std::uint64_t written = 0;  // the bytes sent on the socket
+  std::uint64_t taken = 0;    // of them, the ones the viewer acknowledged
   std::uint8_t drain[kDrainBytes];
   for (;;) {
     if (stop) return "closed: the server stopped";
@@ -232,8 +234,14 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
     }
     if ((*ready & POLLOUT) == 0) {
       // Under the low-water mark the socket polls writable, so this one
-      // holds at least that much the viewer has not taken.
-      if (Clock::now() - taking >= options.stall_limit) {
+      // holds at least that much; the viewer takes what it acknowledges,
+      // which a slow one does above the mark.
+      const core::Result<std::size_t> held = detail::unacknowledged(api, fd);
+      if (!held.ok()) return "failed: " + held.status().message();
+      if (*held < written - taken) {
+        taken = written - *held;
+        taking = Clock::now();
+      } else if (Clock::now() - taking >= options.stall_limit) {
         return "closed: took no byte for " +
                std::to_string(options.stall_limit.count()) + " ms";
       }
@@ -254,6 +262,7 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
         detail::send_some(api, fd, chunk->data() + sent, chunk->size() - sent);
     if (!n.ok()) return "failed: " + n.status().message();
     sent += *n;
+    written += *n;
     if (sent == chunk->size()) chunk = nullptr;
   }
 }
