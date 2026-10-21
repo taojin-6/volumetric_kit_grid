@@ -9,8 +9,9 @@
 // Apple); a send to a closed peer failing rather than raising SIGPIPE; the
 // bytes a peer has not acknowledged, none, then all it has not taken in, then
 // none once it has read them; a wait interrupted by a signal going on to its
-// end; the end and an empty receive told apart; numeric IPv4 parsed, anything
-// else not; and localhost resolved to IPv4 alone.
+// end; the end and an empty receive told apart; a deadline saturating at the
+// clock's end; numeric IPv4 parsed, anything else not; and localhost resolved
+// to IPv4 alone.
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -269,6 +270,20 @@ int interrupted_wait_case() {
   return 0;
 }
 
+// A deadline saturates: milliseconds::max() is the clock's end, as is any
+// limit past it; one of 0 or less is now.
+int after_case() {
+  const Clock::time_point now = Clock::now();
+  CHECK(detail::after(now, 10ms) == now + 10ms);
+  CHECK(detail::after(now, 0ms) == now);
+  CHECK(detail::after(now, -5ms) == now);
+  CHECK(detail::after(now, std::chrono::milliseconds::max()) ==
+        Clock::time_point::max());
+  CHECK(detail::after(Clock::time_point::max() - 1ms, 2ms) ==
+        Clock::time_point::max());
+  return 0;
+}
+
 int addresses_case() {
   detail::Address a;
   CHECK(detail::parse_ipv4("192.168.21.217", 47801, &a));
@@ -300,6 +315,7 @@ int main() {
   if (send_receive_case() != 0) return 1;
   if (unacknowledged_case() != 0) return 1;
   if (interrupted_wait_case() != 0) return 1;
+  if (after_case() != 0) return 1;
   if (addresses_case() != 0) return 1;
   std::puts("networking socket: OK");
   return 0;

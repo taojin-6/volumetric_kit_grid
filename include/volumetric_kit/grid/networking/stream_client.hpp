@@ -26,7 +26,8 @@ struct ClientOptions {
   /// name lookup and the TCP connect included), ends the connection with
   /// `Status::Code::IoError`: a sender that stalled, or a path that died (the
   /// VPN dropped). @ref StreamClient::next judges it after reading what has
-  /// come, so a caller back late keeps a sender that kept sending.
+  /// come, so a caller back late keeps a sender that kept sending. Positive;
+  /// `milliseconds::max()` is never.
   std::chrono::milliseconds idle_limit{10'000};
 };
 
@@ -63,8 +64,9 @@ class VR_NETWORKING_API StreamClient {
   /// @param host     A name, or a numeric IPv4 address.
   /// @param port     The sender's port.
   /// @param options  How it reads.
-  /// @return The client; `Status::Code::InvalidArgument` for an empty host
-  ///         or port 0; `Status::Code::IoError` when the lookup's thread
+  /// @return The client; `Status::Code::InvalidArgument` for an empty host,
+  ///         port 0 or an `idle_limit` of 0 or less;
+  ///         `Status::Code::IoError` when the lookup's thread
   ///         cannot start; `Status::Code::OutOfMemory` when the client
   ///         cannot be allocated.
   static core::Result<std::unique_ptr<StreamClient>> connect(
@@ -88,7 +90,7 @@ class VR_NETWORKING_API StreamClient {
   /// @param wait          The longest to wait: however fast bytes come, a
   ///                      call ends within it and one receive (up to
   ///                      256 KiB) more. 0 takes only that receive of what
-  ///                      has come.
+  ///                      has come; `milliseconds::max()` has no end.
   /// @param[out] record   Its header. Its `offset` is the chunk's offset in
   ///                      the bytes received, as in the file they would make.
   /// @param[out] payload  Its payload, resized to fit.

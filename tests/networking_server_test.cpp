@@ -9,13 +9,14 @@
 // records are published gets whole chunks, a key after every jump and the
 // newest GOP whole, with every publish back at once; a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
-// is closed after stall_limit, and on Linux one that takes too few for its
-// socket to poll writable within it is not; connection max_viewers + 1 is
-// closed before any byte; a viewer that leaves never fails publish; the
-// writer's refusals send nothing; the destructor returns within 1 s with no
-// viewers, idle ones and a stalled one; and 100 SIGUSR1 to a no-op handler
-// leave the stream whole. Every test that publishes first waits for the
-// viewer's session.
+// is closed after stall_limit, never when it is milliseconds::max(), and on
+// Linux one that takes too few for its socket to poll writable within it is
+// not; connection max_viewers + 1 is closed before any byte; a viewer that
+// leaves never fails publish; the writer's refusals send nothing, and start
+// refuses (a stall_limit of 0 or less among them); the destructor returns
+// within 1 s with no viewers, idle ones and a stalled one; and 100 SIGUSR1 to
+// a no-op handler leave the stream whole. Every test that publishes first
+// waits for the viewer's session.
 
 #include <pthread.h>
 #include <signal.h>
@@ -423,6 +424,36 @@ int stall_limit_case() {
   return 0;
 }
 
+// A stall_limit of milliseconds::max() is never: a viewer that takes no byte
+// while 4 records of 1 MiB wait for it stays for 500 ms, 25 poll slices.
+int stall_never_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.stall_limit = std::chrono::milliseconds::max();
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd stalled = net::connect_loopback(server->port(), 4096);
+  CHECK(stalled.valid());
+  Bytes header;
+  net::read_upto(stalled.get(), net::session_chunk(session).size(), 5s,
+                 &header);
+  CHECK(header.size() == net::session_chunk(session).size());
+  const std::string name = peer_name(stalled.get());
+  CHECK(log.wait_for(name, "joined", 2s));
+  for (std::uint64_t seq = 0; seq < 4; ++seq) {
+    const Bytes payload = net::record_payload(seq, 1 << 20);
+    CHECK(server
+              ->publish(net::record_info(seq, seq == 0), payload.data(),
+                        payload.size())
+              .ok());
+  }
+  std::this_thread::sleep_for(500ms);
+  CHECK(!log.has(name, " closed: ") && !log.has(name, " failed: "));
+  return 0;
+}
+
 // A viewer that keeps taking bytes, though too slowly for its socket to poll
 // writable within stall_limit (300 ms), is not closed: 1 KiB every 10 ms
 // through a 4 KiB receive buffer, while 256 KiB records come for 2 s. Under
@@ -607,6 +638,11 @@ int rules_case() {
   networking::ServerOptions none = local;
   none.max_viewers = 0;
   CHECK(start(session, none) == Code::InvalidArgument);
+  for (const std::chrono::milliseconds limit : {0ms, -1ms}) {
+    networking::ServerOptions instant = local;
+    instant.stall_limit = limit;
+    CHECK(start(session, instant) == Code::InvalidArgument);
+  }
   networking::ServerOptions taken = local;
   taken.port = server->port();
   CHECK(start(session, taken) == Code::IoError);
@@ -751,6 +787,7 @@ int main() {
   if (newest_key_wins_case() != 0) return 1;
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
+  if (stall_never_case() != 0) return 1;
   if (slow_viewer_case() != 0) return 1;
   if (max_viewers_case() != 0) return 1;
   if (leaving_viewer_case() != 0) return 1;

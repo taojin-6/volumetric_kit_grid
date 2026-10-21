@@ -35,6 +35,7 @@ struct ServerOptions {
   std::uint64_t max_gop_bytes = std::uint64_t{64} << 20;
   /// A viewer that takes no byte for this long, with bytes waiting for it, is
   /// closed: a peer that vanished. A byte its end acknowledges is taken.
+  /// Positive; `milliseconds::max()` is never.
   std::chrono::milliseconds stall_limit{10'000};
 };
 
@@ -79,8 +80,9 @@ class VR_NETWORKING_API StreamServer {
   ///                 `stream::StreamWriter::create` takes, of one track.
   /// @param options  Where and how it serves.
   /// @return The server; `Status::Code::InvalidArgument` for a session the
-  ///         writer would refuse, a host that is not numeric IPv4, or a
-  ///         `max_viewers` of 0; `Status::Code::Unsupported` for more than
+  ///         writer would refuse, a host that is not numeric IPv4, a
+  ///         `max_viewers` of 0 or a `stall_limit` of 0 or less;
+  ///         `Status::Code::Unsupported` for more than
   ///         one track; `Status::Code::IoError` for a port that cannot be
   ///         bound (in use) or a thread that cannot start;
   ///         `Status::Code::OutOfMemory` when the session's chunk cannot be

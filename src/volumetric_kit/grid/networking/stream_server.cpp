@@ -241,7 +241,7 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
       if (*held < written - taken) {
         taken = written - *held;
         taking = Clock::now();
-      } else if (Clock::now() - taking >= options.stall_limit) {
+      } else if (Clock::now() >= detail::after(taking, options.stall_limit)) {
         return "closed: took no byte for " +
                std::to_string(options.stall_limit.count()) + " ms";
       }
@@ -298,6 +298,11 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
     if (options.max_viewers == 0) {
       return core::Status::invalid_argument(std::string(kApi) +
                                             ": a max_viewers of 0");
+    }
+    if (options.stall_limit <= std::chrono::milliseconds{0}) {
+      return core::Status::invalid_argument(
+          std::string(kApi) + ": a stall_limit of " +
+          std::to_string(options.stall_limit.count()) + " ms");
     }
     detail::Address address;
     if (!detail::parse_ipv4(options.host.empty() ? "0.0.0.0" : options.host,

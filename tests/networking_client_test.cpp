@@ -10,9 +10,10 @@
 // 500 ms while chunks it skips flood in; next(0 ms) alone connects and reads,
 // a 230 KB record already in the socket in one call; idle_limit counts from
 // connect, against a listener that sends nothing, and then from the last
-// byte, judged after reading what came while the caller was away; localhost
-// reaches a 127.0.0.1 server; and an empty host or port 0 is refused. Each
-// error is returned again by every later call.
+// byte, judged after reading what came while the caller was away;
+// milliseconds::max() as idle_limit or wait is never; localhost reaches a
+// 127.0.0.1 server; and an empty host, port 0 or an idle_limit of 0 or less is
+// refused. Each error is returned again by every later call.
 
 #include <atomic>
 #include <chrono>
@@ -343,6 +344,37 @@ int late_caller_case() {
   return 0;
 }
 
+// milliseconds::max() means never: as idle_limit it never ends a connection
+// to a sender that sends nothing, and as next's wait it waits until a record
+// comes, 100 ms later.
+int never_case() {
+  constexpr std::chrono::milliseconds kNever = std::chrono::milliseconds::max();
+  networking::ClientOptions options;
+  options.idle_limit = kNever;
+  Sender sender;
+  auto client = net::connect(sender.listener.port, options);
+  CHECK(client != nullptr && sender.take(*client));
+  Got got;
+  for (int i = 0; i < 3; ++i) {
+    const vkc::Result<bool> r = client->next(50ms, &got.record, &got.payload);
+    CHECK(r.ok() && !*r);
+  }
+  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+  std::thread later([&] {
+    std::this_thread::sleep_for(100ms);
+    (void)net::send_bytes(
+        sender.peer.get(),
+        vrst::record(0, 1, 0, 0, stream::kNoSet, vrst::pattern(64, 9)));
+  });
+  const Clock::time_point start = Clock::now();
+  const vkc::Result<bool> r = client->next(kNever, &got.record, &got.payload);
+  const auto took = Clock::now() - start;
+  later.join();
+  CHECK(r.ok() && *r && got.record.info.seq == 0);
+  CHECK(took >= 50ms);
+  return 0;
+}
+
 // localhost reaches a server on 127.0.0.1, through the lookup's thread.
 int localhost_case() {
   auto server = net::serve(net::geometry_session());
@@ -358,6 +390,13 @@ int refusals_case() {
         Code::InvalidArgument);
   CHECK(networking::StreamClient::connect("127.0.0.1", 0).status().domain() ==
         Code::InvalidArgument);
+  for (const std::chrono::milliseconds limit : {0ms, -1ms}) {
+    networking::ClientOptions options;
+    options.idle_limit = limit;
+    CHECK(networking::StreamClient::connect("127.0.0.1", 47801, options)
+              .status()
+              .domain() == Code::InvalidArgument);
+  }
   return 0;
 }
 
@@ -375,6 +414,7 @@ int main() {
   if (idle_case() != 0) return 1;
   if (idle_from_last_byte_case() != 0) return 1;
   if (late_caller_case() != 0) return 1;
+  if (never_case() != 0) return 1;
   if (localhost_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::puts("networking client: OK");

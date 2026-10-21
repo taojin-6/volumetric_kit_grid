@@ -36,6 +36,22 @@ inline constexpr int kSendLowWater = 128 << 10;
 // it: what a reader that falls behind can hide from the sender's drop rule.
 inline constexpr int kReceiveBuffer = 256 << 10;
 
+// `from` + `limit`, saturating: a limit past the clock's end, as
+// milliseconds::max() ("never"), gives that end; one of 0 or less, `from`.
+inline std::chrono::steady_clock::time_point after(
+    std::chrono::steady_clock::time_point from,
+    std::chrono::milliseconds limit) {
+  using Clock = std::chrono::steady_clock;
+  if (limit <= std::chrono::milliseconds{0}) return from;
+  // Compared in milliseconds: the limit in the clock's nanoseconds may not
+  // fit.
+  if (limit >= std::chrono::floor<std::chrono::milliseconds>(
+                   Clock::time_point::max() - from)) {
+    return Clock::time_point::max();
+  }
+  return from + limit;
+}
+
 // An IPv4 socket address. A StreamServer listens on IPv4 alone, so a client
 // tries no other family: an IPv6 address could only be refused, or stall a
 // connect where IPv6 is broken.

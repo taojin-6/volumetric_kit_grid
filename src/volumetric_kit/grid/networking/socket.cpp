@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <system_error>
 
@@ -238,16 +239,18 @@ core::Status finish_connect(std::string_view api, int fd,
 core::Result<short> wait_for(std::string_view api, int fd, short events,
                              std::chrono::milliseconds timeout) {
   using Clock = std::chrono::steady_clock;
-  const Clock::time_point deadline = Clock::now() + timeout;
+  const Clock::time_point deadline = after(Clock::now(), timeout);
   for (;;) {
     pollfd p{fd, events, 0};
     const auto left =
         std::chrono::ceil<std::chrono::milliseconds>(deadline - Clock::now());
-    const int n = ::poll(
-        &p, 1, static_cast<int>(std::max<std::int64_t>(left.count(), 0)));
+    // A poll waits at most INT_MAX ms (24 days), then the next goes on.
+    const std::int64_t ms = std::clamp<std::int64_t>(
+        left.count(), 0, std::numeric_limits<int>::max());
+    const int n = ::poll(&p, 1, static_cast<int>(ms));
     if (n > 0) return p.revents;
-    if (n == 0) return short{0};
-    if (errno != EINTR) return failure(api, "cannot poll", errno);
+    if (n == 0 && Clock::now() >= deadline) return short{0};
+    if (n < 0 && errno != EINTR) return failure(api, "cannot poll", errno);
   }
 }
 

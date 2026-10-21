@@ -151,6 +151,11 @@ core::Result<std::unique_ptr<StreamClient>> StreamClient::connect(
     if (port == 0) {
       return core::Status::invalid_argument(std::string(kApi) + ": port 0");
     }
+    if (options.idle_limit <= std::chrono::milliseconds{0}) {
+      return core::Status::invalid_argument(
+          std::string(kApi) + ": an idle_limit of " +
+          std::to_string(options.idle_limit.count()) + " ms");
+    }
     auto impl = std::make_unique<Impl>(host, port, options);
     detail::Address address;
     if (detail::parse_ipv4(host, port, &address)) {
@@ -198,8 +203,7 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
   Impl& s = *impl_;
   try {
     if (!s.failure.ok()) return s.failure;
-    const Clock::time_point deadline =
-        Clock::now() + std::max(wait, std::chrono::milliseconds{0});
+    const Clock::time_point deadline = detail::after(Clock::now(), wait);
     // At least one step, so a wait of 0 still reads what has come, and a
     // caller back late reads what came meanwhile before the idle limit is
     // judged; then the deadline ends the loop, though bytes keep coming, and
@@ -208,7 +212,8 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
       core::Result<bool> got = s.parser.next(record, payload);
       if (!got.ok()) return s.fail(std::move(got).status());
       if (*got) return true;
-      const Clock::time_point idle = s.last_byte + s.options.idle_limit;
+      const Clock::time_point idle =
+          detail::after(s.last_byte, s.options.idle_limit);
       if (stepped && Clock::now() >= idle) {
         return s.fail(core::Status::io_error(
             s.api + ": no byte for " +
