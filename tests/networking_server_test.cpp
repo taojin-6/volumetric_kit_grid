@@ -31,6 +31,9 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -906,10 +909,15 @@ std::uint64_t address_space() {
 // space is back within 4 MiB of where it was after the first 20. A thread
 // never joined keeps its stack (8 MiB on Linux) or, on macOS, about 34 KiB,
 // and neither shows in a thread count. A viewer's thread sees its end within
-// a poll slice, so 64 slots, and one refused tries again. Not under ASan or
-// TSan, which keep freed memory a while.
+// a poll slice, so 64 slots, and one refused tries again. glibc gives a
+// thread that finds malloc busy an arena of its own, 64 MiB of address space
+// kept, so no new one is made meanwhile. Not under ASan or TSan, which keep
+// freed memory a while.
 int reaping_case() {
 #ifndef VR_TEST_SANITIZED
+#ifdef __GLIBC__
+  CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
+#endif
   const stream::Session session = net::geometry_session();
   networking::ServerOptions options;
   options.max_viewers = 64;
