@@ -135,8 +135,9 @@ core::Result<std::vector<Address>> resolve(std::string_view api,
     addresses.push_back(address);
   }
   if (addresses.empty()) {
-    return core::Status::not_found(std::string(api) +
-                                   ": the name has no IPv4 address for TCP");
+    return core::Status::not_found(
+        std::string(api) +
+        ": cannot look up the name: no IPv4 address for TCP");
   }
   return addresses;
 }
