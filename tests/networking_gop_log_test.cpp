@@ -55,7 +55,7 @@ using Seqs = std::vector<std::uint64_t>;
 // Before any key nothing is kept or handed out; the first key starts it.
 int before_any_key_case() {
   GopLog log(1 << 20);
-  GopLog::Cursor early = log.join();
+  GopLog::Cursor early;
   CHECK(!log.open());
   CHECK(log.next(&early) == nullptr);
   CHECK(!log.append(chunk(0, false), false));
@@ -75,16 +75,16 @@ int join_mid_gop_case() {
   GopLog log(1 << 20);
   CHECK(log.append(chunk(0, true), true));
   CHECK(log.append(chunk(1, false), false));
-  GopLog::Cursor first = log.join();
+  GopLog::Cursor first;
   CHECK(drain(log, &first) == (Seqs{0, 1}));
   CHECK(log.append(chunk(2, false), false));
-  GopLog::Cursor late = log.join();
+  GopLog::Cursor late;
   CHECK(drain(log, &late) == (Seqs{0, 1, 2}));
   CHECK(drain(log, &first) == (Seqs{2}));
   // After a second key, a join starts there.
   CHECK(log.append(chunk(3, true), true));
   CHECK(log.append(chunk(4, false), false));
-  GopLog::Cursor later = log.join();
+  GopLog::Cursor later;
   CHECK(drain(log, &later) == (Seqs{3, 4}));
   return 0;
 }
@@ -95,8 +95,8 @@ int join_mid_gop_case() {
 int newest_key_wins_case() {
   GopLog log(1 << 20);
   CHECK(log.append(chunk(0, true, 4096), true));
-  GopLog::Cursor slow = log.join();
-  GopLog::Cursor fast = log.join();
+  GopLog::Cursor slow;
+  GopLog::Cursor fast;
   for (std::uint64_t seq = 1; seq < 10; ++seq) {
     CHECK(log.append(chunk(seq, false, 4096), false));
   }
@@ -130,14 +130,14 @@ int overflow_case() {
   GopLog log(3000);
   CHECK(log.append(chunk(0, true, 1000), true));
   CHECK(log.append(chunk(1, false, 1000), false));
-  GopLog::Cursor live = log.join();
+  GopLog::Cursor live;
   CHECK(drain(log, &live) == (Seqs{0, 1}));
   // Exactly at the limit is kept.
   CHECK(log.append(chunk(2, false, 1000), false));
   CHECK(drain(log, &live) == (Seqs{2}));
   CHECK(!log.append(chunk(3, false, 1), false));
   CHECK(!log.open());
-  GopLog::Cursor joined = log.join();
+  GopLog::Cursor joined;
   CHECK(log.next(&joined) == nullptr);
   CHECK(log.next(&live) == nullptr);
   CHECK(!log.append(chunk(4, false, 10), false));
@@ -147,7 +147,7 @@ int overflow_case() {
   CHECK(drain(log, &live) == (Seqs{5, 6}));
   CHECK(drain(log, &joined) == (Seqs{5, 6}));
   // A viewer behind in the broken GOP gets nothing more of it.
-  GopLog::Cursor behind = log.join();
+  GopLog::Cursor behind;
   CHECK(seq_of(log.next(&behind)) == 5);
   CHECK(!log.append(chunk(7, false, 2500), false));
   CHECK(log.next(&behind) == nullptr);
@@ -165,13 +165,13 @@ int overflow_case() {
 int failed_copy_case() {
   GopLog log(1 << 20);
   CHECK(log.append(chunk(0, true), true));
-  GopLog::Cursor live = log.join();
+  GopLog::Cursor live;
   CHECK(drain(log, &live) == (Seqs{0}));
   log.break_gop();
   CHECK(!log.open());
   CHECK(!log.append(chunk(2, false), false));
   CHECK(log.next(&live) == nullptr);
-  GopLog::Cursor joined = log.join();
+  GopLog::Cursor joined;
   CHECK(log.next(&joined) == nullptr);
   CHECK(log.append(chunk(3, true), true));
   CHECK(drain(log, &live) == (Seqs{3}));
@@ -209,7 +209,6 @@ int never_without_key_case() {
         ++seq;  // the record lost
       } else if (what < 36 && viewers.size() < 6) {
         viewers.emplace_back();
-        viewers.back().cursor = log.join();
       } else if (!viewers.empty()) {
         Viewer& v = viewers[std::uniform_int_distribution<std::size_t>(
             0, viewers.size() - 1)(rng)];

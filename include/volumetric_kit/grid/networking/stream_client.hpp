@@ -14,6 +14,7 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/networking/export.hpp"
+#include "volumetric_kit/recon/networking/stream_server.hpp"  // kDefaultPort
 #include "volumetric_kit/recon/stream/session.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 
@@ -53,15 +54,18 @@ struct ClientOptions {
 /// @warning Not thread-safe: one thread uses it.
 class VR_NETWORKING_API StreamClient {
  public:
-  /// @brief Start looking up @p host and connecting; never blocks. A name is
-  ///        looked up on a detached helper thread, which the client abandons
-  ///        if it is destroyed first.
+  /// @brief A client of @p host's sender; never blocks. A name is looked up
+  ///        at once, on a detached helper thread, which the client abandons
+  ///        if it is destroyed first; @ref next makes the TCP connect. Since
+  ///        @ref ClientOptions::idle_limit counts from here, call @ref next
+  ///        soon after.
   /// @param host     A name, or a numeric IPv4 address.
   /// @param port     The sender's port.
   /// @param options  How it reads.
   /// @return The client; `Status::Code::InvalidArgument` for an empty host
   ///         or port 0; `Status::Code::IoError` when the lookup's thread
-  ///         cannot start.
+  ///         cannot start; `Status::Code::OutOfMemory` when the client
+  ///         cannot be allocated.
   static core::Result<std::unique_ptr<StreamClient>> connect(
       const std::string& host, std::uint16_t port,
       const ClientOptions& options = {});
@@ -86,13 +90,14 @@ class VR_NETWORKING_API StreamClient {
   /// @param[out] payload  Its payload, resized to fit.
   /// @return `true` with a record; `false` when none came within @p wait;
   ///         `Status::Code::NotFound` for a name that does not resolve;
-  ///         `Status::Code::IoError` for a connection refused at every
-  ///         address, reset or closed, or idle past
-  ///         @ref ClientOptions::idle_limit; `Status::Code::InvalidArgument`
-  ///         for bytes that are not a `.vrst` stream, fail a check, or hold a
-  ///         session body over `stream::kMaxSessionBytes`;
-  ///         `Status::Code::Unsupported` for another version or session
-  ///         flags; `Status::Code::OutOfMemory` for another chunk's body over
+  ///         `Status::Code::IoError` for a lookup that fails otherwise, a
+  ///         connection refused at every address, reset or closed, or idle
+  ///         past @ref ClientOptions::idle_limit;
+  ///         `Status::Code::InvalidArgument` for bytes that are not a `.vrst`
+  ///         stream, fail a check, or hold a session body over
+  ///         `stream::kMaxSessionBytes`; `Status::Code::Unsupported` for
+  ///         another version or session flags; `Status::Code::OutOfMemory`
+  ///         for another chunk's body over
   ///         `stream::ChunkParser::kMaxBodyBytes` (64 MiB), before reading
   ///         it, or an allocation failure. A record setting an unknown flag
   ///         is skipped. After an error the connection is closed, and every

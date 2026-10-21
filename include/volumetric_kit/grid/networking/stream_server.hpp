@@ -49,13 +49,13 @@ struct ServerOptions {
 /// **Newest key wins.** The server keeps one GOP: the newest key record and
 /// every record after it. A viewer joins at that key, so it decodes at once.
 /// It takes its next record only while its socket holds under 128 KiB unsent
-/// (`TCP_NOTSENT_LOWAT`), so no backlog hides in the kernel. When a newer key
-/// arrives before it has sent the GOP, it finishes the chunk under way, skips
-/// the rest and goes on from that key. A P-frame is never sent without the
-/// records it is predicted from.
+/// (`TCP_NOTSENT_LOWAT`), so little backlog hides in the kernel. When a newer
+/// key arrives before it has sent the GOP, it finishes the chunk under way,
+/// skips the rest and goes on from that key. A P-frame is never sent without
+/// the records it is predicted from.
 ///
-/// **Joining.** A viewer is subscribed at accept, before its `VRST` chunk is
-/// queued, under the lock @ref publish takes. So once a viewer has the
+/// **Joining.** A viewer's first record, after its `VRST` chunk, is the GOP's
+/// key, and the server keeps every record since. So once a viewer has the
 /// session, it misses no record published after, except by newest key wins.
 ///
 /// **Threads.** @ref publish never waits on a socket or a viewer: it copies

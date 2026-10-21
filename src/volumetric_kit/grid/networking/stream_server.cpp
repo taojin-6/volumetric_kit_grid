@@ -43,12 +43,11 @@ void log_at(core::LogLevel level, const std::string& message) noexcept {
 }  // namespace
 
 struct StreamServer::Impl {
-  // One viewer: its socket, its place in the log and its thread.
+  // One viewer: its socket and its thread.
   struct Viewer {
-    core::UniqueFd fd;              // its thread's, which closes it
-    std::string name;               // its address, for the log
-    detail::GopLog::Cursor cursor;  // under the mutex
-    bool done = false;              // under the mutex: its thread has ended
+    core::UniqueFd fd;  // its thread's, which closes it
+    std::string name;   // its address, for the log
+    bool done = false;  // under the mutex: its thread has ended
     std::thread thread;
   };
 
@@ -65,9 +64,9 @@ struct StreamServer::Impl {
   // The accept thread: take each connection, admit it or close it, and join
   // the threads of viewers that have ended, until the stop.
   void accept_loop() noexcept;
-  // Subscribe `fd`'s viewer under the lock, before anything is queued for
-  // it, then start its thread.
-  void admit(core::UniqueFd fd, const std::string& name);
+  // Count `fd`'s viewer in and start its thread, or close it past
+  // max_viewers.
+  void admit(core::UniqueFd fd, std::string name);
   // Join the threads of the viewers that have ended.
   void reap();
   // A viewer's thread: send it everything, then close it and say why.
@@ -122,7 +121,7 @@ void StreamServer::Impl::accept_loop() noexcept {
   }
 }
 
-void StreamServer::Impl::admit(core::UniqueFd fd, const std::string& name) {
+void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
   std::size_t serving = 0;
   {
     // Only this thread adds viewers, so one admitted after this check still
@@ -137,19 +136,24 @@ void StreamServer::Impl::admit(core::UniqueFd fd, const std::string& name) {
                                      " viewers already");
     return;
   }
+  // Nothing from here to its thread's start throws but that start, which is
+  // undone: a viewer counted with no thread would keep its slot and its
+  // connection for the server's life.
   Viewer& viewer = viewers.emplace_back();
   viewer.fd = std::move(fd);
-  viewer.name = name;
+  viewer.name = std::move(name);
   {
     const std::lock_guard<std::mutex> lock(mutex);
-    viewer.cursor = log.join();
     ++live;
     serving = live;
   }
-  log_at(core::LogLevel::Info, std::string(kServer) + ": viewer " + name +
-                                   " joined, " + std::to_string(serving) +
-                                   " of " +
-                                   std::to_string(options.max_viewers));
+  try {
+    log_at(core::LogLevel::Info, std::string(kServer) + ": viewer " +
+                                     viewer.name + " joined, " +
+                                     std::to_string(serving) + " of " +
+                                     std::to_string(options.max_viewers));
+  } catch (...) {
+  }
   try {
     viewer.thread = std::thread([this, &viewer] { serve(viewer); });
   } catch (...) {
@@ -208,6 +212,9 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
   const int fd = viewer.fd.get();
   detail::Chunk chunk = session_chunk;  // the chunk under way; null between
   std::size_t sent = 0;                 // its bytes sent
+  // Its place in the log, which it enters after the session chunk at the
+  // GOP's key: the log keeps every record since.
+  detail::GopLog::Cursor cursor;
   // When the viewer last took a byte, or its socket could take one.
   Clock::time_point taking = Clock::now();
   std::uint8_t drain[kDrainBytes];
@@ -236,7 +243,7 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
     if (!chunk) {
       // A chunk boundary: the next chunk, from a newer key if one has come.
       std::unique_lock<std::mutex> lock(mutex);
-      chunk = log.next(&viewer.cursor);
+      chunk = log.next(&cursor);
       if (!chunk) {
         wake.wait_for(lock, detail::kPollSlice);
         continue;

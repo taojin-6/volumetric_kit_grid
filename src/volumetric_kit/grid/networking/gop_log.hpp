@@ -25,7 +25,8 @@ using Chunk = std::shared_ptr<const std::vector<std::uint8_t>>;
 class GopLog {
  public:
   // A viewer's place: the GOP it is in, and the index of the next chunk of it
-  // to hand out.
+  // to hand out. A new viewer's, {}, is in no GOP: it starts at the key of the
+  // GOP there is at its first chunk, or of the next.
   struct Cursor {
     std::uint64_t gop = 0;
     std::size_t next = 0;
@@ -45,10 +46,6 @@ class GopLog {
   // Break the GOP, dropping its chunks: what a record that could not be
   // copied leaves, as it is lost.
   void break_gop() noexcept;
-
-  // Where a viewer joining now starts: the GOP's key, or before any key (or
-  // in a broken GOP) the next key.
-  Cursor join() const noexcept;
 
   // The next chunk for the viewer at `cursor`, which it moves on: from the
   // key of a newer GOP than the cursor's, else the GOP's next; null when the

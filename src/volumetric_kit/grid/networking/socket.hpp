@@ -12,7 +12,7 @@
 // on EINTR: an application's signal handler, as fuse_orbbec's for Ctrl+C,
 // interrupts poll, which is never restarted.
 
-#include <sys/socket.h>
+#include <netinet/in.h>
 
 #include <chrono>
 #include <cstddef>
@@ -36,24 +36,25 @@ inline constexpr int kSendLowWater = 128 << 10;
 // it: what a reader that falls behind can hide from the sender's drop rule.
 inline constexpr int kReceiveBuffer = 256 << 10;
 
-// A socket address of any family, as a lookup returns it.
+// An IPv4 socket address. A StreamServer listens on IPv4 alone, so a client
+// tries no other family: an IPv6 address could only be refused, or stall a
+// connect where IPv6 is broken.
 struct Address {
-  sockaddr_storage storage{};
-  socklen_t size = 0;
+  sockaddr_in in{};
 };
 
 // `host`, a numeric IPv4 address ("192.168.21.217"), with `port`; false for
 // anything else.
 bool parse_ipv4(const std::string& host, std::uint16_t port, Address* out);
 
-// Every address `host` resolves to for TCP (getaddrinfo, any family), with
-// `port`. Blocks for as long as the resolver takes. NotFound for a name that
-// does not resolve; IoError for a lookup that fails otherwise.
+// Every IPv4 address `host` resolves to for TCP (getaddrinfo), with `port`.
+// Blocks for as long as the resolver takes. NotFound for a name that does not
+// resolve; IoError for a lookup that fails otherwise.
 core::Result<std::vector<Address>> resolve(std::string_view api,
                                            const std::string& host,
                                            std::uint16_t port);
 
-// "a.b.c.d:port", or "[v6]:port".
+// "a.b.c.d:port".
 std::string to_string(const Address& address);
 
 // A socket listening on `address` (SO_REUSEADDR, so a restarted sender takes
@@ -70,8 +71,8 @@ core::Result<std::uint16_t> bound_port(std::string_view api, int fd);
 core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
                                          Address* peer);
 
-// A socket for `address`'s family, its receive buffer kReceiveBuffer,
-// connecting to `address` without waiting: `*connected` says whether it
+// A socket, its receive buffer kReceiveBuffer, connecting to `address`
+// without waiting: `*connected` says whether it
 // already has, else poll it writable and call finish_connect.
 core::Result<core::UniqueFd> start_connect(std::string_view api,
                                            const Address& address,

@@ -214,9 +214,7 @@ int idle_case() {
   return 0;
 }
 
-// localhost reaches a server on 127.0.0.1, through the lookup's thread; an
-// address the server is not on (::1, where localhost names it) is refused and
-// the next is tried.
+// localhost reaches a server on 127.0.0.1, through the lookup's thread.
 int localhost_case() {
   auto server = net::serve(net::geometry_session());
   CHECK(server != nullptr);

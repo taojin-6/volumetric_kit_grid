@@ -39,8 +39,6 @@ void GopLog::break_gop() noexcept {
   open_ = false;
 }
 
-GopLog::Cursor GopLog::join() const noexcept { return {gop_, 0}; }
-
 Chunk GopLog::next(Cursor* cursor) const noexcept {
   if (cursor->gop != gop_) *cursor = {gop_, 0};
   if (cursor->next >= chunks_.size()) return nullptr;

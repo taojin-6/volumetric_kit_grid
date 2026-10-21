@@ -9,7 +9,7 @@
 // Apple); a send to a closed peer failing rather than raising SIGPIPE; a
 // wait interrupted by a signal going on to its end; the end and an empty
 // receive told apart; numeric IPv4 parsed, anything else not; and localhost
-// resolved.
+// resolved to IPv4 alone.
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -209,16 +209,14 @@ int addresses_case() {
   for (const char* host : {"", "localhost", "1.2.3", "::1", "256.1.1.1"}) {
     CHECK(!detail::parse_ipv4(host, 1, &a));
   }
+  // IPv4 alone, though localhost names ::1 too.
   const vkc::Result<std::vector<detail::Address>> found =
       detail::resolve("test", "localhost", 9);
   CHECK(found.ok() && !found->empty());
-  bool ipv4 = false;
   for (const detail::Address& address : *found) {
-    const std::string name = detail::to_string(address);
-    CHECK(name.size() > 2 && name.substr(name.size() - 2) == ":9");
-    ipv4 = ipv4 || name == "127.0.0.1:9";
+    CHECK(address.in.sin_family == AF_INET);
+    CHECK(detail::to_string(address) == "127.0.0.1:9");
   }
-  CHECK(ipv4);
   // A port in use is refused, though SO_REUSEADDR is set.
   Connected c;
   CHECK(connect_pair(&c) == 0);
