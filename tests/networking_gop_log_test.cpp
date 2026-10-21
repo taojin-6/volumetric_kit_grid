@@ -208,7 +208,8 @@ int never_without_key_case() {
         log.break_gop();
         ++seq;  // the record lost
       } else if (what < 36 && viewers.size() < 6) {
-        viewers.push_back({log.join()});
+        viewers.emplace_back();
+        viewers.back().cursor = log.join();
       } else if (!viewers.empty()) {
         Viewer& v = viewers[std::uniform_int_distribution<std::size_t>(
             0, viewers.size() - 1)(rng)];

@@ -79,11 +79,20 @@ core::Result<core::UniqueFd> new_socket(std::string_view api, int family) {
   return fd;
 }
 
+// The family's own address, copied out of the storage rather than read
+// through a cast, which strict aliasing forbids.
+template <typename In>
+In as(const sockaddr_storage& storage) {
+  In in{};
+  std::memcpy(&in, &storage, sizeof in);
+  return in;
+}
+
 std::uint16_t port_of(const sockaddr_storage& storage) {
   if (storage.ss_family == AF_INET6) {
-    return ntohs(reinterpret_cast<const sockaddr_in6&>(storage).sin6_port);
+    return ntohs(as<sockaddr_in6>(storage).sin6_port);
   }
-  return ntohs(reinterpret_cast<const sockaddr_in&>(storage).sin_port);
+  return ntohs(as<sockaddr_in>(storage).sin_port);
 }
 
 }  // namespace
@@ -140,12 +149,12 @@ std::string to_string(const Address& address) {
   char text[INET6_ADDRSTRLEN] = {};
   const sockaddr_storage& s = address.storage;
   if (s.ss_family == AF_INET6) {
-    ::inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6&>(s).sin6_addr,
-                text, sizeof text);
+    const sockaddr_in6 in6 = as<sockaddr_in6>(s);
+    ::inet_ntop(AF_INET6, &in6.sin6_addr, text, sizeof text);
     return "[" + std::string(text) + "]:" + std::to_string(port_of(s));
   }
-  ::inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in&>(s).sin_addr, text,
-              sizeof text);
+  const sockaddr_in in = as<sockaddr_in>(s);
+  ::inet_ntop(AF_INET, &in.sin_addr, text, sizeof text);
   return std::string(text) + ":" + std::to_string(port_of(s));
 }
 
