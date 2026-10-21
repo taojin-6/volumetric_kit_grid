@@ -875,6 +875,7 @@ int teardown_case() {
   return 0;
 }
 
+#ifndef VR_TEST_SANITIZED
 // The process's address space, in bytes, or 0 when it cannot be read.
 std::uint64_t address_space() {
 #ifdef __APPLE__
@@ -893,6 +894,7 @@ std::uint64_t address_space() {
   return pages * static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
 #endif
 }
+#endif
 
 // The threads of viewers that ended are joined as they go, not when the
 // server does: after 300 viewers join and leave one by one, the address
