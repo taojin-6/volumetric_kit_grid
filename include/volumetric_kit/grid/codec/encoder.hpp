@@ -66,11 +66,9 @@ struct VR_CODEC_API EncoderConfig {
   /// - only the blocks holding a corner of a cell whose 8 voxels, across
   ///   block faces too, are observed and not cut, and whose sign changes or
   ///   that has a corner within one voxel of zero;
-  /// - each of their voxels as observed, but the cut: every corner farther
-  ///   than `sqrt(3)` voxels from zero of a cell whose 8 voxels are observed
-  ///   and whose sign changes. No crossing of a distance field has one, so
-  ///   the cut removes sign errors alone, such as the sheets a mesh's
-  ///   closest-face sign leaves past a hole's rim or a sharp edge.
+  /// - each of their observed voxels as observed, but the cut: every corner
+  ///   farther than `sqrt(3)` voxels from zero of a cell whose 8 voxels are
+  ///   observed and whose sign changes.
   ///
   /// Every voxel of those blocks lies within @ref kTrueSdfBandVoxels voxels
   /// of the zero level, so a grid observed that far out codes every mask as
@@ -108,7 +106,8 @@ struct VR_CODEC_API EncoderConfig {
 /// 2026-09-27 format). A block with **no** observed voxel is left out -- the
 /// mesher uses nothing from it, and a fused grid allocates a whole truncation
 /// band, much of which is never integrated -- so a decoded grid can hold
-/// fewer blocks than the one encoded, and the same surface.
+/// fewer blocks than the one encoded, and the same surface (with
+/// @ref EncoderConfig::true_sdf, the surface less its cuts).
 ///
 /// The blocks are coded in (z, y, x) order, whatever order the hash table
 /// holds them in, so the same content always makes the same bytes on the same
