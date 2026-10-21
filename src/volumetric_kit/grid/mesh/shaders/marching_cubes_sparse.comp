@@ -84,7 +84,7 @@ layout(set = 0, binding = 0, scalar) readonly buffer Tables {
 };
 // The compacted active blocks -- one WORKGROUP per block, so the 2x2x2
 // neighbourhood can be resolved once into shared memory and amortised over every
-// voxel of the block (see s_neighbour in marching_cubes_sparse_common.glsl).
+// voxel of the block (see s_neighbour in block_neighbourhood.glsl).
 layout(set = 0, binding = 1, scalar) readonly buffer Active {
   BlockIndex active_blocks[];
 };
@@ -152,8 +152,8 @@ layout(push_constant, scalar) uniform PushConstants {
 // DrawCommand bindings declared above.
 #include "marching_cubes_common.glsl"
 
-// localIndex / mcLocalBase / s_neighbour / mcResolveNeighbourhood /
-// mcCornerStorage / mcGather / mcCellSigns -- everything this kernel and the
+// vrLocalIndex / vrLocalBase / s_neighbour / vrResolveNeighbourhood /
+// vrCornerStorage / mcGather / mcCellSigns -- everything this kernel and the
 // sharing one do identically.
 #include "marching_cubes_sparse_common.glsl"
 
@@ -273,7 +273,8 @@ void main() {
     s_block_base = 0u;
     s_cursor = 0u;
   }
-  mcResolveNeighbourhood(block, tid);
+  vrResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
+                         pc.bucket_size, pc.max_chain);
   barrier();
 
   // PHASE ONE -- count, and cache each cell's TRIANGLE COUNT for phase three.
@@ -308,7 +309,7 @@ void main() {
   uint mine = 0u;
   uint cache = 0u;  // this invocation's first kCachedSlots counts, one per byte
   for (uint local = tid; local < vpb; local += group_threads) {
-    int n = mcCellTriangleCount(mcCellSigns(bs, mcLocalBase(local, bs)));
+    int n = mcCellTriangleCount(mcCellSigns(bs, vrLocalBase(local, bs)));
     if (n != 0) {
       uint slot = mcCacheSlot(local, tid, group_threads);
       if (slot < kCachedSlots) {
@@ -359,7 +360,7 @@ void main() {
     if (slot < kCachedSlots && ((cache >> (slot * 8u)) & 0xFFu) == 0u) {
       continue;
     }
-    ivec3 base = mcLocalBase(local, bs);
+    ivec3 base = vrLocalBase(local, bs);
     float sdf[8];
     vec3 corner_color[8];
     int cube_index;
