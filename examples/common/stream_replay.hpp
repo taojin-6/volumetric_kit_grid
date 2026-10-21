@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 
@@ -33,57 +34,62 @@ class ReplayLoop {
   ///        the reader finds damaged is left out.
   /// @return The loop; `InvalidArgument` for a track the session lacks;
   ///         `NotFound` for a track with no undamaged key; the reader's
-  ///         `IoError` or `OutOfMemory`.
+  ///         `IoError`; `OutOfMemory`, the reader's or the loop's own.
   static vkc::Result<ReplayLoop> create(const vr::stream::StreamReader& reader,
                                         std::uint16_t track = 0) {
-    VKC_ASSIGN(vr::stream::Position pos, reader.key(track, 0));
-    ReplayLoop loop;
-    for (;;) {
-      vr::stream::Record record;
-      const vkc::Result<bool> more = reader.next(&pos, &record);
-      if (!more.ok()) {
-        // Only damage leaves pos past it; anything else is the loop's
-        // failure, as an allocation's, which may leave pos where it was.
-        const vkc::Status::Code code = more.status().domain();
-        if (code != vkc::Status::Code::InvalidArgument &&
-            code != vkc::Status::Code::Unsupported) {
-          return more.status();
+    try {
+      VKC_ASSIGN(vr::stream::Position pos, reader.key(track, 0));
+      ReplayLoop loop;
+      for (;;) {
+        vr::stream::Record record;
+        const vkc::Result<bool> more = reader.next(&pos, &record);
+        if (!more.ok()) {
+          // Only damage leaves pos past it; anything else is the loop's
+          // failure, as an allocation's, which may leave pos where it was.
+          const vkc::Status::Code code = more.status().domain();
+          if (code != vkc::Status::Code::InvalidArgument &&
+              code != vkc::Status::Code::Unsupported) {
+            return more.status();
+          }
+          continue;  // damage: pos is past it
         }
-        continue;  // damage: pos is past it
+        if (!*more) break;
+        // From a key read whole: what follows a damaged one lacks its key.
+        if (record.info.track == track &&
+            (record.info.key || !loop.records_.empty())) {
+          loop.records_.push_back(record);
+        }
       }
-      if (!*more) break;
-      // From a key read whole: what follows a damaged one lacks its key.
-      if (record.info.track == track &&
-          (record.info.key || !loop.records_.empty())) {
-        loop.records_.push_back(record);
+      if (loop.records_.empty()) {
+        return vkc::Status::not_found("ReplayLoop: every key of track " +
+                                      std::to_string(track) + " is damaged");
       }
+      std::uint64_t least = loop.records_.front().info.pts_ns;
+      std::uint64_t most = least;
+      for (const vr::stream::Record& r : loop.records_) {
+        least = std::min(least, r.info.pts_ns);
+        most = std::max(most, r.info.pts_ns);
+      }
+      // One mean step past the span; with one record, or all at one pts, the
+      // track's nominal rate, else 30 a second.
+      std::uint64_t step = 0;
+      if (loop.records_.size() > 1) {
+        step = (most - least) / (loop.records_.size() - 1);
+      }
+      if (step == 0) {
+        const vr::stream::Rate rate = reader.session().tracks[track].rate;
+        step = rate.num > 0 ? std::uint64_t{1'000'000'000} * rate.den / rate.num
+                            : 33'333'333;
+      }
+      loop.first_pts_ = least;
+      loop.pass_ns_ = most - least + step;
+      loop.pass_seqs_ =
+          loop.records_.back().info.seq - loop.records_.front().info.seq + 1;
+      return loop;
+    } catch (...) {
+      return vkc::exception_status("ReplayLoop",
+                                   vkc::Status::Code::OutOfMemory);
     }
-    if (loop.records_.empty()) {
-      return vkc::Status::not_found("ReplayLoop: every key of track " +
-                                    std::to_string(track) + " is damaged");
-    }
-    std::uint64_t least = loop.records_.front().info.pts_ns;
-    std::uint64_t most = least;
-    for (const vr::stream::Record& r : loop.records_) {
-      least = std::min(least, r.info.pts_ns);
-      most = std::max(most, r.info.pts_ns);
-    }
-    // One mean step past the span; with one record, or all at one pts, the
-    // track's nominal rate, else 30 a second.
-    std::uint64_t step = 0;
-    if (loop.records_.size() > 1) {
-      step = (most - least) / (loop.records_.size() - 1);
-    }
-    if (step == 0) {
-      const vr::stream::Rate rate = reader.session().tracks[track].rate;
-      step = rate.num > 0 ? std::uint64_t{1'000'000'000} * rate.den / rate.num
-                          : 33'333'333;
-    }
-    loop.first_pts_ = least;
-    loop.pass_ns_ = most - least + step;
-    loop.pass_seqs_ =
-        loop.records_.back().info.seq - loop.records_.front().info.seq + 1;
-    return loop;
   }
 
   /// @return The records each pass replays, in file order.

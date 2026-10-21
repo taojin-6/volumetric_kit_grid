@@ -5,11 +5,12 @@
 // .vrst: the records from the track's first key; pass 0 unchanged; across
 // passes seq rising and key pts never falling, so the writer's rules take
 // three passes in a row; dues following the pts gaps, a pass one mean step
-// after the last; a lone record paced by the track's rate; a record with a
-// damaged header or a flag this version does not know left out, and an
-// allocation failure reading past the damage refused; a damaged first key
-// left out with the P-frames after it; and a track with no key, no undamaged
-// key, or none at all, refused. Host-only.
+// after the last; a lone record paced by the track's rate, and the loop's
+// own allocation failure refused; a record with a damaged header or a flag
+// this version does not know left out, and an allocation failure reading
+// past the damage refused; a damaged first key left out with the P-frames
+// after it; and a track with no key, no undamaged key, or none at all,
+// refused. Host-only.
 
 #include <chrono>
 #include <cstdint>
@@ -128,17 +129,31 @@ int loop_case(const std::string& dir) {
   return 0;
 }
 
-// One record: a pass is the track's frame period.
+// One record: a pass is the track's frame period. The loop's own last
+// allocation, its records' growth, failed is OutOfMemory.
 int lone_record_case(const std::string& dir) {
   const std::string path = dir + "/lone.vrst";
   CHECK(write(path, {vrst::info(0, true, 500, 4)}));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
+  auto& failure = vr_test::allocation_failure;
+  failure = {};
+  failure.measure = true;
   vkc::Result<vr_example::ReplayLoop> loop =
       vr_example::ReplayLoop::create(*reader);
+  failure.measure = false;
   CHECK(loop.ok());
   const stream::RecordInfo next = loop->restamp(loop->records()[0].info, 1);
   CHECK(next.seq == 5 && next.pts_ns == 500 + 1'000'000'000 / 30);
+
+  CHECK(failure.bytes == sizeof(stream::Record));
+  failure.site = failure.measured_site;
+  failure.armed = true;
+  const Code refused =
+      vr_example::ReplayLoop::create(*reader).status().domain();
+  const bool injected = failure.injected;
+  failure = {};
+  CHECK(injected && refused == Code::OutOfMemory);
   return 0;
 }
 
