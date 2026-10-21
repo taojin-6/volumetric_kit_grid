@@ -5,9 +5,9 @@
 // viewer's bytes are StreamWriter's file for the same session and records,
 // less its footer; a client reads the session, then every record's info,
 // payload and file offset; a viewer joining gets the GOP from its key, and
-// before any key nothing; a viewer that does not read while 3 GOPs of 1 MiB
-// records are published gets whole chunks, a key after every jump and the
-// newest GOP whole, with every publish back at once; a GOP past
+// before any key nothing; a viewer that stops reading in the first key while
+// 3 GOPs of 1 MiB records are published gets that key whole, then the newest
+// GOP whole, with every publish back at once; a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
 // is closed after stall_limit, never when it is milliseconds::max(), and on
 // Linux one that takes too few for its socket to poll writable within it is
@@ -295,48 +295,63 @@ int join_case() {
 // ---------------------------------------------------------
 
 // A viewer that stops reading while 3 GOPs of 1 MiB records are published,
-// then drains: whole chunks (each passes its CRCs), seq rising, a key after
-// every jump, the newest GOP whole and some of the stream skipped; every
-// publish returned at once.
+// then drains, gets the first key whole, then the newest GOP whole, each
+// chunk passing its CRCs; every publish returned at once. The raw viewer
+// reads the first key's header before the rest is published, so the server
+// is sending it then, and under the low-water mark the kernel holds well
+// under 1 MiB of a viewer that does not read: the key is under way, however
+// late its thread ran, until the viewer drains.
 int newest_key_wins_case() {
   constexpr std::uint64_t kGop = 4;
   constexpr std::uint64_t kRecords = 3 * kGop;
+  constexpr std::size_t kSize = 1 << 20;
   const stream::Session session = net::geometry_session();
   auto server = net::serve(session);
   CHECK(server != nullptr);
-  auto client = net::connect(server->port());
-  CHECK(client != nullptr);
-  CHECK(net::wait_session(*client));
-  for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
-    const Bytes payload = net::record_payload(seq, 1 << 20);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port(), 4096);
+  CHECK(viewer.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  const auto publish = [&](std::uint64_t seq) {
+    const Bytes payload = net::record_payload(seq, kSize);
     const Clock::time_point start = Clock::now();
-    CHECK(server
-              ->publish(net::record_info(seq, seq % kGop == 0), payload.data(),
-                        payload.size())
-              .ok());
-    CHECK(Clock::now() - start < 1s);
-  }
+    return server
+               ->publish(net::record_info(seq, seq % kGop == 0), payload.data(),
+                         payload.size())
+               .ok() &&
+           Clock::now() - start < 1s;
+  };
+  CHECK(publish(0));
+  net::read_upto(viewer.get(), header + 56, 5s, &wire);  // the key's header
+  CHECK(wire.size() == header + 56);
+  for (std::uint64_t seq = 1; seq < kRecords; ++seq) CHECK(publish(seq));
+
+  stream::ChunkParser parser;
+  CHECK(parser.feed(wire.data(), wire.size()).ok());
   std::vector<stream::RecordInfo> got;
-  for (Got g; got.empty() || got.back().seq + 1 < kRecords;) {
-    CHECK(net::next_within(*client, &g));
-    CHECK(g.payload == net::record_payload(g.record.info.seq, 1 << 20));
-    got.push_back(g.record.info);
+  const Clock::time_point end = Clock::now() + 10s;
+  while ((got.empty() || got.back().seq + 1 < kRecords) && Clock::now() < end) {
+    stream::Record record;
+    Bytes payload;
+    const vkc::Result<bool> r = parser.next(&record, &payload);
+    CHECK(r.ok());
+    if (*r) {
+      CHECK(payload == net::record_payload(record.info.seq, kSize));
+      got.push_back(record.info);
+      continue;
+    }
+    Bytes more;
+    net::read_upto(viewer.get(), kSize, 100ms, &more);
+    CHECK(parser.feed(more.data(), more.size()).ok());
   }
-  CHECK(got.front().seq == 0 && got.front().key);
-  for (std::size_t i = 1; i < got.size(); ++i) {
-    CHECK(got[i].seq > got[i - 1].seq);
-    if (got[i].seq != got[i - 1].seq + 1) CHECK(got[i].key);
-  }
-  CHECK(got.size() >= kGop);
-  for (std::uint64_t k = 0; k < kGop; ++k) {
-    CHECK(got[got.size() - kGop + k].seq == kRecords - kGop + k);
-  }
-  // Under the low-water mark the kernel holds well under 1 MiB of a viewer
-  // that does not read, so the first key was still under way when the rest
-  // came: it is finished, then the newest GOP follows.
   CHECK(got.size() == 1 + kGop);
-  std::printf("newest key wins: got %zu of %llu records\n", got.size(),
-              static_cast<unsigned long long>(kRecords));
+  CHECK(got[0].seq == 0 && got[0].key);
+  for (std::uint64_t k = 0; k < kGop; ++k) {
+    CHECK(got[1 + k].seq == kRecords - kGop + k);
+    CHECK(got[1 + k].key == (k == 0));
+  }
   return 0;
 }
 
