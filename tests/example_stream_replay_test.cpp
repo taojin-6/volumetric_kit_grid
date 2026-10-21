@@ -5,7 +5,9 @@
 // .vrst: the records from the track's first key; pass 0 unchanged; across
 // passes seq rising and key pts never falling, so the writer's rules take
 // three passes in a row; dues following the pts gaps, a pass one mean step
-// after the last; a lone record paced by the track's rate; and a track with no
+// after the last; a lone record paced by the track's rate; a record with a
+// damaged header or a flag this version does not know left out, and an
+// allocation failure reading past the damage refused; and a track with no
 // key, or none at all, refused. Host-only.
 
 #include <chrono>
@@ -17,6 +19,7 @@
 #include "scratch_dir.hpp"
 #include "stream_files.hpp"
 #include "stream_replay.hpp"
+#include "test_allocation_failure.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
@@ -138,6 +141,62 @@ int lone_record_case(const std::string& dir) {
   return 0;
 }
 
+// Seq 2's header fails its CRC (InvalidArgument) and seq 4 sets flag bit 1
+// (Unsupported): both are left out. An allocation failure reading past the
+// damage, here its message's, is the loop's failure, not more damage.
+int damage_case(const std::string& dir) {
+  const std::string path = dir + "/damaged.vrst";
+  std::vector<stream::RecordInfo> infos;
+  for (std::uint64_t seq = 0; seq < 5; ++seq) {
+    infos.push_back(vrst::info(0, seq % 3 == 0, seq * kStep, seq));
+  }
+  CHECK(write(path, infos));
+  vrst::Bytes file = vr_test::read_bytes(path);
+  std::vector<vrst::ChunkAt> records;
+  for (const vrst::ChunkAt& c : vrst::chunks(file)) {
+    if (c.tag == "RECD") records.push_back(c);
+  }
+  CHECK(records.size() == infos.size());
+  const std::uint64_t damaged = records[2].offset;
+  file = vrst::flipped(file, damaged + 26, 0);
+  // The flags, then the header's CRC over the bytes before it.
+  const vrst::ChunkAt& flagged = records[4];
+  file[flagged.offset + 22] |= 2;
+  const std::uint64_t crc_at = flagged.offset + flagged.header_bytes - 4;
+  const std::uint32_t crc =
+      vrst::crc32(file.data() + flagged.offset, flagged.header_bytes - 4);
+  for (int i = 0; i < 4; ++i) {
+    file[crc_at + i] = static_cast<std::uint8_t>(crc >> (8 * i));
+  }
+  CHECK(vrst::write_bytes(path, file));
+  const auto reader = reader_of(path);
+  CHECK(reader != nullptr);
+  vkc::Result<vr_example::ReplayLoop> loop =
+      vr_example::ReplayLoop::create(*reader);
+  CHECK(loop.ok() && loop->records().size() == 3);
+  CHECK(loop->records()[1].info.seq == 1 && loop->records()[2].info.seq == 3);
+
+  // As stream_oom_test does: measure the read at the damage, then fail its
+  // last allocation at the same site.
+  auto& failure = vr_test::allocation_failure;
+  failure = {};
+  failure.measure = true;
+  stream::Position pos{damaged};
+  stream::Record record;
+  const Code measured = reader->next(&pos, &record).status().domain();
+  failure.measure = false;
+  CHECK(measured == Code::InvalidArgument);
+  CHECK(failure.bytes != 0 && failure.measured_site != nullptr);
+  failure.site = failure.measured_site;
+  failure.armed = true;
+  const Code refused =
+      vr_example::ReplayLoop::create(*reader).status().domain();
+  const bool injected = failure.injected;
+  failure = {};
+  CHECK(injected && refused == Code::OutOfMemory);
+  return 0;
+}
+
 int refusals_case(const std::string& dir) {
   const std::string path = dir + "/no_key.vrst";
   CHECK(write(path, {vrst::info(0, false, 0, 0), vrst::info(0, false, 1, 1)}));
@@ -157,6 +216,7 @@ int main() {
   const std::string dir = scratch.path.string();
   if (loop_case(dir) != 0) return 1;
   if (lone_record_case(dir) != 0) return 1;
+  if (damage_case(dir) != 0) return 1;
   if (refusals_case(dir) != 0) return 1;
   std::puts("stream replay: OK");
   return 0;
