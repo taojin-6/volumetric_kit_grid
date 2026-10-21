@@ -188,14 +188,15 @@ inline std::unique_ptr<networking::StreamClient> connect(
 
 // The reason in `message`, an error of a client of 127.0.0.1:`port`, which
 // reads "StreamClient: 127.0.0.1:<port>: <reason>" with the address in it
-// once (stream_client.hpp); the whole message when it does not.
+// once (stream_client.hpp); when it does not, the message marked so that it
+// matches no reason.
 inline std::string client_reason(const std::string& message,
                                  std::uint16_t port) {
   const std::string address = "127.0.0.1:" + std::to_string(port);
   const std::string prefix = "StreamClient: " + address + ": ";
   if (message.compare(0, prefix.size(), prefix) != 0 ||
       message.find(address, prefix.size()) != std::string::npos) {
-    return message;
+    return "(not a client's) " + message;
   }
   return message.substr(prefix.size());
 }

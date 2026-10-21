@@ -154,10 +154,27 @@ int huge_header_case() {
   return 0;
 }
 
+// A corrupt body is InvalidArgument; so is one after a whole record, sent at
+// once, which is read first, the failure found once the record is taken.
 int corrupt_body_case() {
   Bytes record = vrst::record(0, 1, 0, 0, stream::kNoSet, vrst::pattern(64, 1));
   record[56 + 10] ^= 0x20;
   CHECK(error_from(concat({session_bytes(), record})) == Code::InvalidArgument);
+
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  const Bytes whole =
+      vrst::record(0, 1, 0, 0, stream::kNoSet, vrst::pattern(64, 2));
+  CHECK(net::send_bytes(sender.peer.get(),
+                        concat({session_bytes(), whole, record})));
+  Got got;
+  vkc::Result<bool> r = settle(*client, &got);
+  CHECK(r.ok() && *r && got.record.info.seq == 0);
+  r = settle(*client, &got);
+  CHECK(!r.ok() && r.status().domain() == Code::InvalidArgument);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port)
+            .rfind("ChunkParser: ", 0) == 0);
   return 0;
 }
 
