@@ -159,7 +159,7 @@ core::Status StreamReader::scan() {
       continue;
     }
     if (c.body_bytes > file_size_ - pos - c.header_bytes) break;  // torn
-    if (c.tag == detail::kRecordTag && (c.flags & ~detail::kKeyFlag) == 0) {
+    if (detail::known_record(c)) {
       detail::count_record(stats_[c.record.track], c.record, c.body_bytes);
       if (c.record.key) {
         std::vector<KeyPoint>& keys = keys_[c.record.track];
@@ -282,7 +282,7 @@ core::Result<bool> StreamReader::next(Position* pos, Record* record) const {
       pos->offset =
           at + c.header_bytes + c.body_bytes + detail::padding(c.body_bytes);
       if (c.tag != detail::kRecordTag) continue;
-      if ((c.flags & ~detail::kKeyFlag) != 0) {
+      if (!detail::known_record(c)) {
         return core::Status::unsupported(
             std::string(kApi) + ": " + path_ + ": the record at " +
             std::to_string(at) + " sets flags " + std::to_string(c.flags) +

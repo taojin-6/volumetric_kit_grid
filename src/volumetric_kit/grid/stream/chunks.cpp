@@ -91,21 +91,16 @@ core::Result<ChunkEncoder::RecordFraming> ChunkEncoder::frame(
 }
 
 core::Status ChunkParser::feed(const std::uint8_t* data, std::size_t size) {
+  VKC_CHECK(data != nullptr || size == 0, "ChunkParser::feed takes bytes");
   try {
     if (!failure_.ok()) return failure_;
-    // What was passed goes, and so does any padding still to come at the
-    // start of these bytes.
+    // What was passed goes.
     const auto passed = static_cast<std::size_t>(
         std::min<std::uint64_t>(next_ - base_, buffer_.size()));
     buffer_.erase(buffer_.begin(),
                   buffer_.begin() + static_cast<std::ptrdiff_t>(passed));
     base_ += passed;
-    const auto padding =
-        static_cast<std::size_t>(std::min<std::uint64_t>(next_ - base_, size));
-    base_ += padding;
-    if (size > padding) {
-      buffer_.insert(buffer_.end(), data + padding, data + size);
-    }
+    buffer_.insert(buffer_.end(), data, data + size);
     VKC_ASSIGN(ready_, advance());
     return {};
   } catch (...) {
@@ -203,9 +198,7 @@ core::Result<bool> ChunkParser::advance() {
       return fail(
           core::Status::invalid_argument(where() + ": its body fails its CRC"));
     }
-    if (c.tag == detail::kRecordTag && (c.flags & ~detail::kKeyFlag) == 0) {
-      return true;
-    }
+    if (detail::known_record(c)) return true;
     // Another tag, or a record setting a flag this version does not know.
     next_ += h + c.body_bytes + detail::padding(c.body_bytes);
   }

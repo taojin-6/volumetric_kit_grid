@@ -5,9 +5,9 @@
 // encoder's bytes against the writer's file on 1 and 2 tracks; its refusals
 // against the writer's, messages included; the parser fed a writer's file,
 // finished or not, whole, a byte at a time and in pseudo-random pieces,
-// against the reader; each refusal at the byte that completes what it
-// refuses, bodies of 1 GiB before any of them arrives; the chunks it skips;
-// and a failure returned by every later call.
+// against the reader; the chunks it skips and a wider session header; each
+// refusal at the byte that completes what it refuses, bodies of 1 GiB before
+// any of them arrives; and a failure returned by every later call.
 
 #include <algorithm>
 #include <cstdint>
@@ -395,6 +395,25 @@ int parser_skips_case(const std::string& dir) {
   return 0;
 }
 
+// A session header wider than this version's, as a later one might write:
+// its trailing fields are ignored, and its body and the record after it are
+// found past its H, as the reader finds them.
+int parser_wider_session_case(const std::string& dir) {
+  Bytes fields = vrst::session_fields(0, 1, 0);
+  fields.resize(fields.size() + 8, 0xA5);  // H 64
+  Bytes bytes = vrst::chunk("VRST", fields, vrst::session_body(1));
+  CHECK(vrst::get(bytes, 4, 4) == 64);
+  const Bytes record = vrst::record(0, 1, 7, 0, 9, pattern(11, 1));
+  bytes.insert(bytes.end(), record.begin(), record.end());
+  const std::string path = dir + "/wider.vrst";
+  CHECK(vrst::write_bytes(path, bytes));
+  CHECK(parses_as_read(path, bytes) == 0);
+  const Parsed parsed = parse_whole(bytes);
+  CHECK(parsed.records.size() == 1 &&
+        parsed.records[0].offset == bytes.size() - record.size());
+  return 0;
+}
+
 // Each refusal comes from the feed of the byte that completes what it
 // refuses, `at` bytes in.
 struct Refusal {
@@ -449,6 +468,8 @@ int parser_refusals_case(const std::string&) {
       {"RECD H below 56", after(vrst::header("RECD", Bytes(24, 0), 0, 0)),
        g + 8, Code::InvalidArgument},
       {"INDX H below 40", after(vrst::header("INDX", Bytes(8, 0), 0, 0)), g + 8,
+       Code::InvalidArgument},
+      {"TAIL H below 40", after(vrst::header("TAIL", Bytes{}, 0, 0)), g + 8,
        Code::InvalidArgument},
       {"RECD header CRC", after(vrst::flipped(record, 30, 0)), g + 56,
        Code::InvalidArgument},
@@ -534,6 +555,7 @@ int main() {
   if (encoder_refusals_case(dir) != 0) return 1;
   if (parser_round_trip_case(dir) != 0) return 1;
   if (parser_skips_case(dir) != 0) return 1;
+  if (parser_wider_session_case(dir) != 0) return 1;
   if (parser_refusals_case(dir) != 0) return 1;
   if (parser_latch_case(dir) != 0) return 1;
   std::puts("stream chunks: OK");
