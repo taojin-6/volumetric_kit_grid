@@ -6,9 +6,9 @@
 // The stream tests' own .vrst bytes, built from the layout stream/session.hpp
 // states and not from the library: a bitwise CRC-32, chunks with any fields,
 // a footer index read and written, and the edits a test makes to a file. Also
-// what the tests share of the library: payloads, record fields and stats
-// compared, an open that says why it failed, and a reader's every record,
-// read in file order as a player would.
+// what the tests share of the library: payloads, sessions, record fields and
+// stats compared, an open that says why it failed, and a reader's every
+// record, read in file order as a player would.
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -276,6 +276,23 @@ inline bool same(const stream::TrackStats& a, const stream::TrackStats& b) {
   return a.records == b.records && a.keys == b.keys &&
          a.payload_bytes == b.payload_bytes && a.min_pts_ns == b.min_pts_ns &&
          a.max_pts_ns == b.max_pts_ns;
+}
+
+inline bool same(const stream::Track& a, const stream::Track& b) {
+  return a.kind == b.kind && a.clock == b.clock && a.rate.num == b.rate.num &&
+         a.rate.den == b.rate.den && a.width == b.width &&
+         a.height == b.height && a.sensor == b.sensor && a.params == b.params;
+}
+
+inline bool same(const stream::Session& a, const stream::Session& b) {
+  if (a.id != b.id || a.created_ns != b.created_ns || a.writer != b.writer ||
+      a.calibration != b.calibration || a.tracks.size() != b.tracks.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.tracks.size(); ++i) {
+    if (!same(a.tracks[i], b.tracks[i])) return false;
+  }
+  return true;
 }
 
 inline stream::RecordInfo info(std::uint16_t track, bool key, std::uint64_t pts,

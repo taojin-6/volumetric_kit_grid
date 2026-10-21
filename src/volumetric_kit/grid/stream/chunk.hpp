@@ -5,9 +5,10 @@
 
 // The .vrst chunks in code (stream/session.hpp holds the layout): the tags
 // and sizes, CRC-32, little-endian words, each chunk's encoding and decoding,
-// and reading a chunk header from the file, with the search past damage for
-// the next one.
+// the checks a chunk passes, on bytes in memory, and reading a chunk header
+// from the file, with the search past damage for the next one.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -98,7 +99,7 @@ core::Status encode_session(std::string_view api, const Session& session,
 // A `RECD` header for a payload of `size` bytes whose CRC is `body_crc`.
 void encode_record_header(const RecordInfo& info, std::uint64_t size,
                           std::uint32_t body_crc,
-                          std::uint8_t (&header)[kRecordHeaderBytes]);
+                          std::array<std::uint8_t, kRecordHeaderBytes>& header);
 
 // One key entry of the `INDX` body, appended to `entries`.
 void append_key_entry(std::vector<std::uint8_t>& entries, std::uint64_t offset,
@@ -151,6 +152,62 @@ struct Chunk {
   std::uint64_t keys = 0;          // INDX: K
   std::uint64_t index_offset = 0;  // TAIL
 };
+
+// --- Checks, on bytes in memory. ---------------------------------------------
+//
+// The file reader and ChunkParser (stream/chunks.hpp) both check a chunk with
+// these, each check on the bytes it needs: header_fits on its first 8, then
+// header_crc_ok and decode_chunk on its H. The session header, the first
+// chunk, has its own three, each naming `api` and `path` (the bytes' name: a
+// file's path) in its refusal.
+
+// The least H of a chunk tagged `tag` after the session header: its tag's
+// own, or 24 for a tag this version does not read (a `VRST` there too).
+std::uint32_t least_header_bytes(std::uint32_t tag);
+
+// Whether H = `h` is a header size, at least `least`, that fits in the
+// `available` bytes left.
+bool header_fits(std::uint32_t h, std::uint32_t least, std::uint64_t available);
+
+// Whether the `h` bytes of `header` pass their CRC, the last 4.
+bool header_crc_ok(const std::uint8_t* header, std::uint32_t h);
+
+// What the `h` header bytes at `header`, which passed the checks above, say,
+// into `out`: false, with `out` filled all the same, for a `RECD` of a track
+// not below `tracks`.
+bool decode_chunk(const std::uint8_t* header, std::uint32_t h,
+                  std::uint32_t tracks, Chunk* out);
+
+// Whether `c` is a `RECD` setting only the flags this version knows; one
+// setting another is skipped (stream/session.hpp).
+inline bool known_record(const Chunk& c) {
+  return c.tag == kRecordTag && (c.flags & ~kKeyFlag) == 0;
+}
+
+// The session header's H, from its first 8 bytes at `header`:
+// InvalidArgument unless they start with `VRST` and H is a header size of at
+// least 56 within `available`.
+core::Result<std::uint32_t> session_header_bytes(std::string_view api,
+                                                 std::string_view path,
+                                                 const std::uint8_t* header,
+                                                 std::uint64_t available);
+
+// The session header's B, from its `h` bytes at `header`: InvalidArgument
+// when they fail their CRC or B is above kMaxSessionBytes; Unsupported for a
+// version or flag this version does not know.
+core::Result<std::uint64_t> session_body_bytes(std::string_view api,
+                                               std::string_view path,
+                                               const std::uint8_t* header,
+                                               std::uint32_t h);
+
+// The session the header at `header` and its body, `size` bytes at `body`,
+// hold, into `session`: InvalidArgument when the body fails its CRC or does
+// not parse exactly.
+core::Status parse_session(std::string_view api, std::string_view path,
+                           const std::uint8_t* header, const std::uint8_t* body,
+                           std::uint64_t size, Session* session);
+
+// --- The file. ---------------------------------------------------------------
 
 // Read the chunk header at `offset`: `true`, with `out` filled, when it lies
 // inside the file and passes its range and CRC checks, and a known tag's

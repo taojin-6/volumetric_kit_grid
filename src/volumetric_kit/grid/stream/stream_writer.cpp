@@ -21,11 +21,11 @@ constexpr std::uint8_t kZeros[8] = {};
 }  // namespace
 
 StreamWriter::StreamWriter(core::UniqueFd fd, std::string path,
-                           std::uint64_t size, std::size_t tracks)
+                           ChunkEncoder encoder, std::size_t tracks)
     : fd_(std::move(fd)),
       path_(std::move(path)),
-      size_(size),
-      state_(tracks),
+      encoder_(std::move(encoder)),
+      size_(encoder_.session_chunk().size()),
       stats_(tracks) {}
 
 StreamWriter::~StreamWriter() = default;
@@ -36,10 +36,14 @@ core::Result<std::unique_ptr<StreamWriter>> StreamWriter::create(
   bool created = false;
   try {
     VKC_TRY(core::check_path(kApi, path));
-    std::vector<std::uint8_t> header;
-    VKC_TRY(detail::encode_session(kApi, session, &header));
+    core::Result<ChunkEncoder> encoder = ChunkEncoder::create(session);
+    if (!encoder.ok()) {
+      return std::move(encoder).status().with_context(std::string(kApi) + ": " +
+                                                      path);
+    }
     VKC_ASSIGN(core::UniqueFd fd, detail::create_new_file(kApi, path));
     created = true;
+    const std::vector<std::uint8_t>& header = encoder->session_chunk();
     const detail::Bytes part{header.data(), header.size()};
     core::Status written = detail::write_all(kApi, path, fd.get(), &part, 1);
     if (written.ok()) written = detail::flush_file(kApi, path, fd.get());
@@ -49,8 +53,9 @@ core::Result<std::unique_ptr<StreamWriter>> StreamWriter::create(
       return written;
     }
     detail::flush_directory_of(path);
-    return std::unique_ptr<StreamWriter>(new StreamWriter(
-        std::move(fd), path, header.size(), session.tracks.size()));
+    return std::unique_ptr<StreamWriter>(
+        new StreamWriter(std::move(fd), path, std::move(encoder).value(),
+                         session.tracks.size()));
   } catch (...) {
     core::Status failure =
         core::exception_status(kApi, core::Status::Code::IoError);
@@ -73,55 +78,33 @@ core::Status StreamWriter::append(const RecordInfo& info,
   constexpr std::string_view kApi = "StreamWriter::append";
   try {
     VKC_TRY(check_open(kApi));
-    const auto refuse = [&](const std::string& why) {
-      return core::Status::invalid_argument(std::string(kApi) + ": " + path_ +
-                                            ": " + why);
-    };
-    if (info.track >= state_.size()) {
-      return refuse("track " + std::to_string(info.track) +
-                    ", but the session has " + std::to_string(state_.size()));
-    }
-    if (data == nullptr && size != 0) {
-      return refuse("a null payload of " + std::to_string(size) + " bytes");
-    }
-    TrackState& state = state_[info.track];
-    if (state.any && info.seq <= state.last_seq) {
-      return refuse("track " + std::to_string(info.track) + "'s seq " +
-                    std::to_string(info.seq) + " does not follow its last, " +
-                    std::to_string(state.last_seq));
-    }
-    if (info.key && state.any_key && info.pts_ns < state.last_key_pts_ns) {
-      return refuse("track " + std::to_string(info.track) + "'s key pts " +
-                    std::to_string(info.pts_ns) +
-                    " is before its last key's, " +
-                    std::to_string(state.last_key_pts_ns));
-    }
-    // The index entry's room comes first, so a record once written is always
-    // indexed.
+    // The index entry's room comes first, before the encoder counts the
+    // record, so a refused allocation leaves the writer unchanged and a
+    // record once written is always indexed.
     if (info.key &&
         index_keys_.capacity() - index_keys_.size() < detail::kKeyEntryBytes) {
       index_keys_.reserve(std::max<std::size_t>(2 * index_keys_.capacity(),
                                                 64 * detail::kKeyEntryBytes));
     }
-    std::uint8_t header[detail::kRecordHeaderBytes];
-    detail::encode_record_header(info, size, detail::crc32(data, size), header);
-    const auto pad = static_cast<std::size_t>(detail::padding(size));
+    core::Result<ChunkEncoder::RecordFraming> framed =
+        encoder_.frame(info, data, size);
+    if (!framed.ok()) {
+      return std::move(framed).status().with_context(std::string(kApi) + ": " +
+                                                     path_);
+    }
+    const ChunkEncoder::RecordFraming& framing = *framed;
     const detail::Bytes parts[3] = {
-        {header, sizeof(header)}, {data, size}, {kZeros, pad}};
+        {framing.header.data(), framing.header.size()},
+        {data, size},
+        {kZeros, framing.padding}};
     core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 3);
     if (!written.ok()) {
       failure_ = std::move(written);
       return failure_;
     }
     const std::uint64_t offset = size_;
-    size_ += sizeof(header) + std::uint64_t{size} + pad;
-    state.any = true;
-    state.last_seq = info.seq;
-    if (info.key) {
-      state.any_key = true;
-      state.last_key_pts_ns = info.pts_ns;
-      detail::append_key_entry(index_keys_, offset, info);
-    }
+    size_ += framing.header.size() + std::uint64_t{size} + framing.padding;
+    if (info.key) detail::append_key_entry(index_keys_, offset, info);
     detail::count_record(stats_[info.track], info, size);
     return {};
   } catch (...) {

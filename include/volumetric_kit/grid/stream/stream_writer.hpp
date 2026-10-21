@@ -15,6 +15,7 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
+#include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/export.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 
@@ -22,7 +23,8 @@ namespace volumetric_kit::recon::stream {
 
 /// @brief Writes one `.vrst` file (stream/session.hpp): the session header,
 ///        then each record as it is appended, then on @ref finish the
-///        footer index.
+///        footer index. The chunks, and the rules a record follows, are
+///        @ref ChunkEncoder's.
 ///
 /// **Visible and recoverable while written.** The file appears at its path
 /// when @ref create makes it, and every @ref append is one `writev` with no
@@ -114,15 +116,7 @@ class VR_STREAM_API StreamWriter {
   std::uint64_t size() const noexcept;
 
  private:
-  // What the record rules check of a track's last records.
-  struct TrackState {
-    bool any = false;      // a record appended
-    bool any_key = false;  // a key appended
-    std::uint64_t last_seq = 0;
-    std::uint64_t last_key_pts_ns = 0;
-  };
-
-  StreamWriter(core::UniqueFd fd, std::string path, std::uint64_t size,
+  StreamWriter(core::UniqueFd fd, std::string path, ChunkEncoder encoder,
                std::size_t tracks);
 
   // The sticky failure, or the refusal of a call after `finish`.
@@ -130,8 +124,8 @@ class VR_STREAM_API StreamWriter {
 
   core::UniqueFd fd_;
   std::string path_;
+  ChunkEncoder encoder_;  // the session's chunk and the record rules
   std::uint64_t size_ = 0;
-  std::vector<TrackState> state_;  // by track
   std::vector<TrackStats> stats_;  // by track
   // The footer index's key entries, encoded as they are appended.
   std::vector<std::uint8_t> index_keys_;

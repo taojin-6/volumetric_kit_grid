@@ -81,23 +81,6 @@ bool append(stream::StreamWriter& w, const stream::RecordInfo& i,
   return w.append(i, payload.data(), payload.size()).ok();
 }
 
-bool same(const stream::Track& a, const stream::Track& b) {
-  return a.kind == b.kind && a.clock == b.clock && a.rate.num == b.rate.num &&
-         a.rate.den == b.rate.den && a.width == b.width &&
-         a.height == b.height && a.sensor == b.sensor && a.params == b.params;
-}
-
-bool same(const stream::Session& a, const stream::Session& b) {
-  if (a.id != b.id || a.created_ns != b.created_ns || a.writer != b.writer ||
-      a.calibration != b.calibration || a.tracks.size() != b.tracks.size()) {
-    return false;
-  }
-  for (std::size_t i = 0; i < a.tracks.size(); ++i) {
-    if (!same(a.tracks[i], b.tracks[i])) return false;
-  }
-  return true;
-}
-
 std::uint64_t file_size(const std::string& path) {
   struct stat info{};
   return ::stat(path.c_str(), &info) == 0
