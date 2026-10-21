@@ -37,6 +37,11 @@ ivec3 vrLocalBase(uint local, int bs) {
 // voxels_per_block cells.
 shared int s_neighbour[8];
 
+// s_neighbour's index of octant @p o, each component 0 or 1.
+int vrOctantIndex(ivec3 o) {
+  return o.x + 2 * o.y + 4 * o.z;
+}
+
 // Fill s_neighbour for the block at @p coord, whose voxel-array base is
 // @p self_ptr. Threads 0..7 each resolve one octant; octant 0 is this block,
 // already known. The caller must `barrier()` before any cell reads it.
@@ -84,13 +89,13 @@ void vrResolveNeighbourhood(ivec3 coord, int self_ptr, uint tid,
 // THE cross-block addressing, and one copy of it: the mesher's gathers and the
 // codec's surface passes resolve a corner through here, so the sign-only count
 // and the full gather cannot land on different voxels -- they must not, because
-// the count reserves the range the gather writes into -- and the codec keeps
-// exactly the blocks whose cells the mesher reads.
+// the count reserves the range the gather writes into -- and the codec
+// resolves corners exactly as the mesher does.
 bool vrCornerStorage(int bs, ivec3 c, out uint si) {
   si = 0u;
   ivec3 octant = c / bs;
   ivec3 lc = c - octant * bs;
-  int nptr = s_neighbour[octant.x + 2 * octant.y + 4 * octant.z];
+  int nptr = s_neighbour[vrOctantIndex(octant)];
   if (nptr < 0) {
     return false;
   }

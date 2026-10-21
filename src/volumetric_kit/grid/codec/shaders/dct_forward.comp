@@ -132,9 +132,7 @@ void main() {
     uint v = x_line_base(lane) + x;
     uint slot = voxel_base + v;
     bool obs = weight[slot] >= pc.observed_weight &&
-               (pc.true_sdf == 0u ||
-                ((cut[slot / kMaskWordBits] >> (slot % kMaskWordBits)) & 1u) ==
-                    0u);
+               (pc.true_sdf == 0u || !VR_SLOT_BIT(cut, slot));
     s_work[v] = obs ? tsdf[slot] * inv_trunc : 0.0;
     s_known[v] = obs ? 1u : 0u;
     if (obs) {
