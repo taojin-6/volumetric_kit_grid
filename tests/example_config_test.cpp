@@ -76,10 +76,15 @@ int main() {
     CHECK(outputs.serve.has_value() == served);
     CHECK(!served || (outputs.serve->host.empty() &&
                       outputs.serve->port == vr::networking::kDefaultPort));
+    // No scenario codes a true SDF: codec_mesh alone sets it, in code.
+    const auto encoder = vr_example::encoder_config(loaded->codec);
+    CHECK(encoder.ok() && !encoder->true_sdf);
   }
 
   // The single-mesh template stays one frame, every frame intra; the
-  // sequence's codes Rafa2's frames 1-150 in an 8-voxel band, holes admitted.
+  // sequence's codes Rafa2's frames 1-150, holes admitted. Both convert in a
+  // 16-voxel band, past kTrueSdfBandVoxels, and code at K 56 with the
+  // study's step (DECISIONS 2026-10-21).
   // The two sequences' templates code at period 30 with U = R, as the freeze
   // measured them (DECISIONS, the 2026-10-17 freeze): codec_replica every
   // frame, then its sweep.
@@ -98,8 +103,14 @@ int main() {
             .lexically_normal()
             .string());
   CHECK(sequence->run.first == 1 && sequence->run.frames == 150);
-  CHECK(sequence->fusion.voxel_size_m == 0.005F &&
-        sequence->fusion.truncation_m == 0.04F);
+  for (const cfg::Config* mesh : {&single.value(), &sequence.value()}) {
+    CHECK(mesh->fusion.voxel_size_m == 0.005F &&
+          mesh->fusion.truncation_m == 0.08F);
+    CHECK(mesh->fusion.truncation_m / mesh->fusion.voxel_size_m >=
+          float(vr::codec::kTrueSdfBandVoxels));
+    CHECK(mesh->codec.coefficient_count == 56 &&
+          mesh->codec.quantization_scale == 0.040877F);
+  }
   CHECK(sequence->source.height_m == 1.7 &&
         sequence->source.metres_per_unit == 0.0);
   CHECK(sequence->source.allow_holes && !sequence->codec.sweep &&
