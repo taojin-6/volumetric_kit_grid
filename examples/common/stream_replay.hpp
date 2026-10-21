@@ -22,18 +22,18 @@ namespace vr_example {
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 
-/// @brief One track's records from its first key, replayed pass after pass:
-///        each due at its pts from the pass's start, and restamped so that
-///        seq keeps rising and key pts never go back, as a live sender's do.
+/// @brief One track's records, replayed pass after pass: each due at its pts
+///        from the pass's start, and restamped so that seq keeps rising and
+///        key pts never go back, as a live sender's do.
 class ReplayLoop {
  public:
   using Clock = std::chrono::steady_clock;
 
   /// @brief The loop over @p reader's track @p track: its records from its
-  ///        first key the reader finds undamaged on, in file order; a span
-  ///        the reader finds damaged is left out.
+  ///        first key read whole, in file order; a span the reader finds
+  ///        damaged is left out.
   /// @return The loop; `InvalidArgument` for a track the session lacks;
-  ///         `NotFound` for a track with no undamaged key; the reader's
+  ///         `NotFound` for a track with no key read whole; the reader's
   ///         `IoError`; `OutOfMemory`, the reader's or the loop's own.
   static vkc::Result<ReplayLoop> create(const vr::stream::StreamReader& reader,
                                         std::uint16_t track = 0) {
@@ -54,7 +54,8 @@ class ReplayLoop {
           continue;  // damage: pos is past it
         }
         if (!*more) break;
-        // From a key read whole: what follows a damaged one lacks its key.
+        // Start at a key read whole: the P-frames after a damaged first key
+        // lack theirs.
         if (record.info.track == track &&
             (record.info.key || !loop.records_.empty())) {
           loop.records_.push_back(record);
