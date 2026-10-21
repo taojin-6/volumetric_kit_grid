@@ -72,18 +72,6 @@ constexpr std::size_t kFirstRead = 64;
 constexpr std::size_t kResyncFirstBlock = std::size_t{4} << 10;
 constexpr std::size_t kResyncBlock = std::size_t{1} << 20;
 
-// Whether H = `h` is a header size, at least `least`, that fits in the
-// `available` bytes left in the file.
-bool header_fits(std::uint32_t h, std::uint32_t least,
-                 std::uint64_t available) {
-  return h % 8 == 0 && h >= least && h <= kMaxHeaderBytes && h <= available;
-}
-
-// Whether the `h` bytes of `header` pass their CRC, the last 4.
-bool header_crc_ok(const std::uint8_t* header, std::uint32_t h) {
-  return crc32(header, h - 4) == load_le32(header + h - 4);
-}
-
 // Fill the framing of a header of `header_bytes` whose own fields are in
 // place, then its CRC.
 void seal_header(std::uint8_t* header, std::uint32_t tag,
@@ -96,10 +84,25 @@ void seal_header(std::uint8_t* header, std::uint32_t tag,
   store_le32(header + header_bytes - 4, crc32(header, header_bytes - 4));
 }
 
-core::Status bad_session(std::string_view api, const std::string& path,
+// "<api>: <path><rest>", how each session header refusal starts.
+std::string session_message(std::string_view api, std::string_view path,
+                            const std::string& rest) {
+  std::string message(api);
+  message += ": ";
+  message += path;
+  message += rest;
+  return message;
+}
+
+core::Status refuse_session(std::string_view api, std::string_view path,
+                            const std::string& why) {
+  return core::Status::invalid_argument(session_message(api, path, " " + why));
+}
+
+core::Status bad_session(std::string_view api, std::string_view path,
                          const std::string& why) {
-  return core::Status::invalid_argument(std::string(api) + ": " + path +
-                                        ": the session header " + why);
+  return core::Status::invalid_argument(
+      session_message(api, path, ": the session header " + why));
 }
 
 // Bounds-checked reads through the session body; a read past its end sets
@@ -137,7 +140,7 @@ struct BodyReader {
 
 // The session header's body, `size` bytes holding `tracks` tracks, into
 // `session`: InvalidArgument unless it parses exactly.
-core::Status parse_session_body(std::string_view api, const std::string& path,
+core::Status parse_session_body(std::string_view api, std::string_view path,
                                 const std::uint8_t* body, std::uint64_t size,
                                 std::uint32_t tracks, Session* session) {
   if (tracks == 0) return bad_session(api, path, "has no tracks");
@@ -258,16 +261,17 @@ core::Status encode_session(std::string_view api, const Session& session,
   return {};
 }
 
-void encode_record_header(const RecordInfo& info, std::uint64_t size,
-                          std::uint32_t body_crc,
-                          std::uint8_t (&header)[kRecordHeaderBytes]) {
-  std::memset(header, 0, sizeof(header));
-  store_le16(header + kTrackAt, info.track);
-  store_le16(header + kRecordFlagsAt, info.key ? kKeyFlag : 0);
-  store_le64(header + kPtsAt, info.pts_ns);
-  store_le64(header + kSeqAt, info.seq);
-  store_le64(header + kSetAt, info.set);
-  seal_header(header, kRecordTag, kRecordHeaderBytes, size, body_crc);
+void encode_record_header(
+    const RecordInfo& info, std::uint64_t size, std::uint32_t body_crc,
+    std::array<std::uint8_t, kRecordHeaderBytes>& header) {
+  header.fill(0);
+  std::uint8_t* const p = header.data();
+  store_le16(p + kTrackAt, info.track);
+  store_le16(p + kRecordFlagsAt, info.key ? kKeyFlag : 0);
+  store_le64(p + kPtsAt, info.pts_ns);
+  store_le64(p + kSeqAt, info.seq);
+  store_le64(p + kSetAt, info.set);
+  seal_header(p, kRecordTag, kRecordHeaderBytes, size, body_crc);
 }
 
 void append_key_entry(std::vector<std::uint8_t>& entries, std::uint64_t offset,
@@ -342,6 +346,108 @@ KeyEntry load_key_entry(const std::uint8_t* p) {
   return e;
 }
 
+std::uint32_t least_header_bytes(std::uint32_t tag) {
+  if (tag == kRecordTag) return kRecordHeaderBytes;
+  if (tag == kIndexTag) return kIndexHeaderBytes;
+  if (tag == kTailTag) return kTailBytes;
+  return kMinHeaderBytes;
+}
+
+bool header_fits(std::uint32_t h, std::uint32_t least,
+                 std::uint64_t available) {
+  return h % 8 == 0 && h >= least && h <= kMaxHeaderBytes && h <= available;
+}
+
+bool header_crc_ok(const std::uint8_t* header, std::uint32_t h) {
+  return crc32(header, h - 4) == load_le32(header + h - 4);
+}
+
+bool decode_chunk(const std::uint8_t* header, std::uint32_t h,
+                  std::uint32_t tracks, Chunk* out) {
+  Chunk c;
+  c.tag = load_le32(header);
+  c.header_bytes = h;
+  c.body_bytes = load_le64(header + kBodySizeAt);
+  c.body_crc = load_le32(header + kBodyCrcAt);
+  if (c.tag == kRecordTag) {
+    c.record.track = load_le16(header + kTrackAt);
+    c.flags = load_le16(header + kRecordFlagsAt);
+    c.record.key = (c.flags & kKeyFlag) != 0;
+    c.record.pts_ns = load_le64(header + kPtsAt);
+    c.record.seq = load_le64(header + kSeqAt);
+    c.record.set = load_le64(header + kSetAt);
+  } else if (c.tag == kIndexTag) {
+    c.tracks = load_le32(header + kIndexTracksAt);
+    c.keys = load_le64(header + kIndexKeysAt);
+  } else if (c.tag == kTailTag) {
+    c.index_offset = load_le64(header + kIndexOffsetAt);
+  }
+  *out = c;
+  return c.tag != kRecordTag || c.record.track < tracks;
+}
+
+core::Result<std::uint32_t> session_header_bytes(std::string_view api,
+                                                 std::string_view path,
+                                                 const std::uint8_t* header,
+                                                 std::uint64_t available) {
+  if (load_le32(header) != kSessionTag) {
+    return refuse_session(api, path,
+                          "is not a .vrst file: it does not start with VRST");
+  }
+  const std::uint32_t h = load_le32(header + kHeaderSizeAt);
+  if (!header_fits(h, kSessionHeaderBytes, available)) {
+    return refuse_session(api, path,
+                          "has a session header of " + std::to_string(h) +
+                              " bytes, out of range");
+  }
+  return h;
+}
+
+core::Result<std::uint64_t> session_body_bytes(std::string_view api,
+                                               std::string_view path,
+                                               const std::uint8_t* header,
+                                               std::uint32_t h) {
+  if (!header_crc_ok(header, h)) {
+    return refuse_session(api, path, "has a session header that fails its CRC");
+  }
+  const std::uint32_t version = load_le32(header + kVersionAt);
+  if (version != kSessionVersion) {
+    return core::Status::unsupported(
+        session_message(api, path,
+                        " is version " + std::to_string(version) +
+                            "; this library reads version 0"));
+  }
+  const std::uint16_t flags = load_le16(header + kSessionFlagsAt);
+  if (flags != 0) {
+    return core::Status::unsupported(
+        session_message(api, path,
+                        " sets session flags " + std::to_string(flags) +
+                            ", which version 0 does not define"));
+  }
+  const std::uint64_t size = load_le64(header + kBodySizeAt);
+  if (size > kMaxSessionBytes) {
+    return refuse_session(api, path,
+                          "has a session header body of " +
+                              std::to_string(size) + " bytes, above " +
+                              std::to_string(kMaxSessionBytes));
+  }
+  return size;
+}
+
+core::Status parse_session(std::string_view api, std::string_view path,
+                           const std::uint8_t* header, const std::uint8_t* body,
+                           std::uint64_t size, Session* session) {
+  if (crc32(body, static_cast<std::size_t>(size)) !=
+      load_le32(header + kBodyCrcAt)) {
+    return refuse_session(api, path,
+                          "has a session header body that fails its CRC");
+  }
+  std::memcpy(session->id.data(), header + kSessionIdAt, session->id.size());
+  session->created_ns = load_le64(header + kCreatedAt);
+  return parse_session_body(api, path, body, size,
+                            load_le16(header + kTrackCountAt), session);
+}
+
 core::Result<bool> read_chunk(std::string_view api, const FileView& file,
                               std::uint64_t offset, Chunk* out) {
   if (offset >= file.size || file.size - offset < kMinHeaderBytes) {
@@ -353,36 +459,15 @@ core::Result<bool> read_chunk(std::string_view api, const FileView& file,
       static_cast<std::size_t>(std::min<std::uint64_t>(kFirstRead, available));
   VKC_TRY(read_at(api, *file.path, file.fd, offset, header, first));
   const std::uint32_t h = load_le32(header + kHeaderSizeAt);
-  if (!header_fits(h, kMinHeaderBytes, available)) return false;
+  if (!header_fits(h, least_header_bytes(load_le32(header)), available)) {
+    return false;
+  }
   if (h > first) {
     VKC_TRY(read_at(api, *file.path, file.fd, offset + first, header + first,
                     h - first));
   }
   if (!header_crc_ok(header, h)) return false;
-  Chunk c;
-  c.tag = load_le32(header);
-  c.header_bytes = h;
-  c.body_bytes = load_le64(header + kBodySizeAt);
-  c.body_crc = load_le32(header + kBodyCrcAt);
-  if (c.tag == kRecordTag) {
-    if (h < kRecordHeaderBytes) return false;
-    c.record.track = load_le16(header + kTrackAt);
-    c.flags = load_le16(header + kRecordFlagsAt);
-    c.record.key = (c.flags & kKeyFlag) != 0;
-    c.record.pts_ns = load_le64(header + kPtsAt);
-    c.record.seq = load_le64(header + kSeqAt);
-    c.record.set = load_le64(header + kSetAt);
-    if (c.record.track >= file.tracks) return false;
-  } else if (c.tag == kIndexTag) {
-    if (h < kIndexHeaderBytes) return false;
-    c.tracks = load_le32(header + kIndexTracksAt);
-    c.keys = load_le64(header + kIndexKeysAt);
-  } else if (c.tag == kTailTag) {
-    if (h < kTailBytes) return false;
-    c.index_offset = load_le64(header + kIndexOffsetAt);
-  }
-  *out = c;
-  return true;
+  return decode_chunk(header, h, file.tracks, out);
 }
 
 core::Result<std::uint64_t> resync(std::string_view api, const FileView& file,
@@ -411,58 +496,27 @@ core::Result<std::uint64_t> read_session(std::string_view api,
                                          const FileView& file,
                                          Session* session) {
   const std::string& path = *file.path;
-  const auto refuse = [&](const std::string& why) {
-    return core::Status::invalid_argument(std::string(api) + ": " + path + " " +
-                                          why);
-  };
   if (file.size < kSessionHeaderBytes) {
-    return refuse("holds " + std::to_string(file.size) +
-                  " bytes, fewer than a session header's 56");
+    return refuse_session(api, path,
+                          "holds " + std::to_string(file.size) +
+                              " bytes, fewer than a session header's 56");
   }
   std::uint8_t header[kMaxHeaderBytes];
   VKC_TRY(read_at(api, path, file.fd, 0, header, kSessionHeaderBytes));
-  if (load_le32(header) != kSessionTag) {
-    return refuse("is not a .vrst file: it does not start with VRST");
-  }
-  const std::uint32_t h = load_le32(header + kHeaderSizeAt);
-  if (!header_fits(h, kSessionHeaderBytes, file.size)) {
-    return refuse("has a session header of " + std::to_string(h) +
-                  " bytes, out of range");
-  }
+  VKC_ASSIGN(const std::uint32_t h,
+             session_header_bytes(api, path, header, file.size));
   if (h > kSessionHeaderBytes) {
     VKC_TRY(read_at(api, path, file.fd, kSessionHeaderBytes,
                     header + kSessionHeaderBytes, h - kSessionHeaderBytes));
   }
-  if (!header_crc_ok(header, h)) {
-    return refuse("has a session header that fails its CRC");
+  VKC_ASSIGN(const std::uint64_t size,
+             session_body_bytes(api, path, header, h));
+  if (size > file.size - h) {
+    return refuse_session(api, path, "ends inside its session header");
   }
-  const std::uint32_t version = load_le32(header + kVersionAt);
-  if (version != kSessionVersion) {
-    return core::Status::unsupported(std::string(api) + ": " + path +
-                                     " is version " + std::to_string(version) +
-                                     "; this library reads version 0");
-  }
-  const std::uint16_t flags = load_le16(header + kSessionFlagsAt);
-  if (flags != 0) {
-    return core::Status::unsupported(
-        std::string(api) + ": " + path + " sets session flags " +
-        std::to_string(flags) + ", which version 0 does not define");
-  }
-  const std::uint64_t size = load_le64(header + kBodySizeAt);
-  if (size > kMaxSessionBytes) {
-    return refuse("has a session header body of " + std::to_string(size) +
-                  " bytes, above " + std::to_string(kMaxSessionBytes));
-  }
-  if (size > file.size - h) return refuse("ends inside its session header");
   std::vector<std::uint8_t> body(static_cast<std::size_t>(size));
   VKC_TRY(read_at(api, path, file.fd, h, body.data(), body.size()));
-  if (crc32(body.data(), body.size()) != load_le32(header + kBodyCrcAt)) {
-    return refuse("has a session header body that fails its CRC");
-  }
-  std::memcpy(session->id.data(), header + kSessionIdAt, session->id.size());
-  session->created_ns = load_le64(header + kCreatedAt);
-  VKC_TRY(parse_session_body(api, path, body.data(), size,
-                             load_le16(header + kTrackCountAt), session));
+  VKC_TRY(parse_session(api, path, header, body.data(), size, session));
   return h + size + padding(size);
 }
 

@@ -16,8 +16,8 @@ set(_vr_stream_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(recon_stream)
 add_library(volumetric_kit::recon_stream ALIAS recon_stream)
 
-target_sources(recon_stream PRIVATE chunk.cpp file.cpp stream_reader.cpp
-                                    stream_writer.cpp)
+target_sources(recon_stream PRIVATE chunk.cpp chunks.cpp file.cpp
+                                    stream_reader.cpp stream_writer.cpp)
 
 generate_export_header(
   recon_stream

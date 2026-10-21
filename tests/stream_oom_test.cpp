@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // Allocation failures across the complete public stream calls, including
-// validation and copies of a writer's sticky error. No GPU or camera.
+// validation, copies of a writer's sticky error, and a parser's failure,
+// which sticks too. No GPU or camera.
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -19,6 +20,7 @@
 #include "stream_files.hpp"
 #include "test_allocation_failure.hpp"
 #include "test_check.hpp"
+#include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
 namespace vkc = volumetric_kit::core;
@@ -30,12 +32,16 @@ namespace {
 using Code = vkc::Status::Code;
 using vrst::info;
 
-std::unique_ptr<stream::StreamWriter> create(const std::string& path) {
+stream::Session one_track() {
   stream::Session session;
   stream::Track track;
   track.kind = stream::TrackKind::Geometry;
   session.tracks.push_back(track);
-  auto result = stream::StreamWriter::create(path, session);
+  return session;
+}
+
+std::unique_ptr<stream::StreamWriter> create(const std::string& path) {
+  auto result = stream::StreamWriter::create(path, one_track());
   if (!result.ok()) return nullptr;
   return std::move(result).value();
 }
@@ -290,6 +296,123 @@ int sticky_errors(const std::string& dir) {
   return 0;
 }
 
+// An encoder that cannot allocate its chunk, or a refusal's diagnostic,
+// returns OutOfMemory, and a refused record counts nothing either way.
+int encoder_diagnostics() {
+  CHECK(
+      expect_oom(
+          "encoder create",
+          [] {
+            return stream::ChunkEncoder::create(one_track()).status().domain();
+          },
+          Code::Ok) == 0);
+  auto encoder = stream::ChunkEncoder::create(one_track());
+  CHECK(encoder.ok());
+  CHECK(encoder->frame(info(0, true, 10, 1), nullptr, 0).ok());
+  CHECK(expect_oom(
+            "frame invalid track",
+            [&] {
+              return encoder->frame(info(1, false, 10, 2), nullptr, 0)
+                  .status()
+                  .domain();
+            },
+            Code::InvalidArgument) == 0);
+  CHECK(expect_oom(
+            "frame null payload",
+            [&] {
+              return encoder->frame(info(0, false, 10, 2), nullptr, 1)
+                  .status()
+                  .domain();
+            },
+            Code::InvalidArgument) == 0);
+  CHECK(expect_oom(
+            "frame old sequence",
+            [&] {
+              return encoder->frame(info(0, false, 10, 1), nullptr, 0)
+                  .status()
+                  .domain();
+            },
+            Code::InvalidArgument) == 0);
+  CHECK(expect_oom(
+            "frame old key timestamp",
+            [&] {
+              return encoder->frame(info(0, true, 9, 2), nullptr, 0)
+                  .status()
+                  .domain();
+            },
+            Code::InvalidArgument) == 0);
+  CHECK(encoder->frame(info(0, true, 10, 2), nullptr, 0).ok());
+  return 0;
+}
+
+// A parser that cannot take what it is fed, or copy out a payload, keeps
+// that failure: every later call returns OutOfMemory. One whose check
+// failed keeps that failure too, and no more bytes.
+int parser_failures(const std::string& dir) {
+  const std::string path = dir + "/parsed.vrst";
+  {
+    auto writer = create(path);
+    CHECK(writer != nullptr);
+    const vrst::Bytes payload = vrst::pattern(100, 1);
+    CHECK(writer->append(info(0, true, 10, 1), payload.data(), payload.size())
+              .ok());
+  }
+  const vrst::Bytes bytes = vr_test::read_bytes(path);
+  stream::Record record;
+  vrst::Bytes payload;
+  const auto stuck = [&](stream::ChunkParser& parser) {
+    return parser.feed(bytes.data(), bytes.size()).domain() ==
+               Code::OutOfMemory &&
+           parser.next(&record, &payload).status().domain() ==
+               Code::OutOfMemory;
+  };
+  stream::ChunkParser measured_feed;
+  stream::ChunkParser failed_feed;
+  CHECK(
+      expect_oom(
+          "parser feed",
+          [&] {
+            return measured_feed.feed(bytes.data(), bytes.size()).domain();
+          },
+          [&] { return failed_feed.feed(bytes.data(), bytes.size()).domain(); },
+          Code::Ok) == 0);
+  CHECK(stuck(failed_feed));
+
+  stream::ChunkParser measured_next;
+  stream::ChunkParser failed_next;
+  CHECK(measured_next.feed(bytes.data(), bytes.size()).ok());
+  CHECK(failed_next.feed(bytes.data(), bytes.size()).ok());
+  vrst::Bytes measured_payload;
+  CHECK(
+      expect_oom(
+          "parser next",
+          [&] {
+            return measured_next.next(&record, &measured_payload)
+                .status()
+                .domain();
+          },
+          [&] { return failed_next.next(&record, &payload).status().domain(); },
+          Code::Ok) == 0);
+  CHECK(measured_payload == vrst::pattern(100, 1));
+  CHECK(stuck(failed_next));
+
+  // A parser whose check failed takes no more bytes: feeding 1 MiB after
+  // allocates no more than its message.
+  stream::ChunkParser damaged;
+  const vrst::Bytes bad = vrst::flipped(bytes, bytes.size() - 8, 0);
+  CHECK(damaged.feed(bad.data(), bad.size()).domain() == Code::InvalidArgument);
+  const vrst::Bytes more(std::size_t{1} << 20, 0);
+  auto& failure = vr_test::allocation_failure;
+  failure = {};
+  failure.measure = true;
+  const Code again = damaged.feed(more.data(), more.size()).domain();
+  failure.measure = false;
+  const std::size_t largest = failure.largest;
+  failure = {};
+  CHECK(again == Code::InvalidArgument && largest < more.size());
+  return 0;
+}
+
 }  // namespace
 
 int main() try {
@@ -300,6 +423,8 @@ int main() try {
   failed |= reader_diagnostics(dir);
   failed |= writer_retry(dir);
   failed |= sticky_errors(dir);
+  failed |= encoder_diagnostics();
+  failed |= parser_failures(dir);
   return failed;
 } catch (const std::bad_alloc&) {
   vr_test::allocation_failure = {};
