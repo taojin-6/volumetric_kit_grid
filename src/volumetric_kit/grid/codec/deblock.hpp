@@ -119,7 +119,7 @@ VR_CODEC_API const DeblockRow* deblock_rule(std::uint32_t k, double t_mm);
 ///         `exp(-1 / (2 sigma^2))`, each rounded to float.
 VR_CODEC_API DeblockPasses deblock_passes(const DeblockRow& row, float t);
 
-/// @brief The deblock's kernels, its shell snapshot and a zero skip word.
+/// @brief The deblock's kernels and its shell snapshot.
 ///
 /// The snapshot takes @ref kShellVoxels floats a block of the largest frame a
 /// Gaussian ran on, and grows with 1.5x headroom (`ensure_device_scratch`);
@@ -129,8 +129,7 @@ VR_CODEC_API DeblockPasses deblock_passes(const DeblockRow& row, float t);
 ///          this object. Not thread-safe.
 class VR_CODEC_API Deblock {
  public:
-  /// @brief Build the three kernels, a one-block snapshot and the zero
-  ///        word a call without a skip word binds.
+  /// @brief Build the three kernels and a one-block snapshot.
   /// @return The deblock, or a pipeline, pool or allocation failure.
   static core::Result<std::unique_ptr<Deblock>> create(
       core::Device& device, core::Allocator& allocator);
@@ -161,11 +160,11 @@ class VR_CODEC_API Deblock {
   /// @param frame  The frame's list and masks, by list position, as the
   ///               reference store holds them; no reference entries.
   /// @param passes The filter.
-  /// @param skip   Optional buffer whose first word, written before the
-  ///               dispatches (in this batch or an earlier one), skips the
-  ///               filter when it is non-zero: every kernel returns at once,
-  ///               leaving the grid, its stamps and the snapshot as they
-  ///               were. Null runs the passes.
+  /// @param skip   A buffer whose first word, written before the dispatches
+  ///               (in this batch or an earlier one), skips the filter when
+  ///               it is non-zero: every kernel returns at once, leaving the
+  ///               grid, its stamps and the snapshot as they were. Zero runs
+  ///               the passes.
   /// @param stage  Optional scope the dispatches record their device spans
   ///               into.
   /// @return OK, or, before anything is recorded,
@@ -177,7 +176,7 @@ class VR_CODEC_API Deblock {
   ///         `maxStorageBufferRange`.
   core::Status record(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
                       const ResidentBlocks& frame, const DeblockPasses& passes,
-                      const core::Buffer* skip = nullptr,
+                      const core::Buffer& skip,
                       core::GpuStageScope* stage = nullptr);
 
  private:
@@ -197,8 +196,6 @@ class VR_CODEC_API Deblock {
   core::DescriptorPool pool_;
   // The Gaussian's shell snapshot, kShellVoxels floats an entry.
   core::Buffer shell_;
-  // A zero word, bound when a call passes no skip word.
-  core::Buffer no_skip_;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

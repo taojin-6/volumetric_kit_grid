@@ -238,15 +238,26 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
                  std::move(mask_buffer)};
 }
 
+// A device word holding @p value, as a skip word.
+vkc::Result<vkc::Buffer> word(Gpu& gpu, std::uint32_t value) {
+  return vr_test::upload_device_buffer(gpu.device, gpu.allocator, &value,
+                                       sizeof(value));
+}
+
 // One deblock of @p fx under @p passes, at a fresh tick, in a batch of its
-// own, gated by @p skip when given.
+// own, gated by @p skip, or by a zero word when none is given.
 vkc::Status run(Gpu& gpu, d::Deblock& deblock, Fixture& fx,
                 const d::DeblockPasses& passes,
                 const vkc::Buffer* skip = nullptr) {
+  vkc::Buffer zero;
+  if (skip == nullptr) {
+    VKC_ASSIGN(zero, word(gpu, 0u));
+    skip = &zero;
+  }
   fx.grid.map().advance_tick();
   VKC_TRY(deblock.reserve(std::uint32_t(fx.coords.size()), passes));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes, skip));
+  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes, *skip));
   return batch.submit();
 }
 
@@ -623,8 +634,10 @@ int stamps_case(Gpu& gpu, d::Deblock& deblock) {
 // refusals, each before anything is recorded.
 int record_case(Gpu& gpu, d::Deblock& deblock) {
   vkc::Result<Fixture> made = make_fixture(gpu, ramp_blocks(), ramp_field);
-  CHECK(made.ok());
+  vkc::Result<vkc::Buffer> zero = word(gpu, 0u);
+  CHECK(made.ok() && zero.ok());
   Fixture fx = std::move(made).value();
+  const vkc::Buffer& no_skip = zero.value();
   vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
   CHECK(before.ok());
   const d::DeblockPasses passes = d::deblock_passes(row("LG"), 0.01f);
@@ -632,7 +645,7 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   CHECK(deblock.reserve(n, passes).ok());
   {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    CHECK(deblock.record(batch, fx.grid, fx.frame(), passes).ok());
+    CHECK(deblock.record(batch, fx.grid, fx.frame(), passes, no_skip).ok());
     vkc::Result<Snapshot> pending = snapshot(gpu, fx.grid);
     CHECK(pending.ok() && pending.value() == before.value());
     CHECK(batch.submit().ok());
@@ -643,10 +656,12 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   CHECK(filtered.ok());
   {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    CHECK(deblock.record(batch, fx.grid, fx.frame(), d::DeblockPasses{}).ok());
+    CHECK(
+        deblock.record(batch, fx.grid, fx.frame(), d::DeblockPasses{}, no_skip)
+            .ok());
     d::ResidentBlocks none = fx.frame();
     none.count = 0;
-    CHECK(deblock.record(batch, fx.grid, none, passes).ok());
+    CHECK(deblock.record(batch, fx.grid, none, passes, no_skip).ok());
     CHECK(batch.submit().ok());
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
     CHECK(after.ok() && after.value() == filtered.value());
@@ -655,7 +670,7 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
                            const d::DeblockPasses& p,
                            vol::VoxelBlockGrid& grid) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s = deblock.record(batch, grid, frame, p);
+    const vkc::Status s = deblock.record(batch, grid, frame, p, no_skip);
     return s.domain() == vkc::Status::Code::InvalidArgument;
   };
   d::DeblockPasses unclipped = passes;
@@ -680,7 +695,7 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
     const vkc::Status s =
-        fresh.value()->record(batch, fx.grid, fx.frame(), passes);
+        fresh.value()->record(batch, fx.grid, fx.frame(), passes, no_skip);
     CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
           s.message().find("reserve") != std::string::npos);
   }
@@ -693,16 +708,9 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   return 0;
 }
 
-// A device word holding @p value, as a skip word.
-vkc::Result<vkc::Buffer> word(Gpu& gpu, std::uint32_t value) {
-  return vr_test::upload_device_buffer(gpu.device, gpu.allocator, &value,
-                                       sizeof(value));
-}
-
 // 10b. The skip word: set, every filter leaves the grid and its stamps as
 // they were -- the store too, though the snapshot holds the last Gaussian's
-// shell -- and zero runs the filter as no word does; a buffer without a word
-// is refused.
+// shell -- and zero runs the filter; a buffer without a word is refused.
 int skip_case(Gpu& gpu, d::Deblock& deblock) {
   vkc::Result<vkc::Buffer> one = word(gpu, 1u);
   vkc::Result<vkc::Buffer> zero = word(gpu, 0u);
@@ -750,7 +758,7 @@ int skip_case(Gpu& gpu, d::Deblock& deblock) {
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   const vkc::Status s =
       deblock.record(batch, made.value().grid, made.value().frame(), passes,
-                     &short_word.value());
+                     short_word.value());
   CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
         s.message().find("skip") != std::string::npos);
   return 0;

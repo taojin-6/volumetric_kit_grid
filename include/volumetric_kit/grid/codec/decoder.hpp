@@ -90,7 +90,7 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// blocks, whatever it held before: blocks the frame lacks are removed (and
 /// their attributes zeroed), missing ones are allocated, and every frame
 /// block's `tsdf` and `weight` are rewritten in full -- an observed voxel with
-/// its decoded SDF (smoothed, with the deblock on) and weight 1.0, an
+/// its decoded SDF (smoothed where the deblock runs) and weight 1.0, an
 /// unobserved one as a fresh block holds it. So a player decodes frame after
 /// frame into one grid and meshes it after each; nothing is cleared between
 /// frames, and a block present in both costs no allocation. A block the decode
@@ -231,8 +231,9 @@ class VR_CODEC_API Decoder {
 
   /// @brief Turn the deblock on or off for every frame decoded or rebuilt
   ///        from here on: on, a frame whose masks are all ones is smoothed
-  ///        across its block faces after its inverse transform, in the same
-  ///        submit; off, the default, the grid holds the exact decode.
+  ///        across its block faces by the filter its header picks (none at
+  ///        a fine step), after its inverse transform, in the same submit;
+  ///        off, the default, the grid holds the exact decode.
   ///
   /// A frame any of whose blocks has an unobserved voxel -- a masked frame,
   /// as fused RGB-D's are, or a true-SDF frame with a cut

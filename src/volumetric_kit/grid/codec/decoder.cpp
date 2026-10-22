@@ -118,7 +118,7 @@ core::Result<DeblockInfo> reconstruct(
     const FrameDeblock& filter, core::GpuStageScope* stage) {
   VKC_TRY(transform.record_inverse(batch, grid, blocks, params, stage));
   VKC_TRY(deblock.record(batch, grid, blocks, filter.passes,
-                         &transform.masked_flag(), stage));
+                         transform.masked_flag(), stage));
   std::uint32_t rejected = 0;
   std::uint32_t masked = 0;
   VKC_TRY(transform.record_rejected(batch, rejected, &masked));
