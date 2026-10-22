@@ -29,8 +29,9 @@ struct ServerOptions {
   std::uint16_t port = kDefaultPort;
   /// Viewers served at once, first come: a connection past them is closed at
   /// accept, the first such refusal and then one in 10 s at most logged at
-  /// Warning. With no authentication, any host reaching the port can take a
-  /// slot, and keeps it until it leaves or stalls (@ref stall_limit).
+  /// Warning, the rest at Debug. With no authentication, any host reaching
+  /// the port can take a slot, and keeps it until it leaves or stalls
+  /// (@ref stall_limit).
   std::size_t max_viewers = 4;
   /// The most one GOP (a key record and every record after it) may hold. A
   /// record that would pass it is dropped with the whole GOP, and so is every

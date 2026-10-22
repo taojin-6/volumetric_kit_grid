@@ -7,7 +7,8 @@
 //   serve_stream <in.vrst> [--port N]
 //
 // It serves every interface on port 47801, or N (0 takes a free one, which it
-// prints). No scenario file: its whole input is a file and a port.
+// prints), and prints each viewer joining and leaving. No scenario file: its
+// whole input is a file and a port.
 
 #include <cerrno>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "info_log.hpp"
 #include "stream_replay.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/networking/stream_server.hpp"
@@ -116,6 +118,7 @@ int main(int argc, char** argv) {
     std::printf("%s\n", kUsage);
     return 0;
   }
+  vr_example::print_info_log();  // each viewer joining and leaving
   const vkc::Status failed = serve(*args);
   std::fprintf(stderr, "serve_stream: %s\n", failed.message().c_str());
   return 1;
