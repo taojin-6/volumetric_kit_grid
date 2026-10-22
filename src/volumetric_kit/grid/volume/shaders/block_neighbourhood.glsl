@@ -42,9 +42,29 @@ int vrOctantIndex(ivec3 o) {
   return o.x + 2 * o.y + 4 * o.z;
 }
 
-// Fill s_neighbour for the block at @p coord, whose voxel-array base is
-// @p self_ptr. Threads 0..7 each resolve one octant; octant 0 is this block,
-// already known. The caller must `barrier()` before any cell reads it.
+// Fill s_neighbour's octants whose bit (1 << octant) is set in @p octants for
+// the block at @p coord, whose voxel-array base is @p self_ptr; the others
+// read -1. Threads 0..7 each resolve one octant; octant 0 is this block,
+// already known, and only thread 0's @p self_ptr is read. A caller that reads
+// two octants probes two blocks, not seven. The caller must `barrier()`
+// before any cell reads it.
+void vrResolveOctants(ivec3 coord, int self_ptr, uint tid, uint octants,
+                      int num_buckets, int bucket_size, int max_chain) {
+  if (tid < 8u) {
+    uint oi = tid;
+    if (((octants >> oi) & 1u) == 0u) {
+      s_neighbour[oi] = -1;
+    } else if (oi == 0u) {
+      s_neighbour[0] = self_ptr;
+    } else {
+      ivec3 off = ivec3(int(oi & 1u), int((oi >> 1) & 1u), int((oi >> 2) & 1u));
+      s_neighbour[oi] =
+          vrFindBlockPtr(coord + off, num_buckets, bucket_size, max_chain);
+    }
+  }
+}
+
+// The whole neighbourhood: vrResolveOctants with every octant.
 //
 // TODO(mesh): this prologue, not an occupancy change, is what the on-device
 // probe costs -- 8 lanes each walking a bucket while the rest wait at the
@@ -61,16 +81,8 @@ int vrOctantIndex(ivec3 o) {
 // primary-scan note on vrFindBlockPtr.
 void vrResolveNeighbourhood(ivec3 coord, int self_ptr, uint tid,
                             int num_buckets, int bucket_size, int max_chain) {
-  if (tid < 8u) {
-    uint oi = tid;
-    if (oi == 0u) {
-      s_neighbour[0] = self_ptr;
-    } else {
-      ivec3 off = ivec3(int(oi & 1u), int((oi >> 1) & 1u), int((oi >> 2) & 1u));
-      s_neighbour[oi] =
-          vrFindBlockPtr(coord + off, num_buckets, bucket_size, max_chain);
-    }
-  }
+  vrResolveOctants(coord, self_ptr, tid, 0xFFu, num_buckets, bucket_size,
+                   max_chain);
 }
 
 // Resolve one corner voxel to its slot in the per-voxel attribute arrays.
