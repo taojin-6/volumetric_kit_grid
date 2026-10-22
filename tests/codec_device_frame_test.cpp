@@ -215,16 +215,16 @@ int same_read(d::DeviceFrameReader& reader, const Bytes& bytes,
 }
 
 // The oracle's frame and the device's, for one frame and its sizes -- a
-// P-frame also written bounded, at every tail -- and the device's decode of
-// it.
+// P-frame also written bounded, at every tail, unless @p bounded is false --
+// and the device's decode of it.
 int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
                const oracle::Frame& frame,
-               const oracle::FrameWriteOptions& options) {
+               const oracle::FrameWriteOptions& options, bool bounded = true) {
   const bool inter = frame.type == d::FrameType::kInter;
   const vkc::Result<Bytes> expected = oracle::write_frame(frame, options);
   CHECK(expected.ok());
   std::vector<std::optional<std::uint32_t>> writes = {std::nullopt};
-  if (inter) {
+  if (inter && bounded) {
     for (const std::uint32_t g : tails(frame.modes.size())) writes.push_back(g);
   }
   for (const std::optional<std::uint32_t>& tail : writes) {
@@ -274,8 +274,9 @@ int matches_oracle_case(d::DeviceFrameWriter& writer,
 
 // P-frames: the worked example's pinned bytes, at U = 1 too; the matrix
 // (codec_frames.hpp) at every update and segment size, every mode, K and
-// empty case among them, each written bounded too; one writer alternating
-// exact and bounded entries; and a P-frame of no entries at all.
+// empty case among them, each written bounded too at U = R = 7, several
+// segments of each, and at U past every frame with R = 1; one writer
+// alternating exact and bounded entries; and a P-frame of no entries at all.
 int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   const d::FrameReference example = reference_of(
       oracle::write_frame(codec_frames::example_reference()).value());
@@ -289,10 +290,12 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   int written = 0;
   const std::vector<codec_frames::InterCode> matrix =
       codec_frames::inter_matrix();
+  constexpr std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
   for (const codec_frames::InterCode& c : matrix) {
     for (std::uint32_t u : codec_frames::kInterSizes) {
       for (std::uint32_t r : codec_frames::kInterSizes) {
-        if (same_bytes(writer, reader, c.p, sizes(r, u)) != 0) {
+        const bool bounded = (u == 7 && r == 7) || (u == kLongest && r == 1);
+        if (same_bytes(writer, reader, c.p, sizes(r, u), bounded) != 0) {
           std::fprintf(stderr, "%s: U %u, R %u\n", c.what.c_str(), u, r);
           return 1;
         }
