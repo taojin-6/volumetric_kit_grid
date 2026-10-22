@@ -8,8 +8,8 @@
 ///        its own end would, rather than the process there, so the cameras
 ///        are released and what the run writes is finished. Killed outright,
 ///        the process would leave the cameras to notice the dropped
-///        connection. The handler restores the default, so a second Ctrl+C
-///        still ends a run that has hung.
+///        connection. The handler restores that signal's default, so a
+///        second Ctrl+C, or a second SIGTERM, still ends a run that has hung.
 
 #include <atomic>
 #include <csignal>
