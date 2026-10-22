@@ -17,7 +17,6 @@
 # the integrator that produced the field nor the mesher that consumes the
 # decoded one.
 include(GenerateExportHeader)
-include(GNUInstallDirs)
 
 set(_vr_codec_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 
@@ -72,7 +71,6 @@ target_include_directories(
   recon_codec
   PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
          "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>"
-         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the kernels -- the DCT's, the block lists', the P-frame apply and diff
@@ -104,26 +102,3 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/survivor_ranks.comp")
 
 vr_target_warnings(recon_codec)
-
-# Install the target into the shared export set + this tier's public headers
-# (the codec/ subtree) + its generated export header. The private transform
-# header under src/ is deliberately not installed. Mirrors the other tiers so a
-# partial build never installs a header for a tier it did not build.
-if(VR_INSTALL)
-  install(
-    TARGETS recon_codec
-    EXPORT volumetric_kit_reconTargets
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-  install(
-    DIRECTORY "${PROJECT_SOURCE_DIR}/include/volumetric_kit/recon/codec"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/volumetric_kit/recon"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-  install(
-    DIRECTORY "${_vr_codec_generated_inc}/"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-endif()

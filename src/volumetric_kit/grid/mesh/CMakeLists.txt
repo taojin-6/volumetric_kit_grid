@@ -9,7 +9,6 @@
 # shader. Links recon_volume for the grid it meshes, per the strict
 # left-to-right tier rule.
 include(GenerateExportHeader)
-include(GNUInstallDirs)
 
 set(_vr_mesh_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 
@@ -54,7 +53,6 @@ target_include_directories(
   recon_mesh
   PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
          "$<BUILD_INTERFACE:${_vr_mesh_generated_inc}>"
-         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the GLSL marching-cubes kernel to SPIR-V and embed it as a constexpr
@@ -68,25 +66,3 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/marching_cubes_sparse_shared.comp")
 
 vr_target_warnings(recon_mesh)
-
-# Install the target into the shared export set + this tier's headers (the mesh/
-# subtree) + its generated export header. Mirrors the other tiers so a partial
-# build never installs a header for a tier it did not build.
-if(VR_INSTALL)
-  install(
-    TARGETS recon_mesh
-    EXPORT volumetric_kit_reconTargets
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-  install(
-    DIRECTORY "${PROJECT_SOURCE_DIR}/include/volumetric_kit/recon/mesh"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/volumetric_kit/recon"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-  install(
-    DIRECTORY "${_vr_mesh_generated_inc}/"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-endif()

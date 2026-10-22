@@ -65,7 +65,8 @@ struct Laid {
 
 // @p steps laid out by the device, followed by @p tail's past them with
 // @p surplus as the surplus word, as a bounded P-frame's count leaves them;
-// read back as far as @p steps' own layout reaches.
+// read back as far as @p steps' own layout reaches. Uploads, layout and
+// readbacks in one batch.
 vkc::Result<Laid> device_layout(vr_test::Gpu& gpu, d::StepLayout& layout,
                                 const Steps& steps, std::uint32_t m,
                                 std::uint32_t u, std::uint32_t r,
@@ -73,30 +74,35 @@ vkc::Result<Laid> device_layout(vr_test::Gpu& gpu, d::StepLayout& layout,
   const auto n = static_cast<std::uint32_t>(steps.size());
   Steps bound = steps;
   bound.insert(bound.end(), tail.begin(), tail.end());
+  const VkDeviceSize bytes = bound.size() * sizeof(std::uint32_t);
   vkc::Buffer input;
   if (!bound.empty()) {
-    VKC_ASSIGN(input, vr_test::upload_device_buffer(
-                          gpu.device, gpu.allocator, bound.data(),
-                          bound.size() * sizeof(std::uint32_t)));
+    VKC_ASSIGN(input, vkc::device_storage_buffer(gpu.allocator, bytes));
   }
   VKC_ASSIGN(const vkc::Buffer word,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator, &surplus,
-                                           sizeof(surplus)));
+             vkc::device_storage_buffer(gpu.allocator, sizeof(surplus)));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  if (!bound.empty()) {
+    VKC_TRY(batch.upload(input, 0, bound.data(), bytes));
+  }
+  VKC_TRY(batch.upload(word, 0, &surplus, sizeof(surplus)));
   VKC_TRY(layout.record(batch, input, word,
                         static_cast<std::uint32_t>(bound.size()), m, u, r));
-  VKC_TRY(batch.submit());
   Laid out;
+  if (n != 0) {
+    const std::uint64_t segments =
+        d::frame_segment_count(m, u) + d::frame_segment_count(n - m, r);
+    out.starts.resize(std::size_t(n) + 1);
+    out.slot_offsets.resize(segments + 1);
+    VKC_TRY(batch.readback(layout.starts(), 0,
+                           out.starts.size() * sizeof(std::uint32_t),
+                           out.starts.data()));
+    VKC_TRY(batch.readback(layout.slot_offsets(), 0,
+                           out.slot_offsets.size() * sizeof(std::uint32_t),
+                           out.slot_offsets.data()));
+  }
+  VKC_TRY(batch.submit());
   out.totals = layout.totals();
-  if (n == 0) return out;
-  const std::uint64_t segments =
-      d::frame_segment_count(m, u) + d::frame_segment_count(n - m, r);
-  VKC_ASSIGN(out.starts,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               layout.starts(), n + 1));
-  VKC_ASSIGN(out.slot_offsets, vr_test::read_back<std::uint32_t>(
-                                   gpu.device, gpu.allocator,
-                                   layout.slot_offsets(), segments + 1));
   return out;
 }
 

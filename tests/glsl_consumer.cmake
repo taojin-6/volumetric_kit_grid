@@ -2,11 +2,11 @@
 # Copyright (c) 2026 Tao Jin
 
 # What a project whose kernels include recon's exported GLSL does, for the
-# subproject/ and package/ consumers: read the include root
-# volumetric_kit::recon_core names, and compile through it, with the core's
-# vkc_compile_shaders, a kernel that includes core/shaders/pinhole.glsl
-# (shaders/pinhole_cases.comp). The recon_*_glsl tests build the target,
-# vr_glsl_consumer. The root holds the exported GLSL and none of recon's own.
+# subproject/ consumer: read the include root volumetric_kit::recon_core names,
+# and compile through it, with the core's vkc_compile_shaders, a kernel that
+# includes core/shaders/pinhole.glsl (shaders/pinhole_cases.comp). The
+# recon_subproject_glsl test builds the target, vr_glsl_consumer. The root holds
+# the exported GLSL and none of recon's own.
 get_target_property(_vr_glsl_root volumetric_kit::recon_core
                     VR_SHADER_INCLUDE_DIR)
 set(_vr_pinhole "volumetric_kit/recon/core/shaders/pinhole.glsl")

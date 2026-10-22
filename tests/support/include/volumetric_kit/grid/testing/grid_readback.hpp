@@ -4,8 +4,11 @@
 #pragma once
 
 // A grid attribute as a host vector, and back, for a test: the arrays are
-// device-local, so a test edits a copy and writes it back.
+// device-local, so a test edits a copy and writes it back, or reads the blocks
+// it compares.
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -15,6 +18,7 @@
 #include <vector>
 
 #include "buffer_readback.hpp"
+#include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace vr_test {
@@ -42,6 +46,72 @@ vkc::Status write_attribute(
   return write_back(device, allocator, *view.buffer, data);
 }
 
+// The voxels of an attribute from the block at the lowest ptr of some blocks
+// through the block at the highest: voxel ptr + v is values[ptr - first + v].
+// A test grid's few blocks sit together, so this is a small part of what
+// read_attribute reads.
+template <typename T>
+struct AttributeSpan {
+  std::size_t first = 0;
+  std::vector<T> values;
+};
+
+// The span of attribute `name`, of elements T, that `blocks` lie in; empty
+// for no blocks.
+template <typename T>
+vkc::Result<AttributeSpan<T>> read_span(
+    const vkc::Device& device, vkc::Allocator& allocator,
+    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    std::string_view name,
+    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
+  VKC_ASSIGN(const auto view, grid.attribute(name));
+  if (view.element_size != sizeof(T)) {
+    return vkc::Status::invalid_argument("read_span: another element size");
+  }
+  AttributeSpan<T> out;
+  if (blocks.empty()) return out;
+  const auto by_ptr = [](const auto& a, const auto& b) {
+    return a.ptr < b.ptr;
+  };
+  const auto [lo, hi] =
+      std::minmax_element(blocks.begin(), blocks.end(), by_ptr);
+  out.first = std::size_t(lo->ptr);
+  const std::size_t count =
+      std::size_t(hi->ptr) + grid.grid().voxels_per_block - out.first;
+  VKC_ASSIGN(out.values,
+             read_back<T>(device, allocator, *view.buffer, count, out.first));
+  return out;
+}
+
+// Write `span` back where read_span read it.
+template <typename T>
+vkc::Status write_span(
+    const vkc::Device& device, vkc::Allocator& allocator,
+    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    std::string_view name, const AttributeSpan<T>& span) {
+  VKC_ASSIGN(const auto view, grid.attribute(name));
+  return write_back(device, allocator, *view.buffer, span.values, span.first);
+}
+
+// The voxels of `blocks` in attribute `name`, as elements of T: block i's
+// voxels_per_block elements from element i * voxels_per_block, gathered from
+// their read_span. A test reads the blocks it compares, not the whole heap.
+template <typename T>
+vkc::Result<std::vector<T>> read_blocks(
+    const Gpu& gpu, const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    std::string_view name,
+    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
+  VKC_ASSIGN(const auto span,
+             read_span<T>(gpu.device, gpu.allocator, grid, name, blocks));
+  const auto vpb = static_cast<std::size_t>(grid.grid().voxels_per_block);
+  std::vector<T> out(blocks.size() * vpb);
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const std::size_t at = std::size_t(blocks[i].ptr) - span.first;
+    std::copy_n(span.values.data() + at, vpb, out.data() + i * vpb);
+  }
+  return out;
+}
+
 using BlockCoord = std::tuple<int, int, int>;
 
 // Every active block's coordinate and first voxel (`ptr` is a voxel offset).
@@ -58,42 +128,48 @@ inline vkc::Result<std::map<BlockCoord, std::int32_t>> blocks_of(
 
 namespace detail {
 
-struct GridBlockPair {
-  BlockCoord coord;
-  std::size_t a, b;
+// The blocks two grids share, in coordinate order: a[i] and b[i] are at the
+// same coordinate, whatever slots the GPU gave them.
+struct MatchedBlocks {
+  std::vector<volumetric_kit::recon::volume::BlockIndex> a, b;
 };
 
-inline vkc::Result<std::vector<GridBlockPair>> matching_blocks(
+inline vkc::Result<MatchedBlocks> matching_blocks(
     volumetric_kit::recon::volume::VoxelBlockGrid& a,
     volumetric_kit::recon::volume::VoxelBlockGrid& b) {
-  VKC_ASSIGN(auto ba, blocks_of(a));
-  VKC_ASSIGN(auto bb, blocks_of(b));
-  if (ba.size() != bb.size() ||
+  namespace vol = volumetric_kit::recon::volume;
+  MatchedBlocks m;
+  VKC_ASSIGN(m.a, a.map().compact_active_blocks());
+  VKC_ASSIGN(m.b, b.map().compact_active_blocks());
+  if (m.a.size() != m.b.size() ||
       a.grid().voxels_per_block != b.grid().voxels_per_block) {
     return vkc::Status::invalid_argument("grid shapes differ");
   }
-  std::vector<GridBlockPair> pairs;
-  for (const auto& [coord, ptr] : ba) {
-    const auto other = bb.find(coord);
-    if (other == bb.end()) {
+  const auto by_coord = [](const vol::BlockIndex& x, const vol::BlockIndex& y) {
+    return vol::coord_less(x.coord, y.coord);
+  };
+  std::sort(m.a.begin(), m.a.end(), by_coord);
+  std::sort(m.b.begin(), m.b.end(), by_coord);
+  for (std::size_t i = 0; i < m.a.size(); ++i) {
+    if (m.a[i].coord != m.b[i].coord) {
       return vkc::Status::invalid_argument("grid block sets differ");
     }
-    pairs.push_back({coord, std::size_t(ptr), std::size_t(other->second)});
   }
-  return pairs;
+  return m;
 }
 
-// Match coordinates independently of GPU allocation order. Both comparison
-// paths share this traversal, but choose how many attributes to hold at once.
+// Each voxel of the matched blocks, by its index in both grids' read_blocks.
+// Both comparison paths share this traversal, but choose how many attributes
+// to hold at once.
 template <typename Compare>
-bool compare_voxels(const std::vector<GridBlockPair>& pairs,
-                    std::size_t voxels_per_block, Compare&& compare) {
-  for (const auto& p : pairs) {
+bool compare_voxels(const MatchedBlocks& blocks, std::size_t voxels_per_block,
+                    Compare&& compare) {
+  for (std::size_t i = 0; i < blocks.a.size(); ++i) {
     for (std::size_t k = 0; k < voxels_per_block; ++k) {
-      if (!compare(p.a + k, p.b + k)) {
-        std::fprintf(stderr, "grid voxel %zu differs in (%d, %d, %d)\n", k,
-                     std::get<0>(p.coord), std::get<1>(p.coord),
-                     std::get<2>(p.coord));
+      if (!compare(i * voxels_per_block + k)) {
+        const auto& c = blocks.a[i].coord;
+        std::fprintf(stderr, "grid voxel %zu differs in (%d, %d, %d)\n", k, c.x,
+                     c.y, c.z);
         return false;
       }
     }
@@ -117,19 +193,17 @@ bool compare_grids(const Gpu& gpu,
                    volumetric_kit::recon::volume::VoxelBlockGrid& b,
                    Compare&& compare, std::size_t* observed = nullptr,
                    std::size_t* block_count = nullptr) {
-  auto pairs = detail::matching_blocks(a, b);
-  if (!pairs.ok()) {
+  auto blocks = detail::matching_blocks(a, b);
+  if (!blocks.ok()) {
     std::fprintf(stderr, "compare_grids: %s\n",
-                 pairs.status().message().c_str());
+                 blocks.status().message().c_str());
     return false;
   }
   const char* names[] = {"weight", "tsdf", "color"};
   std::vector<std::uint32_t> wa[3], wb[3];
   for (int n = 0; n < 3; ++n) {
-    auto ra =
-        read_attribute<std::uint32_t>(gpu.device, gpu.allocator, a, names[n]);
-    auto rb =
-        read_attribute<std::uint32_t>(gpu.device, gpu.allocator, b, names[n]);
+    auto ra = read_blocks<std::uint32_t>(gpu, a, names[n], blocks->a);
+    auto rb = read_blocks<std::uint32_t>(gpu, b, names[n], blocks->b);
     if (!ra.ok() || !rb.ok()) {
       std::fprintf(stderr, "compare_grids: no %s attribute\n", names[n]);
       return false;
@@ -139,16 +213,15 @@ bool compare_grids(const Gpu& gpu,
   }
   std::size_t weighted = 0;
   if (!detail::compare_voxels(
-          pairs.value(), a.grid().voxels_per_block,
-          [&](std::size_t ia, std::size_t ib) {
-            const VoxelWords va{wa[0][ia], wa[1][ia], wa[2][ia]};
-            const VoxelWords vb{wb[0][ib], wb[1][ib], wb[2][ib]};
+          blocks.value(), a.grid().voxels_per_block, [&](std::size_t i) {
+            const VoxelWords va{wa[0][i], wa[1][i], wa[2][i]};
+            const VoxelWords vb{wb[0][i], wb[1][i], wb[2][i]};
             weighted += va.weight != 0 ? 1 : 0;
             return compare(va, vb);
           }))
     return false;
   if (observed != nullptr) *observed = weighted;
-  if (block_count != nullptr) *block_count = pairs.value().size();
+  if (block_count != nullptr) *block_count = blocks->a.size();
   return true;
 }
 
@@ -159,34 +232,32 @@ inline bool same_grids(const Gpu& gpu,
                        volumetric_kit::recon::volume::VoxelBlockGrid& b,
                        std::size_t* observed = nullptr,
                        std::size_t* block_count = nullptr) {
-  auto pairs = detail::matching_blocks(a, b);
-  if (!pairs.ok()) {
-    std::fprintf(stderr, "same_grids: %s\n", pairs.status().message().c_str());
+  auto blocks = detail::matching_blocks(a, b);
+  if (!blocks.ok()) {
+    std::fprintf(stderr, "same_grids: %s\n", blocks.status().message().c_str());
     return false;
   }
   const char* names[] = {"weight", "tsdf", "color"};
   std::size_t weighted = 0;
   for (int n = 0; n < 3; ++n) {
-    auto ra =
-        read_attribute<std::uint32_t>(gpu.device, gpu.allocator, a, names[n]);
-    auto rb =
-        read_attribute<std::uint32_t>(gpu.device, gpu.allocator, b, names[n]);
+    auto ra = read_blocks<std::uint32_t>(gpu, a, names[n], blocks->a);
+    auto rb = read_blocks<std::uint32_t>(gpu, b, names[n], blocks->b);
     if (!ra.ok() || !rb.ok()) {
       std::fprintf(stderr, "same_grids: no %s attribute\n", names[n]);
       return false;
     }
-    if (!detail::compare_voxels(pairs.value(), a.grid().voxels_per_block,
-                                [&](std::size_t ia, std::size_t ib) {
+    if (!detail::compare_voxels(blocks.value(), a.grid().voxels_per_block,
+                                [&](std::size_t i) {
                                   if (n == 0)
-                                    weighted += ra.value()[ia] != 0 ? 1 : 0;
-                                  return ra.value()[ia] == rb.value()[ib];
+                                    weighted += ra.value()[i] != 0 ? 1 : 0;
+                                  return ra.value()[i] == rb.value()[i];
                                 })) {
       std::fprintf(stderr, "same_grids: %s differs\n", names[n]);
       return false;
     }
   }
   if (observed != nullptr) *observed = weighted;
-  if (block_count != nullptr) *block_count = pairs.value().size();
+  if (block_count != nullptr) *block_count = blocks->a.size();
   return true;
 }
 
