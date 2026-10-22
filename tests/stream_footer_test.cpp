@@ -63,17 +63,17 @@ stream::Session session_of(std::size_t count) {
 // on track i % `used` (the tracks past `used` stay empty), the n-th of its
 // track a key when n % `key_every` is 0, at pts 1000 + 100 (n / 2) (+ the
 // track), so pairs share a pts, seq n, set i, with a payload of (i * 397) %
-// 1500 bytes.
+// `sizes` bytes.
 bool write_finished(const std::string& path, std::size_t track_count,
                     std::size_t used, std::size_t records,
-                    std::size_t key_every) {
+                    std::size_t key_every, std::size_t sizes = 1500) {
   vkc::Result<std::unique_ptr<stream::StreamWriter>> w =
       stream::StreamWriter::create(path, session_of(track_count));
   if (!w.ok()) return false;
   for (std::size_t i = 0; i < records; ++i) {
     const auto track = static_cast<std::uint16_t>(i % used);
     const std::uint64_t n = i / used;
-    const Bytes p = pattern((i * 397) % 1500, i);
+    const Bytes p = pattern((i * 397) % sizes, i);
     if (!w.value()
              ->append(info(track, n % key_every == 0,
                            1000 + 100 * (n / 2) + track, n, i),
@@ -140,10 +140,15 @@ bool same_records(const vrst::ReadBack& a, const vrst::ReadBack& b) {
   return true;
 }
 
-// Every record's pts, for key_at.
-std::vector<std::uint64_t> all_pts(const vrst::ReadBack& back) {
+// Every record's pts, for key_at; or every `stride`-th record's and the
+// last's.
+std::vector<std::uint64_t> all_pts(const vrst::ReadBack& back,
+                                   std::size_t stride = 1) {
   std::vector<std::uint64_t> pts = {0, ~std::uint64_t{0}};
-  for (const stream::Record& r : back.records) pts.push_back(r.info.pts_ns);
+  for (std::size_t i = 0; i < back.records.size(); i += stride) {
+    pts.push_back(back.records[i].info.pts_ns);
+  }
+  if (!back.records.empty()) pts.push_back(back.records.back().info.pts_ns);
   return pts;
 }
 
@@ -159,19 +164,23 @@ Bytes refooted(const Bytes& file, std::uint64_t index_at,
 
 int footer_equals_scan_case(const std::string& dir) {
   struct Shape {
-    std::size_t tracks, used, records, key_every;
+    std::size_t tracks, used, records, key_every, sizes, stride;
   };
   // Three tracks, one empty, a key in five; one track all keys; no records;
   // and 70,000 keys, over two of the 32,768 key entries the reader reads at a
-  // time.
-  const Shape shapes[] = {
-      {3, 2, 200, 5}, {1, 1, 100, 1}, {2, 2, 0, 1}, {2, 2, 70000, 1}};
+  // time. Those blocks depend on the keys alone, so its payloads are under 8
+  // bytes (every padding still), and key_at is asked at every 97th record's
+  // pts; key is still asked for every key.
+  const Shape shapes[] = {{3, 2, 200, 5, 1500, 1},
+                          {1, 1, 100, 1, 1500, 1},
+                          {2, 2, 0, 1, 1500, 1},
+                          {2, 2, 70000, 1, 8, 97}};
   for (const Shape& shape : shapes) {
     const std::string path = dir + "/same.vrst";
     const std::string cut = dir + "/same_cut.vrst";
     ::unlink(path.c_str());
     CHECK(write_finished(path, shape.tracks, shape.used, shape.records,
-                         shape.key_every));
+                         shape.key_every, shape.sizes));
     const Bytes file = vr_test::read_bytes(path);
     CHECK(vrst::write_bytes(cut, Bytes(file.begin(), file.end() - 40)));
     auto footer = open(path);
@@ -186,7 +195,7 @@ int footer_equals_scan_case(const std::string& dir) {
     const vrst::ReadBack back = vrst::read_all(*footer);
     CHECK(back.records.size() == shape.records);
     CHECK(same_records(back, vrst::read_all(*scan)));
-    CHECK(same_lookups(*footer, *scan, all_pts(back)));
+    CHECK(same_lookups(*footer, *scan, all_pts(back, shape.stride)));
   }
   return 0;
 }
