@@ -7,7 +7,9 @@
 // the frame fits alone, growing one too small exactly once to decode what a
 // roomy grid decodes, returning the second OutOfMemory of a grid one grow
 // leaves too small, timing only the attempt that succeeds, and passing the
-// decoder's refusals through with their codes, ungrown. Skips with no device.
+// decoder's refusals through with their codes, ungrown; and the caller's
+// ceiling, which refuses a forged header, a forged frame and a grow past it
+// with the grid as it was. Skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -16,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "bitstream.hpp"
 #include "codec_fixture.hpp"
 #include "gpu_test.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
@@ -24,12 +27,16 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 
 namespace codec = volumetric_kit::recon::codec;
+namespace d = volumetric_kit::recon::codec::detail;
 using namespace codec_fixture;
 
 namespace {
 
 using Bytes = std::vector<std::uint8_t>;
 using Code = vkc::Status::Code;
+
+// The ceiling the cases pass where they do not test it: far past their frames.
+constexpr std::uint32_t kMaxBlocks = 1u << 20;
 
 // The frames: a small sphere's at its own geometry, and a large sphere's of
 // more blocks than the minimum bucket count holds at half the heap.
@@ -96,23 +103,26 @@ bool has_row(const vkc::StageMetrics& m, const char* name) {
 // The grid from a frame's header: its geometry exactly, 8^3 blocks, the
 // default hash layout with a slot per entry, twice the blocks' buckets at
 // least 1024, float tsdf and weight alone, and no block yet; a frame decodes
-// into it.
+// into it. A ceiling of the frame's own blocks admits it.
 int make_grid_case(Gpu& gpu, const Frames& f) {
   CHECK(f.small_blocks > 32 && f.small_blocks < kMinBucketBlocks);
   CHECK(f.large_blocks > kMinBucketBlocks);
   struct Want {
     const Bytes* frame;
+    std::uint32_t blocks;
     float voxel;
     float trunc;
     std::int32_t buckets;
   };
   const Want wants[] = {
-      {&f.small, kSmallVoxel, kSmallTrunc, kMinBuckets},
-      {&f.large, kVoxel, kTrunc, decode_buckets(f.large_blocks)},
+      {&f.small, f.small_blocks, kSmallVoxel, kSmallTrunc, kMinBuckets},
+      {&f.large, f.large_blocks, kVoxel, kTrunc,
+       decode_buckets(f.large_blocks)},
   };
   for (const Want& want : wants) {
-    vkc::Result<vol::VoxelBlockGrid> grid = codec::make_decode_grid(
-        gpu.device, gpu.allocator, want.frame->data(), want.frame->size());
+    vkc::Result<vol::VoxelBlockGrid> grid =
+        codec::make_decode_grid(gpu.device, gpu.allocator, want.frame->data(),
+                                want.frame->size(), want.blocks);
     CHECK(grid.ok());
     const vol::VoxelGridParams& gp = grid->grid();
     CHECK(gp.voxel_size == want.voxel && gp.trunc_dist == want.trunc);
@@ -133,8 +143,8 @@ int make_grid_case(Gpu& gpu, const Frames& f) {
     CHECK(dec.ok());
     CHECK(dec->decode(want.frame->data(), want.frame->size(), *grid).ok());
   }
-  const vkc::Result<vol::VoxelBlockGrid> cut =
-      codec::make_decode_grid(gpu.device, gpu.allocator, f.small.data(), 10);
+  const vkc::Result<vol::VoxelBlockGrid> cut = codec::make_decode_grid(
+      gpu.device, gpu.allocator, f.small.data(), 10, kMaxBlocks);
   CHECK(cut.status().domain() == Code::InvalidArgument);
   // A header claiming more blocks than any grid holds (block_count, at byte
   // 32) is refused, not built.
@@ -142,8 +152,96 @@ int make_grid_case(Gpu& gpu, const Frames& f) {
   const std::uint32_t all = 0xFFFFFFFFu;
   std::memcpy(most.data() + 32, &all, sizeof all);
   const vkc::Result<vol::VoxelBlockGrid> huge = codec::make_decode_grid(
-      gpu.device, gpu.allocator, most.data(), most.size());
+      gpu.device, gpu.allocator, most.data(), most.size(), kMaxBlocks);
   CHECK(huge.status().domain() == Code::InvalidArgument);
+  return 0;
+}
+
+// A frame of `blocks` blocks that a reader parses up to its block count:
+// `real`'s coding and tables, segments of 1024 blocks, each the shortest
+// stream a reader takes (4 bytes), so 8 bytes carry 1024 blocks.
+vkc::Result<Bytes> forge(const Bytes& real, std::uint32_t blocks) {
+  VKC_ASSIGN(const d::ParsedFrame parsed,
+             d::parse_frame(real.data(), real.size(), kMaxBlocks, nullptr));
+  d::CodedFrame f;
+  f.voxel_size = parsed.header.voxel_size;
+  f.trunc_dist = parsed.header.trunc_dist;
+  f.params = parsed.header.params;
+  f.block_count = blocks;
+  f.segment_size = codec::kMaxDeviceDecodeSegmentSize;
+  f.tables = parsed.tables;
+  const std::uint64_t segments = d::frame_segment_count(blocks, f.segment_size);
+  f.segment_lengths.assign(segments, 4);
+  f.payload.assign(segments * 4, 0);
+  return d::assemble_frame(codec::FrameType::kIntra, f);
+}
+
+// The ceiling, as InvalidArgument (a frame to skip): make_decode_grid refuses
+// a header whose block count its segment table does not carry, and a frame
+// past the ceiling; decode_growing refuses such a frame before it decodes it,
+// and a grow past make_decode_grid's grid for the ceiling before it grows;
+// each leaves the grid's buffers as they were.
+int ceiling_case(Gpu& gpu, const Frames& f) {
+  // A header that claims blocks its segment table does not carry, under the
+  // ceiling.
+  Bytes lying = f.small;
+  const std::uint32_t claimed = 10000;
+  std::memcpy(lying.data() + 32, &claimed, sizeof claimed);
+  CHECK(codec::make_decode_grid(gpu.device, gpu.allocator, lying.data(),
+                                lying.size(), kMaxBlocks)
+            .status()
+            .domain() == Code::InvalidArgument);
+  // A frame one block past the ceiling.
+  CHECK(codec::make_decode_grid(gpu.device, gpu.allocator, f.large.data(),
+                                f.large.size(), f.large_blocks - 1)
+            .status()
+            .domain() == Code::InvalidArgument);
+
+  // A forged frame whose segment table carries its blocks, in fewer bytes
+  // than the small frame's: past the grid's 4096 slots, so the decoder alone
+  // would ask for a grow, and one past the ceiling.
+  constexpr std::uint32_t kForged = 5000;
+  const vkc::Result<Bytes> forged = forge(f.small, kForged);
+  CHECK(forged.ok() && forged->size() < f.small.size());
+  CHECK(codec::make_decode_grid(gpu.device, gpu.allocator, forged->data(),
+                                forged->size(), kForged - 1)
+            .status()
+            .domain() == Code::InvalidArgument);
+  GridShape own;
+  own.voxel_size = kSmallVoxel;
+  own.trunc_dist = kSmallTrunc;
+  vkc::Result<vol::VoxelBlockGrid> grid = make_grid(gpu, own);
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(grid.ok() && dec.ok() &&
+        grid->grid().num_blocks < std::int32_t(kForged));
+  CHECK(codec::decode_growing(*dec, f.small.data(), f.small.size(), *grid,
+                              kForged - 1)
+            .ok());
+  vkc::Result<Snapshot> before = snapshot(gpu, *grid);
+  CHECK(before.ok());
+  const vkc::Status s = codec::decode_growing(
+      *dec, forged->data(), forged->size(), *grid, kForged - 1);
+  CHECK(s.domain() == Code::InvalidArgument);
+  CHECK(grid->grid().num_buckets == own.num_buckets);
+  vkc::Result<Snapshot> after = snapshot(gpu, *grid);
+  CHECK(after.ok() && *after == *before);
+
+  // A sound frame under the ceiling that a grid of about a slot a block, with
+  // one-link chains, cannot place: doubling the grid would pass the slots of
+  // make_decode_grid's grid for the ceiling, the frame's own blocks.
+  GridShape cramped;
+  cramped.num_buckets = std::int32_t(
+      (f.large_blocks + vol::kDefaultBucketSize - 1) / vol::kDefaultBucketSize +
+      1);
+  cramped.max_chain = 1;
+  vkc::Result<vol::VoxelBlockGrid> tight = make_grid(gpu, cramped);
+  CHECK(tight.ok());
+  const vkc::Status g = codec::decode_growing(
+      *dec, f.large.data(), f.large.size(), *tight, f.large_blocks);
+  CHECK(g.domain() == Code::InvalidArgument);
+  CHECK(g.message().find("decode_growing") != std::string::npos);
+  CHECK(tight->grid().num_buckets == cramped.num_buckets);
   return 0;
 }
 
@@ -162,13 +260,13 @@ int grows_once_case(Gpu& gpu, const Frames& f) {
   CHECK(dec.ok());
   vkc::StageMetrics metrics;
   CHECK(codec::decode_growing(*dec, f.small.data(), f.small.size(), *grid,
-                              &metrics)
+                              kMaxBlocks, &metrics)
             .ok());
   CHECK(grid->grid().num_buckets == decode_buckets(f.small_blocks));
   CHECK(has_row(metrics, "codec decode") && has_row(metrics, "  ..inverse"));
 
   vkc::Result<vol::VoxelBlockGrid> roomy = codec::make_decode_grid(
-      gpu.device, gpu.allocator, f.small.data(), f.small.size());
+      gpu.device, gpu.allocator, f.small.data(), f.small.size(), kMaxBlocks);
   CHECK(roomy.ok());
   CHECK(dec->decode(f.small.data(), f.small.size(), *roomy).ok());
   vkc::Result<Snapshot> got = snapshot(gpu, *grid);
@@ -191,8 +289,8 @@ int second_out_of_memory_case(Gpu& gpu, const Frames& f) {
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(dec.ok());
   vkc::StageMetrics metrics;
-  const vkc::Status s = codec::decode_growing(*dec, f.large.data(),
-                                              f.large.size(), *grid, &metrics);
+  const vkc::Status s = codec::decode_growing(
+      *dec, f.large.data(), f.large.size(), *grid, kMaxBlocks, &metrics);
   CHECK(s.domain() == Code::OutOfMemory);
   CHECK(s.message().find("Decoder::decode") != std::string::npos);
   CHECK(grid->grid().num_buckets == decode_buckets(f.large_blocks));
@@ -201,7 +299,8 @@ int second_out_of_memory_case(Gpu& gpu, const Frames& f) {
 }
 
 // A grid the frames fit is never grown: an I-frame, timed, and a P-frame
-// with no metrics, the default.
+// with no metrics, the default. A P-frame builds a grid as an I-frame does,
+// though only a decoder holding its reference decodes it.
 int fits_case(Gpu& gpu) {
   const Sphere a{vr::Vec3f(0.0f), 0.08f};
   const Sphere b{vr::Vec3f(0.02f, 0.0f, 0.0f), 0.08f};
@@ -219,19 +318,28 @@ int fits_case(Gpu& gpu) {
   CHECK(codec::read_frame_info(inter->data(), inter->size())->type ==
         codec::FrameType::kInter);
   vkc::Result<vol::VoxelBlockGrid> grid = codec::make_decode_grid(
-      gpu.device, gpu.allocator, intra->data(), intra->size());
+      gpu.device, gpu.allocator, intra->data(), intra->size(), kMaxBlocks);
   vkc::Result<codec::Decoder> dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(grid.ok() && dec.ok());
   const std::int32_t buckets = grid->grid().num_buckets;
   vkc::StageMetrics metrics;
-  CHECK(
-      codec::decode_growing(*dec, intra->data(), intra->size(), *grid, &metrics)
-          .ok());
+  CHECK(codec::decode_growing(*dec, intra->data(), intra->size(), *grid,
+                              kMaxBlocks, &metrics)
+            .ok());
   CHECK(grid->grid().num_buckets == buckets);
   CHECK(has_row(metrics, "codec decode") && has_row(metrics, "  ..inverse"));
-  CHECK(codec::decode_growing(*dec, inter->data(), inter->size(), *grid).ok());
+  CHECK(codec::decode_growing(*dec, inter->data(), inter->size(), *grid,
+                              kMaxBlocks)
+            .ok());
   CHECK(grid->grid().num_buckets == buckets);
+  vkc::Result<vol::VoxelBlockGrid> from_inter = codec::make_decode_grid(
+      gpu.device, gpu.allocator, inter->data(), inter->size(), kMaxBlocks);
+  vkc::Result<codec::FrameInfo> inter_info =
+      codec::read_frame_info(inter->data(), inter->size());
+  CHECK(from_inter.ok() && inter_info.ok());
+  CHECK(from_inter->grid().num_buckets ==
+        decode_buckets(inter_info->block_count));
   return 0;
 }
 
@@ -251,7 +359,7 @@ int refusals_case(Gpu& gpu, const Frames& f) {
   vkc::Result<Bytes> inter = enc->encode(*ga);
   CHECK(intra.ok() && inter.ok());
   vkc::Result<vol::VoxelBlockGrid> grid = codec::make_decode_grid(
-      gpu.device, gpu.allocator, intra->data(), intra->size());
+      gpu.device, gpu.allocator, intra->data(), intra->size(), kMaxBlocks);
   vkc::Result<codec::Decoder> dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(grid.ok() && dec.ok());
@@ -268,8 +376,8 @@ int refusals_case(Gpu& gpu, const Frames& f) {
   const std::int32_t buckets = grid->grid().num_buckets;
   for (const Refused& r : refusals) {
     vkc::StageMetrics metrics;
-    const vkc::Status s =
-        codec::decode_growing(*dec, r.frame->data(), r.size, *grid, &metrics);
+    const vkc::Status s = codec::decode_growing(*dec, r.frame->data(), r.size,
+                                                *grid, kMaxBlocks, &metrics);
     CHECK(s.domain() == r.code);
     CHECK(grid->grid().num_buckets == buckets && metrics.rows().empty());
     vkc::Result<std::vector<vol::BlockIndex>> active = active_sorted(*grid);
@@ -287,6 +395,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (grows_once_case(gpu, *frames) != 0) return 1;
   if (second_out_of_memory_case(gpu, *frames) != 0) return 1;
   if (fits_case(gpu) != 0) return 1;
+  if (ceiling_case(gpu, *frames) != 0) return 1;
   if (refusals_case(gpu, *frames) != 0) return 1;
   std::printf("codec decode grid: OK\n");
   return 0;

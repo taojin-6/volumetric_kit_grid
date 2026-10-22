@@ -101,7 +101,7 @@ int quantized(uint j) {
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
-  uint entry = pc.block_base + gl_WorkGroupID.x;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup (it depends only on the group id), so every
   // barrier below is still reached by all of this group's lanes or none.
   if (entry >= pc.num_blocks) {

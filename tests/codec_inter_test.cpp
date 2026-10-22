@@ -42,6 +42,7 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 
 #include "gpu_test.hpp"
 
@@ -220,12 +221,11 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
 
 // Every source kind against a held reference, its payload where the device
 // reader leaves it, pads not 0, at K of 1, 21, 64 and 512, with residuals
-// from all of int16 so many wrap; at @p max_blocks_per_dispatch 4, the nine
-// blocks in three dispatches.
-int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
+// from all of int16 so many wrap. gpu_main runs it again at four blocks a
+// dispatch, the nine blocks in three dispatches.
+int apply_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
-      d::ReferenceStore::create(gpu.device, gpu.allocator,
-                                max_blocks_per_dispatch);
+      d::ReferenceStore::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
   CHECK(store.held() == nullptr);
@@ -292,11 +292,11 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
 
 // The slots grow under a held reference, whose words a growing spare never
 // disturbs; and only commit changes what is held, whatever was recorded or
-// refused before it. Seven blocks a dispatch, so 50 blocks take eight
-// dispatches, the last of one block, and 700 take 100.
+// refused before it. gpu_main runs it at seven blocks a dispatch, so 50
+// blocks take eight dispatches, the last of one block, and 700 take 100.
 int grow_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
-      d::ReferenceStore::create(gpu.device, gpu.allocator, 7);
+      d::ReferenceStore::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
   Lcg rng{23};
@@ -1468,9 +1468,12 @@ int diff_refusals_case(Gpu& gpu) {
 }  // namespace
 
 int gpu_main(vr_test::GpuContext& gpu) {
-  if (apply_case(gpu, 0) != 0) return 1;
-  if (apply_case(gpu, 4) != 0) return 1;
+  if (apply_case(gpu) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(4);
+  if (apply_case(gpu) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(7);
   if (grow_case(gpu) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(0);
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
   if (extremes_chain_case(gpu) != 0) return 1;

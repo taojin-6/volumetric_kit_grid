@@ -18,6 +18,7 @@
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/triangle_candidates.hpp"
 
 #include "hash.hpp"
@@ -55,7 +56,11 @@ struct PushConstants {
   VoxelGridParams grid;
   std::uint32_t arg;
   std::uint32_t tick;  // what allocation stamps a block with
+  // The triangle kernel's first work item a dispatch covers
+  // (recon::detail::dispatch_items); the other kernels ignore it.
+  std::uint32_t item_base = 0;
 };
+static_assert(sizeof(PushConstants) == 44, "PushConstants layout drift");
 
 // This tier's local_size, bound once so every call site reads group_count(n).
 std::uint32_t group_count(std::uint32_t items) {
@@ -183,9 +188,8 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
                  allocator, sizeof(std::uint32_t) + sizeof(FrustumPlanes)));
 
   // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
-  // 65535 guaranteed); cache it so every dispatch can reject an over-large
-  // input (an 8K+ depth frame / dense point cloud on a min-spec GPU) as a clean
-  // error.
+  // 65535 guaranteed); cache it for the dispatches that split or refuse past
+  // it (see max_workgroup_count_x_).
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   map.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
@@ -392,11 +396,11 @@ core::Status VoxelHashMap::rebuild_heap_excluding(
 // many new blocks, as depth's first frame does. Already-processed elements
 // take the lock-free fast path on the next round (allocate / depth / points)
 // or are skipped by their done flag (remove), so contention falls and the set
-// converges. A round that failed only on capacity (chain full / heap empty /
-// table full) ends the loop, as insert_block ends its attempts; one with
-// contention as well ends it once the capacity limit stops progress for
-// kStallLimit rounds. Contention alone never does, since another round is
-// what resolves it.
+// converges. A round that hit a capacity limit (chain full / heap low / table
+// full) ends the loop, contention or not: the caller's answer is to grow and
+// dispatch again, and at the limit the contention is mostly threads queued
+// behind the inserts that failed, which another round only repeats.
+// Contention alone never ends it, since another round is what resolves it.
 // Mirrors the prior engine's launchWithRetry.
 //
 // fail_counts_[kFailTotal] is the shared *retryable* tally, split by reason
@@ -416,11 +420,8 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     const std::function<core::Status(core::CommandBatch&)>& dispatches,
     AllocFailures* out_failures,
     const std::function<core::Status(core::CommandBatch&)>& prepare) {
-  constexpr int kStallLimit = 2;  // consecutive no-progress rounds -> give up
   std::uint32_t failures = 0;
   std::uint32_t terminal = 0;
-  std::uint32_t prev_failures = std::numeric_limits<std::uint32_t>::max();
-  int stall = 0;
   for (std::uint32_t round = 0; round < kMaxRounds; ++round) {
     // One submit a round: the call's parameters (the first round only -- they
     // persist), the cleared tally, the dispatch, and the two small results
@@ -444,20 +445,15 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     // no later round can restate it.
     const AllocFailures reported{failures,          slots[kFailLock],
                                  slots[kFailChain], slots[kFailHeap],
-                                 slots[kFailTable], terminal};
+                                 slots[kFailTable], terminal,
+                                 round + 1};
     if (out_failures != nullptr) {
       *out_failures = reported;
     }
-    // Done, or only capacity failures are left: nothing frees a block or a
-    // slot between rounds, so the next would fail them again.
-    if (failures == 0 || reported.lock == 0) {
+    // Only contention is worth another round: nothing frees a block or a slot
+    // between rounds, so a capacity limit would fail again.
+    if (reported.lock == 0 || reported.capacity_limited()) {
       break;
-    }
-    if (failures < prev_failures) {
-      prev_failures = failures;
-      stall = 0;
-    } else if (reported.capacity_limited() && ++stall >= kStallLimit) {
-      break;  // a capacity limit stopped progress; another round cannot help
     }
   }
   return failures + terminal;
@@ -681,13 +677,15 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
   core::Buffer vertex_buf, index_buf, offset_buf;  // alive across every round
 
   // pc.arg is the TRIANGLE count (the kernel's binary-search bound), not the
-  // dispatch width -- the kernel reads that from offsets[pc.arg].
+  // dispatch width -- the kernel reads that from offsets[pc.arg]. A mesh's
+  // candidates can pass 16.7 M, 65535 groups of 256, so they may take several
+  // dispatches.
   const PushConstants push{grid_, triangle_count, tick_};
   return dispatch_with_retry(
       [&](core::CommandBatch& batch) {
-        return batch.dispatch(triangles_, &push, sizeof(push),
-                              group_count(total), max_workgroup_count_x_,
-                              &stage);
+        return recon::detail::dispatch_items(batch, triangles_, push, total,
+                                             kLocalSize, max_workgroup_count_x_,
+                                             &stage);
       },
       out_failures,
       [&](core::CommandBatch& batch) -> core::Status {

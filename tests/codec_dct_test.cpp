@@ -36,6 +36,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -48,7 +49,6 @@ namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
 namespace oracle = codec_oracle;
 using codec::detail::DctTransform;
-using codec::detail::DctTransformConfig;
 using codec_oracle::DctBlocks;
 
 namespace {
@@ -806,17 +806,11 @@ int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
 }
 
 // A list longer than one dispatch's batch runs as several, with the same
-// result -- the path a list past maxComputeWorkGroupCount[0] takes.
+// result -- the path a list past maxComputeWorkGroupCount[0] takes, at three
+// blocks a dispatch here.
 int batching_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  DctTransformConfig small;
-  small.max_blocks_per_dispatch = 3;
-  vkc::Result<std::unique_ptr<DctTransform>> batched_r =
-      DctTransform::create(device, allocator, small);
-  CHECK(batched_r.ok());
-  DctTransform& batched = *batched_r.value();
-
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -836,7 +830,9 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   // the single run: a freed buffer VMA hands straight back still holds the
   // previous run's output, so equality alone passes a batch that wrote
   // nothing past its first entries.
-  CHECK(oracle::forward(ctx, batched, grid, blocks, params, many).ok());
+  vr::detail::set_test_groups_per_dispatch(3);
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, many).ok());
+  vr::detail::set_test_groups_per_dispatch(0);
   int exact = 0;
   int near_half = 0;
   CHECK(check_against_reference(many, content.data(), content.size(), exact,
@@ -861,7 +857,9 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
     }
   }
   put(ctx, grid, "tsdf", tsdf);
-  CHECK(oracle::inverse(ctx, batched, grid, blocks, many).ok());
+  vr::detail::set_test_groups_per_dispatch(3);
+  CHECK(oracle::inverse(ctx, t, grid, blocks, many).ok());
+  vr::detail::set_test_groups_per_dispatch(0);
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     CHECK(read_block(ctx, grid, blocks[i]) == single[i]);
   }
@@ -1344,10 +1342,13 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (batching_case(dev, alloc, t) != 0) return 1;
   if (refusals_case(dev, alloc, t) != 0) return 1;
   if (observed_case(dev, alloc, t) != 0) return 1;
-  auto chunked = DctTransform::create(dev, alloc, DctTransformConfig{2});
+  // Again on fresh scratch, two blocks a dispatch.
+  auto chunked = DctTransform::create(dev, alloc);
   CHECK(chunked.ok());
+  vr::detail::set_test_groups_per_dispatch(2);
   if (observed_case(dev, alloc, *chunked.value()) != 0) return 1;
   if (scratch_reuse_case(dev, alloc, *chunked.value()) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(0);
   if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
   std::printf("codec DctTransform: OK\n");
   return 0;

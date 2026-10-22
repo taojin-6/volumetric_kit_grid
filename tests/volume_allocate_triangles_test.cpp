@@ -13,8 +13,8 @@
 // the truncation band would leave a hole if its vertices were dilated as
 // points, and does not here), that the distance prune actually prunes (a far
 // corner of a slanted triangle's bounding box stays unallocated), idempotent
-// re-run, and the null / degenerate / out-of-range guards. Skips where
-// no device is present.
+// re-run, the same blocks from a dispatch split in four, and the null /
+// degenerate / out-of-range guards. Skips where no device is present.
 
 #include <algorithm>
 #include <cmath>
@@ -30,6 +30,7 @@
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
@@ -199,6 +200,19 @@ int gpu_main(vr_test::GpuContext& gpu) {
     const vr::Vec3i d = vol::world_to_block(v, grid) - centre_block;
     CHECK(std::max({std::abs(d.x), std::abs(d.y), std::abs(d.z)}) > tb);
   }
+
+  // The same triangle's ~970 candidates at one group a dispatch, four
+  // dispatches, allocate the same blocks: the path a mesh with more
+  // candidates than the device's 65535 groups hold takes.
+  CHECK(map.clear().ok());
+  vr::detail::set_test_groups_per_dispatch(1);
+  vkc::Result<std::uint32_t> split =
+      map.allocate_from_triangles(big_verts.data(), 3, big_idx.data(), 1);
+  vr::detail::set_test_groups_per_dispatch(0);
+  CHECK(split.ok() && split.value() == 0);
+  std::set<Coord> split_got;
+  if (collect_active(map, split_got) != 0) return 1;
+  CHECK(split_got == big_got);
 
   // ---- 4. The distance prune prunes ---------------------------------------
   // A triangle in the x=y diagonal plane: its bounding box corners are ~0.42 m

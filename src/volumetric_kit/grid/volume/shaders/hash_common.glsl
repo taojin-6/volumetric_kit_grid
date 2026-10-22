@@ -95,7 +95,7 @@ const int kMaxSpinRetries = 128;
 const int kFailTotal = 0;     // retryable total; drives the retry loop
 const int kFailLock = 1;      // lock contention
 const int kFailChain = 2;     // collision chain full
-const int kFailHeap = 3;      // block heap empty
+const int kFailHeap = 3;      // block heap (too) low
 const int kFailTerminal = 4;  // non-retryable; host accumulates across rounds
 const int kFailTable = 5;     // no free non-anchor slot anywhere in the table
 const int kFailSlots = 6;
@@ -113,6 +113,7 @@ layout(push_constant, scalar) uniform PushConstants {
   uint arg;  // allocate: input coord count; compact: output capacity;
              // depth: the frame's tile count along x.
   uint tick;  // the map's clock, which allocation stamps a block with
+  uint item_base;  // triangles: the first work item this dispatch covers
 } pc;
 #endif
 

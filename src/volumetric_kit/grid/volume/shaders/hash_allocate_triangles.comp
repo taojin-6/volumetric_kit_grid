@@ -55,7 +55,7 @@ layout(set = 0, binding = 6, scalar) readonly buffer Indices { uint indices[]; }
 void main() {
   uint tri_count = pc.arg;  // pc.arg = triangle count
   uint total = vr_tri_offsets[tri_count];
-  uint gid = gl_GlobalInvocationID.x;
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
   if (gid >= total) {
     return;
   }

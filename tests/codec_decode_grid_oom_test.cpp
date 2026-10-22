@@ -25,14 +25,17 @@ namespace {
 using Bytes = std::vector<std::uint8_t>;
 using Code = vkc::Status::Code;
 
+// The decode grid helpers' ceiling: far past these frames.
+constexpr std::uint32_t kMaxBlocks = 1u << 20;
+
 // Capture the diagnostic's allocation by size and call site, so allocations
 // in the driver or validation layer cannot consume the failure.
 int factory_refusal(Gpu& gpu, const std::uint8_t* frame, std::size_t size) {
   auto& failure = vr_test::allocation_failure;
   failure = {};
   failure.measure = true;
-  const auto normal =
-      codec::make_decode_grid(gpu.device, gpu.allocator, frame, size);
+  const auto normal = codec::make_decode_grid(gpu.device, gpu.allocator, frame,
+                                              size, kMaxBlocks);
   failure.measure = false;
   CHECK(normal.status().domain() == Code::InvalidArgument);
   CHECK(failure.bytes != 0 && failure.measured_site != nullptr);
@@ -41,7 +44,8 @@ int factory_refusal(Gpu& gpu, const std::uint8_t* frame, std::size_t size) {
   Code code = Code::Ok;
   bool escaped = false;
   try {
-    code = codec::make_decode_grid(gpu.device, gpu.allocator, frame, size)
+    code = codec::make_decode_grid(gpu.device, gpu.allocator, frame, size,
+                                   kMaxBlocks)
                .status()
                .domain();
   } catch (const std::bad_alloc&) {
@@ -54,8 +58,8 @@ int factory_refusal(Gpu& gpu, const std::uint8_t* frame, std::size_t size) {
                  injected, escaped, static_cast<int>(code));
     return 1;
   }
-  const auto retry =
-      codec::make_decode_grid(gpu.device, gpu.allocator, frame, size);
+  const auto retry = codec::make_decode_grid(gpu.device, gpu.allocator, frame,
+                                             size, kMaxBlocks);
   CHECK(retry.status().domain() == normal.status().domain());
   CHECK(retry.status().message() == normal.status().message());
   return 0;
@@ -63,14 +67,16 @@ int factory_refusal(Gpu& gpu, const std::uint8_t* frame, std::size_t size) {
 
 int factory_case(Gpu& gpu, const Bytes& intra) {
   int failed = factory_refusal(gpu, intra.data(), 10);
-  // The header is readable, but VoxelBlockGrid::create rejects its attribute
-  // sizes. Its diagnostic allocation must be inside the wrapper's boundary.
-  Bytes huge = intra;
-  const std::uint32_t blocks = 0xFFFFFFFFu;
-  std::memcpy(huge.data() + 32, &blocks, sizeof(blocks));
-  failed |= factory_refusal(gpu, huge.data(), huge.size());
-  const auto retry = codec::make_decode_grid(gpu.device, gpu.allocator,
-                                             intra.data(), intra.size());
+  // Readable headers, refused past the ceiling and by the segment table
+  // (block_count, at byte 32). Their diagnostic allocations must be inside
+  // the wrapper's boundary.
+  for (const std::uint32_t blocks : {0xFFFFFFFFu, 10000u}) {
+    Bytes forged = intra;
+    std::memcpy(forged.data() + 32, &blocks, sizeof(blocks));
+    failed |= factory_refusal(gpu, forged.data(), forged.size());
+  }
+  const auto retry = codec::make_decode_grid(
+      gpu.device, gpu.allocator, intra.data(), intra.size(), kMaxBlocks);
   CHECK(retry.ok());
   return failed;
 }
@@ -91,10 +97,12 @@ bool same_metrics(const vkc::StageMetrics& a, const vkc::StageMetrics& b) {
 int metrics_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
                  const Bytes& next) {
   auto grid = codec::make_decode_grid(gpu.device, gpu.allocator, intra.data(),
-                                      intra.size());
+                                      intra.size(), kMaxBlocks);
   auto dec = codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(grid.ok() && dec.ok());
-  CHECK(codec::decode_growing(*dec, intra.data(), intra.size(), *grid).ok());
+  CHECK(
+      codec::decode_growing(*dec, intra.data(), intra.size(), *grid, kMaxBlocks)
+          .ok());
 
   // Existing rows force the successful attempt's merge to allocate beyond
   // anything its own small metrics set needs. The first row already matches
@@ -112,8 +120,8 @@ int metrics_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
   auto& failure = vr_test::allocation_failure;
   failure = {};
   failure.measure = true;
-  const auto normal =
-      codec::decode_growing(*dec, inter.data(), inter.size(), *grid, &measured);
+  const auto normal = codec::decode_growing(*dec, inter.data(), inter.size(),
+                                            *grid, kMaxBlocks, &measured);
   failure.measure = false;
   CHECK(normal.ok());
   CHECK(measured.rows().size() > before.rows().size());
@@ -124,20 +132,22 @@ int metrics_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
   failure = {};
   const auto expected = snapshot(gpu, *grid);
   CHECK(expected.ok());
-  CHECK(codec::decode_growing(*dec, intra.data(), intra.size(), *grid).ok());
+  CHECK(
+      codec::decode_growing(*dec, intra.data(), intra.size(), *grid, kMaxBlocks)
+          .ok());
 
   vkc::StageMetrics metrics = before;
   failure.bytes = bytes;
   failure.site = site;
   failure.armed = true;
-  const auto decoded =
-      codec::decode_growing(*dec, inter.data(), inter.size(), *grid, &metrics);
+  const auto decoded = codec::decode_growing(*dec, inter.data(), inter.size(),
+                                             *grid, kMaxBlocks, &metrics);
   const bool injected = failure.injected;
   failure = {};
   CHECK(injected);
   if (!decoded.ok()) {
-    const auto retry =
-        codec::decode_growing(*dec, inter.data(), inter.size(), *grid);
+    const auto retry = codec::decode_growing(*dec, inter.data(), inter.size(),
+                                             *grid, kMaxBlocks);
     std::fprintf(stderr, "metrics OOM: decode=%d, same-frame retry=%d\n",
                  static_cast<int>(decoded.domain()),
                  static_cast<int>(retry.domain()));
@@ -149,15 +159,18 @@ int metrics_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
 
   // The next P-frame requires the just-committed reference; normal metrics
   // collection also recovers on this call.
-  CHECK(codec::decode_growing(*dec, next.data(), next.size(), *grid, &metrics)
+  CHECK(codec::decode_growing(*dec, next.data(), next.size(), *grid, kMaxBlocks,
+                              &metrics)
             .ok());
   CHECK(metrics.rows().size() == measured.rows().size());
   CHECK(metrics.rows()[0].cpu_ms > before.rows()[0].cpu_ms);
   const auto continued = snapshot(gpu, *grid);
   CHECK(continued.ok());
-  CHECK(codec::decode_growing(*dec, intra.data(), intra.size(), *grid).ok());
-  CHECK(codec::decode_growing(*dec, inter.data(), inter.size(), *grid).ok());
-  CHECK(codec::decode_growing(*dec, next.data(), next.size(), *grid).ok());
+  for (const Bytes* frame : {&intra, &inter, &next}) {
+    CHECK(codec::decode_growing(*dec, frame->data(), frame->size(), *grid,
+                                kMaxBlocks)
+              .ok());
+  }
   const auto reference = snapshot(gpu, *grid);
   CHECK(reference.ok() && *continued == *reference);
   return 0;

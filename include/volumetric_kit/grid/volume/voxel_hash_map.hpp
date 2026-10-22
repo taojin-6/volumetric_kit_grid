@@ -49,7 +49,9 @@ struct AllocFailures {
   std::uint32_t total = 0;  ///< Retryable failures the final round reported.
   std::uint32_t lock = 0;   ///< Lost bucket-lock races: contention, not size.
   std::uint32_t chain = 0;  ///< Collision chain full: a capacity limit.
-  std::uint32_t heap = 0;   ///< Block heap empty: a capacity limit.
+  /// Block heap empty, or below an eighth of the blocks for an insert that
+  /// must overflow its bucket: a capacity limit.
+  std::uint32_t heap = 0;
   /// No free non-anchor slot anywhere in the table: a capacity limit, and a
   /// distinct one. Kept apart from @ref heap because the two are not
   /// interchangeable -- the rehash path presets each block's pointer and never
@@ -68,6 +70,9 @@ struct AllocFailures {
   /// to the free heap is unreachable capacity: neither in the table nor on the
   /// heap. Not resolved by retrying and not fixed by @ref VoxelHashMap::resize.
   std::uint32_t terminal = 0;
+  /// Dispatch rounds the call ran: more than one only while lock contention
+  /// alone was left, never past a capacity limit.
+  std::uint32_t rounds = 0;
 
   /// @return Whether growing the map could help: a genuine capacity limit was
   ///         hit, rather than only transient lock contention.
@@ -641,8 +646,8 @@ class VR_VOLUME_API VoxelHashMap {
   /// Record what @p dispatches records each round, re-dispatching while the
   /// shared `fail_counts_` tally's retryable slot is
   /// non-zero, to converge past transient same-bucket lock contention, until
-  /// only capacity failures are left, a capacity limit stops progress, or the
-  /// rounds run out. Re-zeroes the tally
+  /// a round has no lock failure or hits a capacity limit, or the rounds run
+  /// out. Re-zeroes the tally
   /// each round. The shared tail of every allocate/remove kernel.
   /// The tally's non-retryable slot is accumulated across rounds and added to
   /// the returned count; @p out_failures, when non-null, receives the
@@ -699,7 +704,8 @@ class VR_VOLUME_API VoxelHashMap {
   // valid() is what says that map owns nothing.
   std::uint64_t topology_epoch_ = 0;
   // Cached maxComputeWorkGroupCount[0] -- the device cap on a 1-D dispatch's
-  // groupCountX; every dispatch rejects an input that would exceed it.
+  // groupCountX. allocate_from_triangles splits past it; every other dispatch
+  // rejects an input that would exceed it.
   std::uint32_t max_workgroup_count_x_ = 0;
   // The ceiling on one storage-buffer binding's range, read once at create().
   // The per-call input uploads (a depth frame, a coord or point list) are bound

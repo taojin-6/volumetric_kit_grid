@@ -47,7 +47,7 @@ shared uint s_changed;
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
-  uint entry = pc.block_base + gl_WorkGroupID.x;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup; see dct_forward.comp.
   if (entry >= pc.num_blocks) {
     return;
