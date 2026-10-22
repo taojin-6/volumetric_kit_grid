@@ -240,7 +240,13 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     core::CommandBatch batch(*device_, *allocator_);
     VKC_ASSIGN(const detail::ResidentBlocks blocks,
                store_->record_apply(batch, payload, n, &stage));
-    VKC_TRY(transform_->inverse(batch, grid, blocks, header.params, &stage));
+    VKC_TRY(
+        transform_->record_inverse(batch, grid, blocks, header.params, &stage));
+    std::uint32_t rejected = 0;
+    VKC_TRY(transform_->record_rejected(batch, rejected));
+    VKC_TRY(batch.submit());
+    VKC_TRY(detail::DctTransform::check_rejected("inverse", rejected,
+                                                 blocks.count));
     VKC_TRY(store_->check_apply());
   }
   // Only a decode that succeeded moves the reference.

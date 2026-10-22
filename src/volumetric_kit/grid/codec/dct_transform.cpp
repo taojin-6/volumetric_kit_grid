@@ -430,11 +430,12 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
   return out;
 }
 
-core::Status DctTransform::inverse(core::CommandBatch& batch,
-                                   volume::VoxelBlockGrid& grid,
-                                   const ResidentBlocks& in,
-                                   const CodecParams& params,
-                                   core::GpuStageScope* stage) {
+core::Status DctTransform::record_inverse(core::CommandBatch& batch,
+                                          volume::VoxelBlockGrid& grid,
+                                          const ResidentBlocks& in,
+                                          const CodecParams& params,
+                                          core::GpuStageScope* stage) {
+  inverse_recorded_ = false;
   VKC_ASSIGN(GridViews views, check_inputs("inverse", grid, params));
   if (in.coefficient_count != params.coefficient_count) {
     return fail("inverse", "the blocks hold " +
@@ -452,7 +453,7 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
                                std::to_string(grid.grid().num_blocks) + ")");
   }
   if (in.count == 0) {
-    return batch.submit();
+    return {};
   }
   // Bound where they are, so each must hold the entries the kernel reads.
   const VkDeviceSize n = in.count;
@@ -464,7 +465,6 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
     return fail("inverse", "the resident buffers do not hold " +
                                std::to_string(in.count) + " blocks");
   }
-  std::uint32_t rejected = 0;
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();
   VKC_TRY(record(
@@ -472,9 +472,17 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
       in.coefficients->handle(), in.masks->handle(),
       VkDeviceSize(in.count) * kMaskWordsPerBlock * sizeof(std::uint32_t),
       TrueSdf{}, stage));
-  VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
-  VKC_TRY(batch.submit());
-  return check_rejected("inverse", rejected, in.count);
+  inverse_recorded_ = true;
+  return {};
+}
+
+core::Status DctTransform::record_rejected(core::CommandBatch& batch,
+                                           std::uint32_t& rejected) {
+  rejected = 0;
+  if (!inverse_recorded_) {
+    return {};
+  }
+  return batch.readback(rejected_, 0, sizeof(rejected), &rejected);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

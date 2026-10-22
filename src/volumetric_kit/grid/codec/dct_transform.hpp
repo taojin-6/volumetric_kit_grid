@@ -193,32 +193,47 @@ class VR_CODEC_API DctTransform {
   static core::Status check_rejected(const char* op, std::uint32_t rejected,
                                      std::uint32_t count);
 
-  /// @brief Reconstruct every block of @p in from its coefficients and mask,
-  ///        overwriting its `tsdf` and `weight`, from blocks the device holds
-  ///        (the reference store's apply output), bound where they are and
-  ///        recorded into the caller's @p batch after what it already holds
-  ///        -- that apply -- and submitted with it, so the two share one
-  ///        submit.
+  /// @brief Record the reconstruction of every block of @p in from its
+  ///        coefficients and mask, overwriting its `tsdf` and `weight`, into
+  ///        @p batch after what it already holds -- the reference store's
+  ///        apply, which wrote @p in -- for the caller to submit once it has
+  ///        recorded what reads the blocks next and @ref record_rejected.
   ///
-  /// The list must be duplicate-free, and the coefficients made against the
-  /// grid's `trunc_dist` (both unchecked: they come from a frame whose order
-  /// and header the caller checked). Each entry's coord must be one @p grid
-  /// holds; its ptr is ignored.
-  /// @param batch  Holding what the inverse reads; submitted here once the
-  ///               checks pass (a refusal submits nothing).
-  /// @param grid   As @ref record_forward, written in place.
-  /// @param stage  As @ref record_forward.
-  /// @return OK, @ref record_forward's refusals of @p grid and @p params, or
+  /// Advances the map's tick, which every block the inverse changes is
+  /// stamped with. The list must be duplicate-free, and the coefficients
+  /// made against the grid's `trunc_dist` (both unchecked: they come from a
+  /// frame whose order and header the caller checked). Each entry's coord
+  /// must be one @p grid holds; its ptr is ignored.
+  /// @param batch   The batch to record into; submitted by the caller.
+  /// @param grid    As @ref record_forward, written in place.
+  /// @param in      The blocks, bound where they are; a count of 0 records
+  ///                nothing.
+  /// @param params  Their coefficient count and steps.
+  /// @param stage   As @ref record_forward.
+  /// @return OK, or, before anything is recorded, @ref record_forward's
+  ///         refusals of @p grid and @p params, or
   ///         `Status::Code::InvalidArgument` for blocks holding another K
   ///         than @p params, more blocks than the grid's heap, buffers
   ///         missing or smaller than @p in's count needs, or a P-frame's
-  ///         entries, which are not yet its blocks; a refusal for entries
-  ///         whose coord the grid does not hold comes from the device, after
-  ///         every other entry has been written. Otherwise a buffer or
-  ///         dispatch failure.
-  core::Status inverse(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
-                       const ResidentBlocks& in, const CodecParams& params,
-                       core::GpuStageScope* stage = nullptr);
+  ///         entries, which are not yet its blocks. Otherwise a buffer
+  ///         failure.
+  core::Status record_inverse(core::CommandBatch& batch,
+                              volume::VoxelBlockGrid& grid,
+                              const ResidentBlocks& in,
+                              const CodecParams& params,
+                              core::GpuStageScope* stage = nullptr);
+
+  /// @brief Record the readback of the last @ref record_inverse's reject
+  ///        count -- the entries whose coord the grid does not hold, which
+  ///        it neither read nor wrote -- after what @p batch holds: last, so
+  ///        no copy splits the compute recorded after the inverse.
+  /// @param batch     The inverse's batch.
+  /// @param rejected  Written at submit, for @ref check_rejected; must
+  ///                  outlive it. Set to 0, with nothing recorded, when that
+  ///                  call recorded nothing.
+  /// @return OK, or the batch's refusal.
+  core::Status record_rejected(core::CommandBatch& batch,
+                               std::uint32_t& rejected);
 
   /// @brief Gather the entries of @p list whose block holds an observed
   ///        voxel (`weight >= volume::kObservedWeight`) into
@@ -328,6 +343,9 @@ class VR_CODEC_API DctTransform {
   // Rejected entries followed by the observed count (binding 7), zeroed
   // in each call's batch. Forward/inverse only read the first word back.
   core::Buffer rejected_;
+  // Whether the last record_inverse recorded its dispatches, so
+  // record_rejected has a count to read.
+  bool inverse_recorded_ = false;
   // Scratch stays alive between calls; each binding uses its logical range,
   // not the retained capacity. No allocation when a call fits it.
   core::Buffer observed_blocks_;
