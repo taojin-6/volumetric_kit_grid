@@ -33,8 +33,10 @@ inline constexpr std::chrono::milliseconds kPollSlice{20};
 // writable (TCP_NOTSENT_LOWAT): a viewer takes its next record only below it.
 inline constexpr int kSendLowWater = 128 << 10;
 // A client's receive buffer, set before the connect so the window scale fits
-// it: what a reader that falls behind can hide from the sender's drop rule.
-inline constexpr int kReceiveBuffer = 256 << 10;
+// it: the most a stream carries a round trip, and what a reader that falls
+// behind can hide from the sender's drop rule. Sized for the rig's stream
+// over the VPN (DECISIONS.md, 2026-10-21 networking).
+inline constexpr int kReceiveBuffer = 2 << 20;
 
 // `from` + `limit`, saturating: a limit past the clock's end, as
 // milliseconds::max() ("never"), gives that end; one of 0 or less, `from`.

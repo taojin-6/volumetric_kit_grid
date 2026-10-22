@@ -222,6 +222,33 @@ int gpu_main(vr_test::GpuContext& gpu) {
         vkc::Status::Code::InvalidArgument);
   CHECK(map.check_device_block_list(kept.value(), "test").ok());
 
+  // first_round runs once, and only on a call that accepted its input; its
+  // refusal is the call's, with nothing freed.
+  int calls = 0;
+  const auto counted = [&](vkc::CommandBatch&) -> vkc::Status {
+    ++calls;
+    return {};
+  };
+  CHECK(map.remove(empty, 0, nullptr, counted).ok());
+  CHECK(map.remove(empty, 1, nullptr, counted).status().domain() ==
+        vkc::Status::Code::InvalidArgument);
+  CHECK(calls == 0);
+  CHECK(map.remove(device_list.value(), device_count, nullptr,
+                   [](vkc::CommandBatch&) {
+                     return vkc::Status::unsupported("first round");
+                   })
+            .status()
+            .domain() == vkc::Status::Code::Unsupported);
+  vkc::Result<std::set<Coord>> refused = active_set(map);
+  CHECK(refused.ok() && refused.value() == want_all);
+  device_removed =
+      map.remove(device_list.value(), device_count, nullptr, counted);
+  CHECK(device_removed.ok() && device_removed.value() == 0);
+  CHECK(calls == 1);
+  device_survivors = active_set(map);
+  CHECK(device_survivors.ok() &&
+        device_survivors.value() == after_remove.value());
+
   // Thousands of blocks freed in one call all go back to the heap, and are
   // drawn off it again with no pass calling a half-free heap empty. A capped
   // compare-and-swap loop lost about 960 of 2 048 removed blocks for good, and
@@ -318,12 +345,22 @@ int gpu_main(vr_test::GpuContext& gpu) {
       return left == 0;
     };
     CHECK(settle(false));
+    auto listed =
+        vr_test::upload_device_buffer(gpu.device, gpu.allocator, coords.data(),
+                                      coords.size() * sizeof(vol::BlockIndex));
+    CHECK(listed.ok());
     vol::AllocFailures failures{};
+    int first_rounds = 0;
     vkc::Result<std::uint32_t> left =
-        vr_test::remove_blocks(gpu, tight, coords, &failures);
+        tight.remove(listed.value(), std::uint32_t(coords.size()), &failures,
+                     [&](vkc::CommandBatch&) -> vkc::Status {
+                       ++first_rounds;
+                       return {};
+                     });
     CHECK(left.ok());
     CHECK(failures.lock == left.value());
     CHECK(failures.terminal == 0);
+    CHECK(first_rounds == 1);  // however many rounds the contention took
     // Nothing was lost: the blocks still allocated remove, and free the heap.
     CHECK(settle(true));
     vkc::Result<float> occupancy = tight.load_factor();

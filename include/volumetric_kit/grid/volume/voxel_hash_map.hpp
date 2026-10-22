@@ -109,6 +109,20 @@ struct DeviceBlockList {
   std::uint32_t heap_free = 0;
 };
 
+/// @brief A compaction recorded into a caller's batch
+///        (@ref VoxelHashMap::record_compaction): the list and its count stay
+///        on the device, for the batch's later commands to read and to size a
+///        dispatch from.
+///
+/// Borrowed from the map, and good only in that batch: the map's next
+/// compaction rewrites both.
+struct RecordedBlockList {
+  /// The listed @ref BlockIndex entries, at most the map's `num_blocks`.
+  const core::Buffer* buffer = nullptr;
+  /// One `uint32_t`: how many entries @ref buffer lists.
+  const core::Buffer* count = nullptr;
+};
+
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
 ///        pipelines that operate on them, and drives block allocation and
@@ -253,11 +267,17 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param out_failures  As @ref allocate_from_depth, over every frame.
   /// @param metrics       As @ref allocate_from_depth: one `"allocate"` row,
   ///                      a device span per frame per round.
+  /// @param then          Optional: recorded into the first round's batch
+  ///                      after its dispatches and readbacks, so a caller's
+  ///                      work on the new blocks shares the round's submit.
+  ///                      With it the call runs that one round and no retry.
+  ///                      Not called when no frame has pixels.
   /// @return As @ref allocate_from_depth, the failures summed over the frames.
   core::Result<std::uint32_t> allocate_from_depth(
       const std::vector<DepthInput>& frames,
       AllocFailures* out_failures = nullptr,
-      core::StageMetrics* metrics = nullptr);
+      core::StageMetrics* metrics = nullptr,
+      const std::function<core::Status(core::CommandBatch&)>& then = {});
 
   // TODO(volume): the candidate count is a host pass over the triangles, as
   // in tsdf's MeshIntegrator (the 2026-10-13 volume block-list entry's Next).
@@ -317,6 +337,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional: receives the per-reason split (see
   ///                      @ref AllocFailures). Untouched when null.
+  /// @param first_round   Optional: records into the first round's batch,
+  ///                      once the input is accepted and ahead of the
+  ///                      removal, so it runs in the same submit before any
+  ///                      index is freed; @ref VoxelBlockGrid::remove zeroes
+  ///                      the blocks there.
   /// @warning This frees the block index but does **not** clear the per-voxel
   ///          attribute data it addressed -- the block index does not know what
   ///          attributes, if any, a consumer declared. The free heap is LIFO,
@@ -334,9 +359,10 @@ class VR_VOLUME_API VoxelHashMap {
   ///         kept through every round (@ref AllocFailures::lock), which are
   ///         still in the table: call again to remove them. An empty, refused
   ///         or zero-count call leaves @ref topology_epoch unchanged.
-  core::Result<std::uint32_t> remove(const core::Buffer& coords,
-                                     std::uint32_t count,
-                                     AllocFailures* out_failures = nullptr);
+  core::Result<std::uint32_t> remove(
+      const core::Buffer& coords, std::uint32_t count,
+      AllocFailures* out_failures = nullptr,
+      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
 
   // TODO(volume): a bulk readback; its callers are the remesh-report example
   // and resize's snapshot (the 2026-10-13 volume block-list entry's Next).
@@ -425,6 +451,26 @@ class VR_VOLUME_API VoxelHashMap {
       const std::vector<FrustumPlanes>& frusta,
       core::StageMetrics* metrics = nullptr);
 
+  /// @brief Record a compaction into @p batch, its list and count left on the
+  ///        device for the commands recorded after it: the active blocks
+  ///        inside any of @p frusta, kept as
+  ///        @ref compact_active_blocks_in_frusta_on_device keeps them, or
+  ///        every active block when @p frusta is null.
+  ///
+  /// Nothing reaches the host, so a dispatch sized from the count follows in
+  /// the same submit (`tsdf::TsdfIntegrator` fuses this way). A list from the
+  /// on-device compaction of the same kind no longer holds.
+  /// @param batch   Records the compaction.
+  /// @param frusta  The frusta, none keeping no block; or null.
+  /// @param stage   Optional span around the dispatch; open until @p batch is
+  ///                submitted.
+  /// @return The list; or `Status::Code::InvalidArgument` as
+  ///         @ref compact_active_blocks_in_frusta_on_device refuses; or the
+  ///         batch's refusal.
+  core::Result<RecordedBlockList> record_compaction(
+      core::CommandBatch& batch, const std::vector<FrustumPlanes>* frusta,
+      core::GpuStageScope* stage = nullptr);
+
   /// @brief Reset the table to empty (re-runs the init kernel).
   /// @return An OK `Status`, or a non-OK one if the init dispatch fails or
   ///         the map is moved-from.
@@ -509,6 +555,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The occupancy in `[0, 1]`, or a non-OK `Status` if the map is
   ///         moved-from.
   core::Result<float> load_factor() const;
+
+  /// @return The blocks the map holds, `num_blocks` less the free ones: the
+  ///         host's copy of the heap counter @ref load_factor reads, exact
+  ///         where that fraction rounds. 0 on an empty or moved-from map.
+  std::uint32_t allocated_blocks() const noexcept;
 
   /// @brief The @ref load_factor a caller should grow at rather than run past.
   ///
@@ -619,13 +670,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// when non-null, collects the dispatch's device span.
   core::Result<std::vector<BlockIndex>> collect_compacted(
       core::GpuStageScope* stage);
-  /// The compaction into @p out, the buffer @p kernel writes, in one submit,
-  /// returning the count and reading the list's first @p head_count entries
-  /// back into @p head.
+  /// @ref record_compaction in a submit of its own, returning the count and
+  /// reading the list's first @p head_count entries back into @p head.
   core::Result<std::uint32_t> compact_into_device_list(
-      const core::ComputeKernel& kernel, const core::Buffer& out,
-      core::GpuStageScope* stage,
-      const std::function<core::Status(core::CommandBatch&)>& prepare = {},
+      const std::vector<FrustumPlanes>* frusta, core::GpuStageScope* stage,
       BlockIndex* head = nullptr, std::uint32_t head_count = 0);
   /// Record into @p batch the upload of @p count frusta into
   /// @ref frustum_planes_ -- the count, then the planes from byte 4, the
@@ -659,10 +707,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// @p prepare, when set, records the call's parameter uploads into the first
   /// round's batch, ahead of the dispatches. Each round is one submit, and
   /// reads back the heap counter into @ref heap_free_ beside the tally.
+  /// @p then, when set, is recorded last in the first round's batch, and that
+  /// round is the only one.
   core::Result<std::uint32_t> dispatch_with_retry(
       const std::function<core::Status(core::CommandBatch&)>& dispatches,
       AllocFailures* out_failures,
-      const std::function<core::Status(core::CommandBatch&)>& prepare = {});
+      const std::function<core::Status(core::CommandBatch&)>& prepare = {},
+      const std::function<core::Status(core::CommandBatch&)>& then = {});
 
   /// Create a transient device-local buffer that @p batch fills with @p bytes
   /// of @p data, and bind it at @p binding of @p set. The caller keeps the
@@ -680,12 +731,14 @@ class VR_VOLUME_API VoxelHashMap {
   /// via @ref dispatch_with_retry.
   /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
   /// moves @ref topology_epoch once the input is accepted, and binds a zeroed
-  /// flag per element at binding 6, which the kernel sets on each coord it
-  /// finishes so later rounds skip it.
+  /// flag per element at binding 6 (@ref remove_done_), which the kernel sets
+  /// on each coord it finishes so later rounds skip it. @p first_round, when
+  /// set, records last into the first round's batch, ahead of the dispatch.
   core::Result<std::uint32_t> run_input_kernel(
       const char* op, const core::StorageInput& input, std::size_t elem_size,
       std::uint32_t count, const core::ComputeKernel& kernel,
-      AllocFailures* out_failures, bool removes = false);
+      AllocFailures* out_failures, bool removes = false,
+      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and
@@ -722,6 +775,9 @@ class VR_VOLUME_API VoxelHashMap {
   // fail-counts and the compaction counter are fixed; the compaction output
   // tracks num_blocks, so resize() grows it with the rest.
   core::Buffer fail_counts_;
+  // remove's per-coord done flags, retained scratch grown to the largest
+  // count yet and re-zeroed per call.
+  core::Buffer remove_done_;
   core::Buffer compacted_;
   // The frustum compactions' output, so they leave compacted_'s list holding.
   core::Buffer frustum_compacted_;

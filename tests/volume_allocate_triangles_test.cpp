@@ -13,8 +13,10 @@
 // the truncation band would leave a hole if its vertices were dilated as
 // points, and does not here), that the distance prune actually prunes (a far
 // corner of a slanted triangle's bounding box stays unallocated), idempotent
-// re-run, the same blocks from a dispatch split in four, and the null /
-// degenerate / out-of-range guards. Skips where no device is present.
+// re-run, the same blocks from a dispatch split in four, the same blocks from
+// a fine mesh in one call as from its triangles a call each, every band block
+// of a sliver that crowds one workgroup, and the null / degenerate /
+// out-of-range guards. Skips where no device is present.
 
 #include <algorithm>
 #include <cmath>
@@ -33,6 +35,7 @@
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/recon/volume/triangle_candidates.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
@@ -270,6 +273,70 @@ int gpu_main(vr_test::GpuContext& gpu) {
   std::set<Coord> odd_got;
   if (collect_active(map, odd_got) != 0) return 1;
   CHECK(odd_got.empty());
+
+  // ---- 6. A workgroup asks for each block once, and loses none -------------
+  // A curved sheet of 200 triangles 10 mm a side: each names a few dozen
+  // candidate blocks, most of which its neighbours in the same workgroup name
+  // too. A triangle a call names each of its blocks once, so the union of
+  // those calls is every block that passes the band test with nothing
+  // de-duplicated: exactly what the whole sheet in one call must allocate.
+  constexpr int kSide = 10;
+  std::vector<vr::Vec3f> sheet_verts;
+  for (int j = 0; j <= kSide; ++j) {
+    for (int i = 0; i <= kSide; ++i) {
+      const float x = 0.01f * float(i) + 0.003f;
+      const float y = 0.01f * float(j) + 0.007f;
+      sheet_verts.push_back({x, y, 3.0f * (x * x + y * y) + 0.011f});
+    }
+  }
+  std::vector<std::uint32_t> sheet_idx;
+  for (std::uint32_t j = 0; j < kSide; ++j) {
+    for (std::uint32_t i = 0; i < kSide; ++i) {
+      const std::uint32_t a = j * (kSide + 1) + i;
+      sheet_idx.insert(sheet_idx.end(), {a, a + 1, a + kSide + 2, a,
+                                         a + kSide + 2, a + kSide + 1});
+    }
+  }
+  const auto sheet_vertex_count =
+      static_cast<std::uint32_t>(sheet_verts.size());
+  for (std::size_t t = 0; t < sheet_idx.size(); t += 3) {
+    vkc::Result<std::uint32_t> one = map.allocate_from_triangles(
+        sheet_verts.data(), sheet_vertex_count, sheet_idx.data() + t, 1);
+    CHECK(one.ok() && one.value() == 0);
+  }
+  std::set<Coord> per_triangle;
+  if (collect_active(map, per_triangle) != 0) return 1;
+  CHECK(map.clear().ok());
+  vkc::Result<std::uint32_t> sheet = map.allocate_from_triangles(
+      sheet_verts.data(), sheet_vertex_count, sheet_idx.data(),
+      static_cast<std::uint32_t>(sheet_idx.size() / 3));
+  CHECK(sheet.ok() && sheet.value() == 0);
+  std::set<Coord> sheet_got;
+  if (collect_active(map, sheet_got) != 0) return 1;
+  CHECK(sheet_got == per_triangle);
+  for (const Coord& c : blocks_within_band(grid, sheet_verts, sheet_idx)) {
+    CHECK(sheet_got.count(c) == 1);
+  }
+  // A tall sliver: its 216 candidates, distinct blocks stacked in columns,
+  // crowd one workgroup's set, so probes run on past other blocks' slots,
+  // among them their column's neighbours. None may be taken for the lane's
+  // own block.
+  CHECK(map.clear().ok());
+  const std::vector<vr::Vec3f> sliver_verts = {{0.011f, 0.013f, 0.007f},
+                                               {0.063f, 0.017f, 0.009f},
+                                               {0.019f, 0.021f, 0.611f}};
+  const std::vector<std::uint32_t> sliver_idx = {0, 1, 2};
+  vkc::Result<std::uint32_t> sliver =
+      map.allocate_from_triangles(sliver_verts.data(), 3, sliver_idx.data(), 1);
+  CHECK(sliver.ok() && sliver.value() == 0);
+  CHECK(vol::triangle_candidate_offsets(grid, sliver_verts.data(), 3,
+                                        sliver_idx.data(), 1, "sliver")
+            .value()[1] == 216);
+  std::set<Coord> sliver_got;
+  if (collect_active(map, sliver_got) != 0) return 1;
+  for (const Coord& c : blocks_within_band(grid, sliver_verts, sliver_idx)) {
+    CHECK(sliver_got.count(c) == 1);
+  }
 
   std::printf("volume_allocate_triangles: OK\n");
   return 0;

@@ -328,24 +328,26 @@ core::Result<std::uint32_t> VoxelBlockGrid::remove(
                                            bytes));
   VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
                                            bytes, max_storage_buffer_range_));
-  core::CommandBatch batch(*device_, *allocator_);
-  return zero_and_remove(batch, coords, count, out_failures, nullptr);
+  return zero_and_remove(coords, count, out_failures, nullptr);
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
-    core::CommandBatch& batch, const core::Buffer& list, std::uint32_t count,
-    AllocFailures* out_failures, core::GpuStageScope* stage) {
-  if (!attributes_.empty()) {
-    // The zero kernel finds each coord's block in the table itself, so this
-    // costs the count, not the grid.
-    VKC_TRY(prepare_block_kernels());
-    VKC_TRY(record_zero(batch, list, count, stage));
-  }
-  VKC_TRY(batch.submit());
+    const core::Buffer& list, std::uint32_t count, AllocFailures* out_failures,
+    core::GpuStageScope* stage) {
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
   // actually freed -- so there is nothing to bump here, and no way for the raw
   // map() path to skip it (see VoxelHashMap::topology_epoch).
-  return map_.remove(list, count, out_failures);
+  if (attributes_.empty()) {
+    return map_.remove(list, count, out_failures);
+  }
+  // The zero kernel finds each coord's block in the table itself, so this
+  // costs the count, not the grid. It rides the map's first round, ahead of
+  // the delete in the same submit, so every block is zeroed before its index
+  // is freed.
+  VKC_TRY(prepare_block_kernels());
+  return map_.remove(list, count, out_failures, [&](core::CommandBatch& batch) {
+    return record_zero(batch, list, count, stage);
+  });
 }
 
 core::Status VoxelBlockGrid::clear() {
@@ -464,9 +466,8 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
   // Both zeroing and deletion consume the device list the stamp pass wrote.
   // Only the small stale/failure counts reach the host; the coordinates never
   // make a round trip through a host vector and a second device allocation.
-  core::CommandBatch batch(*device_, *allocator_);
   VKC_ASSIGN(const std::uint32_t failed,
-             zero_and_remove(batch, stale_list_, stale, nullptr, &stage));
+             zero_and_remove(stale_list_, stale, nullptr, &stage));
   return stale - std::min(failed, stale);
 }
 

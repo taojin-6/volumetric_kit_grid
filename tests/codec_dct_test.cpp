@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -1272,7 +1273,8 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
 
 // The inverse stamps changed only on a block it leaves different, as the
 // integrator does, so decoding a block's last frame again leaves it
-// unstamped.
+// unstamped. It writes only voxels whose bits differ, yet leaves every block
+// bit for bit as decoded: a -0.0 where it decodes 0.0 is rewritten, unstamped.
 int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
                         DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
@@ -1282,9 +1284,10 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
+  // Block 2 unobserved, so it decodes to zeros alone.
   for (std::size_t i = 0; i < 3; ++i) {
     write_block(ctx, grid, blocks[i], random_cube(500u + std::uint32_t(i)),
-                observed);
+                [i](std::uint32_t v) { return i < 2 ? observed(v) : 0.0f; });
   }
   DctBlocks out;
   CHECK(oracle::forward(ctx, t, grid, blocks, codec::CodecParams{}, out).ok());
@@ -1311,9 +1314,40 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   moved.coefficients[out.params.coefficient_count] = static_cast<std::int16_t>(
       moved.coefficients[out.params.coefficient_count] + 1);
   CHECK(oracle::inverse(ctx, t, grid, blocks, moved).ok());
+  const std::uint32_t second = grid.map().tick();
   CHECK(changed(0) == first);
-  CHECK(changed(1) == grid.map().tick());
+  CHECK(changed(1) == second);
   CHECK(changed(2) == first);
+
+  // Every 0.0 of the grid made -0.0: equal as values, so nothing is stamped,
+  // but rewritten, so the arrays end bit for bit as the decode left them.
+  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  const std::vector<float> weight = attr(ctx, grid, "weight");
+  auto negate_zeros = [](std::vector<float> a) {
+    for (float& x : a) {
+      if (x == 0.0f) x = -0.0f;
+    }
+    return a;
+  };
+  put(ctx, grid, "tsdf", negate_zeros(tsdf));
+  put(ctx, grid, "weight", negate_zeros(weight));
+  CHECK(oracle::inverse(ctx, t, grid, blocks, moved).ok());
+  CHECK(changed(0) == first);
+  CHECK(changed(1) == second);
+  CHECK(changed(2) == first);
+  const std::vector<float> tsdf_after = attr(ctx, grid, "tsdf");
+  const std::vector<float> weight_after = attr(ctx, grid, "weight");
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    // Block 2 held -0.0 in every voxel.
+    const std::size_t i = std::size_t(blocks[2].ptr) + v;
+    CHECK(!std::signbit(tsdf_after[i]) && !std::signbit(weight_after[i]));
+  }
+  for (const vol::BlockIndex& b : blocks) {
+    const std::size_t at = std::size_t(b.ptr);
+    CHECK(std::memcmp(&tsdf_after[at], &tsdf[at], kVpb * sizeof(float)) == 0);
+    CHECK(std::memcmp(&weight_after[at], &weight[at], kVpb * sizeof(float)) ==
+          0);
+  }
   return 0;
 }
 
