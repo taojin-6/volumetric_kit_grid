@@ -616,7 +616,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     vkc::Result<codec::Decoder> dec =
         codec::Decoder::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> alone = codec::make_decode_grid(
-        gpu.device, gpu.allocator, payload.data(), payload.size());
+        gpu.device, gpu.allocator, payload.data(), payload.size(),
+        static_cast<std::uint32_t>(fresh->grid().num_blocks));
     CHECK(dec.ok() && alone.ok());
     CHECK(dec->decode(payload.data(), payload.size(), *alone).ok());
     vkc::Result<std::vector<vol::BlockIndex>> decoded =

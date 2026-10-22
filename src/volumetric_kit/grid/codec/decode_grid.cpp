@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <string>
 #include <utility>
 
+#include "bitstream.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/recon/volume/grid_growth.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -30,12 +32,34 @@ std::int32_t decode_buckets(std::uint32_t blocks) {
       need, kMinBuckets, std::numeric_limits<std::int32_t>::max() / kBucket));
 }
 
+// The caller's ceiling on a frame's blocks, refused as a frame to skip.
+core::Status check_ceiling(const char* who, std::uint32_t blocks,
+                           std::uint32_t max_blocks) {
+  if (blocks <= max_blocks) return {};
+  return core::Status::invalid_argument(
+      std::string(who) + ": the frame holds " + std::to_string(blocks) +
+      " blocks, more than the caller's ceiling of " +
+      std::to_string(max_blocks));
+}
+
 }  // namespace
 
 core::Result<volume::VoxelBlockGrid> make_decode_grid(
     core::Device& device, core::Allocator& allocator, const std::uint8_t* frame,
-    std::size_t size) try {
+    std::size_t size, std::uint32_t max_blocks) try {
   VKC_ASSIGN(const FrameInfo info, read_frame_info(frame, size));
+  VKC_TRY(check_ceiling("make_decode_grid", info.block_count, max_blocks));
+  // The block count against the segment table, as the decoder parses the
+  // frame. A sound P-frame stops at the reference only a decoder holds
+  // (NotFound); anything else is the decoder's refusal of the frame.
+  {
+    const core::Result<detail::ParsedFrame> parsed =
+        detail::parse_frame(frame, size, info.block_count, nullptr);
+    if (!parsed.ok() &&
+        parsed.status().domain() != core::Status::Code::NotFound) {
+      return parsed.status();
+    }
+  }
   volume::VoxelGridParams grid{};
   grid.voxel_size = info.voxel_size;
   grid.block_size = kBlockSize;
@@ -55,7 +79,10 @@ core::Result<volume::VoxelBlockGrid> make_decode_grid(
 
 core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
                             std::size_t size, volume::VoxelBlockGrid& grid,
+                            std::uint32_t max_blocks,
                             core::StageMetrics* metrics) try {
+  VKC_ASSIGN(const FrameInfo info, read_frame_info(frame, size));
+  VKC_TRY(check_ceiling("decode_growing", info.block_count, max_blocks));
   int contended = 0;
   bool grown = false;
   for (;;) {
@@ -78,9 +105,23 @@ core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
     }
     if (s.domain() == core::Status::Code::OutOfMemory) {
       if (grown) return s;
-      // The decoder read this header before any OutOfMemory.
-      VKC_ASSIGN(const FrameInfo info, read_frame_info(frame, size));
-      VKC_TRY(volume::grow_grid(grid, decode_buckets(info.block_count)));
+      // grow_grid's target, in slots, against make_decode_grid's grid for
+      // the ceiling.
+      const std::int32_t at_least = decode_buckets(info.block_count);
+      const volume::VoxelGridParams& gp = grid.grid();
+      const std::int64_t slots =
+          std::int64_t(gp.bucket_size) *
+          std::max<std::int64_t>(2 * std::int64_t(gp.num_buckets), at_least);
+      const std::int64_t ceiling =
+          std::int64_t(volume::kDefaultBucketSize) * decode_buckets(max_blocks);
+      if (slots > ceiling) {
+        return core::Status::invalid_argument(
+            "decode_growing: growing the grid to " + std::to_string(slots) +
+            " slots would pass the " + std::to_string(ceiling) +
+            " the caller's ceiling of " + std::to_string(max_blocks) +
+            " blocks allows (" + s.message() + ")");
+      }
+      VKC_TRY(volume::grow_grid(grid, at_least));
       grown = true;
     } else if (s.domain() != core::Status::Code::IoError ||
                ++contended > kContendedRetries) {
