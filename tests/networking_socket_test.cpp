@@ -199,13 +199,15 @@ int unacknowledged_case() {
   vkc::Result<std::size_t> held =
       detail::unacknowledged("test", c.accepted.get());
   CHECK(held.ok() && *held == 0);
-  // Sent until the socket takes no more, even after a pause: past what the
-  // peer can hold.
+  // Sent until the socket takes no more and, after a pause, holds bytes the
+  // peer has not taken in: past what the peer can hold. A socket can stop
+  // taking with all it sent taken in, the last of it not yet acknowledged,
+  // as when the peer's buffer is just full; it takes more once acknowledged.
   const std::vector<std::uint8_t> bytes(std::size_t{1} << 20, 7);
   std::size_t sent = 0;
-  const Clock::time_point end = Clock::now() + 2s;
-  for (bool took = true; took && Clock::now() < end;) {
-    took = false;
+  const Clock::time_point end = Clock::now() + 4s;
+  for (bool full = false; !full && Clock::now() < end;) {
+    bool took = false;
     for (;;) {
       const vkc::Result<std::size_t> n = detail::send_some(
           "test", c.accepted.get(), bytes.data(), bytes.size());
@@ -215,16 +217,11 @@ int unacknowledged_case() {
       took = true;
     }
     std::this_thread::sleep_for(20ms);
-  }
-  // The peer may acknowledge late: wait until the two sides agree.
-  const Clock::time_point settled = Clock::now() + 2s;
-  for (;;) {
-    held = detail::unacknowledged("test", c.accepted.get());
-    CHECK(held.ok());
-    if (*held + unread(c.client.get()) == sent || Clock::now() >= settled) {
-      break;
+    if (!took) {
+      held = detail::unacknowledged("test", c.accepted.get());
+      CHECK(held.ok());
+      full = *held > 0 && *held + unread(c.client.get()) == sent;
     }
-    std::this_thread::sleep_for(10ms);
   }
   CHECK(*held > 0 && *held + unread(c.client.get()) == sent);
 
