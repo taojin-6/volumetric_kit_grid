@@ -51,15 +51,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define VR_TEST_SANITIZED 1
-#endif
-#endif
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define VR_TEST_SANITIZED 1
-#endif
-
 #include "networking_loopback.hpp"
 #include "scratch_dir.hpp"
 #include "stream_files.hpp"
