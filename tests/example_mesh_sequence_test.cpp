@@ -571,7 +571,7 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   CHECK(coder.rows().size() == 3);
   // The player holds frame 7's blocks, no more.
   vkc::Result<std::vector<vol::BlockIndex>> played =
-      codec_fixture::active_sorted(coder.player());
+      codec_fixture::active_sorted(*coder.player());
   CHECK(played.ok() && played->size() == coder.rows()[2].blocks);
 
   vkc::Result<std::unique_ptr<stream::StreamReader>> opened =
