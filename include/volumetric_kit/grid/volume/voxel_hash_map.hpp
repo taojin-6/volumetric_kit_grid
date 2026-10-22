@@ -704,7 +704,8 @@ class VR_VOLUME_API VoxelHashMap {
   // valid() is what says that map owns nothing.
   std::uint64_t topology_epoch_ = 0;
   // Cached maxComputeWorkGroupCount[0] -- the device cap on a 1-D dispatch's
-  // groupCountX; every dispatch rejects an input that would exceed it.
+  // groupCountX. allocate_from_triangles splits past it; every other dispatch
+  // rejects an input that would exceed it.
   std::uint32_t max_workgroup_count_x_ = 0;
   // The ceiling on one storage-buffer binding's range, read once at create().
   // The per-call input uploads (a depth frame, a coord or point list) are bound

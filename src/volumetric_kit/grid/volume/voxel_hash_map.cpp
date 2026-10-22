@@ -18,6 +18,7 @@
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/triangle_candidates.hpp"
 
 #include "hash.hpp"
@@ -55,7 +56,11 @@ struct PushConstants {
   VoxelGridParams grid;
   std::uint32_t arg;
   std::uint32_t tick;  // what allocation stamps a block with
+  // The triangle kernel's first work item a dispatch covers
+  // (recon::detail::dispatch_items); the other kernels ignore it.
+  std::uint32_t item_base = 0;
 };
+static_assert(sizeof(PushConstants) == 44, "PushConstants layout drift");
 
 // This tier's local_size, bound once so every call site reads group_count(n).
 std::uint32_t group_count(std::uint32_t items) {
@@ -673,13 +678,15 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
   core::Buffer vertex_buf, index_buf, offset_buf;  // alive across every round
 
   // pc.arg is the TRIANGLE count (the kernel's binary-search bound), not the
-  // dispatch width -- the kernel reads that from offsets[pc.arg].
+  // dispatch width -- the kernel reads that from offsets[pc.arg]. A mesh's
+  // candidates can pass 16.7 M, 65535 groups of 256, so they may take several
+  // dispatches.
   const PushConstants push{grid_, triangle_count, tick_};
   return dispatch_with_retry(
       [&](core::CommandBatch& batch) {
-        return batch.dispatch(triangles_, &push, sizeof(push),
-                              group_count(total), max_workgroup_count_x_,
-                              &stage);
+        return recon::detail::dispatch_items(batch, triangles_, push, total,
+                                             kLocalSize, max_workgroup_count_x_,
+                                             &stage);
       },
       out_failures,
       [&](core::CommandBatch& batch) -> core::Status {

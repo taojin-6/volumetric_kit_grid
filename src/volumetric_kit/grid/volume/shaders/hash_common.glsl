@@ -113,6 +113,7 @@ layout(push_constant, scalar) uniform PushConstants {
   uint arg;  // allocate: input coord count; compact: output capacity;
              // depth: the frame's tile count along x.
   uint tick;  // the map's clock, which allocation stamps a block with
+  uint item_base;  // triangles: the first work item this dispatch covers
 } pc;
 #endif
 
