@@ -15,6 +15,7 @@
 #include "codec_sweep.hpp"
 #include "grid_layout.hpp"
 #include "replica_config.hpp"
+#include "volumetric_kit/recon/networking/stream_server.hpp"
 #ifdef VR_TEST_ORBBEC_CONFIG
 #include "orbbec_config.hpp"
 #endif
@@ -43,6 +44,7 @@ int main() {
       {"codec_mesh_sequence", cfg::Application::CodecMesh},
       {"fuse_orbbec", cfg::Application::FuseOrbbec},
       {"codec_orbbec", cfg::Application::FuseOrbbec},
+      {"serve_orbbec", cfg::Application::FuseOrbbec},
       {"stream_orbbec", cfg::Application::FuseOrbbec},
       {"readback_orbbec", cfg::Application::FuseOrbbec},
       {"dump_orbbec", cfg::Application::FuseOrbbec},
@@ -58,14 +60,22 @@ int main() {
       std::fprintf(stderr, "%s: %s\n", example.file,
                    loaded.status().message().c_str());
     CHECK(loaded);
-    // codec_orbbec alone writes codec rows and frames; every live example
-    // fuses Dynamic, by core's default, the rest Classic.
+    // codec_orbbec alone writes codec rows, and it and serve_orbbec frames;
+    // serve_orbbec alone serves them, on the default port to every interface.
+    // Every live example fuses Dynamic, by core's default, the rest Classic.
     const bool coded = std::string(example.file) == "codec_orbbec";
+    const bool served = std::string(example.file) == "serve_orbbec";
     const bool live = example.application == cfg::Application::FuseOrbbec ||
                       example.application == cfg::Application::RigViewer;
     CHECK(loaded->fusion.dynamic == live);
-    CHECK(loaded->output.csv.empty() != coded &&
-          loaded->output.stream.empty() != coded);
+    CHECK(loaded->output.csv.empty() != coded);
+    CHECK(loaded->output.stream.empty() != (coded || served));
+    CHECK(loaded->output.serve == (served ? 47801 : 0));
+    const vr_example::CodecOutputs outputs =
+        vr_example::codec_outputs(loaded.value().output);
+    CHECK(outputs.serve.has_value() == served);
+    CHECK(!served || (outputs.serve->host.empty() &&
+                      outputs.serve->port == vr::networking::kDefaultPort));
   }
 
   // The single-mesh template stays one frame, every frame intra; the
@@ -145,6 +155,36 @@ int main() {
         (results / "rig_frames.csv").lexically_normal().string());
   CHECK(coding->output.path ==
         (results / "rig_end.ply").lexically_normal().string());
+  // The rig served live as it is coded and recorded, at the same period, for
+  // 216000 camera frames: 30 minutes of four cameras at 30 fps.
+  const auto serving =
+      cfg::load(std::string(VR_CONFIG_FIXTURES) + "/serve_orbbec.json",
+                cfg::Application::FuseOrbbec);
+  CHECK(serving && serving->operation == cfg::Operation::Fuse);
+  CHECK(serving->run.frames == 216000 && serving->fusion.voxel_size_m == 0.01F);
+  CHECK(serving->codec.intra_period == 30 && !serving->codec.sweep);
+  CHECK(serving->output.stream ==
+        (results / "rig.vrst").lexically_normal().string());
+  CHECK(serving->output.path ==
+        (results / "rig_end.ply").lexically_normal().string());
+  // Any port maps to every interface on it, the server's other options at
+  // their defaults; serving alone needs no file.
+  const auto on_port = cfg::parse(R"({
+    "version": 1, "operation": "fuse",
+    "source": {"kind": "live", "sync_config": "sync.json"},
+    "output": {"path": "rig.ply", "serve": 5000}
+  })",
+                                  cfg::Application::FuseOrbbec);
+  CHECK(on_port);
+  const vr_example::CodecOutputs to_port =
+      vr_example::codec_outputs(on_port.value().output);
+  const vr::networking::ServerOptions defaults_served;
+  CHECK(to_port.csv.empty() && to_port.stream.empty());
+  CHECK(to_port.serve && to_port.serve->host.empty() &&
+        to_port.serve->port == 5000);
+  CHECK(to_port.serve->max_viewers == defaults_served.max_viewers &&
+        to_port.serve->max_gop_bytes == defaults_served.max_gop_bytes &&
+        to_port.serve->stall_limit == defaults_served.stall_limit);
 
   const auto dataset =
       cfg::parse(R"({
@@ -206,6 +246,7 @@ int main() {
       vr_example::codec_outputs(encoded.value().output);
   CHECK(outputs.csv == "/tmp/scenarios/results/rows.csv");
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
+  CHECK(!outputs.serve);
 
   // Both codec profiles: the period as given, and with P-frames the update
   // size as given, core's 0 included, up to the format's longest segment;

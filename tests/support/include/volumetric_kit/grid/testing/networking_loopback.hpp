@@ -242,6 +242,29 @@ inline bool next_within(networking::StreamClient& client, Got* got,
   }
 }
 
+// Whether the client of 127.0.0.1:`port` reads the sender's end after its
+// session, within `timeout`, with no record before it (another error on
+// stderr).
+inline bool wait_end(networking::StreamClient& client, std::uint16_t port,
+                     std::chrono::milliseconds timeout = 5s) {
+  const Clock::time_point end = Clock::now() + timeout;
+  stream::Record record;
+  Bytes payload;
+  for (;;) {
+    const vkc::Result<bool> got = client.next(10ms, &record, &payload);
+    if (!got.ok()) {
+      if (got.status().domain() == vkc::Status::Code::IoError &&
+          client_reason(got.status().message(), port) ==
+              "the sender closed the connection") {
+        return true;
+      }
+      std::fprintf(stderr, "wait_end: %s\n", got.status().message().c_str());
+      return false;
+    }
+    if (*got || Clock::now() >= end) return false;
+  }
+}
+
 // A record's seq and key, with a payload made from its seq.
 inline stream::RecordInfo record_info(std::uint64_t seq, bool key) {
   return vrst::info(0, key, 1'000'000 * seq, seq);
