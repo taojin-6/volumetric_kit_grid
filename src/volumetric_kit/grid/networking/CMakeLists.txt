@@ -9,7 +9,6 @@
 # tier, apart from the format, so the sockets are tested apart from it. It logs
 # through recon's log seam (core/log.hpp), header-only over that base tier.
 include(GenerateExportHeader)
-include(GNUInstallDirs)
 
 set(_vr_networking_generated_inc
     "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
@@ -48,8 +47,8 @@ target_compile_features(recon_networking PUBLIC cxx_std_17)
 target_compile_options(recon_networking PRIVATE -fexceptions)
 
 # PUBLIC: the headers return the core's Status/Result and the stream's Session
-# and Record. The server and the client run threads of their own; the package
-# config re-finds Threads, which a static archive's link interface names.
+# and Record. The server and the client run threads of their own, so a static
+# archive's link interface names Threads.
 find_package(Threads REQUIRED)
 target_link_libraries(
   recon_networking
@@ -57,28 +56,7 @@ target_link_libraries(
   PRIVATE Threads::Threads)
 
 target_include_directories(
-  recon_networking
-  PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-         "$<BUILD_INTERFACE:${_vr_networking_generated_inc}>"
-         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+  recon_networking PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+                          "$<BUILD_INTERFACE:${_vr_networking_generated_inc}>")
 
 vr_target_warnings(recon_networking)
-
-if(VR_INSTALL)
-  install(
-    TARGETS recon_networking
-    EXPORT volumetric_kit_reconTargets
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-  install(
-    DIRECTORY "${PROJECT_SOURCE_DIR}/include/volumetric_kit/recon/networking"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/volumetric_kit/recon"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-  install(
-    DIRECTORY "${_vr_networking_generated_inc}/"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-endif()
