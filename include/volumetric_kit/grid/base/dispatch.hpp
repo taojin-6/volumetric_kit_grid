@@ -4,8 +4,8 @@
 #pragma once
 
 /// @file dispatch.hpp
-/// @brief The loop every tier records a 1-D dispatch with whose group count
-///        can pass the device's limit, and its test seam.
+/// @brief A loop that records a 1-D dispatch of items whose group count can
+///        pass the device's limit, and its test seam.
 ///
 /// Internal (under src/, never installed). Vulkan guarantees only 65535
 /// groups along x (`maxComputeWorkGroupCount[0]`), which a room's blocks

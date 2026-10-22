@@ -188,9 +188,8 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
                  allocator, sizeof(std::uint32_t) + sizeof(FrustumPlanes)));
 
   // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
-  // 65535 guaranteed); cache it so every dispatch can reject an over-large
-  // input (an 8K+ depth frame / dense point cloud on a min-spec GPU) as a clean
-  // error.
+  // 65535 guaranteed); cache it for the dispatches that split or refuse past
+  // it (see max_workgroup_count_x_).
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   map.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
