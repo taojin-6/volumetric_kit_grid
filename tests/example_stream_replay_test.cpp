@@ -9,8 +9,9 @@
 // own allocation failure refused; a record with a damaged header or a flag
 // this version does not know left out, and an allocation failure reading
 // past the damage refused; a damaged first key left out with the P-frames
-// after it; and a track with no key, no undamaged key, or none at all,
-// refused. Host-only.
+// after it; a pass sending each record restamped, but a damaged payload and
+// the P-frames after it, and refusing to send nothing; and a track with no
+// key, no undamaged key, or none at all, refused. Host-only.
 
 #include <chrono>
 #include <cstdint>
@@ -244,6 +245,75 @@ int damaged_key_case(const std::string& dir) {
   return 0;
 }
 
+// Seq 2's payload fails its CRC: each pass sends the rest, restamped, but for
+// seq 2 and seq 3, its GOP's, up to the key at seq 4; with every key's
+// payload damaged, a pass that would send nothing is NotFound. send's error
+// ends the pass.
+int payload_damage_case(const std::string& dir) {
+  const std::string path = dir + "/payload.vrst";
+  std::vector<stream::RecordInfo> infos;
+  for (std::uint64_t seq = 0; seq < 6; ++seq) {
+    infos.push_back(vrst::info(0, seq % 4 == 0, seq * 1000, seq));
+  }
+  CHECK(write(path, infos));
+  vrst::Bytes file = vr_test::read_bytes(path);
+  std::vector<vrst::ChunkAt> records;
+  for (const vrst::ChunkAt& c : vrst::chunks(file)) {
+    if (c.tag == "RECD") records.push_back(c);
+  }
+  CHECK(records.size() == infos.size());
+  const auto payload_at = [&](std::size_t i) {
+    return records[i].offset + records[i].header_bytes;
+  };
+  CHECK(vrst::write_bytes(path, vrst::flipped(file, payload_at(2), 0)));
+  const auto reader = reader_of(path);
+  CHECK(reader != nullptr);
+  vkc::Result<vr_example::ReplayLoop> loop =
+      vr_example::ReplayLoop::create(*reader);
+  CHECK(loop.ok() && loop->records().size() == infos.size());
+
+  std::vector<stream::RecordInfo> sent;
+  const auto collect = [&](const stream::RecordInfo& info,
+                           const std::vector<std::uint8_t>& payload) {
+    sent.push_back(info);
+    // Each payload as written: its seq's pattern, before the restamp.
+    return payload == vrst::pattern(100, info.seq % infos.size())
+               ? vkc::Status{}
+               : vkc::Status::invalid_argument("not the record's payload");
+  };
+  const Clock::time_point start = Clock::now();
+  for (std::uint64_t pass = 0; pass < 2; ++pass) {
+    CHECK(loop->send_pass(*reader, start, pass, collect).ok());
+  }
+  const std::uint64_t expected[] = {0, 1, 4, 5, 6, 7, 10, 11};
+  CHECK(sent.size() == std::size(expected));
+  for (std::size_t i = 0; i < sent.size(); ++i) {
+    CHECK(sent[i].seq == expected[i]);
+    CHECK(vrst::same(sent[i], loop->restamp(infos[expected[i] % 6], i / 4)));
+  }
+
+  const auto refuse = [](const stream::RecordInfo&,
+                         const std::vector<std::uint8_t>&) {
+    return vkc::Status::io_error("refused");
+  };
+  CHECK(loop->send_pass(*reader, start, 0, refuse).domain() == Code::IoError);
+
+  const std::string both = dir + "/payload_keys.vrst";
+  CHECK(vrst::write_bytes(
+      both,
+      vrst::flipped(vrst::flipped(file, payload_at(0), 0), payload_at(4), 0)));
+  const auto keyless = reader_of(both);
+  CHECK(keyless != nullptr);
+  vkc::Result<vr_example::ReplayLoop> none =
+      vr_example::ReplayLoop::create(*keyless);
+  CHECK(none.ok());
+  sent.clear();
+  CHECK(none->send_pass(*keyless, Clock::now(), 0, collect).domain() ==
+        Code::NotFound);
+  CHECK(sent.empty());
+  return 0;
+}
+
 int refusals_case(const std::string& dir) {
   const std::string path = dir + "/no_key.vrst";
   CHECK(write(path, {vrst::info(0, false, 0, 0), vrst::info(0, false, 1, 1)}));
@@ -265,6 +335,7 @@ int main() {
   if (lone_record_case(dir) != 0) return 1;
   if (damage_case(dir) != 0) return 1;
   if (damaged_key_case(dir) != 0) return 1;
+  if (payload_damage_case(dir) != 0) return 1;
   if (refusals_case(dir) != 0) return 1;
   std::puts("stream replay: OK");
   return 0;
