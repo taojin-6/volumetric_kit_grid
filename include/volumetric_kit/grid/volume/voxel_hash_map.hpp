@@ -317,6 +317,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional: receives the per-reason split (see
   ///                      @ref AllocFailures). Untouched when null.
+  /// @param first_round   Optional: records into the first round's batch,
+  ///                      once the input is accepted and ahead of the
+  ///                      removal, so it runs in the same submit before any
+  ///                      index is freed; @ref VoxelBlockGrid::remove zeroes
+  ///                      the blocks there.
   /// @warning This frees the block index but does **not** clear the per-voxel
   ///          attribute data it addressed -- the block index does not know what
   ///          attributes, if any, a consumer declared. The free heap is LIFO,
@@ -334,9 +339,10 @@ class VR_VOLUME_API VoxelHashMap {
   ///         kept through every round (@ref AllocFailures::lock), which are
   ///         still in the table: call again to remove them. An empty, refused
   ///         or zero-count call leaves @ref topology_epoch unchanged.
-  core::Result<std::uint32_t> remove(const core::Buffer& coords,
-                                     std::uint32_t count,
-                                     AllocFailures* out_failures = nullptr);
+  core::Result<std::uint32_t> remove(
+      const core::Buffer& coords, std::uint32_t count,
+      AllocFailures* out_failures = nullptr,
+      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
 
   // TODO(volume): a bulk readback; its callers are the remesh-report example
   // and resize's snapshot (the 2026-10-13 volume block-list entry's Next).
@@ -681,11 +687,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
   /// moves @ref topology_epoch once the input is accepted, and binds a zeroed
   /// flag per element at binding 6, which the kernel sets on each coord it
-  /// finishes so later rounds skip it.
+  /// finishes so later rounds skip it. @p first_round, when set, records last
+  /// into the first round's batch, ahead of the dispatch.
   core::Result<std::uint32_t> run_input_kernel(
       const char* op, const core::StorageInput& input, std::size_t elem_size,
       std::uint32_t count, const core::ComputeKernel& kernel,
-      AllocFailures* out_failures, bool removes = false);
+      AllocFailures* out_failures, bool removes = false,
+      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and

@@ -197,8 +197,9 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// Each coord is found in the hash table on the device, by the kernel that
   /// zeroes its block, so the cost is the count's, not the grid's, and a
   /// coord that is not currently allocated costs nothing and clears nothing.
-  /// The blocks are zeroed, then @ref VoxelHashMap::remove runs over the same
-  /// buffer: two submits. A block that call leaves in the table
+  /// The blocks are zeroed in @ref VoxelHashMap::remove's first round, ahead
+  /// of the removal over the same buffer and in its submit. A block that call
+  /// leaves in the table
   /// (@ref AllocFailures::lock) is left zeroed, reading as a freshly
   /// allocated block until a later call removes it. The input is checked
   /// first, so a refused call zeroes nothing and leaves @ref topology_epoch
@@ -346,11 +347,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
                            std::uint32_t count, core::GpuStageScope* stage);
   // Every removal's body -- remove's and free_stale_blocks':
-  // zero the first `count` blocks `list` names, recorded into `batch` after
-  // what it holds and submitted, then free them through the map. `list` is
-  // the caller's to check.
-  core::Result<std::uint32_t> zero_and_remove(core::CommandBatch& batch,
-                                              const core::Buffer& list,
+  // zero the first `count` blocks `list` names and free them through the
+  // map, in the submit of the map's first round. `list` is the caller's to
+  // check.
+  core::Result<std::uint32_t> zero_and_remove(const core::Buffer& list,
                                               std::uint32_t count,
                                               AllocFailures* out_failures,
                                               core::GpuStageScope* stage);

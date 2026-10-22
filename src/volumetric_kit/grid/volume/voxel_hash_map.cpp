@@ -471,7 +471,8 @@ core::Result<core::Buffer> VoxelHashMap::upload_to_binding(
 core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
     const char* op, const core::StorageInput& input, std::size_t elem_size,
     std::uint32_t count, const core::ComputeKernel& kernel,
-    AllocFailures* out_failures, bool removes) {
+    AllocFailures* out_failures, bool removes,
+    const std::function<core::Status(core::CommandBatch&)>& first_round) {
   if (!valid()) {
     return core::Status::invalid_argument(std::string(op) + ": moved-from map");
   }
@@ -515,6 +516,9 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
           VKC_TRY(batch.fill(done_buf, 0, bytes, 0u));
           kernel.set.write_storage_buffer(6, done_buf.handle(), 0,
                                           VK_WHOLE_SIZE);
+        }
+        if (first_round) {
+          VKC_TRY(first_round(batch));
         }
         return {};
       });
@@ -699,12 +703,13 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
       });
 }
 
-core::Result<std::uint32_t> VoxelHashMap::remove(const core::Buffer& coords,
-                                                 std::uint32_t count,
-                                                 AllocFailures* out_failures) {
+core::Result<std::uint32_t> VoxelHashMap::remove(
+    const core::Buffer& coords, std::uint32_t count,
+    AllocFailures* out_failures,
+    const std::function<core::Status(core::CommandBatch&)>& first_round) {
   return run_input_kernel("VoxelHashMap::remove", core::StorageInput(coords),
                           sizeof(BlockIndex), count, delete_, out_failures,
-                          true);
+                          true, first_round);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
