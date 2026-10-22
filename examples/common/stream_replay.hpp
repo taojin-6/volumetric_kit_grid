@@ -72,15 +72,14 @@ class ReplayLoop {
         most = std::max(most, r.info.pts_ns);
       }
       // One mean step past the span; with one record, or all at one pts, the
-      // track's nominal rate, else 30 a second.
+      // track's nominal period.
       std::uint64_t step = 0;
       if (loop.records_.size() > 1) {
         step = (most - least) / (loop.records_.size() - 1);
       }
       if (step == 0) {
-        const vr::stream::Rate rate = reader.session().tracks[track].rate;
-        step = rate.num > 0 ? std::uint64_t{1'000'000'000} * rate.den / rate.num
-                            : 33'333'333;
+        step =
+            vr::stream::nominal_period_ns(reader.session().tracks[track].rate);
       }
       loop.first_pts_ = least;
       loop.pass_ns_ = most - least + step;

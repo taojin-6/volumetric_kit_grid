@@ -136,6 +136,17 @@ struct Rate {
   std::uint32_t den = 1;  ///< At least 1.
 };
 
+/// @brief How far apart a track's records are nominally, for a reader that
+///        paces them where their pts cannot.
+/// @return @p rate 's period in ns, rounded down; for an unknown rate (a
+///         `num` or `den` of 0), 30 a second's, the one fallback every
+///         reader takes.
+inline constexpr std::uint64_t nominal_period_ns(Rate rate) noexcept {
+  constexpr std::uint64_t kNsPerSecond = 1'000'000'000;
+  if (rate.num == 0 || rate.den == 0) return kNsPerSecond / 30;
+  return kNsPerSecond * rate.den / rate.num;
+}
+
 /// @brief One track of a session: a stream of records of one kind.
 struct Track {
   TrackKind kind{};  ///< Never 0.
