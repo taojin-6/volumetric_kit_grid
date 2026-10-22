@@ -138,9 +138,10 @@ struct Rate {
 
 /// @brief How far apart a track's records are nominally, for a reader that
 ///        paces them where their pts cannot.
+/// @param rate  The track's @ref Track::rate.
 /// @return @p rate 's period in ns, rounded down; for an unknown rate (a
-///         `num` or `den` of 0), 30 a second's, the one fallback every
-///         reader takes.
+///         `num` or `den` of 0), 30 a second's, so every reader paces an
+///         unknown rate alike.
 inline constexpr std::uint64_t nominal_period_ns(Rate rate) noexcept {
   constexpr std::uint64_t kNsPerSecond = 1'000'000'000;
   if (rate.num == 0 || rate.den == 0) return kNsPerSecond / 30;
