@@ -73,9 +73,15 @@ inline std::string codec_settings(
 
 /// @return Where a codec stream writes besides its report: core's
 ///         `output.csv` and `output.stream`, already relative to the
-///         scenario's directory; an empty path writes nothing.
+///         scenario's directory, an empty path writing nothing; and
+///         `output.serve`, every interface on that port, 0 serving nothing.
 inline CodecOutputs codec_outputs(const config::Output& output) {
-  return {output.csv, output.stream};
+  CodecOutputs outputs{output.csv, output.stream};
+  if (output.serve != 0) {
+    outputs.serve.emplace();  // every interface
+    outputs.serve->port = output.serve;
+  }
+  return outputs;
 }
 
 /// @return Runtime SDF parameters from core's validated mesh source, or
