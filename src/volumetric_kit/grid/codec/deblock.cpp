@@ -229,8 +229,11 @@ core::Status Deblock::record(core::CommandBatch& batch,
   VKC_TRY(core::check_storage_buffer_range(
       "Deblock: the hash entries", entries_bytes, max_storage_buffer_range_));
 
+  // The sets of the kernels this filter runs, each written before its
+  // dispatches.
   for (core::ComputeKernel* kernel :
        {&line_kernel_, &gauss_kernel_, &store_kernel_}) {
+    if (kernel == &line_kernel_ ? !passes.linfit : !passes.gauss) continue;
     const core::DescriptorSet& set = kernel->set;
     set.write_storage_buffer(kBindingBlocks, frame.list->handle(), 0,
                              list_bytes);
