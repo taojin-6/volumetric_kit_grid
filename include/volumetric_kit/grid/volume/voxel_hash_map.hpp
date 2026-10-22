@@ -70,6 +70,9 @@ struct AllocFailures {
   /// to the free heap is unreachable capacity: neither in the table nor on the
   /// heap. Not resolved by retrying and not fixed by @ref VoxelHashMap::resize.
   std::uint32_t terminal = 0;
+  /// Dispatch rounds the call ran: more than one only while lock contention
+  /// alone was left, never past a capacity limit.
+  std::uint32_t rounds = 0;
 
   /// @return Whether growing the map could help: a genuine capacity limit was
   ///         hit, rather than only transient lock contention.
@@ -643,8 +646,8 @@ class VR_VOLUME_API VoxelHashMap {
   /// Record what @p dispatches records each round, re-dispatching while the
   /// shared `fail_counts_` tally's retryable slot is
   /// non-zero, to converge past transient same-bucket lock contention, until
-  /// only capacity failures are left, a capacity limit stops progress, or the
-  /// rounds run out. Re-zeroes the tally
+  /// a round has no lock failure or hits a capacity limit, or the rounds run
+  /// out. Re-zeroes the tally
   /// each round. The shared tail of every allocate/remove kernel.
   /// The tally's non-retryable slot is accumulated across rounds and added to
   /// the returned count; @p out_failures, when non-null, receives the
