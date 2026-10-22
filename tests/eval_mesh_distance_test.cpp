@@ -189,9 +189,15 @@ int closest_point_case() {
 // sits a sine of 1e-6 to 1e-2 off the opposite edge, each corner in turn
 // first, and needles with a 1 um edge. Marching cubes emits both. Ericson's
 // region test was off on about one in 300 000 of these, by up to 90 um, so
-// the sample is large enough to meet a few. The answer must be the
-// double-precision one to within float rounding at 3 m (0.24 um).
+// the sample is large enough to meet a few; a tenth of it under the
+// sanitizers, which look for memory errors, not rare misses. The answer must
+// be the double-precision one to within float rounding at 3 m (0.24 um).
 int thin_triangle_case() {
+#ifdef VR_TEST_SANITIZED
+  constexpr int kDraws = 5000;
+#else
+  constexpr int kDraws = 50000;
+#endif
   Lcg rng;
   const vr::Vec3f base(3.2f, 1.7f, 2.9f);
   const auto around = [&rng](float r) {
@@ -203,7 +209,7 @@ int thin_triangle_case() {
            std::fabs(double(vr::length(p - q)) -
                      triangle_distance(p, a, b, c)) <= 0.5e-6;
   };
-  for (int i = 0; i < 50000; ++i) {
+  for (int i = 0; i < kDraws; ++i) {
     const vr::Vec3f a = base + around(0.01f);
     const vr::Vec3f b = a + around(0.01f);
     const vr::Vec3f p = base + around(0.04f);
@@ -223,7 +229,9 @@ int thin_triangle_case() {
 
 // The search prunes neighbouring cells by distance; it must find what a scan
 // of every triangle finds. A bumpy sheet of 1 cm triangles, some collapsed to
-// a segment, against points scattered within and beyond the reach.
+// a segment, against 500 points scattered within and beyond the reach. A
+// search probing one cell fewer at the -x end first errs at the 357th, at
+// the +x end at the 76th.
 int search_case() {
   Lcg rng;
   mesh::Mesh m = plane(30, 0.01f, 0.0f);
@@ -238,7 +246,7 @@ int search_case() {
   vkc::Result<eval::MeshDistance> d = eval::MeshDistance::create(m, reach);
   CHECK(d.ok());
   int within = 0;
-  for (int i = 0; i < 3000; ++i) {
+  for (int i = 0; i < 500; ++i) {
     const vr::Vec3f p(rng(-0.05f, 0.35f), rng(-0.05f, 0.35f),
                       rng(-0.05f, 0.05f));
     float best = reach;
@@ -252,7 +260,7 @@ int search_case() {
     CHECK(near(double(d.value().distance(p)), double(best), 1e-7));
     within += best < reach ? 1 : 0;
   }
-  CHECK(within > 1000 && within < 3000);  // both sides of the reach
+  CHECK(within > 150 && within < 500);  // both sides of the reach
   return 0;
 }
 
