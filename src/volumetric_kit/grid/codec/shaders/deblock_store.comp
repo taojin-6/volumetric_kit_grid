@@ -20,7 +20,7 @@ void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup.
-  if (entry >= pc.num_blocks) {
+  if (skip != 0u || entry >= pc.num_blocks) {
     return;
   }
   if (lane == 0u) {

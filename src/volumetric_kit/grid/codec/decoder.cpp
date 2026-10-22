@@ -107,22 +107,27 @@ FrameDeblock frame_deblock(const detail::FrameHeader& header, bool on) {
 }
 
 // The frame's blocks reconstructed from @p blocks into @p grid and deblocked
-// under @p passes, recorded after what @p batch holds and submitted with it,
-// the inverse's reject count read back last.
-core::Status reconstruct(core::CommandBatch& batch,
-                         detail::DctTransform& transform,
-                         detail::Deblock& deblock, volume::VoxelBlockGrid& grid,
-                         const detail::ResidentBlocks& blocks,
-                         const CodecParams& params,
-                         const detail::DeblockPasses& passes,
-                         core::GpuStageScope* stage) {
+// under @p filter, recorded after what @p batch holds and submitted with it,
+// the inverse's reject count and mask flag read back last. The deblock skips a
+// frame the flag marks, one with an unobserved voxel (the 2026-10-22
+// decision), and the result, what it ran, says "off" for it.
+core::Result<DeblockInfo> reconstruct(
+    core::CommandBatch& batch, detail::DctTransform& transform,
+    detail::Deblock& deblock, volume::VoxelBlockGrid& grid,
+    const detail::ResidentBlocks& blocks, const CodecParams& params,
+    const FrameDeblock& filter, core::GpuStageScope* stage) {
   VKC_TRY(transform.record_inverse(batch, grid, blocks, params, stage));
-  VKC_TRY(deblock.record(batch, grid, blocks, passes, stage));
+  VKC_TRY(deblock.record(batch, grid, blocks, filter.passes,
+                         &transform.masked_flag(), stage));
   std::uint32_t rejected = 0;
-  VKC_TRY(transform.record_rejected(batch, rejected));
+  std::uint32_t masked = 0;
+  VKC_TRY(transform.record_rejected(batch, rejected, &masked));
   VKC_TRY(batch.submit());
-  return detail::DctTransform::check_rejected("inverse", rejected,
-                                              blocks.count);
+  VKC_TRY(
+      detail::DctTransform::check_rejected("inverse", rejected, blocks.count));
+  DeblockInfo ran = filter.info;
+  if (masked != 0) ran.filter = "off";
+  return ran;
 }
 
 // Every round's residue lost bucket-lock races over a table with room: not a
@@ -302,19 +307,20 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // hash table, so the slots the allocation drew need not be read back, and
   // a frame block the grid does not hold -- a grid changed under this call
   // -- is refused there rather than written.
+  DeblockInfo ran;
   {
     core::StageScope inverse(metrics, "  ..inverse");
     core::CommandBatch batch(*device_, *allocator_);
     VKC_ASSIGN(const detail::ResidentBlocks blocks,
                store_->record_apply(batch, payload, n, &stage));
-    VKC_TRY(reconstruct(batch, *transform_, *deblock_, grid, blocks,
-                        header.params, filter.passes, &stage));
+    VKC_ASSIGN(ran, reconstruct(batch, *transform_, *deblock_, grid, blocks,
+                                header.params, filter, &stage));
     VKC_TRY(store_->check_apply());
   }
   // Only a decode that succeeded moves the reference.
   store_->commit(
       detail::FrameReference{detail::frame_hash(data, size), header});
-  last_deblock_ = filter.info;
+  last_deblock_ = ran;
   return {};
 }
 
@@ -355,10 +361,9 @@ core::Status Decoder::rebuild(volume::VoxelBlockGrid& grid,
     }
   }
   core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(reconstruct(batch, *transform_, *deblock_, grid,
-                      store_->reference_blocks(), header.params, filter.passes,
-                      &stage));
-  last_deblock_ = filter.info;
+  VKC_ASSIGN(last_deblock_, reconstruct(batch, *transform_, *deblock_, grid,
+                                        store_->reference_blocks(),
+                                        header.params, filter, &stage));
   return {};
 }
 

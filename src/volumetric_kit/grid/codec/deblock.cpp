@@ -67,7 +67,8 @@ enum Binding : std::uint32_t {
   kBindingWeight = 4,
   kBindingStamps = 5,
   kBindingShell = 6,
-  kBindingCount = 7,
+  kBindingSkip = 7,
+  kBindingCount = 8,
 };
 
 static_assert(kShellVoxels == 296, "deblock_common.glsl's kShellVoxels");
@@ -167,6 +168,14 @@ core::Result<std::unique_ptr<Deblock>> Deblock::create(
   VKC_TRY(core::ensure_device_scratch(device, allocator, d.shell_, kShellBytes,
                                       d.max_storage_buffer_range_,
                                       "codec.deblock_shell"));
+  VKC_ASSIGN(d.no_skip_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(d.no_skip_.handle()),
+                         "codec.deblock_no_skip");
+  core::CommandBatch batch(device, allocator);
+  VKC_TRY(batch.fill(d.no_skip_, 0, sizeof(std::uint32_t), 0u));
+  VKC_TRY(batch.submit());
   return owned;
 }
 
@@ -183,6 +192,7 @@ core::Status Deblock::record(core::CommandBatch& batch,
                              volume::VoxelBlockGrid& grid,
                              const ResidentBlocks& frame,
                              const DeblockPasses& passes,
+                             const core::Buffer* skip,
                              core::GpuStageScope* stage) {
   const std::uint32_t n = frame.count;
   if ((!passes.linfit && !passes.gauss) || n == 0) {
@@ -225,6 +235,10 @@ core::Status Deblock::record(core::CommandBatch& batch,
   if (passes.gauss && shell_.size() < shell_bytes) {
     return fail(std::to_string(n) + " blocks, more than reserve made room for");
   }
+  if (skip != nullptr && skip->size() < sizeof(std::uint32_t)) {
+    return fail("the skip buffer holds no word");
+  }
+  const core::Buffer& skip_word = skip != nullptr ? *skip : no_skip_;
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
   VKC_TRY(core::check_storage_buffer_range(
       "Deblock: the hash entries", entries_bytes, max_storage_buffer_range_));
@@ -248,6 +262,8 @@ core::Status Deblock::record(core::CommandBatch& batch,
     set.write_storage_buffer(
         kBindingStamps, grid.map().stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
     set.write_storage_buffer(kBindingShell, shell_.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(kBindingSkip, skip_word.handle(), 0,
+                             sizeof(std::uint32_t));
   }
 
   PushConstants push{};

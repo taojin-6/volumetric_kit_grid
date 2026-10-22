@@ -101,7 +101,8 @@ enum Binding : std::uint32_t {
   kBindingQuantization = 9,
   kBindingCut = 10,
   kBindingKeep = 11,
-  kBindingCount = 12,
+  kBindingMasked = 12,
+  kBindingCount = 13,
 };
 
 // The cut set's bytes for a grid of @p slots block slots: a bit a voxel.
@@ -171,6 +172,8 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
   VKC_ASSIGN(t.tables_, core::device_storage_buffer(allocator, sizeof(tables)));
   VKC_ASSIGN(t.rejected_,
              core::device_storage_buffer(allocator, sizeof(Counts)));
+  VKC_ASSIGN(t.masked_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
   VKC_ASSIGN(
       t.quantization_steps_,
       core::device_storage_buffer(allocator, kVoxelsPerBlock * sizeof(float)));
@@ -188,6 +191,9 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(t.rejected_.handle()),
                          "codec.rejected");
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(t.masked_.handle()),
+                         "codec.masked_flag");
   device.set_object_name(
       VK_OBJECT_TYPE_BUFFER,
       core::debug_object_handle(t.quantization_steps_.handle()),
@@ -206,6 +212,8 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
     kernel->set.write_storage_buffer(
         kBindingQuantization, t.quantization_steps_.handle(), 0, VK_WHOLE_SIZE);
     kernel->set.write_storage_buffer(kBindingRejected, t.rejected_.handle(), 0,
+                                     VK_WHOLE_SIZE);
+    kernel->set.write_storage_buffer(kBindingMasked, t.masked_.handle(), 0,
                                      VK_WHOLE_SIZE);
   }
   return owned;
@@ -467,6 +475,7 @@ core::Status DctTransform::record_inverse(core::CommandBatch& batch,
   }
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();
+  VKC_TRY(batch.fill(masked_, 0, sizeof(std::uint32_t), 0u));
   VKC_TRY(record(
       batch, inverse_kernel_, grid, views, in.list->handle(), in.count, params,
       in.coefficients->handle(), in.masks->handle(),
@@ -477,12 +486,16 @@ core::Status DctTransform::record_inverse(core::CommandBatch& batch,
 }
 
 core::Status DctTransform::record_rejected(core::CommandBatch& batch,
-                                           std::uint32_t& rejected) {
+                                           std::uint32_t& rejected,
+                                           std::uint32_t* masked) {
   rejected = 0;
+  if (masked != nullptr) *masked = 0;
   if (!inverse_recorded_) {
     return {};
   }
-  return batch.readback(rejected_, 0, sizeof(rejected), &rejected);
+  VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
+  if (masked == nullptr) return {};
+  return batch.readback(masked_, 0, sizeof(*masked), masked);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

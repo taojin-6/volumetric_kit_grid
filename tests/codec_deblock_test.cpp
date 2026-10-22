@@ -8,13 +8,17 @@
 // (codec_deblock_oracle.hpp); workgroups run one at a time in list order and
 // in reverse, and in chunks, each the same bits, so a write another
 // workgroup reads is a deterministic failure; the stamps; recording without
-// submitting; the refusals; and the step-keyed rule on the host. The fixtures'
-// blocks sit at slots past twice their count, and their lists carry another
-// block's ptr, so a kernel that trusts a ptr or indexes by slot fails. And
-// the Decoder's switch: off is the exact decode; on, each frame is the
-// oracle's filter of it, under the filter its header picks, for I- and
-// P-frames, toggled between frames, across filters in one decoder and
-// rebuilt while paused; the stamps; and the rows. Skips with no device.
+// submitting; the skip word; the refusals; and the step-keyed rule on the
+// host. The fixtures' blocks sit at slots past twice their count, and their
+// lists carry another block's ptr, so a kernel that trusts a ptr or indexes
+// by slot fails. And the Decoder's switch: off is the exact decode; on, each
+// mask-free frame is the oracle's filter of it, under the filter its header
+// picks, for I- and P-frames, toggled between frames, across filters in one
+// decoder and rebuilt while paused; a frame with an unobserved voxel, a
+// single one included, is the exact decode, reported "off", decoded or
+// rebuilt, interleaved with mask-free frames, and a true-SDF frame is
+// deblocked unless it holds a cut; the stamps; and the rows. Skips with no
+// device.
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +36,7 @@
 #include "deblock.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
@@ -234,13 +239,14 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
 }
 
 // One deblock of @p fx under @p passes, at a fresh tick, in a batch of its
-// own.
+// own, gated by @p skip when given.
 vkc::Status run(Gpu& gpu, d::Deblock& deblock, Fixture& fx,
-                const d::DeblockPasses& passes) {
+                const d::DeblockPasses& passes,
+                const vkc::Buffer* skip = nullptr) {
   fx.grid.map().advance_tick();
   VKC_TRY(deblock.reserve(std::uint32_t(fx.coords.size()), passes));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes));
+  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes, skip));
   return batch.submit();
 }
 
@@ -687,6 +693,69 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   return 0;
 }
 
+// A device word holding @p value, as a skip word.
+vkc::Result<vkc::Buffer> word(Gpu& gpu, std::uint32_t value) {
+  return vr_test::upload_device_buffer(gpu.device, gpu.allocator, &value,
+                                       sizeof(value));
+}
+
+// 10b. The skip word: set, every filter leaves the grid and its stamps as
+// they were -- the store too, though the snapshot holds the last Gaussian's
+// shell -- and zero runs the filter as no word does; a buffer without a word
+// is refused.
+int skip_case(Gpu& gpu, d::Deblock& deblock) {
+  vkc::Result<vkc::Buffer> one = word(gpu, 1u);
+  vkc::Result<vkc::Buffer> zero = word(gpu, 0u);
+  CHECK(one.ok() && zero.ok());
+  const float t = 0.01f;
+  for (const char* filter : {"LF", "LG", "R"}) {
+    const d::DeblockPasses passes = d::deblock_passes(row(filter), t);
+    // The snapshot primed with a filtered shell, entry for entry.
+    CHECK(against_oracle(gpu, deblock, passes, filter) == 0);
+    vkc::Result<Fixture> made = make_fixture(gpu, ramp_blocks(), ramp_field);
+    CHECK(made.ok());
+    Fixture fx = std::move(made).value();
+    vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
+    vkc::Result<std::vector<vol::BlockStamp>> stamps_before =
+        fx.grid.map().read_block_stamps();
+    CHECK(before.ok() && stamps_before.ok());
+    CHECK(run(gpu, deblock, fx, passes, &one.value()).ok());
+    vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
+    vkc::Result<std::vector<vol::BlockStamp>> stamps_after =
+        fx.grid.map().read_block_stamps();
+    CHECK(after.ok() && stamps_after.ok());
+    CHECK(after.value() == before.value());
+    CHECK(stamps_after.value().size() == stamps_before.value().size());
+    for (std::size_t i = 0; i < stamps_after.value().size(); ++i) {
+      CHECK(stamps_after.value()[i].changed ==
+            stamps_before.value()[i].changed);
+    }
+    // Zero runs it: the oracle's filter.
+    CHECK(run(gpu, deblock, fx, passes, &zero.value()).ok());
+    vkc::Result<Snapshot> ran = snapshot(gpu, fx.grid);
+    CHECK(ran.ok());
+    Snapshot want = before.value();
+    oracle::apply(want, passes, kBand);
+    CHECK(matches(ran.value(), want, nullptr) == 0);
+    CHECK(largest_change(ran.value(), before.value()) >= 100 * kTolerance);
+  }
+  vkc::Result<Fixture> made = make_fixture(gpu, ramp_blocks(), ramp_field);
+  const std::uint16_t half = 1;
+  vkc::Result<vkc::Buffer> short_word = vr_test::upload_device_buffer(
+      gpu.device, gpu.allocator, &half, sizeof(half));
+  CHECK(made.ok() && short_word.ok());
+  const d::DeblockPasses passes = d::deblock_passes(row("LG"), t);
+  CHECK(
+      deblock.reserve(std::uint32_t(made.value().coords.size()), passes).ok());
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  const vkc::Status s =
+      deblock.record(batch, made.value().grid, made.value().frame(), passes,
+                     &short_word.value());
+  CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
+        s.message().find("skip") != std::string::npos);
+  return 0;
+}
+
 // 11. The rule, on the host: T in the study's arithmetic, to the bit; the
 // rows' bounds, each inclusive below; and the filters it resolves.
 int rule_case() {
@@ -778,6 +847,31 @@ vkc::Result<vol::VoxelBlockGrid> player_grid(Gpu& gpu,
   return make_grid(gpu, shape);
 }
 
+// A mask-free fixture: the band blocks of @p spheres, every voxel observed,
+// the nearer surface's distance clamped to the band, so every mask is all
+// ones -- a frame the deblock runs on. The fixture's sphere_grid and
+// two_sphere_grid leave the voxels past the band unobserved, as fused depth
+// does: a masked frame, which it skips.
+vkc::Result<vol::VoxelBlockGrid> full_grid(Gpu& gpu,
+                                           const std::vector<Sphere>& spheres) {
+  VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
+  VKC_TRY(allocate(gpu, grid, union_blocks(spheres)));
+  VKC_TRY(write_field(
+      gpu, grid,
+      [&spheres](const vr::Vec3f& p) {
+        float d = spheres[0].sdf(p);
+        for (const Sphere& s : spheres) d = std::min(d, s.sdf(p));
+        return d;
+      },
+      true));
+  return grid;
+}
+
+// Whether @p s holds an unobserved voxel: a masked frame's decode.
+bool has_unobserved(const Snapshot& s) {
+  return std::find(s.weight.begin(), s.weight.end(), 0.0f) != s.weight.end();
+}
+
 // The filter the rule picks for a frame of @p info, resolved: what the
 // decoder should have run.
 const d::DeblockRow* picked(const codec::FrameInfo& info, float* t) {
@@ -839,7 +933,7 @@ int switch_case(Gpu& gpu) {
   CHECK(on.deblock());
 
   const Sphere s{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
-  vkc::Result<vol::VoxelBlockGrid> source = sphere_grid(gpu, s);
+  vkc::Result<vol::VoxelBlockGrid> source = full_grid(gpu, {s});
   CHECK(source.ok());
   struct Setting {
     std::uint32_t k;
@@ -870,6 +964,7 @@ int switch_case(Gpu& gpu) {
     vkc::Result<Snapshot> exact = snapshot(gpu, a.value());
     vkc::Result<Snapshot> smoothed = snapshot(gpu, b.value());
     CHECK(exact.ok() && smoothed.ok());
+    CHECK(!has_unobserved(exact.value()));
     float t = 0.0f;
     const d::DeblockRow* chosen = picked(info.value(), &t);
     const codec::DeblockInfo& got = on.last_deblock();
@@ -910,17 +1005,21 @@ int switch_case(Gpu& gpu) {
   return 0;
 }
 
-// A sphere that moves and grows beside one that stays, at step @p t.
-vkc::Result<vol::VoxelBlockGrid> moving_grid(Gpu& gpu, int t) {
+// A sphere that moves and grows beside one that stays, at step @p t:
+// mask-free, or with @p full false masked.
+vkc::Result<vol::VoxelBlockGrid> moving_grid(Gpu& gpu, int t,
+                                             bool full = true) {
   const Sphere moving{
       vr::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
       0.07f + 0.002f * float(t)};
-  return two_sphere_grid(gpu, moving,
-                         Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
+  const Sphere still{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f};
+  if (full) return full_grid(gpu, {moving, still});
+  return two_sphere_grid(gpu, moving, still);
 }
 
-// I- and P-frames, frame after frame into one grid, with the switch toggled
-// between frames: each frame on is the oracle's filter of the exact decode
+// Mask-free I- and P-frames, frame after frame into one grid, with the
+// switch toggled between frames: each frame on is the oracle's filter of
+// the exact decode
 // -- a P-frame decodes from its reference's coefficients, so the filter
 // never compounds -- each frame off is the exact decode, and a second
 // decoder on, into a grid of another table, gets the same bits.
@@ -997,7 +1096,7 @@ int mixed_filters_case(Gpu& gpu) {
   std::size_t last_blocks = 0;
   for (const Frame& f : frames) {
     vkc::Result<vol::VoxelBlockGrid> source =
-        sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), f.radius});
+        full_grid(gpu, {Sphere{vr::Vec3f(0.0f), f.radius}});
     CHECK(source.ok());
     vkc::Result<Bytes> frame = encode_at(gpu, source.value(), f.k, f.scale);
     vkc::Result<vol::VoxelBlockGrid> exact_grid = player_grid(gpu, 2048);
@@ -1146,8 +1245,8 @@ int decoder_stamps_case(Gpu& gpu) {
   CHECK(one.ok() && two.ok());
   CHECK(allocate(gpu, one.value(), {b}).ok());
   CHECK(allocate(gpu, two.value(), {left, b}).ok());
-  CHECK(write_field(gpu, one.value(), plane(0.0f)).ok());
-  CHECK(write_field(gpu, two.value(), plane(0.004f)).ok());
+  CHECK(write_field(gpu, one.value(), plane(0.0f), true).ok());
+  CHECK(write_field(gpu, two.value(), plane(0.004f), true).ok());
   vkc::Result<Bytes> f1 = encode_at(gpu, one.value(), 64, 0.2f);
   vkc::Result<Bytes> f2 = encode_at(gpu, two.value(), 64, 0.2f);
   CHECK(f1.ok() && f2.ok());
@@ -1183,12 +1282,268 @@ int decoder_stamps_case(Gpu& gpu) {
   return 0;
 }
 
+// A grid's stamps, block by block in (z, y, x) order.
+vkc::Result<std::vector<std::uint32_t>> stamps_by_coord(
+    vol::VoxelBlockGrid& grid) {
+  VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
+  VKC_ASSIGN(const std::vector<vol::BlockStamp> stamps,
+             grid.map().read_block_stamps());
+  std::vector<std::uint32_t> out;
+  for (const vol::BlockIndex& b : active) {
+    out.push_back(stamps[std::uint32_t(b.ptr) / kVpb].changed);
+  }
+  return out;
+}
+
+// Masked frames -- the moving spheres with the voxels past the band
+// unobserved, as fused depth leaves them -- with the switch on: I- and
+// P-frames each the exact decode to the bit, their stamps too, reported
+// "off" with the frame's T, though the rule picks a filter; and rebuilt with
+// the switch on, the exact decode again.
+int masked_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 4;
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Decoder> on_dec = decoder(gpu, true);
+  vkc::Result<codec::Decoder> off_dec = decoder(gpu, false);
+  vkc::Result<vol::VoxelBlockGrid> on_grid = player_grid(gpu);
+  vkc::Result<vol::VoxelBlockGrid> off_grid = player_grid(gpu);
+  CHECK(enc.ok() && on_dec.ok() && off_dec.ok() && on_grid.ok() &&
+        off_grid.ok());
+  std::size_t p_frames = 0;
+  for (int t = 0; t < 6; ++t) {
+    vkc::Result<vol::VoxelBlockGrid> g = moving_grid(gpu, t, false);
+    CHECK(g.ok());
+    vkc::Result<Bytes> frame = enc.value().encode(g.value());
+    CHECK(frame.ok());
+    vkc::Result<codec::FrameInfo> info =
+        codec::read_frame_info(frame.value().data(), frame.value().size());
+    CHECK(info.ok());
+    p_frames += info.value().type == codec::FrameType::kInter ? 1 : 0;
+    CHECK(
+        on_dec.value()
+            .decode(frame.value().data(), frame.value().size(), on_grid.value())
+            .ok());
+    CHECK(off_dec.value()
+              .decode(frame.value().data(), frame.value().size(),
+                      off_grid.value())
+              .ok());
+    vkc::Result<Snapshot> on = snapshot(gpu, on_grid.value());
+    vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
+    vkc::Result<std::vector<std::uint32_t>> on_stamps =
+        stamps_by_coord(on_grid.value());
+    vkc::Result<std::vector<std::uint32_t>> off_stamps =
+        stamps_by_coord(off_grid.value());
+    CHECK(on.ok() && exact.ok() && on_stamps.ok() && off_stamps.ok());
+    CHECK(has_unobserved(exact.value()));
+    CHECK(on.value() == exact.value());
+    CHECK(on_stamps.value() == off_stamps.value());
+    float step = 0.0f;
+    const d::DeblockRow* row = picked(info.value(), &step);
+    CHECK(row != nullptr);
+    const codec::DeblockInfo& got = on_dec.value().last_deblock();
+    CHECK(std::strcmp(got.filter, "off") == 0 && got.step == step * kTrunc);
+    CHECK(off_dec.value().last_deblock().step == got.step);
+  }
+  CHECK(p_frames == 4);
+  CHECK(on_dec.value().rebuild(on_grid.value()).ok());
+  vkc::Result<Snapshot> rebuilt = snapshot(gpu, on_grid.value());
+  vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
+  CHECK(rebuilt.ok() && exact.ok() && rebuilt.value() == exact.value());
+  CHECK(std::strcmp(on_dec.value().last_deblock().filter, "off") == 0);
+  return 0;
+}
+
+// A single unobserved voxel skips the whole frame: a mask-free frame is the
+// oracle's filter of its exact decode, and the same frame with one voxel of
+// one block unobserved is its exact decode in every block, reported "off".
+int one_voxel_case(Gpu& gpu) {
+  const Sphere s{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
+  vkc::Result<vol::VoxelBlockGrid> full = full_grid(gpu, {s});
+  vkc::Result<vol::VoxelBlockGrid> one = full_grid(gpu, {s});
+  CHECK(full.ok() && one.ok());
+  {
+    vol::VoxelBlockGrid& grid = one.value();
+    vkc::Result<std::vector<vol::BlockIndex>> active = active_sorted(grid);
+    vkc::Result<std::vector<float>> tsdf =
+        vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf");
+    vkc::Result<std::vector<float>> weight = vr_test::read_attribute<float>(
+        gpu.device, gpu.allocator, grid, "weight");
+    CHECK(active.ok() && tsdf.ok() && weight.ok());
+    const vol::BlockIndex& b = active.value()[active.value().size() / 2];
+    const std::uint32_t v = std::uint32_t(b.ptr) + 3 + 8 * 4 + 64 * 5;
+    tsdf.value()[v] = 0.0f;
+    weight.value()[v] = 0.0f;
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf",
+                                   tsdf.value())
+              .ok());
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
+                                   weight.value())
+              .ok());
+  }
+  for (const bool masked : {false, true}) {
+    vkc::Result<Bytes> frame =
+        encode_at(gpu, masked ? one.value() : full.value(), 64, 0.2f);
+    CHECK(frame.ok());
+    vkc::Result<codec::FrameInfo> info =
+        codec::read_frame_info(frame.value().data(), frame.value().size());
+    vkc::Result<codec::Decoder> on_dec = decoder(gpu, true);
+    vkc::Result<codec::Decoder> off_dec = decoder(gpu, false);
+    vkc::Result<vol::VoxelBlockGrid> on_grid = player_grid(gpu);
+    vkc::Result<vol::VoxelBlockGrid> off_grid = player_grid(gpu);
+    CHECK(info.ok() && on_dec.ok() && off_dec.ok() && on_grid.ok() &&
+          off_grid.ok());
+    CHECK(
+        on_dec.value()
+            .decode(frame.value().data(), frame.value().size(), on_grid.value())
+            .ok());
+    CHECK(off_dec.value()
+              .decode(frame.value().data(), frame.value().size(),
+                      off_grid.value())
+              .ok());
+    vkc::Result<Snapshot> on = snapshot(gpu, on_grid.value());
+    vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
+    CHECK(on.ok() && exact.ok());
+    CHECK(std::size_t(std::count(exact.value().weight.begin(),
+                                 exact.value().weight.end(), 0.0f)) ==
+          (masked ? 1u : 0u));
+    float step = 0.0f;
+    const d::DeblockRow* row = picked(info.value(), &step);
+    CHECK(row != nullptr && std::strcmp(row->filter, "LG") == 0);
+    const char* reported = on_dec.value().last_deblock().filter;
+    if (masked) {
+      CHECK(on.value() == exact.value());
+      CHECK(std::strcmp(reported, "off") == 0);
+    } else {
+      CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
+      CHECK(std::strcmp(reported, "LG") == 0);
+    }
+  }
+  return 0;
+}
+
+// One decoder, the switch on, over a chain whose frames alternate between
+// mask-free and masked, I- and P-frames of each: every frame the oracle's
+// filter of its exact decode or the exact decode, as its own masks say,
+// with its report, so nothing of one frame's gate is left for the next.
+int interleaved_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 3;
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Decoder> on_dec = decoder(gpu, true);
+  vkc::Result<codec::Decoder> off_dec = decoder(gpu, false);
+  vkc::Result<vol::VoxelBlockGrid> on_grid = player_grid(gpu);
+  vkc::Result<vol::VoxelBlockGrid> off_grid = player_grid(gpu);
+  CHECK(enc.ok() && on_dec.ok() && off_dec.ok() && on_grid.ok() &&
+        off_grid.ok());
+  // Frames by (masked, P).
+  std::size_t kinds[2][2] = {{0, 0}, {0, 0}};
+  for (int t = 0; t < 7; ++t) {
+    const bool masked = t % 2 == 1;
+    vkc::Result<vol::VoxelBlockGrid> g = moving_grid(gpu, t, !masked);
+    CHECK(g.ok());
+    vkc::Result<Bytes> frame = enc.value().encode(g.value());
+    CHECK(frame.ok());
+    vkc::Result<codec::FrameInfo> info =
+        codec::read_frame_info(frame.value().data(), frame.value().size());
+    CHECK(info.ok());
+    ++kinds[masked][info.value().type == codec::FrameType::kInter];
+    CHECK(
+        on_dec.value()
+            .decode(frame.value().data(), frame.value().size(), on_grid.value())
+            .ok());
+    CHECK(off_dec.value()
+              .decode(frame.value().data(), frame.value().size(),
+                      off_grid.value())
+              .ok());
+    vkc::Result<Snapshot> on = snapshot(gpu, on_grid.value());
+    vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
+    CHECK(on.ok() && exact.ok());
+    CHECK(has_unobserved(exact.value()) == masked);
+    float step = 0.0f;
+    const d::DeblockRow* row = picked(info.value(), &step);
+    CHECK(row != nullptr);
+    const char* reported = on_dec.value().last_deblock().filter;
+    if (masked) {
+      CHECK(on.value() == exact.value());
+      CHECK(std::strcmp(reported, "off") == 0);
+    } else {
+      CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
+      CHECK(std::strcmp(reported, row->filter) == 0);
+    }
+  }
+  for (const auto& by_type : kinds) {
+    CHECK(by_type[0] >= 1 && by_type[1] >= 1);
+  }
+  return 0;
+}
+
+// The block ceiling the player's helpers take: far past any fixture's.
+constexpr std::uint32_t kMaxBlocks = 1u << 20;
+
+// True-SDF frames (EncoderConfig::true_sdf) at the mesh templates' 16-voxel
+// band: a sphere's, every mask all ones, is the oracle's filter of its exact
+// decode; a curtain's, whose sign errors are cut and coded unobserved, is
+// its exact decode, reported "off".
+int true_sdf_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.true_sdf = true;
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<vol::VoxelBlockGrid> sphere = sphere_grid(
+      gpu, Sphere{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.07f}, wide_band());
+  vkc::Result<vol::VoxelBlockGrid> curtain = curtain_grid(
+      gpu, Curtain{Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, false});
+  CHECK(enc.ok() && sphere.ok() && curtain.ok());
+  for (const bool cut : {false, true}) {
+    vkc::Result<Bytes> frame =
+        enc.value().encode(cut ? curtain.value() : sphere.value());
+    CHECK(frame.ok());
+    const Bytes& f = frame.value();
+    vkc::Result<codec::FrameInfo> info =
+        codec::read_frame_info(f.data(), f.size());
+    vkc::Result<codec::Decoder> on_dec = decoder(gpu, true);
+    vkc::Result<codec::Decoder> off_dec = decoder(gpu, false);
+    vkc::Result<vol::VoxelBlockGrid> on_grid = codec::make_decode_grid(
+        gpu.device, gpu.allocator, f.data(), f.size(), kMaxBlocks);
+    vkc::Result<vol::VoxelBlockGrid> off_grid = codec::make_decode_grid(
+        gpu.device, gpu.allocator, f.data(), f.size(), kMaxBlocks);
+    CHECK(info.ok() && on_dec.ok() && off_dec.ok() && on_grid.ok() &&
+          off_grid.ok());
+    CHECK(codec::decode_growing(on_dec.value(), f.data(), f.size(),
+                                on_grid.value(), kMaxBlocks)
+              .ok());
+    CHECK(codec::decode_growing(off_dec.value(), f.data(), f.size(),
+                                off_grid.value(), kMaxBlocks)
+              .ok());
+    vkc::Result<Snapshot> on = snapshot(gpu, on_grid.value());
+    vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
+    CHECK(on.ok() && exact.ok());
+    CHECK(has_unobserved(exact.value()) == cut);
+    float step = 0.0f;
+    const d::DeblockRow* row = picked(info.value(), &step);
+    CHECK(row != nullptr);
+    const char* reported = on_dec.value().last_deblock().filter;
+    if (cut) {
+      CHECK(on.value() == exact.value());
+      CHECK(std::strcmp(reported, "off") == 0);
+    } else {
+      CHECK(deblocked(on.value(), exact.value(), *row, step,
+                      info.value().trunc_dist) == 0);
+      CHECK(std::strcmp(reported, row->filter) == 0);
+    }
+  }
+  return 0;
+}
+
 // On, the rows are the decode's: "codec decode", its device half the
 // deblock's dispatches too, over the same three breakdowns, no other.
 int rows_case(Gpu& gpu) {
   vkc::Result<codec::Decoder> dec = decoder(gpu, true);
   vkc::Result<vol::VoxelBlockGrid> source =
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.08f});
+      full_grid(gpu, {Sphere{vr::Vec3f(0.0f), 0.08f}});
   CHECK(dec.ok() && source.ok());
   vkc::Result<Bytes> frame = encode_at(gpu, source.value(), 64, 0.2f);
   vkc::Result<vol::VoxelBlockGrid> grid = player_grid(gpu);
@@ -1224,11 +1579,16 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (order_case(gpu) != 0) return 1;
   if (stamps_case(gpu, deblock) != 0) return 1;
   if (record_case(gpu, deblock) != 0) return 1;
+  if (skip_case(gpu, deblock) != 0) return 1;
   if (switch_case(gpu) != 0) return 1;
   if (chain_case(gpu) != 0) return 1;
   if (mixed_filters_case(gpu) != 0) return 1;
   if (rebuild_case(gpu) != 0) return 1;
   if (decoder_stamps_case(gpu) != 0) return 1;
+  if (masked_case(gpu) != 0) return 1;
+  if (one_voxel_case(gpu) != 0) return 1;
+  if (interleaved_case(gpu) != 0) return 1;
+  if (true_sdf_case(gpu) != 0) return 1;
   if (rows_case(gpu) != 0) return 1;
   std::printf("codec deblock: OK\n");
   return 0;

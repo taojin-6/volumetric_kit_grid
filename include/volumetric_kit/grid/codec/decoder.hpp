@@ -55,8 +55,9 @@ struct FrameInfo {
 struct DeblockInfo {
   /// The filter the frame's steps chose and the decoder ran: `"LF"`, a line
   /// fit across each block face; `"LG"`, that and a light Gaussian; `"R"`,
-  /// that and a stronger one; or `"off"`, for the deblock off or a step too
-  /// fine to need one. A string literal.
+  /// that and a stronger one; or `"off"`, for the deblock off, a step too
+  /// fine to need one, or a frame it skipped for an unobserved voxel
+  /// (@ref Decoder::set_deblock). A string literal.
   const char* filter = "off";
   /// T, in metres: the largest change one quantum of the frame's
   /// lowest-frequency coefficients makes to a voxel, by which the filter is
@@ -97,16 +98,16 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// the deblock off one it leaves as it was is not, so a consumer of the
 /// stamps sees only what the stream changed.
 ///
-/// The deblock (@ref set_deblock, off by default) smooths each frame across
-/// its block faces, where quantization leaves steps the mesher would draw,
-/// by a filter the frame's header chooses (@ref DeblockInfo), on the device
-/// inside the decode's last submit. It is out of loop -- a P-frame decodes
-/// from its reference's coefficients, never from a grid -- so it may change
-/// between any two frames, and it costs no bits. It writes observed voxels'
-/// `tsdf` alone, and stamps a block it writes `changed`. With it on, the
-/// stamps can also name a block whose values end as they were -- the inverse
-/// compares the exact decode with the smoothed values the grid held -- but
-/// never miss one that changed.
+/// The deblock (@ref set_deblock, off by default) smooths each frame it runs
+/// on across its block faces, where quantization leaves steps the mesher
+/// would draw, by a filter the frame's header chooses (@ref DeblockInfo), on
+/// the device inside the decode's last submit. It is out of loop -- a P-frame
+/// decodes from its reference's coefficients, never from a grid -- so it may
+/// change between any two frames, and it costs no bits. It writes observed
+/// voxels' `tsdf` alone, and stamps a block it writes `changed`. With it on,
+/// the stamps can also name a block whose values end as they were -- the
+/// inverse compares the exact decode with the smoothed values the grid held
+/// -- but never miss one that changed.
 ///
 /// Only `tsdf` and `weight` are written, so a grid that declares any other
 /// attribute is refused: a block kept across frames would carry that
@@ -229,9 +230,14 @@ class VR_CODEC_API Decoder {
                       core::StageMetrics* metrics = nullptr);
 
   /// @brief Turn the deblock on or off for every frame decoded or rebuilt
-  ///        from here on: on, each is smoothed across its block faces after
-  ///        its inverse transform, in the same submit; off, the default, the
-  ///        grid holds the exact decode.
+  ///        from here on: on, a frame whose masks are all ones is smoothed
+  ///        across its block faces after its inverse transform, in the same
+  ///        submit; off, the default, the grid holds the exact decode.
+  ///
+  /// A frame any of whose blocks has an unobserved voxel -- a masked frame,
+  /// as fused RGB-D's are, or a true-SDF frame with a cut
+  /// (@ref EncoderConfig::true_sdf) -- is skipped on the device, so it
+  /// decodes exactly as with the deblock off.
   void set_deblock(bool on) noexcept { deblock_on_ = on; }
   /// @return Whether the deblock is on.
   bool deblock() const noexcept { return deblock_on_; }

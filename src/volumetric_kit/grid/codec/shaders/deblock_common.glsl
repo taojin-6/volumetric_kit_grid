@@ -3,8 +3,8 @@
 
 // Shared by deblock_line.comp, deblock_gauss.comp and deblock_store.comp, the
 // decoder-side deblock (deblock.hpp has the filters): the bindings and push
-// constants of their one layout, the normalized field, the mask bit, the
-// shell index and the stamp.
+// constants of their one layout, the skip word, the normalized field, the
+// mask bit, the shell index and the stamp.
 //
 // ONE WORKGROUP OF kLanes (64) INVOCATIONS PER FRAME BLOCK, the entry
 // item_base + the group's id in the frame's list, found by its coord through
@@ -31,6 +31,7 @@ const uint kShellVoxels = 296u;  // kBlockVoxels - 6^3
 #define VR_DEBLOCK_BINDING_WEIGHT 4
 #define VR_DEBLOCK_BINDING_STAMPS 5
 #define VR_DEBLOCK_BINDING_SHELL 6
+#define VR_DEBLOCK_BINDING_SKIP 7
 
 // BlockIndex, BlockStamp and the read-only hash lookup from the volume tier
 // (one definition; see hash_lookup.glsl).
@@ -84,6 +85,13 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_STAMPS, scalar) buffer Stamps {
 // position, kUnobserved where the store leaves tsdf as it is.
 layout(set = 0, binding = VR_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
   float shell[];
+};
+// The frame's skip word: non-zero, and every kernel returns before it reads
+// or writes anything else. No deblock dispatch writes it, so each invocation
+// reads the same value and the return is uniform.
+layout(set = 0, binding = VR_DEBLOCK_BINDING_SKIP, scalar) readonly buffer
+    Skip {
+  uint skip;
 };
 
 // An unobserved voxel's value in the kernels' working field, and a shell
