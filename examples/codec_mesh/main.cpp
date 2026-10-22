@@ -87,9 +87,9 @@ vkc::Status run(const Options& opt) {
   // existing stream is refused before any conversion or output.
   VKC_ASSIGN(
       vr_example::CodecStream stream,
-      vr_example::CodecStream::create(device, allocator, config,
-                                      vr_example::codec_outputs(opt.output),
-                                      "codec_mesh", placement));
+      vr_example::CodecStream::create(
+          device, allocator, config, vr_example::codec_outputs(opt.output),
+          "codec_mesh", {vr_example::kNominalFps, 1}, placement));
   std::printf(
       "codec: %s\n",
       vr_example::codec_settings(config, opt.codec.quantization_table).c_str());
