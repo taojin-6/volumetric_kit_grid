@@ -31,11 +31,12 @@ constexpr std::uint8_t kZeros[8] = {};
 // What a viewer thread reads at a time of the bytes a viewer sends, which it
 // drops.
 constexpr std::size_t kDrainBytes = 4096;
-// The least time between two refusals logged at Warning; the rest go at Info.
+// The least time between two refusals logged at Warning; the rest go at Debug.
 constexpr std::chrono::seconds kRefusalWarningEvery{10};
 
 // recon's log_message, from a thread or a catch no exception may leave.
-// Viewers come and go at Info, which the core's default sink drops.
+// Viewers come and go at Info, which the core's default sink drops and a
+// sender prints, as serve_stream and fuse_orbbec do.
 void log_at(core::LogLevel level, const std::string& message) noexcept {
   try {
     log_message(level, message);
@@ -137,12 +138,13 @@ void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
   if (serving >= options.max_viewers) {
     fd.reset();  // closed at accept: the viewer sees its end before any byte
     // At Warning, which the default sink prints, so the owner sees why a
-    // viewer gets nothing: the first refusal, then one in 10 s at most.
+    // viewer gets nothing: the first refusal, then one in 10 s at most. The
+    // rest at Debug, so a sender that prints Info is not flooded either.
     const Clock::time_point now = Clock::now();
     const bool warn =
         !refusal_warned || now - *refusal_warned >= kRefusalWarningEvery;
     if (warn) refusal_warned = now;
-    log_at(warn ? core::LogLevel::Warning : core::LogLevel::Info,
+    log_at(warn ? core::LogLevel::Warning : core::LogLevel::Debug,
            std::string(kServer) + ": refused viewer " + name + ": " +
                std::to_string(serving) + " viewers already");
     return;
