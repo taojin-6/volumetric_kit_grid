@@ -146,29 +146,28 @@ inline std::vector<vr::Vec3i> band_blocks(const Sphere& s, float voxel = kVoxel,
 template <typename Sdf>
 vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VKC_ASSIGN(
-      std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
-  VKC_ASSIGN(std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+  VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
+                                       active));
+  VKC_ASSIGN(vr_test::AttributeSpan<float> weight,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       "weight", active));
   const float voxel = grid.grid().voxel_size;
   const float trunc = grid.grid().trunc_dist;
   for (const vol::BlockIndex& b : active) {
+    const std::size_t at = std::size_t(b.ptr) - tsdf.first;
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       const vr::Vec3f p(float(b.coord.x * 8 + int(v % 8)) * voxel,
                         float(b.coord.y * 8 + int((v / 8) % 8)) * voxel,
                         float(b.coord.z * 8 + int(v / 64)) * voxel);
       const float d = sdf(p);
       const bool obs = std::fabs(d) <= trunc;
-      tsdf[std::uint32_t(b.ptr) + v] = obs ? d : 0.0f;
-      weight[std::uint32_t(b.ptr) + v] = obs ? 2.0f : 0.0f;
+      tsdf.values[at + v] = obs ? d : 0.0f;
+      weight.values[at + v] = obs ? 2.0f : 0.0f;
     }
   }
-  VKC_TRY(
-      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  return vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                  weight);
+  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
+  return vr_test::write_span(gpu.device, gpu.allocator, grid, "weight", weight);
 }
 
 // write_field of one sphere.
@@ -224,16 +223,16 @@ struct Snapshot {
 
 inline vkc::Result<Snapshot> snapshot(Gpu& gpu, vol::VoxelBlockGrid& grid) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VKC_ASSIGN(
-      const std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
-  VKC_ASSIGN(const std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+  VKC_ASSIGN(const vr_test::AttributeSpan<float> tsdf,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
+                                       active));
+  VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       "weight", active));
   Snapshot out;
   for (const vol::BlockIndex& b : active) {
-    const auto at = [&](const std::vector<float>& a) {
-      return a.begin() + std::ptrdiff_t(b.ptr);
+    const auto at = [&](const vr_test::AttributeSpan<float>& a) {
+      return a.values.begin() + std::ptrdiff_t(std::size_t(b.ptr) - a.first);
     };
     out.coords.push_back(b.coord);
     out.tsdf.insert(out.tsdf.end(), at(tsdf), at(tsdf) + kVpb);

@@ -6,6 +6,8 @@
 // A grid attribute as a host vector, and back, for a test: the arrays are
 // device-local, so a test edits a copy and writes it back.
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -40,6 +42,58 @@ vkc::Status write_attribute(
     std::string_view name, const std::vector<T>& data) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
   return write_back(device, allocator, *view.buffer, data);
+}
+
+// The voxels of an attribute from the block at the lowest ptr of some blocks
+// through the block at the highest: voxel ptr + v is values[ptr - first + v].
+// A test grid's few blocks sit together, so this is a small part of what
+// read_attribute reads.
+template <typename T>
+struct AttributeSpan {
+  std::size_t first = 0;
+  std::vector<T> values;
+};
+
+// The span of attribute `name`, of elements T, that `blocks` lie in; empty
+// for no blocks.
+template <typename T>
+vkc::Result<AttributeSpan<T>> read_span(
+    const vkc::Device& device, vkc::Allocator& allocator,
+    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    std::string_view name,
+    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
+  VKC_ASSIGN(const auto view, grid.attribute(name));
+  if (view.element_size != sizeof(T)) {
+    return vkc::Status::invalid_argument("read_span: another element size");
+  }
+  AttributeSpan<T> out;
+  if (blocks.empty()) return out;
+  const auto by_ptr = [](const auto& a, const auto& b) {
+    return a.ptr < b.ptr;
+  };
+  const auto [lo, hi] =
+      std::minmax_element(blocks.begin(), blocks.end(), by_ptr);
+  out.first = std::size_t(lo->ptr);
+  out.values.resize(std::size_t(hi->ptr) + grid.grid().voxels_per_block -
+                    out.first);
+  vkc::CommandBatch batch(device, allocator);
+  VKC_TRY(batch.readback(*view.buffer, out.first * sizeof(T),
+                         out.values.size() * sizeof(T), out.values.data()));
+  VKC_TRY(batch.submit());
+  return out;
+}
+
+// Write `span` back where read_span read it.
+template <typename T>
+vkc::Status write_span(
+    const vkc::Device& device, vkc::Allocator& allocator,
+    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    std::string_view name, const AttributeSpan<T>& span) {
+  VKC_ASSIGN(const auto view, grid.attribute(name));
+  vkc::CommandBatch batch(device, allocator);
+  VKC_TRY(batch.upload(*view.buffer, span.first * sizeof(T), span.values.data(),
+                       span.values.size() * sizeof(T)));
+  return batch.submit();
 }
 
 using BlockCoord = std::tuple<int, int, int>;

@@ -206,12 +206,13 @@ vkc::Result<std::vector<std::uint8_t>> encode(
     const codec::EncoderConfig& config) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
-  VKC_ASSIGN(const std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+  VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       "weight", active));
   std::vector<vol::BlockIndex> observed;
   for (const vol::BlockIndex& b : active) {
-    const auto first = weight.begin() + std::ptrdiff_t(b.ptr);
+    const auto first = weight.values.begin() +
+                       std::ptrdiff_t(std::size_t(b.ptr) - weight.first);
     if (std::any_of(first, first + codec::kVoxelsPerBlock,
                     [](float w) { return w >= vol::kObservedWeight; })) {
       observed.push_back(b);

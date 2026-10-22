@@ -1190,23 +1190,23 @@ vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
   for (const auto& [c, voxels] : content) coords.push_back(c);
   VKC_TRY(allocate(gpu, grid, coords));
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
-  VKC_ASSIGN(
-      std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
-  VKC_ASSIGN(std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+  VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
+                                       blocks));
+  VKC_ASSIGN(vr_test::AttributeSpan<float> weight,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       "weight", blocks));
   for (const vol::BlockIndex& b : blocks) {
     const Voxels& v = content.at(b.coord);
+    const std::size_t at = std::size_t(b.ptr) - tsdf.first;
     for (std::uint32_t i = 0; i < kVpb; ++i) {
-      tsdf[std::uint32_t(b.ptr) + i] = v.observed[i] ? v.sdf[i] * kTrunc : 0.0f;
-      weight[std::uint32_t(b.ptr) + i] = v.observed[i] ? 2.0f : 0.0f;
+      tsdf.values[at + i] = v.observed[i] ? v.sdf[i] * kTrunc : 0.0f;
+      weight.values[at + i] = v.observed[i] ? 2.0f : 0.0f;
     }
   }
+  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
   VKC_TRY(
-      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight));
+      vr_test::write_span(gpu.device, gpu.allocator, grid, "weight", weight));
   return grid;
 }
 
