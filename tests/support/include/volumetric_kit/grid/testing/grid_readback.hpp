@@ -36,36 +36,6 @@ vkc::Result<std::vector<T>> read_attribute(
                       view.buffer->size() / sizeof(T));
 }
 
-// The voxels of `blocks` in attribute `name`, as elements of T: block i's
-// voxels_per_block elements from element i * voxels_per_block. A test reads
-// the blocks it compares, not the whole heap: one copy of the slots they
-// span, which a grid hands out from one end, so about the blocks alone.
-template <typename T>
-vkc::Result<std::vector<T>> read_blocks(
-    const Gpu& gpu, const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
-    std::string_view name,
-    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
-  VKC_ASSIGN(const auto view, grid.attribute(name));
-  const auto vpb = static_cast<std::size_t>(grid.grid().voxels_per_block);
-  std::vector<T> out(blocks.size() * vpb);
-  if (blocks.empty()) return out;
-  std::size_t lo = ~std::size_t{0}, hi = 0;  // the voxels the blocks span
-  for (const auto& b : blocks) {
-    lo = std::min(lo, static_cast<std::size_t>(b.ptr));
-    hi = std::max(hi, static_cast<std::size_t>(b.ptr) + vpb);
-  }
-  std::vector<T> span(hi - lo);
-  vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_TRY(batch.readback(*view.buffer, VkDeviceSize(lo) * sizeof(T),
-                         VkDeviceSize(span.size()) * sizeof(T), span.data()));
-  VKC_TRY(batch.submit());
-  for (std::size_t i = 0; i < blocks.size(); ++i) {
-    const std::size_t at = static_cast<std::size_t>(blocks[i].ptr) - lo;
-    std::copy_n(span.data() + at, vpb, out.data() + i * vpb);
-  }
-  return out;
-}
-
 // Write `data` over the start of attribute `name`.
 template <typename T>
 vkc::Status write_attribute(
@@ -126,6 +96,25 @@ vkc::Status write_span(
   VKC_TRY(batch.upload(*view.buffer, span.first * sizeof(T), span.values.data(),
                        span.values.size() * sizeof(T)));
   return batch.submit();
+}
+
+// The voxels of `blocks` in attribute `name`, as elements of T: block i's
+// voxels_per_block elements from element i * voxels_per_block, gathered from
+// their read_span. A test reads the blocks it compares, not the whole heap.
+template <typename T>
+vkc::Result<std::vector<T>> read_blocks(
+    const Gpu& gpu, const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    std::string_view name,
+    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
+  VKC_ASSIGN(const auto span,
+             read_span<T>(gpu.device, gpu.allocator, grid, name, blocks));
+  const auto vpb = static_cast<std::size_t>(grid.grid().voxels_per_block);
+  std::vector<T> out(blocks.size() * vpb);
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const std::size_t at = std::size_t(blocks[i].ptr) - span.first;
+    std::copy_n(span.values.data() + at, vpb, out.data() + i * vpb);
+  }
+  return out;
 }
 
 using BlockCoord = std::tuple<int, int, int>;
