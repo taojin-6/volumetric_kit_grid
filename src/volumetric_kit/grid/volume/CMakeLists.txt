@@ -48,9 +48,13 @@ target_compile_features(recon_volume PUBLIC cxx_std_17)
 # recon_core too. recon_core carries the Vulkan/GLM include wiring transitively.
 target_link_libraries(recon_volume PUBLIC recon_core)
 
+# PRIVATE src/: recon_core's internal dispatch.hpp, by root-relative path, as
+# the shaders include another tier's GLSL.
 target_include_directories(
-  recon_volume PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-                      "$<BUILD_INTERFACE:${_vr_volume_generated_inc}>")
+  recon_volume
+  PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+         "$<BUILD_INTERFACE:${_vr_volume_generated_inc}>"
+  PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the GLSL hash kernels to SPIR-V and embed them as constexpr byte
 # arrays into the library (voxel_hash_map.cpp #includes the generated *.spv.hpp

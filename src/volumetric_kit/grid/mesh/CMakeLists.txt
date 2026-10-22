@@ -48,9 +48,12 @@ target_compile_features(recon_mesh PUBLIC cxx_std_17)
 # transitively.
 target_link_libraries(recon_mesh PUBLIC recon_volume)
 
+# PRIVATE src/: recon_core's internal dispatch.hpp, as recon_volume reaches it.
 target_include_directories(
-  recon_mesh PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-                    "$<BUILD_INTERFACE:${_vr_mesh_generated_inc}>")
+  recon_mesh
+  PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+         "$<BUILD_INTERFACE:${_vr_mesh_generated_inc}>"
+  PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the GLSL marching-cubes kernel to SPIR-V and embed it as a constexpr
 # byte array into the library (marching_cubes.cpp #includes the generated

@@ -8,7 +8,8 @@
 // the F-score between meshes whose true distance is known -- a plane against a
 // copy of itself shifted by a known amount, and against one with half its
 // triangles gone -- what counts as surface, figures independent of the mesh's
-// order, the reusable reference, and every refusal. CPU-only.
+// order, the reusable reference, figures measured across threads the same as
+// on one, and every refusal. CPU-only.
 
 #include <algorithm>
 #include <chrono>
@@ -463,6 +464,35 @@ int reference_case() {
   return 0;
 }
 
+// A comparison with points enough to split across threads (22 801 a way: five
+// slices of at least 4096, where there are the cores) gives, to the bit, what
+// one thread measuring every point in turn gives. The test plane is bumped so
+// the points' distances differ: a slice skipped or shifted moves the figures.
+int threads_case() {
+  const mesh::Mesh reference = plane(150, 0.002f, 0.0f);
+  mesh::Mesh test = reference;
+  for (std::size_t v = 0; v < test.vertices.size(); ++v) {
+    test.vertices[v].position.z = 1e-4f * float(v % 17);
+  }
+  eval::CompareOptions opt;
+  opt.reach = 0.02f;
+  const auto one_thread = [&opt](const mesh::Mesh& from, const mesh::Mesh& to) {
+    const vkc::Result<eval::MeshDistance> d =
+        eval::MeshDistance::create(to, opt.reach);
+    std::vector<float> out;
+    for (const mesh::Vertex& v : from.vertices) {
+      out.push_back(d.value().distance(v.position));
+    }
+    return eval::summarize(std::move(out), opt.reach);
+  };
+  const vkc::Result<eval::MeshComparison> c = compare(reference, test, opt);
+  CHECK(c.ok());
+  CHECK(c.value().accuracy.count == test.vertices.size());
+  CHECK(identical(c.value().accuracy, one_thread(test, reference)));
+  CHECK(identical(c.value().coverage, one_thread(reference, test)));
+  return 0;
+}
+
 // The F-score: every point of the shifted plane is 3 mm off, so a threshold
 // above that is perfect and one below it is zero; half a mesh has full
 // precision and the recall of the half it kept.
@@ -586,6 +616,7 @@ int main() {
   if (fscore_case() != 0) return 1;
   if (surface_case() != 0) return 1;
   if (reference_case() != 0) return 1;
+  if (threads_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::printf("eval mesh distance: OK\n");
   return 0;

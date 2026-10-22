@@ -13,6 +13,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 
 #include "table_sizes.hpp"
 
@@ -22,8 +23,10 @@
 namespace volumetric_kit::recon::volume {
 namespace {
 
+// Both kernels run a workgroup a listed block, item_base the first block a
+// dispatch covers (recon::detail::dispatch_items).
 struct StampPush {
-  std::uint32_t base;
+  std::uint32_t item_base;
   std::uint32_t voxels_per_block;
   std::uint32_t tick;
   std::uint32_t max_age;
@@ -31,7 +34,7 @@ struct StampPush {
 };
 
 struct ZeroPush {
-  std::uint32_t base;
+  std::uint32_t item_base;
   std::uint32_t voxels_per_block;
   std::uint32_t words_per_block;
   std::uint32_t num_words;
@@ -39,24 +42,6 @@ struct ZeroPush {
   std::int32_t bucket_size;
   std::int32_t max_chain;
 };
-
-// One workgroup per listed block, in dispatches of at most the device's
-// maxComputeWorkGroupCount[0], each starting at push.base.
-template <typename Push>
-core::Status dispatch_per_block(core::CommandBatch& batch,
-                                const core::ComputeKernel& kernel,
-                                const core::DescriptorSet& set, Push push,
-                                std::uint32_t count, std::uint32_t max_groups,
-                                core::GpuStageScope* stage) {
-  for (std::uint32_t base = 0; base < count;) {
-    const std::uint32_t groups = std::min(max_groups, count - base);
-    push.base = base;
-    VKC_TRY(batch.dispatch(kernel, set, &push, sizeof(push), groups, max_groups,
-                           stage));
-    base += groups;
-  }
-  return {};
-}
 
 // The per-voxel count backing every attribute: one element per voxel across the
 // whole block pool. Grid dimensions are validated positive by
@@ -343,24 +328,26 @@ core::Result<std::uint32_t> VoxelBlockGrid::remove(
                                            bytes));
   VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
                                            bytes, max_storage_buffer_range_));
-  core::CommandBatch batch(*device_, *allocator_);
-  return zero_and_remove(batch, coords, count, out_failures, nullptr);
+  return zero_and_remove(coords, count, out_failures, nullptr);
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
-    core::CommandBatch& batch, const core::Buffer& list, std::uint32_t count,
-    AllocFailures* out_failures, core::GpuStageScope* stage) {
-  if (!attributes_.empty()) {
-    // The zero kernel finds each coord's block in the table itself, so this
-    // costs the count, not the grid.
-    VKC_TRY(prepare_block_kernels());
-    VKC_TRY(record_zero(batch, list, count, stage));
-  }
-  VKC_TRY(batch.submit());
+    const core::Buffer& list, std::uint32_t count, AllocFailures* out_failures,
+    core::GpuStageScope* stage) {
   // The topology epoch moves inside VoxelHashMap::remove -- where the index is
   // actually freed -- so there is nothing to bump here, and no way for the raw
   // map() path to skip it (see VoxelHashMap::topology_epoch).
-  return map_.remove(list, count, out_failures);
+  if (attributes_.empty()) {
+    return map_.remove(list, count, out_failures);
+  }
+  // The zero kernel finds each coord's block in the table itself, so this
+  // costs the count, not the grid. It rides the map's first round, ahead of
+  // the delete in the same submit, so every block is zeroed before its index
+  // is freed.
+  VKC_TRY(prepare_block_kernels());
+  return map_.remove(list, count, out_failures, [&](core::CommandBatch& batch) {
+    return record_zero(batch, list, count, stage);
+  });
 }
 
 core::Status VoxelBlockGrid::clear() {
@@ -458,8 +445,9 @@ core::Result<std::uint32_t> VoxelBlockGrid::block_pass(
   std::uint32_t stale = 0;
   core::CommandBatch batch(*device_, *allocator_);
   VKC_TRY(batch.fill(stale_count_, 0, sizeof(stale), 0u));
-  VKC_TRY(dispatch_per_block(batch, stamp_kernel_, set, push, active.count,
-                             max_workgroup_count_x_, &stage));
+  VKC_TRY(recon::detail::dispatch_items(batch, stamp_kernel_, push,
+                                        active.count, 1, max_workgroup_count_x_,
+                                        &stage, &set));
   VKC_TRY(batch.readback(stale_count_, 0, sizeof(stale), &stale));
   VKC_TRY(batch.submit());
   return std::min(stale, active.count);
@@ -478,9 +466,8 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
   // Both zeroing and deletion consume the device list the stamp pass wrote.
   // Only the small stale/failure counts reach the host; the coordinates never
   // make a round trip through a host vector and a second device allocation.
-  core::CommandBatch batch(*device_, *allocator_);
   VKC_ASSIGN(const std::uint32_t failed,
-             zero_and_remove(batch, stale_list_, stale, nullptr, &stage));
+             zero_and_remove(stale_list_, stale, nullptr, &stage));
   return stale - std::min(failed, stale);
 }
 
@@ -508,8 +495,8 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                         gp.num_buckets,
                         gp.bucket_size,
                         gp.max_chain};
-    VKC_TRY(dispatch_per_block(batch, zero_kernel_, set, push, count,
-                               max_workgroup_count_x_, stage));
+    VKC_TRY(recon::detail::dispatch_items(batch, zero_kernel_, push, count, 1,
+                                          max_workgroup_count_x_, stage, &set));
   }
   return {};
 }

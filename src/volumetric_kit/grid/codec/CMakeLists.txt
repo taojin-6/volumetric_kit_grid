@@ -66,9 +66,12 @@ target_compile_features(recon_codec PUBLIC cxx_std_17)
 # (Result, Status); recon_volume carries recon_core transitively.
 target_link_libraries(recon_codec PUBLIC recon_volume)
 
+# PRIVATE src/: recon_core's internal dispatch.hpp, as recon_volume reaches it.
 target_include_directories(
-  recon_codec PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-                     "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>")
+  recon_codec
+  PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+         "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>"
+  PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the kernels -- the DCT's, the block lists', the P-frame apply and diff
 # and the rANS coders' -- to SPIR-V and embed them (their sources #include the

@@ -24,7 +24,7 @@ namespace {
 
 // Mirrors `Push` in inter_apply.comp.
 struct ApplyPush {
-  std::uint32_t block_base = 0;
+  std::uint32_t item_base = 0;
   std::uint32_t num_blocks = 0;
   std::uint32_t coefficient_count = 0;
   std::uint32_t reference_count = 0;
@@ -74,8 +74,7 @@ core::Status fail(const char* op, const std::string& why) {
 }  // namespace
 
 core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
-    core::Device& device, core::Allocator& allocator,
-    std::uint32_t max_blocks_per_dispatch) {
+    core::Device& device, core::Allocator& allocator) {
   VKC_TRY(check_device_requirements(device, "ReferenceStore::create"));
   std::unique_ptr<ReferenceStore> owned(new ReferenceStore());
   ReferenceStore& s = *owned;
@@ -100,10 +99,6 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   s.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
-  s.blocks_per_dispatch_ =
-      max_blocks_per_dispatch == 0
-          ? s.max_workgroup_count_x_
-          : std::min(max_blocks_per_dispatch, s.max_workgroup_count_x_);
   s.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
   // One entry of each, so a side with none -- the reference of an intra
   // frame, a frame with no new blocks -- binds a buffer; and the counts.
@@ -226,12 +221,8 @@ core::Result<ResidentBlocks> ReferenceStore::record_apply(
   push.reference_count = m;
   push.payload_count = payload.count;
   VKC_TRY(batch.fill(faults_, 0, sizeof(std::uint32_t), 0u));
-  for (std::uint32_t base = 0; base < n; base += blocks_per_dispatch_) {
-    push.block_base = base;
-    const std::uint32_t groups = std::min(blocks_per_dispatch_, n - base);
-    VKC_TRY(batch.dispatch(apply, &push, sizeof(push), groups,
-                           max_workgroup_count_x_, stage));
-  }
+  VKC_TRY(
+      dispatch_items(batch, apply, push, n, 1, max_workgroup_count_x_, stage));
   VKC_TRY(batch.readback(faults_, 0, sizeof(std::uint32_t), &faults_host_));
   return out;
 }

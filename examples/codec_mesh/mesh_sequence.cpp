@@ -283,9 +283,9 @@ vkc::Result<vr::tsdf::MeshIntegrateStats> convert_frame(
   for (int contended = 0;;) {
     vr::volume::AllocFailures failures;
     VKC_ASSIGN(const auto failed,
-               grid.map().allocate_from_triangles(mesh.positions.data(),
-                                                  vertices, mesh.indices.data(),
-                                                  triangles, &failures));
+               grid.map().allocate_from_triangles(
+                   mesh.positions.data(), vertices, mesh.indices.data(),
+                   triangles, &failures, metrics));
     if (failed == 0) break;
     if (!failures.capacity_limited()) {
       if (++contended == 5) {

@@ -17,7 +17,6 @@
 #include <cstring>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "info_log.hpp"
@@ -97,14 +96,12 @@ vkc::Status serve(const Args& args) {
   std::fflush(stdout);
   const vr_example::ReplayLoop::Clock::time_point start =
       vr_example::ReplayLoop::Clock::now();
-  std::vector<std::uint8_t> payload;
+  const auto publish = [&](const stream::RecordInfo& info,
+                           const std::vector<std::uint8_t>& payload) {
+    return server->publish(info, payload.data(), payload.size());
+  };
   for (std::uint64_t pass = 0;; ++pass) {
-    for (const stream::Record& record : loop.records()) {
-      std::this_thread::sleep_until(loop.due(start, pass, record.info.pts_ns));
-      VKC_TRY(reader->read(record, &payload));
-      VKC_TRY(server->publish(loop.restamp(record.info, pass), payload.data(),
-                              payload.size()));
-    }
+    VKC_TRY(loop.send_pass(*reader, start, pass, publish));
   }
 }
 

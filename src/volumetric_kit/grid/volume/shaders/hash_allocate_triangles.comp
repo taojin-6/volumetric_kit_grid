@@ -23,6 +23,16 @@
 // trunc_dist is never rejected) and it is what keeps a big triangle from
 // allocating the solid interior of its bounding box.
 //
+// Neighbouring triangles name mostly the same blocks: at scan density each
+// block a mesh allocates is named by a few hundred work items. So, as
+// hash_allocate_depth does for a tile, a workgroup asks for each distinct
+// block that passes the band test once; the other lanes naming it would
+// repeat its probe, race it for a new block's bucket lock and stamp it again.
+// The allocated set is the same, since allocate_block is idempotent. The lanes
+// meet in a set in shared memory, not depth's walk back over the lanes before:
+// a triangle's own candidates are all different blocks, so a walk would pass
+// every one of them before reaching a neighbour's.
+//
 // Deliberately NOT the (2*tb+1)^3 cube dilation that hash_allocate_depth
 // applies. That dilates a POINT, where the cube is both the
 // cheapest and tightest thing available; a triangle has a real extent, so the
@@ -38,7 +48,8 @@
 #define VR_TRI_OFFSETS_BINDING 7
 #include "triangle_candidates.glsl"
 
-layout(local_size_x = 256) in;
+const uint kLanes = 256u;
+layout(local_size_x = kLanes) in;
 
 // binding 4: mesh vertices, tightly packed vec3 (scalar layout gives a stride
 // of 12, byte-identical to the host Vec3f array).
@@ -52,25 +63,51 @@ layout(set = 0, binding = 6, scalar) readonly buffer Indices { uint indices[]; }
 // binding 7: the per-triangle candidate offsets, declared by
 // triangle_candidates.glsl.
 
+// Each lane's candidate block, and the workgroup's distinct blocks as an
+// open-addressed set of the lanes asking for them: 1 + lane, 0 for a free
+// slot. Twice the lanes, so a probe always ends.
+const uint kSlots = 2u * kLanes;
+shared ivec3 s_block[kLanes];
+shared uint s_slot[kSlots];
+
 void main() {
+  // No lane returns before the barrier.
+  uint lid = gl_LocalInvocationID.x;
   uint tri_count = pc.arg;  // pc.arg = triangle count
-  uint total = vr_tri_offsets[tri_count];
-  uint gid = gl_GlobalInvocationID.x;
-  if (gid >= total) {
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
+  bool valid = gid < vr_tri_offsets[tri_count];
+  ivec3 coord = ivec3(0);
+  if (valid) {
+    uint t = vrTriangleOf(gid, tri_count);
+    uint local = gid - vr_tri_offsets[t];
+
+    vec3 v0 = vertices[indices[3u * t]];
+    vec3 v1 = vertices[indices[3u * t + 1u]];
+    vec3 v2 = vertices[indices[3u * t + 2u]];
+
+    valid = vrCandidateBlock(local, v0, v1, v2, pc.grid, coord) &&
+            vrBlockInBand(coord, v0, v1, v2, pc.grid);
+  }
+  s_block[lid] = coord;
+  s_slot[lid] = 0u;
+  s_slot[lid + kLanes] = 0u;
+  barrier();
+  if (!valid) {
     return;
   }
 
-  uint t = vrTriangleOf(gid, tri_count);
-  uint local = gid - vr_tri_offsets[t];
-
-  vec3 v0 = vertices[indices[3u * t]];
-  vec3 v1 = vertices[indices[3u * t + 1u]];
-  vec3 v2 = vertices[indices[3u * t + 2u]];
-
-  ivec3 coord;
-  if (!vrCandidateBlock(local, v0, v1, v2, pc.grid, coord) ||
-      !vrBlockInBand(coord, v0, v1, v2, pc.grid)) {
-    return;
+  // The lane that claims the block's slot asks for it; a lane finding its
+  // block there already leaves it to that one.
+  uint h = computeHashPos(coord, int(kSlots));
+  for (;;) {
+    uint lead = atomicCompSwap(s_slot[h], 0u, lid + 1u);
+    if (lead == 0u) {
+      break;
+    }
+    if (s_block[lead - 1u] == coord) {
+      return;
+    }
+    h = (h + 1u) % kSlots;
   }
   report_alloc_fail(allocate_block(coord));
 }

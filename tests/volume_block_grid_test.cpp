@@ -96,9 +96,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
     return vr_test::write_attribute(gpu.device, gpu.allocator, vbg, name, data)
         .ok();
   };
-  // load_factor() reads a host copy of the heap counter, which every allocate
-  // and remove round reads back from the device's own: after each call that
-  // moves the counter, the heap's blocks out agree with the table's blocks.
+  // load_factor() and allocated_blocks() read a host copy of the heap
+  // counter, which every allocate and remove round reads back from the
+  // device's own: after each call that moves the counter, the heap's blocks
+  // out agree with the table's blocks.
   const auto heap_agrees = [&]() {
     vkc::Result<float> lf = vbg.map().load_factor();
     vkc::Result<std::vector<vol::BlockIndex>> live =
@@ -106,7 +107,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
     const auto total = static_cast<float>(vbg.grid().num_blocks);
     return lf.ok() && live.ok() &&
            lf.value() ==
-               1.0f - (total - static_cast<float>(live.value().size())) / total;
+               1.0f -
+                   (total - static_cast<float>(live.value().size())) / total &&
+           vbg.map().allocated_blocks() == live.value().size();
   };
   std::vector<float> tsdf_data = get("tsdf");
   std::vector<float> weight_data = get("weight");

@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "volumetric_kit/core/base/exception_status.hpp"
@@ -72,15 +74,14 @@ class ReplayLoop {
         most = std::max(most, r.info.pts_ns);
       }
       // One mean step past the span; with one record, or all at one pts, the
-      // track's nominal rate, else 30 a second.
+      // track's nominal period.
       std::uint64_t step = 0;
       if (loop.records_.size() > 1) {
         step = (most - least) / (loop.records_.size() - 1);
       }
       if (step == 0) {
-        const vr::stream::Rate rate = reader.session().tracks[track].rate;
-        step = rate.num > 0 ? std::uint64_t{1'000'000'000} * rate.den / rate.num
-                            : 33'333'333;
+        step =
+            vr::stream::nominal_period_ns(reader.session().tracks[track].rate);
       }
       loop.first_pts_ = least;
       loop.pass_ns_ = most - least + step;
@@ -116,6 +117,50 @@ class ReplayLoop {
     info.seq += pass * pass_seqs_;
     info.pts_ns += pass * pass_ns_;
     return info;
+  }
+
+  /// @brief Sends pass @p pass of a loop started at @p start: each record,
+  ///        once @ref due, read from @p reader and @ref restamp ed, as
+  ///        `send(info, payload)`. A payload that fails its CRC
+  ///        (`InvalidArgument`) is not sent, nor are the P-frames after it,
+  ///        which lack their reference, up to the pass's next key; pass 0
+  ///        prints each such record to stderr, as every pass meets the same.
+  /// @param reader  The reader the loop was made from.
+  /// @param send    Called as `vkc::Status send(const vr::stream::RecordInfo&,
+  ///                const std::vector<std::uint8_t>&)`.
+  /// @return OK; `NotFound` when no key's payload reads whole, so the pass
+  ///         sends nothing; the reader's other errors; or @p send 's.
+  template <typename Send>
+  vkc::Status send_pass(const vr::stream::StreamReader& reader,
+                        Clock::time_point start, std::uint64_t pass,
+                        Send&& send) const {
+    std::vector<std::uint8_t> payload;
+    bool resync = false;  // past a damaged payload, until the next key
+    bool sent = false;
+    for (const vr::stream::Record& record : records_) {
+      if (resync && !record.info.key) continue;
+      resync = false;
+      std::this_thread::sleep_until(due(start, pass, record.info.pts_ns));
+      const vkc::Status read = reader.read(record, &payload);
+      if (read.domain() == vkc::Status::Code::InvalidArgument) {
+        if (pass == 0) {
+          std::fprintf(stderr,
+                       "serve_stream: %s; every pass skips seq %llu up to the "
+                       "next key\n",
+                       read.message().c_str(),
+                       static_cast<unsigned long long>(record.info.seq));
+        }
+        resync = true;
+        continue;
+      }
+      VKC_TRY(read);
+      VKC_TRY(send(restamp(record.info, pass), payload));
+      sent = true;
+    }
+    if (!sent) {
+      return vkc::Status::not_found("ReplayLoop: no key's payload reads whole");
+    }
+    return {};
   }
 
  private:

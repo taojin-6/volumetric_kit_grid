@@ -181,6 +181,9 @@ class VR_EVAL_API ReferenceMesh {
                                             const CompareOptions& options = {});
 
   /// @brief Compare @p test against the reference.
+  ///
+  /// The distances are measured on every core, the figures the same as on
+  /// one.
   /// @param test  The mesh being judged.
   /// @return The comparison, or `Status::Code::InvalidArgument` for a mesh
   ///         @ref MeshDistance::create refuses.

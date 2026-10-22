@@ -508,7 +508,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // Exactness of the two capacity reasons, on a table small enough to sweep by
   // hand: 2 buckets x 2 entries. Slot 1 and slot 3 are the per-bucket chain
   // anchors, which an overflow insert skips, so slots 0 and 2 are the only ones
-  // it may ever take.
+  // it may ever take. Four blocks leave the heap path no reserve (an eighth),
+  // so an overflow insert sweeps whenever a block is left.
   {
     vol::VoxelGridParams tg{};
     tg.voxel_size = 0.005f;
@@ -575,6 +576,44 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(f6.ok() && f6.value() > 0);
     CHECK(hf.heap > 0);
     CHECK(hf.table == 0);
+  }
+
+  // The same state at the default bucket size, where the reserve is the
+  // anchors' count: 2 buckets x 8. Fifteen coords on bucket 0 fill its eight
+  // slots and spill into bucket 1's seven non-anchors, leaving one block on the
+  // heap for bucket 1's anchor. Without the reserve a sixteenth sweeps the
+  // table and reports `table`, the sweep every failing insert of an overfull
+  // frame paid (DECISIONS.md, 2026-08-08); under it, the insert reports `heap`.
+  {
+    vol::VoxelGridParams rg{};
+    rg.voxel_size = 0.005f;
+    rg.block_size = 8;
+    rg.voxels_per_block = 512;
+    rg.trunc_dist = 0.04f;
+    rg.bucket_size = 8;
+    rg.num_buckets = 2;
+    rg.num_blocks = 16;  // bucket_size * num_buckets; reserve 2
+    rg.max_chain = 16;
+
+    vkc::Result<vol::VoxelHashMap> rmap =
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, rg);
+    CHECK(rmap.ok());
+    const std::vector<vol::BlockIndex> b0 =
+        coords_in_bucket(0, rg.num_buckets, 16);
+    CHECK(b0.size() == 16);
+    for (std::size_t i = 0; i < 15; ++i) {
+      vkc::Result<std::uint32_t> f =
+          vr_test::allocate_blocks(gpu, rmap.value(), &b0[i], 1);
+      CHECK(f.ok() && f.value() == 0);
+    }
+    vkc::Result<float> rlf = rmap.value().load_factor();
+    CHECK(rlf.ok() && rlf.value() == 15.0f / 16.0f);
+    vol::AllocFailures rf{};
+    vkc::Result<std::uint32_t> f16 =
+        vr_test::allocate_blocks(gpu, rmap.value(), &b0[15], 1, &rf);
+    CHECK(f16.ok() && f16.value() > 0);
+    CHECK(rf.heap > 0);
+    CHECK(rf.table == 0);
   }
 
   if (device_allocate_case(gpu, grid) != 0) return 1;

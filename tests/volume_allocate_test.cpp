@@ -269,6 +269,31 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(one_got == depth_want);
   }
 
+  // --- a frame over capacity ends its rounds at the limit --------------------
+  // The band outnumbers a 16-block table. The first call fills it, in as many
+  // rounds as its lock races take to reach the limit; the second meets the
+  // limit in its first round and stops there. More rounds would only repeat
+  // the failed inserts, whose queued threads' lock races kept a full table
+  // re-dispatching until progress stalled.
+  {
+    vol::VoxelGridParams small = grid;
+    small.num_buckets = 2;
+    small.num_blocks = 16;
+    CHECK(depth_want.size() > 2 * std::size_t(small.num_blocks));
+    vkc::Result<vol::VoxelHashMap> made =
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, small);
+    CHECK(made.ok());
+    for (int call = 0; call < 2; ++call) {
+      vol::AllocFailures failures{};
+      vkc::Result<std::uint32_t> r =
+          made.value().allocate_from_depth(depth.data(), cam, &failures);
+      CHECK(r.ok() && r.value() > 0 && failures.capacity_limited());
+      std::printf("  over capacity, call %d: %u round(s), %u lock, %u heap\n",
+                  call, failures.rounds, failures.lock, failures.heap);
+      if (call == 1) CHECK(failures.rounds == 1);
+    }
+  }
+
   // --- allocate-from-depth over several tiles -------------------------------
   // The kernel works a 16 x 16 tile a workgroup and dilates each distinct
   // block once, so a frame several tiles wide and ragged at both edges, with

@@ -24,6 +24,7 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 #include "gpu_test.hpp"
@@ -248,7 +249,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
   // Repeated GC grows then reuses a device stale-list buffer. A later short
   // list must delete only its live prefix, without stale entries from the
-  // longer previous pass or a host coordinate copy.
+  // longer previous pass or a host coordinate copy. At 16 blocks a dispatch,
+  // the 120-block passes split as a list past the device's limit does.
+  vr::detail::set_test_groups_per_dispatch(16);
   for (const int count : {7, 120, 3}) {
     std::vector<vol::BlockIndex> coords;
     for (int i = 0; i < count; ++i) coords.push_back(at(1000 + i));
@@ -264,6 +267,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     auto again = grid.free_stale_blocks(1);
     CHECK(again.ok() && again.value() == 0);
   }
+  vr::detail::set_test_groups_per_dispatch(0);
 
   // Refusals: a max_age of 0, and a grid with no weight.
   CHECK(grid.free_stale_blocks(0).status().domain() ==

@@ -149,6 +149,7 @@ layout(push_constant, scalar) uniform PushConstants {
   // Block slots the grid's heap holds, to bound each block's ptr in one
   // comparison.
   uint num_block_slots;
+  uint item_base;  // the first active block this dispatch covers
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeOwner / mcEdgeVertex + the near-tangent
@@ -538,7 +539,7 @@ void main() {
   // One workgroup per block, NOT a flat voxel grid: shared memory is per
   // workgroup, so the neighbourhood and the owned-edge table can only be shared
   // if every thread here belongs to the same block.
-  uint block_i = gl_WorkGroupID.x;
+  uint block_i = pc.item_base + gl_WorkGroupID.x;
   if (block_i >= pc.num_active_blocks) {
     return;
   }

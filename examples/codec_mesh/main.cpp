@@ -87,9 +87,9 @@ vkc::Status run(const Options& opt) {
   // existing stream is refused before any conversion or output.
   VKC_ASSIGN(
       vr_example::CodecStream stream,
-      vr_example::CodecStream::create(device, allocator, config,
-                                      vr_example::codec_outputs(opt.output),
-                                      "codec_mesh", placement));
+      vr_example::CodecStream::create(
+          device, allocator, config, vr_example::codec_outputs(opt.output),
+          "codec_mesh", {vr_example::kNominalFps, 1}, placement));
   std::printf(
       "codec: %s\n",
       vr_example::codec_settings(config, opt.codec.quantization_table).c_str());
@@ -135,7 +135,8 @@ vkc::Status run(const Options& opt) {
   vr_example::print_frame(last->frame);
   const mesh::Mesh input = vr_example::geometry_mesh(last->frame.mesh);
   VKC_ASSIGN(const mesh::Mesh source, extractor.extract_host(volume));
-  VKC_ASSIGN(const mesh::Mesh decoded, extractor.extract_host(stream.player()));
+  VKC_ASSIGN(const mesh::Mesh decoded,
+             extractor.extract_host(*stream.player()));
   if (!opt.output.prefix.empty()) {
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_input.ply", input));
     VKC_TRY(vr::io::write_ply(opt.output.prefix + "_source.ply", source));
@@ -166,7 +167,7 @@ vkc::Status run(const Options& opt) {
   if (opt.codec.sweep) {
     VKC_TRY(vr_example::run_codec_sweep(device, allocator, volume,
                                         source_reference, extractor, config,
-                                        stream.player()));
+                                        *stream.player()));
   }
   return {};
 }
