@@ -5,7 +5,7 @@
 // socket.hpp) on loopback, 127.0.0.1 port 0 only: what each socket is set to,
 // read back (non-blocking and close-on-exec on every one, the listener's
 // SO_REUSEADDR, the accepted sender's TCP_NODELAY and 128 KiB
-// TCP_NOTSENT_LOWAT, the client's 256 KiB receive buffer, SO_NOSIGPIPE on
+// TCP_NOTSENT_LOWAT, the client's 2 MiB receive buffer, SO_NOSIGPIPE on
 // Apple); a send to a closed peer failing rather than raising SIGPIPE; the
 // bytes a peer has not acknowledged, none, then all it has not taken in, then
 // none once it has read them; a wait interrupted by a signal going on to its
@@ -23,9 +23,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -112,9 +114,16 @@ int settings_case() {
 
   CHECK(nonblocking_cloexec(c.client.get()));
   CHECK(no_sigpipe(c.client.get()));
-  // Linux doubles what is asked for, for its bookkeeping.
-  CHECK(option(c.client.get(), SOL_SOCKET, SO_RCVBUF) >=
-        detail::kReceiveBuffer);
+  // Linux holds what is asked for to net.core.rmem_max, then doubles it for
+  // its bookkeeping.
+  int asked = detail::kReceiveBuffer;
+#ifdef __linux__
+  std::ifstream rmem_max("/proc/sys/net/core/rmem_max");
+  int most = 0;
+  CHECK(rmem_max >> most);
+  asked = 2 * std::min(asked, most);
+#endif
+  CHECK(option(c.client.get(), SOL_SOCKET, SO_RCVBUF) >= asked);
 
   CHECK(nonblocking_cloexec(c.accepted.get()));
   CHECK(no_sigpipe(c.accepted.get()));
@@ -122,7 +131,7 @@ int settings_case() {
   CHECK(option(c.accepted.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT) ==
         detail::kSendLowWater);
   CHECK(detail::kSendLowWater == 128 << 10);
-  CHECK(detail::kReceiveBuffer == 256 << 10);
+  CHECK(detail::kReceiveBuffer == 2 << 20);
 
   // The peer is the client, as named in the log.
   sockaddr_in local{};
