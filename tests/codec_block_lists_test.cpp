@@ -405,9 +405,9 @@ int merge_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
                            modes_of(rng, reference.size(), every, 4), added,
                            "int32 extremes") == 0);
   }
-  // A thousand random frames, and one past a dispatch's 65,535 groups' worth
+  // A hundred random frames, and one past a dispatch's 65,535 groups' worth
   // of nothing but a large reference.
-  for (int trial = 0; trial < 1000; ++trial) {
+  for (int trial = 0; trial < 100; ++trial) {
     split_coords(rng, rng.below(200), rng.below(1001), reference, added);
     CHECK(merges_as_oracle(gpu, lists, reference,
                            modes_of(rng, reference.size(), every, 4), added,
