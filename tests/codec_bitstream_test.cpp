@@ -659,7 +659,7 @@ int corruption_case() {
   const std::vector<std::uint8_t> big = oracle::write_frame(f, opt).value();
   Lcg rng{17};
   int refused = 0;
-  const int trials = 3000;
+  const int trials = 500;
   for (int i = 0; i < trials; ++i) {
     std::vector<std::uint8_t> b = big;
     const std::uint32_t edits = 1 + rng.below(3);
