@@ -686,9 +686,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// via @ref dispatch_with_retry.
   /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
   /// moves @ref topology_epoch once the input is accepted, and binds a zeroed
-  /// flag per element at binding 6, which the kernel sets on each coord it
-  /// finishes so later rounds skip it. @p first_round, when set, records last
-  /// into the first round's batch, ahead of the dispatch.
+  /// flag per element at binding 6 (@ref remove_done_), which the kernel sets
+  /// on each coord it finishes so later rounds skip it. @p first_round, when
+  /// set, records last into the first round's batch, ahead of the dispatch.
   core::Result<std::uint32_t> run_input_kernel(
       const char* op, const core::StorageInput& input, std::size_t elem_size,
       std::uint32_t count, const core::ComputeKernel& kernel,
@@ -730,6 +730,9 @@ class VR_VOLUME_API VoxelHashMap {
   // fail-counts and the compaction counter are fixed; the compaction output
   // tracks num_blocks, so resize() grows it with the rest.
   core::Buffer fail_counts_;
+  // remove's per-coord done flags, retained scratch grown to the largest
+  // count yet and re-zeroed per call.
+  core::Buffer remove_done_;
   core::Buffer compacted_;
   // The frustum compactions' output, so they leave compacted_'s list holding.
   core::Buffer frustum_compacted_;

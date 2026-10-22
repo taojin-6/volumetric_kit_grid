@@ -497,7 +497,6 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
     topology_epoch_ = next_topology_epoch();
   }
   core::Buffer input_buf;  // alive across every round
-  core::Buffer done_buf;
   const PushConstants push{grid_, count, tick_};
   return dispatch_with_retry(
       [&](core::CommandBatch& batch) {
@@ -512,10 +511,11 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
         if (removes) {
           const VkDeviceSize bytes =
               VkDeviceSize(count) * sizeof(std::uint32_t);
-          VKC_ASSIGN(done_buf, core::device_storage_buffer(*allocator_, bytes));
-          VKC_TRY(batch.fill(done_buf, 0, bytes, 0u));
-          kernel.set.write_storage_buffer(6, done_buf.handle(), 0,
-                                          VK_WHOLE_SIZE);
+          VKC_TRY(core::ensure_device_scratch(
+              *device_, *allocator_, remove_done_, bytes,
+              max_storage_buffer_range_, "hash.remove_done"));
+          VKC_TRY(batch.fill(remove_done_, 0, bytes, 0u));
+          kernel.set.write_storage_buffer(6, remove_done_.handle(), 0, bytes);
         }
         if (first_round) {
           VKC_TRY(first_round(batch));
