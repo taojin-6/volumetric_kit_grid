@@ -908,14 +908,20 @@ std::uint64_t address_space() {
 // the first 20. A thread never joined keeps its stack (8 MiB on Linux) or,
 // on macOS, 32 KiB of it, and neither shows in a thread count. A viewer's
 // thread sees its end within a poll slice, so 64 slots, and one refused
-// tries again. glibc gives a thread that finds malloc busy an arena of its
-// own, 64 MiB of address space kept, so no new one is made meanwhile. Not
-// under ASan or TSan, which keep freed memory a while.
+// tries again. Each reading waits, however long a loaded machine takes, for
+// every viewer the log says joined to have ended, then for two more to join
+// in turn and stay: the accept loop joins every ended viewer's thread before
+// each accept, so before it took the second. glibc gives a thread that finds
+// malloc busy an arena of its own, 64 MiB of address space kept, so no new
+// one is made meanwhile. Not under ASan or TSan, which keep freed memory a
+// while.
 int reaping_case() {
 #ifndef VR_TEST_SANITIZED
 #ifdef __GLIBC__
   CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
 #endif
+  Captured log;
+  LogCapture capture(&log);
   const stream::Session session = net::geometry_session();
   networking::ServerOptions options;
   options.max_viewers = 64;
@@ -933,17 +939,34 @@ int reaping_case() {
     }
     return true;
   };
+  // The address space once every ended viewer's thread is joined, with two
+  // viewers held. A viewer's lines: one as it joins, one as it ends.
+  const auto all_ended = [&] {
+    return log.count(": viewer ") == 2 * log.count(": viewer ", " joined, ");
+  };
+  const auto reaped = [&](std::uint64_t* bytes) {
+    const Clock::time_point end = Clock::now() + 60s;
+    while (!all_ended()) {
+      if (Clock::now() >= end) return false;
+      std::this_thread::sleep_for(5ms);
+    }
+    vkc::UniqueFd held[2];
+    for (vkc::UniqueFd& viewer : held) {
+      viewer = net::connect_loopback(server->port());
+      Bytes got;
+      net::read_upto(viewer.get(), header, 10s, &got);
+      if (got.size() != header) return false;
+    }
+    *bytes = address_space();
+    return true;
+  };
   CHECK(join_and_leave(20));
-  std::this_thread::sleep_for(100ms);  // five poll slices: the 20 are joined
-  const std::uint64_t before = address_space();
+  std::uint64_t before = 0;
+  CHECK(reaped(&before));
   CHECK(before > 0);
   CHECK(join_and_leave(300));
-  std::uint64_t after = address_space();
-  const Clock::time_point end = Clock::now() + 2s;
-  while (after >= before + (4 << 20) && Clock::now() < end) {
-    std::this_thread::sleep_for(20ms);
-    after = address_space();
-  }
+  std::uint64_t after = 0;
+  CHECK(reaped(&after));
   std::printf(
       "reaping: %+lld KiB after 300 viewers\n",
       (static_cast<long long>(after) - static_cast<long long>(before)) / 1024);
