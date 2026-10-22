@@ -76,12 +76,10 @@ vkc::Result<AttributeSpan<T>> read_span(
   const auto [lo, hi] =
       std::minmax_element(blocks.begin(), blocks.end(), by_ptr);
   out.first = std::size_t(lo->ptr);
-  out.values.resize(std::size_t(hi->ptr) + grid.grid().voxels_per_block -
-                    out.first);
-  vkc::CommandBatch batch(device, allocator);
-  VKC_TRY(batch.readback(*view.buffer, out.first * sizeof(T),
-                         out.values.size() * sizeof(T), out.values.data()));
-  VKC_TRY(batch.submit());
+  const std::size_t count =
+      std::size_t(hi->ptr) + grid.grid().voxels_per_block - out.first;
+  VKC_ASSIGN(out.values,
+             read_back<T>(device, allocator, *view.buffer, count, out.first));
   return out;
 }
 
@@ -92,10 +90,7 @@ vkc::Status write_span(
     const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name, const AttributeSpan<T>& span) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
-  vkc::CommandBatch batch(device, allocator);
-  VKC_TRY(batch.upload(*view.buffer, span.first * sizeof(T), span.values.data(),
-                       span.values.size() * sizeof(T)));
-  return batch.submit();
+  return write_back(device, allocator, *view.buffer, span.values, span.first);
 }
 
 // The voxels of `blocks` in attribute `name`, as elements of T: block i's
