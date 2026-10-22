@@ -712,31 +712,49 @@ core::Result<std::uint32_t> VoxelHashMap::remove(
                           true, first_round);
 }
 
-core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
-    const core::ComputeKernel& kernel, const core::Buffer& out,
-    core::GpuStageScope* stage,
-    const std::function<core::Status(core::CommandBatch&)>& prepare,
-    BlockIndex* head, std::uint32_t head_count) {
+core::Result<RecordedBlockList> VoxelHashMap::record_compaction(
+    core::CommandBatch& batch, const std::vector<FrustumPlanes>* frusta,
+    core::GpuStageScope* stage) {
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        "VoxelHashMap::record_compaction: moved-from map");
+  }
+  if (frusta != nullptr) {
+    VKC_TRY(core::check_storage_buffer_range(
+        "VoxelHashMap::record_compaction: the frusta",
+        sizeof(std::uint32_t) +
+            VkDeviceSize(frusta->size()) * sizeof(FrustumPlanes),
+        max_storage_buffer_range_));
+    VKC_TRY(upload_frusta(batch, frusta->data(),
+                          static_cast<std::uint32_t>(frusta->size())));
+  }
+  const bool culled = frusta != nullptr;
+  const core::Buffer& out = culled ? frustum_compacted_ : compacted_;
   // The active set is at most num_blocks entries; the persistent output buffer
   // is sized to that upper bound, so no grow/retry is needed for this slice.
   const auto capacity = static_cast<std::uint32_t>(grid_.num_blocks);
   const PushConstants push{grid_, capacity, tick_};
   // Before the submit, which may have run in part.
-  ++(&out == &compacted_ ? compaction_serial_ : frustum_serial_);
+  ++(culled ? frustum_serial_ : compaction_serial_);
+  VKC_TRY(batch.fill(active_count_, 0, sizeof(std::uint32_t), 0u));
+  VKC_TRY(batch.dispatch(culled ? compact_frustum_ : compact_, &push,
+                         sizeof(push), group_count(total_entries()),
+                         max_workgroup_count_x_, stage));
+  return RecordedBlockList{&out, &active_count_};
+}
+
+core::Result<std::uint32_t> VoxelHashMap::compact_into_device_list(
+    const std::vector<FrustumPlanes>* frusta, core::GpuStageScope* stage,
+    BlockIndex* head, std::uint32_t head_count) {
   std::uint32_t count = 0;
   core::CommandBatch batch(*device_, *allocator_);
-  if (prepare) {
-    VKC_TRY(prepare(batch));
-  }
-  VKC_TRY(batch.fill(active_count_, 0, sizeof(count), 0u));
-  VKC_TRY(batch.dispatch(kernel, &push, sizeof(push),
-                         group_count(total_entries()), max_workgroup_count_x_,
-                         stage));
+  VKC_ASSIGN(const RecordedBlockList list,
+             record_compaction(batch, frusta, stage));
   VKC_TRY(batch.readback(active_count_, 0, sizeof(count), &count));
-  VKC_TRY(batch.readback(out, 0, VkDeviceSize(head_count) * sizeof(BlockIndex),
-                         head));
+  VKC_TRY(batch.readback(*list.buffer, 0,
+                         VkDeviceSize(head_count) * sizeof(BlockIndex), head));
   VKC_TRY(batch.submit());
-  return std::min(count, capacity);
+  return std::min(count, static_cast<std::uint32_t>(grid_.num_blocks));
 }
 
 core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
@@ -744,16 +762,15 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
   // The list comes back beside its count, as far as a guess a quarter past
   // this kernel's last count, so a set that has not outgrown it costs one
   // submit rather than two (0.38 ms each on an RTX 5090).
-  // TODO(volume): size the fuse's and the extract's dispatches on the device,
-  // so no count reaches the host either.
+  // TODO(volume): size the extract's dispatch on the device, as the fuse's is
+  // (record_compaction), so no count reaches the host either.
   const std::uint32_t guess =
       static_cast<std::uint32_t>(std::min<std::uint64_t>(
           grid_.num_blocks,
           std::uint64_t(last_active_count_) + last_active_count_ / 4));
   std::vector<BlockIndex> active(guess);
   VKC_ASSIGN(const std::uint32_t count,
-             compact_into_device_list(compact_, compacted_, stage, {},
-                                      active.data(), guess));
+             compact_into_device_list(nullptr, stage, active.data(), guess));
   last_active_count_ = count;
   active.resize(count);
   if (count > guess) {
@@ -804,7 +821,7 @@ core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
         "VoxelHashMap::compact_active_blocks_on_device: moved-from map");
   }
   VKC_ASSIGN(const std::uint32_t count,
-             compact_into_device_list(compact_, compacted_, &stage));
+             compact_into_device_list(nullptr, &stage));
   last_device_list_ = DeviceBlockList{&compacted_, count, topology_epoch_,
                                       compaction_serial_, heap_free_};
   return last_device_list_;
@@ -862,18 +879,8 @@ VoxelHashMap::compact_active_blocks_in_frusta_on_device(
         "VoxelHashMap::compact_active_blocks_in_frusta_on_device: moved-from "
         "map");
   }
-  VKC_TRY(core::check_storage_buffer_range(
-      "VoxelHashMap::compact_active_blocks_in_frusta_on_device: the frusta",
-      sizeof(std::uint32_t) +
-          VkDeviceSize(frusta.size()) * sizeof(FrustumPlanes),
-      max_storage_buffer_range_));
-  const auto count = static_cast<std::uint32_t>(frusta.size());
   VKC_ASSIGN(const std::uint32_t kept,
-             compact_into_device_list(compact_frustum_, frustum_compacted_,
-                                      &stage, [&](core::CommandBatch& batch) {
-                                        return upload_frusta(
-                                            batch, frusta.data(), count);
-                                      }));
+             compact_into_device_list(&frusta, &stage));
   return DeviceBlockList{&frustum_compacted_, kept, topology_epoch_,
                          frustum_serial_, heap_free_};
 }
@@ -1099,6 +1106,11 @@ core::Result<float> VoxelHashMap::load_factor() const {
   // num_buckets > 0, and their product is num_blocks).
   return 1.0f -
          static_cast<float>(heap_free_) / static_cast<float>(grid_.num_blocks);
+}
+
+std::uint32_t VoxelHashMap::allocated_blocks() const noexcept {
+  return valid() ? static_cast<std::uint32_t>(grid_.num_blocks) - heap_free_
+                 : 0;
 }
 
 }  // namespace volumetric_kit::recon::volume

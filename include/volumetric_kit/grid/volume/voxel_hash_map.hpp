@@ -109,6 +109,20 @@ struct DeviceBlockList {
   std::uint32_t heap_free = 0;
 };
 
+/// @brief A compaction recorded into a caller's batch
+///        (@ref VoxelHashMap::record_compaction): the list and its count stay
+///        on the device, for the batch's later commands to read and to size a
+///        dispatch from.
+///
+/// Borrowed from the map, and good only in that batch: the map's next
+/// compaction rewrites both.
+struct RecordedBlockList {
+  /// The listed @ref BlockIndex entries, at most the map's `num_blocks`.
+  const core::Buffer* buffer = nullptr;
+  /// One `uint32_t`: how many entries @ref buffer lists.
+  const core::Buffer* count = nullptr;
+};
+
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
 ///        pipelines that operate on them, and drives block allocation and
@@ -431,6 +445,26 @@ class VR_VOLUME_API VoxelHashMap {
       const std::vector<FrustumPlanes>& frusta,
       core::StageMetrics* metrics = nullptr);
 
+  /// @brief Record a compaction into @p batch, its list and count left on the
+  ///        device for the commands recorded after it: the active blocks
+  ///        inside any of @p frusta, kept as
+  ///        @ref compact_active_blocks_in_frusta_on_device keeps them, or
+  ///        every active block when @p frusta is null.
+  ///
+  /// Nothing reaches the host, so a dispatch sized from the count follows in
+  /// the same submit (`tsdf::TsdfIntegrator` fuses this way). A list from the
+  /// on-device compaction of the same kind no longer holds.
+  /// @param batch   Records the compaction.
+  /// @param frusta  The frusta, none keeping no block; or null.
+  /// @param stage   Optional span around the dispatch; open until @p batch is
+  ///                submitted.
+  /// @return The list; or `Status::Code::InvalidArgument` as
+  ///         @ref compact_active_blocks_in_frusta_on_device refuses; or the
+  ///         batch's refusal.
+  core::Result<RecordedBlockList> record_compaction(
+      core::CommandBatch& batch, const std::vector<FrustumPlanes>* frusta,
+      core::GpuStageScope* stage = nullptr);
+
   /// @brief Reset the table to empty (re-runs the init kernel).
   /// @return An OK `Status`, or a non-OK one if the init dispatch fails or
   ///         the map is moved-from.
@@ -515,6 +549,11 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return The occupancy in `[0, 1]`, or a non-OK `Status` if the map is
   ///         moved-from.
   core::Result<float> load_factor() const;
+
+  /// @return The blocks the map holds, `num_blocks` less the free ones: the
+  ///         host's copy of the heap counter @ref load_factor reads, exact
+  ///         where that fraction rounds. 0 on an empty or moved-from map.
+  std::uint32_t allocated_blocks() const noexcept;
 
   /// @brief The @ref load_factor a caller should grow at rather than run past.
   ///
@@ -625,13 +664,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// when non-null, collects the dispatch's device span.
   core::Result<std::vector<BlockIndex>> collect_compacted(
       core::GpuStageScope* stage);
-  /// The compaction into @p out, the buffer @p kernel writes, in one submit,
-  /// returning the count and reading the list's first @p head_count entries
-  /// back into @p head.
+  /// @ref record_compaction in a submit of its own, returning the count and
+  /// reading the list's first @p head_count entries back into @p head.
   core::Result<std::uint32_t> compact_into_device_list(
-      const core::ComputeKernel& kernel, const core::Buffer& out,
-      core::GpuStageScope* stage,
-      const std::function<core::Status(core::CommandBatch&)>& prepare = {},
+      const std::vector<FrustumPlanes>* frusta, core::GpuStageScope* stage,
       BlockIndex* head = nullptr, std::uint32_t head_count = 0);
   /// Record into @p batch the upload of @p count frusta into
   /// @ref frustum_planes_ -- the count, then the planes from byte 4, the
