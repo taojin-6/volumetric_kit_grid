@@ -419,14 +419,15 @@ core::Status VoxelHashMap::rebuild_heap_excluding(
 core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     const std::function<core::Status(core::CommandBatch&)>& dispatches,
     AllocFailures* out_failures,
-    const std::function<core::Status(core::CommandBatch&)>& prepare) {
+    const std::function<core::Status(core::CommandBatch&)>& prepare,
+    const std::function<core::Status(core::CommandBatch&)>& then) {
   std::uint32_t failures = 0;
   std::uint32_t terminal = 0;
   for (std::uint32_t round = 0; round < kMaxRounds; ++round) {
     // One submit a round: the call's parameters (the first round only -- they
     // persist), the cleared tally, the dispatch, and the two small results
     // the host decides on -- the tally, and the heap counter behind
-    // load_factor().
+    // load_factor(); then the caller's work, when it shares the one round.
     std::uint32_t slots[kFailSlots] = {};
     std::uint32_t heap_free = 0;
     core::CommandBatch batch(*device_, *allocator_);
@@ -437,6 +438,9 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     VKC_TRY(dispatches(batch));
     VKC_TRY(batch.readback(fail_counts_, 0, sizeof(slots), slots));
     VKC_TRY(batch.readback(heap_counter_, 0, sizeof(heap_free), &heap_free));
+    if (then) {
+      VKC_TRY(then(batch));
+    }
     VKC_TRY(batch.submit());
     heap_free_ = heap_free;
     failures = slots[kFailTotal];
@@ -452,7 +456,7 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     }
     // Only contention is worth another round: nothing frees a block or a slot
     // between rounds, so a capacity limit would fail again.
-    if (reported.lock == 0 || reported.capacity_limited()) {
+    if (then || reported.lock == 0 || reported.capacity_limited()) {
       break;
     }
   }
@@ -547,7 +551,8 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const std::vector<DepthInput>& frames, AllocFailures* out_failures,
-    core::StageMetrics* metrics) {
+    core::StageMetrics* metrics,
+    const std::function<core::Status(core::CommandBatch&)>& then) {
   // Before the validity check, so a refused call still costs its row -- a stage
   // silent on failure reads as one that did not run. Inert when null, and it
   // publishes both halves on every return below, including the failing ones.
@@ -630,7 +635,8 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
           set.write_storage_buffer(7, stamps_.handle(), 0, VK_WHOLE_SIZE);
         }
         return {};
-      });
+      },
+      then);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(

@@ -267,11 +267,17 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param out_failures  As @ref allocate_from_depth, over every frame.
   /// @param metrics       As @ref allocate_from_depth: one `"allocate"` row,
   ///                      a device span per frame per round.
+  /// @param then          Optional: recorded into the first round's batch
+  ///                      after its dispatches and readbacks, so a caller's
+  ///                      work on the new blocks shares the round's submit.
+  ///                      With it the call runs that one round and no retry.
+  ///                      Not called when no frame has pixels.
   /// @return As @ref allocate_from_depth, the failures summed over the frames.
   core::Result<std::uint32_t> allocate_from_depth(
       const std::vector<DepthInput>& frames,
       AllocFailures* out_failures = nullptr,
-      core::StageMetrics* metrics = nullptr);
+      core::StageMetrics* metrics = nullptr,
+      const std::function<core::Status(core::CommandBatch&)>& then = {});
 
   // TODO(volume): the candidate count is a host pass over the triangles, as
   // in tsdf's MeshIntegrator (the 2026-10-13 volume block-list entry's Next).
@@ -701,10 +707,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// @p prepare, when set, records the call's parameter uploads into the first
   /// round's batch, ahead of the dispatches. Each round is one submit, and
   /// reads back the heap counter into @ref heap_free_ beside the tally.
+  /// @p then, when set, is recorded last in the first round's batch, and that
+  /// round is the only one.
   core::Result<std::uint32_t> dispatch_with_retry(
       const std::function<core::Status(core::CommandBatch&)>& dispatches,
       AllocFailures* out_failures,
-      const std::function<core::Status(core::CommandBatch&)>& prepare = {});
+      const std::function<core::Status(core::CommandBatch&)>& prepare = {},
+      const std::function<core::Status(core::CommandBatch&)>& then = {});
 
   /// Create a transient device-local buffer that @p batch fills with @p bytes
   /// of @p data, and bind it at @p binding of @p set. The caller keeps the
