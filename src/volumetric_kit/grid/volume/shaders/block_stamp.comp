@@ -22,7 +22,7 @@ layout(set = 0, binding = 3, scalar) writeonly buffer Stale {
 layout(set = 0, binding = 4, scalar) buffer StaleCount { uint stale_count; };
 
 layout(push_constant, scalar) uniform Push {
-  uint base;  // this dispatch's first active block
+  uint item_base;  // this dispatch's first active block
   uint voxels_per_block;
   uint tick;
   uint max_age;  // 0 lists nothing
@@ -38,7 +38,7 @@ void main() {
   }
   barrier();
   // One group per active block, so the group is in range.
-  BlockIndex block = active_blocks[pc.base + gl_WorkGroupID.x];
+  BlockIndex block = active_blocks[pc.item_base + gl_WorkGroupID.x];
   uint first = uint(block.ptr);
   bool any = false;
   for (uint k = lid; k < pc.voxels_per_block && !any; k += gl_WorkGroupSize.x) {

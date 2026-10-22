@@ -74,14 +74,10 @@ class VR_CODEC_API ReferenceStore {
  public:
   /// @brief Build the apply's and the diff's kernels and the store's first,
   ///        smallest buffers.
-  /// @param max_blocks_per_dispatch  Blocks per apply dispatch, as
-  ///        @ref DctTransformConfig::max_blocks_per_dispatch: 0 means the
-  ///        device's `maxComputeWorkGroupCount[0]`, which caps it either way.
   /// @return The store, holding no reference; or a pipeline, pool or
   ///         allocation failure.
   static core::Result<std::unique_ptr<ReferenceStore>> create(
-      core::Device& device, core::Allocator& allocator,
-      std::uint32_t max_blocks_per_dispatch = 0);
+      core::Device& device, core::Allocator& allocator);
 
   ~ReferenceStore() = default;
   ReferenceStore(const ReferenceStore&) = delete;
@@ -199,8 +195,6 @@ class VR_CODEC_API ReferenceStore {
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
   std::uint32_t max_workgroup_count_x_ = 0;
-  // The blocks one apply dispatch covers: create's cap, at most the above.
-  std::uint32_t blocks_per_dispatch_ = 0;
   VkDeviceSize max_storage_buffer_range_ = 0;
 
   // Declared before pool_, so the pool is destroyed first.

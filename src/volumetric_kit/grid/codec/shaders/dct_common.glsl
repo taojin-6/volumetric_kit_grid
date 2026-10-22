@@ -61,7 +61,7 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
 // layout places each at its host offset (44 bytes).
 layout(push_constant, scalar) uniform PushConstants {
-  uint block_base;         // first list entry this dispatch covers
+  uint item_base;          // first list entry this dispatch covers
   uint num_blocks;         // entries in the whole list
   uint coefficient_count;  // K, in [1, kBlockVoxels]
   float trunc_dist;        // metres; the SDF is divided by it (forward) and

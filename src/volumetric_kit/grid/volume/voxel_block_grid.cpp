@@ -13,6 +13,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 
 #include "table_sizes.hpp"
 
@@ -22,8 +23,10 @@
 namespace volumetric_kit::recon::volume {
 namespace {
 
+// Both kernels run a workgroup a listed block, item_base the first block a
+// dispatch covers (recon::detail::dispatch_items).
 struct StampPush {
-  std::uint32_t base;
+  std::uint32_t item_base;
   std::uint32_t voxels_per_block;
   std::uint32_t tick;
   std::uint32_t max_age;
@@ -31,7 +34,7 @@ struct StampPush {
 };
 
 struct ZeroPush {
-  std::uint32_t base;
+  std::uint32_t item_base;
   std::uint32_t voxels_per_block;
   std::uint32_t words_per_block;
   std::uint32_t num_words;
@@ -39,24 +42,6 @@ struct ZeroPush {
   std::int32_t bucket_size;
   std::int32_t max_chain;
 };
-
-// One workgroup per listed block, in dispatches of at most the device's
-// maxComputeWorkGroupCount[0], each starting at push.base.
-template <typename Push>
-core::Status dispatch_per_block(core::CommandBatch& batch,
-                                const core::ComputeKernel& kernel,
-                                const core::DescriptorSet& set, Push push,
-                                std::uint32_t count, std::uint32_t max_groups,
-                                core::GpuStageScope* stage) {
-  for (std::uint32_t base = 0; base < count;) {
-    const std::uint32_t groups = std::min(max_groups, count - base);
-    push.base = base;
-    VKC_TRY(batch.dispatch(kernel, set, &push, sizeof(push), groups, max_groups,
-                           stage));
-    base += groups;
-  }
-  return {};
-}
 
 // The per-voxel count backing every attribute: one element per voxel across the
 // whole block pool. Grid dimensions are validated positive by
@@ -458,8 +443,9 @@ core::Result<std::uint32_t> VoxelBlockGrid::block_pass(
   std::uint32_t stale = 0;
   core::CommandBatch batch(*device_, *allocator_);
   VKC_TRY(batch.fill(stale_count_, 0, sizeof(stale), 0u));
-  VKC_TRY(dispatch_per_block(batch, stamp_kernel_, set, push, active.count,
-                             max_workgroup_count_x_, &stage));
+  VKC_TRY(recon::detail::dispatch_items(batch, stamp_kernel_, push,
+                                        active.count, 1, max_workgroup_count_x_,
+                                        &stage, &set));
   VKC_TRY(batch.readback(stale_count_, 0, sizeof(stale), &stale));
   VKC_TRY(batch.submit());
   return std::min(stale, active.count);
@@ -508,8 +494,8 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                         gp.num_buckets,
                         gp.bucket_size,
                         gp.max_chain};
-    VKC_TRY(dispatch_per_block(batch, zero_kernel_, set, push, count,
-                               max_workgroup_count_x_, stage));
+    VKC_TRY(recon::detail::dispatch_items(batch, zero_kernel_, push, count, 1,
+                                          max_workgroup_count_x_, stage, &set));
   }
   return {};
 }
