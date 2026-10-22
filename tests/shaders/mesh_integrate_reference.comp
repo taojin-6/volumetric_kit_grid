@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// The brute force mesh_integrate.comp must match bit for bit
+// (recon_tsdf_mesh_integrate_exact): one thread per voxel measures every
+// triangle of its block's bin -- the kernel as it was before it ruled
+// triangles out, its voxel, update and write unchanged. Two passes (pc.pass):
+//   bins    -- one item per (triangle, candidate block) work item, decoded,
+//              band-tested and looked up as mesh_bin.comp's count pass does,
+//              through the same GLSL: the bin's (block, triangle) bit.
+//   measure -- one item per voxel of the blocks, over the bins the host lists
+//              from those bits, in triangle order.
+
+#define VR_HASH_ENTRIES_BINDING 7
+#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#define VR_TRI_OFFSETS_BINDING 2
+#include "volumetric_kit/recon/volume/shaders/triangle_candidates.glsl"
+
+layout(local_size_x = 256) in;
+
+// A block: its coordinate, and its bin's run of `lists` (measure pass).
+struct RefBlock {
+  ivec3 coord;
+  uint begin;
+  uint count;
+};
+
+layout(set = 0, binding = 0, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+layout(set = 0, binding = 1, scalar) readonly buffer Indices { uint indices[]; };
+// binding 2: the host's candidate offsets (triangle_candidates.glsl).
+layout(set = 0, binding = 3, scalar) readonly buffer Blocks {
+  RefBlock blocks[];
+};
+// The bins pass's bits, zeroed by the host; the measure pass's lists.
+layout(set = 0, binding = 4, scalar) buffer Lists { uint lists[]; };
+layout(set = 0, binding = 5, scalar) writeonly buffer Tsdf { float tsdf[]; };
+layout(set = 0, binding = 6, scalar) writeonly buffer Weight {
+  float weight[];
+};
+// binding 7: the grid's hash entries (hash_lookup.glsl). Then each heap
+// slot's index in `blocks`, or -1.
+layout(set = 0, binding = 8, scalar) readonly buffer SlotBlocks {
+  int slot_block[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+  VoxelGridParams grid;
+  uint tri_count;
+  uint block_count;
+  uint pass;    // kPassBins or kPassMeasure
+  uint mode;    // tsdf::MeshSdfMode
+  float shell;  // shell half-thickness, metres
+} pc;
+
+const uint kPassBins = 0u;
+const uint kPassMeasure = 1u;
+const uint kModeSigned = 0u;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (pc.pass == kPassBins) {
+    if (gid >= vr_tri_offsets[pc.tri_count]) {
+      return;
+    }
+    uint t = vrTriangleOf(gid, pc.tri_count);
+    vec3 v0 = vertices[indices[3u * t]];
+    vec3 v1 = vertices[indices[3u * t + 1u]];
+    vec3 v2 = vertices[indices[3u * t + 2u]];
+    ivec3 coord;
+    if (vrCandidateBlock(gid - vr_tri_offsets[t], v0, v1, v2, pc.grid,
+                         coord) &&
+        vrBlockInBand(coord, v0, v1, v2, pc.grid)) {
+      int ptr = vrFindBlockPtr(coord, pc.grid.num_buckets,
+                               pc.grid.bucket_size, pc.grid.max_chain);
+      int b = ptr < 0 ? -1
+                      : slot_block[uint(ptr) / uint(pc.grid.voxels_per_block)];
+      if (b >= 0) {
+        uint bit = uint(b) * pc.tri_count + t;
+        atomicOr(lists[bit >> 5u], 1u << (bit & 31u));
+      }
+    }
+    return;
+  }
+
+  uint vpb = uint(pc.grid.voxels_per_block);
+  if (gid >= pc.block_count * vpb) {
+    return;
+  }
+  RefBlock blk = blocks[gid / vpb];
+  uint local = gid % vpb;
+  int bs = pc.grid.block_size;
+  ivec3 lc = ivec3(int(local % uint(bs)), int((local / uint(bs)) % uint(bs)),
+                   int(local / uint(bs * bs)));
+  vec3 p = vec3(blk.coord * bs + lc) * pc.grid.voxel_size;
+
+  float best_d2 = 3.4e38;
+  uint best_t = 0xFFFFFFFFu;
+  vec3 best_closest = p;
+  for (uint i = 0u; i < blk.count; ++i) {
+    uint t = lists[blk.begin + i];
+    vec3 a = vertices[indices[3u * t]];
+    vec3 b = vertices[indices[3u * t + 1u]];
+    vec3 c = vertices[indices[3u * t + 2u]];
+    vec3 q = vrClosestPointOnTriangle(p, a, b, c);
+    vec3 d = p - q;
+    float d2 = dot(d, d);
+    if (d2 < best_d2 || (d2 == best_d2 && t < best_t)) {
+      best_d2 = d2;
+      best_t = t;
+      best_closest = q;
+    }
+  }
+
+  float trunc_dist = pc.grid.trunc_dist;
+  float dist = sqrt(best_d2);
+  bool observed = best_t != 0xFFFFFFFFu && dist <= trunc_dist;
+  float sdf = 0.0;
+  if (observed) {
+    if (pc.mode == kModeSigned) {
+      vec3 a = vertices[indices[3u * best_t]];
+      vec3 b = vertices[indices[3u * best_t + 1u]];
+      vec3 c = vertices[indices[3u * best_t + 2u]];
+      sdf = dot(p - best_closest, cross(b - a, c - a)) >= 0.0 ? dist : -dist;
+    } else {
+      sdf = dist - pc.shell;
+    }
+  }
+  tsdf[gid] = observed ? clamp(sdf, -trunc_dist, trunc_dist) : 0.0;
+  weight[gid] = observed ? 1.0 : 0.0;
+}
