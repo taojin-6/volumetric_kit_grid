@@ -127,6 +127,26 @@ class VR_NETWORKING_API StreamClient {
                           stream::Record* record,
                           std::vector<std::uint8_t>* payload);
 
+  /// @brief Read as @ref next, also reporting progress without a whole record.
+  /// @param wait          The longest wait, as in the three-argument overload.
+  /// @param[out] record   The next record's header, when one is returned.
+  /// @param[out] payload  Its payload, resized to fit, when one is returned.
+  /// @param[out] progressed Optional; reset to false on every call. True if
+  ///                       the call returned a record (already buffered or
+  ///                       newly received), completed a lookup/connect step,
+  ///                       or received bytes successfully. Remains true if a
+  ///                       later step is idle. A false result with true
+  ///                       progress can be a partial chunk: call again to
+  ///                       drain available input before waiting elsewhere.
+  ///                       On error, reports only earlier successful steps;
+  ///                       the error still closes the connection.
+  /// @return The same record, timeout and error results as the three-argument
+  ///         overload. A false result with false progress means this call
+  ///         found no record and made no progress.
+  core::Result<bool> next(std::chrono::milliseconds wait,
+                          stream::Record* record,
+                          std::vector<std::uint8_t>* payload, bool* progressed);
+
  private:
   struct Impl;
   explicit StreamClient(std::unique_ptr<Impl> impl) noexcept;

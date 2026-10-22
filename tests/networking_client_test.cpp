@@ -9,7 +9,10 @@
 // read, and an end before the session says so; next(20 ms) with nothing
 // returns false in about 20 ms, and within 500 ms while chunks it skips flood
 // in; next(0 ms) alone connects and reads, a 230 KB record already in the
-// socket in one call; idle_limit counts from connect, against a listener that
+// socket in one call; progress distinguishes a partial record larger than a
+// receive from idle input, stays true across a later idle step, includes
+// buffered records and resets for each call, saved errors included;
+// idle_limit counts from connect, against a listener that
 // sends nothing and a port whose connects never finish, and then from the
 // last byte, judged after taking what came while the caller was away (bytes,
 // a connect's end or its refusal);
@@ -36,6 +39,7 @@
 
 #include "networking_loopback.hpp"
 #include "stream_files.hpp"
+#include "test_allocation_failure.hpp"
 #include "test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
@@ -94,9 +98,11 @@ Code error_from(const Bytes& bytes) {
               .rfind("ChunkParser: ", 0) != 0) {
     return Code::Ok;
   }
-  const vkc::Result<bool> again = client->next(0ms, &got.record, &got.payload);
+  bool progressed = true;
+  const vkc::Result<bool> again =
+      client->next(0ms, &got.record, &got.payload, &progressed);
   if (again.ok() || again.status().domain() != first.status().domain() ||
-      again.status().message() != first.status().message()) {
+      again.status().message() != first.status().message() || progressed) {
     return Code::Ok;
   }
   Bytes rest;
@@ -314,6 +320,88 @@ int zero_wait_case() {
   std::this_thread::sleep_for(200ms);  // on loopback, in the socket by now
   r = client->next(0ms, &got.record, &got.payload);
   CHECK(r.ok() && *r && got.record.info.seq == 1);
+  return 0;
+}
+
+// A partial record is progress even though next returns false. Each piece is
+// drained before another goes, and a later idle step in the same call must
+// not erase its progress. A separate idle call resets it. Records sent
+// together report progress too, including one already buffered by the call
+// before it; no receive is required to return a record.
+int progress_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr);
+  Got got;
+  bool progressed = false;
+  vkc::Result<bool> r =
+      client->next(0ms, &got.record, &got.payload, &progressed);
+  CHECK(r.ok() && !*r && progressed);  // starting the connect is progress
+  sender.peer = net::accept_within(sender.listener.fd.get(), 2s);
+  CHECK(sender.peer.valid());
+  CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
+  CHECK(net::wait_session(*client));
+
+  const Bytes payload = vrst::pattern(512 * 1024, 7);
+  const Bytes record = vrst::record(0, 1, 0, 0, stream::kNoSet, payload);
+  constexpr std::size_t kPiece = 128 * 1024;
+  for (std::size_t begin = 0; begin < record.size(); begin += kPiece) {
+    const std::size_t end = std::min(begin + kPiece, record.size());
+    const Bytes piece(record.data() + begin, record.data() + end);
+    CHECK(net::send_bytes(sender.peer.get(), piece));
+    progressed = false;
+    r = client->next(20ms, &got.record, &got.payload, &progressed);
+    CHECK(r.ok() && progressed);
+    CHECK(*r == (end == record.size()));
+    if (!*r) {
+      r = client->next(0ms, &got.record, &got.payload, &progressed);
+      CHECK(r.ok() && !*r && !progressed);
+    }
+  }
+  CHECK(got.record.info.seq == 0 && got.payload == payload);
+
+  const Bytes small = vrst::pattern(64, 9);
+  CHECK(net::send_bytes(
+      sender.peer.get(),
+      concat({vrst::record(0, 0, 1, 1, stream::kNoSet, small),
+              vrst::record(0, 0, 2, 2, stream::kNoSet, small)})));
+  for (std::uint64_t seq = 1; seq <= 2; ++seq) {
+    progressed = false;
+    r = client->next(20ms, &got.record, &got.payload, &progressed);
+    CHECK(r.ok() && *r && progressed && got.record.info.seq == seq);
+    CHECK(got.payload == small);
+  }
+  progressed = true;
+  r = client->next(0ms, &got.record, &got.payload, &progressed);
+  CHECK(r.ok() && !*r && !progressed);
+  return 0;
+}
+
+// The progress output is reset even when copying a saved error allocates and
+// fails. The overload still contains the exception and returns OutOfMemory.
+int progress_oom_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  CHECK(net::send_bytes(sender.peer.get(), Bytes(64, 'x')));
+  Got got;
+  CHECK(!settle(*client, &got).ok());
+  auto& failure = vr_test::allocation_failure;
+  failure = {};
+  failure.measure = true;
+  const vkc::Result<bool> measured =
+      client->next(0ms, &got.record, &got.payload);
+  failure.measure = false;
+  CHECK(!measured.ok() && failure.bytes != 0);
+  failure.site = failure.measured_site;
+  failure.armed = true;
+  bool progressed = true;
+  const vkc::Result<bool> r =
+      client->next(0ms, &got.record, &got.payload, &progressed);
+  const bool injected = failure.injected;
+  failure = {};
+  CHECK(injected && !r.ok() && r.status().domain() == Code::OutOfMemory);
+  CHECK(!progressed);
   return 0;
 }
 
@@ -581,6 +669,8 @@ int main() {
   if (wait_case() != 0) return 1;
   if (flood_case() != 0) return 1;
   if (zero_wait_case() != 0) return 1;
+  if (progress_case() != 0) return 1;
+  if (progress_oom_case() != 0) return 1;
   if (idle_case() != 0) return 1;
   if (connect_within_case() != 0) return 1;
   if (idle_from_last_byte_case() != 0) return 1;
