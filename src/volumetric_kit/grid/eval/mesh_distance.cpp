@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace volumetric_kit::recon::eval {
@@ -186,13 +187,40 @@ std::vector<Vec3f> sample_points(const mesh::Mesh& mesh, std::size_t stride) {
   return points;
 }
 
-// TODO(eval): thread this -- room0 at 1 cm takes ~2 s at stride 4 on one core.
+// Each point's distance to `surface`, in the points' order, on every core: a
+// slice of the points per thread, each writing only its own entries, so the
+// result is one thread's whatever the count. A slice is a few milliseconds of
+// queries at the least, worth a thread's start.
 std::vector<float> distances_to(const std::vector<Vec3f>& points,
                                 const MeshDistance& surface) {
-  std::vector<float> out;
-  out.reserve(points.size());
-  for (const Vec3f& p : points) {
-    out.push_back(surface.distance(p));
+  constexpr std::size_t kMinSlice = 4096;
+  std::vector<float> out(points.size());
+  const std::size_t slices = std::clamp<std::size_t>(
+      points.size() / kMinSlice, 1,
+      std::max(1u, std::thread::hardware_concurrency()));
+  const std::size_t per = (points.size() + slices - 1) / slices;
+  const auto measure = [&](std::size_t s) {
+    const std::size_t end = std::min(points.size(), (s + 1) * per);
+    for (std::size_t i = s * per; i < end; ++i) {
+      out[i] = surface.distance(points[i]);
+    }
+  };
+  std::vector<std::thread> threads;
+  threads.reserve(slices - 1);
+  std::size_t s = 1;
+  try {
+    for (; s < slices; ++s) {
+      threads.emplace_back(measure, s);
+    }
+  } catch (...) {
+    // No thread to be had: this one measures the slices left.
+  }
+  for (std::size_t rest = s; rest < slices; ++rest) {
+    measure(rest);
+  }
+  measure(0);
+  for (std::thread& t : threads) {
+    t.join();
   }
   return out;
 }
