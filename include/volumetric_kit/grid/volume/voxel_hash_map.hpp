@@ -49,7 +49,9 @@ struct AllocFailures {
   std::uint32_t total = 0;  ///< Retryable failures the final round reported.
   std::uint32_t lock = 0;   ///< Lost bucket-lock races: contention, not size.
   std::uint32_t chain = 0;  ///< Collision chain full: a capacity limit.
-  std::uint32_t heap = 0;   ///< Block heap empty: a capacity limit.
+  /// Block heap empty, or below an eighth of the blocks for an insert that
+  /// must overflow its bucket: a capacity limit.
+  std::uint32_t heap = 0;
   /// No free non-anchor slot anywhere in the table: a capacity limit, and a
   /// distinct one. Kept apart from @ref heap because the two are not
   /// interchangeable -- the rehash path presets each block's pointer and never

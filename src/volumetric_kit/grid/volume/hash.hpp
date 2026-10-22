@@ -52,7 +52,7 @@ static_assert(offsetof(HashEntry, offset) == 16, "HashEntry layout drift");
 inline constexpr std::uint32_t kFailTotal = 0;     ///< Retryable total.
 inline constexpr std::uint32_t kFailLock = 1;      ///< Lock contention.
 inline constexpr std::uint32_t kFailChain = 2;     ///< Collision chain full.
-inline constexpr std::uint32_t kFailHeap = 3;      ///< Block heap empty.
+inline constexpr std::uint32_t kFailHeap = 3;      ///< Block heap (too) low.
 inline constexpr std::uint32_t kFailTerminal = 4;  ///< Non-retryable.
 /// No free non-anchor slot anywhere in the table: the overflow scan swept every
 /// entry and every one it may use was occupied. Proof of exhaustion rather than

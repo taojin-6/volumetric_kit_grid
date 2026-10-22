@@ -133,9 +133,10 @@ int allocate_in_primary(uint first_empty, ivec3 coord, int preset_ptr,
   return -1;
 }
 
-// Returns -1 on success, else kFailHeap (no block left on the heap), kFailLock
-// (a free-looking slot was skipped because another thread held its bucket) or
-// kFailTable (scanned every entry and every non-anchor slot was occupied).
+// Returns -1 on success, else kFailHeap (on the heap path, fewer than an eighth
+// of the blocks left), kFailLock (a free-looking slot was skipped because
+// another thread held its bucket) or kFailTable (scanned every entry and every
+// non-anchor slot was occupied).
 //
 // The scan is exhaustive, so kFailTable is proof rather than a guess -- which is
 // what makes growing the right answer to it. What makes an exhaustive scan
@@ -174,8 +175,18 @@ int allocate_in_overflow(uint hash_bucket, uint bucket_start, ivec3 coord,
   // kFailHeap -- one physical state with two names depending on which helper
   // happened to hit it. Guarded to the heap path, so kFailHeap stays provably
   // impossible on the rehash preset, which never consults the heap.
-  if (preset_ptr == kNoPresetPtr && heap_empty(atomicAdd(heap_counter, 0u))) {
-    return kFailHeap;
+  //
+  // The same load also refuses a heap below an eighth of the table. A dispatch
+  // that fills the table leaves only anchors free, which an overflow insert
+  // may not take, so the heap never empties and every failing insert would
+  // sweep the whole table holding its home bucket's lock (DECISIONS.md,
+  // 2026-08-08). An eighth is the anchors' share at the default bucket size,
+  // well past the load a caller grows at.
+  if (preset_ptr == kNoPresetPtr) {
+    uint free_now = atomicAdd(heap_counter, 0u);
+    if (heap_empty(free_now) || free_now < uint(pc.grid.num_blocks) / 8u) {
+      return kFailHeap;
+    }
   }
 
   bool lost_lock = false;
