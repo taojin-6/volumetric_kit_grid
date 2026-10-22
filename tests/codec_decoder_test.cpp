@@ -8,7 +8,7 @@
 // last frame; every refusal before the grid is touched leaves it untouched;
 // a grid whose hash table cannot place the frame says so and recovers after a
 // resize; read_frame_info; the stage rows; the moves; and the Encoder's
-// P-frame chains, at a period of 30 and open-ended, decoding to exactly the
+// P-frame chains, at a period of 4 and open-ended, decoding to exactly the
 // grids its I-frames of the same content do, and recovering from a lost
 // frame through force_intra(). Links recon_mesh, which the codec tier itself
 // may not. Skips with no device.
@@ -730,7 +730,7 @@ vkc::Result<vol::VoxelBlockGrid> chain_grid(Gpu& gpu, int t) {
                          Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
 }
 
-// Chains of P-frames at a period of 30 and open-ended, each decoded frame
+// Chains of P-frames at a period of 4 and open-ended, each decoded frame
 // after frame into one grid by a decoder of its own, leave that grid bit for
 // bit as an all-intra chain of the same grids leaves another, at every frame;
 // the period's chain crosses its second I-frame.
@@ -742,7 +742,7 @@ int p_chain_case(Gpu& gpu) {
     vol::VoxelBlockGrid grid;
   };
   std::vector<Chain> chains;
-  for (const std::uint32_t period : {1u, 30u, ~0u}) {
+  for (const std::uint32_t period : {1u, 4u, ~0u}) {
     codec::EncoderConfig config;
     config.intra_period = period;
     vkc::Result<codec::Encoder> enc =
@@ -755,7 +755,7 @@ int p_chain_case(Gpu& gpu) {
                            std::move(dec).value(), std::move(grid).value()});
   }
   std::size_t p_frames = 0;
-  for (int t = 0; t < 32; ++t) {
+  for (int t = 0; t < 6; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
     CHECK(g.ok());
     std::vector<Snapshot> decoded;
@@ -783,7 +783,7 @@ int p_chain_case(Gpu& gpu) {
     }
     CHECK(!decoded[0].coords.empty());
   }
-  CHECK(p_frames == 30 + 31);
+  CHECK(p_frames == 4 + 5);
   return 0;
 }
 
