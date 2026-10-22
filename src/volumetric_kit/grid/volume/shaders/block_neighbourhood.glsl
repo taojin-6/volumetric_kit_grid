@@ -3,8 +3,9 @@
 
 // A block's 2x2x2 +neighbourhood, resolved on the device, and the one
 // cross-block addressing of a cell's corners through it: what the sparse
-// mesher (marching_cubes_sparse_common.glsl) and the codec's surface passes
-// (dct_surface.comp) both walk, so a cell reaches the same voxels in either.
+// mesher (marching_cubes_sparse_common.glsl), the codec's surface passes
+// (dct_surface.comp) and its deblock's line passes (deblock_line.comp) walk,
+// so each reaches the same voxels.
 //
 // The includer must have included hash_lookup.glsl (for `BlockIndex` and
 // `vrFindBlockPtr`) first, and runs one workgroup per block. The hash table's
