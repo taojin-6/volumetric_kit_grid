@@ -650,8 +650,10 @@ int max_viewers_case() {
 // then fails the accepted socket's first setsockopt) are dropped quietly: no
 // Warning, and a viewer joining while they come gets its session. Served
 // ones end at once, and 64 slots keep any from being refused. They come in
-// bursts the listener's queue (8) holds, 5 ms apart, since Linux drops a SYN
-// to a full queue, and a connect then waits a second to send it again.
+// bursts the listener's queue (8) holds, 20 ms apart, so that an accept
+// thread slowed by a sanitizer on a busy machine mostly empties it first:
+// Linux drops a SYN to a full queue, and a connect then waits a second to
+// send it again. So 100 resets get 10 s.
 int reset_before_accept_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -671,10 +673,10 @@ int reset_before_accept_case() {
         fd.reset();
         ++resets;
       }
-      std::this_thread::sleep_for(5ms);
+      std::this_thread::sleep_for(20ms);
     }
   });
-  const Clock::time_point flooding = Clock::now() + 2s;
+  const Clock::time_point flooding = Clock::now() + 10s;
   while (resets < 100 && Clock::now() < flooding) {
     std::this_thread::sleep_for(5ms);
   }
