@@ -504,9 +504,8 @@ class VR_MESH_API MarchingCubes {
   /// or
   ///         a non-OK `Status`: `Status::Code::InvalidArgument` for a
   ///         moved-from extractor, a moved-from @p grid, or a grid missing a
-  ///         `float` `tsdf`/`weight` attribute, if the active set is too large
-  ///         for a single 1-D dispatch, or if the surface's *measured* triangle
-  ///         count needs a vertex arena past the device's
+  ///         `float` `tsdf`/`weight` attribute, or if the surface's *measured*
+  ///         triangle count needs a vertex arena past the device's
   ///         `maxStorageBufferRange` (the predicted capacity is clamped to that
   ///         limit rather than rejected, so an over-estimate costs one refit
   ///         dispatch instead of failing an extract that would have fit); @ref
@@ -625,8 +624,8 @@ class VR_MESH_API MarchingCubes {
   core::Allocator* allocator_ = nullptr;
 
   // Cached maxComputeWorkGroupCount[0]: the ceiling on a 1-D dispatch's
-  // groupCountX (Vulkan guarantees only >= 65535), so extract() can reject an
-  // over-large grid cleanly instead of risking a device-lost.
+  // groupCountX (Vulkan guarantees only >= 65535), past which extract() splits
+  // its active set across dispatches.
   std::uint32_t max_workgroup_count_x_ = 0;
 
   // Cached maxStorageBufferRange: the ceiling on a storage-buffer binding, so
