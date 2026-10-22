@@ -19,6 +19,7 @@
 #include "dct_transform.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
@@ -68,5 +69,11 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
                     vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
                     const DctBlocks& in);
+
+// encode (codec_oracle_encode.hpp) through @p t, for a test that encodes
+// many grids on one transform.
+vkc::Result<std::vector<std::uint8_t>> encode(
+    const vr_test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
+    const codec::EncoderConfig& config);
 
 }  // namespace codec_oracle
