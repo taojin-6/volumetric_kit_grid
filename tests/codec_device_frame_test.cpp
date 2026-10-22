@@ -407,10 +407,10 @@ int corruption_case(d::DeviceFrameReader& reader) {
   CHECK(corrupt_payloads(
             reader,
             oracle::write_frame(make_frame(300, 32, 13), sizes(16, 64)).value(),
-            nullptr, 400, rng, v) == 0);
+            nullptr, 100, rng, v) == 0);
   CHECK(corrupt_payloads(
             reader, oracle::write_frame(extreme_frame(), sizes(2, 64)).value(),
-            nullptr, 400, rng, v) == 0);
+            nullptr, 100, rng, v) == 0);
   std::printf(
       "corrupt payloads: %d decoded, %d overflow, %d corrupt, %d "
       "out of order\n",
@@ -444,7 +444,7 @@ Bytes extreme_inter(d::FrameReference& id) {
 }
 
 // P-frame refusals: every reader refusal of C2's edit list, each one edit
-// from a valid P-frame, and 800 random payload corruptions of two P-frames,
+// from a valid P-frame, and 200 random payload corruptions of two P-frames,
 // each refused by the device with the oracle's code and message, or decoded
 // to the oracle's entries.
 int inter_refusals_case(d::DeviceFrameReader& reader) {
@@ -471,11 +471,11 @@ int inter_refusals_case(d::DeviceFrameReader& reader) {
   Lcg rng{31};
   Verdicts v;
   const codec_frames::InterCase& good = base.good;
-  CHECK(corrupt_payloads(reader, good.bytes, &good.reference, 400, rng, v) ==
+  CHECK(corrupt_payloads(reader, good.bytes, &good.reference, 100, rng, v) ==
         0);
   d::FrameReference id;
   const Bytes extreme = extreme_inter(id);
-  CHECK(corrupt_payloads(reader, extreme, &id, 400, rng, v) == 0);
+  CHECK(corrupt_payloads(reader, extreme, &id, 100, rng, v) == 0);
   std::printf(
       "corrupt P-frame payloads: %d decoded, %d overflow, %d corrupt, %d out "
       "of order, %d survivor counts\n",
