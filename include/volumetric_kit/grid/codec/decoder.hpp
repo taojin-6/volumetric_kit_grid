@@ -239,8 +239,8 @@ class VR_CODEC_API Decoder {
   /// voxel -- as nearly every block of a fused RGB-D frame does -- is
   /// skipped on the device, so it decodes exactly as with the deblock off.
   /// A frame with fewer, such as a true-SDF frame with a few cut voxels
-  /// (@ref EncoderConfig::true_sdf), is smoothed; its unobserved voxels are
-  /// neither read nor written.
+  /// (@ref EncoderConfig::true_sdf), is smoothed; its unobserved voxels keep
+  /// their decoded values and never enter the filter.
   void set_deblock(bool on) noexcept { deblock_on_ = on; }
   /// @return Whether the deblock is on.
   bool deblock() const noexcept { return deblock_on_; }

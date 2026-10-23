@@ -14,8 +14,9 @@
 /// build.
 ///
 /// The filters are the 2026-10-21 quantization study's, on the field
-/// `v = tsdf / trunc_dist` of observed voxels alone (an unobserved voxel is
-/// neither read nor written, and a missing block is no neighbour):
+/// `v = tsdf / trunc_dist` of observed voxels alone (an unobserved voxel
+/// neither enters the filter nor changes, and a missing block is no
+/// neighbour):
 ///
 /// - **The line fit** (linfit, n 2, m 3). For each axis, x then y then z, and
 ///   each block B whose +axis neighbour N exists, each of the 64 lines across
