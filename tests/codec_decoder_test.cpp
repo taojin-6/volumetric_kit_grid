@@ -4,14 +4,15 @@
 // GPU test for codec::Decoder, and the codec end to end: a frame decodes to
 // exactly the encoded grid's observed blocks and voxels, within the bound an
 // orthonormal transform guarantees; the decoded grid meshes to the analytic
-// sphere it came from; frame after frame into one grid leaves exactly the
-// last frame; every refusal before the grid is touched leaves it untouched;
-// a grid whose hash table cannot place the frame says so and recovers after a
-// resize; read_frame_info; the stage rows; the moves; and the Encoder's
-// P-frame chains, at a period of 4 and open-ended, decoding to exactly the
-// grids its I-frames of the same content do, and recovering from a lost
-// frame through force_intra(). Links recon_mesh, which the codec tier itself
-// may not. Skips with no device.
+// sphere it came from, with EncoderConfig::true_sdf too, every decoded voxel
+// observed, and a curtain cut away; frame after frame into one grid leaves
+// exactly the last frame; every refusal before the grid is touched leaves it
+// untouched; a grid whose hash table cannot place the frame says so and
+// recovers after a resize; read_frame_info; the stage rows; the moves; and the
+// Encoder's P-frame chains, at a period of 4 and open-ended, decoding to
+// exactly the grids its I-frames of the same content do, and recovering from a
+// lost frame through force_intra(). Links recon_mesh, which the codec tier
+// itself may not. Skips with no device.
 
 #include <algorithm>
 #include <cmath>
@@ -182,7 +183,9 @@ struct MeshFit {
   double mean_off = 0.0;  // metres
 };
 
-vkc::Result<MeshFit> fit(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sphere& s) {
+// @p s is the truth: anything with an `sdf` of a world point.
+template <typename Field>
+vkc::Result<MeshFit> fit(Gpu& gpu, vol::VoxelBlockGrid& grid, const Field& s) {
   VKC_ASSIGN(mesh::MarchingCubes mc,
              mesh::MarchingCubes::create(gpu.device, gpu.allocator));
   VKC_ASSIGN(const mesh::Mesh m, mc.extract_host(grid));
@@ -843,6 +846,133 @@ int lost_frame_case(Gpu& gpu, codec::Encoder& all_intra) {
 
 }  // namespace
 
+// The union of two spheres, for fit.
+struct Union {
+  Sphere a;
+  Sphere b;
+  float sdf(const vr::Vec3f& p) const { return std::min(a.sdf(p), b.sdf(p)); }
+};
+
+// EncoderConfig::true_sdf at a 16-voxel band with the defaults' step in
+// metres (the scale is a fraction of the band, which doubles), and
+// near-lossless; with mesh_case's bounds, but the near-lossless mean's 1.3x
+// the largest an M5 Max measures here (0.0042 voxels, the curtain's).
+struct TrueSdfSetting {
+  const char* name;
+  codec::EncoderConfig config;
+  double max_off_voxels;
+  double mean_off_voxels;
+  double tri_ratio;
+};
+
+std::vector<TrueSdfSetting> true_sdf_settings() {
+  codec::EncoderConfig physical;
+  physical.true_sdf = true;
+  physical.params.quantization_scale =
+      codec::CodecParams{}.quantization_scale * kTrunc / wide_band().trunc_dist;
+  codec::EncoderConfig lossless = near_lossless();
+  lossless.true_sdf = true;
+  return {{"true SDF", physical, 0.8, 0.085, 0.02},
+          {"true SDF near-lossless", lossless, 0.1, 0.0055, 0.005}};
+}
+
+// True distances -- a sphere, and two spheres' union -- coded with true_sdf
+// decode on the Decoder as any frame does: every voxel of every decoded
+// block observed, since the band holds them all and nothing in a true
+// distance is cut, and the mesh on the truth within the defaults' bounds,
+// with about the source's triangle count (surface_blocks_case in
+// codec_encoder_test pins the exact block set).
+int true_sdf_decode_case(Gpu& gpu, codec::Decoder& dec) {
+  const Union truth{Sphere{vr::Vec3f(0.0f, 0.02f, 0.0f), 0.12f},
+                    Sphere{vr::Vec3f(0.33f, 0.0f, 0.0f), 0.05f}};
+  for (const bool two : {false, true}) {
+    vkc::Result<vol::VoxelBlockGrid> g =
+        two ? two_sphere_grid(gpu, truth.a, truth.b, wide_band())
+            : sphere_grid(gpu, truth.a, wide_band());
+    CHECK(g.ok());
+    vol::VoxelBlockGrid src = std::move(g).value();
+    const auto off = [&](vol::VoxelBlockGrid& grid) {
+      return two ? fit(gpu, grid, truth) : fit(gpu, grid, truth.a);
+    };
+    vkc::Result<MeshFit> source = off(src);
+    CHECK(source.ok() && source.value().triangles > 1000);
+    for (const TrueSdfSetting& setting : true_sdf_settings()) {
+      vkc::Result<Bytes> frame = encode_with(gpu, src, setting.config);
+      CHECK(frame.ok());
+      vkc::Result<vol::VoxelBlockGrid> d = grid_for(gpu, frame.value());
+      CHECK(d.ok());
+      vol::VoxelBlockGrid out = std::move(d).value();
+      CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
+      vkc::Result<Snapshot> snap = snapshot(gpu, out);
+      CHECK(snap.ok() && !snap.value().coords.empty());
+      for (const float w : snap.value().weight) CHECK(w == 1.0f);
+      vkc::Result<MeshFit> got = off(out);
+      CHECK(got.ok());
+      const double ratio =
+          double(got.value().triangles) / double(source.value().triangles);
+      std::printf(
+          "%s, %s: %zu blocks, %zu bytes, %zu triangles (x%.4f), max %.3g / "
+          "mean %.3g voxels off\n",
+          setting.name, two ? "two spheres" : "sphere",
+          snap.value().coords.size(), frame.value().size(),
+          got.value().triangles, ratio, got.value().max_off / kVoxel,
+          got.value().mean_off / kVoxel);
+      CHECK(got.value().max_off <= setting.max_off_voxels * kVoxel);
+      CHECK(got.value().mean_off <= setting.mean_off_voxels * kVoxel);
+      CHECK(std::fabs(ratio - 1.0) <= setting.tri_ratio);
+    }
+  }
+  return 0;
+}
+
+// The cut removes a curtain: a sphere's distance negated in a slab 20 mm out
+// meshes far off the sphere, and so does its frame coded under the mask;
+// coded with true_sdf it decodes to the sphere alone, the cut voxels of its
+// coded blocks unobserved. Near-lossless, so what is judged is the cut; at a
+// coarse step, the jump the cut leaves inside a coded block rings.
+int curtain_case(Gpu& gpu, codec::Decoder& dec) {
+  const Curtain curtain{Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f},
+                        false};
+  vkc::Result<vol::VoxelBlockGrid> g = curtain_grid(gpu, curtain);
+  CHECK(g.ok());
+  vol::VoxelBlockGrid src = std::move(g).value();
+  vkc::Result<MeshFit> source = fit(gpu, src, curtain.sphere);
+  CHECK(source.ok());
+  std::printf("curtain source: %zu triangles, max %.3g mm off\n",
+              source.value().triangles, source.value().max_off * 1e3);
+  CHECK(source.value().max_off >= 0.015);
+  for (const bool true_sdf : {false, true}) {
+    const TrueSdfSetting setting = true_sdf_settings()[1];
+    codec::EncoderConfig config = setting.config;
+    config.true_sdf = true_sdf;
+    vkc::Result<Bytes> frame = encode_with(gpu, src, config);
+    CHECK(frame.ok());
+    vkc::Result<vol::VoxelBlockGrid> d = grid_for(gpu, frame.value());
+    CHECK(d.ok());
+    vol::VoxelBlockGrid out = std::move(d).value();
+    CHECK(dec.decode(frame.value().data(), frame.value().size(), out).ok());
+    vkc::Result<MeshFit> got = fit(gpu, out, curtain.sphere);
+    vkc::Result<Snapshot> snap = snapshot(gpu, out);
+    CHECK(got.ok() && snap.ok());
+    const auto cut = std::count(snap.value().weight.begin(),
+                                snap.value().weight.end(), 0.0f);
+    std::printf(
+        "curtain %s: %zu triangles, max %.3g / mean %.3g voxels off, "
+        "%zu unobserved voxels\n",
+        true_sdf ? "true SDF" : "masked", got.value().triangles,
+        got.value().max_off / kVoxel, got.value().mean_off / kVoxel,
+        std::size_t(cut));
+    if (true_sdf) {
+      CHECK(got.value().max_off <= setting.max_off_voxels * kVoxel);
+      CHECK(got.value().mean_off <= setting.mean_off_voxels * kVoxel);
+      CHECK(cut > 0);
+    } else {
+      CHECK(got.value().max_off >= 0.015);
+    }
+  }
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   auto made = codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
@@ -864,6 +994,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (frame_info_case(gpu) != 0) return 1;
   if (p_chain_case(gpu) != 0) return 1;
   if (lost_frame_case(gpu, enc) != 0) return 1;
+  if (true_sdf_decode_case(gpu, dec) != 0) return 1;
+  if (curtain_case(gpu, dec) != 0) return 1;
   std::printf("codec Decoder: OK\n");
   return 0;
 }

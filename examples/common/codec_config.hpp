@@ -53,8 +53,9 @@ encoder_config(const config::Codec& settings) {
 }
 
 /// @return How @p config codes, as the codec examples print it: K, the
-///         quantization @p table and scale, the segment size, and the intra
-///         period, above 1 with the update size its P-frames use.
+///         quantization @p table and scale, the segment size, the intra
+///         period, above 1 with the update size its P-frames use, and
+///         whether it codes a true SDF.
 inline std::string codec_settings(
     const volumetric_kit::recon::codec::EncoderConfig& config,
     config::QuantizationTable table) {
@@ -63,12 +64,16 @@ inline std::string codec_settings(
                 "K %u, table %s, scale %.6g; segments of %u blocks",
                 config.params.coefficient_count, quantization_name(table),
                 double(config.params.quantization_scale), config.segment_size);
-  const std::string settings = text;
-  if (config.intra_period == 1) return settings + "; every frame intra";
-  std::snprintf(text, sizeof text,
-                ", update segments of %u entries; an I-frame every %u frames",
-                config.resolved_update_size(), config.intra_period);
-  return settings + text;
+  std::string settings = text;
+  if (config.intra_period == 1) {
+    settings += "; every frame intra";
+  } else {
+    std::snprintf(text, sizeof text,
+                  ", update segments of %u entries; an I-frame every %u frames",
+                  config.resolved_update_size(), config.intra_period);
+    settings += text;
+  }
+  return config.true_sdf ? settings + "; true SDF" : settings;
 }
 
 /// @return Where a codec stream writes besides its report: core's
@@ -82,6 +87,33 @@ inline CodecOutputs codec_outputs(const config::Output& output) {
     outputs.serve->port = output.serve;
   }
   return outputs;
+}
+
+/// @return OK when @p grid's band observes every voxel a true-SDF frame of a
+///         mesh codes: `codec::kTrueSdfBandVoxels` voxels from the zero
+///         level, which in shell mode lies @p sdf's half-thickness further
+///         out; or InvalidArgument naming the minimum, for a caller that
+///         refuses before any GPU work.
+inline volumetric_kit::core::Status check_true_sdf_band(
+    const volumetric_kit::recon::tsdf::MeshSdfParams& sdf,
+    const volumetric_kit::recon::volume::VoxelGridParams& grid) {
+  namespace codec = volumetric_kit::recon::codec;
+  namespace tsdf = volumetric_kit::recon::tsdf;
+  const bool shell = sdf.mode == tsdf::MeshSdfMode::Shell;
+  const double least = double(codec::kTrueSdfBandVoxels) +
+                       (shell ? double(sdf.shell_voxels) : 0.0);
+  // A relative margin: two floats' ratio can fall just short of a whole band
+  // (0.06 m of 4 mm voxels is 14.999999).
+  const double band = double(grid.trunc_dist) / double(grid.voxel_size);
+  if (band >= least * (1.0 - 1e-4)) return {};
+  char text[256];
+  std::snprintf(text, sizeof text,
+                "fusion.truncation_m %.6g m is %.6g voxels; a mesh codes as a "
+                "true SDF in at least %.6g voxels (%.6g m)%s",
+                double(grid.trunc_dist), band, least,
+                least * double(grid.voxel_size),
+                shell ? ", the shell's half-thickness included" : "");
+  return volumetric_kit::core::Status::invalid_argument(text);
 }
 
 /// @return Runtime SDF parameters from core's validated mesh source, or

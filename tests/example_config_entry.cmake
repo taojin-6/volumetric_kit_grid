@@ -139,10 +139,12 @@ if(program_name STREQUAL "codec_mesh")
   endforeach()
 
   # A run that would code is refused before any GPU work: with no Vulkan driver
-  # to find, each case must fail with its own reason, never Vulkan's.
-  set(coding_source
-      "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"up_axis\":\"y\","
-  )
+  # to find, each case must fail with its own reason, never Vulkan's. The band,
+  # a case's fourth field or 0.15 m, is the least a true SDF takes at 1 cm: 15
+  # voxels, and the shell's half-thickness on top in shell mode.
+  set(coding_band
+      "{\"version\":1,\"operation\":\"codec\",\"fusion\":{\"truncation_m\":")
+  set(coding_source "},\"source\":{\"kind\":\"mesh\",\"up_axis\":\"y\",")
   foreach(
     case
     "pattern|\"height_m\":1.7,\"path\":\"t_%s.obj\"}}|source.path"
@@ -150,19 +152,27 @@ if(program_name STREQUAL "codec_mesh")
     "directory|\"height_m\":1.7,\"path\":\"d_%02d.obj\"},\"run\":{\"first\":1,\"frames\":2}}|not a regular file.*d_02.obj"
     "plain_first|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"run\":{\"first\":1}}|run.first"
     "open|\"height_m\":1.7,\"path\":\"open_%02d.obj\"},\"run\":{\"first\":1}}|source.allow_holes"
-    "shell|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"shell_voxels\":5,\"path\":\"t_01.obj\"}}|shell_voxels"
+    "shell|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"shell_voxels\":16,\"path\":\"t_01.obj\"}}|shell_voxels"
     "codec_step|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"quantization_scale\":1e-30}}|CodecParams"
     "update_size|\"height_m\":1.7,\"path\":\"t_01.obj\"},\"codec\":{\"intra_period\":2,\"update_size\":1025}}|update_size 1025"
     "empty|\"height_m\":1.7,\"path\":\"empty.obj\"}}|empty.obj"
     "vertices|\"height_m\":1.7,\"path\":\"vertices.obj\"}}|vertices.obj"
-    "flat|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"path\":\"flat.obj\"}}|zero extent along up"
+    "flat|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"path\":\"flat.obj\"}}|zero extent along up|0.2"
     "overflow|\"metres_per_unit\":1e39,\"path\":\"t_%02d.obj\"},\"run\":{\"first\":1,\"frames\":2}}|past float range"
+    "shell_band|\"height_m\":1.7,\"sdf_mode\":\"shell\",\"path\":\"t_01.obj\"}}|at least 16.5 voxels .0.165 m., the shell's half-thickness included"
+    "band|\"height_m\":1.7,\"path\":\"t_01.obj\"}}|fusion.truncation_m 0.14 m is 14 voxels. a mesh codes as a true SDF in at least 15 voxels .0.15 m.|0.14"
   )
     string(REPLACE "|" ";" fields "${case}")
     list(GET fields 0 name)
     list(GET fields 1 rest)
     list(GET fields 2 pattern)
-    file(WRITE "${WORK_DIR}/${name}.json" "${coding_source}${rest}\n")
+    set(band 0.15)
+    list(LENGTH fields count)
+    if(count EQUAL 4)
+      list(GET fields 3 band)
+    endif()
+    file(WRITE "${WORK_DIR}/${name}.json"
+         "${coding_band}${band}${coding_source}${rest}\n")
     execute_process(
       COMMAND
         "${CMAKE_COMMAND}" -E env VK_DRIVER_FILES=/nonexistent

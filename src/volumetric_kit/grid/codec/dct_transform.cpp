@@ -22,6 +22,7 @@
 #include "dct_forward_comp.spv.hpp"
 #include "dct_inverse_comp.spv.hpp"
 #include "dct_observed_comp.spv.hpp"
+#include "dct_surface_comp.spv.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
 namespace {
@@ -41,8 +42,12 @@ struct PushConstants {
   std::int32_t max_chain;
   std::int32_t max_quantized;
   std::uint32_t tick;  // the map's tick, which the inverse stamps blocks with
+  std::uint32_t true_sdf;
+  std::uint32_t surface_pass;
+  float cut_distance;
+  float near_distance;
 };
-static_assert(sizeof(PushConstants) == 44, "PushConstants must be 44 bytes");
+static_assert(sizeof(PushConstants) == 60, "PushConstants must be 60 bytes");
 static_assert(offsetof(PushConstants, item_base) == 0, "layout drift");
 static_assert(offsetof(PushConstants, num_blocks) == 4, "layout drift");
 static_assert(offsetof(PushConstants, coefficient_count) == 8, "layout drift");
@@ -54,6 +59,10 @@ static_assert(offsetof(PushConstants, bucket_size) == 28, "layout drift");
 static_assert(offsetof(PushConstants, max_chain) == 32, "layout drift");
 static_assert(offsetof(PushConstants, max_quantized) == 36, "layout drift");
 static_assert(offsetof(PushConstants, tick) == 40, "layout drift");
+static_assert(offsetof(PushConstants, true_sdf) == 44, "layout drift");
+static_assert(offsetof(PushConstants, surface_pass) == 48, "layout drift");
+static_assert(offsetof(PushConstants, cut_distance) == 52, "layout drift");
+static_assert(offsetof(PushConstants, near_distance) == 56, "layout drift");
 
 // The kernels' lane-to-line mapping is written for this edge (kEdge in
 // dct_common.glsl), which is why a grid with another block size is refused.
@@ -90,8 +99,23 @@ enum Binding : std::uint32_t {
   kBindingRejected = 7,
   kBindingStamps = 8,
   kBindingQuantization = 9,
-  kBindingCount = 10,
+  kBindingCut = 10,
+  kBindingKeep = 11,
+  kBindingCount = 12,
 };
+
+// The cut set's bytes for a grid of @p slots block slots: a bit a voxel.
+VkDeviceSize cut_bytes(std::int32_t slots) {
+  return VkDeviceSize(slots) * kMaskWordsPerBlock * sizeof(std::uint32_t);
+}
+
+// How far from zero a corner of a sign-change cell is cut, in metres: past
+// sqrt(3) voxels, no crossing of a distance field has a corner, and the
+// 1e-6 m margin keeps float rounding of a true one from reaching it. One
+// fused multiply-add, so every host computes the same float.
+float cut_distance(float voxel_size) {
+  return std::fma(std::sqrt(3.0f), voxel_size, 1e-6f);
+}
 
 core::Status fail(const char* op, const std::string& why) {
   return core::Status::invalid_argument(std::string("DctTransform::") + op +
@@ -127,6 +151,9 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
   VKC_TRY(kb.add(t.observed_kernel_, "codec_dct_observed",
                  vr_dct_observed_comp_spv, vr_dct_observed_comp_spv_size,
                  kBindingCount, &push_range));
+  VKC_TRY(kb.add(t.surface_kernel_, "codec_dct_surface",
+                 vr_dct_surface_comp_spv, vr_dct_surface_comp_spv_size,
+                 kBindingCount, &push_range));
   VKC_ASSIGN(t.pool_, kb.build());
 
   VkPhysicalDeviceProperties props{};
@@ -147,6 +174,11 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
   VKC_ASSIGN(
       t.quantization_steps_,
       core::device_storage_buffer(allocator, kVoxelsPerBlock * sizeof(float)));
+  // Real buffers from the start, so every call's bindings name one; the true
+  // SDF passes grow them to the grid's heap.
+  VKC_ASSIGN(t.cut_, core::device_storage_buffer(allocator, cut_bytes(1)));
+  VKC_ASSIGN(t.keep_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
   core::CommandBatch batch(device, allocator);
   VKC_TRY(batch.upload(t.tables_, 0, &tables, sizeof(tables)));
   VKC_TRY(batch.submit());
@@ -160,8 +192,15 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
       VK_OBJECT_TYPE_BUFFER,
       core::debug_object_handle(t.quantization_steps_.handle()),
       "codec.quantization_steps");
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(t.cut_.handle()),
+                         "codec.cut_set");
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(t.keep_.handle()),
+                         "codec.keep_flags");
   for (core::ComputeKernel* kernel :
-       {&t.forward_kernel_, &t.inverse_kernel_, &t.observed_kernel_}) {
+       {&t.forward_kernel_, &t.inverse_kernel_, &t.observed_kernel_,
+        &t.surface_kernel_}) {
     kernel->set.write_storage_buffer(kBindingTables, t.tables_.handle(), 0,
                                      VK_WHOLE_SIZE);
     kernel->set.write_storage_buffer(
@@ -203,7 +242,8 @@ core::Status DctTransform::record(
     core::CommandBatch& batch, core::ComputeKernel& kernel,
     const volume::VoxelBlockGrid& grid, const GridViews& views, VkBuffer list,
     std::uint32_t count, const CodecParams& params, VkBuffer coefficients,
-    VkBuffer masks, VkDeviceSize masks_bytes, core::GpuStageScope* stage) {
+    VkBuffer masks, VkDeviceSize masks_bytes, const TrueSdf& true_sdf,
+    core::GpuStageScope* stage) {
   // Another tier sized this one (and every resize doubles it), so it is bound
   // at its real size and range-checked, as the mesher binds it.
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
@@ -224,11 +264,19 @@ core::Status DctTransform::record(
     kernel.set.write_storage_buffer(kBindingCoefficients, coefficients, 0,
                                     coeff_bytes);
   }
-  kernel.set.write_storage_buffer(kBindingMasks, masks, 0, masks_bytes);
+  if (masks != VK_NULL_HANDLE) {
+    kernel.set.write_storage_buffer(kBindingMasks, masks, 0, masks_bytes);
+  }
   kernel.set.write_storage_buffer(kBindingEntries, grid.map().entries_buffer(),
                                   0, entries_bytes);
   kernel.set.write_storage_buffer(
       kBindingStamps, grid.map().stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
+  // On every call, as the grid's are: the true SDF passes regrow both with
+  // the grid's heap, which frees the buffers an earlier call bound.
+  const core::Buffer& cut = true_sdf.cut != nullptr ? *true_sdf.cut : cut_;
+  kernel.set.write_storage_buffer(kBindingCut, cut.handle(), 0, VK_WHOLE_SIZE);
+  kernel.set.write_storage_buffer(kBindingKeep, keep_.handle(), 0,
+                                  VK_WHOLE_SIZE);
 
   const volume::VoxelGridParams& gp = grid.grid();
   PushConstants push{};
@@ -251,12 +299,20 @@ core::Status DctTransform::record(
   push.max_chain = gp.max_chain;
   push.max_quantized = kMaxQuantizedMagnitude;
   push.tick = grid.map().tick();
+  push.true_sdf = true_sdf.on ? 1u : 0u;
+  push.cut_distance = cut_distance(gp.voxel_size);
+  push.near_distance = gp.voxel_size;
   VKC_TRY(batch.fill(rejected_, 0, sizeof(Counts), 0u));
   // A workgroup a block. Room0 alone (~107 k blocks) passes the 65535 groups
   // Vulkan guarantees, so a longer list takes several dispatches, which touch
-  // disjoint list entries.
-  return recon::detail::dispatch_items(batch, kernel, push, count, 1,
-                                       max_workgroup_count_x_, stage);
+  // disjoint list entries; the batch barriers every dispatch, so a pass sees
+  // all of the last one's.
+  for (std::uint32_t pass = 0; pass < true_sdf.passes; ++pass) {
+    push.surface_pass = pass;
+    VKC_TRY(recon::detail::dispatch_items(batch, kernel, push, count, 1,
+                                          max_workgroup_count_x_, stage));
+  }
+  return {};
 }
 
 core::Status DctTransform::check_rejected(const char* op,
@@ -280,7 +336,7 @@ core::Status DctTransform::ensure_scratch(core::Buffer& buffer,
 
 core::Result<std::uint32_t> DctTransform::observed(
     const volume::VoxelBlockGrid& grid, const volume::DeviceBlockList& list,
-    core::GpuStageScope* stage) {
+    bool true_sdf, core::GpuStageScope* stage) {
   VKC_ASSIGN(GridViews views, check_inputs("observed", grid, CodecParams{}));
   VKC_TRY(grid.map().check_device_block_list(list, "DctTransform::observed"));
   if (list.count == 0) return std::uint32_t{0};
@@ -290,9 +346,23 @@ core::Result<std::uint32_t> DctTransform::observed(
       ensure_scratch(observed_blocks_, list_bytes, "codec.observed_blocks"));
   Counts counts;
   core::CommandBatch batch(*device_, *allocator_);
+  if (true_sdf) {
+    // Sized to the heap, since a cell's corners are found by slot, and
+    // zeroed first: a slot the last grid used may hold another block now.
+    const std::int32_t slots = grid.grid().num_blocks;
+    const VkDeviceSize keep_bytes = VkDeviceSize(slots) * sizeof(std::uint32_t);
+    VKC_TRY(ensure_scratch(cut_, cut_bytes(slots), "codec.cut_set"));
+    VKC_TRY(ensure_scratch(keep_, keep_bytes, "codec.keep_flags"));
+    VKC_TRY(batch.fill(cut_, 0, cut_bytes(slots), 0u));
+    VKC_TRY(batch.fill(keep_, 0, keep_bytes, 0u));
+    VKC_TRY(record(batch, surface_kernel_, grid, views, list.buffer->handle(),
+                   list.count, CodecParams{}, VK_NULL_HANDLE, VK_NULL_HANDLE, 0,
+                   TrueSdf{true, nullptr, 2}, stage));
+  }
   VKC_TRY(record(batch, observed_kernel_, grid, views, list.buffer->handle(),
                  list.count, CodecParams{}, VK_NULL_HANDLE,
-                 observed_blocks_.handle(), list_bytes, stage));
+                 observed_blocks_.handle(), list_bytes, TrueSdf{true_sdf},
+                 stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(counts), &counts));
   VKC_TRY(batch.submit());
   VKC_TRY(check_rejected("observed", counts.rejected, list.count));
@@ -306,7 +376,8 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
     core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
     const core::Buffer& list, std::uint32_t count, const CodecParams& params,
     const core::Buffer& masks, const core::Buffer& coefficients,
-    std::uint32_t& rejected, core::GpuStageScope* stage) {
+    std::uint32_t& rejected, const core::Buffer* cut,
+    core::GpuStageScope* stage) {
   rejected = 0;
   VKC_ASSIGN(GridViews views, check_inputs("forward", grid, params));
   if (count > static_cast<std::uint32_t>(grid.grid().num_blocks)) {
@@ -337,6 +408,11 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
     return fail("forward", "the output buffers do not hold " +
                                std::to_string(count) + " blocks");
   }
+  if (cut != nullptr && cut->size() < cut_bytes(grid.grid().num_blocks)) {
+    return fail("forward", "the cut set does not cover the grid's " +
+                               std::to_string(grid.grid().num_blocks) +
+                               " block slots");
+  }
   VKC_TRY(core::check_storage_buffer_range(
       "DctTransform::forward: the coefficients", coeff_bytes,
       max_storage_buffer_range_));
@@ -345,7 +421,7 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
                                            max_storage_buffer_range_));
   VKC_TRY(record(batch, forward_kernel_, grid, views, list.handle(), count,
                  params, coefficients.handle(), masks.handle(), mask_bytes,
-                 stage));
+                 TrueSdf{cut != nullptr, cut}, stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
   out.list = &list;
   out.masks = &masks;
@@ -395,7 +471,7 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
       batch, inverse_kernel_, grid, views, in.list->handle(), in.count, params,
       in.coefficients->handle(), in.masks->handle(),
       VkDeviceSize(in.count) * kMaskWordsPerBlock * sizeof(std::uint32_t),
-      stage));
+      TrueSdf{}, stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
   VKC_TRY(batch.submit());
   return check_rejected("inverse", rejected, in.count);

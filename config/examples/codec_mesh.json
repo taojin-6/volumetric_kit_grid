@@ -12,9 +12,12 @@
     ]
   },
   "fusion": {
-    "voxel_size_m": 0.005
+    "voxel_size_m": 0.005,
+    "truncation_m": 0.08
   },
   "codec": {
+    "coefficient_count": 56,
+    "quantization_scale": 0.040877,
     "sweep": true
   },
   "output": {

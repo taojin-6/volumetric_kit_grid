@@ -8,7 +8,8 @@
 // and any outgrown tail, rather than the full input list and flags. A fused
 // grid's band is mostly never integrated -- room0 codes about one block in
 // five of those it allocates -- so this reads weights alone where the forward
-// would read the block, transform it and write it out. An entry whose coord
+// would read the block, transform it and write it out. With pc.true_sdf it
+// appends the blocks dct_surface.comp flagged instead. An entry whose coord
 // the table does not hold (see block_ptr) is reported and written nothing.
 
 #extension GL_GOOGLE_include_directive : require
@@ -27,6 +28,11 @@ layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) writeonly buffer
   BlockIndex observed[];
 };
 
+// One word per block slot (see dct_common.glsl), read only with pc.true_sdf.
+layout(set = 0, binding = VR_DCT_BINDING_KEEP, scalar) readonly buffer Keep {
+  uint keep[];
+};
+
 shared uint s_observed;
 
 void main() {
@@ -38,6 +44,13 @@ void main() {
   }
   int ptr = block_ptr(entry, lane);
   if (ptr < 0) {
+    return;
+  }
+  // Uniform: a push constant.
+  if (pc.true_sdf != 0u) {
+    if (lane == 0u && keep[uint(ptr) / kBlockVoxels] != 0u) {
+      observed[atomicAdd(observed_count, 1u)] = blocks[entry];
+    }
     return;
   }
   if (lane == 0u) {
