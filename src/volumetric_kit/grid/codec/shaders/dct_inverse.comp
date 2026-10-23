@@ -14,8 +14,8 @@
 // changed with the map's tick, as the integrator stamps one, so a frame that
 // repeats a block's last one leaves it unstamped. An entry
 // whose coord the table does not hold (see block_ptr) is written nothing. A
-// block whose mask is not all ones sets the call's mask flag, which the
-// decoder's deblock reads.
+// block whose mask is not all ones -- a masked block -- adds one to the
+// call's masked-block count, which the decoder's deblock reads.
 //
 // Re-implements the prior engine's computeIDCTKernel (compute_dct.cu), which
 // wrote every voxel's SDF and left weights alone; the mask is what replaces the
@@ -44,9 +44,10 @@ layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) readonly buffer
 layout(set = 0, binding = VR_DCT_BINDING_STAMPS, scalar) buffer Stamps {
   BlockStamp stamps[];
 };
-// Zeroed in the call's batch; any workgroup may set it, hence atomically.
-layout(set = 0, binding = VR_DCT_BINDING_MASKED, scalar) buffer Masked {
-  uint masked;
+// The call's masked blocks, zeroed in its batch: a masked block's workgroup
+// adds one, atomically, since every workgroup may.
+layout(set = 0, binding = VR_DCT_BINDING_MASKED, scalar) buffer MaskedBlocks {
+  uint masked_blocks;
 };
 
 shared uint s_changed;
@@ -125,7 +126,7 @@ void main() {
       stamps[voxel_base / kBlockVoxels].changed = pc.tick;
     }
     if (s_masked != 0u) {
-      atomicOr(masked, 1u);
+      atomicAdd(masked_blocks, 1u);
     }
   }
 }

@@ -9,8 +9,9 @@
 ///
 /// Internal (under src/, never installed): the `Decoder` runs it, inside the
 /// decode's last submit, when `Decoder::set_deblock` is on, skipping a frame
-/// the inverse's @ref DctTransform::masked_flag marks. It carries
-/// `VR_CODEC_API` so the tier's tests reach it in a shared-library build.
+/// whose @ref DctTransform::masked_blocks count @ref deblock_skips. It
+/// carries `VR_CODEC_API` so the tier's tests reach it in a shared-library
+/// build.
 ///
 /// The filters are the 2026-10-21 quantization study's, on the field
 /// `v = tsdf / trunc_dist` of observed voxels alone (an unobserved voxel is
@@ -66,6 +67,20 @@ namespace volumetric_kit::recon::codec::detail {
 /// A block's shell: its voxels with a coordinate 0 or 7 on some axis, which a
 /// neighbour's 1-voxel halo reaches.
 inline constexpr std::uint32_t kShellVoxels = kVoxelsPerBlock - 6 * 6 * 6;
+
+/// The frame gate's divisor: a frame more than 1 / kDeblockMaskedDivisor of
+/// whose blocks are masked -- hold an unobserved voxel -- is skipped (the
+/// 2026-10-21 deblock decision's 2026-10-23 amendment has the measured
+/// shares that set it). Mirrored in deblock_common.glsl.
+inline constexpr std::uint32_t kDeblockMaskedDivisor = 2;
+
+/// @return Whether the gate skips a frame of @p blocks blocks, @p masked of
+///         them masked: `masked > blocks / kDeblockMaskedDivisor`, so a frame
+///         of 2n blocks runs with n masked and is skipped with n + 1. The
+///         kernels compare the same way.
+constexpr bool deblock_skips(std::uint32_t masked, std::uint32_t blocks) {
+  return masked > blocks / kDeblockMaskedDivisor;
+}
 
 /// @brief One frame's filter, as the kernels take it, in units of the
 ///        normalized field.
@@ -160,11 +175,12 @@ class VR_CODEC_API Deblock {
   /// @param frame  The frame's list and masks, by list position, as the
   ///               reference store holds them; no reference entries.
   /// @param passes The filter.
-  /// @param skip   A buffer whose first word, written before the dispatches
-  ///               (in this batch or an earlier one), skips the filter when
-  ///               it is non-zero: every kernel returns at once, leaving the
-  ///               grid, its stamps and the snapshot as they were. Zero runs
-  ///               the passes.
+  /// @param masked_blocks A buffer whose first word, written before the
+  ///               dispatches (in this batch or an earlier one), counts the
+  ///               frame's masked blocks. When that count skips the frame
+  ///               (@ref deblock_skips, against @p frame's count), every
+  ///               kernel returns at once, leaving the grid, its stamps and
+  ///               the snapshot as they were; otherwise the passes run.
   /// @param stage  Optional scope the dispatches record their device spans
   ///               into.
   /// @return OK, or, before anything is recorded,
@@ -172,11 +188,11 @@ class VR_CODEC_API Deblock {
   ///         size or without float `tsdf` and `weight`, a pass without a
   ///         positive clip, a P-frame's entries, more blocks than the grid's
   ///         heap or than @ref reserve made room for, buffers smaller than
-  ///         the count or a @p skip without a word, or a hash table past
-  ///         `maxStorageBufferRange`.
+  ///         the count or a @p masked_blocks without a word, or a hash
+  ///         table past `maxStorageBufferRange`.
   core::Status record(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
                       const ResidentBlocks& frame, const DeblockPasses& passes,
-                      const core::Buffer& skip,
+                      const core::Buffer& masked_blocks,
                       core::GpuStageScope* stage = nullptr);
 
  private:

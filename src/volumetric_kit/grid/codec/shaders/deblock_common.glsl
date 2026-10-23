@@ -3,7 +3,7 @@
 
 // Shared by deblock_line.comp, deblock_gauss.comp and deblock_store.comp, the
 // decoder-side deblock (deblock.hpp has the filters): the bindings and push
-// constants of their one layout, the skip word, the normalized field, the
+// constants of their one layout, the frame gate, the normalized field, the
 // mask bit, the shell index and the stamp.
 //
 // ONE WORKGROUP OF kLanes (64) INVOCATIONS PER FRAME BLOCK, the entry
@@ -22,6 +22,8 @@ const uint kBlockVoxels = 512u;
 const uint kLanes = 64u;
 const uint kMaskWords = 16u;
 const uint kShellVoxels = 296u;  // kBlockVoxels - 6^3
+// The frame gate's divisor, mirroring kDeblockMaskedDivisor (deblock.hpp).
+const uint kMaskedDivisor = 2u;
 
 // The set-0 bindings, mirroring `Binding` in deblock.cpp.
 #define VR_DEBLOCK_BINDING_BLOCKS 0
@@ -31,7 +33,7 @@ const uint kShellVoxels = 296u;  // kBlockVoxels - 6^3
 #define VR_DEBLOCK_BINDING_WEIGHT 4
 #define VR_DEBLOCK_BINDING_STAMPS 5
 #define VR_DEBLOCK_BINDING_SHELL 6
-#define VR_DEBLOCK_BINDING_SKIP 7
+#define VR_DEBLOCK_BINDING_MASKED 7
 
 // BlockIndex, BlockStamp and the read-only hash lookup from the volume tier
 // (one definition; see hash_lookup.glsl).
@@ -86,12 +88,12 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_STAMPS, scalar) buffer Stamps {
 layout(set = 0, binding = VR_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
   float shell[];
 };
-// The frame's skip word: non-zero, and every kernel returns before it reads
-// or writes anything else. No deblock dispatch writes it, so each invocation
-// reads the same value and the return is uniform.
-layout(set = 0, binding = VR_DEBLOCK_BINDING_SKIP, scalar) readonly buffer
-    Skip {
-  uint skip;
+// The frame's masked blocks, those with an unobserved voxel, as the inverse
+// counted them. No deblock dispatch writes it, so each invocation reads the
+// same value.
+layout(set = 0, binding = VR_DEBLOCK_BINDING_MASKED, scalar) readonly buffer
+    MaskedBlocks {
+  uint masked_blocks;
 };
 
 // An unobserved voxel's value in the kernels' working field, and a shell
@@ -109,6 +111,15 @@ float vrNormalized(float t) {
   precise float r = fma(-q, pc.trunc_dist, t);
   precise float v = fma(r, pc.inv_trunc, q);
   return v;
+}
+
+// Whether the gate skips the frame: more than 1 / kMaskedDivisor of its
+// pc.num_blocks blocks masked, as deblock_skips (deblock.hpp) has it. Every
+// kernel returns first thing when it does, before it reads or writes
+// anything else, and before any barrier: it compares a word no deblock
+// dispatch writes with a push constant, so the return is uniform.
+bool vrFrameSkipped() {
+  return masked_blocks > pc.num_blocks / kMaskedDivisor;
 }
 
 // Whether the frame observed voxel @p l of its entry @p entry.
