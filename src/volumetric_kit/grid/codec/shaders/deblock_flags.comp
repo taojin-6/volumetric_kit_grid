@@ -1,0 +1,48 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The deblock's first dispatch (deblock.hpp): the per-block fallback's flags.
+// An invocation a frame block, kLanes a workgroup, the entry item_base + the
+// global invocation id: it ANDs the block's kMaskWords mask words, finds its
+// slot by coordinate through the grid's hash, and writes full[slot], 1 for a
+// mask all ones and 0 for a masked block, which keeps its exact decode. A
+// workgroup counts its masked blocks in shared memory and adds them to
+// exact_blocks at once. No invocation reads a flag another writes; the
+// dispatches after this one read them, after the batch's barrier.
+
+#extension GL_GOOGLE_include_directive : require
+#include "deblock_common.glsl"
+
+layout(local_size_x = kLanes) in;
+
+shared uint s_masked;
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.item_base + gl_GlobalInvocationID.x;
+  if (lane == 0u) {
+    s_masked = 0u;
+  }
+  barrier();
+  if (entry < pc.num_blocks) {
+    uint all = ~0u;
+    for (uint w = 0u; w < kMaskWords; ++w) {
+      all &= masks[entry * kMaskWords + w];
+    }
+    bool full_block = all == ~0u;
+    if (!full_block) {
+      atomicAdd(s_masked, 1u);
+    }
+    int ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+                             pc.bucket_size, pc.max_chain);
+    if (ptr >= 0) {
+      full[uint(ptr) / kBlockVoxels] = full_block ? 1u : 0u;
+    }
+  }
+  barrier();
+  if (lane == 0u && s_masked != 0u) {
+    atomicAdd(exact_blocks, s_masked);
+  }
+}

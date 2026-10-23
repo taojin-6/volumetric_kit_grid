@@ -56,8 +56,6 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 // keep flags, one word per block slot.
 #define VR_DCT_BINDING_CUT 10
 #define VR_DCT_BINDING_KEEP 11
-// The inverse's masked-block count (dct_inverse.comp), one word.
-#define VR_DCT_BINDING_MASKED 12
 // Whether slot s's bit is set in a bit-per-slot set such as the cut set.
 #define VR_SLOT_BIT(set, s) \
   ((((set)[(s) / kMaskWordBits] >> ((s) % kMaskWordBits)) & 1u) != 0u)

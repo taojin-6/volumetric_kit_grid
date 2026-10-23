@@ -51,18 +51,26 @@ struct FrameInfo {
 };
 
 /// @brief What the deblock did to the frame a @ref Decoder last decoded or
-///        rebuilt (@ref Decoder::set_deblock).
+///        rebuilt (@ref Decoder::set_deblock): enough for a player to show,
+///        say, "LF, 12 of 1,920 blocks exact".
 struct DeblockInfo {
-  /// The filter the frame's steps chose and the decoder ran: `"LF"`, a line
-  /// fit across each block face; `"LG"`, that and a light Gaussian; `"R"`,
-  /// that and a stronger one; or `"off"`, for the deblock off, a step too
-  /// fine to need one, or a frame its gate skipped
-  /// (@ref Decoder::set_deblock). A string literal.
+  /// The filter the frame's steps chose and the decoder ran on its fully
+  /// observed blocks: `"LF"`, a line fit across each block face; `"LG"`,
+  /// that and a light Gaussian; `"R"`, that and a stronger one; or `"off"`,
+  /// for the deblock off or a step too fine to need one. A string literal.
   const char* filter = "off";
   /// T, in metres: the largest change one quantum of the frame's
   /// lowest-frequency coefficients makes to a voxel, by which the filter is
   /// chosen and its changes are clipped. The frame's, the deblock on or off.
   float step = 0.0f;
+  /// The frame's blocks.
+  std::uint32_t block_count = 0;
+  /// Of them, those that kept their exact decode: with a filter, the blocks
+  /// holding an unobserved voxel, which it never writes
+  /// (@ref Decoder::set_deblock), counted on the device; with `"off"`,
+  /// every block. A frame with them all decodes exactly as with the deblock
+  /// off.
+  std::uint32_t exact_blocks = 0;
 };
 
 /// @brief Read a frame's complete header, including its quantization weights.
@@ -103,8 +111,9 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// would draw, by a filter the frame's header chooses (@ref DeblockInfo), on
 /// the device inside the decode's last submit. It is out of loop -- a P-frame
 /// decodes from its reference's coefficients, never from a grid -- so it may
-/// change between any two frames, and it costs no bits. It writes observed
-/// voxels' `tsdf` alone, and stamps a block it writes `changed`. With it on,
+/// change between any two frames, and it costs no bits. It writes the `tsdf`
+/// of fully observed blocks alone -- a block holding an unobserved voxel keeps
+/// its exact decode -- and stamps a block it writes `changed`. With it on,
 /// the stamps can also name a block whose values end as they were -- the
 /// inverse compares the exact decode with the smoothed values the grid held
 /// -- but never miss one that changed.
@@ -129,9 +138,10 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// and its new blocks), 16 more a new block and 8 a reference entry, and
 /// 16 KiB a frequency table for its slot lookup, beside the frame's payload
 /// and tables; the blocks the grid must drop take 16 bytes a hash slot; and
-/// with the deblock on, a frame whose filter has a Gaussian takes 1,184
-/// bytes a block, grown with 1.5x headroom. All of it is kept, sized for
-/// the largest frame decoded.
+/// with the deblock on, a frame it filters takes 4 bytes a block slot of the
+/// grid's heap, and one whose filter has a Gaussian 1,184 bytes a block
+/// more, each grown with 1.5x headroom. All of it is kept, sized for the
+/// largest frame decoded.
 ///
 /// Everything but I/O and control runs on the device: the rANS decode, one
 /// segment an invocation; the reader's verdict; the merge of a P-frame's
@@ -236,12 +246,15 @@ class VR_CODEC_API Decoder {
   ///        inverse transform, in the same submit; off, the default, the grid
   ///        holds the exact decode.
   ///
-  /// The gate: a frame more than half of whose blocks hold an unobserved
-  /// voxel -- as nearly every block of a fused RGB-D frame does -- is
-  /// skipped on the device, so it decodes exactly as with the deblock off.
-  /// A frame with fewer, such as a true-SDF frame with a few cut voxels
-  /// (@ref EncoderConfig::true_sdf), is smoothed; its unobserved voxels keep
-  /// their decoded values and never enter the filter.
+  /// The per-block fallback: a block holding an unobserved voxel -- as
+  /// nearly every block of a fused RGB-D frame does, and a true-SDF frame's
+  /// few blocks with cut voxels (@ref EncoderConfig::true_sdf) -- keeps its
+  /// exact decode. No pass writes it and no line is fitted across a face it
+  /// shares, so both sides of that face stay as decoded; the Gaussian of a
+  /// neighbour reads its observed voxels as decoded, its unobserved ones not
+  /// at all. Only fully observed blocks are smoothed, so a frame all of whose
+  /// blocks are masked decodes exactly as with the deblock off;
+  /// @ref DeblockInfo::exact_blocks counts the blocks kept.
   void set_deblock(bool on) noexcept { deblock_on_ = on; }
   /// @return Whether the deblock is on.
   bool deblock() const noexcept { return deblock_on_; }
@@ -268,7 +281,8 @@ class VR_CODEC_API Decoder {
                        core::StageMetrics* metrics = nullptr);
 
   /// @return What the deblock did to the frame the last successful
-  ///         @ref decode or @ref rebuild left; `"off"` and 0 before one.
+  ///         @ref decode or @ref rebuild left; `"off"` and zeros before
+  ///         one.
   const DeblockInfo& last_deblock() const noexcept { return last_deblock_; }
 
   /// @return `true` if this owns a live transform (`false` when moved-from).

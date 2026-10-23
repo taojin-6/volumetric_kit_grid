@@ -120,8 +120,7 @@ struct ResidentBlocks {
 /// caller says (the encoder's reference store, from which the device frame
 /// writer codes it), and the inverse reads its input where the reference
 /// store's apply wrote it, in the caller's batch too; each reads back its
-/// reject count alone (the inverse its masked-block count too, on request),
-/// and the observed filter its count and reject tally.
+/// reject count alone, and the observed filter its count and reject tally.
 /// The observed list, the cut set and the keep flags grow when needed and
 /// remain allocated for later calls. The coefficients travel two to a word,
 /// 16 bits each.
@@ -201,12 +200,10 @@ class VR_CODEC_API DctTransform {
   ///        recorded what reads the blocks next and @ref record_rejected.
   ///
   /// Advances the map's tick, which every block the inverse changes is
-  /// stamped with, and counts in @ref masked_blocks, zeroed first in
-  /// @p batch, the blocks whose mask is not all ones. The list must be
-  /// duplicate-free, and the coefficients made against the grid's
-  /// `trunc_dist` (both unchecked: they come from a frame whose order and
-  /// header the caller checked). Each entry's coord must be one @p grid
-  /// holds; its ptr is ignored.
+  /// stamped with. The list must be duplicate-free, and the coefficients
+  /// made against the grid's `trunc_dist` (both unchecked: they come from a
+  /// frame whose order and header the caller checked). Each entry's coord
+  /// must be one @p grid holds; its ptr is ignored.
   /// @param batch   The batch to record into; submitted by the caller.
   /// @param grid    As @ref record_forward, written in place.
   /// @param in      The blocks, bound where they are; a count of 0 records
@@ -228,26 +225,15 @@ class VR_CODEC_API DctTransform {
 
   /// @brief Record the readback of the last @ref record_inverse's reject
   ///        count -- the entries whose coord the grid does not hold, which
-  ///        it neither read nor wrote -- and optionally its
-  ///        @ref masked_blocks, after what @p batch holds: last, so no copy
-  ///        splits the compute recorded after the inverse.
+  ///        it neither read nor wrote -- after what @p batch holds: last, so
+  ///        no copy splits the compute recorded after the inverse.
   /// @param batch     The inverse's batch.
   /// @param rejected  Written at submit, for @ref check_rejected; must
   ///                  outlive it. Set to 0, with nothing recorded, when that
   ///                  call recorded nothing.
-  /// @param masked    Optional, as @p rejected: the count of blocks whose
-  ///                  mask is not all ones.
   /// @return OK, or the batch's refusal.
   core::Status record_rejected(core::CommandBatch& batch,
-                               std::uint32_t& rejected,
-                               std::uint32_t* masked = nullptr);
-
-  /// @return The one-word buffer the last @ref record_inverse zeroes and
-  ///         then counts its masked blocks into -- those whose mask is not
-  ///         all ones, a block with an unobserved voxel, each adding one
-  ///         atomically -- for a later kernel in its batch to read (the
-  ///         decoder's deblock).
-  const core::Buffer& masked_blocks() const noexcept { return masked_; }
+                               std::uint32_t& rejected);
 
   /// @brief Gather the entries of @p list whose block holds an observed
   ///        voxel (`weight >= volume::kObservedWeight`) into
@@ -341,7 +327,7 @@ class VR_CODEC_API DctTransform {
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // The kernels share one layout shape (thirteen storage buffers + the push
+  // The kernels share one layout shape (twelve storage buffers + the push
   // range) and one pool. Declared before pool_ and tables_, so those are
   // destroyed first -- the kernels' sets are freed with the pool.
   core::ComputeKernel forward_kernel_;
@@ -357,9 +343,6 @@ class VR_CODEC_API DctTransform {
   // Rejected entries followed by the observed count (binding 7), zeroed
   // in each call's batch. Forward/inverse only read the first word back.
   core::Buffer rejected_;
-  // The inverse's masked-block count (binding 12), zeroed in each
-  // inverse's batch.
-  core::Buffer masked_;
   // Whether the last record_inverse recorded its dispatches, so
   // record_rejected has a count to read.
   bool inverse_recorded_ = false;

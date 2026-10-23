@@ -88,6 +88,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_surface.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_flags.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_gauss.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_line.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_store.comp"
