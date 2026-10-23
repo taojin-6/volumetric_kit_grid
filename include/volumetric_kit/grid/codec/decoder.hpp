@@ -152,18 +152,19 @@ class VR_CODEC_API Decoder {
   ///                 frame's `voxel_size` and `trunc_dist` exactly (see
   ///                 @ref read_frame_info).
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
-  ///                 row with both halves -- its device half is the rANS
-  ///                 kernels, the apply and the inverse transform -- over
-  ///                 the breakdown rows
+  ///                 row with its host, wait and device halves -- the whole
+  ///                 decode's -- over the breakdown rows, each with all
+  ///                 three, that tile it:
   ///                 `"  ..rans decode"` (parsing the frame, then one
   ///                 submit: decoding it, merging a P-frame's blocks with
   ///                 its reference's, and diffing the grid's block set
   ///                 against the frame's), `"  ..apply"` (removing and
-  ///                 allocating blocks) and `"  ..inverse"` (making the
-  ///                 frame's blocks from the reference and the payload, and
-  ///                 the transform, in one submit). Named apart from the
-  ///                 @ref Encoder's, so both timed into one `StageMetrics`
-  ///                 stay apart. `nullptr` measures nothing.
+  ///                 allocating blocks: the zeroing, the hash deletes and
+  ///                 the allocations, every round) and `"  ..inverse"`
+  ///                 (making the frame's blocks from the reference and the
+  ///                 payload, and the transform, in one submit). Named apart
+  ///                 from the @ref Encoder's, so both timed into one
+  ///                 `StageMetrics` stay apart. `nullptr` measures nothing.
   /// @return OK, or: whatever the frame reader refuses
   ///         (`Status::Code::Unsupported`,
   ///         `Status::Code::InvalidArgument` for a malformed or corrupt
