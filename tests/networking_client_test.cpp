@@ -9,8 +9,8 @@
 // read, and an end before the session says so; next(20 ms) with nothing
 // returns false in about 20 ms, and within 500 ms while chunks it skips flood
 // in; next(0 ms) alone connects and reads, a 230 KB record already in the
-// socket in one call; progress distinguishes a partial record larger than a
-// receive from idle input, stays true across a later idle step, includes
+// socket in one call; progress distinguishes a partial record sent in pieces
+// from idle input, stays true across a later idle step, includes
 // buffered records and resets for each call, saved errors included;
 // idle_limit counts from connect, against a listener that
 // sends nothing and a port whose connects never finish, and then from the
