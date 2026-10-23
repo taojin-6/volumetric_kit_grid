@@ -27,7 +27,8 @@
 ///   `delta = sum_i c_i (q_i - p_i)` with c = (13, 4, -5) / 12, clipped to
 ///   +-`line_clip`, is spread as a tent: p_0 and q_0 move 0.375 delta toward
 ///   each other, p_1 and q_1 0.125, each clamped to [-1, 1]. A face with a
-///   masked side is not fitted, so both sides of it stay as they were.
+///   masked side is not fitted, so the line passes leave both its sides as
+///   they were.
 /// - **The Gaussian** (r 1). Along x, then y, then z, each voxel of a fully
 ///   observed block becomes the mean of itself and its observed axis
 ///   neighbours, weighted 1 and `gauss_g1`, its change clipped to
@@ -41,14 +42,14 @@
 ///
 /// On the device: a first kernel, an invocation a frame block, sets the flag
 /// by slot of each fully observed block, the rest zeroed before it, and
-/// counts the masked blocks, which the caller reads back. Then one 64-lane
-/// workgroup per frame block in every kernel, which returns at once for a
-/// block its own mask words mark masked. The line passes run in place on
-/// `tsdf`, a dispatch an axis: a voxel lies on at most one line of a pass,
-/// read before it is written. The Gaussian is one fused kernel per block over
-/// the block and the 1-voxel halo of its 26 neighbours, x, y and z in shared
-/// memory; it writes the block's interior in place, which no other workgroup
-/// reads, and its shell (the voxels with a coordinate 0 or 7, which
+/// counts the masked blocks, read back into @ref Deblock::record's `exact`.
+/// Then one 64-lane workgroup per frame block in every kernel, which returns
+/// at once for a block its own mask words mark masked. The line passes run in
+/// place on `tsdf`, a dispatch an axis: a voxel lies on at most one line of a
+/// pass, read before it is written. The Gaussian is one fused kernel per
+/// block over the block and the 1-voxel halo of its 26 neighbours, x, y and z
+/// in shared memory; it writes the block's interior in place, which no other
+/// workgroup reads, and its shell (the voxels with a coordinate 0 or 7, which
 /// neighbours' halos read) into a snapshot by list position, which a store
 /// kernel then copies into `tsdf`. A neighbour is fully observed by its flag,
 /// and a masked neighbour's observed voxels are found by their weights;

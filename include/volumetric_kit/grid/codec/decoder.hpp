@@ -65,11 +65,12 @@ struct DeblockInfo {
   float step = 0.0f;
   /// The frame's blocks.
   std::uint32_t block_count = 0;
-  /// Of them, those that kept their exact decode: with a filter, the blocks
-  /// holding an unobserved voxel, which it never writes
+  /// Of them, those the per-block fallback kept at their exact decode: with
+  /// a filter, the blocks holding an unobserved voxel, which it never writes
   /// (@ref Decoder::set_deblock), counted on the device; with `"off"`,
-  /// every block. A frame with them all decodes exactly as with the deblock
-  /// off.
+  /// every block. A fully observed block the filter happens to leave
+  /// unchanged is not counted. A frame with them all decodes exactly as with
+  /// the deblock off.
   std::uint32_t exact_blocks = 0;
 };
 
@@ -250,7 +251,7 @@ class VR_CODEC_API Decoder {
   /// nearly every block of a fused RGB-D frame does, and a true-SDF frame's
   /// few blocks with cut voxels (@ref EncoderConfig::true_sdf) -- keeps its
   /// exact decode. No pass writes it and no line is fitted across a face it
-  /// shares, so both sides of that face stay as decoded; the Gaussian of a
+  /// shares, so neither side of that face is line-fitted; the Gaussian of a
   /// neighbour reads its observed voxels as decoded, its unobserved ones not
   /// at all. Only fully observed blocks are smoothed, so a frame all of whose
   /// blocks are masked decodes exactly as with the deblock off;

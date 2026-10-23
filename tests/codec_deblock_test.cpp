@@ -1199,7 +1199,7 @@ vkc::Result<vol::VoxelBlockGrid> player_grid(Gpu& gpu,
 // the nearer surface's distance clamped to the band, so every mask is all
 // ones -- a frame the deblock runs on. The fixture's sphere_grid and
 // two_sphere_grid leave the voxels past the band unobserved, as fused depth
-// does: a masked frame, which it skips.
+// does: a masked frame, whose masked blocks it keeps exact.
 vkc::Result<vol::VoxelBlockGrid> full_grid(Gpu& gpu,
                                            const std::vector<Sphere>& spheres) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
