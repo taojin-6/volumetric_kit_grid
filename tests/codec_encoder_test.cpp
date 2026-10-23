@@ -763,7 +763,10 @@ int true_sdf_heap_case(Gpu& gpu) {
 // One encoder, a frame with cuts, then a frame without any on the same grid
 // cleared and allocated again -- its slots now other blocks': no cut and no
 // kept block of the first frame reaches the second, which is the oracle's
-// and codes every voxel of its blocks observed.
+// and codes every voxel of its blocks observed. clear() refills the heap as
+// a new grid's, so the same blocks may draw the same slots again: far blocks,
+// drawn one at a time until one holds a slot of the first frame's, keep that
+// slot from its block while the curtain's blocks are drawn, then go.
 int stale_cut_case(Gpu& gpu) {
   const Curtain curtain = test_curtain(false);
   vkc::Result<codec::Encoder> enc =
@@ -776,12 +779,28 @@ int stale_cut_case(Gpu& gpu) {
   vkc::Result<Snapshot> with_cuts = decoded(gpu, cut.value());
   CHECK(with_cuts.ok() && unobserved(with_cuts.value()) > 0);
   vkc::Result<std::vector<vol::BlockIndex>> before = active_sorted(grid);
+  CHECK(before.ok());
   CHECK(grid.clear().ok());
+  std::vector<vol::BlockIndex> far;
+  bool holds_one = false;
+  while (!holds_one) {
+    CHECK(far.size() < std::size_t(grid.grid().num_blocks));
+    far.push_back(vol::BlockIndex{vr::Vec3i(1000 + int(far.size()), 0, 0), 0});
+    CHECK(allocate(gpu, grid, {far.back().coord}).ok());
+    vkc::Result<std::vector<vol::BlockIndex>> drawn = active_sorted(grid);
+    CHECK(drawn.ok());
+    for (const vol::BlockIndex& f : drawn.value()) {
+      for (const vol::BlockIndex& b : before.value()) {
+        holds_one = holds_one || f.ptr == b.ptr;
+      }
+    }
+  }
   CHECK(allocate(gpu, grid, union_blocks({curtain.sphere}, wide_band())).ok());
+  vkc::Result<std::uint32_t> failed = vr_test::remove_blocks(gpu, grid, far);
+  CHECK(failed.ok() && failed.value() == 0);
   CHECK(write_sphere(gpu, grid, curtain.sphere).ok());
   vkc::Result<std::vector<vol::BlockIndex>> after = active_sorted(grid);
-  CHECK(before.ok() && after.ok() &&
-        coords_of(before.value()) == coords_of(after.value()));
+  CHECK(after.ok() && coords_of(before.value()) == coords_of(after.value()));
   bool moved = false;
   for (std::size_t i = 0; i < after.value().size(); ++i) {
     moved = moved || before.value()[i].ptr != after.value()[i].ptr;
