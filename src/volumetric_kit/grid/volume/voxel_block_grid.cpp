@@ -128,6 +128,9 @@ core::Result<VoxelBlockGrid> VoxelBlockGrid::create(core::Device& device,
   }
   VKC_TRY(zero.submit());
   vbg.name_attribute_buffers();
+  if (!vbg.attributes_.empty()) {
+    VKC_TRY(vbg.build_block_kernels());
+  }
   return vbg;
 }
 
@@ -312,9 +315,10 @@ std::uint64_t VoxelBlockGrid::bytes_at(
   return bytes;
 }
 
-core::Result<std::uint32_t> VoxelBlockGrid::remove(
-    const core::Buffer& coords, std::uint32_t count,
-    AllocFailures* out_failures) {
+core::Result<std::uint32_t> VoxelBlockGrid::remove(const core::Buffer& coords,
+                                                   std::uint32_t count,
+                                                   AllocFailures* out_failures,
+                                                   core::GpuStageScope* stage) {
   if (!valid()) {
     return core::Status::invalid_argument(
         "VoxelBlockGrid::remove: moved-from grid");
@@ -328,7 +332,7 @@ core::Result<std::uint32_t> VoxelBlockGrid::remove(
                                            bytes));
   VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
                                            bytes, max_storage_buffer_range_));
-  return zero_and_remove(coords, count, out_failures, nullptr);
+  return zero_and_remove(coords, count, out_failures, stage);
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
@@ -338,16 +342,18 @@ core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
   // actually freed -- so there is nothing to bump here, and no way for the raw
   // map() path to skip it (see VoxelHashMap::topology_epoch).
   if (attributes_.empty()) {
-    return map_.remove(list, count, out_failures);
+    return map_.remove(list, count, out_failures, {}, stage);
   }
   // The zero kernel finds each coord's block in the table itself, so this
   // costs the count, not the grid. It rides the map's first round, ahead of
   // the delete in the same submit, so every block is zeroed before its index
   // is freed.
-  VKC_TRY(prepare_block_kernels());
-  return map_.remove(list, count, out_failures, [&](core::CommandBatch& batch) {
-    return record_zero(batch, list, count, stage);
-  });
+  return map_.remove(
+      list, count, out_failures,
+      [&](core::CommandBatch& batch) {
+        return record_zero(batch, list, count, stage);
+      },
+      stage);
 }
 
 core::Status VoxelBlockGrid::clear() {
@@ -376,13 +382,10 @@ core::Status VoxelBlockGrid::prepare_block_pass() {
     return core::Status::invalid_argument(
         "VoxelBlockGrid: the block pass needs a float weight attribute");
   }
-  return prepare_block_kernels();
+  return {};
 }
 
-core::Status VoxelBlockGrid::prepare_block_kernels() {
-  if (stamp_kernel_.valid()) return {};
-  // Built aside and committed at the end, the stamp kernel last, since it is
-  // what says the pass is built.
+core::Status VoxelBlockGrid::build_block_kernels() {
   VKC_ASSIGN(core::Buffer count,
              core::device_storage_buffer(*allocator_, sizeof(std::uint32_t)));
   VkPushConstantRange stamp_push{};

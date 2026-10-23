@@ -674,6 +674,56 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   // decode compacts nothing.
   CHECK(find_row(m, "  ..active set") == nullptr);
   CHECK(m.total_cpu_ms() == top->cpu_ms);
+  vkc::Result<vkc::GpuTimer> probe = vkc::GpuTimer::create(gpu.device);
+  CHECK(probe.ok());
+  const bool can_time = probe.value().available();
+  // Every row has its host span's wait inside it; where the device times,
+  // each breakdown tiles the decode -- the grid's removal and allocation
+  // rounds in "  ..apply" -- and the stage's device half is theirs.
+  const auto tiles = [&](const vkc::StageMetrics& rows, bool removes) {
+    const vkc::StageRow* stage = find_row(rows, "codec decode");
+    if (stage == nullptr || stage->wait_ms > stage->cpu_ms) return false;
+    double sum = 0.0;
+    for (const char* sub : {"  ..rans decode", "  ..apply", "  ..inverse"}) {
+      const vkc::StageRow* row = find_row(rows, sub);
+      if (row == nullptr || row->wait_ms > row->cpu_ms) return false;
+      if (!can_time) continue;
+      if (row->device != vkc::DeviceTime::Measured) return false;
+      sum += row->gpu_ms;
+    }
+    if (!can_time) return true;
+    std::fprintf(stderr, "decode%s: device %.4f ms, ..apply %.4f\n",
+                 removes ? " (removes)" : "", stage->gpu_ms,
+                 find_row(rows, "  ..apply")->gpu_ms);
+    return stage->device == vkc::DeviceTime::Measured && stage->gpu_ms > 0.0 &&
+           stage->gpu_ms < stage->cpu_ms &&
+           find_row(rows, "  ..apply")->gpu_ms > 0.0 &&
+           std::fabs(sum - stage->gpu_ms) < 1e-9 &&
+           rows.total_gpu_ms() == stage->gpu_ms;
+  };
+  CHECK(tiles(m, false));
+  // A second frame on another sphere: the grid removes the blocks the first
+  // held alone and allocates the second's, both in "  ..apply".
+  const Sphere moved{vr::Vec3f(0.04f, 0.0f, 0.0f), 0.08f};
+  vkc::Result<vol::VoxelBlockGrid> g2 = sphere_grid(gpu, moved);
+  CHECK(g2.ok());
+  vkc::Result<Bytes> second = enc.encode(g2.value());
+  CHECK(second.ok());
+  vkc::StageMetrics m2;
+  CHECK(dec.decode(second.value().data(), second.value().size(), d.value(), &m2)
+            .ok());
+  CHECK(tiles(m2, true));
+  // Null metrics tile nothing: a scope open around the decode gets its waits
+  // and no device half.
+  vkc::StageMetrics outer;
+  {
+    const vkc::StageScope around(outer, "around");
+    CHECK(
+        dec.decode(frame.value().data(), frame.value().size(), d.value()).ok());
+  }
+  CHECK(outer.rows().size() == 1 &&
+        outer.rows()[0].device == vkc::DeviceTime::None &&
+        outer.rows()[0].wait_ms <= outer.rows()[0].cpu_ms);
   // Encoding into the same metrics adds its own rows beside these rather
   // than summing into them.
   vkc::StageMetrics both = m;
@@ -683,12 +733,6 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   }
   CHECK(find_row(both, "  ..forward") != nullptr);
   CHECK(find_row(both, "  ..rans encode") != nullptr);
-  vkc::Result<vkc::GpuTimer> probe = vkc::GpuTimer::create(gpu.device);
-  CHECK(probe.ok());
-  if (probe.value().available()) {
-    CHECK(top->has_gpu);
-    CHECK(top->gpu_ms > 0.0 && top->gpu_ms < top->cpu_ms);
-  }
   return 0;
 }
 

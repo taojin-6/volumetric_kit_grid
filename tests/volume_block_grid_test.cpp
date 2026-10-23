@@ -5,9 +5,12 @@
 // verify they are distinct, correctly-sized device buffers keyed by the block
 // pool, that the composed VoxelHashMap still allocates, that resize grows the
 // attribute arrays while preserving per-voxel data at the same block pointer,
-// that remove zeroes what it frees, and the error / move paths. Runs on the
-// real driver (MoltenVK / NVIDIA); exits 0 (skip) where no device is present.
+// that remove zeroes what it frees, that create builds the block kernels and a
+// caller's scope times the grid's edits, and the error / move paths. Runs on
+// the real driver (MoltenVK / NVIDIA); exits 0 (skip) where no device is
+// present.
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -15,8 +18,10 @@
 #include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -48,6 +53,17 @@ vol::VoxelGridParams small_grid() {
   return grid;
 }
 
+// The bytes of the device's pipeline cache, which every pipeline the device
+// compiles adds to: how a call is seen to compile none.
+std::size_t pipeline_cache_bytes(const vkc::Device& device) {
+  std::size_t bytes = 0;
+  if (vkGetPipelineCacheData(device.handle(), device.pipeline_cache(), &bytes,
+                             nullptr) != VK_SUCCESS) {
+    return 0;
+  }
+  return bytes;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   const vol::VoxelGridParams grid = small_grid();
   const std::uint64_t voxels =
@@ -56,6 +72,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // Declare two independent float attributes (SoA): tsdf + weight.
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
+  const std::size_t cache_before = pipeline_cache_bytes(gpu.device);
   vkc::Result<vol::VoxelBlockGrid> grid_result =
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, attrs, 2);
   if (!grid_result) {
@@ -64,6 +81,54 @@ int gpu_main(vr_test::GpuContext& gpu) {
     return 1;
   }
   vol::VoxelBlockGrid vbg = std::move(grid_result).value();
+
+  // --- create built the block kernels, so the first remove compiles no
+  // pipeline; and the grid's edits, every round, count to a caller's scope,
+  // and to none without one. Before any other remove in this process, which
+  // would have built them.
+  {
+    vol::BlockIndex far{};
+    far.coord = vr::Vec3i(100, 100, 100);
+    vkc::Result<vkc::Buffer> list = vr_test::upload_device_buffer(
+        gpu.device, gpu.allocator, &far, sizeof(far));
+    vkc::Result<vkc::GpuTimer> timer = vkc::GpuTimer::create(gpu.device);
+    CHECK(list.ok() && timer.ok());
+    vkc::StageMetrics rows;
+    {
+      vkc::GpuStageScope stage(&rows, timer.value(), "edit");
+      vkc::Result<std::uint32_t> placed =
+          vbg.map().allocate(list.value(), 1, nullptr, &stage);
+      CHECK(placed.ok() && placed.value() == 0);
+    }
+    const std::size_t cache_at_remove = pipeline_cache_bytes(gpu.device);
+    {
+      vkc::GpuStageScope stage(&rows, timer.value(), "edit");
+      vkc::Result<std::uint32_t> removed =
+          vbg.remove(list.value(), 1, nullptr, &stage);
+      CHECK(removed.ok() && removed.value() == 0);
+    }
+    if (cache_at_remove > cache_before) {
+      CHECK(pipeline_cache_bytes(gpu.device) == cache_at_remove);
+    } else {
+      std::fprintf(stderr,
+                   "note: this device's pipeline cache does not grow with a "
+                   "compile, so a build at the first remove goes unseen\n");
+    }
+    CHECK(rows.rows().size() == 1);
+    const vkc::StageRow& edit = rows.rows()[0];
+    if (timer.value().available()) {
+      CHECK(edit.device == vkc::DeviceTime::Measured && edit.gpu_ms > 0.0 &&
+            edit.gpu_ms < edit.cpu_ms);
+    }
+    vkc::StageMetrics outer;
+    {
+      const vkc::StageScope around(outer, "around");
+      CHECK(vbg.map().allocate(list.value(), 1).ok());
+      CHECK(vbg.remove(list.value(), 1).ok());
+    }
+    CHECK(outer.rows().size() == 1 &&
+          outer.rows()[0].device == vkc::DeviceTime::None);
+  }
 
   // Attribute presence + lookup.
   CHECK(vbg.valid());
