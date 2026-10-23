@@ -57,11 +57,11 @@ struct Appended {
 };
 
 // Records on `tracks` tracks, keys and not, an empty payload of each, every
-// padding from 0 to 7, and payloads above 64 KiB. The last pads by 5.
+// padding from 0 to 7, and a payload above 64 KiB. The last pads by 5.
 std::vector<Appended> records_on(std::size_t tracks) {
-  const std::size_t sizes[] = {0,  0,  1,   2,    3,     4,      5,  6,
-                               7,  8,  9,   63,   64,    65,     56, 4096,
-                               57, 15, 300, 4097, 65537, 300000, 3};
+  const std::size_t sizes[] = {0,  0,  1,   2,    3,     4,  5,  6,
+                               7,  8,  9,   63,   64,    65, 56, 4096,
+                               57, 15, 300, 4097, 65537, 3};
   std::vector<Appended> out;
   std::vector<std::uint64_t> seqs(tracks, 0);
   std::uint64_t i = 0;

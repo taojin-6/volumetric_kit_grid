@@ -39,8 +39,9 @@ struct ClientOptions {
 /// A chunk that fails a check ends the connection; nothing is resynced. A
 /// seq may jump where the server skipped to a newer key, and a geometry
 /// consumer then decodes again from the next key (`codec::Decoder`'s
-/// `NotFound`). Its receive buffer is 256 KiB, set before the connect, so a
-/// reader that falls behind hides little from the server's drop rule.
+/// `NotFound`). Its receive buffer is 2 MiB, set before the connect: the most
+/// a stream carries a round trip, and what a reader that falls behind can
+/// hide from the server's drop rule. Linux holds it to `net.core.rmem_max`.
 ///
 /// **Messages.** Every error @ref next returns reads
 /// `"StreamClient: <host>:<port>: <reason>"`, the host and port as given to
@@ -104,7 +105,7 @@ class VR_NETWORKING_API StreamClient {
   ///        error moves to the next.
   /// @param wait          The longest to wait: however fast bytes come, a
   ///                      call ends within it and one receive (up to
-  ///                      256 KiB) more. 0 takes only that receive of what
+  ///                      2 MiB) more. 0 takes only that receive of what
   ///                      has come; `milliseconds::max()` has no end.
   /// @param[out] record   Its header. Its `offset` is the chunk's offset in
   ///                      the bytes received, as in the file they would make.

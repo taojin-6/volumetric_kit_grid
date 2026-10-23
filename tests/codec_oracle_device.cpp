@@ -202,16 +202,17 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
 }
 
 vkc::Result<std::vector<std::uint8_t>> encode(
-    const vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid,
+    const vr_test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
     const codec::EncoderConfig& config) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
-  VKC_ASSIGN(const std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+  VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       "weight", active));
   std::vector<vol::BlockIndex> observed;
   for (const vol::BlockIndex& b : active) {
-    const auto first = weight.begin() + std::ptrdiff_t(b.ptr);
+    const auto first = weight.values.begin() +
+                       std::ptrdiff_t(std::size_t(b.ptr) - weight.first);
     if (std::any_of(first, first + codec::kVoxelsPerBlock,
                     [](float w) { return w >= vol::kObservedWeight; })) {
       observed.push_back(b);
@@ -221,15 +222,21 @@ vkc::Result<std::vector<std::uint8_t>> encode(
             [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
               return d::coord_less(a.coord, b.coord);
             });
-  VKC_ASSIGN(const std::unique_ptr<d::DctTransform> t,
-             d::DctTransform::create(gpu.device, gpu.allocator));
   Frame frame;
   frame.voxel_size = grid.grid().voxel_size;
-  VKC_TRY(forward(gpu, *t, grid, observed, config.params, frame.blocks));
+  VKC_TRY(forward(gpu, t, grid, observed, config.params, frame.blocks));
   for (const vol::BlockIndex& b : observed) frame.coords.push_back(b.coord);
   FrameWriteOptions options;
   options.segment_size = config.segment_size;
   return write_frame(frame, options);
+}
+
+vkc::Result<std::vector<std::uint8_t>> encode(
+    const vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid,
+    const codec::EncoderConfig& config) {
+  VKC_ASSIGN(const std::unique_ptr<d::DctTransform> t,
+             d::DctTransform::create(gpu.device, gpu.allocator));
+  return encode(gpu, *t, grid, config);
 }
 
 }  // namespace codec_oracle

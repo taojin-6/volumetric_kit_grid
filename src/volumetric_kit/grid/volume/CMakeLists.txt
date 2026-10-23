@@ -10,7 +10,6 @@
 # (was header-only) since VoxelHashMap + its embedded shaders landed. Depends
 # only on recon_core, per the strict left-to-right tier rule.
 include(GenerateExportHeader)
-include(GNUInstallDirs)
 
 set(_vr_volume_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 
@@ -49,11 +48,13 @@ target_compile_features(recon_volume PUBLIC cxx_std_17)
 # recon_core too. recon_core carries the Vulkan/GLM include wiring transitively.
 target_link_libraries(recon_volume PUBLIC recon_core)
 
+# PRIVATE src/: recon_core's internal dispatch.hpp, by root-relative path, as
+# the shaders include another tier's GLSL.
 target_include_directories(
   recon_volume
   PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
          "$<BUILD_INTERFACE:${_vr_volume_generated_inc}>"
-         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+  PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the GLSL hash kernels to SPIR-V and embed them as constexpr byte
 # arrays into the library (voxel_hash_map.cpp #includes the generated *.spv.hpp
@@ -75,25 +76,3 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rehash.comp")
 
 vr_target_warnings(recon_volume)
-
-# Install the target into the shared export set + this tier's headers (the
-# volume/ subtree) + its generated export header. Mirrors recon_core so a
-# partial build never installs a header for a tier it did not build.
-if(VR_INSTALL)
-  install(
-    TARGETS recon_volume
-    EXPORT volumetric_kit_reconTargets
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-  install(
-    DIRECTORY "${PROJECT_SOURCE_DIR}/include/volumetric_kit/recon/volume"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/volumetric_kit/recon"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-  install(
-    DIRECTORY "${_vr_volume_generated_inc}/"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-endif()

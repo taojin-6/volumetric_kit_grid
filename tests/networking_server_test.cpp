@@ -13,16 +13,17 @@
 // is closed after stall_limit, never when it is milliseconds::max(), and on
 // Linux one that takes too few for its socket to poll writable within it is
 // not; connection max_viewers + 1 is closed before any byte, the first such
-// refusal logged at Warning and the next at Info, and a client refused there
+// refusal logged at Warning and the next at Debug, and a client refused there
 // is told it may have been; peers reset before they are accepted are dropped
 // with no Warning while a viewer joins; a viewer that leaves never fails
-// publish; the writer's refusals send nothing, and so does a payload over the
-// parser's cap; start refuses (a stall_limit of 0 or less among them); the
-// destructor returns within 1 s with no viewers, idle ones and a stalled one;
-// the threads of viewers that ended are joined as they go, the address space
-// (on macOS, its stacks) back near its start after 300; and 100 SIGUSR1 to a
-// no-op handler leave the stream whole. Every test that publishes first waits
-// for the viewer's session.
+// publish; a viewer's join and leave are logged at Info; the writer's
+// refusals send nothing, and so does a payload over the parser's cap; start
+// refuses (a stall_limit of 0 or less among them); the destructor returns
+// within 1 s with no viewers, idle ones and a stalled one; the threads of
+// viewers that ended are joined as they go, the address space (on macOS, its
+// stacks) back near its start after 300; and 100 SIGUSR1 to a no-op handler
+// leave the stream whole. Every test that publishes first waits for the
+// viewer's session.
 
 #include <pthread.h>
 #include <signal.h>
@@ -50,15 +51,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-#define VR_TEST_SANITIZED 1
-#endif
-#endif
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define VR_TEST_SANITIZED 1
-#endif
 
 #include "networking_loopback.hpp"
 #include "scratch_dir.hpp"
@@ -621,7 +613,7 @@ int max_viewers_case() {
             "the sender closed the connection before its session (it may "
             "already serve its most viewers)");
   // The first refusal at Warning, which the default sink prints; the next,
-  // within 10 s of it, at Info.
+  // within 10 s of it, at Debug, which a sender printing Info drops too.
   const Clock::time_point counted = Clock::now() + 2s;
   while (log.count("refused viewer ") < 2 && Clock::now() < counted) {
     std::this_thread::sleep_for(5ms);
@@ -629,7 +621,7 @@ int max_viewers_case() {
   CHECK(log.count("refused viewer ", peer_name(third.get()),
                   vkc::LogLevel::Warning) == 1);
   CHECK(log.count("refused viewer ", "", vkc::LogLevel::Warning) == 1);
-  CHECK(log.count("refused viewer ", "", vkc::LogLevel::Info) == 1);
+  CHECK(log.count("refused viewer ", "", vkc::LogLevel::Debug) == 1);
 
   first.reset();
   const std::size_t header = net::session_chunk(session).size();
@@ -747,6 +739,29 @@ int leaving_viewer_case() {
     std::this_thread::sleep_for(5ms);
   }
   CHECK(log.has(resets_name, " failed: ") || log.has(resets_name, " left"));
+  return 0;
+}
+
+// A viewer that reads its session and closes is logged joining, then leaving,
+// each at Info, which the senders print: the only lines that name it.
+int join_leave_log_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  const stream::Session session = net::geometry_session();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  vkc::UniqueFd viewer = net::connect_loopback(server->port());
+  CHECK(viewer.valid());
+  const std::string name = peer_name(viewer.get());
+  Bytes header;
+  net::read_upto(viewer.get(), net::session_chunk(session).size(), 5s, &header);
+  CHECK(header.size() == net::session_chunk(session).size());
+  viewer.reset();  // nothing unread, so a clean end
+  CHECK(log.wait_for(name, " left", 2s));
+  const std::string line = "StreamServer: viewer " + name;
+  CHECK(log.count(line + " joined, 1 of 4", "", vkc::LogLevel::Info) == 1);
+  CHECK(log.count(line + " left", "", vkc::LogLevel::Info) == 1);
+  CHECK(log.count(name) == 2);
   return 0;
 }
 
@@ -917,14 +932,20 @@ std::uint64_t address_space() {
 // the first 20. A thread never joined keeps its stack (8 MiB on Linux) or,
 // on macOS, 32 KiB of it, and neither shows in a thread count. A viewer's
 // thread sees its end within a poll slice, so 64 slots, and one refused
-// tries again. glibc gives a thread that finds malloc busy an arena of its
-// own, 64 MiB of address space kept, so no new one is made meanwhile. Not
-// under ASan or TSan, which keep freed memory a while.
+// tries again. Each reading waits, however long a loaded machine takes, for
+// every viewer the log says joined to have ended, then for two more to join
+// in turn and stay: the accept loop joins every ended viewer's thread before
+// each accept, so before it took the second. glibc gives a thread that finds
+// malloc busy an arena of its own, 64 MiB of address space kept, so no new
+// one is made meanwhile. Not under ASan or TSan, which keep freed memory a
+// while.
 int reaping_case() {
 #ifndef VR_TEST_SANITIZED
 #ifdef __GLIBC__
   CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
 #endif
+  Captured log;
+  LogCapture capture(&log);
   const stream::Session session = net::geometry_session();
   networking::ServerOptions options;
   options.max_viewers = 64;
@@ -942,17 +963,34 @@ int reaping_case() {
     }
     return true;
   };
+  // The address space once every ended viewer's thread is joined, with two
+  // viewers held. A viewer's lines: one as it joins, one as it ends.
+  const auto all_ended = [&] {
+    return log.count(": viewer ") == 2 * log.count(": viewer ", " joined, ");
+  };
+  const auto reaped = [&](std::uint64_t* bytes) {
+    const Clock::time_point end = Clock::now() + 60s;
+    while (!all_ended()) {
+      if (Clock::now() >= end) return false;
+      std::this_thread::sleep_for(5ms);
+    }
+    vkc::UniqueFd held[2];
+    for (vkc::UniqueFd& viewer : held) {
+      viewer = net::connect_loopback(server->port());
+      Bytes got;
+      net::read_upto(viewer.get(), header, 10s, &got);
+      if (got.size() != header) return false;
+    }
+    *bytes = address_space();
+    return true;
+  };
   CHECK(join_and_leave(20));
-  std::this_thread::sleep_for(100ms);  // five poll slices: the 20 are joined
-  const std::uint64_t before = address_space();
+  std::uint64_t before = 0;
+  CHECK(reaped(&before));
   CHECK(before > 0);
   CHECK(join_and_leave(300));
-  std::uint64_t after = address_space();
-  const Clock::time_point end = Clock::now() + 2s;
-  while (after >= before + (4 << 20) && Clock::now() < end) {
-    std::this_thread::sleep_for(20ms);
-    after = address_space();
-  }
+  std::uint64_t after = 0;
+  CHECK(reaped(&after));
   std::printf(
       "reaping: %+lld KiB after 300 viewers\n",
       (static_cast<long long>(after) - static_cast<long long>(before)) / 1024);
@@ -1051,6 +1089,7 @@ int main() {
   if (max_viewers_case() != 0) return 1;
   if (reset_before_accept_case() != 0) return 1;
   if (leaving_viewer_case() != 0) return 1;
+  if (join_leave_log_case() != 0) return 1;
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;
   if (reaping_case() != 0) return 1;

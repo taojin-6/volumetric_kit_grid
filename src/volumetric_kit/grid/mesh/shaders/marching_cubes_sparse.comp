@@ -144,6 +144,7 @@ layout(push_constant, scalar) uniform PushConstants {
   // Block slots the grid's heap holds, to bound each block's ptr in one
   // comparison.
   uint num_block_slots;
+  uint item_base;  // the first active block this dispatch covers
 } pc;
 
 // mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
@@ -245,7 +246,7 @@ void main() {
   // One workgroup per block, NOT a flat voxel grid: shared memory is per
   // workgroup, so the neighbourhood can only be shared if every thread here
   // belongs to the same block.
-  uint block_i = gl_WorkGroupID.x;
+  uint block_i = pc.item_base + gl_WorkGroupID.x;
   if (block_i >= pc.num_active_blocks) {
     return;
   }
@@ -298,10 +299,9 @@ void main() {
   // voxels_per_block lanes ever enter this loop, so below block_size 8 most of
   // the group idles -- 192 of 256 at block_size 4, 248 of 256 at block_size 2 --
   // and the host's one-workgroup-per-block dispatch multiplies the group count
-  // by 256/voxels_per_block, which lowers the reachable active-block count
-  // against maxComputeWorkGroupCount[0] by the same factor (see the dispatch in
-  // marching_cubes.cpp). Both costs are booked rather than paid down: sizing the
-  // group from voxels_per_block needs a specialization constant plumbed through
+  // by 256/voxels_per_block (see the dispatch in marching_cubes.cpp). Both
+  // costs are booked rather than paid down: sizing the group from
+  // voxels_per_block needs a specialization constant plumbed through
   // ComputePipeline::create, and every in-tree caller uses block_size 8, where
   // this shape is a win. TODO(mesh): revisit if a consumer ships a smaller
   // block.

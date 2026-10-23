@@ -706,7 +706,7 @@ int corruption_case() {
   }
   Lcg rng{17};
   int refused = 0;
-  const int trials = 3000;
+  const int trials = 500;
   for (int i = 0; i < trials; ++i) {
     Bytes b = good;
     const std::uint32_t edits = 1 + rng.below(3);

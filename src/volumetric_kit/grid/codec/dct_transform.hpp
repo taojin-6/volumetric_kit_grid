@@ -43,16 +43,6 @@ constexpr std::uint32_t coefficient_words(std::uint32_t k) {
   return k / 2 + k % 2;
 }
 
-/// @brief Construction-time options.
-struct DctTransformConfig {
-  /// Blocks per dispatch, capped at the device's `maxComputeWorkGroupCount[0]`
-  /// either way; 0 means that cap. A list longer than this is run as several
-  /// dispatches rather than refused. Lowering it only changes how the same
-  /// work is batched, which is what lets a test reach the multi-dispatch path
-  /// without a list larger than the device limit.
-  std::uint32_t max_blocks_per_dispatch = 0;
-};
-
 /// @brief Blocks where the device holds them: @ref count entries of masks
 ///        and coefficients, and their block list, in the layout the kernels
 ///        write. Borrowed from what produced them -- the transform's
@@ -141,12 +131,10 @@ class VR_CODEC_API DctTransform {
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator the scratch buffers come from (must
   ///                   outlive this object).
-  /// @param config     Construction-time options.
   /// @return The transform, or a non-OK `Status` if a pipeline, the pool or
   ///         the table upload fails.
   static core::Result<std::unique_ptr<DctTransform>> create(
-      core::Device& device, core::Allocator& allocator,
-      const DctTransformConfig& config = {});
+      core::Device& device, core::Allocator& allocator);
 
   ~DctTransform() = default;
   DctTransform(const DctTransform&) = delete;
@@ -268,8 +256,8 @@ class VR_CODEC_API DctTransform {
                                        const CodecParams& params) const;
 
   /// Bind the call's buffers and record @p kernel over the @p count entries
-  /// of @p list into @p batch, in dispatches of at most
-  /// @ref blocks_per_dispatch_ workgroups, the reject count zeroed first.
+  /// of @p list into @p batch, a workgroup an entry, the reject count zeroed
+  /// first.
   /// @p coefficients may be null for the kernel that reads none.
   core::Status record(core::CommandBatch& batch, core::ComputeKernel& kernel,
                       const volume::VoxelBlockGrid& grid,
@@ -286,10 +274,8 @@ class VR_CODEC_API DctTransform {
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
 
-  // The device's maxComputeWorkGroupCount[0], and the batch size run() uses:
-  // the config's value capped at it. Cached at create().
+  // The device's maxComputeWorkGroupCount[0], cached at create().
   std::uint32_t max_workgroup_count_x_ = 0;
-  std::uint32_t blocks_per_dispatch_ = 0;
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 

@@ -9,10 +9,11 @@
 // directory, resolved through config::load, read as written; signed mode's
 // rule and source.allow_holes, refused before any GPU work; inspection over a
 // range and its counts. On a device: each frame converted into a cleared grid,
-// and code_frame's records -- set the frame's number, pts that number at 30
-// fps, seq from 0, each payload what a fresh encoder makes of the frame alone,
-// the transform in the track's params -- and its own audit and allow_holes. The
-// device part skips with no device.
+// its allocation in the conversion's metrics, and code_frame's records -- set
+// the frame's number, pts that number at 30 fps, seq from 0, each payload what
+// a fresh encoder makes of the frame alone, the transform in the track's params
+// and 30 a second its rate -- and its own audit and allow_holes. The device
+// part skips with no device.
 
 #include <cmath>
 #include <cstdint>
@@ -547,7 +548,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   vr_example::CodecOutputs outputs;
   outputs.stream = (scratch.path / "moving" / "frames.vrst").string();
   vkc::Result<vr_example::CodecStream> made = vr_example::CodecStream::create(
-      gpu.device, gpu.allocator, {}, outputs, "example_mesh_sequence", *params);
+      gpu.device, gpu.allocator, {}, outputs, "example_mesh_sequence",
+      {vr_example::kNominalFps, 1}, *params);
   CHECK(made.ok());
   vr_example::CodecStream coder = std::move(made).value();
   vkc::Result<ts::MeshIntegrator> integrator =
@@ -566,11 +568,14 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     CHECK(active.ok());
     blocks.push_back(*active);
   }
+  // The conversion reports both of its calls, the allocation first.
+  CHECK(conversion.rows().size() >= 2);
+  CHECK(std::string(conversion.rows()[0].name) == "allocate");
   CHECK(coder.finish().ok());
   CHECK(coder.rows().size() == 3);
   // The player holds frame 7's blocks, no more.
   vkc::Result<std::vector<vol::BlockIndex>> played =
-      codec_fixture::active_sorted(coder.player());
+      codec_fixture::active_sorted(*coder.player());
   CHECK(played.ok() && played->size() == coder.rows()[2].blocks);
 
   vkc::Result<std::unique_ptr<stream::StreamReader>> opened =
@@ -581,6 +586,7 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   CHECK(reader.session().tracks.size() == 1);
   const stream::Track& track = reader.session().tracks[0];
   CHECK(track.kind == stream::TrackKind::Geometry && track.params == *params);
+  CHECK(track.rate.num == 30 && track.rate.den == 1);
   vkc::Result<io::MeshTransform> stored = io::decode_transform(track.params);
   CHECK(stored.ok() && same(*stored, sequence->transform()));
   vkc::Result<codec::Encoder> enc =
@@ -616,7 +622,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     vkc::Result<codec::Decoder> dec =
         codec::Decoder::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> alone = codec::make_decode_grid(
-        gpu.device, gpu.allocator, payload.data(), payload.size());
+        gpu.device, gpu.allocator, payload.data(), payload.size(),
+        static_cast<std::uint32_t>(fresh->grid().num_blocks));
     CHECK(dec.ok() && alone.ok());
     CHECK(dec->decode(payload.data(), payload.size(), *alone).ok());
     vkc::Result<std::vector<vol::BlockIndex>> decoded =

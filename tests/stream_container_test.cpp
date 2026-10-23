@@ -6,8 +6,9 @@
 // 64 at every alignment against a bitwise one; round trips of the session,
 // every record field and the payloads; seeking by key; unknown kinds, chunks
 // and header fields; the payload limit and a body size near 2^64; every
-// writer and reader refusal, a file cut short after its open included; and
-// two threads reading one reader.
+// writer and reader refusal, a file cut short after its open included; two
+// threads reading one reader; and a track's nominal period, 30 a second's
+// for an unknown rate.
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -763,6 +764,19 @@ int concurrency_case(const std::string& dir) {
   return 0;
 }
 
+// --- A track's nominal period. -----------------------------------------------
+
+int nominal_period_case(const std::string&) {
+  CHECK(stream::nominal_period_ns({25, 1}) == 40'000'000);
+  CHECK(stream::nominal_period_ns({30000, 1001}) == 33'366'666);
+  CHECK(stream::nominal_period_ns({1, 4'000'000'000u}) ==
+        4'000'000'000'000'000'000ull);
+  // Unknown, and a den no reader returns: 30 a second.
+  CHECK(stream::nominal_period_ns({}) == 33'333'333);
+  CHECK(stream::nominal_period_ns({30, 0}) == 33'333'333);
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -777,6 +791,7 @@ int main() {
   if (writer_refusals_case(dir) != 0) return 1;
   if (reader_refusals_case(dir) != 0) return 1;
   if (concurrency_case(dir) != 0) return 1;
+  if (nominal_period_case(dir) != 0) return 1;
   std::puts("stream container: OK");
   return 0;
 }

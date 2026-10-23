@@ -47,7 +47,7 @@ shared uint s_changed;
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
-  uint entry = pc.block_base + gl_WorkGroupID.x;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup; see dct_forward.comp.
   if (entry >= pc.num_blocks) {
     return;
@@ -84,6 +84,9 @@ void main() {
       (masks[entry * kMaskWords + lane / kLinesPerMaskWord] >>
        ((lane % kLinesPerMaskWord) * kEdge)) &
       kLineBits;
+  // A voxel is written only where its bits differ (-0.0 against 0.0 too, so
+  // the block ends exactly as decoded), which spares a block the frame
+  // repeats its writes; the stamp still compares values.
   bool changed = false;
   for (uint x = 0u; x < kEdge; ++x) {
     uint local = x_line_base(lane) + x;
@@ -92,9 +95,15 @@ void main() {
     float sdf = clamp(s_work[kHalf + local], -1.0, 1.0) * pc.trunc_dist;
     float t = observed ? sdf : 0.0;
     float w = observed ? pc.decoded_weight : 0.0;
-    changed = changed || tsdf[v] != t || weight[v] != w;
-    tsdf[v] = t;
-    weight[v] = w;
+    float old_t = tsdf[v];
+    float old_w = weight[v];
+    changed = changed || old_t != t || old_w != w;
+    if (floatBitsToUint(old_t) != floatBitsToUint(t)) {
+      tsdf[v] = t;
+    }
+    if (floatBitsToUint(old_w) != floatBitsToUint(w)) {
+      weight[v] = w;
+    }
   }
   if (changed) {
     atomicOr(s_changed, 1u);

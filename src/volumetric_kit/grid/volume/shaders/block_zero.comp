@@ -19,7 +19,7 @@ layout(set = 0, binding = 1, scalar) readonly buffer Blocks {
 };
 
 layout(push_constant, scalar) uniform Push {
-  uint base;  // this dispatch's first listed block
+  uint item_base;  // this dispatch's first listed block
   uint voxels_per_block;
   uint words_per_block;
   uint num_words;  // the array's, so an out-of-lockstep one is left alone
@@ -32,7 +32,7 @@ shared int s_ptr;
 
 void main() {
   if (gl_LocalInvocationID.x == 0u) {
-    s_ptr = vrFindBlockPtr(blocks[pc.base + gl_WorkGroupID.x].coord,
+    s_ptr = vrFindBlockPtr(blocks[pc.item_base + gl_WorkGroupID.x].coord,
                            pc.num_buckets, pc.bucket_size, pc.max_chain);
   }
   barrier();

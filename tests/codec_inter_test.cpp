@@ -42,6 +42,7 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 
 #include "gpu_test.hpp"
 
@@ -220,12 +221,11 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
 
 // Every source kind against a held reference, its payload where the device
 // reader leaves it, pads not 0, at K of 1, 21, 64 and 512, with residuals
-// from all of int16 so many wrap; at @p max_blocks_per_dispatch 4, the nine
-// blocks in three dispatches.
-int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
+// from all of int16 so many wrap. gpu_main runs it again at four blocks a
+// dispatch, the nine blocks in three dispatches.
+int apply_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
-      d::ReferenceStore::create(gpu.device, gpu.allocator,
-                                max_blocks_per_dispatch);
+      d::ReferenceStore::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
   CHECK(store.held() == nullptr);
@@ -292,11 +292,11 @@ int apply_case(Gpu& gpu, std::uint32_t max_blocks_per_dispatch) {
 
 // The slots grow under a held reference, whose words a growing spare never
 // disturbs; and only commit changes what is held, whatever was recorded or
-// refused before it. Seven blocks a dispatch, so 50 blocks take eight
-// dispatches, the last of one block, and 700 take 100.
+// refused before it. gpu_main runs it at seven blocks a dispatch, so 50
+// blocks take eight dispatches, the last of one block, and 700 take 100.
 int grow_case(Gpu& gpu) {
   vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
-      d::ReferenceStore::create(gpu.device, gpu.allocator, 7);
+      d::ReferenceStore::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
   d::ReferenceStore& store = *made.value();
   Lcg rng{23};
@@ -422,6 +422,13 @@ int apply_refusals_case(Gpu& gpu) {
 
 // --- The Decoder. -----------------------------------------------------------
 
+// The device, with what the cases share on it, each made once: the oracle's
+// transform, and a Decoder for the cases whose chains start with an I-frame.
+struct Shared : Gpu {
+  d::DctTransform& transform;
+  codec::Decoder& dec;
+};
+
 // A grid built from a frame's header, as a player builds one.
 vkc::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
                                           std::int32_t num_buckets = 512) {
@@ -438,21 +445,19 @@ vkc::Result<vol::VoxelBlockGrid> grid_for(Gpu& gpu, const Bytes& frame,
 // entries (oracle::read_frame, which pins the format's bytes),
 // inverse-transformed into a fresh grid of the frame's blocks -- no device
 // reader, no apply, no reference.
-vkc::Result<Snapshot> oracle_decode(Gpu& gpu, const Bytes& frame) {
+vkc::Result<Snapshot> oracle_decode(Shared& gpu, const Bytes& frame) {
   VKC_ASSIGN(const oracle::Frame content,
              oracle::read_frame(frame.data(), frame.size(), kMaxBlocks));
   VKC_ASSIGN(vol::VoxelBlockGrid grid, grid_for(gpu, frame));
   VKC_TRY(allocate(gpu, grid, content.coords));
   // The grid's blocks in frame order, entry for entry with the content's.
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
-  VKC_ASSIGN(std::unique_ptr<d::DctTransform> transform,
-             d::DctTransform::create(gpu.device, gpu.allocator));
-  VKC_TRY(oracle::inverse(gpu, *transform, grid, blocks, content.blocks));
+  VKC_TRY(oracle::inverse(gpu, gpu.transform, grid, blocks, content.blocks));
   return snapshot(gpu, grid);
 }
 
 // Whether @p grid holds what @p frame, an intra frame, decodes to.
-bool holds(Gpu& gpu, vol::VoxelBlockGrid& grid, const Bytes& frame) {
+bool holds(Shared& gpu, vol::VoxelBlockGrid& grid, const Bytes& frame) {
   vkc::Result<Snapshot> want = oracle_decode(gpu, frame);
   vkc::Result<Snapshot> got = snapshot(gpu, grid);
   return want.ok() && got.ok() && want.value() == got.value();
@@ -499,14 +504,12 @@ Step i_step(const Bytes& intra) {
 
 // Decode a chain's frames in order into one grid, which after each must hold
 // the oracle's decode of that step's intra frame.
-int run_chain(Gpu& gpu, const std::vector<Step>& chain, const char* what) {
-  vkc::Result<codec::Decoder> dec =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+int run_chain(Shared& gpu, const std::vector<Step>& chain, const char* what) {
   vkc::Result<vol::VoxelBlockGrid> grid = grid_for(gpu, chain[0].sent);
-  CHECK(dec.ok() && grid.ok());
+  CHECK(grid.ok());
   for (std::size_t i = 0; i < chain.size(); ++i) {
     const Bytes& f = chain[i].sent;
-    const vkc::Status s = dec.value().decode(f.data(), f.size(), grid.value());
+    const vkc::Status s = gpu.dec.decode(f.data(), f.size(), grid.value());
     if (!s.ok() || !holds(gpu, grid.value(), chain[i].intra)) {
       std::fprintf(stderr, "%s: step %zu: %s\n", what, i,
                    s.ok() ? "differs" : s.message().c_str());
@@ -537,7 +540,7 @@ Census census(const Step& prev, const Step& p) {
 // (M = 0) -- at odd K, K = 64 and K = 512, update and new segments of
 // several sizes; and the extreme coefficients, whose differences wrap and,
 // at +-32768, code zero.
-int synthetic_case(Gpu& gpu) {
+int synthetic_case(Shared& gpu) {
   for (std::uint32_t k : {21u, 64u, codec::kVoxelsPerBlock}) {
     const std::size_t n = k == codec::kVoxelsPerBlock ? 30 : 90;
     std::vector<Step> chain;
@@ -580,7 +583,7 @@ int synthetic_case(Gpu& gpu) {
 // among them, beside a reference that keeps, skips, zeroes and removes; then
 // back to the reference, which drops them: the merge and the grid diff
 // search them as any other.
-int extremes_chain_case(Gpu& gpu) {
+int extremes_chain_case(Shared& gpu) {
   const oracle::Frame reference = make_frame(60, 4, 31);
   const oracle::Frame kept = successor(reference, 32, 100, 400, 0);
   const oracle::Frame added = codec_frames::extreme_frame();
@@ -606,12 +609,10 @@ int extremes_chain_case(Gpu& gpu) {
 
 // The Encoder's frames of one sphere at an odd K, at the default segments
 // and finer ones, each into a fresh grid: as the oracle decodes them.
-int encoder_case(Gpu& gpu) {
+int encoder_case(Shared& gpu) {
   vkc::Result<vol::VoxelBlockGrid> g =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f});
-  vkc::Result<codec::Decoder> dec =
-      codec::Decoder::create(gpu.device, gpu.allocator);
-  CHECK(g.ok() && dec.ok());
+  CHECK(g.ok());
   for (std::uint32_t segment_size : {64u, 3u}) {
     codec::EncoderConfig config;
     config.params.coefficient_count = 37;
@@ -627,7 +628,7 @@ int encoder_case(Gpu& gpu) {
     vkc::Result<vol::VoxelBlockGrid> player = grid_for(gpu, frame.value());
     CHECK(player.ok());
     CHECK(
-        dec.value()
+        gpu.dec
             .decode(frame.value().data(), frame.value().size(), player.value())
             .ok());
     CHECK(holds(gpu, player.value(), frame.value()));
@@ -640,23 +641,18 @@ struct Spheres {
   std::vector<Step> chain;  // I, P, P
 };
 
-vkc::Result<Bytes> encode_sphere(Gpu& gpu, const Sphere& s) {
-  VKC_ASSIGN(vol::VoxelBlockGrid g, sphere_grid(gpu, s));
+vkc::Result<Spheres> spheres(Gpu& gpu) {
+  Spheres out;
   codec::EncoderConfig config;
   config.segment_size = 3;
   VKC_ASSIGN(codec::Encoder enc,
              codec::Encoder::create(gpu.device, gpu.allocator, config));
-  return enc.encode(g);
-}
-
-vkc::Result<Spheres> spheres(Gpu& gpu) {
-  Spheres out;
   std::vector<Bytes> intra;
   for (int t = 0; t < 3; ++t) {
-    VKC_ASSIGN(Bytes frame,
-               encode_sphere(gpu, Sphere{vr::Vec3f(0.006f * float(t), 0.0f,
-                                                   0.002f * float(t)),
-                                         0.1f + 0.008f * float(t)}));
+    const Sphere s{vr::Vec3f(0.006f * float(t), 0.0f, 0.002f * float(t)),
+                   0.1f + 0.008f * float(t)};
+    VKC_ASSIGN(vol::VoxelBlockGrid g, sphere_grid(gpu, s));
+    VKC_ASSIGN(Bytes frame, enc.encode(g));
     intra.push_back(std::move(frame));
   }
   out.chain.push_back(i_step(intra[0]));
@@ -674,7 +670,7 @@ vkc::Result<Spheres> spheres(Gpu& gpu) {
 
 // The sphere chain; the last P-frame into a fresh grid built from its own
 // header.
-int sphere_case(Gpu& gpu, const Spheres& s) {
+int sphere_case(Shared& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
   const Census c = census(chain[0], chain[1]);
   CHECK(c.modes[std::size_t(d::BlockMode::kKeep)] > 0);
@@ -682,13 +678,12 @@ int sphere_case(Gpu& gpu, const Spheres& s) {
   CHECK(c.added > 0);
   CHECK(run_chain(gpu, chain, "spheres") == 0);
 
-  vkc::Result<codec::Decoder> dec =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+  codec::Decoder& dec = gpu.dec;
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
-  CHECK(dec.ok() && g.ok());
+  CHECK(g.ok());
   for (int i = 0; i < 2; ++i) {
     const Bytes& f = chain[std::size_t(i)].sent;
-    CHECK(dec.value().decode(f.data(), f.size(), g.value()).ok());
+    CHECK(dec.decode(f.data(), f.size(), g.value()).ok());
   }
   const Bytes& p = chain[2].sent;
   vkc::Result<codec::FrameInfo> info =
@@ -697,7 +692,7 @@ int sphere_case(Gpu& gpu, const Spheres& s) {
   CHECK(info.value().block_count == chain[2].content.coords.size());
   vkc::Result<vol::VoxelBlockGrid> fresh = grid_for(gpu, p);
   CHECK(fresh.ok());
-  CHECK(dec.value().decode(p.data(), p.size(), fresh.value()).ok());
+  CHECK(dec.decode(p.data(), p.size(), fresh.value()).ok());
   CHECK(holds(gpu, fresh.value(), chain[2].intra));
   return 0;
 }
@@ -721,7 +716,7 @@ int refused(Gpu& gpu, codec::Decoder& dec, const Bytes& frame,
 
 // NotFound, with the grid and the reference untouched and the chain going on:
 // no reference held; a later I-frame held; another decoder's reference.
-int not_found_case(Gpu& gpu, const Spheres& s) {
+int not_found_case(Shared& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
   vkc::Result<codec::Decoder> made =
       codec::Decoder::create(gpu.device, gpu.allocator);
@@ -749,19 +744,16 @@ int not_found_case(Gpu& gpu, const Spheres& s) {
   // refuses what the first decodes.
   vkc::Result<codec::Decoder> other =
       codec::Decoder::create(gpu.device, gpu.allocator);
-  vkc::Result<codec::Decoder> first =
-      codec::Decoder::create(gpu.device, gpu.allocator);
+  codec::Decoder& first = gpu.dec;
   vkc::Result<vol::VoxelBlockGrid> og = grid_for(gpu, chain[0].sent);
-  CHECK(other.ok() && first.ok() && og.ok());
-  CHECK(first.value()
-            .decode(chain[0].sent.data(), chain[0].sent.size(), og.value())
+  CHECK(other.ok() && og.ok());
+  CHECK(first.decode(chain[0].sent.data(), chain[0].sent.size(), og.value())
             .ok());
   vkc::Result<vol::VoxelBlockGrid> fresh = grid_for(gpu, chain[1].sent);
   CHECK(fresh.ok());
   CHECK(refused(gpu, other.value(), chain[1].sent, fresh.value(), C::NotFound,
                 "no reference frame is held") == 0);
-  CHECK(first.value()
-            .decode(chain[1].sent.data(), chain[1].sent.size(), fresh.value())
+  CHECK(first.decode(chain[1].sent.data(), chain[1].sent.size(), fresh.value())
             .ok());
   CHECK(holds(gpu, fresh.value(), chain[1].intra));
   return 0;
@@ -771,7 +763,7 @@ int not_found_case(Gpu& gpu, const Spheres& s) {
 // reference block (after it), and a scale not the reference's (before it) --
 // and rows 11 and 12 judged before row 13 on a frame that fails both,
 // leaving the grid and the reference as they were.
-int invalid_case(Gpu& gpu, const Spheres& s) {
+int invalid_case(Shared& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
   // The second P-frame with one more new block: the coordinate of a block
   // its reference has and it removes.
@@ -815,11 +807,9 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
   Bytes rescaled = chain[2].sent;
   codec_frames::put_f32(rescaled, 24, 0.3f);
 
-  vkc::Result<codec::Decoder> made =
-      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
-  CHECK(made.ok() && g.ok());
-  codec::Decoder& dec = made.value();
+  CHECK(g.ok());
+  codec::Decoder& dec = gpu.dec;
   for (int i = 0; i < 2; ++i) {
     const Bytes& f = chain[std::size_t(i)].sent;
     CHECK(dec.decode(f.data(), f.size(), g.value()).ok());
@@ -841,7 +831,7 @@ int invalid_case(Gpu& gpu, const Spheres& s) {
 // changes, and its hash table, after -- then the documented resize, and the
 // same P-frame decodes against the same reference. A P-frame on the frame
 // that failed is NotFound, since a failed decode holds nothing new.
-int out_of_memory_case(Gpu& gpu, const Spheres& s) {
+int out_of_memory_case(Shared& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
   // A few blocks, which short chains in a table of as many slots cannot all
   // place, and a resize can.
@@ -851,11 +841,9 @@ int out_of_memory_case(Gpu& gpu, const Spheres& s) {
       p_step(few[0], successor(few[0].content, 42, 100, 400, 6), sizes(4, 4)));
   few.push_back(
       p_step(few[1], successor(few[1].content, 43, 100, 400, 2), sizes(4, 4)));
-  vkc::Result<codec::Decoder> made =
-      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> big = grid_for(gpu, chain[0].sent);
-  CHECK(made.ok() && big.ok());
-  codec::Decoder& dec = made.value();
+  CHECK(big.ok());
+  codec::Decoder& dec = gpu.dec;
   CHECK(
       dec.decode(chain[0].sent.data(), chain[0].sent.size(), big.value()).ok());
 
@@ -900,7 +888,7 @@ int out_of_memory_case(Gpu& gpu, const Spheres& s) {
 // The device buffers grow with a frame and are kept for smaller ones: a
 // large frame, a small one and the large one again, each into a grid of its
 // own and each as the oracle decodes it.
-int scratch_case(Gpu& gpu, const Spheres& s) {
+int scratch_case(Shared& gpu, const Spheres& s) {
   vkc::Result<codec::Decoder> dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(dec.ok());
@@ -917,7 +905,7 @@ int scratch_case(Gpu& gpu, const Spheres& s) {
 
 // A decoder moved mid-chain, by construction and by assignment, takes its
 // reference with it.
-int moves_case(Gpu& gpu, const Spheres& s) {
+int moves_case(Shared& gpu, const Spheres& s) {
   const std::vector<Step>& chain = s.chain;
   vkc::Result<codec::Decoder> made =
       codec::Decoder::create(gpu.device, gpu.allocator);
@@ -943,7 +931,7 @@ int moves_case(Gpu& gpu, const Spheres& s) {
 // segment size, or a P-frame's update size -- is malformed: refused before
 // any device work, with the grid and the reference as they were. Segments of
 // exactly the limit decode.
-int segment_rule_case(Gpu& gpu) {
+int segment_rule_case(Shared& gpu) {
   constexpr std::uint32_t kLimit = codec::kMaxDeviceDecodeSegmentSize;
   const oracle::Frame first = make_frame(kLimit, 8, 71);
   std::vector<Step> chain;
@@ -958,11 +946,9 @@ int segment_rule_case(Gpu& gpu) {
   codec_frames::put_u32(s[0].body, 12, kLimit + 1);
   const Bytes long_update = codec_frames::assemble(chain[1].sent, s);
 
-  vkc::Result<codec::Decoder> made =
-      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, chain[0].sent);
-  CHECK(made.ok() && g.ok());
-  codec::Decoder& dec = made.value();
+  CHECK(g.ok());
+  codec::Decoder& dec = gpu.dec;
   const Bytes& i = chain[0].sent;
   CHECK(dec.decode(i.data(), i.size(), g.value()).ok());
   CHECK(holds(gpu, g.value(), chain[0].intra));
@@ -992,11 +978,11 @@ struct Coded {
 // to the oracle's intra frame of the grid, a P-frame to the oracle's writer
 // over encoder_frame against the chain's last frame, at @p config's sizes.
 // Appends the frame to @p chain.
-int encode_checked(Gpu& gpu, codec::Encoder& enc,
+int encode_checked(Shared& gpu, codec::Encoder& enc,
                    const codec::EncoderConfig& config,
                    vol::VoxelBlockGrid& grid, std::vector<Coded>& chain) {
   vkc::Result<Bytes> sent = enc.encode(grid);
-  vkc::Result<Bytes> intra = oracle::encode(gpu, grid, config);
+  vkc::Result<Bytes> intra = oracle::encode(gpu, gpu.transform, grid, config);
   CHECK(sent.ok() && intra.ok());
   vkc::Result<oracle::Frame> content = oracle::read_frame(
       intra.value().data(), intra.value().size(), kMaxBlocks);
@@ -1058,7 +1044,7 @@ vkc::Result<vol::VoxelBlockGrid> moving_spheres(Gpu& gpu, int t) {
 // the oracle's bytes, every P-frame decoding to its I-frame's grid; and
 // among the P-frames every mode the encoder chooses but motion, and new
 // blocks.
-int encoder_chain_case(Gpu& gpu) {
+int encoder_chain_case(Shared& gpu) {
   for (const std::uint32_t period : {4u, ~0u}) {
     for (const bool odd : {true, false}) {
       codec::EncoderConfig config;
@@ -1070,9 +1056,7 @@ int encoder_chain_case(Gpu& gpu) {
       }
       vkc::Result<codec::Encoder> enc =
           codec::Encoder::create(gpu.device, gpu.allocator, config);
-      vkc::Result<codec::Decoder> dec =
-          codec::Decoder::create(gpu.device, gpu.allocator);
-      CHECK(enc.ok() && dec.ok());
+      CHECK(enc.ok());
       std::vector<Coded> chain;
       Census all;
       vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
@@ -1085,7 +1069,7 @@ int encoder_chain_case(Gpu& gpu) {
         CHECK(type_of(chain.back().sent) ==
               (intra ? codec::FrameType::kIntra : codec::FrameType::kInter));
         const Bytes& f = chain.back().sent;
-        CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
+        CHECK(gpu.dec.decode(f.data(), f.size(), player.value()).ok());
         CHECK(holds(gpu, player.value(), chain.back().intra));
         if (!intra) {
           const Census c = census_of(chain);
@@ -1108,7 +1092,7 @@ int encoder_chain_case(Gpu& gpu) {
 // frames, an I-frame and a P-frame: each the oracle's bytes at the config's
 // sizes, the P-frame's REFERENCE carrying the U expected, and the chain
 // decoding to the second grid's I-frame.
-int default_update_size_case(Gpu& gpu) {
+int default_update_size_case(Shared& gpu) {
   const std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
   struct Sizes {
     std::uint32_t segment_size;
@@ -1124,17 +1108,15 @@ int default_update_size_case(Gpu& gpu) {
     config.update_size = s.update_size;
     vkc::Result<codec::Encoder> enc =
         codec::Encoder::create(gpu.device, gpu.allocator, config);
-    vkc::Result<codec::Decoder> dec =
-        codec::Decoder::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
-    CHECK(enc.ok() && dec.ok() && player.ok());
+    CHECK(enc.ok() && player.ok());
     std::vector<Coded> chain;
     for (int t = 0; t < 2; ++t) {
       vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
       CHECK(g.ok());
       CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
       const Bytes& f = chain.back().sent;
-      CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
+      CHECK(gpu.dec.decode(f.data(), f.size(), player.value()).ok());
     }
     CHECK(type_of(chain[0].sent) == codec::FrameType::kIntra);
     CHECK(type_of(chain[1].sent) == codec::FrameType::kInter);
@@ -1190,23 +1172,23 @@ vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
   for (const auto& [c, voxels] : content) coords.push_back(c);
   VKC_TRY(allocate(gpu, grid, coords));
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
-  VKC_ASSIGN(
-      std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
-  VKC_ASSIGN(std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+  VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
+                                       blocks));
+  VKC_ASSIGN(vr_test::AttributeSpan<float> weight,
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       "weight", blocks));
   for (const vol::BlockIndex& b : blocks) {
     const Voxels& v = content.at(b.coord);
+    const std::size_t at = std::size_t(b.ptr) - tsdf.first;
     for (std::uint32_t i = 0; i < kVpb; ++i) {
-      tsdf[std::uint32_t(b.ptr) + i] = v.observed[i] ? v.sdf[i] * kTrunc : 0.0f;
-      weight[std::uint32_t(b.ptr) + i] = v.observed[i] ? 2.0f : 0.0f;
+      tsdf.values[at + i] = v.observed[i] ? v.sdf[i] * kTrunc : 0.0f;
+      weight.values[at + i] = v.observed[i] ? 2.0f : 0.0f;
     }
   }
+  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
   VKC_TRY(
-      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight));
+      vr_test::write_span(gpu.device, gpu.allocator, grid, "weight", weight));
   return grid;
 }
 
@@ -1217,7 +1199,7 @@ vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
 // grid an I-frame, smaller than the P-frame removing every entry, and the
 // frame after it an I-frame too. Every frame is the oracle's, and the prices
 // agree.
-int diff_case(Gpu& gpu) {
+int diff_case(Shared& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 1000;
   config.segment_size = 2;
@@ -1344,7 +1326,7 @@ int diff_case(Gpu& gpu) {
 // +-0.9 beside a shared ramp along x; at j = 3, the (1, 0, 0) basis and a
 // word's high half, its cosine at +-0.75 on a shared level. The P-frame
 // decodes to the target's grid.
-int wrap_case(Gpu& gpu, std::uint32_t j) {
+int wrap_case(Shared& gpu, std::uint32_t j) {
   codec::EncoderConfig config;
   config.intra_period = 2;
   config.params.coefficient_count = 4;
@@ -1396,13 +1378,10 @@ int wrap_case(Gpu& gpu, std::uint32_t j) {
   const Census c = census_of(chain);
   CHECK(c.modes[std::size_t(d::BlockMode::kZero)] == 1);
   CHECK(c.modes[std::size_t(d::BlockMode::kSkip)] == 1);
-  vkc::Result<codec::Decoder> dec =
-      codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
-  CHECK(dec.ok() && player.ok());
+  CHECK(player.ok());
   for (const Coded& f : chain) {
-    CHECK(
-        dec.value().decode(f.sent.data(), f.sent.size(), player.value()).ok());
+    CHECK(gpu.dec.decode(f.sent.data(), f.sent.size(), player.value()).ok());
   }
   CHECK(holds(gpu, player.value(), chain[1].intra));
   return 0;
@@ -1467,10 +1446,20 @@ int diff_refusals_case(Gpu& gpu) {
 
 }  // namespace
 
-int gpu_main(vr_test::GpuContext& gpu) {
-  if (apply_case(gpu, 0) != 0) return 1;
-  if (apply_case(gpu, 4) != 0) return 1;
+int gpu_main(vr_test::GpuContext& context) {
+  vkc::Result<std::unique_ptr<d::DctTransform>> transform =
+      d::DctTransform::create(context.device, context.allocator);
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(context.device, context.allocator);
+  CHECK(transform.ok() && dec.ok());
+  Shared gpu{
+      {context.device, context.allocator}, *transform.value(), dec.value()};
+  if (apply_case(gpu) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(4);
+  if (apply_case(gpu) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(7);
   if (grow_case(gpu) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(0);
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
   if (extremes_chain_case(gpu) != 0) return 1;

@@ -8,7 +8,8 @@
 // the F-score between meshes whose true distance is known -- a plane against a
 // copy of itself shifted by a known amount, and against one with half its
 // triangles gone -- what counts as surface, figures independent of the mesh's
-// order, the reusable reference, and every refusal. CPU-only.
+// order, the reusable reference, figures measured across threads the same as
+// on one, and every refusal. CPU-only.
 
 #include <algorithm>
 #include <chrono>
@@ -189,9 +190,15 @@ int closest_point_case() {
 // sits a sine of 1e-6 to 1e-2 off the opposite edge, each corner in turn
 // first, and needles with a 1 um edge. Marching cubes emits both. Ericson's
 // region test was off on about one in 300 000 of these, by up to 90 um, so
-// the sample is large enough to meet a few. The answer must be the
-// double-precision one to within float rounding at 3 m (0.24 um).
+// the sample is large enough to meet a few; a tenth of it under the
+// sanitizers, which look for memory errors, not rare misses. The answer must
+// be the double-precision one to within float rounding at 3 m (0.24 um).
 int thin_triangle_case() {
+#ifdef VR_TEST_SANITIZED
+  constexpr int kDraws = 5000;
+#else
+  constexpr int kDraws = 50000;
+#endif
   Lcg rng;
   const vr::Vec3f base(3.2f, 1.7f, 2.9f);
   const auto around = [&rng](float r) {
@@ -203,7 +210,7 @@ int thin_triangle_case() {
            std::fabs(double(vr::length(p - q)) -
                      triangle_distance(p, a, b, c)) <= 0.5e-6;
   };
-  for (int i = 0; i < 50000; ++i) {
+  for (int i = 0; i < kDraws; ++i) {
     const vr::Vec3f a = base + around(0.01f);
     const vr::Vec3f b = a + around(0.01f);
     const vr::Vec3f p = base + around(0.04f);
@@ -223,7 +230,9 @@ int thin_triangle_case() {
 
 // The search prunes neighbouring cells by distance; it must find what a scan
 // of every triangle finds. A bumpy sheet of 1 cm triangles, some collapsed to
-// a segment, against points scattered within and beyond the reach.
+// a segment, against 500 points scattered within and beyond the reach. A
+// search probing one cell fewer at the -x end first errs at the 357th, at
+// the +x end at the 76th.
 int search_case() {
   Lcg rng;
   mesh::Mesh m = plane(30, 0.01f, 0.0f);
@@ -238,7 +247,7 @@ int search_case() {
   vkc::Result<eval::MeshDistance> d = eval::MeshDistance::create(m, reach);
   CHECK(d.ok());
   int within = 0;
-  for (int i = 0; i < 3000; ++i) {
+  for (int i = 0; i < 500; ++i) {
     const vr::Vec3f p(rng(-0.05f, 0.35f), rng(-0.05f, 0.35f),
                       rng(-0.05f, 0.05f));
     float best = reach;
@@ -252,7 +261,7 @@ int search_case() {
     CHECK(near(double(d.value().distance(p)), double(best), 1e-7));
     within += best < reach ? 1 : 0;
   }
-  CHECK(within > 1000 && within < 3000);  // both sides of the reach
+  CHECK(within > 150 && within < 500);  // both sides of the reach
   return 0;
 }
 
@@ -455,6 +464,35 @@ int reference_case() {
   return 0;
 }
 
+// A comparison with points enough to split across threads (22 801 a way: five
+// slices of at least 4096, where there are the cores) gives, to the bit, what
+// one thread measuring every point in turn gives. The test plane is bumped so
+// the points' distances differ: a slice skipped or shifted moves the figures.
+int threads_case() {
+  const mesh::Mesh reference = plane(150, 0.002f, 0.0f);
+  mesh::Mesh test = reference;
+  for (std::size_t v = 0; v < test.vertices.size(); ++v) {
+    test.vertices[v].position.z = 1e-4f * float(v % 17);
+  }
+  eval::CompareOptions opt;
+  opt.reach = 0.02f;
+  const auto one_thread = [&opt](const mesh::Mesh& from, const mesh::Mesh& to) {
+    const vkc::Result<eval::MeshDistance> d =
+        eval::MeshDistance::create(to, opt.reach);
+    std::vector<float> out;
+    for (const mesh::Vertex& v : from.vertices) {
+      out.push_back(d.value().distance(v.position));
+    }
+    return eval::summarize(std::move(out), opt.reach);
+  };
+  const vkc::Result<eval::MeshComparison> c = compare(reference, test, opt);
+  CHECK(c.ok());
+  CHECK(c.value().accuracy.count == test.vertices.size());
+  CHECK(identical(c.value().accuracy, one_thread(test, reference)));
+  CHECK(identical(c.value().coverage, one_thread(reference, test)));
+  return 0;
+}
+
 // The F-score: every point of the shifted plane is 3 mm off, so a threshold
 // above that is perfect and one below it is zero; half a mesh has full
 // precision and the recall of the half it kept.
@@ -578,6 +616,7 @@ int main() {
   if (fscore_case() != 0) return 1;
   if (surface_case() != 0) return 1;
   if (reference_case() != 0) return 1;
+  if (threads_case() != 0) return 1;
   if (refusals_case() != 0) return 1;
   std::printf("eval mesh distance: OK\n");
   return 0;

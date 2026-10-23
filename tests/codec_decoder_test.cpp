@@ -8,7 +8,7 @@
 // last frame; every refusal before the grid is touched leaves it untouched;
 // a grid whose hash table cannot place the frame says so and recovers after a
 // resize; read_frame_info; the stage rows; the moves; and the Encoder's
-// P-frame chains, at a period of 30 and open-ended, decoding to exactly the
+// P-frame chains, at a period of 4 and open-ended, decoding to exactly the
 // grids its I-frames of the same content do, and recovering from a lost
 // frame through force_intra(). Links recon_mesh, which the codec tier itself
 // may not. Skips with no device.
@@ -262,14 +262,14 @@ int mesh_case(Gpu& gpu, codec::Decoder& dec) {
 // Frame after frame into one grid leaves exactly the last frame -- the same
 // state, bit for bit, as decoding that frame into a fresh grid. The two
 // spheres overlap, so the grid keeps some blocks, drops some and gains some.
-int sequence_case(Gpu& gpu, codec::Decoder& dec) {
+int sequence_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   const Sphere a{vr::Vec3f(0.0f), 0.08f};
   const Sphere b{vr::Vec3f(0.05f, 0.0f, 0.0f), 0.07f};
   vkc::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
   vkc::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
   CHECK(ga.ok() && gb.ok());
-  vkc::Result<Bytes> fa = encode_with(gpu, ga.value());
-  vkc::Result<Bytes> fb = encode_with(gpu, gb.value());
+  vkc::Result<Bytes> fa = enc.encode(ga.value());
+  vkc::Result<Bytes> fb = enc.encode(gb.value());
   CHECK(fa.ok() && fb.ok());
 
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, fa.value());
@@ -323,7 +323,7 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   vkc::Result<std::uint32_t> removed =
       vr_test::remove_blocks(gpu, gb.value(), dropped);
   CHECK(removed.ok() && removed.value() == 0);
-  vkc::Result<Bytes> fsub = encode_with(gpu, gb.value());
+  vkc::Result<Bytes> fsub = enc.encode(gb.value());
   CHECK(fsub.ok());
   CHECK(dec.decode(fsub.value().data(), fsub.value().size(), player).ok());
   vkc::Result<Snapshot> after_sub = snapshot(gpu, player);
@@ -351,7 +351,7 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
   // And a frame of no blocks empties the grid.
   vkc::Result<vol::VoxelBlockGrid> e = make_grid(gpu);
   CHECK(e.ok());
-  vkc::Result<Bytes> empty = encode_with(gpu, e.value());
+  vkc::Result<Bytes> empty = enc.encode(e.value());
   CHECK(empty.ok());
   CHECK(dec.decode(empty.value().data(), empty.value().size(), player).ok());
   vkc::Result<Snapshot> none = snapshot(gpu, player);
@@ -361,14 +361,14 @@ int sequence_case(Gpu& gpu, codec::Decoder& dec) {
 
 // Every refusal that comes before the grid changes leaves it exactly as it
 // was: a corrupt frame, one of other geometry, one too big for the heap.
-int untouched_case(Gpu& gpu, codec::Decoder& dec) {
+int untouched_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   const Sphere a{vr::Vec3f(0.0f), 0.06f};
   const Sphere b{vr::Vec3f(0.03f, 0.0f, 0.0f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
   vkc::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
   CHECK(ga.ok() && gb.ok());
-  vkc::Result<Bytes> fa = encode_with(gpu, ga.value());
-  vkc::Result<Bytes> fb = encode_with(gpu, gb.value());
+  vkc::Result<Bytes> fa = enc.encode(ga.value());
+  vkc::Result<Bytes> fb = enc.encode(gb.value());
   CHECK(fa.ok() && fb.ok());
   vkc::Result<vol::VoxelBlockGrid> g = grid_for(gpu, fa.value());
   CHECK(g.ok());
@@ -406,7 +406,7 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
   other.voxel_size = 0.004f;
   vkc::Result<vol::VoxelBlockGrid> go = sphere_grid(gpu, b, other);
   CHECK(go.ok());
-  vkc::Result<Bytes> fo = encode_with(gpu, go.value());
+  vkc::Result<Bytes> fo = enc.encode(go.value());
   CHECK(fo.ok());
   CHECK(!dec.decode(fo.value().data(), fo.value().size(), player).ok());
   CHECK(unchanged());
@@ -460,7 +460,7 @@ int untouched_case(Gpu& gpu, codec::Decoder& dec) {
 // A hash table that cannot place the frame's blocks -- few buckets, short
 // chains, as many blocks as it has slots -- is OutOfMemory, and a resize
 // followed by the same decode recovers the frame exactly.
-int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
+int out_of_memory_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   // Sixteen blocks, every voxel observed, from a roomy source grid.
   vkc::Result<vol::VoxelBlockGrid> gs = make_grid(gpu);
   CHECK(gs.ok());
@@ -474,7 +474,7 @@ int out_of_memory_case(Gpu& gpu, codec::Decoder& dec) {
             .ok());
   vkc::Result<Snapshot> src_snap = snapshot(gpu, src);
   CHECK(src_snap.ok());
-  vkc::Result<Bytes> frame = encode_with(gpu, src);
+  vkc::Result<Bytes> frame = enc.encode(src);
   CHECK(frame.ok());
   vkc::Result<codec::FrameInfo> info =
       codec::read_frame_info(frame.value().data(), frame.value().size());
@@ -596,13 +596,13 @@ int frame_info_case(Gpu& gpu) {
   return 0;
 }
 
-int refusals_case(Gpu& gpu, codec::Decoder& dec) {
+int refusals_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   // A frame with blocks in it, so a refusal that came after the grid started
   // to change would show.
   vkc::Result<vol::VoxelBlockGrid> g =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
   CHECK(g.ok());
-  vkc::Result<Bytes> frame = encode_with(gpu, g.value());
+  vkc::Result<Bytes> frame = enc.encode(g.value());
   CHECK(frame.ok());
   GridShape four;
   four.block_size = 4;
@@ -652,11 +652,11 @@ int refusals_case(Gpu& gpu, codec::Decoder& dec) {
   return 0;
 }
 
-int metrics_case(Gpu& gpu, codec::Decoder& dec) {
+int metrics_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   const Sphere s{vr::Vec3f(0.0f), 0.08f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
-  vkc::Result<Bytes> frame = encode_with(gpu, g.value());
+  vkc::Result<Bytes> frame = enc.encode(g.value());
   CHECK(frame.ok());
   vkc::Result<vol::VoxelBlockGrid> d = grid_for(gpu, frame.value());
   CHECK(d.ok());
@@ -677,10 +677,7 @@ int metrics_case(Gpu& gpu, codec::Decoder& dec) {
   // Encoding into the same metrics adds its own rows beside these rather
   // than summing into them.
   vkc::StageMetrics both = m;
-  vkc::Result<codec::Encoder> enc =
-      codec::Encoder::create(gpu.device, gpu.allocator);
-  CHECK(enc.ok());
-  CHECK(enc.value().encode(g.value(), &both).ok());
+  CHECK(enc.encode(g.value(), &both).ok());
   for (const char* sub : {"  ..rans decode", "  ..apply", "  ..inverse"}) {
     CHECK(find_row(both, sub)->cpu_ms == find_row(m, sub)->cpu_ms);
   }
@@ -695,7 +692,7 @@ int metrics_case(Gpu& gpu, codec::Decoder& dec) {
   return 0;
 }
 
-int moves_case(Gpu& gpu) {
+int moves_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<codec::Decoder> a_r =
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(a_r.ok());
@@ -717,7 +714,7 @@ int moves_case(Gpu& gpu) {
 
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(gpu);
   CHECK(g.ok());
-  vkc::Result<Bytes> frame = encode_with(gpu, g.value());
+  vkc::Result<Bytes> frame = enc.encode(g.value());
   CHECK(frame.ok());
   CHECK(c.decode(frame.value().data(), frame.value().size(), g.value()).ok());
   CHECK(!a.decode(frame.value().data(), frame.value().size(), g.value()).ok());
@@ -733,7 +730,7 @@ vkc::Result<vol::VoxelBlockGrid> chain_grid(Gpu& gpu, int t) {
                          Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
 }
 
-// Chains of P-frames at a period of 30 and open-ended, each decoded frame
+// Chains of P-frames at a period of 4 and open-ended, each decoded frame
 // after frame into one grid by a decoder of its own, leave that grid bit for
 // bit as an all-intra chain of the same grids leaves another, at every frame;
 // the period's chain crosses its second I-frame.
@@ -745,7 +742,7 @@ int p_chain_case(Gpu& gpu) {
     vol::VoxelBlockGrid grid;
   };
   std::vector<Chain> chains;
-  for (const std::uint32_t period : {1u, 30u, ~0u}) {
+  for (const std::uint32_t period : {1u, 4u, ~0u}) {
     codec::EncoderConfig config;
     config.intra_period = period;
     vkc::Result<codec::Encoder> enc =
@@ -758,7 +755,7 @@ int p_chain_case(Gpu& gpu) {
                            std::move(dec).value(), std::move(grid).value()});
   }
   std::size_t p_frames = 0;
-  for (int t = 0; t < 32; ++t) {
+  for (int t = 0; t < 6; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
     CHECK(g.ok());
     std::vector<Snapshot> decoded;
@@ -786,7 +783,7 @@ int p_chain_case(Gpu& gpu) {
     }
     CHECK(!decoded[0].coords.empty());
   }
-  CHECK(p_frames == 30 + 31);
+  CHECK(p_frames == 4 + 5);
   return 0;
 }
 
@@ -794,7 +791,7 @@ int p_chain_case(Gpu& gpu) {
 // P-frame after it is NotFound, the grid untouched; force_intra() makes the
 // next frame an I-frame, which the player decodes, and the P-frames after
 // it decode as the all-intra chain does.
-int lost_frame_case(Gpu& gpu) {
+int lost_frame_case(Gpu& gpu, codec::Encoder& all_intra) {
   codec::EncoderConfig config;
   config.intra_period = 30;
   vkc::Result<codec::Encoder> made =
@@ -831,7 +828,7 @@ int lost_frame_case(Gpu& gpu) {
           info.value().type == (t == 0 || t == 3 ? codec::FrameType::kIntra
                                                  : codec::FrameType::kInter));
     CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
-    vkc::Result<Bytes> intra = encode_with(gpu, g.value());
+    vkc::Result<Bytes> intra = all_intra.encode(g.value());
     CHECK(intra.ok());
     CHECK(intra_dec.value()
               .decode(intra.value().data(), intra.value().size(),
@@ -850,18 +847,23 @@ int gpu_main(vr_test::GpuContext& gpu) {
   auto made = codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
   codec::Decoder dec = std::move(made).value();
+  // The default config's Encoder, whose period of 1 makes every frame an
+  // I-frame, shared by the cases that code with it.
+  auto intra = codec::Encoder::create(gpu.device, gpu.allocator);
+  CHECK(intra.ok());
+  codec::Encoder& enc = intra.value();
   if (round_trip_case(gpu, dec) != 0) return 1;
   if (mesh_case(gpu, dec) != 0) return 1;
-  if (sequence_case(gpu, dec) != 0) return 1;
-  if (untouched_case(gpu, dec) != 0) return 1;
-  if (out_of_memory_case(gpu, dec) != 0) return 1;
+  if (sequence_case(gpu, enc, dec) != 0) return 1;
+  if (untouched_case(gpu, enc, dec) != 0) return 1;
+  if (out_of_memory_case(gpu, enc, dec) != 0) return 1;
   if (quantization_sequence_case(gpu, dec) != 0) return 1;
-  if (refusals_case(gpu, dec) != 0) return 1;
-  if (metrics_case(gpu, dec) != 0) return 1;
-  if (moves_case(gpu) != 0) return 1;
+  if (refusals_case(gpu, enc, dec) != 0) return 1;
+  if (metrics_case(gpu, enc, dec) != 0) return 1;
+  if (moves_case(gpu, enc) != 0) return 1;
   if (frame_info_case(gpu) != 0) return 1;
   if (p_chain_case(gpu) != 0) return 1;
-  if (lost_frame_case(gpu) != 0) return 1;
+  if (lost_frame_case(gpu, enc) != 0) return 1;
   std::printf("codec Decoder: OK\n");
   return 0;
 }

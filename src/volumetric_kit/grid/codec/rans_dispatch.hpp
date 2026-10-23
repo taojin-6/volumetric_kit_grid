@@ -5,9 +5,9 @@
 
 /// @file rans_dispatch.hpp
 /// @brief The host side of the rANS kernels, which the device frame writer
-///        and reader share: their push constants, the table entries they
-///        read, and the loop that dispatches them, which the block lists'
-///        kernels share too.
+///        and reader share: their push constants and the table entries they
+///        read. They and the block lists' kernels dispatch through
+///        `recon::detail::dispatch_items` (core/dispatch.hpp).
 ///
 /// Internal (under src/, never installed).
 
@@ -16,12 +16,12 @@
 #include <vector>
 
 #include "rans.hpp"
-#include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/core/vulkan/command_batch.hpp"
-#include "volumetric_kit/core/vulkan/compute_kernel.hpp"
-#include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/vulkan.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
+
+using recon::detail::dispatch_items;
 
 /// Mirrors `Push` in rans_push.glsl.
 struct RansPush {
@@ -58,32 +58,6 @@ inline std::vector<std::uint32_t> rans_table_entries(
 ///         blocks) still binds a valid range, which its kernel never reads.
 inline VkDeviceSize binding_range(VkDeviceSize bytes, VkDeviceSize element) {
   return std::max(bytes, element);
-}
-
-/// Record @p kernel over @p items invocations of @p lanes a workgroup, in as
-/// many dispatches as the device's group limit needs; each pushes @p push
-/// (@ref RansPush, or another whose `item_base` is its first word) with the
-/// first item it covers as `item_base`, and binds @p set, or the kernel's own
-/// set when it is null.
-template <typename Push>
-core::Status dispatch_items(core::CommandBatch& batch,
-                            const core::ComputeKernel& kernel, Push push,
-                            std::uint64_t items, std::uint32_t lanes,
-                            std::uint32_t max_groups,
-                            core::GpuStageScope* stage,
-                            const core::DescriptorSet* set = nullptr) {
-  const std::uint64_t per_dispatch = std::uint64_t(max_groups) * lanes;
-  for (std::uint64_t base = 0; base < items; base += per_dispatch) {
-    push.item_base = static_cast<std::uint32_t>(base);
-    const std::uint64_t count =
-        std::min<std::uint64_t>(per_dispatch, items - base);
-    const auto groups = static_cast<std::uint32_t>((count + lanes - 1) / lanes);
-    VKC_TRY(set != nullptr ? batch.dispatch(kernel, *set, &push, sizeof(push),
-                                            groups, max_groups, stage)
-                           : batch.dispatch(kernel, &push, sizeof(push), groups,
-                                            max_groups, stage));
-  }
-  return {};
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

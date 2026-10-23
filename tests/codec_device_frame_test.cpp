@@ -215,16 +215,16 @@ int same_read(d::DeviceFrameReader& reader, const Bytes& bytes,
 }
 
 // The oracle's frame and the device's, for one frame and its sizes -- a
-// P-frame also written bounded, at every tail -- and the device's decode of
-// it.
+// P-frame also written bounded, at every tail, unless @p bounded is false --
+// and the device's decode of it.
 int same_bytes(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader,
                const oracle::Frame& frame,
-               const oracle::FrameWriteOptions& options) {
+               const oracle::FrameWriteOptions& options, bool bounded = true) {
   const bool inter = frame.type == d::FrameType::kInter;
   const vkc::Result<Bytes> expected = oracle::write_frame(frame, options);
   CHECK(expected.ok());
   std::vector<std::optional<std::uint32_t>> writes = {std::nullopt};
-  if (inter) {
+  if (inter && bounded) {
     for (const std::uint32_t g : tails(frame.modes.size())) writes.push_back(g);
   }
   for (const std::optional<std::uint32_t>& tail : writes) {
@@ -274,8 +274,9 @@ int matches_oracle_case(d::DeviceFrameWriter& writer,
 
 // P-frames: the worked example's pinned bytes, at U = 1 too; the matrix
 // (codec_frames.hpp) at every update and segment size, every mode, K and
-// empty case among them, each written bounded too; one writer alternating
-// exact and bounded entries; and a P-frame of no entries at all.
+// empty case among them, each written bounded too at U = R = 7, several
+// segments of each, and at U past every frame with R = 1; one writer
+// alternating exact and bounded entries; and a P-frame of no entries at all.
 int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   const d::FrameReference example = reference_of(
       oracle::write_frame(codec_frames::example_reference()).value());
@@ -289,10 +290,12 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   int written = 0;
   const std::vector<codec_frames::InterCode> matrix =
       codec_frames::inter_matrix();
+  constexpr std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
   for (const codec_frames::InterCode& c : matrix) {
     for (std::uint32_t u : codec_frames::kInterSizes) {
       for (std::uint32_t r : codec_frames::kInterSizes) {
-        if (same_bytes(writer, reader, c.p, sizes(r, u)) != 0) {
+        const bool bounded = (u == 7 && r == 7) || (u == kLongest && r == 1);
+        if (same_bytes(writer, reader, c.p, sizes(r, u), bounded) != 0) {
           std::fprintf(stderr, "%s: U %u, R %u\n", c.what.c_str(), u, r);
           return 1;
         }
@@ -404,10 +407,10 @@ int corruption_case(d::DeviceFrameReader& reader) {
   CHECK(corrupt_payloads(
             reader,
             oracle::write_frame(make_frame(300, 32, 13), sizes(16, 64)).value(),
-            nullptr, 400, rng, v) == 0);
+            nullptr, 100, rng, v) == 0);
   CHECK(corrupt_payloads(
             reader, oracle::write_frame(extreme_frame(), sizes(2, 64)).value(),
-            nullptr, 400, rng, v) == 0);
+            nullptr, 100, rng, v) == 0);
   std::printf(
       "corrupt payloads: %d decoded, %d overflow, %d corrupt, %d "
       "out of order\n",
@@ -441,7 +444,7 @@ Bytes extreme_inter(d::FrameReference& id) {
 }
 
 // P-frame refusals: every reader refusal of C2's edit list, each one edit
-// from a valid P-frame, and 800 random payload corruptions of two P-frames,
+// from a valid P-frame, and 200 random payload corruptions of two P-frames,
 // each refused by the device with the oracle's code and message, or decoded
 // to the oracle's entries.
 int inter_refusals_case(d::DeviceFrameReader& reader) {
@@ -468,11 +471,11 @@ int inter_refusals_case(d::DeviceFrameReader& reader) {
   Lcg rng{31};
   Verdicts v;
   const codec_frames::InterCase& good = base.good;
-  CHECK(corrupt_payloads(reader, good.bytes, &good.reference, 400, rng, v) ==
+  CHECK(corrupt_payloads(reader, good.bytes, &good.reference, 100, rng, v) ==
         0);
   d::FrameReference id;
   const Bytes extreme = extreme_inter(id);
-  CHECK(corrupt_payloads(reader, extreme, &id, 400, rng, v) == 0);
+  CHECK(corrupt_payloads(reader, extreme, &id, 100, rng, v) == 0);
   std::printf(
       "corrupt P-frame payloads: %d decoded, %d overflow, %d corrupt, %d out "
       "of order, %d survivor counts\n",

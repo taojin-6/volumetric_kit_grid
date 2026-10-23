@@ -9,7 +9,6 @@
 # document, stored as bytes, and a geometry record is a codec frame, also bytes,
 # so neither tier is linked.
 include(GenerateExportHeader)
-include(GNUInstallDirs)
 
 set(_vr_stream_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 
@@ -50,28 +49,7 @@ target_compile_definitions(recon_stream PRIVATE _FILE_OFFSET_BITS=64)
 target_link_libraries(recon_stream PUBLIC volumetric_kit::core_base)
 
 target_include_directories(
-  recon_stream
-  PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
-         "$<BUILD_INTERFACE:${_vr_stream_generated_inc}>"
-         "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+  recon_stream PUBLIC "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
+                      "$<BUILD_INTERFACE:${_vr_stream_generated_inc}>")
 
 vr_target_warnings(recon_stream)
-
-if(VR_INSTALL)
-  install(
-    TARGETS recon_stream
-    EXPORT volumetric_kit_reconTargets
-    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-  install(
-    DIRECTORY "${PROJECT_SOURCE_DIR}/include/volumetric_kit/recon/stream"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/volumetric_kit/recon"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-  install(
-    DIRECTORY "${_vr_stream_generated_inc}/"
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING
-    PATTERN "*.hpp")
-endif()

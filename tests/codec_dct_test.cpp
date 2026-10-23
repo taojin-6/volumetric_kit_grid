@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -36,6 +37,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -48,7 +50,6 @@ namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
 namespace oracle = codec_oracle;
 using codec::detail::DctTransform;
-using codec::detail::DctTransformConfig;
 using codec_oracle::DctBlocks;
 
 namespace {
@@ -806,17 +807,11 @@ int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
 }
 
 // A list longer than one dispatch's batch runs as several, with the same
-// result -- the path a list past maxComputeWorkGroupCount[0] takes.
+// result -- the path a list past maxComputeWorkGroupCount[0] takes, at three
+// blocks a dispatch here.
 int batching_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
-  DctTransformConfig small;
-  small.max_blocks_per_dispatch = 3;
-  vkc::Result<std::unique_ptr<DctTransform>> batched_r =
-      DctTransform::create(device, allocator, small);
-  CHECK(batched_r.ok());
-  DctTransform& batched = *batched_r.value();
-
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -836,7 +831,9 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   // the single run: a freed buffer VMA hands straight back still holds the
   // previous run's output, so equality alone passes a batch that wrote
   // nothing past its first entries.
-  CHECK(oracle::forward(ctx, batched, grid, blocks, params, many).ok());
+  vr::detail::set_test_groups_per_dispatch(3);
+  CHECK(oracle::forward(ctx, t, grid, blocks, params, many).ok());
+  vr::detail::set_test_groups_per_dispatch(0);
   int exact = 0;
   int near_half = 0;
   CHECK(check_against_reference(many, content.data(), content.size(), exact,
@@ -861,7 +858,9 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
     }
   }
   put(ctx, grid, "tsdf", tsdf);
-  CHECK(oracle::inverse(ctx, batched, grid, blocks, many).ok());
+  vr::detail::set_test_groups_per_dispatch(3);
+  CHECK(oracle::inverse(ctx, t, grid, blocks, many).ok());
+  vr::detail::set_test_groups_per_dispatch(0);
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     CHECK(read_block(ctx, grid, blocks[i]) == single[i]);
   }
@@ -1274,7 +1273,8 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
 
 // The inverse stamps changed only on a block it leaves different, as the
 // integrator does, so decoding a block's last frame again leaves it
-// unstamped.
+// unstamped. It writes only voxels whose bits differ, yet leaves every block
+// bit for bit as decoded: a -0.0 where it decodes 0.0 is rewritten, unstamped.
 int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
                         DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
@@ -1284,9 +1284,10 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   vkc::Result<std::vector<vol::BlockIndex>> active = allocate_row(ctx, grid, 3);
   CHECK(active.ok());
   const std::vector<vol::BlockIndex>& blocks = active.value();
+  // Block 2 unobserved, so it decodes to zeros alone.
   for (std::size_t i = 0; i < 3; ++i) {
     write_block(ctx, grid, blocks[i], random_cube(500u + std::uint32_t(i)),
-                observed);
+                [i](std::uint32_t v) { return i < 2 ? observed(v) : 0.0f; });
   }
   DctBlocks out;
   CHECK(oracle::forward(ctx, t, grid, blocks, codec::CodecParams{}, out).ok());
@@ -1313,9 +1314,40 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   moved.coefficients[out.params.coefficient_count] = static_cast<std::int16_t>(
       moved.coefficients[out.params.coefficient_count] + 1);
   CHECK(oracle::inverse(ctx, t, grid, blocks, moved).ok());
+  const std::uint32_t second = grid.map().tick();
   CHECK(changed(0) == first);
-  CHECK(changed(1) == grid.map().tick());
+  CHECK(changed(1) == second);
   CHECK(changed(2) == first);
+
+  // Every 0.0 of the grid made -0.0: equal as values, so nothing is stamped,
+  // but rewritten, so the arrays end bit for bit as the decode left them.
+  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  const std::vector<float> weight = attr(ctx, grid, "weight");
+  auto negate_zeros = [](std::vector<float> a) {
+    for (float& x : a) {
+      if (x == 0.0f) x = -0.0f;
+    }
+    return a;
+  };
+  put(ctx, grid, "tsdf", negate_zeros(tsdf));
+  put(ctx, grid, "weight", negate_zeros(weight));
+  CHECK(oracle::inverse(ctx, t, grid, blocks, moved).ok());
+  CHECK(changed(0) == first);
+  CHECK(changed(1) == second);
+  CHECK(changed(2) == first);
+  const std::vector<float> tsdf_after = attr(ctx, grid, "tsdf");
+  const std::vector<float> weight_after = attr(ctx, grid, "weight");
+  for (std::uint32_t v = 0; v < kVpb; ++v) {
+    // Block 2 held -0.0 in every voxel.
+    const std::size_t i = std::size_t(blocks[2].ptr) + v;
+    CHECK(!std::signbit(tsdf_after[i]) && !std::signbit(weight_after[i]));
+  }
+  for (const vol::BlockIndex& b : blocks) {
+    const std::size_t at = std::size_t(b.ptr);
+    CHECK(std::memcmp(&tsdf_after[at], &tsdf[at], kVpb * sizeof(float)) == 0);
+    CHECK(std::memcmp(&weight_after[at], &weight[at], kVpb * sizeof(float)) ==
+          0);
+  }
   return 0;
 }
 
@@ -1344,10 +1376,13 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (batching_case(dev, alloc, t) != 0) return 1;
   if (refusals_case(dev, alloc, t) != 0) return 1;
   if (observed_case(dev, alloc, t) != 0) return 1;
-  auto chunked = DctTransform::create(dev, alloc, DctTransformConfig{2});
+  // Again on fresh scratch, two blocks a dispatch.
+  auto chunked = DctTransform::create(dev, alloc);
   CHECK(chunked.ok());
+  vr::detail::set_test_groups_per_dispatch(2);
   if (observed_case(dev, alloc, *chunked.value()) != 0) return 1;
   if (scratch_reuse_case(dev, alloc, *chunked.value()) != 0) return 1;
+  vr::detail::set_test_groups_per_dispatch(0);
   if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
   std::printf("codec DctTransform: OK\n");
   return 0;

@@ -28,7 +28,7 @@ const uint kNoSource = 0xFFFFFFFFu;
 
 // Mirrors ApplyPush in reference_store.cpp.
 layout(push_constant, std430) uniform Push {
-  uint block_base;         // first block this dispatch covers
+  uint item_base;          // first block this dispatch covers
   uint num_blocks;         // N, the frame's blocks
   uint coefficient_count;  // K
   uint reference_count;    // the reference entries a source may read
@@ -74,7 +74,7 @@ uint add_halves(uint a, uint b) {
 }
 
 void main() {
-  const uint block = pc.block_base + gl_WorkGroupID.x;
+  const uint block = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup.
   if (block >= pc.num_blocks) {
     return;

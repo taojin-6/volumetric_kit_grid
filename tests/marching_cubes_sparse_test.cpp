@@ -22,8 +22,9 @@
 // the two output buffers grow independently, the refit-and-re-run path an
 // undersized arena takes -- over one block and over a run of 27, where the
 // arena boundary falls inside one block's range and past others entirely --
-// that a block's triangles land CONTIGUOUSLY in the arena on both paths, and
-// the empty / argument-validation / moved-from paths. A frustum-culled device
+// that a block's triangles land CONTIGUOUSLY in the arena on both paths, the
+// same surface from a dispatch split across several, and the empty /
+// argument-validation / moved-from paths. A frustum-culled device
 // list meshes exactly its blocks -- two halves merge back into the whole --
 // is refused when stale or foreign, and records its density. Skips
 // where no device is present.
@@ -48,6 +49,7 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/color_space.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
@@ -926,6 +928,19 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // nothing, or shared only within a cell, would fail.
   CHECK(sphere.vertices.size() == sphere.indices.size());  // 3 per triangle
   CHECK(share_mesh.vertices.size() * 2 < sphere.vertices.size());
+
+  // Both kernels at three blocks a dispatch mesh the same surface: the path
+  // an active set past the device's 65,535-group floor takes.
+  {
+    vr::detail::set_test_groups_per_dispatch(3);
+    vkc::Result<mesh::Mesh> chunked = extractor.extract_host(grid, 0.0f);
+    vkc::Result<mesh::Mesh> chunked_shared = share_mc.extract_host(grid, 0.0f);
+    vr::detail::set_test_groups_per_dispatch(0);
+    CHECK(chunked.ok() && chunked_shared.ok());
+    CHECK(canonical_triangles(chunked.value()) == canonical_triangles(sphere));
+    CHECK(canonical_triangles(chunked_shared.value()) ==
+          canonical_triangles(sphere));
+  }
 
   // ... and this kernel's triangles are per-block contiguous too: exactly
   // `distinct - 1` transitions, the same bound the unshared path is held to --
