@@ -12,11 +12,11 @@
 // computed by every workgroup that needs them, from the same inputs by the
 // same code, so they agree.
 //
-// The per-block fallback: a masked block (deblock_flags.comp) is never
-// written, so a masked B's workgroup returns at once, and a voxel of a masked
-// neighbour keeps its value through every pass -- its exact decode, which the
-// line passes left alone -- read by B's taps like any other, its unobserved
-// voxels dropping out.
+// The per-block fallback: a masked block is never written, so a masked B's
+// workgroup returns at once, by its own mask, and a voxel of a neighbour
+// masked by its flag (deblock_flags.comp) keeps its value through every pass
+// -- its exact decode, which the line passes left alone -- read by B's taps
+// like any other, its unobserved voxels dropping out.
 //
 // Its output goes where no other workgroup of this dispatch reads it: B's
 // interior (no coordinate 0 or 7), which only B's halo-free loads read,
@@ -86,8 +86,8 @@ float gauss_step(float a, float v, float b) {
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
-  // Uniform across the workgroup.
-  if (entry >= pc.num_blocks) {
+  // Uniform across the workgroup: a masked B keeps its exact decode.
+  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
     return;
   }
   ivec3 coord = blocks[entry].coord;
@@ -104,8 +104,8 @@ void main() {
   }
   barrier();
   int self_ptr = s_blocks[13];
-  // Uniform: shared values. A masked B keeps its exact decode.
-  if (self_ptr < 0 || s_full[13] == 0u) {
+  // Uniform: a shared value.
+  if (self_ptr < 0) {
     return;
   }
 

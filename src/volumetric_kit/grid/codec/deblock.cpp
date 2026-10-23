@@ -310,11 +310,12 @@ core::Status Deblock::record(core::CommandBatch& batch,
   // A workgroup a block, in as many dispatches as the device's group limit
   // takes. The batch barriers every dispatch, so each pass sees all of the
   // last one's writes, a chunk's included. The flags first, an invocation a
-  // block, and their count from zero.
+  // block, over the zeroed flags and count.
   const auto run = [&](const core::ComputeKernel& kernel) -> core::Status {
     return recon::detail::dispatch_items(batch, kernel, push, n, 1,
                                          max_workgroup_count_x_, stage);
   };
+  VKC_TRY(batch.fill(full_, 0, full_bytes, 0u));
   VKC_TRY(batch.fill(exact_, 0, sizeof(std::uint32_t), 0u));
   VKC_TRY(recon::detail::dispatch_items(batch, flags_kernel_, push, n, kLanes,
                                         max_workgroup_count_x_, stage));

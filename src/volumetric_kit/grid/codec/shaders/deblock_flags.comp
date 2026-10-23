@@ -5,12 +5,12 @@
 
 // The deblock's first dispatch (deblock.hpp): the per-block fallback's flags.
 // An invocation a frame block, kLanes a workgroup, the entry item_base + the
-// global invocation id: it ANDs the block's kMaskWords mask words, finds its
-// slot by coordinate through the grid's hash, and writes full[slot], 1 for a
-// mask all ones and 0 for a masked block, which keeps its exact decode. A
-// workgroup counts its masked blocks in shared memory and adds them to
-// exact_blocks at once. No invocation reads a flag another writes; the
-// dispatches after this one read them, after the batch's barrier.
+// global invocation id: a block whose mask is all ones finds its slot by
+// coordinate through the grid's hash and sets full[slot], which the batch
+// zeroed; a masked block, which keeps its exact decode, probes nothing and is
+// counted, a workgroup's count added to exact_blocks at once. No invocation
+// reads a flag another writes; the dispatches after this one read them,
+// after the batch's barrier.
 
 #extension GL_GOOGLE_include_directive : require
 #include "deblock_common.glsl"
@@ -27,18 +27,14 @@ void main() {
   }
   barrier();
   if (entry < pc.num_blocks) {
-    uint all = ~0u;
-    for (uint w = 0u; w < kMaskWords; ++w) {
-      all &= masks[entry * kMaskWords + w];
-    }
-    bool full_block = all == ~0u;
-    if (!full_block) {
+    if (vrEntryFull(entry)) {
+      int ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+                               pc.bucket_size, pc.max_chain);
+      if (ptr >= 0) {
+        full[uint(ptr) / kBlockVoxels] = 1u;
+      }
+    } else {
       atomicAdd(s_masked, 1u);
-    }
-    int ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
-                             pc.bucket_size, pc.max_chain);
-    if (ptr >= 0) {
-      full[uint(ptr) / kBlockVoxels] = full_block ? 1u : 0u;
     }
   }
   barrier();

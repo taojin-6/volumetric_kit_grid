@@ -68,8 +68,7 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_BLOCKS, scalar) readonly buffer
   BlockIndex blocks[];
 };
 // The frame's masks by list position: voxel l of entry e is bit l % 32 of
-// word e * kMaskWords + l / 32, as the inverse read them. deblock_flags.comp
-// alone reads them.
+// word e * kMaskWords + l / 32, as the inverse read them.
 layout(set = 0, binding = VR_DEBLOCK_BINDING_MASKS, scalar) readonly buffer
     Masks {
   uint masks[];
@@ -89,11 +88,11 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_STAMPS, scalar) buffer Stamps {
 layout(set = 0, binding = VR_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
   float shell[];
 };
-// The per-block fallback's flags, a word a slot of the grid's heap:
-// deblock_flags.comp sets a frame block's to 1 when its mask is all ones --
-// fully observed, which the passes may write -- and to 0 when it holds an
-// unobserved voxel -- masked, which keeps its exact decode. Read by the
-// dispatches after it alone.
+// The per-block fallback's flags, a word a slot of the grid's heap, zeroed
+// before deblock_flags.comp sets a frame block's to 1 when its mask is all
+// ones: fully observed, which the passes may write. A 0 is a masked block --
+// one holding an unobserved voxel, which keeps its exact decode -- or a slot
+// the frame does not list. Read by the dispatches after it alone.
 layout(set = 0, binding = VR_DEBLOCK_BINDING_FULL, scalar) buffer Full {
   uint full[];
 };
@@ -121,10 +120,22 @@ float vrNormalized(float t) {
   return v;
 }
 
+// Whether the frame observed every voxel of its entry @p entry: its
+// kMaskWords mask words all ones. Each kernel asks it of its own entry first
+// thing, so a masked block's workgroup returns before it probes the hash:
+// every lane reads the same words, so the return is uniform.
+bool vrEntryFull(uint entry) {
+  uint all = ~0u;
+  for (uint w = 0u; w < kMaskWords; ++w) {
+    all &= masks[entry * kMaskWords + w];
+  }
+  return all == ~0u;
+}
+
 // Whether the block at voxel base @p ptr is fully observed, so the passes may
-// write it. Every lane of a workgroup that asks of one block reads the same
-// word, which no dispatch after deblock_flags.comp writes, so a return on it
-// is uniform.
+// write it: a neighbour's flag. Every lane of a workgroup that asks of one
+// block reads the same word, which no dispatch after deblock_flags.comp
+// writes, so a return on it is uniform.
 bool vrFull(int ptr) {
   return full[uint(ptr) / kBlockVoxels] != 0u;
 }

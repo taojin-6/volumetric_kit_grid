@@ -20,14 +20,13 @@ shared uint s_wrote;
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
-  // Uniform across the workgroup.
-  if (entry >= pc.num_blocks) {
+  // Uniform across the workgroup: a masked block's shell was not written.
+  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
     return;
   }
   if (lane == 0u) {
-    int found = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
-                               pc.bucket_size, pc.max_chain);
-    s_ptr = found >= 0 && vrFull(found) ? found : -1;
+    s_ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+                           pc.bucket_size, pc.max_chain);
     s_wrote = 0u;
   }
   barrier();

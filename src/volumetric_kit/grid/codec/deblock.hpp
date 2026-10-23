@@ -39,21 +39,22 @@
 /// value comes out with the bits it went in with is not written, so it keeps
 /// its metres exactly.
 ///
-/// On the device: a first kernel, an invocation a frame block, sets each
-/// block's flag by slot from its mask -- fully observed or masked -- and
+/// On the device: a first kernel, an invocation a frame block, sets the flag
+/// by slot of each fully observed block, the rest zeroed before it, and
 /// counts the masked blocks, which the caller reads back. Then one 64-lane
-/// workgroup per frame block in every kernel. The line passes run in place on
+/// workgroup per frame block in every kernel, which returns at once for a
+/// block its own mask words mark masked. The line passes run in place on
 /// `tsdf`, a dispatch an axis: a voxel lies on at most one line of a pass,
 /// read before it is written. The Gaussian is one fused kernel per block over
 /// the block and the 1-voxel halo of its 26 neighbours, x, y and z in shared
 /// memory; it writes the block's interior in place, which no other workgroup
 /// reads, and its shell (the voxels with a coordinate 0 or 7, which
 /// neighbours' halos read) into a snapshot by list position, which a store
-/// kernel then copies into `tsdf`. A block is fully observed by its flag, and
-/// a masked neighbour's observed voxels are found by their weights; blocks
-/// are found by coordinate through the grid's hash, so no list `ptr` is
-/// read. A block a pass writes is stamped `changed` with the map's current
-/// tick.
+/// kernel then copies into `tsdf`. A neighbour is fully observed by its flag,
+/// and a masked neighbour's observed voxels are found by their weights;
+/// blocks are found by coordinate through the grid's hash, so no list `ptr`
+/// is read. A block a pass writes is stamped `changed` with the map's
+/// current tick.
 
 #include <cstdint>
 #include <memory>
@@ -163,10 +164,10 @@ class VR_CODEC_API Deblock {
   ///        writes they read (the inverse transform's); the caller submits.
   ///
   /// @p frame must name every block @p grid holds, each once, as a decode
-  /// leaves them: a block's flag is set from the entry naming it, and one
-  /// named twice races. Its order and `ptr`s are ignored. Records nothing
-  /// for passes that run nothing or no blocks. The readback of the masked
-  /// blocks' count comes last, after the passes.
+  /// leaves them: a block it lacks reads as masked, and one it names twice
+  /// races. Its order and `ptr`s are ignored. Records nothing for passes
+  /// that run nothing or no blocks. The readback of the masked blocks' count
+  /// comes last, after the passes.
   /// @param batch  The batch to record into; submitted by the caller.
   /// @param grid   The grid, its `tsdf` filtered in place; 4-byte `tsdf` and
   ///               `weight`, `block_size` 8.

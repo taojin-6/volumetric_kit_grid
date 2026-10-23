@@ -478,7 +478,8 @@ std::vector<float> read_line(const Snapshot& s, int i) {
 // exactly 0.375 of it. Then the fallback on the face: one unobserved voxel
 // in either block -- p2 of a line, q2, or the far corner of a block, no
 // line's sample -- masks it, and no line of the face is fitted, both sides
-// left as they were, to the bit, stamps too, and the block counted.
+// left as they were, to the bit, stamps too, and the block counted; and a
+// block the frame does not list is no fully observed neighbour.
 int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
   const float sat = 1.0f - 1e-5f;
   for (const bool at_kink : {true, false}) {
@@ -566,6 +567,33 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
     CHECK(after.ok() && masked_kept(after.value(), before.value()));
     CHECK(!(after.value() == before.value()));
   }
+
+  // A block the frame does not list reads as masked, though an earlier run
+  // flagged its slot: after the face is fitted once, a frame of block
+  // (0,0,0) alone leaves the grid as it was, where a second fit would move
+  // it again.
+  vkc::Result<Fixture> made = make_fixture(
+      gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)}, lines_field(jump));
+  CHECK(made.ok());
+  Fixture fx = std::move(made).value();
+  const d::DeblockPasses lf = linfit_only(0.05f);
+  CHECK(run(gpu, deblock, fx, lf).ok());
+  vkc::Result<Snapshot> fitted = snapshot(gpu, fx.grid);
+  vkc::Result<std::vector<vol::BlockStamp>> stamps =
+      fx.grid.map().read_block_stamps();
+  CHECK(fitted.ok() && stamps.ok());
+  CHECK(fx.coords.front() == vr::Vec3i(0, 0, 0));
+  d::ResidentBlocks first = fx.frame();
+  first.count = 1;
+  fx.grid.map().advance_tick();
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  std::uint32_t exact = 1;
+  CHECK(deblock.record(batch, fx.grid, first, lf, exact).ok());
+  CHECK(batch.submit().ok() && exact == 0);
+  CHECK(unchanged(gpu, fx, fitted.value(), stamps.value()) == 0);
+  CHECK(run(gpu, deblock, fx, lf).ok());
+  vkc::Result<Snapshot> twice = snapshot(gpu, fx.grid);
+  CHECK(twice.ok() && !(twice.value() == fitted.value()));
   return 0;
 }
 

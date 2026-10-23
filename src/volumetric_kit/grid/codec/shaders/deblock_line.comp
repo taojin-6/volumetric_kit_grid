@@ -10,9 +10,10 @@
 // voxel lies on one line of a pass alone -- B's t 0..2 on the face to B's
 // -axis block, its t 5..7 on this one -- and each lane reads its line before
 // it writes it: in place is the snapshot the filter is defined on. The face
-// is fitted only when B and N are both fully observed (deblock_flags.comp),
-// so every sample is observed and a masked block is never written. The next
-// axis is the next dispatch, after the batch's barrier.
+// is fitted only when B and N are both fully observed -- B by its own mask,
+// N by its flag (deblock_flags.comp) -- so every sample is observed and a
+// masked block is never written. The next axis is the next dispatch, after
+// the batch's barrier.
 
 #extension GL_GOOGLE_include_directive : require
 #include "deblock_common.glsl"
@@ -34,8 +35,8 @@ ivec3 line_voxel(int t, int u, int w) {
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
-  // Uniform across the workgroup.
-  if (entry >= pc.num_blocks) {
+  // Uniform across the workgroup: a masked B fits no face.
+  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
     return;
   }
   ivec3 coord = blocks[entry].coord;
@@ -53,7 +54,7 @@ void main() {
   barrier();
   // Uniform: shared values and flags no dispatch of this pass writes.
   if (s_neighbour[0] < 0 || s_neighbour[next] < 0 ||
-      !vrFull(s_neighbour[0]) || !vrFull(s_neighbour[next])) {
+      !vrFull(s_neighbour[next])) {
     return;
   }
 
