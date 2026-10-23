@@ -98,6 +98,22 @@ class VR_CODEC_API ReferenceStore {
     return slots_[current_].list;
   }
 
+  /// @return The held reference as the inverse reads it: its list, masks
+  ///         and coefficients, block count and K, valid until the next
+  ///         @ref commit; no blocks with none held. What `Decoder::rebuild`
+  ///         reconstructs.
+  ResidentBlocks reference_blocks() const noexcept {
+    ResidentBlocks out;
+    if (!held_) return out;
+    const Slot& reference = slots_[current_];
+    out.list = &reference.list;
+    out.masks = &reference.masks;
+    out.coefficients = &reference.coefficients;
+    out.count = reference_.header.block_count;
+    out.coefficient_count = reference_.header.params.coefficient_count;
+    return out;
+  }
+
   /// @return The spare and the sources, as @ref reserve last sized them.
   FrameBuffers frame_buffers() const noexcept {
     const Slot& spare = slots_[current_ ^ 1u];

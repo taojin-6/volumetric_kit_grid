@@ -101,7 +101,8 @@ enum Binding : std::uint32_t {
   kBindingQuantization = 9,
   kBindingCut = 10,
   kBindingKeep = 11,
-  kBindingCount = 12,
+  kBindingMasked = 12,
+  kBindingCount = 13,
 };
 
 // The cut set's bytes for a grid of @p slots block slots: a bit a voxel.
@@ -171,6 +172,8 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
   VKC_ASSIGN(t.tables_, core::device_storage_buffer(allocator, sizeof(tables)));
   VKC_ASSIGN(t.rejected_,
              core::device_storage_buffer(allocator, sizeof(Counts)));
+  VKC_ASSIGN(t.masked_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
   VKC_ASSIGN(
       t.quantization_steps_,
       core::device_storage_buffer(allocator, kVoxelsPerBlock * sizeof(float)));
@@ -188,6 +191,9 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(t.rejected_.handle()),
                          "codec.rejected");
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(t.masked_.handle()),
+                         "codec.masked_blocks");
   device.set_object_name(
       VK_OBJECT_TYPE_BUFFER,
       core::debug_object_handle(t.quantization_steps_.handle()),
@@ -206,6 +212,8 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
     kernel->set.write_storage_buffer(
         kBindingQuantization, t.quantization_steps_.handle(), 0, VK_WHOLE_SIZE);
     kernel->set.write_storage_buffer(kBindingRejected, t.rejected_.handle(), 0,
+                                     VK_WHOLE_SIZE);
+    kernel->set.write_storage_buffer(kBindingMasked, t.masked_.handle(), 0,
                                      VK_WHOLE_SIZE);
   }
   return owned;
@@ -430,11 +438,12 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
   return out;
 }
 
-core::Status DctTransform::inverse(core::CommandBatch& batch,
-                                   volume::VoxelBlockGrid& grid,
-                                   const ResidentBlocks& in,
-                                   const CodecParams& params,
-                                   core::GpuStageScope* stage) {
+core::Status DctTransform::record_inverse(core::CommandBatch& batch,
+                                          volume::VoxelBlockGrid& grid,
+                                          const ResidentBlocks& in,
+                                          const CodecParams& params,
+                                          core::GpuStageScope* stage) {
+  inverse_recorded_ = false;
   VKC_ASSIGN(GridViews views, check_inputs("inverse", grid, params));
   if (in.coefficient_count != params.coefficient_count) {
     return fail("inverse", "the blocks hold " +
@@ -452,7 +461,7 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
                                std::to_string(grid.grid().num_blocks) + ")");
   }
   if (in.count == 0) {
-    return batch.submit();
+    return {};
   }
   // Bound where they are, so each must hold the entries the kernel reads.
   const VkDeviceSize n = in.count;
@@ -464,17 +473,29 @@ core::Status DctTransform::inverse(core::CommandBatch& batch,
     return fail("inverse", "the resident buffers do not hold " +
                                std::to_string(in.count) + " blocks");
   }
-  std::uint32_t rejected = 0;
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();
+  VKC_TRY(batch.fill(masked_, 0, sizeof(std::uint32_t), 0u));
   VKC_TRY(record(
       batch, inverse_kernel_, grid, views, in.list->handle(), in.count, params,
       in.coefficients->handle(), in.masks->handle(),
       VkDeviceSize(in.count) * kMaskWordsPerBlock * sizeof(std::uint32_t),
       TrueSdf{}, stage));
+  inverse_recorded_ = true;
+  return {};
+}
+
+core::Status DctTransform::record_rejected(core::CommandBatch& batch,
+                                           std::uint32_t& rejected,
+                                           std::uint32_t* masked) {
+  rejected = 0;
+  if (masked != nullptr) *masked = 0;
+  if (!inverse_recorded_) {
+    return {};
+  }
   VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
-  VKC_TRY(batch.submit());
-  return check_rejected("inverse", rejected, in.count);
+  if (masked == nullptr) return {};
+  return batch.readback(masked_, 0, sizeof(*masked), masked);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

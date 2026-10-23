@@ -203,7 +203,11 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
     r.blocks.list = r.list.get();
   }
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  return t.inverse(batch, grid, r.blocks, in.params);
+  VKC_TRY(t.record_inverse(batch, grid, r.blocks, in.params));
+  std::uint32_t rejected = 0;
+  VKC_TRY(t.record_rejected(batch, rejected));
+  VKC_TRY(batch.submit());
+  return d::DctTransform::check_rejected("inverse", rejected, r.blocks.count);
 }
 
 namespace {

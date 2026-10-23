@@ -1,0 +1,57 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The deblock's last dispatch (deblock.hpp): each block's shell, as the
+// Gaussian left it in the shell snapshot, copied into tsdf once no
+// workgroup reads it as halo any more. A kUnobserved entry -- an unobserved
+// voxel, or one whose bits the Gaussian kept -- is skipped.
+
+#extension GL_GOOGLE_include_directive : require
+#include "deblock_common.glsl"
+
+layout(local_size_x = kLanes) in;
+
+shared int s_ptr;
+shared uint s_wrote;
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup.
+  if (vrFrameSkipped() || entry >= pc.num_blocks) {
+    return;
+  }
+  if (lane == 0u) {
+    s_ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+                           pc.bucket_size, pc.max_chain);
+    s_wrote = 0u;
+  }
+  barrier();
+  int ptr = s_ptr;
+  if (ptr < 0) {
+    return;
+  }
+  bool wrote = false;
+  for (uint j = 0u; j < kBlockVoxels / kLanes; ++j) {
+    uint l = lane + kLanes * j;
+    uint si = vrShellIndex(uvec3(l % kEdge, (l / kEdge) % kEdge,
+                                 l / (kEdge * kEdge)));
+    if (si == kShellVoxels) {
+      continue;
+    }
+    float metres = shell[entry * kShellVoxels + si];
+    if (vrObserved(metres)) {
+      tsdf[uint(ptr) + l] = metres;
+      wrote = true;
+    }
+  }
+  if (wrote) {
+    atomicOr(s_wrote, 1u);
+  }
+  barrier();
+  if (lane == 0u && s_wrote != 0u) {
+    vrStampChanged(ptr);
+  }
+}

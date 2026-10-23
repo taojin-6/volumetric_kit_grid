@@ -1,0 +1,194 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The deblock's Gaussian (deblock.hpp), x, y and z fused: a workgroup loads
+// its block B and the 1-voxel halo around it -- the 10^3 field, from B's 26
+// neighbours too, since the z pass reads y's outputs, which read x's, so B's
+// corner reaches its diagonal block's -- and runs the three passes in shared
+// memory, each pass's outputs kept in registers until every lane has read its
+// inputs, then written back over them. A halo voxel's x and y outputs are
+// computed by every workgroup that needs them, from the same inputs by the
+// same code, so they agree.
+//
+// Its output goes where no other workgroup of this dispatch reads it: B's
+// interior (no coordinate 0 or 7), which only B's halo-free loads read,
+// straight into tsdf; its shell, which the neighbours' halos read, into the
+// shell snapshot by list position, for deblock_store.comp. A voxel whose bits
+// the passes leave as they were is not written.
+
+#extension GL_GOOGLE_include_directive : require
+#include "deblock_common.glsl"
+
+layout(local_size_x = kLanes) in;
+
+// The field: B's voxels and a voxel of halo around them, x fastest, from -1
+// to 8 on each axis.
+const uint kField = 10u;
+const uint kFieldVoxels = kField * kField * kField;
+// Each pass's outputs: x over (x 0..7, y and z -1..8), y over (x and y 0..7,
+// z -1..8), z over B; per lane, rounded up.
+const uint kXOutputs = kEdge * kField * kField;
+const uint kYOutputs = kEdge * kEdge * kField;
+const uint kXRounds = (kXOutputs + kLanes - 1u) / kLanes;
+const uint kYRounds = (kYOutputs + kLanes - 1u) / kLanes;
+
+shared float s_field[kFieldVoxels];
+// The voxel bases of B's 3x3x3 neighbourhood, (ox + 1) + 3 (oy + 1) +
+// 9 (oz + 1), -1 for a missing block; B at 13.
+shared int s_blocks[27];
+shared uint s_wrote;
+
+uint field_index(int x, int y, int z) {
+  return uint((x + 1) + int(kField) * ((y + 1) + int(kField) * (z + 1)));
+}
+
+// One pass's output at a voxel whose input is @p v, with axis neighbours
+// @p a and @p b: their weighted mean over the observed among them, its change
+// clipped, then clamped; an unobserved voxel stays unobserved. Summed in the
+// CPU's order, -1, 0, +1.
+float gauss_step(float a, float v, float b) {
+  if (!vrObserved(v)) {
+    return v;
+  }
+  float sw = 0.0;
+  float sv = 0.0;
+  if (vrObserved(a)) {
+    sw += pc.gauss_g1;
+    sv += pc.gauss_g1 * a;
+  }
+  sw += 1.0;
+  sv += v;
+  if (vrObserved(b)) {
+    sw += pc.gauss_g1;
+    sv += pc.gauss_g1 * b;
+  }
+  float mean = sv / sw;
+  return clamp(v + clamp(mean - v, -pc.gauss_clip, pc.gauss_clip), -1.0, 1.0);
+}
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup.
+  if (vrFrameSkipped() || entry >= pc.num_blocks) {
+    return;
+  }
+  ivec3 coord = blocks[entry].coord;
+  if (lane < 27u) {
+    ivec3 o = ivec3(int(lane % 3u), int((lane / 3u) % 3u), int(lane / 9u)) -
+              ivec3(1);
+    s_blocks[lane] = vrFindBlockPtr(coord + o, pc.num_buckets,
+                                    pc.bucket_size, pc.max_chain);
+  }
+  if (lane == 0u) {
+    s_wrote = 0u;
+  }
+  barrier();
+  int self_ptr = s_blocks[13];
+  if (self_ptr < 0) {
+    return;
+  }
+
+  // Load: B's voxels observed by the mask, the halo's by its weights, each
+  // voxel's tsdf with it.
+  for (uint i = lane; i < kFieldVoxels; i += kLanes) {
+    ivec3 h = ivec3(int(i % kField), int((i / kField) % kField),
+                    int(i / (kField * kField))) -
+              ivec3(1);
+    ivec3 o = h >> 3;  // -1, 0 or 1: which block
+    ivec3 lc = h & 7;  // its local voxel
+    int b = s_blocks[(o.x + 1) + 3 * (o.y + 1) + 9 * (o.z + 1)];
+    float v = kUnobserved;
+    if (b >= 0) {
+      uint l = uint(lc.x + int(kEdge) * (lc.y + int(kEdge) * lc.z));
+      uint s = uint(b) + l;
+      float t = tsdf[s];
+      bool own = o == ivec3(0);
+      float w = own ? 0.0 : weight[s];
+      bool observed = own ? vrMaskObserved(entry, l) : w >= pc.observed_weight;
+      if (observed) {
+        v = vrNormalized(t);
+      }
+    }
+    s_field[i] = v;
+  }
+  barrier();
+
+  // This lane's column of B, (x, y) = (lane % 8, lane / 8), as loaded.
+  int cx = int(lane % kEdge);
+  int cy = int(lane / kEdge);
+  float input_value[kEdge];
+  for (int z = 0; z < int(kEdge); ++z) {
+    input_value[z] = s_field[field_index(cx, cy, z)];
+  }
+
+  // x.
+  float xo[kXRounds];
+  for (uint j = 0u; j < kXRounds; ++j) {
+    uint o = lane + kLanes * j;
+    xo[j] = 0.0;
+    if (o < kXOutputs) {
+      uint yz = o / kEdge;
+      uint c = field_index(int(o % kEdge), int(yz % kField) - 1,
+                           int(yz / kField) - 1);
+      xo[j] = gauss_step(s_field[c - 1u], s_field[c], s_field[c + 1u]);
+    }
+  }
+  barrier();
+  for (uint j = 0u; j < kXRounds; ++j) {
+    uint o = lane + kLanes * j;
+    if (o < kXOutputs) {
+      uint yz = o / kEdge;
+      s_field[field_index(int(o % kEdge), int(yz % kField) - 1,
+                          int(yz / kField) - 1)] = xo[j];
+    }
+  }
+  barrier();
+
+  // y.
+  float yo[kYRounds];
+  for (uint j = 0u; j < kYRounds; ++j) {
+    uint o = lane + kLanes * j;
+    uint c = field_index(int(o % kEdge), int((o / kEdge) % kEdge),
+                         int(o / (kEdge * kEdge)) - 1);
+    yo[j] = gauss_step(s_field[c - kField], s_field[c], s_field[c + kField]);
+  }
+  barrier();
+  for (uint j = 0u; j < kYRounds; ++j) {
+    uint o = lane + kLanes * j;
+    s_field[field_index(int(o % kEdge), int((o / kEdge) % kEdge),
+                        int(o / (kEdge * kEdge)) - 1)] = yo[j];
+  }
+  barrier();
+
+  // z, down this lane's column, and the writes.
+  bool wrote = false;
+  for (int z = 0; z < int(kEdge); ++z) {
+    uint c = field_index(cx, cy, z);
+    float out_value = gauss_step(s_field[c - kField * kField], s_field[c],
+                             s_field[c + kField * kField]);
+    float in_value = input_value[z];
+    bool changed = vrObserved(in_value) &&
+                   floatBitsToUint(out_value) != floatBitsToUint(in_value);
+    float metres = out_value * pc.trunc_dist;
+    uint l = uint(cx + int(kEdge) * (cy + int(kEdge) * z));
+    uint si = vrShellIndex(uvec3(cx, cy, z));
+    if (si == kShellVoxels) {
+      if (changed) {
+        tsdf[uint(self_ptr) + l] = metres;
+        wrote = true;
+      }
+    } else {
+      shell[entry * kShellVoxels + si] = changed ? metres : kUnobserved;
+    }
+  }
+  if (wrote) {
+    atomicOr(s_wrote, 1u);
+  }
+  barrier();
+  if (lane == 0u && s_wrote != 0u) {
+    vrStampChanged(self_ptr);
+  }
+}
