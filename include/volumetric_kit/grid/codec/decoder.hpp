@@ -185,21 +185,18 @@ class VR_CODEC_API Decoder {
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
   ///                 row with its host, wait and device halves -- the whole
   ///                 decode's, the deblock's included -- over the breakdown
-  ///                 rows that tile it, each with all three but the last:
+  ///                 rows, each with all three, that tile it:
   ///                 `"  ..rans decode"` (parsing the frame, then one
   ///                 submit: decoding it, merging a P-frame's blocks with
   ///                 its reference's, and diffing the grid's block set
   ///                 against the frame's), `"  ..apply"` (removing and
   ///                 allocating blocks: the zeroing, the hash deletes and
-  ///                 the allocations, every round), `"  ..inverse"`
+  ///                 the allocations, every round) and `"  ..inverse"`
   ///                 (making the frame's blocks from the reference and the
-  ///                 payload, and the transform, in one submit with the
-  ///                 deblock, its host span and wait the whole submit's)
-  ///                 and, for a frame the deblock runs a filter on,
-  ///                 `"  ..deblock"` (its passes, and the counts read back
-  ///                 after them: a device half alone). Named apart from the
-  ///                 @ref Encoder's, so both timed into one `StageMetrics`
-  ///                 stay apart. `nullptr` measures nothing.
+  ///                 payload, the transform and the deblock, in one
+  ///                 submit). Named apart from the @ref Encoder's, so both
+  ///                 timed into one `StageMetrics` stay apart. `nullptr`
+  ///                 measures nothing.
   /// @return OK, or: whatever the frame reader refuses
   ///         (`Status::Code::Unsupported`,
   ///         `Status::Code::InvalidArgument` for a malformed or corrupt
@@ -259,8 +256,7 @@ class VR_CODEC_API Decoder {
   /// @param grid     The grid the last decode wrote: the frame's geometry,
   ///                 and exactly its blocks, whatever their values.
   /// @param metrics  Optional; a `"codec decode"` row with its host, wait and
-  ///                 device halves, over the deblock's `"  ..deblock"` as
-  ///                 @ref decode reports it.
+  ///                 device halves.
   /// @return OK; `Status::Code::NotFound` before a decode has succeeded;
   ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///         grid @ref decode refuses before it changes one, or one whose

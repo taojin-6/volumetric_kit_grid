@@ -3,8 +3,6 @@
 
 #include "volumetric_kit/recon/codec/decoder.hpp"
 
-#include <cstdint>
-#include <optional>
 #include <string>
 #include <utility>
 
@@ -108,57 +106,24 @@ FrameDeblock frame_deblock(const detail::FrameHeader& header, bool on) {
   return out;
 }
 
-// The deblock's breakdown row (reconstruct).
-constexpr const char* kDeblockRow = "  ..deblock";
-
 // The frame's blocks reconstructed from @p blocks into @p grid and deblocked
 // under @p filter, recorded after what @p batch holds and submitted with it,
 // the inverse's reject count and masked-block count read back last. The
 // deblock skips a frame most of whose blocks are masked (detail::deblock_skips,
 // the 2026-10-21 decision's 2026-10-23 amendment), and the result, what it
 // ran, says "off" for it.
-//
-// Timed, a deblock that records its passes is @p metrics' kDeblockRow: a
-// scope of its own around the passes and the submit, as a blocking submit
-// credits only the scopes open at it. That scope nests in @p stage's, whose
-// row so holds the deblock's tiles too; where that row is a breakdown beside
-// the deblock's (@p sibling: the decode's "  ..inverse"), they are taken off
-// it, which is exact, as the two tile one submit (the 2026-10-23 decision,
-// as the integrator's fused round). Its host time is the submit's, in
-// @p stage's row, so only its device half reaches @p metrics, and the counts
-// read back after its passes join its tile.
 core::Result<DeblockInfo> reconstruct(
     core::CommandBatch& batch, detail::DctTransform& transform,
     detail::Deblock& deblock, volume::VoxelBlockGrid& grid,
     const detail::ResidentBlocks& blocks, const CodecParams& params,
-    const FrameDeblock& filter, core::GpuStageScope& stage,
-    core::StageMetrics* metrics, bool sibling) {
-  VKC_TRY(transform.record_inverse(batch, grid, blocks, params, &stage));
-  // Declared before the scope, which closes into it first.
-  core::StageMetrics part;
-  std::optional<core::GpuStageScope> deblock_stage;
-  if (metrics != nullptr && stage.timer() != nullptr && blocks.count != 0 &&
-      (filter.passes.linfit || filter.passes.gauss)) {
-    deblock_stage.emplace(&part, *stage.timer(), kDeblockRow);
-  }
+    const FrameDeblock& filter, core::GpuStageScope* stage) {
+  VKC_TRY(transform.record_inverse(batch, grid, blocks, params, stage));
   VKC_TRY(deblock.record(batch, grid, blocks, filter.passes,
-                         transform.masked_blocks(),
-                         deblock_stage ? &*deblock_stage : &stage));
+                         transform.masked_blocks(), stage));
   std::uint32_t rejected = 0;
   std::uint32_t masked = 0;
   VKC_TRY(transform.record_rejected(batch, rejected, &masked));
   VKC_TRY(batch.submit());
-  if (deblock_stage) {
-    deblock_stage.reset();
-    for (const core::StageRow& row : part.rows()) {
-      metrics->seed(row.name);
-      metrics->add_device(row.name, row.device, row.gpu_ms);
-      if (sibling && row.device == core::DeviceTime::Measured) {
-        metrics->add_device(stage.name(), core::DeviceTime::Measured,
-                            -row.gpu_ms);
-      }
-    }
-  }
   VKC_TRY(
       detail::DctTransform::check_rejected("inverse", rejected, blocks.count));
   DeblockInfo ran = filter.info;
@@ -351,8 +316,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     VKC_ASSIGN(const detail::ResidentBlocks blocks,
                store_->record_apply(batch, payload, n, &inverse));
     VKC_ASSIGN(ran, reconstruct(batch, *transform_, *deblock_, grid, blocks,
-                                header.params, filter, inverse, metrics,
-                                /*sibling=*/true));
+                                header.params, filter, &inverse));
     VKC_TRY(store_->check_apply());
   }
   // Only a decode that succeeded moves the reference.
@@ -399,10 +363,9 @@ core::Status Decoder::rebuild(volume::VoxelBlockGrid& grid,
     }
   }
   core::CommandBatch batch(*device_, *allocator_);
-  VKC_ASSIGN(last_deblock_,
-             reconstruct(batch, *transform_, *deblock_, grid,
-                         store_->reference_blocks(), header.params, filter,
-                         stage, metrics, /*sibling=*/false));
+  VKC_ASSIGN(last_deblock_, reconstruct(batch, *transform_, *deblock_, grid,
+                                        store_->reference_blocks(),
+                                        header.params, filter, &stage));
   return {};
 }
 

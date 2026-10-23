@@ -1639,10 +1639,9 @@ int true_sdf_case(Gpu& gpu) {
 }
 
 // On, the rows are the decode's: "codec decode", its device half the
-// deblock's dispatches too, over its three breakdowns and the deblock's
-// "  ..deblock", a device half alone, which the four tile: "  ..inverse"
-// holds the submit the two share, the deblock's tiles taken off it. Off, the
-// three alone. A rebuild is "codec decode" over the deblock's alone.
+// deblock's dispatches too, over the same three breakdowns, no other. Timed,
+// the three tile it, so the deblock's dispatches are a breakdown's:
+// "  ..inverse"'s, whose submit they share.
 int rows_case(Gpu& gpu) {
   vkc::Result<codec::Decoder> dec = decoder(gpu, true);
   vkc::Result<vol::VoxelBlockGrid> source =
@@ -1657,59 +1656,26 @@ int rows_case(Gpu& gpu) {
           .decode(frame.value().data(), frame.value().size(), grid.value(), &m)
           .ok());
   CHECK(std::strcmp(dec.value().last_deblock().filter, "LG") == 0);
-  const auto names = [](const vkc::StageMetrics& rows) {
-    std::vector<std::string> out;
-    for (const vkc::StageRow& row : rows.rows()) out.push_back(row.name);
-    return out;
-  };
+  std::vector<std::string> names;
+  for (const vkc::StageRow& row : m.rows()) names.push_back(row.name);
   const std::vector<std::string> want = {"codec decode", "  ..rans decode",
-                                         "  ..apply", "  ..inverse",
-                                         "  ..deblock"};
-  CHECK(names(m) == want);
-  const vkc::StageRow* deblock = find_row(m, "  ..deblock");
-  CHECK(deblock->cpu_ms == 0.0 && deblock->wait_ms == 0.0);
+                                         "  ..apply", "  ..inverse"};
+  CHECK(names == want);
   vkc::Result<vkc::GpuTimer> probe = vkc::GpuTimer::create(gpu.device);
   CHECK(probe.ok());
-  const bool can_time = probe.value().available();
-  if (can_time) {
+  if (probe.value().available()) {
     const vkc::StageRow* top = find_row(m, "codec decode");
-    CHECK(top->device == vkc::DeviceTime::Measured && top->gpu_ms > 0.0);
+    CHECK(top->has_gpu);
     double sum = 0.0;
     for (std::size_t i = 1; i < want.size(); ++i) {
       const vkc::StageRow* row = find_row(m, want[i].c_str());
-      CHECK(row->device == vkc::DeviceTime::Measured && row->gpu_ms >= 0.0);
+      CHECK(row->device == vkc::DeviceTime::Measured);
       sum += row->gpu_ms;
     }
-    std::fprintf(
-        stderr, "decode: device %.4f ms, ..inverse %.4f, ..deblock %.4f\n",
-        top->gpu_ms, find_row(m, "  ..inverse")->gpu_ms, deblock->gpu_ms);
+    std::fprintf(stderr, "decode: device %.4f ms, ..inverse %.4f\n",
+                 top->gpu_ms, find_row(m, "  ..inverse")->gpu_ms);
     CHECK(std::fabs(sum - top->gpu_ms) < 1e-9);
     CHECK(m.total_gpu_ms() == top->gpu_ms);
-  } else {
-    CHECK(deblock->device != vkc::DeviceTime::Measured);
-  }
-
-  dec.value().set_deblock(false);
-  vkc::StageMetrics off;
-  CHECK(dec.value()
-            .decode(frame.value().data(), frame.value().size(), grid.value(),
-                    &off)
-            .ok());
-  CHECK(names(off) == std::vector<std::string>(want.begin(), want.end() - 1));
-
-  dec.value().set_deblock(true);
-  vkc::StageMetrics again;
-  CHECK(dec.value().rebuild(grid.value(), &again).ok());
-  CHECK(std::strcmp(dec.value().last_deblock().filter, "LG") == 0);
-  CHECK(names(again) ==
-        (std::vector<std::string>{"codec decode", "  ..deblock"}));
-  if (can_time) {
-    const vkc::StageRow* top = find_row(again, "codec decode");
-    const vkc::StageRow* row = find_row(again, "  ..deblock");
-    CHECK(top->device == vkc::DeviceTime::Measured &&
-          row->device == vkc::DeviceTime::Measured);
-    CHECK(row->gpu_ms >= 0.0 && row->gpu_ms <= top->gpu_ms);
-    CHECK(again.total_gpu_ms() == top->gpu_ms);
   }
   return 0;
 }
