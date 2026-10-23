@@ -86,6 +86,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_forward.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_surface.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_merge.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_diff.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_apply.comp"

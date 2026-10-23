@@ -28,6 +28,10 @@ class DeviceFrameWriter;
 class ReferenceStore;
 }  // namespace detail
 
+/// The band, in voxels from the zero level, that holds every voxel an
+/// @ref EncoderConfig::true_sdf frame codes: `ceil(1 + 8 sqrt(3))`.
+inline constexpr std::uint32_t kTrueSdfBandVoxels = 15;
+
 /// @brief How an @ref Encoder codes a frame.
 struct VR_CODEC_API EncoderConfig {
   /// Coefficients kept per block and their quantization steps.
@@ -55,6 +59,25 @@ struct VR_CODEC_API EncoderConfig {
   /// codes P-frames after the first frame for as long as the rules on
   /// @ref Encoder::encode allow.
   std::uint32_t intra_period = 1;
+  /// Whether the grid holds a true (Euclidean) signed distance, as
+  /// @ref tsdf::MeshIntegrator converts a mesh to. `false`, the default,
+  /// codes every block with an observed voxel under its observed mask, as
+  /// fused depth needs. `true` codes, without writing the grid:
+  /// - only the blocks holding a corner of a cell whose 8 voxels, across
+  ///   block faces too, are observed and not cut, and whose sign changes or
+  ///   that has a corner within one voxel of zero;
+  /// - each of their observed voxels as observed, but the cut: every corner
+  ///   farther than `sqrt(3)` voxels from zero of a cell whose 8 voxels are
+  ///   observed and whose sign changes.
+  ///
+  /// Every voxel of those blocks lies within @ref kTrueSdfBandVoxels voxels
+  /// of the zero level, so a grid observed that far out codes every mask as
+  /// all ones but the cuts, and every voxel of a coded block but the cuts
+  /// decodes with weight 1; a narrower band leaves the voxels past it
+  /// unobserved.
+  /// @warning Only for a true distance: fused depth has crossings with
+  ///          corners past `sqrt(3)` voxels, which the cut would erase.
+  bool true_sdf = false;
 
   /// @brief The update segment size a P-frame of this config codes with.
   /// @return @ref update_size, or @ref segment_size when @ref update_size is
@@ -77,12 +100,14 @@ struct VR_CODEC_API EncoderConfig {
 ///        codec's capture side (the 2026-09-26 decision).
 ///
 /// A frame holds every active block that has at least one observed voxel
-/// (`weight >= volume::kObservedWeight`): its coordinate, a 1-bit-per-voxel
-/// observed mask, and the first K coefficients of its 8^3 DCT, entropy-coded
-/// (the 2026-09-27 format). A block with **no** observed voxel is left out --
-/// the mesher uses nothing from it, and a fused grid allocates a whole
-/// truncation band, much of which is never integrated -- so a decoded grid can
-/// hold fewer blocks than the one encoded, and the same surface.
+/// (`weight >= volume::kObservedWeight`), or with @ref EncoderConfig::true_sdf
+/// every block that holds surface: its coordinate, a 1-bit-per-voxel observed
+/// mask, and the first K coefficients of its 8^3 DCT, entropy-coded (the
+/// 2026-09-27 format). A block with **no** observed voxel is left out -- the
+/// mesher uses nothing from it, and a fused grid allocates a whole truncation
+/// band, much of which is never integrated -- so a decoded grid can hold
+/// fewer blocks than the one encoded, and the same surface (with
+/// @ref EncoderConfig::true_sdf, the surface less its cuts).
 ///
 /// The blocks are coded in (z, y, x) order, whatever order the hash table
 /// holds them in, so the same content always makes the same bytes on the same
@@ -104,7 +129,8 @@ struct VR_CODEC_API EncoderConfig {
 /// encoded take `80 + 4 * ceil(K / 2)` bytes of device memory a block each,
 /// and the frame 8 more; a P-frame's entries `80 + 4 * ceil(K / 2)` a block
 /// of the frame and `72 + 4 * ceil(K / 2)` a reference block, all kept,
-/// sized for the largest frame.
+/// sized for the largest frame; @ref EncoderConfig::true_sdf 68 bytes more
+/// a block slot of the grid's heap, kept too.
 ///
 /// Geometry only: colour is not coded. A player textures the decoded mesh
 /// from RGB that travels beside the frame.
@@ -140,14 +166,14 @@ class VR_CODEC_API Encoder {
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
 
-  /// @brief Encode every observed block of @p grid as one frame: an
+  /// @brief Encode @p grid's blocks (see the class notes) as one frame: an
   ///        I-frame, or a P-frame against the last frame this returned.
   ///
   /// The frame is an I-frame when it is the first, when
   /// @ref EncoderConfig::intra_period frames have been coded since the last
   /// I-frame, after @ref force_intra, when @p grid's `voxel_size` or
   /// `trunc_dist` is not the reference's, when the reference holds no block,
-  /// or when @p grid has no observed block (an I-frame is then the smaller);
+  /// or when @p grid has no block to code (an I-frame is then the smaller);
   /// otherwise a P-frame. A frame returned becomes the reference and counts
   /// toward the period; a refusal changes neither.
   /// @param grid     A grid with 4-byte float `tsdf` and `weight` attributes
@@ -162,7 +188,8 @@ class VR_CODEC_API Encoder {
   ///                 and the rANS kernels -- over the breakdown rows
   ///                 `"  ..active set"` (the compaction, when the map holds
   ///                 no list that is still its active set), `"  ..observed"`
-  ///                 (finding the blocks with an observed voxel),
+  ///                 (finding the blocks to code, with
+  ///                 @ref EncoderConfig::true_sdf's passes),
   ///                 `"  ..forward"` (sorting them, the transform, a
   ///                 P-frame's diff against the reference, and the symbol
   ///                 count: one batch)

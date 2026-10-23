@@ -5,8 +5,9 @@
 # GPU setup and before any frame is converted or written, so a rerun onto an
 # existing stream is refused with nothing converted, no PLY or CSV written and
 # the file left as it was. Then a two-frame run at a period of 2 codes frame 1
-# as an I-frame and frame 2 as a P-frame, and a single mesh has no bitrate.
-# Skips with no Vulkan device unless VKC_REQUIRE_VULKAN_DEVICE is set.
+# as an I-frame and frame 2 as a P-frame, as a true SDF in a band of 15 voxels,
+# the least codec_mesh takes, and a single mesh has no bitrate. Skips with no
+# Vulkan device unless VKC_REQUIRE_VULKAN_DEVICE is set.
 
 file(REMOVE_RECURSE "${WORK_DIR}")
 file(MAKE_DIRECTORY "${WORK_DIR}/out")
@@ -22,7 +23,7 @@ foreach(frame_apex "1;0.06" "2;0.08")
 endforeach()
 file(
   WRITE "${WORK_DIR}/run.json"
-  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_%02d.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"run\":{\"first\":1,\"frames\":2},\"fusion\":{\"voxel_size_m\":0.02},\"codec\":{\"intra_period\":2,\"update_size\":16},\"output\":{\"prefix\":\"out/run\",\"stream\":\"out/run.vrst\",\"csv\":\"out/run.csv\"}}\n"
+  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_%02d.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"run\":{\"first\":1,\"frames\":2},\"fusion\":{\"voxel_size_m\":0.02,\"truncation_m\":0.3},\"codec\":{\"intra_period\":2,\"update_size\":16},\"output\":{\"prefix\":\"out/run\",\"stream\":\"out/run.vrst\",\"csv\":\"out/run.csv\"}}\n"
 )
 
 file(WRITE "${WORK_DIR}/out/run.vrst" "earlier")
@@ -59,9 +60,11 @@ execute_process(
 if(NOT result EQUAL 0 OR NOT output MATCHES "mesh: frames 1..2 of .*2 frame")
   message(FATAL_ERROR "The run failed: ${result}: ${output}${error}")
 endif()
-# The scenario's period and update size reach the encoder: frame 1 an I-frame,
-# frame 2 a P-frame on it, and the report a GOP's bitrate.
-if(NOT output MATCHES "update segments of 16 entries; an I-frame every 2 frames"
+# The scenario's period and update size reach the encoder, which codes a true
+# SDF: frame 1 an I-frame, frame 2 a P-frame on it, and the report a GOP's
+# bitrate.
+if(NOT output MATCHES
+   "update segments of 16 entries; an I-frame every 2 frames; true SDF"
    OR NOT output MATCHES "GOP of 2: [0-9.]+ Mbit/s"
    OR NOT output MATCHES "1 I-frames: .*1 P-frames: ")
   message(FATAL_ERROR "The period did not reach the encoder: ${output}")
@@ -91,7 +94,7 @@ endforeach()
 # A single mesh is no measured sequence: it has no bitrate.
 file(
   WRITE "${WORK_DIR}/one.json"
-  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_01.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"fusion\":{\"voxel_size_m\":0.02}}\n"
+  "{\"version\":1,\"operation\":\"codec\",\"source\":{\"kind\":\"mesh\",\"path\":\"tet_01.obj\",\"metres_per_unit\":1,\"up_axis\":\"y\"},\"fusion\":{\"voxel_size_m\":0.02,\"truncation_m\":0.3}}\n"
 )
 execute_process(
   COMMAND "${PROGRAM}" --config "${WORK_DIR}/one.json"

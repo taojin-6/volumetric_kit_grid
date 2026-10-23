@@ -52,6 +52,10 @@ vkc::Status run(const Options& opt) {
   if (!inspect) {
     VKC_ASSIGN(config, vr_example::encoder_config(opt.codec));
     VKC_ASSIGN(sdf, vr_example::mesh_sdf_config(opt.source, grid));
+    // A mesh's field is a true distance: it codes without the observed mask
+    // (DECISIONS 2026-10-21), in a band that observes every voxel it codes.
+    config.true_sdf = true;
+    VKC_TRY(vr_example::check_true_sdf_band(sdf, grid));
   }
   VKC_ASSIGN(const vr_example::MeshSequence sequence,
              vr_example::MeshSequence::open(opt));

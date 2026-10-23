@@ -1,0 +1,133 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// EncoderConfig::true_sdf's two passes over the map's active list, before the
+// observed filter: one workgroup per block, each lane taking the kEdge cells
+// anchored on its x-line, whose corners reach across the block's +x/+y/+z
+// faces through its neighbourhood (block_neighbourhood.glsl). A cell counts
+// when all 8 of its corners are observed.
+//
+// Pass 0, the cut: in each counted cell whose sign changes, every corner
+// farther than cut_distance from zero sets its bit in the cut set. It reads
+// tsdf and weight alone, so no cut changes which cells another tests.
+//
+// Pass 1, the keep: a counted cell with no corner cut, whose sign changes or
+// that has a corner nearer than near_distance to zero, flags every block that
+// holds one of its corners, which the observed filter then appends.
+//
+// Metres on the raw tsdf, strict comparisons, and a corner below 0 inside.
+// Every write is an atomicOr of a bit, so the result does not depend on the
+// order the workgroups run in.
+
+#extension GL_GOOGLE_include_directive : require
+#include "dct_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/block_neighbourhood.glsl"
+
+layout(local_size_x = kLanes) in;
+
+layout(set = 0, binding = VR_DCT_BINDING_TSDF, scalar) readonly buffer Tsdf {
+  float tsdf[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) readonly buffer
+    Weight {
+  float weight[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_CUT, scalar) buffer Cut {
+  uint cut[];
+};
+layout(set = 0, binding = VR_DCT_BINDING_KEEP, scalar) buffer Keep {
+  uint keep[];
+};
+
+shared uint s_any;
+// The octants (ox + 2 oy + 4 oz) of the neighbourhood whose block holds a
+// corner of a cell pass 1 keeps.
+shared uint s_needed;
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup; see dct_forward.comp.
+  if (entry >= pc.num_blocks) {
+    return;
+  }
+  int ptr = block_ptr(entry, lane);
+  if (ptr < 0) {
+    return;
+  }
+  if (lane == 0u) {
+    s_any = 0u;
+    s_needed = 0u;
+  }
+  barrier();
+  // A cell's first corner is its anchor block's own voxel, so a block with no
+  // observed voxel anchors no cell that counts.
+  uint first = uint(ptr) + x_line_base(lane);
+  bool any = false;
+  for (uint x = 0u; x < kEdge; ++x) {
+    any = any || weight[first + x] >= pc.observed_weight;
+  }
+  if (any) {
+    atomicOr(s_any, 1u);
+  }
+  vrResolveNeighbourhood(blocks[entry].coord, ptr, lane, pc.num_buckets,
+                         pc.bucket_size, pc.max_chain);
+  barrier();
+  if (s_any == 0u) {
+    return;
+  }
+
+  const int bs = int(kEdge);
+  uint needed = 0u;
+  for (uint x = 0u; x < kEdge; ++x) {
+    ivec3 anchor = ivec3(int(x), int(lane % kEdge), int(lane / kEdge));
+    uint si[8];
+    uint octants = 0u;
+    uint inside = 0u;
+    bool counted = true;
+    bool any_far = false;
+    bool any_near = false;
+    for (int i = 0; i < 8; ++i) {
+      ivec3 c = anchor + ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+      if (!vrCornerStorage(bs, c, si[i]) ||
+          weight[si[i]] < pc.observed_weight ||
+          (pc.surface_pass == 1u && VR_SLOT_BIT(cut, si[i]))) {
+        counted = false;
+        break;
+      }
+      float t = tsdf[si[i]];
+      inside += t < 0.0 ? 1u : 0u;
+      any_far = any_far || abs(t) > pc.cut_distance;
+      any_near = any_near || abs(t) < pc.near_distance;
+      octants |= 1u << uint(vrOctantIndex(c / bs));
+    }
+    if (!counted) {
+      continue;
+    }
+    bool flips = inside != 0u && inside != 8u;
+    if (pc.surface_pass == 0u) {
+      if (flips && any_far) {
+        for (int i = 0; i < 8; ++i) {
+          if (abs(tsdf[si[i]]) > pc.cut_distance) {
+            atomicOr(cut[si[i] / kMaskWordBits],
+                     1u << (si[i] % kMaskWordBits));
+          }
+        }
+      }
+    } else if (flips || any_near) {
+      needed |= octants;
+    }
+  }
+  // Uniform: a push constant.
+  if (pc.surface_pass == 1u) {
+    if (needed != 0u) {
+      atomicOr(s_needed, needed);
+    }
+    barrier();
+    if (lane < 8u && ((s_needed >> lane) & 1u) != 0u) {
+      atomicOr(keep[uint(s_neighbour[lane]) / kBlockVoxels], 1u);
+    }
+  }
+}

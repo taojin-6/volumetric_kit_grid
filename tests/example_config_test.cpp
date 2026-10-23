@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "codec_config.hpp"
@@ -76,10 +77,15 @@ int main() {
     CHECK(outputs.serve.has_value() == served);
     CHECK(!served || (outputs.serve->host.empty() &&
                       outputs.serve->port == vr::networking::kDefaultPort));
+    // No scenario codes a true SDF: codec_mesh alone sets it, in code.
+    const auto encoder = vr_example::encoder_config(loaded->codec);
+    CHECK(encoder.ok() && !encoder->true_sdf);
   }
 
   // The single-mesh template stays one frame, every frame intra; the
-  // sequence's codes Rafa2's frames 1-150 in an 8-voxel band, holes admitted.
+  // sequence's codes Rafa2's frames 1-150, holes admitted. Both convert in a
+  // 16-voxel band, past kTrueSdfBandVoxels, and code at K 56 with the
+  // study's step (DECISIONS 2026-10-21).
   // The two sequences' templates code at period 30 with U = R, as the freeze
   // measured them (DECISIONS, the 2026-10-17 freeze): codec_replica every
   // frame, then its sweep.
@@ -98,8 +104,12 @@ int main() {
             .lexically_normal()
             .string());
   CHECK(sequence->run.first == 1 && sequence->run.frames == 150);
-  CHECK(sequence->fusion.voxel_size_m == 0.005F &&
-        sequence->fusion.truncation_m == 0.04F);
+  for (const cfg::Config* mesh : {&single.value(), &sequence.value()}) {
+    CHECK(mesh->fusion.voxel_size_m == 0.005F &&
+          mesh->fusion.truncation_m == 0.08F);
+    CHECK(mesh->codec.coefficient_count == 56 &&
+          mesh->codec.quantization_scale == 0.040877F);
+  }
   CHECK(sequence->source.height_m == 1.7 &&
         sequence->source.metres_per_unit == 0.0);
   CHECK(sequence->source.allow_holes && !sequence->codec.sweep &&
@@ -372,6 +382,37 @@ int main() {
     CHECK(accepted ||
           (shell.status().domain() == vkc::Status::Code::InvalidArgument &&
            shell.status().message().find("shell_voxels") != std::string::npos));
+  }
+
+  // The true-SDF band: a whole 15 voxels is taken at every voxel size from 1
+  // to 50 mm, though two floats' ratio can fall short of it (0.06 m of 4 mm
+  // voxels), and 14 refused; shell mode adds the half-thickness. Both mesh
+  // templates pass.
+  vr::tsdf::MeshSdfParams solid;
+  vr::tsdf::MeshSdfParams shelled;
+  shelled.mode = vr::tsdf::MeshSdfMode::Shell;
+  shelled.shell_voxels = 2.F;
+  for (int mm = 1; mm <= 50; ++mm) {
+    const auto band = [mm](int voxels) {
+      return vr_example::example_grid_params(float(mm / 1000.0),
+                                             float(voxels * mm / 1000.0), 1024);
+    };
+    CHECK(vr_example::check_true_sdf_band(solid, band(15)).ok());
+    CHECK(vr_example::check_true_sdf_band(shelled, band(17)).ok());
+    for (const auto& [sdf, voxels, least] :
+         {std::tuple{&solid, 14, "at least 15 voxels"},
+          std::tuple{&shelled, 16, "at least 17 voxels"}}) {
+      const vkc::Status refused =
+          vr_example::check_true_sdf_band(*sdf, band(voxels));
+      CHECK(refused.domain() == vkc::Status::Code::InvalidArgument &&
+            refused.message().find(least) != std::string::npos);
+    }
+  }
+  for (const cfg::Config* mesh : {&single.value(), &sequence.value()}) {
+    const auto sdf =
+        vr_example::mesh_sdf_config(mesh->source, grid(mesh->fusion));
+    CHECK(sdf.ok() &&
+          vr_example::check_true_sdf_band(*sdf, grid(mesh->fusion)).ok());
   }
 
 #ifdef VR_TEST_ORBBEC_CONFIG

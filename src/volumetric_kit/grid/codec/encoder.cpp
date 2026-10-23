@@ -85,14 +85,16 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   // so encoding between two costs neither of them a compaction.
   VKC_ASSIGN(const volume::DeviceBlockList list,
              grid.map().compact_active_blocks_on_device(metrics));
-  // Only the blocks with an observed voxel are coded, found on the device
-  // before the transform: a fused band is mostly never integrated, and
-  // transforming those blocks only to drop them read every one back. Only
-  // their count crosses.
+  // Only the blocks with an observed voxel are coded -- with true_sdf, only
+  // those holding surface, the cut set left beside them -- found on the
+  // device before the transform: a fused band is mostly never integrated,
+  // and transforming those blocks only to drop them read every one back.
+  // Only their count crosses.
   std::uint32_t observed = 0;
   {
     core::StageScope row(metrics, "  ..observed");
-    VKC_ASSIGN(observed, transform_->observed(grid, list, &stage));
+    VKC_ASSIGN(observed,
+               transform_->observed(grid, list, config_.true_sdf, &stage));
   }
 
   // A P-frame codes against the frame returned last, unless the rules on
@@ -136,10 +138,11 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     VKC_TRY(batch.copy(*sorted, 0, *frame.list, 0,
                        VkDeviceSize(observed) * sizeof(volume::BlockIndex),
                        &stage));
-    VKC_ASSIGN(entries,
-               transform_->record_forward(
-                   batch, grid, *frame.list, observed, params, *frame.masks,
-                   *frame.coefficients, rejected, &stage));
+    VKC_ASSIGN(entries, transform_->record_forward(
+                            batch, grid, *frame.list, observed, params,
+                            *frame.masks, *frame.coefficients, rejected,
+                            config_.true_sdf ? &transform_->cut_set() : nullptr,
+                            &stage));
     if (reference != nullptr) {
       VKC_ASSIGN(entries,
                  store_->record_diff(batch, observed, params.coefficient_count,

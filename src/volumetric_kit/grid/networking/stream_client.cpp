@@ -222,6 +222,14 @@ const stream::Session* StreamClient::session() const noexcept {
 core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
                                       stream::Record* record,
                                       std::vector<std::uint8_t>* payload) {
+  return next(wait, record, payload, nullptr);
+}
+
+core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
+                                      stream::Record* record,
+                                      std::vector<std::uint8_t>* payload,
+                                      bool* progressed) {
+  if (progressed != nullptr) *progressed = false;
   VKC_CHECK(record != nullptr && payload != nullptr,
             "StreamClient::next takes a record and a payload");
   Impl& s = *impl_;
@@ -236,7 +244,10 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
     for (bool stepped = false, moved = false;; stepped = true) {
       core::Result<bool> got = s.parser.next(record, payload);
       if (!got.ok()) return s.fail(std::move(got).status().with_context(s.api));
-      if (*got) return true;
+      if (*got) {
+        if (progressed != nullptr) *progressed = true;
+        return true;
+      }
       const Clock::time_point idle =
           detail::after(s.last_byte, s.options.idle_limit);
       if (stepped && !moved && Clock::now() >= idle) {
@@ -246,6 +257,7 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
       core::Result<bool> progress = s.step(std::min(deadline, idle));
       if (!progress.ok()) return s.fail(std::move(progress).status());
       moved = *progress;
+      if (progressed != nullptr && moved) *progressed = true;
     }
   } catch (...) {
     // Saved and returned, each by its own call: a copy may find no memory.
