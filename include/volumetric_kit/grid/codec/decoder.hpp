@@ -56,7 +56,7 @@ struct DeblockInfo {
   /// The filter the frame's steps chose and the decoder ran: `"LF"`, a line
   /// fit across each block face; `"LG"`, that and a light Gaussian; `"R"`,
   /// that and a stronger one; or `"off"`, for the deblock off, a step too
-  /// fine to need one, or a frame it skipped for an unobserved voxel
+  /// fine to need one, or a frame its gate skipped
   /// (@ref Decoder::set_deblock). A string literal.
   const char* filter = "off";
   /// T, in metres: the largest change one quantum of the frame's
@@ -230,15 +230,17 @@ class VR_CODEC_API Decoder {
                       core::StageMetrics* metrics = nullptr);
 
   /// @brief Turn the deblock on or off for every frame decoded or rebuilt
-  ///        from here on: on, a frame whose masks are all ones is smoothed
-  ///        across its block faces by the filter its header picks (none at
-  ///        a fine step), after its inverse transform, in the same submit;
-  ///        off, the default, the grid holds the exact decode.
+  ///        from here on: on, a frame is smoothed across its block faces by
+  ///        the filter its header picks (none at a fine step), after its
+  ///        inverse transform, in the same submit; off, the default, the grid
+  ///        holds the exact decode.
   ///
-  /// A frame any of whose blocks has an unobserved voxel -- a masked frame,
-  /// as fused RGB-D's are, or a true-SDF frame with a cut
-  /// (@ref EncoderConfig::true_sdf) -- is skipped on the device, so it
-  /// decodes exactly as with the deblock off.
+  /// The gate: a frame more than half of whose blocks hold an unobserved
+  /// voxel -- as nearly every block of a fused RGB-D frame does -- is
+  /// skipped on the device, so it decodes exactly as with the deblock off.
+  /// A frame with fewer, such as a true-SDF frame with a few cut voxels
+  /// (@ref EncoderConfig::true_sdf), is smoothed; its unobserved voxels keep
+  /// their decoded values and never enter the filter.
   void set_deblock(bool on) noexcept { deblock_on_ = on; }
   /// @return Whether the deblock is on.
   bool deblock() const noexcept { return deblock_on_; }

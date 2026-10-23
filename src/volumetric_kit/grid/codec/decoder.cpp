@@ -108,9 +108,10 @@ FrameDeblock frame_deblock(const detail::FrameHeader& header, bool on) {
 
 // The frame's blocks reconstructed from @p blocks into @p grid and deblocked
 // under @p filter, recorded after what @p batch holds and submitted with it,
-// the inverse's reject count and mask flag read back last. The deblock skips a
-// frame the flag marks, one with an unobserved voxel (the 2026-10-22
-// decision), and the result, what it ran, says "off" for it.
+// the inverse's reject count and masked-block count read back last. The
+// deblock skips a frame most of whose blocks are masked (detail::deblock_skips,
+// the 2026-10-21 decision's 2026-10-23 amendment), and the result, what it
+// ran, says "off" for it.
 core::Result<DeblockInfo> reconstruct(
     core::CommandBatch& batch, detail::DctTransform& transform,
     detail::Deblock& deblock, volume::VoxelBlockGrid& grid,
@@ -118,7 +119,7 @@ core::Result<DeblockInfo> reconstruct(
     const FrameDeblock& filter, core::GpuStageScope* stage) {
   VKC_TRY(transform.record_inverse(batch, grid, blocks, params, stage));
   VKC_TRY(deblock.record(batch, grid, blocks, filter.passes,
-                         transform.masked_flag(), stage));
+                         transform.masked_blocks(), stage));
   std::uint32_t rejected = 0;
   std::uint32_t masked = 0;
   VKC_TRY(transform.record_rejected(batch, rejected, &masked));
@@ -126,7 +127,7 @@ core::Result<DeblockInfo> reconstruct(
   VKC_TRY(
       detail::DctTransform::check_rejected("inverse", rejected, blocks.count));
   DeblockInfo ran = filter.info;
-  if (masked != 0) ran.filter = "off";
+  if (detail::deblock_skips(masked, blocks.count)) ran.filter = "off";
   return ran;
 }
 

@@ -67,12 +67,14 @@ enum Binding : std::uint32_t {
   kBindingWeight = 4,
   kBindingStamps = 5,
   kBindingShell = 6,
-  kBindingSkip = 7,
+  kBindingMasked = 7,
   kBindingCount = 8,
 };
 
 static_assert(kShellVoxels == 296, "deblock_common.glsl's kShellVoxels");
 static_assert(kMaskWordsPerBlock == 16, "deblock_common.glsl's kMaskWords");
+static_assert(kDeblockMaskedDivisor == 2,
+              "deblock_common.glsl's kMaskedDivisor");
 
 // |v| at or above this is the clamp's kink, where a line is not fitted.
 constexpr float kSaturated = 1.0f - 1e-5f;
@@ -184,7 +186,7 @@ core::Status Deblock::record(core::CommandBatch& batch,
                              volume::VoxelBlockGrid& grid,
                              const ResidentBlocks& frame,
                              const DeblockPasses& passes,
-                             const core::Buffer& skip,
+                             const core::Buffer& masked_blocks,
                              core::GpuStageScope* stage) {
   const std::uint32_t n = frame.count;
   if ((!passes.linfit && !passes.gauss) || n == 0) {
@@ -227,8 +229,8 @@ core::Status Deblock::record(core::CommandBatch& batch,
   if (passes.gauss && shell_.size() < shell_bytes) {
     return fail(std::to_string(n) + " blocks, more than reserve made room for");
   }
-  if (skip.size() < sizeof(std::uint32_t)) {
-    return fail("the skip buffer holds no word");
+  if (masked_blocks.size() < sizeof(std::uint32_t)) {
+    return fail("the masked-block count's buffer holds no word");
   }
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
   VKC_TRY(core::check_storage_buffer_range(
@@ -253,7 +255,7 @@ core::Status Deblock::record(core::CommandBatch& batch,
     set.write_storage_buffer(
         kBindingStamps, grid.map().stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
     set.write_storage_buffer(kBindingShell, shell_.handle(), 0, VK_WHOLE_SIZE);
-    set.write_storage_buffer(kBindingSkip, skip.handle(), 0,
+    set.write_storage_buffer(kBindingMasked, masked_blocks.handle(), 0,
                              sizeof(std::uint32_t));
   }
 

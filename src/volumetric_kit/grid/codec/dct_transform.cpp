@@ -193,7 +193,7 @@ core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
                          "codec.rejected");
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(t.masked_.handle()),
-                         "codec.masked_flag");
+                         "codec.masked_blocks");
   device.set_object_name(
       VK_OBJECT_TYPE_BUFFER,
       core::debug_object_handle(t.quantization_steps_.handle()),
