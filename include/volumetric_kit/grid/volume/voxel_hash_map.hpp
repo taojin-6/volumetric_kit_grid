@@ -398,11 +398,16 @@ class VR_VOLUME_API VoxelHashMap {
   /// reporting nothing, so the encoder after a mesh extract reuses the
   /// extract's compaction.
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
+  /// @param row      The row's name instead, from a stage whose compaction
+  ///                 must stay apart from another stage's timed into the same
+  ///                 `StageMetrics` (the extract's `"  ..compact"`, beside a
+  ///                 fuse's `"  ..active set"`); string-literal lifetime. Null
+  ///                 names it as @ref compact_active_blocks does.
   /// @return The list, which @ref check_device_block_list accepts until this
   ///         map compacts another, allocates a block, resizes, removes,
   ///         clears or moves; or a non-OK `Status`.
   core::Result<DeviceBlockList> compact_active_blocks_on_device(
-      core::StageMetrics* metrics = nullptr);
+      core::StageMetrics* metrics = nullptr, const char* row = nullptr);
 
   /// @brief Whether @p list is still this map's active set, for a consumer
   ///        that needs every block to ask before it binds the list.

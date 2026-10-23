@@ -349,8 +349,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   // The block pass's check for a float weight, which the zeroing alone does
   // not need.
   core::Status prepare_block_pass();
-  // Build the zeroing's and the block pass's kernels, timer and count: once,
-  // at create, for a grid with attributes.
+  // Build the zeroing's and the block pass's kernels and count: once, at
+  // create, for a grid with attributes.
   core::Status build_block_kernels();
   // Record the zero kernel over the first `count` entries of `list`, an
   // attribute a dispatch, each block found by its coord.
@@ -374,8 +374,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   std::vector<Attribute> attributes_;
   // The block pass's kernels (their pool first, so it outlives the sets): the
   // stamp pass, and the zeroing of the stale blocks, a set an attribute. Then
-  // its device timer, and its stale list and count; the list grows to the
-  // most active blocks a pass has seen.
+  // its device timer, made by the first timed pass, and its stale list and
+  // count; the list grows to the most active blocks a pass has seen.
   core::DescriptorPool block_pool_;
   core::ComputeKernel stamp_kernel_;
   core::ComputeKernel zero_kernel_;

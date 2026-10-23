@@ -827,7 +827,6 @@ core::Result<MarchingCubes> MarchingCubes::create(
                                              VK_WHOLE_SIZE);
 
   VKC_TRY(batch.submit());
-  VKC_ASSIGN(mc.gpu_timer_, core::GpuTimer::create(device));
 
   return mc;
 }
@@ -966,7 +965,13 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     volume::VoxelBlockGrid& grid, float iso,
     const volume::DeviceBlockList* blocks, ExtractTimings* timings,
     core::StageMetrics* metrics, const char* entry) {
-  // Before any refusal, so a refused call still costs its row.
+  // The first timed call makes the timer, so an extractor nobody times holds
+  // no query pool: a device layered on Metal backs each with one of its few
+  // counter sample buffers. Then the row, before any refusal, so a refused
+  // call still costs it.
+  if (metrics != nullptr && valid() && !gpu_timer_.valid()) {
+    VKC_ASSIGN(gpu_timer_, core::GpuTimer::create(*device_));
+  }
   core::GpuStageScope stage(metrics, gpu_timer_, "marching cubes");
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
@@ -1039,8 +1044,10 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     on_device = *blocks;
   } else {
     // The map's last list when nothing has changed since it compacted; a
-    // compaction is this stage's "  ..active set".
-    VKC_ASSIGN(on_device, grid.map().compact_active_blocks_on_device(metrics));
+    // compaction is this stage's "  ..compact", apart from a fuse's or an
+    // encode's "  ..active set" timed into the same metrics.
+    VKC_ASSIGN(on_device, grid.map().compact_active_blocks_on_device(
+                              metrics, "  ..compact"));
     // Only this path writes the row: a caller's list was compacted by the
     // caller, not here.
     if (timings != nullptr) timings->compact_ms = phase_clock.lap();

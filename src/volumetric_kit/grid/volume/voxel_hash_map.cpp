@@ -794,9 +794,9 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
 }
 
 // "active set" rather than "compact": rows merge by content, and the mesh tier
-// already publishes a "  ..compact" breakdown for the same call inside its own
-// extract. Two stages' compactions summed under one row is the collision
-// kBreakdownPrefix exists to avoid, not to cause.
+// names its own compaction "  ..compact" (the `row` its extract passes). Two
+// stages' compactions summed under one row is the collision kBreakdownPrefix
+// exists to avoid, not to cause.
 //
 // Which of the two names applies is the caller's nesting, not this call's:
 // under a fusion tier's open stage the host span is already counted by that
@@ -820,11 +820,12 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
 }
 
 core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
-    core::StageMetrics* metrics) {
+    core::StageMetrics* metrics, const char* row) {
   // Above the row: a list that still holds is no compaction, so none is
   // reported.
   if (valid() && holds(last_device_list_)) return last_device_list_;
-  core::GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
+  core::GpuStageScope stage(metrics, gpu_timer_,
+                            row != nullptr ? row : active_set_row(metrics));
   if (!valid()) {
     return core::Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks_on_device: moved-from map");

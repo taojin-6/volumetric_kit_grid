@@ -404,7 +404,6 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   core::KernelSets sets;
   VKC_TRY(sets.reserve(*device_, zero,
                        static_cast<std::uint32_t>(attributes_.size())));
-  VKC_ASSIGN(core::GpuTimer timer, core::GpuTimer::create(*device_));
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device_->physical_device(), &props);
   device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
@@ -414,7 +413,6 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   block_pool_ = std::move(pool);
   zero_kernel_ = std::move(zero);
   zero_sets_ = std::move(sets);
-  gpu_timer_ = std::move(timer);
   max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   stamp_kernel_ = std::move(stamp);
   return {};
@@ -463,6 +461,12 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
         "VoxelBlockGrid::free_stale_blocks: max_age must be at least 1");
   }
   VKC_TRY(prepare_block_pass());
+  // The first timed pass makes the timer, so a grid nobody times holds no
+  // query pool: a device layered on Metal backs each with one of its few
+  // counter sample buffers.
+  if (metrics != nullptr && !gpu_timer_.valid()) {
+    VKC_ASSIGN(gpu_timer_, core::GpuTimer::create(*device_));
+  }
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
   VKC_ASSIGN(const std::uint32_t stale, block_pass(max_age, stage, metrics));
   if (stale == 0) return std::uint32_t{0};

@@ -546,14 +546,14 @@ class VR_MESH_API MarchingCubes {
   ///                 no vertex copy is made.
   /// @param metrics  Optional `StageMetrics` collecting a `"marching cubes"`
   ///                 row with its host, wait and device halves -- the whole
-  ///                 call -- over the breakdown rows `"  ..active set"`, the
+  ///                 call -- over the breakdown rows of the phases
+  ///                 @ref ExtractTimings names alike: `"  ..compact"`, the
   ///                 compaction, when the map's last list no longer holds:
   ///                 @ref volume::VoxelHashMap::compact_active_blocks_on_device
-  ///                 -- and `"  ..dispatch"`, each attempt's submit as
-  ///                 @ref ExtractTimings::dispatch_ms counts it: the command
-  ///                 reset, the dispatch and the command's readback, and a
-  ///                 refit between two. `nullptr` measures nothing and writes
-  ///                 no timestamp.
+  ///                 -- and `"  ..dispatch"`, each attempt's submit: the
+  ///                 command reset, the dispatch and the command's readback,
+  ///                 and a refit between two. `nullptr` measures nothing,
+  ///                 writes no timestamp and makes no timer.
   /// @return A `Device`Mesh **borrowing** this extractor's buffers -- valid
   ///         only until the next extract on this object, which overwrites them
   ///         -- or the same failures @ref extract_host reports (including its
@@ -599,7 +599,7 @@ class VR_MESH_API MarchingCubes {
   ///                 ExtractTimings::compact_ms is 0 (the caller compacted) and
   ///                 @ref ExtractTimings::active_blocks reports @p blocks's
   ///                 count.
-  /// @param metrics  As @ref extract_device, with no `"  ..active set"`.
+  /// @param metrics  As @ref extract_device, with no `"  ..compact"`.
   /// @return The mesh in this extractor's device buffers, borrowed exactly as
   ///         @ref extract_device's is, or that overload's `Status`, plus
   ///         `Status::Code::InvalidArgument` when @p blocks is not this grid's
@@ -795,8 +795,8 @@ class VR_MESH_API MarchingCubes {
   // fixed at create by MarchingCubesConfig::share_vertices.
   core::ComputeKernel kernel_sparse_;
   core::DescriptorPool pool_;
-  // The timer an extract's stage rows tile its submits in; untouched unless a
-  // caller passes metrics.
+  // The timer an extract's stage rows tile its submits in, made by the first
+  // extract a caller passes metrics; empty until then.
   core::GpuTimer gpu_timer_;
 
   // Triangles the current slot's INDEX RUN can hold (0 when it holds no

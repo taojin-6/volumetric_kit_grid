@@ -7,11 +7,12 @@
 // voxel (`weighted`); and free_stale_blocks frees exactly the blocks that have
 // been neither for more than max_age ticks, zeroing their voxels. A freed
 // slot's record is zeroed, resize keeps every record in its slot (the rehash
-// does not restamp), and clear zeroes them all. Skips where no device
-// is present.
+// does not restamp), and clear zeroes them all. The first timed pass makes
+// the grid's timer and times its row. Skips where no device is present.
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 #include <tuple>
@@ -20,9 +21,11 @@
 #include "device_blocks.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -162,8 +165,23 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(batch.submit().ok());
   }
   map.advance_tick();
-  freed = grid.free_stale_blocks(2);
+  // Timed, the first timed pass, which makes the grid's timer: the stamps and
+  // the frees in one row.
+  vkc::StageMetrics gc;
+  freed = grid.free_stale_blocks(2, &gc);
   CHECK(freed.ok() && freed.value() == 1);
+  {
+    CHECK(!gc.empty());
+    const vkc::StageRow& pass = gc.rows()[0];
+    CHECK(std::strcmp(pass.name, "block stamps") == 0);
+    CHECK(pass.wait_ms <= pass.cpu_ms);
+    vkc::Result<vkc::GpuTimer> probe = vkc::GpuTimer::create(dev);
+    CHECK(probe.ok());
+    if (probe.value().available()) {
+      CHECK(pass.device == vkc::DeviceTime::Measured && pass.gpu_ms > 0.0 &&
+            pass.gpu_ms < pass.cpu_ms);
+    }
+  }
   slot = slots(grid);
   CHECK(slot.ok() && slot.value().size() == 2 &&
         slot.value().count(Coord{1, 0, 0}) == 0);
