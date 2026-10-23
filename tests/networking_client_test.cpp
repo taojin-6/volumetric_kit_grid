@@ -274,19 +274,25 @@ int flood_case() {
     ended = true;
   });
   // Checked once the flood is joined.
+  bool all_skipped = true;
   bool prompt = true;
   Got got;
   for (int i = 0; i < 5; ++i) {
     const Clock::time_point start = Clock::now();
     const vkc::Result<bool> r = client->next(20ms, &got.record, &got.payload);
-    prompt = prompt && r.ok() && !*r && Clock::now() - start < 500ms;
+    all_skipped = all_skipped && r.ok() && !*r;
+    prompt = prompt && Clock::now() - start < 500ms;
   }
   stop = true;
   // Read on until the flood ends, so a send under way finishes.
   while (!ended && client->next(10ms, &got.record, &got.payload).ok()) {
   }
   flood.join();
+  CHECK(all_skipped);
+#ifndef VR_TEST_SANITIZED
+  // Under ASan or TSan, the calls are checked without the time limit.
   CHECK(prompt);
+#endif
   return 0;
 }
 
