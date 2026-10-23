@@ -13,7 +13,9 @@
 // the original. A block whose tsdf or weight this leaves different is stamped
 // changed with the map's tick, as the integrator stamps one, so a frame that
 // repeats a block's last one leaves it unstamped. An entry
-// whose coord the table does not hold (see block_ptr) is written nothing.
+// whose coord the table does not hold (see block_ptr) is written nothing. A
+// block whose mask is not all ones sets the call's mask flag, which the
+// decoder's deblock reads.
 //
 // Re-implements the prior engine's computeIDCTKernel (compute_dct.cu), which
 // wrote every voxel's SDF and left weights alone; the mask is what replaces the
@@ -42,8 +44,13 @@ layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) readonly buffer
 layout(set = 0, binding = VR_DCT_BINDING_STAMPS, scalar) buffer Stamps {
   BlockStamp stamps[];
 };
+// Zeroed in the call's batch; any workgroup may set it, hence atomically.
+layout(set = 0, binding = VR_DCT_BINDING_MASKED, scalar) buffer Masked {
+  uint masked;
+};
 
 shared uint s_changed;
+shared uint s_masked;
 
 void main() {
   uint lane = gl_LocalInvocationIndex;
@@ -59,6 +66,7 @@ void main() {
   uint voxel_base = uint(ptr);
   if (lane == 0u) {
     s_changed = 0u;
+    s_masked = 0u;
   }
 
   s_basis[lane] = basis[lane];
@@ -84,6 +92,9 @@ void main() {
       (masks[entry * kMaskWords + lane / kLinesPerMaskWord] >>
        ((lane % kLinesPerMaskWord) * kEdge)) &
       kLineBits;
+  if (line_bits != kLineBits) {
+    atomicOr(s_masked, 1u);
+  }
   // A voxel is written only where its bits differ (-0.0 against 0.0 too, so
   // the block ends exactly as decoded), which spares a block the frame
   // repeats its writes; the stamp still compares values.
@@ -109,7 +120,12 @@ void main() {
     atomicOr(s_changed, 1u);
   }
   barrier();
-  if (lane == 0u && s_changed != 0u) {
-    stamps[voxel_base / kBlockVoxels].changed = pc.tick;
+  if (lane == 0u) {
+    if (s_changed != 0u) {
+      stamps[voxel_base / kBlockVoxels].changed = pc.tick;
+    }
+    if (s_masked != 0u) {
+      atomicOr(masked, 1u);
+    }
   }
 }

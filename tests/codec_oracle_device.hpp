@@ -66,7 +66,7 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
 // @p in's blocks, the entries of @p blocks as given (ptrs included),
 // reconstructed into @p grid by @p t's inverse; InvalidArgument for sizes
 // that disagree with the list or a trunc_dist other than the grid's, else
-// DctTransform::inverse's refusals.
+// DctTransform::record_inverse's refusals, or its reject count's.
 vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
                     vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,

@@ -1,0 +1,122 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// One axis pass of the deblock's line fit (deblock.hpp), pc.axis, in place on
+// tsdf. A workgroup owns its block B's face to its +axis neighbour N, a lane
+// one line across it: p_i is B's voxel at 7 - i along the axis, q_i N's at i,
+// i < 3. The fit reads three voxels a side and the tent writes two, so a
+// voxel lies on one line of a pass alone -- B's t 0..2 on the face to B's
+// -axis block, its t 5..7 on this one -- and each lane reads its line before
+// it writes it: in place is the snapshot the filter is defined on. B's
+// observed voxels come from the frame's mask, N's from its weights. The next
+// axis is the next dispatch, after the batch's barrier.
+
+#extension GL_GOOGLE_include_directive : require
+#include "deblock_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/block_neighbourhood.glsl"
+
+layout(local_size_x = kLanes) in;
+
+shared uint s_wrote_self;
+shared uint s_wrote_next;
+
+// The line voxel of lane (u, w) at coordinate t along the axis, in B's frame
+// (t 8..10 lie in N).
+ivec3 line_voxel(int t, int u, int w) {
+  if (pc.axis == 0u) return ivec3(t, u, w);
+  if (pc.axis == 1u) return ivec3(u, t, w);
+  return ivec3(u, w, t);
+}
+
+void main() {
+  uint lane = gl_LocalInvocationIndex;
+  uint entry = pc.item_base + gl_WorkGroupID.x;
+  // Uniform across the workgroup.
+  if (skip != 0u || entry >= pc.num_blocks) {
+    return;
+  }
+  ivec3 coord = blocks[entry].coord;
+  uint next = 1u << pc.axis;  // N's octant
+  // Lane 0 finds B while lane `next` finds N.
+  int self_ptr = lane == 0u ? vrFindBlockPtr(coord, pc.num_buckets,
+                                             pc.bucket_size, pc.max_chain)
+                            : -1;
+  vrResolveOctants(coord, self_ptr, lane, 1u | (1u << next), pc.num_buckets,
+                   pc.bucket_size, pc.max_chain);
+  if (lane == 0u) {
+    s_wrote_self = 0u;
+    s_wrote_next = 0u;
+  }
+  barrier();
+  if (s_neighbour[0] < 0 || s_neighbour[next] < 0) {
+    return;
+  }
+
+  int u = int(lane % kEdge);
+  int w = int(lane / kEdge);
+  // Every load at once: each side's tsdf, and N's weights.
+  uint ps[3], qs[3];
+  float pt[3], qt[3], qw[3];
+  bool candidate = true;
+  for (int i = 0; i < 3; ++i) {
+    ivec3 p_voxel = line_voxel(int(kEdge) - 1 - i, u, w);
+    vrCornerStorage(int(kEdge), p_voxel, ps[i]);
+    vrCornerStorage(int(kEdge), line_voxel(int(kEdge) + i, u, w), qs[i]);
+    pt[i] = tsdf[ps[i]];
+    qt[i] = tsdf[qs[i]];
+    qw[i] = weight[qs[i]];
+    uint local = uint(vrLocalIndex(p_voxel, int(kEdge)));
+    candidate = candidate && vrMaskObserved(entry, local);
+  }
+  for (int i = 0; i < 3; ++i) {
+    candidate = candidate && qw[i] >= pc.observed_weight;
+  }
+  bool wrote_self = false;
+  bool wrote_next = false;
+  if (candidate) {
+    float p[3], q[3];
+    bool saturated = false;
+    for (int i = 0; i < 3; ++i) {
+      p[i] = vrNormalized(pt[i]);
+      q[i] = vrNormalized(qt[i]);
+      saturated = saturated || abs(p[i]) >= pc.saturated ||
+                  abs(q[i]) >= pc.saturated;
+    }
+    if (!saturated) {
+      float delta = pc.c0 * (q[0] - p[0]) + pc.c1 * (q[1] - p[1]) +
+                    pc.c2 * (q[2] - p[2]);
+      delta = clamp(delta, -pc.line_clip, pc.line_clip);
+      // The tent over n = 2 voxels a side: (n - i - 0.5) / (2n).
+      const float tent[2] = float[2](0.375, 0.125);
+      for (int i = 0; i < 2; ++i) {
+        float d = delta * tent[i];
+        if (d == 0.0) {
+          continue;
+        }
+        float np = clamp(p[i] + d, -1.0, 1.0);
+        if (floatBitsToUint(np) != floatBitsToUint(p[i])) {
+          tsdf[ps[i]] = np * pc.trunc_dist;
+          wrote_self = true;
+        }
+        float nq = clamp(q[i] - d, -1.0, 1.0);
+        if (floatBitsToUint(nq) != floatBitsToUint(q[i])) {
+          tsdf[qs[i]] = nq * pc.trunc_dist;
+          wrote_next = true;
+        }
+      }
+    }
+  }
+  if (wrote_self) {
+    atomicOr(s_wrote_self, 1u);
+  }
+  if (wrote_next) {
+    atomicOr(s_wrote_next, 1u);
+  }
+  barrier();
+  if (lane == 0u) {
+    if (s_wrote_self != 0u) vrStampChanged(s_neighbour[0]);
+    if (s_wrote_next != 0u) vrStampChanged(s_neighbour[next]);
+  }
+}

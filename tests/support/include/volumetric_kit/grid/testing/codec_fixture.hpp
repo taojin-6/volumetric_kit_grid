@@ -141,10 +141,12 @@ inline std::vector<vr::Vec3i> band_blocks(const Sphere& s, float voxel = kVoxel,
 
 // Write the field @p sdf (signed distance of a world point, metres) into
 // every active block: a voxel within the band is observed (weight 2) with its
-// SDF clamped to +-trunc; one outside it is unobserved (weight 0, tsdf 0) --
-// the shape a fused grid has, partially observed blocks included.
+// SDF; one outside it is unobserved (weight 0, tsdf 0) -- the shape a fused
+// grid has, partially observed blocks included. With @p observe_all, every
+// voxel is observed, its SDF clamped to +-trunc, so every mask is all ones.
 template <typename Sdf>
-vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf) {
+vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf,
+                        bool observe_all = false) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
              vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
@@ -161,8 +163,8 @@ vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf) {
                         float(b.coord.y * 8 + int((v / 8) % 8)) * voxel,
                         float(b.coord.z * 8 + int(v / 64)) * voxel);
       const float d = sdf(p);
-      const bool obs = std::fabs(d) <= trunc;
-      tsdf.values[at + v] = obs ? d : 0.0f;
+      const bool obs = observe_all || std::fabs(d) <= trunc;
+      tsdf.values[at + v] = obs ? std::clamp(d, -trunc, trunc) : 0.0f;
       weight.values[at + v] = obs ? 2.0f : 0.0f;
     }
   }

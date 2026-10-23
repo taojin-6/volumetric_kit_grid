@@ -1102,7 +1102,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(small.ok());
     const auto inverse = [&](const codec::detail::ResidentBlocks& in) {
       vkc::CommandBatch batch(device, allocator);
-      return t.inverse(batch, grid, in, params);
+      return t.record_inverse(batch, grid, in, params);
     };
     codec::detail::ResidentBlocks resident;
     resident.count = std::uint32_t(blocks.size());

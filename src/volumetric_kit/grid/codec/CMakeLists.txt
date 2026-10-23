@@ -29,6 +29,7 @@ target_sources(
           block_lists.cpp
           codec_params.cpp
           dct_transform.cpp
+          deblock.cpp
           decode_grid.cpp
           decoder.cpp
           device_frame_reader.cpp
@@ -73,10 +74,10 @@ target_include_directories(
          "$<BUILD_INTERFACE:${_vr_codec_generated_inc}>"
   PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
-# Compile the kernels -- the DCT's, the block lists', the P-frame apply and diff
-# and the rANS coders' -- to SPIR-V and embed them (their sources #include the
-# generated *.spv.hpp on a PRIVATE path), so recon_codec ships with no runtime
-# shader files.
+# Compile the kernels -- the DCT's, the deblock's, the block lists', the P-frame
+# apply and diff and the rANS coders' -- to SPIR-V and embed them (their sources
+# #include the generated *.spv.hpp on a PRIVATE path), so recon_codec ships with
+# no runtime shader files.
 include(vr_embed)
 vr_embed_shaders(
   recon_codec
@@ -87,6 +88,9 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_inverse.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_observed.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/dct_surface.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_gauss.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_line.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_store.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_merge.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_diff.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_apply.comp"

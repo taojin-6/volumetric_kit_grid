@@ -5,8 +5,9 @@
 
 /// @file codec/decoder.hpp
 /// @brief Decode a frame -- intra, or a P-frame against the frame decoded
-///        before it -- into a @ref volume::VoxelBlockGrid, and read a frame's
-///        header without decoding it.
+///        before it -- into a @ref volume::VoxelBlockGrid, smoothed across its
+///        block faces on request, and read a frame's header without decoding
+///        it.
 
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@ namespace volumetric_kit::recon::codec {
 namespace detail {
 class BlockLists;
 class DctTransform;
+class Deblock;
 class DeviceFrameReader;
 class ReferenceStore;
 }  // namespace detail
@@ -46,6 +48,21 @@ struct FrameInfo {
   /// Intra, or a P-frame, which decodes only after the frame it was coded
   /// against (@ref Decoder).
   FrameType type = FrameType::kIntra;
+};
+
+/// @brief What the deblock did to the frame a @ref Decoder last decoded or
+///        rebuilt (@ref Decoder::set_deblock).
+struct DeblockInfo {
+  /// The filter the frame's steps chose and the decoder ran: `"LF"`, a line
+  /// fit across each block face; `"LG"`, that and a light Gaussian; `"R"`,
+  /// that and a stronger one; or `"off"`, for the deblock off, a step too
+  /// fine to need one, or a frame it skipped for an unobserved voxel
+  /// (@ref Decoder::set_deblock). A string literal.
+  const char* filter = "off";
+  /// T, in metres: the largest change one quantum of the frame's
+  /// lowest-frequency coefficients makes to a voxel, by which the filter is
+  /// chosen and its changes are clipped. The frame's, the deblock on or off.
+  float step = 0.0f;
 };
 
 /// @brief Read a frame's complete header, including its quantization weights.
@@ -73,12 +90,24 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// blocks, whatever it held before: blocks the frame lacks are removed (and
 /// their attributes zeroed), missing ones are allocated, and every frame
 /// block's `tsdf` and `weight` are rewritten in full -- an observed voxel with
-/// its decoded SDF and weight 1.0, an unobserved one as a fresh block holds
-/// it. So a player decodes frame after frame into one grid and meshes it after
-/// each; nothing is cleared between frames, and a block present in both costs
-/// no allocation. A block the decode leaves different is stamped `changed`
-/// (@ref volume::BlockStamp) and one it leaves as it was is not, so a
-/// consumer of the stamps sees only what the stream changed.
+/// its decoded SDF (smoothed where the deblock runs) and weight 1.0, an
+/// unobserved one as a fresh block holds it. So a player decodes frame after
+/// frame into one grid and meshes it after each; nothing is cleared between
+/// frames, and a block present in both costs no allocation. A block the decode
+/// leaves different is stamped `changed` (@ref volume::BlockStamp), and with
+/// the deblock off one it leaves as it was is not, so a consumer of the
+/// stamps sees only what the stream changed.
+///
+/// The deblock (@ref set_deblock, off by default) smooths each frame it runs
+/// on across its block faces, where quantization leaves steps the mesher
+/// would draw, by a filter the frame's header chooses (@ref DeblockInfo), on
+/// the device inside the decode's last submit. It is out of loop -- a P-frame
+/// decodes from its reference's coefficients, never from a grid -- so it may
+/// change between any two frames, and it costs no bits. It writes observed
+/// voxels' `tsdf` alone, and stamps a block it writes `changed`. With it on,
+/// the stamps can also name a block whose values end as they were -- the
+/// inverse compares the exact decode with the smoothed values the grid held
+/// -- but never miss one that changed.
 ///
 /// Only `tsdf` and `weight` are written, so a grid that declares any other
 /// attribute is refused: a block kept across frames would carry that
@@ -99,8 +128,10 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// `64 + 4 * ceil(K / 2)` an entry it decodes (a P-frame's reference entries
 /// and its new blocks), 16 more a new block and 8 a reference entry, and
 /// 16 KiB a frequency table for its slot lookup, beside the frame's payload
-/// and tables; and the blocks the grid must drop take 16 bytes a hash slot.
-/// All of it is kept, sized for the largest frame decoded.
+/// and tables; the blocks the grid must drop take 16 bytes a hash slot; and
+/// with the deblock on, a frame whose filter has a Gaussian takes 1,184
+/// bytes a block, grown with 1.5x headroom. All of it is kept, sized for
+/// the largest frame decoded.
 ///
 /// Everything but I/O and control runs on the device: the rANS decode, one
 /// segment an invocation; the reader's verdict; the merge of a P-frame's
@@ -115,8 +146,8 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 class VR_CODEC_API Decoder {
  public:
   /// @brief Build the kernels: the rANS decoder's, the block lists' (the
-  ///        merge's and the grid diff's among them), the apply's and the
-  ///        inverse transform's.
+  ///        merge's and the grid diff's among them), the apply's, the
+  ///        inverse transform's and the deblock's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -153,15 +184,16 @@ class VR_CODEC_API Decoder {
   ///                 @ref read_frame_info).
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
   ///                 row with both halves -- its device half is the rANS
-  ///                 kernels, the apply and the inverse transform -- over
-  ///                 the breakdown rows
+  ///                 kernels, the apply, the inverse transform and the
+  ///                 deblock -- over the breakdown rows
   ///                 `"  ..rans decode"` (parsing the frame, then one
   ///                 submit: decoding it, merging a P-frame's blocks with
   ///                 its reference's, and diffing the grid's block set
   ///                 against the frame's), `"  ..apply"` (removing and
   ///                 allocating blocks) and `"  ..inverse"` (making the
-  ///                 frame's blocks from the reference and the payload, and
-  ///                 the transform, in one submit). Named apart from the
+  ///                 frame's blocks from the reference and the payload, the
+  ///                 transform and the deblock, in one submit). Named apart
+  ///                 from the
   ///                 @ref Encoder's, so both timed into one `StageMetrics`
   ///                 stay apart. `nullptr` measures nothing.
   /// @return OK, or: whatever the frame reader refuses
@@ -197,6 +229,44 @@ class VR_CODEC_API Decoder {
                       volume::VoxelBlockGrid& grid,
                       core::StageMetrics* metrics = nullptr);
 
+  /// @brief Turn the deblock on or off for every frame decoded or rebuilt
+  ///        from here on: on, a frame whose masks are all ones is smoothed
+  ///        across its block faces by the filter its header picks (none at
+  ///        a fine step), after its inverse transform, in the same submit;
+  ///        off, the default, the grid holds the exact decode.
+  ///
+  /// A frame any of whose blocks has an unobserved voxel -- a masked frame,
+  /// as fused RGB-D's are, or a true-SDF frame with a cut
+  /// (@ref EncoderConfig::true_sdf) -- is skipped on the device, so it
+  /// decodes exactly as with the deblock off.
+  void set_deblock(bool on) noexcept { deblock_on_ = on; }
+  /// @return Whether the deblock is on.
+  bool deblock() const noexcept { return deblock_on_; }
+
+  /// @brief Rebuild the frame this decoder last decoded into @p grid, from
+  ///        the reference it holds, with the deblock as it is now: what a
+  ///        paused player calls after @ref set_deblock to show the change on
+  ///        the frame it shows, without reading the frame again.
+  ///
+  /// The inverse transform and the deblock, in one submit, as the decode
+  /// ran them, stamping as it does. The reference is unchanged.
+  /// @param grid     The grid the last decode wrote: the frame's geometry,
+  ///                 and exactly its blocks, whatever their values.
+  /// @param metrics  Optional; a `"codec decode"` row with both halves.
+  /// @return OK; `Status::Code::NotFound` before a decode has succeeded;
+  ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
+  ///         grid @ref decode refuses before it changes one, or one whose
+  ///         blocks are not exactly the frame's, found on the device before
+  ///         anything is written (decode the frame into it instead);
+  ///         otherwise a buffer or dispatch failure, after which the grid
+  ///         holds a partial rebuild until a decode or rebuild succeeds.
+  core::Status rebuild(volume::VoxelBlockGrid& grid,
+                       core::StageMetrics* metrics = nullptr);
+
+  /// @return What the deblock did to the frame the last successful
+  ///         @ref decode or @ref rebuild left; `"off"` and 0 before one.
+  const DeblockInfo& last_deblock() const noexcept { return last_deblock_; }
+
   /// @return `true` if this owns a live transform (`false` when moved-from).
   bool valid() const noexcept;
 
@@ -212,6 +282,10 @@ class VR_CODEC_API Decoder {
   std::unique_ptr<detail::ReferenceStore> store_;
   // The frame's blocks merged into frame order, and diffed against the grid.
   std::unique_ptr<detail::BlockLists> lists_;
+  // The deblock's kernels and snapshot, and its switch.
+  std::unique_ptr<detail::Deblock> deblock_;
+  bool deblock_on_ = false;
+  DeblockInfo last_deblock_;
   // Device spans for the transform; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;
 };
