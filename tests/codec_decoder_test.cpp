@@ -727,6 +727,14 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   CHECK(outer.rows().size() == 1 &&
         outer.rows()[0].device == vkc::DeviceTime::None &&
         outer.rows()[0].wait_ms <= outer.rows()[0].cpu_ms);
+  // The grid holds the frame's blocks and one more, so decoding the frame
+  // again only removes: "  ..apply" is the removal's rounds alone, which
+  // must time too.
+  CHECK(allocate(gpu, d.value(), {{30, 30, 30}}).ok());
+  vkc::StageMetrics m3;
+  CHECK(dec.decode(frame.value().data(), frame.value().size(), d.value(), &m3)
+            .ok());
+  CHECK(tiles(m3, true));
   // Encoding into the same metrics adds its own rows beside these rather
   // than summing into them.
   vkc::StageMetrics both = m;
