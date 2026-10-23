@@ -339,7 +339,7 @@ class VR_CODEC_API DctTransform {
   // Cached maxStorageBufferRange; every per-call buffer is checked against it.
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // The kernels share one layout shape (twelve storage buffers + the push
+  // The kernels share one layout shape (thirteen storage buffers + the push
   // range) and one pool. Declared before pool_ and tables_, so those are
   // destroyed first -- the kernels' sets are freed with the pool.
   core::ComputeKernel forward_kernel_;
