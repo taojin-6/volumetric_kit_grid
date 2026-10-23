@@ -95,14 +95,14 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(list.ok() && timer.ok());
     vkc::StageMetrics rows;
     {
-      vkc::GpuStageScope stage(&rows, timer.value(), "edit");
+      vkc::GpuStageScope stage(&rows, timer.value(), "allocate");
       vkc::Result<std::uint32_t> placed =
           vbg.map().allocate(list.value(), 1, nullptr, &stage);
       CHECK(placed.ok() && placed.value() == 0);
     }
     const std::size_t cache_at_remove = pipeline_cache_bytes(gpu.device);
     {
-      vkc::GpuStageScope stage(&rows, timer.value(), "edit");
+      vkc::GpuStageScope stage(&rows, timer.value(), "remove");
       vkc::Result<std::uint32_t> removed =
           vbg.remove(list.value(), 1, nullptr, &stage);
       CHECK(removed.ok() && removed.value() == 0);
@@ -114,11 +114,13 @@ int gpu_main(vr_test::GpuContext& gpu) {
                    "note: this device's pipeline cache does not grow with a "
                    "compile, so a build at the first remove goes unseen\n");
     }
-    CHECK(rows.rows().size() == 1);
-    const vkc::StageRow& edit = rows.rows()[0];
-    if (timer.value().available()) {
-      CHECK(edit.device == vkc::DeviceTime::Measured && edit.gpu_ms > 0.0 &&
-            edit.gpu_ms < edit.cpu_ms);
+    CHECK(rows.rows().size() == 2);
+    for (const vkc::StageRow& edit : rows.rows()) {
+      CHECK(edit.wait_ms <= edit.cpu_ms);
+      if (timer.value().available()) {
+        CHECK(edit.device == vkc::DeviceTime::Measured && edit.gpu_ms > 0.0 &&
+              edit.gpu_ms < edit.cpu_ms);
+      }
     }
     vkc::StageMetrics outer;
     {
