@@ -40,7 +40,8 @@ struct TexturedMesh {
 ///
 /// The diffuse map is the one every mesh's material names, resolved against
 /// the file that defines the material: an OBJ's material library, otherwise
-/// the asset. It is not opened; @ref load_color_packed decodes it.
+/// the asset. A backslash in its path separates directories, as a slash
+/// does. It is not opened; @ref load_color_packed decodes it.
 ///
 /// @param path Asset path without embedded NUL; the files it names, such as
 ///             material libraries, resolve relative to it.

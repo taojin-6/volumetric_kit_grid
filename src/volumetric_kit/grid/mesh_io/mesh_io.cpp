@@ -3,6 +3,7 @@
 
 #include "volumetric_kit/recon/io/mesh_io.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
@@ -292,11 +293,13 @@ core::Result<TexturedMesh> import_mesh(const std::string& path, bool textured) {
     return core::Status::unsupported(
         "load_textured_mesh: embedded diffuse map: " + path);
   }
+  // Either separator divides the map's path, as when Assimp opens a file.
+  std::string map = *diffuse;
+  std::replace(map.begin(), map.end(), '\\', '/');
   // An OBJ's texture paths are relative to its material library; other
-  // formats define their materials in the asset itself. Assimp 6 reports an
-  // OBJ's relative to the asset, its library's directory prefixed; earlier
-  // releases, as the library writes them.
-  std::filesystem::path base = std::filesystem::path(path).parent_path();
+  // formats define their materials in the asset itself.
+  const std::filesystem::path asset = std::filesystem::path(path).parent_path();
+  std::filesystem::path base = asset;
   if (!libraries.empty()) {
     const std::filesystem::path library =
         std::filesystem::path(libraries.front()).parent_path();
@@ -308,9 +311,19 @@ core::Result<TexturedMesh> import_mesh(const std::string& path, bool textured) {
             path);
       }
     }
-    if (aiGetVersionMajor() < 6) base = library;
+    base = library;
+    // Assimp 6 prefixes the library's directory as the OBJ names it, even to
+    // an absolute path; earlier releases report the path as the library
+    // writes it. An absolute prefix (a bare OBJ name, a library named by an
+    // absolute path) already makes the map absolute.
+    const std::filesystem::path relative = library.lexically_relative(asset);
+    const std::string prefix = relative.generic_string() + '/';
+    if (aiGetVersionMajor() >= 6 && !relative.empty() &&
+        map.compare(0, prefix.size(), prefix) == 0) {
+      map.erase(0, prefix.size());
+    }
   }
-  textured_result.diffuse_texture = (base / *diffuse).string();
+  textured_result.diffuse_texture = (base / map).string();
   return textured_result;
 }
 
