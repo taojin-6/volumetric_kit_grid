@@ -2,30 +2,35 @@
 // Copyright (c) 2026 Tao Jin
 
 // GPU test for the decoder-side deblock. detail::Deblock: its chains, each
-// stage alone and every rule its filters have -- the 3-sample candidacy, the
-// saturated samples, the clips, the [-1, 1] clamp, unobserved taps, the
-// Gaussian's 26-block halo -- against the CPU oracle
-// (codec_deblock_oracle.hpp); workgroups run one at a time in list order and
-// in reverse, and in chunks, each the same bits, so a write another
-// workgroup reads is a deterministic failure; the stamps; recording without
-// submitting; the frame gate's masked-block count at its boundary; the
-// refusals; and the step-keyed rule and the gate on the host. The fixtures'
-// blocks sit at slots past twice their count, and their lists carry another
-// block's ptr, so a kernel that trusts a ptr or indexes by slot fails. And
-// the Decoder's switch: off is the exact decode; on, each mask-free frame is
-// the oracle's filter of it, under the filter its header picks, for I- and
-// P-frames, toggled between frames, across filters in one decoder and
-// rebuilt while paused; a frame with up to half its blocks masked, one
-// among them, is the oracle's filter too, unobserved taps and all, and one
-// with a block more the exact decode, reported "off", decoded or rebuilt; a
-// frame more than half of whose blocks are masked is the exact decode,
-// interleaved with mask-free frames too; and a true-SDF frame is deblocked,
-// cuts and all; the stamps; and the rows. Skips with no device.
+// stage alone and every rule its filters have -- the saturated samples, the
+// clips, the [-1, 1] clamp, a masked neighbour's taps, the Gaussian's
+// 26-block halo -- against the CPU oracle (codec_deblock_oracle.hpp);
+// workgroups run one at a time in list order and in reverse, and in chunks,
+// each the same bits, so a write another workgroup reads is a deterministic
+// failure; the stamps; recording without submitting; the refusals; and the
+// step-keyed rule on the host. The per-block fallback: a block with one
+// unobserved voxel, anywhere, keeps its exact decode and leaves both sides of
+// its faces unfitted; one masked block among many is kept to the bit, faces
+// and all, the rest the oracle's filter, and differs from the filter without
+// the fallback only within the line fit's reach of it; a fully masked frame
+// is left as it was, stamps too; and the count of the blocks kept. The
+// fixtures' blocks sit at slots past twice their count, and their lists
+// carry another block's ptr, so a kernel that trusts a ptr or indexes by
+// slot fails. And the Decoder's switch: off is the exact decode; on, each
+// frame is the oracle's filter of it, under the filter its header picks, its
+// masked blocks kept to the bit: mask-free frames, for I- and P-frames,
+// toggled between frames, across filters in one decoder and rebuilt while
+// paused; masked chains, interleaved with mask-free frames too; a frame of
+// 2n blocks with one masked block, a single unobserved voxel, with n, and
+// with every block masked, which is the exact decode; and a true-SDF frame,
+// its cut blocks kept; each with its report, the blocks kept among them; the
+// stamps; and the rows. Skips with no device.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -109,8 +114,8 @@ float hash01(std::uint32_t a, std::uint32_t b = 0, std::uint32_t c = 0) {
 
 // The decoded field as a quantizer leaves it: a ramp, plus each block's own
 // offset and slope along x (the DC and first-AC errors, a few T at
-// T = 0.01), plus noise; 10% of voxels and the plane x = 13 unobserved.
-Voxel ramp_field(const Where& at) {
+// T = 0.01), plus noise, every voxel observed.
+Voxel quantized_ramp(const Where& at) {
   const vr::Vec3i g = at.global();
   const vr::Vec3i& b = at.block;
   const std::uint32_t bx = std::uint32_t(b.x + 16),
@@ -119,7 +124,6 @@ Voxel ramp_field(const Where& at) {
   const std::uint32_t gx = std::uint32_t(g.x + 64),
                       gy = std::uint32_t(g.y + 64),
                       gz = std::uint32_t(g.z + 64);
-  if (g.x == 13 || hash01(gx, gy, gz) < 0.1f) return Voxel{false, 0.0f};
   const float offset = 0.04f * (hash01(bx, by, bz + 7) - 0.5f);
   const float slope = 0.004f * (hash01(bx + 3, by, bz) - 0.5f);
   const float noise = 0.002f * (hash01(gx + 11, gy, gz) - 0.5f);
@@ -127,6 +131,23 @@ Voxel ramp_field(const Where& at) {
                          0.002f * float(g.z) - 0.02f + offset +
                          slope * (float(at.x) - 3.5f) + noise};
 }
+
+// The ramp fixture's masked blocks (kRampMasked): 10% of block (1,1,1)'s
+// voxels, the plane x = 13 of the blocks (1, y, 0), and block (3,0,0)'s voxel
+// (0,4,4), on its face to (2,0,0), unobserved; the rest of quantized_ramp.
+Voxel ramp_field(const Where& at) {
+  const vr::Vec3i g = at.global();
+  const vr::Vec3i& b = at.block;
+  const bool partial = b == vr::Vec3i(1, 1, 1) &&
+                       hash01(std::uint32_t(g.x + 64), std::uint32_t(g.y + 64),
+                              std::uint32_t(g.z + 64)) < 0.1f;
+  const bool plane = g.x == 13 && b.z == 0;
+  const bool single =
+      b == vr::Vec3i(3, 0, 0) && at.x == 0 && at.y == 4 && at.z == 4;
+  if (partial || plane || single) return Voxel{false, 0.0f};
+  return quantized_ramp(at);
+}
+constexpr std::uint32_t kRampMasked = 5;
 
 // The ramp fixture's blocks: 4 x 3 x 3, less a face neighbour, an edge
 // neighbour and a corner neighbour of their blocks.
@@ -240,28 +261,24 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
                  std::move(mask_buffer)};
 }
 
-// A device word holding @p value, as a masked-block count.
-vkc::Result<vkc::Buffer> word(Gpu& gpu, std::uint32_t value) {
-  return vr_test::upload_device_buffer(gpu.device, gpu.allocator, &value,
-                                       sizeof(value));
+// @p fx's grid's block slots.
+std::uint32_t slots(const Fixture& fx) {
+  return std::uint32_t(fx.grid.grid().num_blocks);
 }
 
 // One deblock of @p fx under @p passes, at a fresh tick, in a batch of its
-// own, gated by the masked-block count @p masked, or by a zero count when
-// none is given.
+// own; the blocks it kept go to @p exact.
 vkc::Status run(Gpu& gpu, d::Deblock& deblock, Fixture& fx,
                 const d::DeblockPasses& passes,
-                const vkc::Buffer* masked = nullptr) {
-  vkc::Buffer zero;
-  if (masked == nullptr) {
-    VKC_ASSIGN(zero, word(gpu, 0u));
-    masked = &zero;
-  }
+                std::uint32_t* exact = nullptr) {
   fx.grid.map().advance_tick();
-  VKC_TRY(deblock.reserve(std::uint32_t(fx.coords.size()), passes));
+  VKC_TRY(deblock.reserve(std::uint32_t(fx.coords.size()), slots(fx), passes));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes, *masked));
-  return batch.submit();
+  std::uint32_t kept = 0;
+  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes, kept));
+  VKC_TRY(batch.submit());
+  if (exact != nullptr) *exact = kept;
+  return {};
 }
 
 // The device's result against the oracle's: the same blocks and weights, an
@@ -295,8 +312,45 @@ double largest_change(const Snapshot& a, const Snapshot& b) {
   return worst;
 }
 
+// Whether every masked block of @p before -- one holding an unobserved voxel
+// -- holds in @p after exactly the bits it held.
+bool masked_kept(const Snapshot& after, const Snapshot& before) {
+  for (std::size_t b = 0; b < before.coords.size(); ++b) {
+    if (oracle::masked(before, b) &&
+        std::memcmp(&after.tsdf[b * kVpb], &before.tsdf[b * kVpb],
+                    kVpb * sizeof(float)) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The masked blocks of @p s.
+std::uint32_t masked_count(const Snapshot& s) {
+  std::uint32_t out = 0;
+  for (std::size_t b = 0; b < s.coords.size(); ++b) {
+    out += oracle::masked(s, b) ? 1u : 0u;
+  }
+  return out;
+}
+
+// A grid's stamps, block by block in (z, y, x) order.
+vkc::Result<std::vector<std::uint32_t>> stamps_by_coord(
+    vol::VoxelBlockGrid& grid) {
+  VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
+  VKC_ASSIGN(const std::vector<vol::BlockStamp> stamps,
+             grid.map().read_block_stamps());
+  std::vector<std::uint32_t> out;
+  for (const vol::BlockIndex& b : active) {
+    out.push_back(stamps[std::uint32_t(b.ptr) / kVpb].changed);
+  }
+  return out;
+}
+
 // @p passes on a fresh ramp fixture against the oracle, the filter moving
-// the field by far more than the tolerance. The result goes to @p out.
+// the field by far more than the tolerance, the masked blocks kept to the
+// bit and counted, and the filter without the fallback far off. The result
+// goes to @p out.
 int against_oracle(Gpu& gpu, d::Deblock& deblock,
                    const d::DeblockPasses& passes, const char* name,
                    Snapshot* out = nullptr) {
@@ -305,24 +359,35 @@ int against_oracle(Gpu& gpu, d::Deblock& deblock,
   Fixture fx = std::move(made).value();
   vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
   CHECK(before.ok());
-  CHECK(run(gpu, deblock, fx, passes).ok());
+  CHECK(masked_count(before.value()) == kRampMasked);
+  std::uint32_t exact = 0;
+  CHECK(run(gpu, deblock, fx, passes, &exact).ok());
+  CHECK(exact == kRampMasked);
   vkc::Result<Snapshot> dev = snapshot(gpu, fx.grid);
   CHECK(dev.ok());
+  CHECK(masked_kept(dev.value(), before.value()));
   Snapshot want = before.value();
   oracle::apply(want, passes, kBand);
   double diff = 0.0;
   CHECK(matches(dev.value(), want, &diff) == 0);
+  Snapshot unguarded = before.value();
+  oracle::apply(unguarded, passes, kBand, false);
   const double moved = largest_change(dev.value(), before.value());
-  std::printf("%s: moves the field by up to %.3g, the oracle within %.3g\n",
-              name, moved, diff);
+  const double fallback = largest_change(dev.value(), unguarded);
+  std::printf(
+      "%s: moves the field by up to %.3g, the oracle within %.3g, %.3g from "
+      "the filter without the fallback\n",
+      name, moved, diff, fallback);
   CHECK(moved >= 100 * kTolerance);
+  CHECK(fallback >= 100 * kTolerance);
   if (out != nullptr) *out = std::move(dev).value();
   return 0;
 }
 
 // 1, 2. LF, LG and R, and each stage alone, against the oracle on the ramp:
-// partial masks, a missing face, edge and corner neighbour, an unobserved
-// plane. LF writes no voxel a line cannot reach: local 2..5 on every axis.
+// masked blocks -- 10% unobserved, an unobserved plane, a single voxel --
+// beside fully observed ones, a missing face, edge and corner neighbour. LF
+// writes no voxel a line cannot reach: local 2..5 on every axis.
 int chains_case(Gpu& gpu, d::Deblock& deblock) {
   const float t = 0.01f;
   for (const char* filter : {"LF", "LG", "R"}) {
@@ -350,25 +415,47 @@ int chains_case(Gpu& gpu, d::Deblock& deblock) {
   return 0;
 }
 
+// Whether @p s, a fixture's grid as it was, is the same grid after a run:
+// its blocks and fields, and its stamps against @p stamps.
+int unchanged(Gpu& gpu, Fixture& fx, const Snapshot& s,
+              const std::vector<vol::BlockStamp>& stamps) {
+  vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
+  vkc::Result<std::vector<vol::BlockStamp>> stamps_after =
+      fx.grid.map().read_block_stamps();
+  CHECK(after.ok() && stamps_after.ok());
+  CHECK(after.value() == s);
+  CHECK(stamps_after.value().size() == stamps.size());
+  for (std::size_t i = 0; i < stamps.size(); ++i) {
+    CHECK(stamps_after.value()[i].changed == stamps[i].changed);
+  }
+  return 0;
+}
+
 // Two blocks along x, a zero field but for lines set by hand, which only the
 // x pass reaches.
 struct Lines {
   float p[3];  // block (0,0,0)'s voxels at x = 7, 6, 5
   float q[3];  // block (1,0,0)'s at x = 0, 1, 2
-  bool p_observed[3] = {true, true, true};
-  bool q_observed[3] = {true, true, true};
 };
-// Lines (u, w) = (2 + i, 3) of the two blocks: y = 2 + i, z = 3.
-Field lines_field(const std::vector<Lines>& lines) {
-  return [lines](const Where& at) {
+// Lines (u, w) = (2 + i, 3) of the two blocks: y = 2 + i, z = 3; with
+// @p hole, that voxel unobserved, which masks its block.
+Field lines_field(const std::vector<Lines>& lines,
+                  const Where* hole = nullptr) {
+  return [lines, hole = hole == nullptr
+                            ? std::vector<Where>{}
+                            : std::vector<Where>{*hole}](const Where& at) {
+    for (const Where& h : hole) {
+      if (h.block == at.block && h.x == at.x && h.y == at.y && h.z == at.z) {
+        return Voxel{false, 0.0f};
+      }
+    }
     const int i = at.y - 2;
     if (at.z != 3 || i < 0 || i >= int(lines.size())) return Voxel{true, 0.0f};
     const Lines& line = lines[std::size_t(i)];
     const bool left = at.block.x == 0;
     const int s = left ? 7 - at.x : at.x;
     if (s > 2) return Voxel{true, 0.0f};
-    return left ? Voxel{line.p_observed[s], line.p[s]}
-                : Voxel{line.q_observed[s], line.q[s]};
+    return Voxel{true, left ? line.p[s] : line.q[s]};
   };
 }
 
@@ -386,9 +473,13 @@ std::vector<float> read_line(const Snapshot& s, int i) {
   return out;
 }
 
-// 3, 4. Candidacy over all three fitted samples a side; a fitted sample at
-// exactly 1 - 1e-5 skips its line and one an ulp below does not; the clamp
-// to [-1, 1]; and the line clip, which moves p0 by exactly 0.375 of it.
+// 3, 4. A fitted sample at exactly 1 - 1e-5 skips its line and one an ulp
+// below does not; the clamp to [-1, 1]; and the line clip, which moves p0 by
+// exactly 0.375 of it. Then the fallback on the face: one unobserved voxel
+// in either block -- p2 of a line, q2, or the far corner of a block, no
+// line's sample -- masks it, and no line of the face is fitted, both sides
+// left as they were, to the bit, stamps too, and the block counted; and a
+// block the frame does not list is no fully observed neighbour.
 int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
   const float sat = 1.0f - 1e-5f;
   for (const bool at_kink : {true, false}) {
@@ -399,15 +490,7 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
     lines.push_back(
         Lines{{0.2f, 0.2f, 0.2f},
               {0.3f, 0.3f, at_kink ? sat : std::nextafter(sat, 0.0f)}});
-    // 2, 3: p2, then q2, unobserved: not a candidate, though p0..1 and
-    // q0..1 are.
-    Lines no_p2{{0.1f, 0.1f, 0.0f}, {0.3f, 0.3f, 0.3f}};
-    no_p2.p_observed[2] = false;
-    lines.push_back(no_p2);
-    Lines no_q2{{0.1f, 0.1f, 0.1f}, {0.3f, 0.3f, 0.0f}};
-    no_q2.q_observed[2] = false;
-    lines.push_back(no_q2);
-    // 4: a jump of 0.5, clipped.
+    // 2: a jump of 0.5, clipped.
     lines.push_back(Lines{{0.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}});
 
     vkc::Result<Fixture> made = make_fixture(
@@ -416,9 +499,11 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
     Fixture fx = std::move(made).value();
     vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
     CHECK(before.ok());
-    const float t = 0.05f;  // line clip 0.2: lines 0..3 unclipped
+    const float t = 0.05f;  // line clip 0.2: lines 0..1 unclipped
     const d::DeblockPasses passes = linfit_only(t);
-    CHECK(run(gpu, deblock, fx, passes).ok());
+    std::uint32_t exact = 1;
+    CHECK(run(gpu, deblock, fx, passes, &exact).ok());
+    CHECK(exact == 0);
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
     CHECK(after.ok());
     Snapshot want = before.value();
@@ -438,9 +523,7 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
     const std::vector<float> kink = read_line(after.value(), 1);
     const std::vector<float> kink_before = read_line(before.value(), 1);
     CHECK((kink == kink_before) == at_kink);
-    CHECK(read_line(after.value(), 2) == read_line(before.value(), 2));
-    CHECK(read_line(after.value(), 3) == read_line(before.value(), 3));
-    const std::vector<float> clipped = read_line(after.value(), 4);
+    const std::vector<float> clipped = read_line(after.value(), 2);
     CHECK(std::fabs(double(clipped[0]) - 0.375 * double(passes.line_clip)) <=
           kTolerance);
     CHECK(std::fabs(double(clipped[1]) - 0.125 * double(passes.line_clip)) <=
@@ -448,18 +531,86 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
     CHECK(std::fabs(double(clipped[3]) -
                     (0.5 - 0.375 * double(passes.line_clip))) <= kTolerance);
     CHECK(clipped[2] == 0.0f && clipped[5] == 0.5f);
-    // Lines 0 and 4 write four voxels each, line 1 four unless at the kink.
+    // Lines 0 and 2 write four voxels each, line 1 four unless at the kink.
     CHECK(changed == (at_kink ? 8u : 12u));
   }
+
+  // The fallback: the clipped line, which would move four voxels, beside a
+  // hole in either block.
+  const std::vector<Lines> jump = {
+      Lines{{0.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}}};
+  const Where holes[] = {{vr::Vec3i(0, 0, 0), 5, 2, 3},
+                         {vr::Vec3i(1, 0, 0), 2, 2, 3},
+                         {vr::Vec3i(0, 0, 0), 0, 0, 0},
+                         {vr::Vec3i(1, 0, 0), 7, 7, 7}};
+  for (const Where& hole : holes) {
+    vkc::Result<Fixture> made =
+        make_fixture(gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)},
+                     lines_field(jump, &hole));
+    CHECK(made.ok());
+    Fixture fx = std::move(made).value();
+    vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
+    vkc::Result<std::vector<vol::BlockStamp>> stamps =
+        fx.grid.map().read_block_stamps();
+    CHECK(before.ok() && stamps.ok());
+    for (const char* filter : {"LF", "R"}) {
+      std::uint32_t exact = 0;
+      CHECK(run(gpu, deblock, fx, d::deblock_passes(row(filter), 0.05f), &exact)
+                .ok());
+      CHECK(exact == 1);
+      if (std::strcmp(filter, "LF") == 0) {
+        CHECK(unchanged(gpu, fx, before.value(), stamps.value()) == 0);
+      }
+    }
+    // The Gaussian smooths the fully observed block alone.
+    vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
+    CHECK(after.ok() && masked_kept(after.value(), before.value()));
+    CHECK(!(after.value() == before.value()));
+  }
+
+  // A block the frame does not list reads as masked, though an earlier run
+  // flagged its slot: after the face is fitted once, a frame of block
+  // (0,0,0) alone leaves the grid as it was, where a second fit would move
+  // it again.
+  vkc::Result<Fixture> made = make_fixture(
+      gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)}, lines_field(jump));
+  CHECK(made.ok());
+  Fixture fx = std::move(made).value();
+  const d::DeblockPasses lf = linfit_only(0.05f);
+  CHECK(run(gpu, deblock, fx, lf).ok());
+  vkc::Result<Snapshot> fitted = snapshot(gpu, fx.grid);
+  vkc::Result<std::vector<vol::BlockStamp>> stamps =
+      fx.grid.map().read_block_stamps();
+  CHECK(fitted.ok() && stamps.ok());
+  CHECK(fx.coords.front() == vr::Vec3i(0, 0, 0));
+  d::ResidentBlocks first = fx.frame();
+  first.count = 1;
+  fx.grid.map().advance_tick();
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  std::uint32_t exact = 1;
+  CHECK(deblock.record(batch, fx.grid, first, lf, exact).ok());
+  CHECK(batch.submit().ok() && exact == 0);
+  CHECK(unchanged(gpu, fx, fitted.value(), stamps.value()) == 0);
+  CHECK(run(gpu, deblock, fx, lf).ok());
+  vkc::Result<Snapshot> twice = snapshot(gpu, fx.grid);
+  CHECK(twice.ok() && !(twice.value() == fitted.value()));
   return 0;
 }
 
-// x alone varies: a ramp along x, and with @p plane the plane x = 4 of block
-// (0,0,0) unobserved; or a spike.
+// x alone varies: a ramp along x, the plane x = 7 of block (0,0,0)
+// unobserved for y >= 4, which masks it; or a spike.
 Voxel x_ramp_field(const Where& at) {
   const vr::Vec3i g = at.global();
-  if (g.x == 4) return Voxel{false, 0.0f};
+  if (g.x == 7 && g.y >= 4) return Voxel{false, 0.0f};
   return Voxel{true, 0.02f * float(g.x)};
+}
+// A spike in masked block (0,1,0), at (3,0,3), on its face to (0,0,0).
+Voxel masked_spike_field(const Where& at) {
+  if (at.block == vr::Vec3i(0, 1, 0)) {
+    if (at.x == 7 && at.y == 7 && at.z == 7) return Voxel{false, 0.0f};
+    if (at.x == 3 && at.y == 0 && at.z == 3) return Voxel{true, 0.5f};
+  }
+  return Voxel{true, 0.0f};
 }
 Voxel spike_field(const Where& at) {
   if (at.block == vr::Vec3i(0, 0, 0) && at.x == 3 && at.y == 3 && at.z == 3) {
@@ -474,29 +625,70 @@ Voxel corner_field(const Where& at) {
   return Voxel{true, 0.0f};
 }
 
-// 3, 5, 6. The Gaussian: an unobserved tap drops out of both sums (a hand
-// value); each pass's change is clipped, so a spike loses three clips; and
-// a block's corner reaches its diagonal neighbour's through the 26-block
-// halo.
+// 3, 5, 6. The Gaussian: a masked neighbour's unobserved tap drops out of
+// both sums, and its observed one counts as decoded (hand values); a masked
+// neighbour's voxels keep their values through every pass, so a full
+// block's y pass reads a spike there as decoded, not as the x pass would
+// have left it; each pass's change is clipped, so a spike loses three
+// clips; and a block's corner reaches its diagonal neighbour's through the
+// 26-block halo.
 int gauss_rules_case(Gpu& gpu, d::Deblock& deblock) {
   {
     vkc::Result<Fixture> made = make_fixture(
         gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)}, x_ramp_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
+    vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
+    CHECK(before.ok());
     const d::DeblockPasses passes = gauss_only(0.1f);
+    std::uint32_t exact = 0;
+    CHECK(run(gpu, deblock, fx, passes, &exact).ok());
+    CHECK(exact == 1);
+    vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
+    CHECK(after.ok() && masked_kept(after.value(), before.value()));
+    // x = 0 of block (1,0,0), at y 6 and 2: its x - 1 tap is the masked
+    // block's unobserved voxel, then its observed one, 0.14. y and z run
+    // along lines constant around both.
+    const double g1 = passes.gauss_g1;
+    const double want_hole = (0.16 + g1 * 0.18) / (1.0 + g1);
+    const double want_tap = (g1 * 0.14 + 0.16 + g1 * 0.18) / (1.0 + 2 * g1);
+    const double hole = after.value().tsdf[kVpb + 8 * 6 + 64 * 4] / kBand;
+    const double tap = after.value().tsdf[kVpb + 8 * 2 + 64 * 4] / kBand;
+    std::printf("unobserved tap: %.9f, by hand %.9f; observed: %.9f, %.9f\n",
+                hole, want_hole, tap, want_tap);
+    CHECK(std::fabs(hole - want_hole) <= kTolerance);
+    CHECK(std::fabs(tap - want_tap) <= kTolerance);
+    // Counted as the 0 stored there, it would be far off.
+    CHECK(std::fabs((g1 * 0.0 + 0.16 + g1 * 0.18) / (1.0 + 2 * g1) -
+                    want_hole) >= 100 * kTolerance);
+  }
+  {
+    vkc::Result<Fixture> made = make_fixture(
+        gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(0, 1, 0)}, masked_spike_field);
+    CHECK(made.ok());
+    Fixture fx = std::move(made).value();
+    vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
+    CHECK(before.ok());
+    const d::DeblockPasses passes = gauss_only(1.0f);  // clips past 0.5
     CHECK(run(gpu, deblock, fx, passes).ok());
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
-    CHECK(after.ok());
-    // x = 5 of block (0,0,0): its x - 1 tap is the unobserved plane.
+    CHECK(after.ok() && masked_kept(after.value(), before.value()));
+    Snapshot want = before.value();
+    oracle::apply(want, passes, kBand);
+    CHECK(matches(after.value(), want, nullptr) == 0);
+    // Block (0,0,0)'s (3,7,3), below the spike: y reads it as 0.5, then z
+    // spreads the result. Read as x would have left it, it is far off.
     const double g1 = passes.gauss_g1;
-    const double want = (0.1 + g1 * 0.12) / (1.0 + g1);
-    const double got = after.value().tsdf[5 + 8 * 4 + 64 * 4] / kBand;
-    std::printf("unobserved tap: %.9f, by hand %.9f\n", got, want);
-    CHECK(std::fabs(got - want) <= kTolerance);
-    // Counted as the 0 stored there, it would be far off.
-    CHECK(std::fabs((g1 * 0.0 + 0.1 + g1 * 0.12) / (1.0 + 2 * g1) - want) >=
-          100 * kTolerance);
+    const double y_out = g1 * 0.5 / (1.0 + 2 * g1);
+    const double z_out = y_out / (1.0 + 2 * g1);
+    const double got = after.value().tsdf[3 + 8 * 7 + 64 * 3] / kBand;
+    Snapshot unguarded = before.value();
+    oracle::apply(unguarded, passes, kBand, false);
+    const double filtered_tap = unguarded.tsdf[3 + 8 * 7 + 64 * 3] / kBand;
+    std::printf("masked tap: %.9f, by hand %.9f; filtered first: %.9f\n", got,
+                z_out, filtered_tap);
+    CHECK(std::fabs(got - z_out) <= kTolerance);
+    CHECK(std::fabs(filtered_tap - z_out) >= 100 * kTolerance);
   }
   {
     vkc::Result<Fixture> made =
@@ -585,19 +777,26 @@ int order_case(Gpu& gpu) {
   return 0;
 }
 
+// Block (0,0,0) at 0.1 among zeros; block (-1,0,0) masked by one voxel.
 Voxel stamps_field(const Where& at) {
+  if (at.block == vr::Vec3i(-1, 0, 0) && at.x == 3 && at.y == 3 && at.z == 3) {
+    return Voxel{false, 0.0f};
+  }
   return Voxel{true, at.block == vr::Vec3i(0, 0, 0) ? 0.1f : 0.0f};
 }
 
 // 9. A block the deblock writes carries the pass's tick, whoever wrote it:
 // a line's +axis block, written by its neighbour's workgroup alone, and a
 // block whose shell alone the Gaussian changes, which the store writes. A
-// block it leaves as it was keeps its stamp.
+// block it leaves as it was keeps its stamp: one far from the step, and a
+// masked one beside it.
 int stamps_case(Gpu& gpu, d::Deblock& deblock) {
   for (const bool gaussian : {false, true}) {
-    vkc::Result<Fixture> made = make_fixture(
-        gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0), vr::Vec3i(5, 5, 5)},
-        stamps_field);
+    vkc::Result<Fixture> made =
+        make_fixture(gpu,
+                     {vr::Vec3i(-1, 0, 0), vr::Vec3i(0, 0, 0),
+                      vr::Vec3i(1, 0, 0), vr::Vec3i(5, 5, 5)},
+                     stamps_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
     vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
@@ -611,20 +810,22 @@ int stamps_case(Gpu& gpu, d::Deblock& deblock) {
         fx.grid.map().read_block_stamps();
     vkc::Result<std::vector<vol::BlockIndex>> active = active_sorted(fx.grid);
     CHECK(after.ok() && stamps.ok() && active.ok());
-    for (std::size_t b = 0; b < 3; ++b) {
+    CHECK(after.value().coords == before.value().coords);
+    for (std::size_t b = 0; b < 4; ++b) {
+      const vr::Vec3i& c = after.value().coords[b];
       const bool changed = std::memcmp(&after.value().tsdf[b * kVpb],
                                        &before.value().tsdf[b * kVpb],
                                        kVpb * sizeof(float)) != 0;
       const std::uint32_t slot = std::uint32_t(active.value()[b].ptr) / kVpb;
-      CHECK(changed == (b < 2));
+      CHECK(changed == (c == vr::Vec3i(0, 0, 0) || c == vr::Vec3i(1, 0, 0)));
       CHECK((stamps.value()[slot].changed == tick) == changed);
-    }
-    if (gaussian) {
-      // Block (1,0,0)'s interior is untouched: its stamp is the store's.
-      for (std::uint32_t l = 0; l < kVpb; ++l) {
-        const std::uint32_t x = l % 8, y = l / 8 % 8, z = l / 64;
-        if (x > 0 && x < 7 && y > 0 && y < 7 && z > 0 && z < 7) {
-          CHECK(after.value().tsdf[kVpb + l] == 0.0f);
+      if (gaussian && c == vr::Vec3i(1, 0, 0)) {
+        // Block (1,0,0)'s interior is untouched: its stamp is the store's.
+        for (std::uint32_t l = 0; l < kVpb; ++l) {
+          const std::uint32_t x = l % 8, y = l / 8 % 8, z = l / 64;
+          if (x > 0 && x < 7 && y > 0 && y < 7 && z > 0 && z < 7) {
+            CHECK(after.value().tsdf[b * kVpb + l] == 0.0f);
+          }
         }
       }
     }
@@ -632,26 +833,30 @@ int stamps_case(Gpu& gpu, d::Deblock& deblock) {
   return 0;
 }
 
-// 10. Recorded, not run: until the batch is submitted the grid is as it was;
-// a filter that runs nothing, or no blocks, records nothing; and the
-// refusals, each before anything is recorded.
+// 10. Recorded, not run: until the batch is submitted the grid is as it was
+// and the count of the blocks kept is every block's, the masked blocks' at
+// submit; a filter that runs nothing, or no blocks, records nothing and
+// counts every block; and the refusals, each before anything is recorded,
+// a reserve that made no room for the blocks or for the grid's slots among
+// them.
 int record_case(Gpu& gpu, d::Deblock& deblock) {
   vkc::Result<Fixture> made = make_fixture(gpu, ramp_blocks(), ramp_field);
-  vkc::Result<vkc::Buffer> zero = word(gpu, 0u);
-  CHECK(made.ok() && zero.ok());
+  CHECK(made.ok());
   Fixture fx = std::move(made).value();
-  const vkc::Buffer& unmasked = zero.value();
   vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
   CHECK(before.ok());
   const d::DeblockPasses passes = d::deblock_passes(row("LG"), 0.01f);
   const std::uint32_t n = std::uint32_t(fx.coords.size());
-  CHECK(deblock.reserve(n, passes).ok());
+  CHECK(deblock.reserve(n, slots(fx), passes).ok());
   {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    CHECK(deblock.record(batch, fx.grid, fx.frame(), passes, unmasked).ok());
+    std::uint32_t exact = 0;
+    CHECK(deblock.record(batch, fx.grid, fx.frame(), passes, exact).ok());
+    CHECK(exact == n);
     vkc::Result<Snapshot> pending = snapshot(gpu, fx.grid);
     CHECK(pending.ok() && pending.value() == before.value());
     CHECK(batch.submit().ok());
+    CHECK(exact == kRampMasked);
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
     CHECK(after.ok() && !(after.value() == before.value()));
   }
@@ -659,132 +864,243 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   CHECK(filtered.ok());
   {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    CHECK(
-        deblock.record(batch, fx.grid, fx.frame(), d::DeblockPasses{}, unmasked)
-            .ok());
+    std::uint32_t exact = 0;
+    CHECK(deblock.record(batch, fx.grid, fx.frame(), d::DeblockPasses{}, exact)
+              .ok());
+    CHECK(exact == n);
     d::ResidentBlocks none = fx.frame();
     none.count = 0;
-    CHECK(deblock.record(batch, fx.grid, none, passes, unmasked).ok());
+    CHECK(deblock.record(batch, fx.grid, none, passes, exact).ok());
+    CHECK(exact == 0);
     CHECK(batch.submit().ok());
+    CHECK(exact == 0);
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
     CHECK(after.ok() && after.value() == filtered.value());
   }
-  const auto refused = [&](const d::ResidentBlocks& frame,
-                           const d::DeblockPasses& p,
-                           vol::VoxelBlockGrid& grid) {
+  const auto refused = [&](d::Deblock& db, const d::ResidentBlocks& frame,
+                           const d::DeblockPasses& p, vol::VoxelBlockGrid& grid,
+                           const char* says = nullptr) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s = deblock.record(batch, grid, frame, p, unmasked);
-    return s.domain() == vkc::Status::Code::InvalidArgument;
+    std::uint32_t exact = 0;
+    const vkc::Status s = db.record(batch, grid, frame, p, exact);
+    return s.domain() == vkc::Status::Code::InvalidArgument &&
+           (says == nullptr || s.message().find(says) != std::string::npos);
   };
   d::DeblockPasses unclipped = passes;
   unclipped.line_clip = 0.0f;
-  CHECK(refused(fx.frame(), unclipped, fx.grid));
+  CHECK(refused(deblock, fx.frame(), unclipped, fx.grid));
   unclipped = passes;
   unclipped.gauss_clip = 0.0f;
-  CHECK(refused(fx.frame(), unclipped, fx.grid));
+  CHECK(refused(deblock, fx.frame(), unclipped, fx.grid));
   d::ResidentBlocks inter = fx.frame();
   inter.reference_count = 1;
-  CHECK(refused(inter, passes, fx.grid));
+  CHECK(refused(deblock, inter, passes, fx.grid));
   d::ResidentBlocks short_list = fx.frame();
   short_list.count = n + 1;
-  CHECK(refused(short_list, linfit_only(0.01f), fx.grid));
+  CHECK(refused(deblock, short_list, linfit_only(0.01f), fx.grid));
   d::ResidentBlocks no_masks = fx.frame();
   no_masks.masks = nullptr;
-  CHECK(refused(no_masks, passes, fx.grid));
-  // More blocks than reserve made room for.
+  CHECK(refused(deblock, no_masks, passes, fx.grid));
+  // More blocks, or slots, than reserve made room for: the snapshot under a
+  // Gaussian, the flags under any filter.
   vkc::Result<std::unique_ptr<d::Deblock>> fresh =
       d::Deblock::create(gpu.device, gpu.allocator);
   CHECK(fresh.ok());
-  {
-    vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s =
-        fresh.value()->record(batch, fx.grid, fx.frame(), passes, unmasked);
-    CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
-          s.message().find("reserve") != std::string::npos);
-  }
+  d::Deblock& small = *fresh.value();
+  CHECK(refused(small, fx.frame(), passes, fx.grid, "reserve"));
+  CHECK(refused(small, fx.frame(), linfit_only(0.01f), fx.grid, "slots"));
+  CHECK(small.reserve(n, slots(fx), linfit_only(0.01f)).ok());
+  CHECK(!refused(small, fx.frame(), linfit_only(0.01f), fx.grid));
+  CHECK(refused(small, fx.frame(), passes, fx.grid, "blocks, more than"));
   // A grid of another block size.
   GridShape four;
   four.block_size = 4;
   vkc::Result<vol::VoxelBlockGrid> g4 = make_grid(gpu, four);
   CHECK(g4.ok());
-  CHECK(refused(fx.frame(), passes, g4.value()));
+  CHECK(refused(deblock, fx.frame(), passes, g4.value()));
   return 0;
 }
 
-// Whether @p s, a fixture's grid as it was, is the same grid after a run:
-// its blocks and fields, and its stamps against @p stamps.
-int unchanged(Gpu& gpu, Fixture& fx, const Snapshot& s,
-              const std::vector<vol::BlockStamp>& stamps) {
-  vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
-  vkc::Result<std::vector<vol::BlockStamp>> stamps_after =
-      fx.grid.map().read_block_stamps();
-  CHECK(after.ok() && stamps_after.ok());
-  CHECK(after.value() == s);
-  CHECK(stamps_after.value().size() == stamps.size());
-  for (std::size_t i = 0; i < stamps.size(); ++i) {
-    CHECK(stamps_after.value()[i].changed == stamps[i].changed);
-  }
-  return 0;
-}
+// The fallback's cube: 5 x 5 x 5 blocks of quantized_ramp, block kHole's
+// voxel (4,3,5) unobserved -- one masked block among 125, list entry 87, in
+// the flags kernel's second workgroup, or 37 reversed -- or, with @p all,
+// every block's, or none.
+const vr::Vec3i kHole(2, 2, 3);
 
-// 10b. The gate, on frames of 32 and 33 blocks, n = 16 their half rounded
-// down: a masked-block count of n + 1 or of every block skips every filter,
-// leaving the grid and its stamps as they were -- the store too, though the
-// snapshot holds the last Gaussian's shell -- and n, exactly half of 32,
-// runs it, the oracle's filter. A buffer without a word is refused.
-int gate_case(Gpu& gpu, d::Deblock& deblock) {
-  const float t = 0.01f;
-  for (const char* filter : {"LF", "LG", "R"}) {
-    const d::DeblockPasses passes = d::deblock_passes(row(filter), t);
-    for (const std::size_t blocks : {std::size_t(32), std::size_t(33)}) {
-      // The snapshot primed with a filtered shell, entry for entry.
-      CHECK(against_oracle(gpu, deblock, passes, filter) == 0);
-      std::vector<vr::Vec3i> coords = ramp_blocks();
-      CHECK(coords.size() == 33);
-      coords.resize(blocks);
-      vkc::Result<Fixture> made = make_fixture(gpu, coords, ramp_field);
-      CHECK(made.ok());
-      Fixture fx = std::move(made).value();
-      const std::uint32_t n = std::uint32_t(blocks) / 2;
-      CHECK(n == 16);
-      vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
-      vkc::Result<std::vector<vol::BlockStamp>> stamps_before =
-          fx.grid.map().read_block_stamps();
-      CHECK(before.ok() && stamps_before.ok());
-      for (const std::uint32_t masked : {std::uint32_t(blocks), n + 1}) {
-        CHECK(d::deblock_skips(masked, std::uint32_t(blocks)));
-        vkc::Result<vkc::Buffer> count = word(gpu, masked);
-        CHECK(count.ok());
-        CHECK(run(gpu, deblock, fx, passes, &count.value()).ok());
-        CHECK(unchanged(gpu, fx, before.value(), stamps_before.value()) == 0);
-      }
-      // Exactly half of 32, and the most of 33 that runs: the oracle's.
-      CHECK(!d::deblock_skips(n, std::uint32_t(blocks)));
-      vkc::Result<vkc::Buffer> count = word(gpu, n);
-      CHECK(count.ok());
-      CHECK(run(gpu, deblock, fx, passes, &count.value()).ok());
-      vkc::Result<Snapshot> ran = snapshot(gpu, fx.grid);
-      CHECK(ran.ok());
-      Snapshot want = before.value();
-      oracle::apply(want, passes, kBand);
-      CHECK(matches(ran.value(), want, nullptr) == 0);
-      CHECK(largest_change(ran.value(), before.value()) >= 100 * kTolerance);
+std::vector<vr::Vec3i> cube_blocks() {
+  std::vector<vr::Vec3i> out;
+  for (int z = 0; z < 5; ++z) {
+    for (int y = 0; y < 5; ++y) {
+      for (int x = 0; x < 5; ++x) out.push_back(vr::Vec3i(x, y, z));
     }
   }
-  vkc::Result<Fixture> made = make_fixture(gpu, ramp_blocks(), ramp_field);
-  const std::uint16_t half = 1;
-  vkc::Result<vkc::Buffer> short_word = vr_test::upload_device_buffer(
-      gpu.device, gpu.allocator, &half, sizeof(half));
-  CHECK(made.ok() && short_word.ok());
-  const d::DeblockPasses passes = d::deblock_passes(row("LG"), t);
-  CHECK(
-      deblock.reserve(std::uint32_t(made.value().coords.size()), passes).ok());
-  vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  const vkc::Status s =
-      deblock.record(batch, made.value().grid, made.value().frame(), passes,
-                     short_word.value());
-  CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
-        s.message().find("masked") != std::string::npos);
+  return out;
+}
+
+enum class Holes { kNone, kOne, kAll };
+
+Field cube_field(Holes holes) {
+  return [holes](const Where& at) {
+    const bool holed =
+        holes == Holes::kAll || (holes == Holes::kOne && at.block == kHole);
+    if (holed && at.x == 4 && at.y == 3 && at.z == 5) {
+      return Voxel{false, 0.0f};
+    }
+    return quantized_ramp(at);
+  };
+}
+
+// Voxel i of a snapshot of @p coords, in global voxels.
+vr::Vec3i global_voxel(const std::vector<vr::Vec3i>& coords, std::size_t i) {
+  const Where w{coords[i / kVpb], int(i % 8), int(i / 8 % 8),
+                int(i % kVpb / 64)};
+  return w.global();
+}
+
+// The Chebyshev distance, in voxels, from global voxel @p g to block @p b.
+int distance_to_block(const vr::Vec3i& g, const vr::Vec3i& b) {
+  const auto axis = [](int v, int lo) {
+    return v < lo ? lo - v : (v > lo + 7 ? v - lo - 7 : 0);
+  };
+  return std::max({axis(g.x, 8 * b.x), axis(g.y, 8 * b.y), axis(g.z, 8 * b.z)});
+}
+
+// 10b. The per-block fallback on the cube. One masked block, a single
+// unobserved voxel: under LF, LG and R, in list order and reversed, in one
+// dispatch and a workgroup a dispatch, it is kept to the bit and its stamp
+// as it was, the rest is the oracle's filter, the same bits every run, and
+// one block is counted kept. Against the filter without the fallback it
+// differs, and only within the line fit's reach of the masked block -- 2
+// voxels, 5 with a Gaussian -- and under LF the voxels of each face beside
+// it that only a line across that face can reach, 1 and 2 voxels from it,
+// keep their bits, which the filter without the fallback moves. Every block
+// masked, the grid and its stamps are as they were and all 125 counted; none
+// masked, the oracle's filter with none counted, as without the fallback.
+int fallback_case(Gpu& gpu, d::Deblock& deblock) {
+  const float t = 0.01f;
+  const std::vector<vr::Vec3i> coords = cube_blocks();
+  for (const char* filter : {"LF", "LG", "R"}) {
+    const d::DeblockPasses passes = d::deblock_passes(row(filter), t);
+    const bool lf = std::strcmp(filter, "LF") == 0;
+    Snapshot first;
+    for (const bool reverse : {false, true}) {
+      for (const std::uint32_t per_dispatch : {0u, 1u}) {
+        vkc::Result<Fixture> made =
+            make_fixture(gpu, coords, cube_field(Holes::kOne), reverse);
+        CHECK(made.ok());
+        Fixture fx = std::move(made).value();
+        vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
+        vkc::Result<std::vector<std::uint32_t>> stamps_before =
+            stamps_by_coord(fx.grid);
+        CHECK(before.ok() && stamps_before.ok());
+        CHECK(masked_count(before.value()) == 1);
+        vr::detail::set_test_groups_per_dispatch(per_dispatch);
+        std::uint32_t exact = 0;
+        const vkc::Status ran = run(gpu, deblock, fx, passes, &exact);
+        vr::detail::set_test_groups_per_dispatch(0);
+        CHECK(ran.ok() && exact == 1);
+        vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
+        vkc::Result<std::vector<std::uint32_t>> stamps_after =
+            stamps_by_coord(fx.grid);
+        CHECK(after.ok() && stamps_after.ok());
+        const Snapshot& dev = after.value();
+        CHECK(masked_kept(dev, before.value()));
+        const std::size_t hole = std::size_t(
+            std::find(coords.begin(), coords.end(), kHole) - coords.begin());
+        CHECK(dev.coords == coords);
+        CHECK(stamps_after.value()[hole] == stamps_before.value()[hole]);
+        Snapshot want = before.value();
+        oracle::apply(want, passes, kBand);
+        CHECK(matches(dev, want, nullptr) == 0);
+        if (first.coords.empty()) {
+          first = dev;
+        } else {
+          CHECK(dev == first);
+        }
+        Snapshot unguarded = before.value();
+        oracle::apply(unguarded, passes, kBand, false);
+        const int reach = lf ? 2 : 5;
+        double inside = 0.0, slab_moved = 0.0;
+        for (std::size_t i = 0; i < dev.tsdf.size(); ++i) {
+          const double diff =
+              std::fabs(double(dev.tsdf[i]) - double(unguarded.tsdf[i])) /
+              double(kBand);
+          if (diff <= kTolerance) continue;
+          CHECK(distance_to_block(global_voxel(coords, i), kHole) <= reach);
+          inside = std::max(inside, diff);
+        }
+        CHECK(inside >= 100 * kTolerance);
+        if (lf) {
+          // Each face neighbour's voxels 1 and 2 from the face, 2..5 along
+          // the face: on no other line of any pass.
+          for (std::size_t b = 0; b < coords.size(); ++b) {
+            const vr::Vec3i o = coords[b] - kHole;
+            if (std::abs(o.x) + std::abs(o.y) + std::abs(o.z) != 1) continue;
+            for (std::uint32_t l = 0; l < kVpb; ++l) {
+              const int p[3] = {int(l % 8), int(l / 8 % 8), int(l / 64)};
+              const int n[3] = {o.x, o.y, o.z};
+              bool slab = true;
+              for (int a = 0; a < 3; ++a) {
+                const int from = n[a] > 0 ? p[a] : 7 - p[a];
+                slab = slab && (n[a] != 0 ? from <= 1 : p[a] >= 2 && p[a] <= 5);
+              }
+              if (!slab) continue;
+              const std::size_t i = b * kVpb + l;
+              CHECK(std::memcmp(&dev.tsdf[i], &before.value().tsdf[i],
+                                sizeof(float)) == 0);
+              slab_moved = std::max(slab_moved,
+                                    std::fabs(double(unguarded.tsdf[i]) -
+                                              double(before.value().tsdf[i])) /
+                                        double(kBand));
+            }
+          }
+          CHECK(slab_moved >= 100 * kTolerance);
+        }
+        if (!reverse && per_dispatch == 0) {
+          std::printf(
+              "%s, one masked block: %.3g from the filter without the "
+              "fallback, within %d voxels of it\n",
+              filter, inside, reach);
+          if (lf) {
+            std::printf("  its faces' slabs kept, %.3g without the fallback\n",
+                        slab_moved);
+          }
+        }
+      }
+    }
+  }
+  for (const Holes holes : {Holes::kAll, Holes::kNone}) {
+    for (const char* filter : {"LF", "LG", "R"}) {
+      const d::DeblockPasses passes = d::deblock_passes(row(filter), t);
+      vkc::Result<Fixture> made = make_fixture(gpu, coords, cube_field(holes));
+      CHECK(made.ok());
+      Fixture fx = std::move(made).value();
+      vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
+      vkc::Result<std::vector<vol::BlockStamp>> stamps =
+          fx.grid.map().read_block_stamps();
+      CHECK(before.ok() && stamps.ok());
+      vr::detail::set_test_groups_per_dispatch(1);
+      std::uint32_t exact = 0;
+      const vkc::Status ran = run(gpu, deblock, fx, passes, &exact);
+      vr::detail::set_test_groups_per_dispatch(0);
+      CHECK(ran.ok());
+      if (holes == Holes::kAll) {
+        CHECK(exact == coords.size());
+        CHECK(unchanged(gpu, fx, before.value(), stamps.value()) == 0);
+        continue;
+      }
+      CHECK(exact == 0);
+      vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
+      CHECK(after.ok());
+      Snapshot want = before.value();
+      oracle::apply(want, passes, kBand);
+      Snapshot unguarded = before.value();
+      oracle::apply(unguarded, passes, kBand, false);
+      CHECK(want == unguarded);
+      CHECK(matches(after.value(), want, nullptr) == 0);
+      CHECK(largest_change(after.value(), before.value()) >= 100 * kTolerance);
+    }
+  }
   return 0;
 }
 
@@ -839,15 +1155,6 @@ int rule_case() {
   CHECK(r.gauss_clip == float(0.75 * double(t)));
   const d::DeblockPasses lf = d::deblock_passes(row("LF"), t);
   CHECK(lf.linfit && !lf.gauss);
-
-  // The gate: more than half a frame's blocks masked, in integers alone.
-  CHECK(!d::deblock_skips(0, 0) && !d::deblock_skips(0, 1));
-  CHECK(d::deblock_skips(1, 1) && d::deblock_skips(2, 2));
-  CHECK(!d::deblock_skips(1, 2) && !d::deblock_skips(1, 3));
-  CHECK(!d::deblock_skips(16, 32) && d::deblock_skips(17, 32));
-  CHECK(!d::deblock_skips(16, 33) && d::deblock_skips(17, 33));
-  CHECK(!d::deblock_skips(0x7FFFFFFFu, 0xFFFFFFFFu) &&
-        d::deblock_skips(0x80000000u, 0xFFFFFFFFu));
   return 0;
 }
 
@@ -892,7 +1199,7 @@ vkc::Result<vol::VoxelBlockGrid> player_grid(Gpu& gpu,
 // the nearer surface's distance clamped to the band, so every mask is all
 // ones -- a frame the deblock runs on. The fixture's sphere_grid and
 // two_sphere_grid leave the voxels past the band unobserved, as fused depth
-// does: a masked frame, which it skips.
+// does: a masked frame, whose masked blocks it keeps exact.
 vkc::Result<vol::VoxelBlockGrid> full_grid(Gpu& gpu,
                                            const std::vector<Sphere>& spheres) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
@@ -913,22 +1220,6 @@ bool has_unobserved(const Snapshot& s) {
   return std::find(s.weight.begin(), s.weight.end(), 0.0f) != s.weight.end();
 }
 
-// The blocks of @p s that hold an unobserved voxel: a frame's masked blocks.
-std::size_t masked_blocks(const Snapshot& s) {
-  std::size_t out = 0;
-  for (std::size_t b = 0; b < s.coords.size(); ++b) {
-    const auto first = s.weight.begin() + std::ptrdiff_t(b * kVpb);
-    out += std::find(first, first + kVpb, 0.0f) != first + kVpb ? 1 : 0;
-  }
-  return out;
-}
-
-// Whether @p s, a frame's exact decode, is past the gate: more than half its
-// blocks masked, as the fixtures' masked frames are by far.
-bool over_half(const Snapshot& s) {
-  return 2 * masked_blocks(s) > s.coords.size();
-}
-
 // The filter the rule picks for a frame of @p info, resolved: what the
 // decoder should have run.
 const d::DeblockRow* picked(const codec::FrameInfo& info, float* t) {
@@ -939,13 +1230,14 @@ const d::DeblockRow* picked(const codec::FrameInfo& info, float* t) {
 
 // @p on, a decode with the deblock on, against @p exact, the same frame
 // decoded with it off: the oracle's filter of it under @p row at T @p t, the
-// unobserved voxels, weights and blocks exactly the exact decode's, and the
+// masked blocks, weights and blocks exactly the exact decode's, and the
 // field moved.
 int deblocked(const Snapshot& on, const Snapshot& exact,
               const d::DeblockRow& row, float t, float trunc) {
   Snapshot want = exact;
   oracle::apply(want, d::deblock_passes(row, t), trunc);
   CHECK(on.coords == want.coords && on.weight == want.weight);
+  CHECK(masked_kept(on, exact));
   double worst = 0.0, moved = 0.0;
   for (std::size_t i = 0; i < on.tsdf.size(); ++i) {
     if (on.weight[i] < vol::kObservedWeight) {
@@ -962,6 +1254,19 @@ int deblocked(const Snapshot& on, const Snapshot& exact,
   return 0;
 }
 
+// @p got, a decoder's report, against @p exact, the frame's exact decode:
+// @p filter, the frame's blocks, and of them those kept -- the masked ones,
+// or every one when no filter ran.
+int reported(const codec::DeblockInfo& got, const Snapshot& exact,
+             const char* filter) {
+  CHECK(std::strcmp(got.filter, filter) == 0);
+  CHECK(got.block_count == exact.coords.size());
+  const bool off = std::strcmp(filter, "off") == 0;
+  CHECK(got.exact_blocks ==
+        (off ? std::uint32_t(exact.coords.size()) : masked_count(exact)));
+  return 0;
+}
+
 // The largest difference of two decodes' fields, in units of the band.
 double field_distance(const Snapshot& a, const Snapshot& b, float trunc) {
   double worst = 0.0;
@@ -972,10 +1277,10 @@ double field_distance(const Snapshot& a, const Snapshot& b, float trunc) {
   return worst;
 }
 
-// Off by default, and off is the exact decode; on, each frame takes the
-// filter its header picks -- none at a fine step, LF, LG, R by T, and R at
-// a small K -- the oracle's, and not the filter of the next row; the switch
-// read at each decode.
+// Off by default, and off is the exact decode; on, each mask-free frame
+// takes the filter its header picks -- none at a fine step, LF, LG, R by T,
+// and R at a small K -- the oracle's, and not the filter of the next row, no
+// block kept; the switch read at each decode; and the reports.
 int switch_case(Gpu& gpu) {
   vkc::Result<codec::Decoder> made_off = decoder(gpu, false);
   vkc::Result<codec::Decoder> made_on = decoder(gpu, true);
@@ -986,7 +1291,9 @@ int switch_case(Gpu& gpu) {
       codec::Decoder::create(gpu.device, gpu.allocator);
   CHECK(fresh.ok() && !fresh.value().deblock());
   CHECK(std::strcmp(fresh.value().last_deblock().filter, "off") == 0 &&
-        fresh.value().last_deblock().step == 0.0f);
+        fresh.value().last_deblock().step == 0.0f &&
+        fresh.value().last_deblock().block_count == 0 &&
+        fresh.value().last_deblock().exact_blocks == 0);
   CHECK(on.deblock());
 
   const Sphere s{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
@@ -1027,10 +1334,10 @@ int switch_case(Gpu& gpu) {
     const codec::DeblockInfo& got = on.last_deblock();
     std::printf("K %u, scale %g: T %.3f mm, %s\n", setting.k,
                 double(setting.scale), double(got.step) * 1e3, got.filter);
-    CHECK(std::strcmp(got.filter, setting.filter) == 0);
+    CHECK(reported(got, exact.value(), setting.filter) == 0);
     CHECK(got.step == t * kTrunc);
-    CHECK(std::strcmp(off.last_deblock().filter, "off") == 0 &&
-          off.last_deblock().step == got.step);
+    CHECK(reported(off.last_deblock(), exact.value(), "off") == 0);
+    CHECK(off.last_deblock().step == got.step);
     if (chosen == nullptr) {
       CHECK(std::strcmp(setting.filter, "off") == 0);
       CHECK(smoothed.value() == exact.value());
@@ -1047,7 +1354,7 @@ int switch_case(Gpu& gpu) {
         on.decode(frame.value().data(), frame.value().size(), b.value()).ok());
     vkc::Result<Snapshot> again = snapshot(gpu, b.value());
     CHECK(again.ok() && again.value() == exact.value());
-    CHECK(std::strcmp(on.last_deblock().filter, "off") == 0);
+    CHECK(reported(on.last_deblock(), exact.value(), "off") == 0);
     on.set_deblock(true);
   }
   // An empty frame, on.
@@ -1059,6 +1366,7 @@ int switch_case(Gpu& gpu) {
   CHECK(on.decode(empty.value().data(), empty.value().size(), g.value()).ok());
   vkc::Result<Snapshot> none = snapshot(gpu, g.value());
   CHECK(none.ok() && none.value().coords.empty());
+  CHECK(reported(on.last_deblock(), none.value(), "LG") == 0);
   return 0;
 }
 
@@ -1122,6 +1430,9 @@ int chain_case(Gpu& gpu) {
     const d::DeblockRow* row = picked(info.value(), &step);
     CHECK(row != nullptr && std::strcmp(row->filter, "LG") == 0);
     CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
+    CHECK(reported(on_dec.value().last_deblock(), exact.value(), "LG") == 0);
+    CHECK(reported(toggled_dec.value().last_deblock(), exact.value(),
+                   toggled_on ? "LG" : "off") == 0);
     if (toggled_on) {
       CHECK(toggled.value() == on.value());
     } else {
@@ -1172,7 +1483,8 @@ int mixed_filters_case(Gpu& gpu) {
     CHECK(on.ok() && exact.ok() && info.ok());
     CHECK(on.value().coords.size() > last_blocks);
     last_blocks = on.value().coords.size();
-    CHECK(std::strcmp(on_dec.value().last_deblock().filter, f.filter) == 0);
+    CHECK(reported(on_dec.value().last_deblock(), exact.value(), f.filter) ==
+          0);
     float t = 0.0f;
     const d::DeblockRow* row = picked(info.value(), &t);
     if (row == nullptr) {
@@ -1234,13 +1546,13 @@ int rebuild_case(Gpu& gpu) {
   CHECK(dec.rebuild(grid, &m).ok());
   vkc::Result<Snapshot> rebuilt_on = snapshot(gpu, grid);
   CHECK(rebuilt_on.ok() && rebuilt_on.value() == on.value());
-  CHECK(std::strcmp(dec.last_deblock().filter, "LG") == 0);
+  CHECK(reported(dec.last_deblock(), exact.value(), "LG") == 0);
   CHECK(find_row(m, "codec decode") != nullptr);
   dec.set_deblock(false);
   CHECK(dec.rebuild(grid).ok());
   vkc::Result<Snapshot> rebuilt_off = snapshot(gpu, grid);
   CHECK(rebuilt_off.ok() && rebuilt_off.value() == exact.value());
-  CHECK(std::strcmp(dec.last_deblock().filter, "off") == 0);
+  CHECK(reported(dec.last_deblock(), exact.value(), "off") == 0);
 
   // Refused, untouched: a block too many, one too few, other geometry.
   vol::BlockIndex extra{};
@@ -1339,24 +1651,12 @@ int decoder_stamps_case(Gpu& gpu) {
   return 0;
 }
 
-// A grid's stamps, block by block in (z, y, x) order.
-vkc::Result<std::vector<std::uint32_t>> stamps_by_coord(
-    vol::VoxelBlockGrid& grid) {
-  VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VKC_ASSIGN(const std::vector<vol::BlockStamp> stamps,
-             grid.map().read_block_stamps());
-  std::vector<std::uint32_t> out;
-  for (const vol::BlockIndex& b : active) {
-    out.push_back(stamps[std::uint32_t(b.ptr) / kVpb].changed);
-  }
-  return out;
-}
-
 // Masked frames -- the moving spheres with the voxels past the band
-// unobserved, as fused depth leaves them, more than half their blocks
-// masked -- with the switch on: I- and P-frames each the exact decode to the
-// bit, their stamps too, reported "off" with the frame's T, though the rule
-// picks a filter; and rebuilt with the switch on, the exact decode again.
+// unobserved, as fused depth leaves them, most of their blocks masked --
+// with the switch on: I- and P-frames each the oracle's filter of the exact
+// decode, the masked blocks kept to the bit and their stamps the exact
+// decode's, reported by the rule's filter with the masked blocks kept; and
+// rebuilt with the switch on, the decode again.
 int masked_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 4;
@@ -1369,6 +1669,7 @@ int masked_case(Gpu& gpu) {
   CHECK(enc.ok() && on_dec.ok() && off_dec.ok() && on_grid.ok() &&
         off_grid.ok());
   std::size_t p_frames = 0;
+  Snapshot last_on;
   for (int t = 0; t < 6; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = moving_grid(gpu, t, false);
     CHECK(g.ok());
@@ -1393,40 +1694,50 @@ int masked_case(Gpu& gpu) {
     vkc::Result<std::vector<std::uint32_t>> off_stamps =
         stamps_by_coord(off_grid.value());
     CHECK(on.ok() && exact.ok() && on_stamps.ok() && off_stamps.ok());
-    CHECK(over_half(exact.value()));
-    std::printf("masked frame %d: %zu of %zu blocks masked\n", t,
-                masked_blocks(exact.value()), exact.value().coords.size());
-    CHECK(on.value() == exact.value());
-    CHECK(on_stamps.value() == off_stamps.value());
+    const std::uint32_t masked = masked_count(exact.value());
+    std::printf("masked frame %d: %u of %zu blocks masked\n", t, masked,
+                exact.value().coords.size());
+    CHECK(2 * masked > exact.value().coords.size());
     float step = 0.0f;
     const d::DeblockRow* row = picked(info.value(), &step);
     CHECK(row != nullptr);
+    CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
+    for (std::size_t b = 0; b < exact.value().coords.size(); ++b) {
+      if (oracle::masked(exact.value(), b)) {
+        CHECK(on_stamps.value()[b] == off_stamps.value()[b]);
+      }
+    }
     const codec::DeblockInfo& got = on_dec.value().last_deblock();
-    CHECK(std::strcmp(got.filter, "off") == 0 && got.step == step * kTrunc);
+    CHECK(reported(got, exact.value(), row->filter) == 0);
+    CHECK(got.step == step * kTrunc);
     CHECK(off_dec.value().last_deblock().step == got.step);
+    last_on = std::move(on).value();
   }
   CHECK(p_frames == 4);
+  const codec::DeblockInfo decoded = on_dec.value().last_deblock();
   CHECK(on_dec.value().rebuild(on_grid.value()).ok());
   vkc::Result<Snapshot> rebuilt = snapshot(gpu, on_grid.value());
-  vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
-  CHECK(rebuilt.ok() && exact.ok() && rebuilt.value() == exact.value());
-  CHECK(std::strcmp(on_dec.value().last_deblock().filter, "off") == 0);
+  CHECK(rebuilt.ok() && rebuilt.value() == last_on);
+  const codec::DeblockInfo& again = on_dec.value().last_deblock();
+  CHECK(std::strcmp(again.filter, decoded.filter) == 0 &&
+        again.exact_blocks == decoded.exact_blocks &&
+        again.block_count == decoded.block_count);
   return 0;
 }
 
-// The gate's fixture: a mask-free sphere's band blocks, the last dropped
-// when they are odd, so its frames have 2n.
+// The fallback's decoder fixture: a mask-free sphere's band blocks, the last
+// dropped when they are odd, so its frames have 2n.
 std::vector<vr::Vec3i> share_coords(const Sphere& s) {
   std::vector<vr::Vec3i> coords = union_blocks({s});
   if (coords.size() % 2 != 0) coords.pop_back();
   return coords;
 }
 
-// share_coords' grid with @p k of its blocks masked: two voxels of each, in
-// two x-lines, unobserved. The masked blocks are every other one in (z, y, x)
-// order, then those between.
+// share_coords' grid with @p k of its blocks masked: @p holes voxels of
+// each, one or two, in two x-lines, unobserved. The masked blocks are every
+// other one in (z, y, x) order, then those between.
 vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
-                                            std::size_t k) {
+                                            std::size_t k, std::size_t holes) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
   VKC_TRY(allocate(gpu, grid, share_coords(s)));
   VKC_TRY(write_field(
@@ -1440,13 +1751,14 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
                                             "weight"));
   const std::size_t n = active.size();
   const std::size_t evens = (n + 1) / 2;
+  // Local (3, 4, 5), then (5, 1, 2).
+  const std::uint32_t at_local[2] = {3u + 8u * 4u + 64u * 5u, 5u + 8u + 128u};
   for (std::size_t i = 0; i < k && i < n; ++i) {
     const std::size_t at = i < evens ? 2 * i : 2 * (i - evens) + 1;
     const std::uint32_t base = std::uint32_t(active[at].ptr);
-    // Local (3, 4, 5) and (5, 1, 2).
-    for (const std::uint32_t l : {3u + 8u * 4u + 64u * 5u, 5u + 8u + 128u}) {
-      tsdf[base + l] = 0.0f;
-      weight[base + l] = 0.0f;
+    for (std::size_t h = 0; h < holes; ++h) {
+      tsdf[base + at_local[h]] = 0.0f;
+      weight[base + at_local[h]] = 0.0f;
     }
   }
   VKC_TRY(
@@ -1456,20 +1768,22 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
   return grid;
 }
 
-// The gate on a frame of 2n blocks: with one block masked, and with n --
-// exactly half -- the frame is the oracle's filter of its exact decode,
-// unobserved taps and all, reported by its filter; with n + 1 it is the
-// exact decode, reported "off". Rebuilt while paused, each is its decode
-// with the switch on, and the exact decode with it off. Each masked block
-// holds two unobserved voxels in two x-lines, so a count by line rather
-// than by block would skip n.
+// The fallback on a decoded frame of 2n blocks: with one block masked by a
+// single unobserved voxel, and with n masked, each by two, the frame is the
+// oracle's filter of its exact decode, its masked blocks kept to the bit;
+// with all 2n masked it is the exact decode. Each reports the rule's filter
+// and the masked blocks kept, rebuilt while paused is its decode, and
+// rebuilt with the switch off the exact decode, reported "off". Two holes a
+// block in two x-lines, so a count by word or line rather than by block
+// would report more.
 int share_case(Gpu& gpu) {
   const Sphere s{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
   const std::size_t blocks = share_coords(s).size();
   const std::size_t n = blocks / 2;
   CHECK(n >= 2);
-  for (const std::size_t k : {std::size_t(1), n, n + 1}) {
-    vkc::Result<vol::VoxelBlockGrid> source = share_grid(gpu, s, k);
+  for (const std::size_t k : {std::size_t(1), n, blocks}) {
+    const std::size_t holes = k == 1 ? 1 : 2;
+    vkc::Result<vol::VoxelBlockGrid> source = share_grid(gpu, s, k, holes);
     CHECK(source.ok());
     vkc::Result<Bytes> frame = encode_at(gpu, source.value(), 64, 0.2f);
     CHECK(frame.ok());
@@ -1494,39 +1808,40 @@ int share_case(Gpu& gpu) {
     vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
     CHECK(on.ok() && exact.ok());
     CHECK(exact.value().coords.size() == blocks);
-    CHECK(masked_blocks(exact.value()) == k);
+    CHECK(masked_count(exact.value()) == k);
     CHECK(std::size_t(std::count(exact.value().weight.begin(),
-                                 exact.value().weight.end(), 0.0f)) == 2 * k);
+                                 exact.value().weight.end(), 0.0f)) ==
+          holes * k);
     float step = 0.0f;
     const d::DeblockRow* row = picked(info.value(), &step);
     CHECK(row != nullptr && std::strcmp(row->filter, "LG") == 0);
-    const char* reported = on_dec.value().last_deblock().filter;
-    std::printf("%zu of %zu blocks masked: %s\n", k, blocks, reported);
-    if (k > n) {
+    const codec::DeblockInfo got = on_dec.value().last_deblock();
+    std::printf("%zu of %zu blocks masked: %s, %u of %u blocks exact\n", k,
+                blocks, got.filter, got.exact_blocks, got.block_count);
+    CHECK(reported(got, exact.value(), "LG") == 0);
+    if (k == blocks) {
       CHECK(on.value() == exact.value());
-      CHECK(std::strcmp(reported, "off") == 0);
+      CHECK(got.exact_blocks == got.block_count);
     } else {
       CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
-      CHECK(std::strcmp(reported, "LG") == 0);
     }
     CHECK(on_dec.value().rebuild(on_grid.value()).ok());
     vkc::Result<Snapshot> rebuilt = snapshot(gpu, on_grid.value());
     CHECK(rebuilt.ok() && rebuilt.value() == on.value());
-    CHECK(std::strcmp(on_dec.value().last_deblock().filter, reported) == 0);
+    CHECK(reported(on_dec.value().last_deblock(), exact.value(), "LG") == 0);
     on_dec.value().set_deblock(false);
     CHECK(on_dec.value().rebuild(on_grid.value()).ok());
     rebuilt = snapshot(gpu, on_grid.value());
     CHECK(rebuilt.ok() && rebuilt.value() == exact.value());
-    CHECK(std::strcmp(on_dec.value().last_deblock().filter, "off") == 0);
+    CHECK(reported(on_dec.value().last_deblock(), exact.value(), "off") == 0);
   }
   return 0;
 }
 
 // One decoder, the switch on, over a chain whose frames alternate between
-// mask-free and masked past the gate, I- and P-frames of each: every frame
-// the oracle's filter of its exact decode or the exact decode, as its own
-// masks say, with its report, so nothing of one frame's count is left for
-// the next.
+// mask-free and mostly masked, I- and P-frames of each: every frame the
+// oracle's filter of its exact decode, its own masked blocks kept, with its
+// report, so nothing of one frame's flags or count is left for the next.
 int interleaved_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;
@@ -1562,18 +1877,12 @@ int interleaved_case(Gpu& gpu) {
     vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
     CHECK(on.ok() && exact.ok());
     CHECK(has_unobserved(exact.value()) == masked);
-    CHECK(over_half(exact.value()) == masked);
     float step = 0.0f;
     const d::DeblockRow* row = picked(info.value(), &step);
     CHECK(row != nullptr);
-    const char* reported = on_dec.value().last_deblock().filter;
-    if (masked) {
-      CHECK(on.value() == exact.value());
-      CHECK(std::strcmp(reported, "off") == 0);
-    } else {
-      CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
-      CHECK(std::strcmp(reported, row->filter) == 0);
-    }
+    CHECK(deblocked(on.value(), exact.value(), *row, step, kTrunc) == 0);
+    CHECK(reported(on_dec.value().last_deblock(), exact.value(), row->filter) ==
+          0);
   }
   for (const auto& by_type : kinds) {
     CHECK(by_type[0] >= 1 && by_type[1] >= 1);
@@ -1588,7 +1897,7 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 // band, each the oracle's filter of its exact decode, reported by its
 // filter: a sphere's, every mask all ones, and a curtain's, whose sign
 // errors are cut and coded unobserved in a minority of its blocks, as the
-// mesh templates' frames with a cut have them.
+// mesh templates' frames with a cut have them, those blocks kept.
 int true_sdf_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.true_sdf = true;
@@ -1624,16 +1933,16 @@ int true_sdf_case(Gpu& gpu) {
     vkc::Result<Snapshot> exact = snapshot(gpu, off_grid.value());
     CHECK(on.ok() && exact.ok());
     CHECK(has_unobserved(exact.value()) == cut);
-    CHECK(!over_half(exact.value()));
-    std::printf("true SDF %s: %zu of %zu blocks masked\n",
-                cut ? "curtain" : "sphere", masked_blocks(exact.value()),
+    std::printf("true SDF %s: %u of %zu blocks masked\n",
+                cut ? "curtain" : "sphere", masked_count(exact.value()),
                 exact.value().coords.size());
     float step = 0.0f;
     const d::DeblockRow* row = picked(info.value(), &step);
     CHECK(row != nullptr);
     CHECK(deblocked(on.value(), exact.value(), *row, step,
                     info.value().trunc_dist) == 0);
-    CHECK(std::strcmp(on_dec.value().last_deblock().filter, row->filter) == 0);
+    CHECK(reported(on_dec.value().last_deblock(), exact.value(), row->filter) ==
+          0);
   }
   return 0;
 }
@@ -1692,7 +2001,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (order_case(gpu) != 0) return 1;
   if (stamps_case(gpu, deblock) != 0) return 1;
   if (record_case(gpu, deblock) != 0) return 1;
-  if (gate_case(gpu, deblock) != 0) return 1;
+  if (fallback_case(gpu, deblock) != 0) return 1;
   if (switch_case(gpu) != 0) return 1;
   if (chain_case(gpu) != 0) return 1;
   if (mixed_filters_case(gpu) != 0) return 1;

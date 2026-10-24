@@ -82,14 +82,16 @@ double extrapolate(const double* v, int m) {
 // The study's tent: voxel i of n a side takes (n - i - 0.5) / (2n).
 double tent(int i, int n) { return (n - i - 0.5) / (2.0 * n); }
 
-// One axis of the line fit (the study's line_pass and its linfit filter).
-void line_pass(codec_fixture::Snapshot& g, const Blocks& blocks, int axis,
-               double clip, float trunc) {
+// One axis of the line fit (the study's line_pass and its linfit filter),
+// across the faces whose blocks are both @p filtered.
+void line_pass(codec_fixture::Snapshot& g, const Blocks& blocks,
+               const std::vector<std::uint8_t>& filtered, int axis, double clip,
+               float trunc) {
   constexpr int kN = 2, kM = 3;
   const codec_fixture::Snapshot src = g;  // the pass's snapshot
   for (std::size_t b = 0; b < src.coords.size(); ++b) {
     const std::int64_t nb = blocks.find(src.coords[b], axis, 1);
-    if (nb < 0) continue;
+    if (nb < 0 || !filtered[b] || !filtered[std::size_t(nb)]) continue;
     for (int w = 0; w < kB; ++w) {
       for (int u = 0; u < kB; ++u) {
         std::size_t pi[kM], qi[kM];
@@ -129,9 +131,11 @@ void line_pass(codec_fixture::Snapshot& g, const Blocks& blocks, int axis,
 }
 
 // The Gaussian's three passes (the study's gauss_pass, r 1), on the field in
-// float, then the voxels whose bits changed written back in metres.
-void gauss(codec_fixture::Snapshot& g, const Blocks& blocks, double g1,
-           double clip, float trunc) {
+// float, over the @p filtered blocks' voxels, the others kept as they are;
+// then the voxels whose bits changed written back in metres.
+void gauss(codec_fixture::Snapshot& g, const Blocks& blocks,
+           const std::vector<std::uint8_t>& filtered, double g1, double clip,
+           float trunc) {
   const std::size_t n = g.tsdf.size();
   std::vector<std::uint8_t> obs(n);
   std::vector<float> cur(n, 0.0f);
@@ -143,6 +147,7 @@ void gauss(codec_fixture::Snapshot& g, const Blocks& blocks, double g1,
   for (int axis = 0; axis < 3; ++axis) {
     std::vector<float> dst = cur;
     for (std::size_t b = 0; b < g.coords.size(); ++b) {
+      if (!filtered[b]) continue;
       const std::int64_t nbs[3] = {blocks.find(g.coords[b], axis, -1),
                                    std::int64_t(b),
                                    blocks.find(g.coords[b], axis, 1)};
@@ -196,17 +201,29 @@ float study_step_scale(
   return float(t);
 }
 
+bool masked(const codec_fixture::Snapshot& grid, std::size_t b) {
+  for (std::size_t l = 0; l < kV; ++l) {
+    if (grid.weight[b * kV + l] < vol::kObservedWeight) return true;
+  }
+  return false;
+}
+
 void apply(codec_fixture::Snapshot& grid, const d::DeblockPasses& passes,
-           float trunc_dist) {
+           float trunc_dist, bool fallback) {
   const Blocks blocks(grid.coords);
+  std::vector<std::uint8_t> filtered(grid.coords.size(), 1);
+  for (std::size_t b = 0; fallback && b < grid.coords.size(); ++b) {
+    filtered[b] = masked(grid, b) ? 0 : 1;
+  }
   if (passes.linfit) {
     for (int axis = 0; axis < 3; ++axis) {
-      line_pass(grid, blocks, axis, double(passes.line_clip), trunc_dist);
+      line_pass(grid, blocks, filtered, axis, double(passes.line_clip),
+                trunc_dist);
     }
   }
   if (passes.gauss) {
-    gauss(grid, blocks, double(passes.gauss_g1), double(passes.gauss_clip),
-          trunc_dist);
+    gauss(grid, blocks, filtered, double(passes.gauss_g1),
+          double(passes.gauss_clip), trunc_dist);
   }
 }
 

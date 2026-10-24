@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Shared by deblock_line.comp, deblock_gauss.comp and deblock_store.comp, the
-// decoder-side deblock (deblock.hpp has the filters): the bindings and push
-// constants of their one layout, the frame gate, the normalized field, the
-// mask bit, the shell index and the stamp.
+// Shared by deblock_flags.comp, deblock_line.comp, deblock_gauss.comp and
+// deblock_store.comp, the decoder-side deblock (deblock.hpp has the filters):
+// the bindings and push constants of their one layout, the per-block
+// fallback's flags, the normalized field, the shell index and the stamp.
 //
 // ONE WORKGROUP OF kLanes (64) INVOCATIONS PER FRAME BLOCK, the entry
 // item_base + the group's id in the frame's list, found by its coord through
-// the grid's hash; its ptr is never read.
+// the grid's hash; its ptr is never read. deblock_flags.comp alone runs an
+// invocation a block.
 
 #ifndef VR_DEBLOCK_COMMON_GLSL
 #define VR_DEBLOCK_COMMON_GLSL
@@ -22,8 +23,6 @@ const uint kBlockVoxels = 512u;
 const uint kLanes = 64u;
 const uint kMaskWords = 16u;
 const uint kShellVoxels = 296u;  // kBlockVoxels - 6^3
-// The frame gate's divisor, mirroring kDeblockMaskedDivisor (deblock.hpp).
-const uint kMaskedDivisor = 2u;
 
 // The set-0 bindings, mirroring `Binding` in deblock.cpp.
 #define VR_DEBLOCK_BINDING_BLOCKS 0
@@ -33,7 +32,8 @@ const uint kMaskedDivisor = 2u;
 #define VR_DEBLOCK_BINDING_WEIGHT 4
 #define VR_DEBLOCK_BINDING_STAMPS 5
 #define VR_DEBLOCK_BINDING_SHELL 6
-#define VR_DEBLOCK_BINDING_MASKED 7
+#define VR_DEBLOCK_BINDING_FULL 7
+#define VR_DEBLOCK_BINDING_EXACT 8
 
 // BlockIndex, BlockStamp and the read-only hash lookup from the volume tier
 // (one definition; see hash_lookup.glsl).
@@ -88,12 +88,19 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_STAMPS, scalar) buffer Stamps {
 layout(set = 0, binding = VR_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
   float shell[];
 };
-// The frame's masked blocks, those with an unobserved voxel, as the inverse
-// counted them. No deblock dispatch writes it, so each invocation reads the
-// same value.
-layout(set = 0, binding = VR_DEBLOCK_BINDING_MASKED, scalar) readonly buffer
-    MaskedBlocks {
-  uint masked_blocks;
+// The per-block fallback's flags, a word a slot of the grid's heap, zeroed
+// before deblock_flags.comp sets a frame block's to 1 when its mask is all
+// ones: fully observed, which the passes may write. A 0 is a masked block --
+// one holding an unobserved voxel, which keeps its exact decode -- or a slot
+// the frame does not list. Read by the dispatches after it alone.
+layout(set = 0, binding = VR_DEBLOCK_BINDING_FULL, scalar) buffer Full {
+  uint full[];
+};
+// The frame's masked blocks, counted by deblock_flags.comp into a word zeroed
+// before it: the blocks the deblock leaves as decoded.
+layout(set = 0, binding = VR_DEBLOCK_BINDING_EXACT, scalar) buffer
+    ExactBlocks {
+  uint exact_blocks;
 };
 
 // An unobserved voxel's value in the kernels' working field, and a shell
@@ -113,18 +120,24 @@ float vrNormalized(float t) {
   return v;
 }
 
-// Whether the gate skips the frame: more than 1 / kMaskedDivisor of its
-// pc.num_blocks blocks masked, as deblock_skips (deblock.hpp) has it. Every
-// kernel returns first thing when it does, before it reads or writes
-// anything else, and before any barrier: it compares a word no deblock
-// dispatch writes with a push constant, so the return is uniform.
-bool vrFrameSkipped() {
-  return masked_blocks > pc.num_blocks / kMaskedDivisor;
+// Whether the frame observed every voxel of its entry @p entry: its
+// kMaskWords mask words all ones. Each kernel asks it of its own entry first
+// thing, so a masked block's workgroup returns before it probes the hash:
+// every lane reads the same words, so the return is uniform.
+bool vrEntryFull(uint entry) {
+  uint all = ~0u;
+  for (uint w = 0u; w < kMaskWords; ++w) {
+    all &= masks[entry * kMaskWords + w];
+  }
+  return all == ~0u;
 }
 
-// Whether the frame observed voxel @p l of its entry @p entry.
-bool vrMaskObserved(uint entry, uint l) {
-  return ((masks[entry * kMaskWords + l / 32u] >> (l % 32u)) & 1u) != 0u;
+// Whether the block at voxel base @p ptr is fully observed, so the passes may
+// write it: a neighbour's flag. Every lane of a workgroup that asks of one
+// block reads the same word, which no dispatch after deblock_flags.comp
+// writes, so a return on it is uniform.
+bool vrFull(int ptr) {
+  return full[uint(ptr) / kBlockVoxels] != 0u;
 }
 
 // The shell index of local voxel @p p (x, y, z in 0..7): its rank among the

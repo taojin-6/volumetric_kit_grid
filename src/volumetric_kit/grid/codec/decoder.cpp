@@ -86,7 +86,8 @@ core::Status check_geometry(const volume::VoxelBlockGrid& grid,
 }
 
 // What the deblock runs on a frame of @p header, and reports: the rule's
-// filter at the frame's T, or none when @p on is false.
+// filter at the frame's T, or none when @p on is false; reconstruct() adds
+// the blocks it kept.
 struct FrameDeblock {
   DeblockInfo info;
   detail::DeblockPasses passes;
@@ -108,26 +109,26 @@ FrameDeblock frame_deblock(const detail::FrameHeader& header, bool on) {
 
 // The frame's blocks reconstructed from @p blocks into @p grid and deblocked
 // under @p filter, recorded after what @p batch holds and submitted with it,
-// the inverse's reject count and masked-block count read back last. The
-// deblock skips a frame most of whose blocks are masked (detail::deblock_skips,
-// the 2026-10-21 decision's 2026-10-23 amendment), and the result, what it
-// ran, says "off" for it.
+// the deblock's count of the blocks it kept and the inverse's reject count
+// read back last. The result is what ran: the filter, and the blocks it left
+// as decoded, those holding an unobserved voxel (the 2026-10-21 decision's
+// 2026-10-23 amendment), or every block when no filter ran.
 core::Result<DeblockInfo> reconstruct(
     core::CommandBatch& batch, detail::DctTransform& transform,
     detail::Deblock& deblock, volume::VoxelBlockGrid& grid,
     const detail::ResidentBlocks& blocks, const CodecParams& params,
     const FrameDeblock& filter, core::GpuStageScope* stage) {
   VKC_TRY(transform.record_inverse(batch, grid, blocks, params, stage));
-  VKC_TRY(deblock.record(batch, grid, blocks, filter.passes,
-                         transform.masked_blocks(), stage));
+  std::uint32_t exact = 0;
+  VKC_TRY(deblock.record(batch, grid, blocks, filter.passes, exact, stage));
   std::uint32_t rejected = 0;
-  std::uint32_t masked = 0;
-  VKC_TRY(transform.record_rejected(batch, rejected, &masked));
+  VKC_TRY(transform.record_rejected(batch, rejected));
   VKC_TRY(batch.submit());
   VKC_TRY(
       detail::DctTransform::check_rejected("inverse", rejected, blocks.count));
   DeblockInfo ran = filter.info;
-  if (detail::deblock_skips(masked, blocks.count)) ran.filter = "off";
+  ran.block_count = blocks.count;
+  ran.exact_blocks = exact;
   return ran;
 }
 
@@ -222,9 +223,10 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     }
     // Room on the device for its N blocks before anything is recorded: the
     // store's spare, list and sources, the diff's lists, and the deblock's
-    // snapshot. Each, like every buffer the inverse and the deblock bind --
-    // K <= 512 coefficients, 16 mask words and 296 floats of snapshot a
-    // block, 20 bytes of hash entry a slot, 16 bytes of gone list a slot --
+    // flags and snapshot. Each, like every buffer the inverse and the
+    // deblock bind -- K <= 512 coefficients, 16 mask words and 296 floats of
+    // snapshot a block, 20 bytes of hash entry a slot, 16 bytes of gone list
+    // and 4 of flag a slot --
     // is at most the 4-byte tsdf array once the frame fits the heap, and
     // VoxelBlockGrid::create / resize bound that array to
     // maxStorageBufferRange (attribute() confirmed it covers the live grid),
@@ -235,7 +237,8 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     VKC_TRY(store_->reserve(n, header.params.coefficient_count));
     VKC_TRY(lists_->reserve(
         n, static_cast<std::uint32_t>(gp.num_buckets * gp.bucket_size)));
-    VKC_TRY(deblock_->reserve(n, filter.passes));
+    VKC_TRY(deblock_->reserve(n, static_cast<std::uint32_t>(gp.num_blocks),
+                              filter.passes));
     core::CommandBatch batch(*device_, *allocator_);
     VKC_ASSIGN(payload, reader_->record_decode(batch, parsed.value(), &read));
     const detail::FrameBuffers frame = store_->frame_buffers();
@@ -345,7 +348,8 @@ core::Status Decoder::rebuild(volume::VoxelBlockGrid& grid,
   const FrameDeblock filter = frame_deblock(header, deblock_on_);
   VKC_TRY(lists_->reserve(
       n, static_cast<std::uint32_t>(gp.num_buckets * gp.bucket_size)));
-  VKC_TRY(deblock_->reserve(n, filter.passes));
+  VKC_TRY(deblock_->reserve(n, static_cast<std::uint32_t>(gp.num_blocks),
+                            filter.passes));
   {
     // The grid's blocks against the frame's, before anything is written: a
     // block the frame lacks would be read as a neighbour.

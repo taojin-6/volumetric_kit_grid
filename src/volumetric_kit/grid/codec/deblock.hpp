@@ -8,46 +8,54 @@
 ///        faces on the device, by a filter its header's steps choose.
 ///
 /// Internal (under src/, never installed): the `Decoder` runs it, inside the
-/// decode's last submit, when `Decoder::set_deblock` is on, skipping a frame
-/// whose @ref DctTransform::masked_blocks count @ref deblock_skips. It
-/// carries `VR_CODEC_API` so the tier's tests reach it in a shared-library
-/// build.
+/// decode's last submit, when `Decoder::set_deblock` is on. It carries
+/// `VR_CODEC_API` so the tier's tests reach it in a shared-library build.
 ///
 /// The filters are the 2026-10-21 quantization study's, on the field
-/// `v = tsdf / trunc_dist` of observed voxels alone (an unobserved voxel
-/// neither enters the filter nor changes, and a missing block is no
-/// neighbour):
+/// `v = tsdf / trunc_dist`, under the per-block fallback (that decision's
+/// 2026-10-23 amendment): a **masked** block, one holding an unobserved
+/// voxel, keeps its exact decode -- no pass writes it -- and only a **fully
+/// observed** block, its mask all ones, is filtered. A missing block is no
+/// neighbour.
 ///
 /// - **The line fit** (linfit, n 2, m 3). For each axis, x then y then z, and
-///   each block B whose +axis neighbour N exists, each of the 64 lines across
-///   their face: p_i is B's voxel at 7 - i along the axis and q_i N's at i.
-///   When all six of p_0..2 and q_0..2 are observed and none has |v| at or
-///   above 1 - 1e-5 (the clamp's kink), the offset between the two sides'
-///   least-squares lines at the face, `delta = sum_i c_i (q_i - p_i)` with
-///   c = (13, 4, -5) / 12, clipped to +-`line_clip`, is spread as a tent:
-///   p_0 and q_0 move 0.375 delta toward each other, p_1 and q_1 0.125, each
-///   clamped to [-1, 1].
-/// - **The Gaussian** (r 1). Along x, then y, then z, each observed voxel
-///   becomes the mean of itself and its observed axis neighbours, weighted 1
-///   and `gauss_g1`, its change clipped to +-`gauss_clip`, then clamped to
-///   [-1, 1].
+///   each block B whose +axis neighbour N exists, B and N both fully
+///   observed, each of the 64 lines across their face: p_i is B's voxel at
+///   7 - i along the axis and q_i N's at i. When none of p_0..2 and q_0..2
+///   has |v| at or above 1 - 1e-5 (the clamp's kink), the offset between the
+///   two sides' least-squares lines at the face,
+///   `delta = sum_i c_i (q_i - p_i)` with c = (13, 4, -5) / 12, clipped to
+///   +-`line_clip`, is spread as a tent: p_0 and q_0 move 0.375 delta toward
+///   each other, p_1 and q_1 0.125, each clamped to [-1, 1]. A face with a
+///   masked side is not fitted, so the line passes leave both its sides as
+///   they were.
+/// - **The Gaussian** (r 1). Along x, then y, then z, each voxel of a fully
+///   observed block becomes the mean of itself and its observed axis
+///   neighbours, weighted 1 and `gauss_g1`, its change clipped to
+///   +-`gauss_clip`, then clamped to [-1, 1]. A masked block's voxels keep
+///   their values through every pass, so a neighbour's taps read its observed
+///   voxels as decoded; its unobserved ones drop out.
 ///
 /// Each pass reads the field as the previous pass left it. A voxel whose
 /// value comes out with the bits it went in with is not written, so it keeps
 /// its metres exactly.
 ///
-/// On the device: one 64-lane workgroup per frame block in every kernel. The
-/// line passes run in place on `tsdf`, a dispatch an axis: a voxel lies on at
-/// most one line of a pass, read before it is written. The Gaussian is one
-/// fused kernel per block over the block and the 1-voxel halo of its 26
-/// neighbours, x, y and z in shared memory; it writes the block's interior in
-/// place, which no other workgroup reads, and its shell (the voxels with a
-/// coordinate 0 or 7, which neighbours' halos read) into a snapshot by list
-/// position, which a store kernel then copies into `tsdf`. Each block's own
-/// observed voxels come from the frame's masks, a neighbour's from its
-/// weights; blocks are found by coordinate through the grid's hash, so no
-/// list `ptr` is read. A block a pass writes is stamped `changed` with the
-/// map's current tick.
+/// On the device: a first kernel, an invocation a frame block, sets the flag
+/// by slot of each fully observed block, the rest zeroed before it, and
+/// counts the masked blocks, read back into @ref Deblock::record's `exact`.
+/// Then one 64-lane workgroup per frame block in every kernel, which returns
+/// at once for a block its own mask words mark masked. The line passes run in
+/// place on `tsdf`, a dispatch an axis: a voxel lies on at most one line of a
+/// pass, read before it is written. The Gaussian is one fused kernel per
+/// block over the block and the 1-voxel halo of its 26 neighbours, x, y and z
+/// in shared memory; it writes the block's interior in place, which no other
+/// workgroup reads, and its shell (the voxels with a coordinate 0 or 7, which
+/// neighbours' halos read) into a snapshot by list position, which a store
+/// kernel then copies into `tsdf`. A neighbour is fully observed by its flag,
+/// and a masked neighbour's observed voxels are found by their weights;
+/// blocks are found by coordinate through the grid's hash, so no list `ptr`
+/// is read. A block a pass writes is stamped `changed` with the map's
+/// current tick.
 
 #include <cstdint>
 #include <memory>
@@ -68,20 +76,6 @@ namespace volumetric_kit::recon::codec::detail {
 /// A block's shell: its voxels with a coordinate 0 or 7 on some axis, which a
 /// neighbour's 1-voxel halo reaches.
 inline constexpr std::uint32_t kShellVoxels = kVoxelsPerBlock - 6 * 6 * 6;
-
-/// The frame gate's divisor: a frame more than 1 / kDeblockMaskedDivisor of
-/// whose blocks are masked -- hold an unobserved voxel -- is skipped (the
-/// 2026-10-21 deblock decision's 2026-10-23 amendment has the measured
-/// shares that set it). Mirrored in deblock_common.glsl.
-inline constexpr std::uint32_t kDeblockMaskedDivisor = 2;
-
-/// @return Whether the gate skips a frame of @p blocks blocks, @p masked of
-///         them masked: `masked > blocks / kDeblockMaskedDivisor`, so a frame
-///         of 2n blocks runs with n masked and is skipped with n + 1. The
-///         kernels compare the same way.
-constexpr bool deblock_skips(std::uint32_t masked, std::uint32_t blocks) {
-  return masked > blocks / kDeblockMaskedDivisor;
-}
 
 /// @brief One frame's filter, as the kernels take it, in units of the
 ///        normalized field.
@@ -135,17 +129,19 @@ VR_CODEC_API const DeblockRow* deblock_rule(std::uint32_t k, double t_mm);
 ///         `exp(-1 / (2 sigma^2))`, each rounded to float.
 VR_CODEC_API DeblockPasses deblock_passes(const DeblockRow& row, float t);
 
-/// @brief The deblock's kernels and its shell snapshot.
+/// @brief The deblock's kernels, its flags and its shell snapshot.
 ///
-/// The snapshot takes @ref kShellVoxels floats a block of the largest frame a
-/// Gaussian ran on, and grows with 1.5x headroom (`ensure_device_scratch`);
-/// a frame without a Gaussian takes none.
+/// The flags take a word a slot of the largest grid heap a filter ran on, and
+/// the snapshot @ref kShellVoxels floats a block of the largest frame a
+/// Gaussian ran on; each grows with 1.5x headroom (`ensure_device_scratch`),
+/// and a frame without a filter takes neither.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must outlive
 ///          this object. Not thread-safe.
 class VR_CODEC_API Deblock {
  public:
-  /// @brief Build the three kernels and a one-block snapshot.
+  /// @brief Build the four kernels, a one-slot flags buffer and a one-block
+  ///        snapshot.
   /// @return The deblock, or a pipeline, pool or allocation failure.
   static core::Result<std::unique_ptr<Deblock>> create(
       core::Device& device, core::Allocator& allocator);
@@ -156,44 +152,45 @@ class VR_CODEC_API Deblock {
   Deblock(Deblock&&) = delete;
   Deblock& operator=(Deblock&&) = delete;
 
-  /// @brief Make room for a frame of @p n blocks under @p passes -- the
-  ///        snapshot, when a Gaussian runs -- before anything is recorded.
-  /// @return OK; `Status::Code::InvalidArgument` for a snapshot past
+  /// @brief Make room for a frame of @p n blocks in a grid of @p slots block
+  ///        slots under @p passes -- the flags, and the snapshot when a
+  ///        Gaussian runs -- before anything is recorded.
+  /// @return OK; `Status::Code::InvalidArgument` for a buffer past
   ///         `maxStorageBufferRange`, which grows nothing; or an
   ///         allocation's failure.
-  core::Status reserve(std::uint32_t n, const DeblockPasses& passes);
+  core::Status reserve(std::uint32_t n, std::uint32_t slots,
+                       const DeblockPasses& passes);
 
   /// @brief Record @p passes over @p frame's blocks into @p batch, after the
   ///        writes they read (the inverse transform's); the caller submits.
   ///
   /// @p frame must name every block @p grid holds, each once, as a decode
-  /// leaves them: a block it lacks is no neighbour, and one it names twice
+  /// leaves them: a block it lacks reads as masked, and one it names twice
   /// races. Its order and `ptr`s are ignored. Records nothing for passes
-  /// that run nothing or no blocks.
+  /// that run nothing or no blocks. The readback of the masked blocks' count
+  /// comes last, after the passes.
   /// @param batch  The batch to record into; submitted by the caller.
   /// @param grid   The grid, its `tsdf` filtered in place; 4-byte `tsdf` and
   ///               `weight`, `block_size` 8.
   /// @param frame  The frame's list and masks, by list position, as the
   ///               reference store holds them; no reference entries.
   /// @param passes The filter.
-  /// @param masked_blocks A buffer whose first word, written before the
-  ///               dispatches (in this batch or an earlier one), counts the
-  ///               frame's masked blocks. When that count skips the frame
-  ///               (@ref deblock_skips, against @p frame's count), every
-  ///               kernel returns at once, leaving the grid, its stamps and
-  ///               the snapshot as they were; otherwise the passes run.
+  /// @param exact  The blocks the deblock leaves as decoded: the frame's
+  ///               masked blocks, written at submit when the passes run, and
+  ///               every block of @p frame, set here, when they run nothing;
+  ///               must outlive the submit.
   /// @param stage  Optional scope the dispatches record their device spans
   ///               into.
   /// @return OK, or, before anything is recorded,
   ///         `Status::Code::InvalidArgument` for a grid of another block
   ///         size or without float `tsdf` and `weight`, a pass without a
   ///         positive clip, a P-frame's entries, more blocks than the grid's
-  ///         heap or than @ref reserve made room for, buffers smaller than
-  ///         the count or a @p masked_blocks without a word, or a hash
-  ///         table past `maxStorageBufferRange`.
+  ///         heap, or more blocks or slots than @ref reserve made room for,
+  ///         buffers smaller than the count, or a hash table past
+  ///         `maxStorageBufferRange`.
   core::Status record(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
                       const ResidentBlocks& frame, const DeblockPasses& passes,
-                      const core::Buffer& masked_blocks,
+                      std::uint32_t& exact,
                       core::GpuStageScope* stage = nullptr);
 
  private:
@@ -205,12 +202,17 @@ class VR_CODEC_API Deblock {
   std::uint32_t max_workgroup_count_x_ = 0;
   VkDeviceSize max_storage_buffer_range_ = 0;
 
-  // One layout for the three (deblock_common.glsl); declared before pool_,
+  // One layout for the four (deblock_common.glsl); declared before pool_,
   // so the pool is destroyed first.
+  core::ComputeKernel flags_kernel_;
   core::ComputeKernel line_kernel_;
   core::ComputeKernel gauss_kernel_;
   core::ComputeKernel store_kernel_;
   core::DescriptorPool pool_;
+  // The per-block fallback's flags, a word a slot of the grid's heap.
+  core::Buffer full_;
+  // The frame's masked blocks, one word, zeroed in each record's batch.
+  core::Buffer exact_;
   // The Gaussian's shell snapshot, kShellVoxels floats an entry.
   core::Buffer shell_;
 };

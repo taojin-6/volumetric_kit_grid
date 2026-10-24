@@ -6,7 +6,8 @@
 // The deblock's last dispatch (deblock.hpp): each block's shell, as the
 // Gaussian left it in the shell snapshot, copied into tsdf once no
 // workgroup reads it as halo any more. A kUnobserved entry -- an unobserved
-// voxel, or one whose bits the Gaussian kept -- is skipped.
+// voxel, or one whose bits the Gaussian kept -- is skipped, and so is a masked
+// block, whose shell the Gaussian did not write.
 
 #extension GL_GOOGLE_include_directive : require
 #include "deblock_common.glsl"
@@ -19,8 +20,8 @@ shared uint s_wrote;
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
-  // Uniform across the workgroup.
-  if (vrFrameSkipped() || entry >= pc.num_blocks) {
+  // Uniform across the workgroup: a masked block's shell was not written.
+  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
     return;
   }
   if (lane == 0u) {

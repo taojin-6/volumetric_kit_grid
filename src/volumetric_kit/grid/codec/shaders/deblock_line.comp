@@ -9,9 +9,11 @@
 // i < 3. The fit reads three voxels a side and the tent writes two, so a
 // voxel lies on one line of a pass alone -- B's t 0..2 on the face to B's
 // -axis block, its t 5..7 on this one -- and each lane reads its line before
-// it writes it: in place is the snapshot the filter is defined on. B's
-// observed voxels come from the frame's mask, N's from its weights. The next
-// axis is the next dispatch, after the batch's barrier.
+// it writes it: in place is the snapshot the filter is defined on. The face
+// is fitted only when B and N are both fully observed -- B by its own mask,
+// N by its flag (deblock_flags.comp) -- so every sample is observed and a
+// masked block is never written. The next axis is the next dispatch, after
+// the batch's barrier.
 
 #extension GL_GOOGLE_include_directive : require
 #include "deblock_common.glsl"
@@ -33,8 +35,8 @@ ivec3 line_voxel(int t, int u, int w) {
 void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
-  // Uniform across the workgroup.
-  if (vrFrameSkipped() || entry >= pc.num_blocks) {
+  // Uniform across the workgroup: a masked B fits no face.
+  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
     return;
   }
   ivec3 coord = blocks[entry].coord;
@@ -50,61 +52,48 @@ void main() {
     s_wrote_next = 0u;
   }
   barrier();
-  if (s_neighbour[0] < 0 || s_neighbour[next] < 0) {
+  // Uniform: shared values and flags no dispatch of this pass writes.
+  if (s_neighbour[0] < 0 || s_neighbour[next] < 0 ||
+      !vrFull(s_neighbour[next])) {
     return;
   }
 
   int u = int(lane % kEdge);
   int w = int(lane / kEdge);
-  // Every load at once: each side's tsdf, and N's weights.
+  // Every load at once.
   uint ps[3], qs[3];
-  float pt[3], qt[3], qw[3];
-  bool candidate = true;
+  float p[3], q[3];
+  bool saturated = false;
   for (int i = 0; i < 3; ++i) {
-    ivec3 p_voxel = line_voxel(int(kEdge) - 1 - i, u, w);
-    vrCornerStorage(int(kEdge), p_voxel, ps[i]);
+    vrCornerStorage(int(kEdge), line_voxel(int(kEdge) - 1 - i, u, w), ps[i]);
     vrCornerStorage(int(kEdge), line_voxel(int(kEdge) + i, u, w), qs[i]);
-    pt[i] = tsdf[ps[i]];
-    qt[i] = tsdf[qs[i]];
-    qw[i] = weight[qs[i]];
-    uint local = uint(vrLocalIndex(p_voxel, int(kEdge)));
-    candidate = candidate && vrMaskObserved(entry, local);
-  }
-  for (int i = 0; i < 3; ++i) {
-    candidate = candidate && qw[i] >= pc.observed_weight;
+    p[i] = vrNormalized(tsdf[ps[i]]);
+    q[i] = vrNormalized(tsdf[qs[i]]);
+    saturated =
+        saturated || abs(p[i]) >= pc.saturated || abs(q[i]) >= pc.saturated;
   }
   bool wrote_self = false;
   bool wrote_next = false;
-  if (candidate) {
-    float p[3], q[3];
-    bool saturated = false;
-    for (int i = 0; i < 3; ++i) {
-      p[i] = vrNormalized(pt[i]);
-      q[i] = vrNormalized(qt[i]);
-      saturated = saturated || abs(p[i]) >= pc.saturated ||
-                  abs(q[i]) >= pc.saturated;
-    }
-    if (!saturated) {
-      float delta = pc.c0 * (q[0] - p[0]) + pc.c1 * (q[1] - p[1]) +
-                    pc.c2 * (q[2] - p[2]);
-      delta = clamp(delta, -pc.line_clip, pc.line_clip);
-      // The tent over n = 2 voxels a side: (n - i - 0.5) / (2n).
-      const float tent[2] = float[2](0.375, 0.125);
-      for (int i = 0; i < 2; ++i) {
-        float d = delta * tent[i];
-        if (d == 0.0) {
-          continue;
-        }
-        float np = clamp(p[i] + d, -1.0, 1.0);
-        if (floatBitsToUint(np) != floatBitsToUint(p[i])) {
-          tsdf[ps[i]] = np * pc.trunc_dist;
-          wrote_self = true;
-        }
-        float nq = clamp(q[i] - d, -1.0, 1.0);
-        if (floatBitsToUint(nq) != floatBitsToUint(q[i])) {
-          tsdf[qs[i]] = nq * pc.trunc_dist;
-          wrote_next = true;
-        }
+  if (!saturated) {
+    float delta = pc.c0 * (q[0] - p[0]) + pc.c1 * (q[1] - p[1]) +
+                  pc.c2 * (q[2] - p[2]);
+    delta = clamp(delta, -pc.line_clip, pc.line_clip);
+    // The tent over n = 2 voxels a side: (n - i - 0.5) / (2n).
+    const float tent[2] = float[2](0.375, 0.125);
+    for (int i = 0; i < 2; ++i) {
+      float d = delta * tent[i];
+      if (d == 0.0) {
+        continue;
+      }
+      float np = clamp(p[i] + d, -1.0, 1.0);
+      if (floatBitsToUint(np) != floatBitsToUint(p[i])) {
+        tsdf[ps[i]] = np * pc.trunc_dist;
+        wrote_self = true;
+      }
+      float nq = clamp(q[i] - d, -1.0, 1.0);
+      if (floatBitsToUint(nq) != floatBitsToUint(q[i])) {
+        tsdf[qs[i]] = nq * pc.trunc_dist;
+        wrote_next = true;
       }
     }
   }
