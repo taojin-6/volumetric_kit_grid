@@ -1639,7 +1639,9 @@ int true_sdf_case(Gpu& gpu) {
 }
 
 // On, the rows are the decode's: "codec decode", its device half the
-// deblock's dispatches too, over the same three breakdowns, no other.
+// deblock's dispatches too, over the same three breakdowns, no other. Timed,
+// the three tile it, so the deblock's dispatches are a breakdown's:
+// "  ..inverse"'s, whose submit they share.
 int rows_case(Gpu& gpu) {
   vkc::Result<codec::Decoder> dec = decoder(gpu, true);
   vkc::Result<vol::VoxelBlockGrid> source =
@@ -1662,7 +1664,18 @@ int rows_case(Gpu& gpu) {
   vkc::Result<vkc::GpuTimer> probe = vkc::GpuTimer::create(gpu.device);
   CHECK(probe.ok());
   if (probe.value().available()) {
-    CHECK(find_row(m, "codec decode")->has_gpu);
+    const vkc::StageRow* top = find_row(m, "codec decode");
+    CHECK(top->has_gpu);
+    double sum = 0.0;
+    for (std::size_t i = 1; i < want.size(); ++i) {
+      const vkc::StageRow* row = find_row(m, want[i].c_str());
+      CHECK(row->device == vkc::DeviceTime::Measured);
+      sum += row->gpu_ms;
+    }
+    std::fprintf(stderr, "decode: device %.4f ms, ..inverse %.4f\n",
+                 top->gpu_ms, find_row(m, "  ..inverse")->gpu_ms);
+    CHECK(std::fabs(sum - top->gpu_ms) < 1e-9);
+    CHECK(m.total_gpu_ms() == top->gpu_ms);
   }
   return 0;
 }

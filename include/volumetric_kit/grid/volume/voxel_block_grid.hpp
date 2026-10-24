@@ -86,6 +86,11 @@ class VR_VOLUME_API VoxelBlockGrid {
  public:
   /// @brief Create the grid: build the block index, then allocate and zero each
   ///        declared attribute array.
+  ///
+  /// A grid with attributes also builds the kernels @ref remove and
+  /// @ref free_stale_blocks run, so neither builds a pipeline on its first
+  /// call: the first frame a decode or a fuse removes blocks from costs what
+  /// the next does.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator its buffers come from (must outlive this).
   /// @param grid       The grid resolution + hash-table shape.
@@ -209,6 +214,9 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///                least @p count block indices (only `coord` is read).
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional: forwarded to @ref VoxelHashMap::remove.
+  /// @param stage   Optional: the caller's scope, open across the call, whose
+  ///                tile the zeroing and every round of the removal count to;
+  ///                null or inert times nothing.
   /// @return What @ref VoxelHashMap::remove returns, or a non-OK `Status`:
   ///         `Status::Code::InvalidArgument` for a moved-from grid, a
   ///         @p coords `StorageInput::check` refuses, or one past
@@ -216,7 +224,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   ///         before any index is freed.
   core::Result<std::uint32_t> remove(const core::Buffer& coords,
                                      std::uint32_t count,
-                                     AllocFailures* out_failures = nullptr);
+                                     AllocFailures* out_failures = nullptr,
+                                     core::GpuStageScope* stage = nullptr);
 
   /// @brief Empty the grid: clear the block index and zero every attribute.
   ///
@@ -298,7 +307,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// @param max_age  Ticks a block may be neither and stay; at least 1.
   /// The stamping is one workgroup per active block, reading its `weight`
   /// attribute, so this is meant for every few ticks rather than every fuse.
-  /// Its kernels are built on the first call.
+  /// Its kernels are built by @ref create.
   /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
   ///                 spanning the frees too, over the compaction's
   ///                 `"  ..active set"`.
@@ -337,19 +346,20 @@ class VR_VOLUME_API VoxelBlockGrid {
     core::Buffer buffer;
   };
 
-  // Build the block pass's kernels, timer and count on its first call, so a
-  // grid that never runs one never pays for them; the pass also checks for a
-  // float weight, which the zeroing alone does not need.
+  // The block pass's check for a float weight, which the zeroing alone does
+  // not need.
   core::Status prepare_block_pass();
-  core::Status prepare_block_kernels();
+  // Build the zeroing's and the block pass's kernels and count: once, at
+  // create, for a grid with attributes.
+  core::Status build_block_kernels();
   // Record the zero kernel over the first `count` entries of `list`, an
   // attribute a dispatch, each block found by its coord.
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
                            std::uint32_t count, core::GpuStageScope* stage);
   // Every removal's body -- remove's and free_stale_blocks':
   // zero the first `count` blocks `list` names and free them through the
-  // map, in the submit of the map's first round. `list` is the caller's to
-  // check.
+  // map, in the submit of the map's first round, each round tagged with
+  // `stage`. `list` is the caller's to check.
   core::Result<std::uint32_t> zero_and_remove(const core::Buffer& list,
                                               std::uint32_t count,
                                               AllocFailures* out_failures,
@@ -364,8 +374,8 @@ class VR_VOLUME_API VoxelBlockGrid {
   std::vector<Attribute> attributes_;
   // The block pass's kernels (their pool first, so it outlives the sets): the
   // stamp pass, and the zeroing of the stale blocks, a set an attribute. Then
-  // its device timer, and its stale list and count; the list grows to the
-  // most active blocks a pass has seen.
+  // its device timer, made by the first timed pass, and its stale list and
+  // count; the list grows to the most active blocks a pass has seen.
   core::DescriptorPool block_pool_;
   core::ComputeKernel stamp_kernel_;
   core::ComputeKernel zero_kernel_;

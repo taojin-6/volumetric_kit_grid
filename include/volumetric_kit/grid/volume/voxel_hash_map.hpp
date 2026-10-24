@@ -177,6 +177,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional: receives the per-reason split (see
   ///                      @ref AllocFailures). Untouched when null.
+  /// @param stage   Optional: the caller's scope, open across the call, whose
+  ///                tile every round's commands count to; null or inert times
+  ///                nothing.
   /// @return The number of allocations that failed (0 = all succeeded), or a
   ///         non-OK `Status`: `Status::Code::InvalidArgument` for a moved-from
   ///         map, a @p coords `StorageInput::check` refuses, or one past
@@ -188,7 +191,8 @@ class VR_VOLUME_API VoxelHashMap {
   ///         also leave a residue.
   core::Result<std::uint32_t> allocate(const core::Buffer& coords,
                                        std::uint32_t count,
-                                       AllocFailures* out_failures = nullptr);
+                                       AllocFailures* out_failures = nullptr,
+                                       core::GpuStageScope* stage = nullptr);
 
   /// @brief Allocate voxel blocks from a posed depth frame.
   ///
@@ -342,6 +346,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///                      removal, so it runs in the same submit before any
   ///                      index is freed; @ref VoxelBlockGrid::remove zeroes
   ///                      the blocks there.
+  /// @param stage         As @ref allocate's.
   /// @warning This frees the block index but does **not** clear the per-voxel
   ///          attribute data it addressed -- the block index does not know what
   ///          attributes, if any, a consumer declared. The free heap is LIFO,
@@ -362,7 +367,8 @@ class VR_VOLUME_API VoxelHashMap {
   core::Result<std::uint32_t> remove(
       const core::Buffer& coords, std::uint32_t count,
       AllocFailures* out_failures = nullptr,
-      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
+      const std::function<core::Status(core::CommandBatch&)>& first_round = {},
+      core::GpuStageScope* stage = nullptr);
 
   // TODO(volume): a bulk readback; its callers are the remesh-report example
   // and resize's snapshot (the 2026-10-13 volume block-list entry's Next).
@@ -392,11 +398,16 @@ class VR_VOLUME_API VoxelHashMap {
   /// reporting nothing, so the encoder after a mesh extract reuses the
   /// extract's compaction.
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
+  /// @param row      The row's name instead, from a stage whose compaction
+  ///                 must stay apart from another stage's timed into the same
+  ///                 `StageMetrics` (the extract's `"  ..compact"`, beside a
+  ///                 fuse's `"  ..active set"`); string-literal lifetime. Null
+  ///                 names it as @ref compact_active_blocks does.
   /// @return The list, which @ref check_device_block_list accepts until this
   ///         map compacts another, allocates a block, resizes, removes,
   ///         clears or moves; or a non-OK `Status`.
   core::Result<DeviceBlockList> compact_active_blocks_on_device(
-      core::StageMetrics* metrics = nullptr);
+      core::StageMetrics* metrics = nullptr, const char* row = nullptr);
 
   /// @brief Whether @p list is still this map's active set, for a consumer
   ///        that needs every block to ask before it binds the list.
@@ -734,10 +745,12 @@ class VR_VOLUME_API VoxelHashMap {
   /// flag per element at binding 6 (@ref remove_done_), which the kernel sets
   /// on each coord it finishes so later rounds skip it. @p first_round, when
   /// set, records last into the first round's batch, ahead of the dispatch.
+  /// Every round's dispatch is tagged with @p stage.
   core::Result<std::uint32_t> run_input_kernel(
       const char* op, const core::StorageInput& input, std::size_t elem_size,
       std::uint32_t count, const core::ComputeKernel& kernel,
-      AllocFailures* out_failures, bool removes = false,
+      AllocFailures* out_failures, core::GpuStageScope* stage,
+      bool removes = false,
       const std::function<core::Status(core::CommandBatch&)>& first_round = {});
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /

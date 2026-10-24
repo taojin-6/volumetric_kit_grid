@@ -181,7 +181,8 @@ core::Result<Decoder> Decoder::create(core::Device& device,
 core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                              volume::VoxelBlockGrid& grid,
                              core::StageMetrics* metrics) {
-  // Before any refusal, so a refused call still costs its row.
+  // Before any refusal, so a refused call still costs its row. The
+  // breakdowns below tag the commands, and their tiles count here too.
   core::GpuStageScope stage(metrics, gpu_timer_, "codec decode");
   if (!valid()) {
     return fail("moved-from decoder");
@@ -208,7 +209,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     // count the reader will allocate for, so a frame the grid cannot hold is
     // refused here too; a frame the device cannot hold is refused as the
     // reader refuses it.
-    core::StageScope read(metrics, "  ..rans decode");
+    core::GpuStageScope read(metrics, gpu_timer_, "  ..rans decode");
     core::Result<detail::ParsedFrame> parsed = detail::parse_frame(
         data, size, static_cast<std::uint32_t>(gp.num_blocks), store_->held());
     if (!parsed.ok()) {
@@ -236,11 +237,11 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
         n, static_cast<std::uint32_t>(gp.num_buckets * gp.bucket_size)));
     VKC_TRY(deblock_->reserve(n, filter.passes));
     core::CommandBatch batch(*device_, *allocator_);
-    VKC_ASSIGN(payload, reader_->record_decode(batch, parsed.value(), &stage));
+    VKC_ASSIGN(payload, reader_->record_decode(batch, parsed.value(), &read));
     const detail::FrameBuffers frame = store_->frame_buffers();
     VKC_TRY(lists_->record_merge(batch, payload, store_->reference_list(),
-                                 frame, n, &stage));
-    VKC_TRY(lists_->record_diff(batch, grid, *frame.list, n, &stage));
+                                 frame, n, &read));
+    VKC_TRY(lists_->record_diff(batch, grid, *frame.list, n, &read));
     VKC_TRY(batch.submit());
     // Rows 11 and 12, then 13, the last refusal, made before the grid
     // changes.
@@ -253,7 +254,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
 
   // --- The grid's block set made the frame's. ---------------------------
   {
-    core::StageScope apply(metrics, "  ..apply");
+    core::GpuStageScope apply(metrics, gpu_timer_, "  ..apply");
     // What the grid holds that the frame lacks is removed
     // (VoxelBlockGrid::remove zeroes it, so a later reuse of its slot starts
     // fresh), and what the frame holds that the grid lacks is allocated,
@@ -264,7 +265,7 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     for (int round = 0; found.gone != 0; ++round) {
       volume::AllocFailures failures;
       VKC_ASSIGN(const std::uint32_t failed,
-                 grid.remove(lists_->gone(), found.gone, &failures));
+                 grid.remove(lists_->gone(), found.gone, &failures, &apply));
       if (failed == 0) {
         break;
       }
@@ -284,9 +285,9 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
     }
     for (int round = 0; found.missing != 0; ++round) {
       volume::AllocFailures failures;
-      VKC_ASSIGN(
-          const std::uint32_t failed,
-          grid.map().allocate(lists_->missing(), found.missing, &failures));
+      VKC_ASSIGN(const std::uint32_t failed,
+                 grid.map().allocate(lists_->missing(), found.missing,
+                                     &failures, &apply));
       if (failed == 0) {
         break;
       }
@@ -310,12 +311,12 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   // -- is refused there rather than written.
   DeblockInfo ran;
   {
-    core::StageScope inverse(metrics, "  ..inverse");
+    core::GpuStageScope inverse(metrics, gpu_timer_, "  ..inverse");
     core::CommandBatch batch(*device_, *allocator_);
     VKC_ASSIGN(const detail::ResidentBlocks blocks,
-               store_->record_apply(batch, payload, n, &stage));
+               store_->record_apply(batch, payload, n, &inverse));
     VKC_ASSIGN(ran, reconstruct(batch, *transform_, *deblock_, grid, blocks,
-                                header.params, filter, &stage));
+                                header.params, filter, &inverse));
     VKC_TRY(store_->check_apply());
   }
   // Only a decode that succeeded moves the reference.

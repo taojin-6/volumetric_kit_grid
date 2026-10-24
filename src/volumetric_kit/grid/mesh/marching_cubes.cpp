@@ -243,18 +243,16 @@ std::uint64_t max_triangles_for(std::uint64_t max_range) {
   return max_range / (kIndicesPerTriangle * sizeof(std::uint32_t));
 }
 
-// Stopwatch for the opt-in ExtractTimings. Reading the clock is cheap, but it
-// is skipped entirely when the caller wants no measurement, so the untimed path
-// costs one branch per phase.
+// Stopwatch for the opt-in ExtractTimings: host wall clock alone. Reading the
+// clock is cheap, but it is skipped entirely when the caller wants no
+// measurement, so the untimed path costs one branch per phase. The device
+// halves are the stage rows' (extract_device's metrics), tiled inside the
+// submits the phases already make.
 //
-// TODO(mesh): give these phases a device half, but NOT one timed submit each.
-// A timed submit costs ~0.13 ms more than an untimed one on MoltenVK (the first
-// vkCmdWriteTimestamp in a command buffer -- measured, see the 2026-08-09
-// timings decision), and four of six phases here run at or under that, so
-// per-phase timing would report the profiler rather than the extract. Bracket
-// several dispatches inside one timed submit with GpuTimer::begin/end and a
-// single resolve() after it, which is the shape Device::submit_single_time's
-// doc points at.
+// TODO(mesh): one submit per extract. A timed submit costs ~0.13 ms more than
+// an untimed one on MoltenVK (the first vkCmdWriteTimestamp in a command
+// buffer, the 2026-08-09 timings decision), which a timed extract pays for the
+// compaction and again for each attempt.
 class PhaseClock {
  public:
   explicit PhaseClock(bool enabled) : enabled_(enabled) { restart(); }
@@ -431,7 +429,8 @@ void MarchingCubes::release_through(std::uint64_t generation) noexcept {
   released_through_ = std::max(released_through_, generation);
 }
 
-core::Status MarchingCubes::ensure_indirect_command(core::CommandBatch& batch) {
+core::Status MarchingCubes::ensure_indirect_command(
+    core::CommandBatch& batch, core::GpuStageScope* stage) {
   if (!indirect().valid()) {
     // INDIRECT_BUFFER beside STORAGE_BUFFER: the kernel counts into field 0
     // through the storage binding, and a renderer issues
@@ -468,7 +467,7 @@ core::Status MarchingCubes::ensure_indirect_command(core::CommandBatch& batch) {
   // able to read as a stale success.
   //
   // Recorded, not written: it lands in the batch ahead of the dispatch.
-  return batch.upload(indirect(), 0, &reset, sizeof(reset));
+  return batch.upload(indirect(), 0, &reset, sizeof(reset), stage);
 }
 
 void MarchingCubes::disarm_indirect_command() {
@@ -526,7 +525,8 @@ std::uint32_t MarchingCubes::plan_vertex_capacity(
 
 core::Status MarchingCubes::ensure_output_buffers(
     core::CommandBatch& batch, std::uint32_t triangle_capacity,
-    std::uint32_t vertex_capacity, const char* entry) {
+    std::uint32_t vertex_capacity, const char* entry,
+    core::GpuStageScope* stage) {
   // Guard the REQUESTED capacity against the device's binding limit before any
   // growth headroom is added, so a surface that legitimately fits is never
   // rejected because the growth policy overshot.
@@ -558,8 +558,9 @@ core::Status MarchingCubes::ensure_output_buffers(
   // stale tail is never read (indexCount bounds the readback). It happens ABOVE
   // the reuse early-return below, and must stay there: a refit that reallocated
   // nothing still has to hand the retry a zeroed count, or the second dispatch
-  // accumulates onto the first's.
-  VKC_TRY(ensure_indirect_command(batch));
+  // accumulates onto the first's. Untagged, so it joins the tile of the
+  // dispatch it precedes.
+  VKC_TRY(ensure_indirect_command(batch, nullptr));
 
   // Two buffers, two budgets, and each is grown ON ITS OWN.
   //
@@ -668,7 +669,7 @@ core::Status MarchingCubes::ensure_output_buffers(
       std::iota(identity.begin(), identity.end(), std::uint32_t{0});
       core::CommandBatch fill(*device_, *allocator_);
       VKC_TRY(fill.upload(indices_buf, 0, identity.data(),
-                          index_run_bytes_for(target_capacity)));
+                          index_run_bytes_for(target_capacity), stage));
       VKC_TRY(fill.submit());
     }
   }
@@ -837,8 +838,9 @@ core::Result<Mesh> MarchingCubes::extract_host(volume::VoxelBlockGrid& grid,
   // name alone: everything below the entry points reports under whichever one
   // the caller actually called, and borrowing extract_device's would tell a
   // host-only caller to release a slot it never saw.
-  VKC_ASSIGN(const DeviceMesh device_mesh,
-             extract_device_impl(grid, iso, nullptr, timings, kEntryHost));
+  VKC_ASSIGN(
+      const DeviceMesh device_mesh,
+      extract_device_impl(grid, iso, nullptr, timings, nullptr, kEntryHost));
   // The host copy is part of this call's readback, so it belongs in the phase
   // that names it -- the device path's readback_ms is near zero, its command
   // read riding the dispatch's submit, which is right for that entry point but
@@ -945,20 +947,32 @@ core::Result<Mesh> MarchingCubes::download(
 }
 
 core::Result<DeviceMesh> MarchingCubes::extract_device(
-    volume::VoxelBlockGrid& grid, float iso, ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, nullptr, timings, kEntryDevice);
+    volume::VoxelBlockGrid& grid, float iso, ExtractTimings* timings,
+    core::StageMetrics* metrics) {
+  return extract_device_impl(grid, iso, nullptr, timings, metrics,
+                             kEntryDevice);
 }
 
 core::Result<DeviceMesh> MarchingCubes::extract_device(
     volume::VoxelBlockGrid& grid, float iso,
-    const volume::DeviceBlockList& blocks, ExtractTimings* timings) {
-  return extract_device_impl(grid, iso, &blocks, timings, kEntryDevice);
+    const volume::DeviceBlockList& blocks, ExtractTimings* timings,
+    core::StageMetrics* metrics) {
+  return extract_device_impl(grid, iso, &blocks, timings, metrics,
+                             kEntryDevice);
 }
 
 core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     volume::VoxelBlockGrid& grid, float iso,
     const volume::DeviceBlockList* blocks, ExtractTimings* timings,
-    const char* entry) {
+    core::StageMetrics* metrics, const char* entry) {
+  // The first timed call makes the timer, so an extractor nobody times holds
+  // no query pool: a device layered on Metal backs each with one of its few
+  // counter sample buffers. Then the row, before any refusal, so a refused
+  // call still costs it.
+  if (metrics != nullptr && valid() && !gpu_timer_.valid()) {
+    VKC_ASSIGN(gpu_timer_, core::GpuTimer::create(*device_));
+  }
+  core::GpuStageScope stage(metrics, gpu_timer_, "marching cubes");
   // Fully overwrite the caller's struct up front, so the accumulating spans
   // below start from zero and one instance can be reused across frames. A
   // failed call then reports zeros rather than a previous call's numbers.
@@ -1029,8 +1043,11 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   if (blocks != nullptr) {
     on_device = *blocks;
   } else {
-    // The map's last list when nothing has changed since it compacted.
-    VKC_ASSIGN(on_device, grid.map().compact_active_blocks_on_device());
+    // The map's last list when nothing has changed since it compacted; a
+    // compaction is this stage's "  ..compact", apart from a fuse's or an
+    // encode's "  ..active set" timed into the same metrics.
+    VKC_ASSIGN(on_device, grid.map().compact_active_blocks_on_device(
+                              metrics, "  ..compact"));
     // Only this path writes the row: a caller's list was compacted by the
     // caller, not here.
     if (timings != nullptr) timings->compact_ms = phase_clock.lap();
@@ -1088,7 +1105,7 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // it, so a cull that sees nothing costs no submit per frame.
     if (!slots_[slot_].command_empty) {
       core::CommandBatch batch(*device_, *allocator_);
-      VKC_TRY(ensure_indirect_command(batch));
+      VKC_TRY(ensure_indirect_command(batch, &stage));
       VKC_TRY(batch.submit());
       slots_[slot_].command_empty = true;
     }
@@ -1206,7 +1223,7 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // The reset is only recorded, so a failure here disarms what the last
   // extract left in the command -- a grow may already have freed its arena.
   if (core::Status sized =
-          ensure_output_buffers(first, capacity, planned_verts, entry);
+          ensure_output_buffers(first, capacity, planned_verts, entry, &stage);
       !sized.ok()) {
     disarm_indirect_command();
     return sized;
@@ -1263,6 +1280,10 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
 
   std::uint32_t produced_verts = 0;
   IndirectWords words{};
+  // Every attempt's submit, the reset recorded ahead of its dispatch joining
+  // the dispatch's tile; open until the loop ends.
+  std::optional<core::GpuStageScope> dispatch_stage;
+  dispatch_stage.emplace(metrics, gpu_timer_, "  ..dispatch");
   for (int attempt = 0; attempt < 2; ++attempt) {
     SparsePushConstants push{bs,
                              static_cast<std::int32_t>(vpb),
@@ -1314,9 +1335,9 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     // recorded, so each of them has to disarm the command: it still holds the
     // last extract's count, or attempt 0's over-count, over buffers this call
     // may have replaced.
-    static_cast<void>(
-        recon::detail::dispatch_items(*batch, kernel_sparse_, push, num_active,
-                                      1, max_workgroup_count_x_, nullptr));
+    static_cast<void>(recon::detail::dispatch_items(
+        *batch, kernel_sparse_, push, num_active, 1, max_workgroup_count_x_,
+        &*dispatch_stage));
     static_cast<void>(batch->readback(indirect(), 0, sizeof(words), &words));
     if (core::Status ran = batch->submit(); !ran.ok()) {
       disarm_indirect_command();
@@ -1385,7 +1406,8 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     batch = &*retry;
     if (core::Status refit = ensure_output_buffers(
             *retry, produced,
-            std::max(produced_verts, plan_vertex_capacity(produced)), entry);
+            std::max(produced_verts, plan_vertex_capacity(produced)), entry,
+            &stage);
         !refit.ok()) {
       disarm_indirect_command();
       return refit;
@@ -1406,6 +1428,7 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     requested_verts = arena_vertex_capacity();
     if (timings != nullptr) timings->arena_alloc_ms += phase_clock.lap();
   }
+  dispatch_stage.reset();
   // Clamped against what the slot can actually mesh, not against `requested`:
   // this count is what download()'s memcpy and the texturer's `num_vertices`
   // bound run on, so bound it by the buffers that have to hold it rather than

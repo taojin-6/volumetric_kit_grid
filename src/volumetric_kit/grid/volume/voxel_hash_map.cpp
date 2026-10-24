@@ -475,7 +475,7 @@ core::Result<core::Buffer> VoxelHashMap::upload_to_binding(
 core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
     const char* op, const core::StorageInput& input, std::size_t elem_size,
     std::uint32_t count, const core::ComputeKernel& kernel,
-    AllocFailures* out_failures, bool removes,
+    AllocFailures* out_failures, core::GpuStageScope* stage, bool removes,
     const std::function<core::Status(core::CommandBatch&)>& first_round) {
   if (!valid()) {
     return core::Status::invalid_argument(std::string(op) + ": moved-from map");
@@ -505,7 +505,7 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
   return dispatch_with_retry(
       [&](core::CommandBatch& batch) {
         return batch.dispatch(kernel, &push, sizeof(push), group_count(count),
-                              max_workgroup_count_x_);
+                              max_workgroup_count_x_, stage);
       },
       out_failures,
       [&](core::CommandBatch& batch) -> core::Status {
@@ -528,11 +528,13 @@ core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
       });
 }
 
-core::Result<std::uint32_t> VoxelHashMap::allocate(
-    const core::Buffer& coords, std::uint32_t count,
-    AllocFailures* out_failures) {
+core::Result<std::uint32_t> VoxelHashMap::allocate(const core::Buffer& coords,
+                                                   std::uint32_t count,
+                                                   AllocFailures* out_failures,
+                                                   core::GpuStageScope* stage) {
   return run_input_kernel("VoxelHashMap::allocate", core::StorageInput(coords),
-                          sizeof(BlockIndex), count, allocate_, out_failures);
+                          sizeof(BlockIndex), count, allocate_, out_failures,
+                          stage);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
@@ -712,10 +714,11 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
 core::Result<std::uint32_t> VoxelHashMap::remove(
     const core::Buffer& coords, std::uint32_t count,
     AllocFailures* out_failures,
-    const std::function<core::Status(core::CommandBatch&)>& first_round) {
+    const std::function<core::Status(core::CommandBatch&)>& first_round,
+    core::GpuStageScope* stage) {
   return run_input_kernel("VoxelHashMap::remove", core::StorageInput(coords),
                           sizeof(BlockIndex), count, delete_, out_failures,
-                          true, first_round);
+                          stage, true, first_round);
 }
 
 core::Result<RecordedBlockList> VoxelHashMap::record_compaction(
@@ -791,9 +794,9 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::collect_compacted(
 }
 
 // "active set" rather than "compact": rows merge by content, and the mesh tier
-// already publishes a "  ..compact" breakdown for the same call inside its own
-// extract. Two stages' compactions summed under one row is the collision
-// kBreakdownPrefix exists to avoid, not to cause.
+// names its own compaction "  ..compact" (the `row` its extract passes). Two
+// stages' compactions summed under one row is the collision kBreakdownPrefix
+// exists to avoid, not to cause.
 //
 // Which of the two names applies is the caller's nesting, not this call's:
 // under a fusion tier's open stage the host span is already counted by that
@@ -817,11 +820,12 @@ core::Result<std::vector<BlockIndex>> VoxelHashMap::compact_active_blocks(
 }
 
 core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
-    core::StageMetrics* metrics) {
+    core::StageMetrics* metrics, const char* row) {
   // Above the row: a list that still holds is no compaction, so none is
   // reported.
   if (valid() && holds(last_device_list_)) return last_device_list_;
-  core::GpuStageScope stage(metrics, gpu_timer_, active_set_row(metrics));
+  core::GpuStageScope stage(metrics, gpu_timer_,
+                            row != nullptr ? row : active_set_row(metrics));
   if (!valid()) {
     return core::Status::invalid_argument(
         "VoxelHashMap::compact_active_blocks_on_device: moved-from map");

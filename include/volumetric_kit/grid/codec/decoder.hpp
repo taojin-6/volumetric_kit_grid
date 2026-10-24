@@ -183,19 +183,20 @@ class VR_CODEC_API Decoder {
   ///                 frame's `voxel_size` and `trunc_dist` exactly (see
   ///                 @ref read_frame_info).
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
-  ///                 row with both halves -- its device half is the rANS
-  ///                 kernels, the apply, the inverse transform and the
-  ///                 deblock -- over the breakdown rows
+  ///                 row with its host, wait and device halves -- the whole
+  ///                 decode's, the deblock's included -- over the breakdown
+  ///                 rows, each with all three, that tile it:
   ///                 `"  ..rans decode"` (parsing the frame, then one
   ///                 submit: decoding it, merging a P-frame's blocks with
   ///                 its reference's, and diffing the grid's block set
   ///                 against the frame's), `"  ..apply"` (removing and
-  ///                 allocating blocks) and `"  ..inverse"` (making the
-  ///                 frame's blocks from the reference and the payload, the
-  ///                 transform and the deblock, in one submit). Named apart
-  ///                 from the
-  ///                 @ref Encoder's, so both timed into one `StageMetrics`
-  ///                 stay apart. `nullptr` measures nothing.
+  ///                 allocating blocks: the zeroing, the hash deletes and
+  ///                 the allocations, every round) and `"  ..inverse"`
+  ///                 (making the frame's blocks from the reference and the
+  ///                 payload, the transform and the deblock, in one
+  ///                 submit). Named apart from the @ref Encoder's, so both
+  ///                 timed into one `StageMetrics` stay apart. `nullptr`
+  ///                 measures nothing.
   /// @return OK, or: whatever the frame reader refuses
   ///         (`Status::Code::Unsupported`,
   ///         `Status::Code::InvalidArgument` for a malformed or corrupt
@@ -254,7 +255,8 @@ class VR_CODEC_API Decoder {
   /// ran them, stamping as it does. The reference is unchanged.
   /// @param grid     The grid the last decode wrote: the frame's geometry,
   ///                 and exactly its blocks, whatever their values.
-  /// @param metrics  Optional; a `"codec decode"` row with both halves.
+  /// @param metrics  Optional; a `"codec decode"` row with its host, wait and
+  ///                 device halves.
   /// @return OK; `Status::Code::NotFound` before a decode has succeeded;
   ///         `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///         grid @ref decode refuses before it changes one, or one whose

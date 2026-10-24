@@ -13,10 +13,12 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -52,7 +54,8 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 /// The spans are **wall-clock**, and the GPU ones are end-to-end: the dispatch
 /// goes through `Device::submit_single_time`, which blocks on a fence, so
 /// @ref dispatch_ms covers host record *plus* device execution rather than
-/// either alone.
+/// either alone. The device's own time is the stage rows' (`StageMetrics`,
+/// @ref MarchingCubes::extract_device's `metrics`).
 ///
 /// Meshing covers the active set or a listed subset of it, and the buffers are
 /// fitted to the surface rather than to the 5-triangles-per-cell ceiling, so
@@ -541,14 +544,24 @@ class VR_MESH_API MarchingCubes {
   /// @param timings  As @ref extract_host, except
   ///                 @ref ExtractTimings::readback_ms reads near zero, since
   ///                 no vertex copy is made.
+  /// @param metrics  Optional `StageMetrics` collecting a `"marching cubes"`
+  ///                 row with its host, wait and device halves -- the whole
+  ///                 call -- over the breakdown rows of the phases
+  ///                 @ref ExtractTimings names alike: `"  ..compact"`, the
+  ///                 compaction, when the map's last list no longer holds:
+  ///                 @ref volume::VoxelHashMap::compact_active_blocks_on_device
+  ///                 -- and `"  ..dispatch"`, each attempt's submit: the
+  ///                 command reset, the dispatch and the command's readback,
+  ///                 and a refit between two. `nullptr` measures nothing,
+  ///                 writes no timestamp and makes no timer.
   /// @return A `Device`Mesh **borrowing** this extractor's buffers -- valid
   ///         only until the next extract on this object, which overwrites them
   ///         -- or the same failures @ref extract_host reports (including its
   ///         `Status::Code::OutOfMemory` case, and its warning that a failed
   ///         call still invalidates an earlier `Device`Mesh).
-  core::Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid,
-                                          float iso = 0.0f,
-                                          ExtractTimings* timings = nullptr);
+  core::Result<DeviceMesh> extract_device(
+      volume::VoxelBlockGrid& grid, float iso = 0.0f,
+      ExtractTimings* timings = nullptr, core::StageMetrics* metrics = nullptr);
 
   /// @brief Extract as @ref extract_device does, but mesh only @p blocks --
   ///        a device-resident subset of the grid's active set, typically the
@@ -586,6 +599,7 @@ class VR_MESH_API MarchingCubes {
   ///                 ExtractTimings::compact_ms is 0 (the caller compacted) and
   ///                 @ref ExtractTimings::active_blocks reports @p blocks's
   ///                 count.
+  /// @param metrics  As @ref extract_device, with no `"  ..compact"`.
   /// @return The mesh in this extractor's device buffers, borrowed exactly as
   ///         @ref extract_device's is, or that overload's `Status`, plus
   ///         `Status::Code::InvalidArgument` when @p blocks is not this grid's
@@ -594,10 +608,10 @@ class VR_MESH_API MarchingCubes {
   ///         remove, resize or later compaction since would mesh blocks that
   ///         moved. That refusal comes before this call claims an output slot,
   ///         so every outstanding `Device`Mesh stays valid.
-  core::Result<DeviceMesh> extract_device(volume::VoxelBlockGrid& grid,
-                                          float iso,
-                                          const volume::DeviceBlockList& blocks,
-                                          ExtractTimings* timings = nullptr);
+  core::Result<DeviceMesh> extract_device(
+      volume::VoxelBlockGrid& grid, float iso,
+      const volume::DeviceBlockList& blocks, ExtractTimings* timings = nullptr,
+      core::StageMetrics* metrics = nullptr);
 
   /// @brief Copy a `Device`Mesh's live vertices + indices into a host
   ///        @ref Mesh.
@@ -781,6 +795,9 @@ class VR_MESH_API MarchingCubes {
   // fixed at create by MarchingCubesConfig::share_vertices.
   core::ComputeKernel kernel_sparse_;
   core::DescriptorPool pool_;
+  // The timer an extract's stage rows tile its submits in, made by the first
+  // extract a caller passes metrics; empty until then.
+  core::GpuTimer gpu_timer_;
 
   // Triangles the current slot's INDEX RUN can hold (0 when it holds no
   // buffer). Derived from the buffer rather than stored, so the capacity can
@@ -842,7 +859,7 @@ class VR_MESH_API MarchingCubes {
   core::Result<DeviceMesh> extract_device_impl(
       volume::VoxelBlockGrid& grid, float iso,
       const volume::DeviceBlockList* blocks, ExtractTimings* timings,
-      const char* entry);
+      core::StageMetrics* metrics, const char* entry);
 
   // Capacity to *try* for a dispatch over @p num_active blocks whose
   // theoretical ceiling is @p worst_case triangles: the last extract's
@@ -896,11 +913,12 @@ class VR_MESH_API MarchingCubes {
   //
   // The reset is recorded into @p batch, ahead of the dispatch that batch will
   // run. The identity index run a grow fills is submitted on its own, before
-  // the run is committed.
+  // the run is committed, and tagged with @p stage.
   core::Status ensure_output_buffers(core::CommandBatch& batch,
                                      std::uint32_t triangle_capacity,
                                      std::uint32_t vertex_capacity,
-                                     const char* entry);
+                                     const char* entry,
+                                     core::GpuStageScope* stage);
 
   // Vertices to budget for a dispatch planned at @p triangle_capacity
   // triangles: the last extract's measured density, seeded when there is none.
@@ -920,8 +938,10 @@ class VR_MESH_API MarchingCubes {
   // host has to build one from. Split out of ensure_output_buffers because the
   // empty-active-set path needs the command without needing an arena.
   //
-  // The reset is recorded into @p batch rather than written.
-  core::Status ensure_indirect_command(core::CommandBatch& batch);
+  // The reset is recorded into @p batch rather than written, tagged with
+  // @p stage.
+  core::Status ensure_indirect_command(core::CommandBatch& batch,
+                                       core::GpuStageScope* stage);
 
   // Bound the command's indexCount by what the arena can actually hold.
   //

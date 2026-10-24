@@ -128,6 +128,9 @@ core::Result<VoxelBlockGrid> VoxelBlockGrid::create(core::Device& device,
   }
   VKC_TRY(zero.submit());
   vbg.name_attribute_buffers();
+  if (!vbg.attributes_.empty()) {
+    VKC_TRY(vbg.build_block_kernels());
+  }
   return vbg;
 }
 
@@ -312,9 +315,10 @@ std::uint64_t VoxelBlockGrid::bytes_at(
   return bytes;
 }
 
-core::Result<std::uint32_t> VoxelBlockGrid::remove(
-    const core::Buffer& coords, std::uint32_t count,
-    AllocFailures* out_failures) {
+core::Result<std::uint32_t> VoxelBlockGrid::remove(const core::Buffer& coords,
+                                                   std::uint32_t count,
+                                                   AllocFailures* out_failures,
+                                                   core::GpuStageScope* stage) {
   if (!valid()) {
     return core::Status::invalid_argument(
         "VoxelBlockGrid::remove: moved-from grid");
@@ -328,7 +332,7 @@ core::Result<std::uint32_t> VoxelBlockGrid::remove(
                                            bytes));
   VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid::remove: the coords",
                                            bytes, max_storage_buffer_range_));
-  return zero_and_remove(coords, count, out_failures, nullptr);
+  return zero_and_remove(coords, count, out_failures, stage);
 }
 
 core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
@@ -338,16 +342,18 @@ core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
   // actually freed -- so there is nothing to bump here, and no way for the raw
   // map() path to skip it (see VoxelHashMap::topology_epoch).
   if (attributes_.empty()) {
-    return map_.remove(list, count, out_failures);
+    return map_.remove(list, count, out_failures, {}, stage);
   }
   // The zero kernel finds each coord's block in the table itself, so this
   // costs the count, not the grid. It rides the map's first round, ahead of
   // the delete in the same submit, so every block is zeroed before its index
   // is freed.
-  VKC_TRY(prepare_block_kernels());
-  return map_.remove(list, count, out_failures, [&](core::CommandBatch& batch) {
-    return record_zero(batch, list, count, stage);
-  });
+  return map_.remove(
+      list, count, out_failures,
+      [&](core::CommandBatch& batch) {
+        return record_zero(batch, list, count, stage);
+      },
+      stage);
 }
 
 core::Status VoxelBlockGrid::clear() {
@@ -376,13 +382,10 @@ core::Status VoxelBlockGrid::prepare_block_pass() {
     return core::Status::invalid_argument(
         "VoxelBlockGrid: the block pass needs a float weight attribute");
   }
-  return prepare_block_kernels();
+  return {};
 }
 
-core::Status VoxelBlockGrid::prepare_block_kernels() {
-  if (stamp_kernel_.valid()) return {};
-  // Built aside and committed at the end, the stamp kernel last, since it is
-  // what says the pass is built.
+core::Status VoxelBlockGrid::build_block_kernels() {
   VKC_ASSIGN(core::Buffer count,
              core::device_storage_buffer(*allocator_, sizeof(std::uint32_t)));
   VkPushConstantRange stamp_push{};
@@ -401,7 +404,6 @@ core::Status VoxelBlockGrid::prepare_block_kernels() {
   core::KernelSets sets;
   VKC_TRY(sets.reserve(*device_, zero,
                        static_cast<std::uint32_t>(attributes_.size())));
-  VKC_ASSIGN(core::GpuTimer timer, core::GpuTimer::create(*device_));
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device_->physical_device(), &props);
   device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
@@ -411,7 +413,6 @@ core::Status VoxelBlockGrid::prepare_block_kernels() {
   block_pool_ = std::move(pool);
   zero_kernel_ = std::move(zero);
   zero_sets_ = std::move(sets);
-  gpu_timer_ = std::move(timer);
   max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   stamp_kernel_ = std::move(stamp);
   return {};
@@ -460,6 +461,12 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
         "VoxelBlockGrid::free_stale_blocks: max_age must be at least 1");
   }
   VKC_TRY(prepare_block_pass());
+  // The first timed pass makes the timer, so a grid nobody times holds no
+  // query pool: a device layered on Metal backs each with one of its few
+  // counter sample buffers.
+  if (metrics != nullptr && !gpu_timer_.valid()) {
+    VKC_ASSIGN(gpu_timer_, core::GpuTimer::create(*device_));
+  }
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
   VKC_ASSIGN(const std::uint32_t stale, block_pass(max_age, stage, metrics));
   if (stale == 0) return std::uint32_t{0};
