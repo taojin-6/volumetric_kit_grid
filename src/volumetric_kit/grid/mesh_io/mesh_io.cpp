@@ -4,30 +4,39 @@
 #include "volumetric_kit/recon/io/mesh_io.hpp"
 
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
+#include <assimp/DefaultIOSystem.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
+#include <assimp/version.h>
 #include <assimp/Importer.hpp>
 
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
+#include "volumetric_kit/recon/io/textured_mesh.hpp"
 
 namespace volumetric_kit::recon::io {
 namespace {
 
-// Positions are finite and have no negative zero, so equal bits mean equal
-// values.
-struct PositionHash {
-  std::size_t operator()(const std::array<float, 3>& p) const noexcept {
+// A vertex: its position and, in a textured load, its texture coordinates
+// (zero otherwise). Each is finite and none is negative zero, so equal bits
+// mean equal values.
+using VertexKey = std::array<float, 5>;
+
+struct VertexKeyHash {
+  std::size_t operator()(const VertexKey& key) const noexcept {
     std::size_t seed = 0;
-    for (const float value : p) {
+    for (const float value : key) {
       std::uint32_t bits = 0;
       std::memcpy(&bits, &value, sizeof(bits));
       seed ^= std::hash<std::uint32_t>{}(bits) + 0x9e3779b9u + (seed << 6) +
@@ -81,10 +90,43 @@ core::Result<std::array<float, 3>> transform_position(const aiMatrix4x4& m,
   return result;
 }
 
-core::Result<TriangleMesh> import_mesh(const std::string& path) {
+// Assimp's own file access, noting each OBJ material library it opens.
+class MaterialLibraries final : public Assimp::IOSystem {
+ public:
+  explicit MaterialLibraries(std::vector<std::string>* opened)
+      : opened_(opened) {}
+
+  bool Exists(const char* file) const override { return files_.Exists(file); }
+  char getOsSeparator() const override { return files_.getOsSeparator(); }
+  Assimp::IOStream* Open(const char* file, const char* mode) override {
+    Assimp::IOStream* handle = files_.Open(file, mode);
+    std::string extension = std::filesystem::path(file).extension().string();
+    for (char& c : extension) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (handle != nullptr && extension == ".mtl") opened_->push_back(file);
+    return handle;
+  }
+  void Close(Assimp::IOStream* handle) override { files_.Close(handle); }
+  bool ComparePaths(const char* one, const char* second) const override {
+    return files_.ComparePaths(one, second);
+  }
+
+ private:
+  Assimp::DefaultIOSystem files_;
+  std::vector<std::string>* opened_;
+};
+
+// The asset as load_mesh reads it, its errors named "load_mesh". A textured
+// load joins vertices on their texture coordinates too, and reports its own
+// refusals only for an asset load_mesh accepts.
+core::Result<TexturedMesh> import_mesh(const std::string& path, bool textured) {
   VKC_TRY(check_mesh_file(path));
 
+  std::vector<std::string> libraries;
   Assimp::Importer importer;
+  // The importer owns and deletes it.
+  if (textured) importer.SetIOHandler(new MaterialLibraries(&libraries));
   // Keep source coordinates: Collada and FBX importers otherwise apply the
   // file's unit and up axis. Literal names build against releases that lack a
   // property. Assimp before 5.3 still applies Collada's <unit>, and 5.4.x
@@ -93,7 +135,8 @@ core::Result<TriangleMesh> import_mesh(const std::string& path) {
   importer.SetPropertyBool("IMPORT_COLLADA_IGNORE_UNIT_SIZE", true);
   importer.SetPropertyBool("AI_CONFIG_IMPORT_FBX_IGNORE_UP_DIRECTION", true);
   // Avoid repair, approximate vertex joining and automatic scene scaling.
-  // Exact joining below ignores discarded UV/normal/material seams.
+  // Exact joining below ignores normal and material seams, and UV seams but
+  // in a textured load.
   const aiScene* scene = importer.ReadFile(
       path, aiProcess_Triangulate | aiProcess_ValidateDataStructure);
   if (scene == nullptr) {
@@ -119,10 +162,15 @@ core::Result<TriangleMesh> import_mesh(const std::string& path) {
     if (scene->mMeshes[i] != nullptr)
       source_vertices += scene->mMeshes[i]->mNumVertices;
   }
-  std::unordered_map<std::array<float, 3>, std::uint32_t, PositionHash>
-      positions;
-  positions.reserve(source_vertices);
-  TriangleMesh result;
+  std::unordered_map<VertexKey, std::uint32_t, VertexKeyHash> vertices;
+  vertices.reserve(source_vertices);
+  TexturedMesh textured_result;
+  TriangleMesh& result = textured_result.geometry;
+  core::Status refusal;  // A textured load's first own refusal.
+  const auto refuse = [&refusal](core::Status status) {
+    if (refusal.ok()) refusal = std::move(status);
+  };
+  std::optional<std::string> diffuse;
   while (!pending.empty()) {
     const Node node = pending.back();
     pending.pop_back();
@@ -149,20 +197,57 @@ core::Result<TriangleMesh> import_mesh(const std::string& path) {
         return core::Status::invalid_argument(
             "load_mesh: mesh has no positions");
       }
+      const aiVector3D* uvs = textured ? mesh.mTextureCoords[0] : nullptr;
+      if (textured) {
+        if (uvs == nullptr) {
+          refuse(core::Status::not_found(
+              "load_textured_mesh: a mesh has no texture coordinates: " +
+              path));
+        }
+        std::string map;
+        aiString file;
+        if (mesh.mMaterialIndex >= scene->mNumMaterials ||
+            scene->mMaterials[mesh.mMaterialIndex] == nullptr) {
+          refuse(core::Status::invalid_argument(
+              "load_textured_mesh: invalid material index"));
+        } else if (scene->mMaterials[mesh.mMaterialIndex]->GetTexture(
+                       aiTextureType_DIFFUSE, 0, &file) == AI_SUCCESS) {
+          map = file.C_Str();
+        }
+        if (!diffuse) {
+          diffuse = map;
+        } else if (*diffuse != map) {
+          refuse(core::Status::unsupported(
+              "load_textured_mesh: meshes name different diffuse maps"));
+        }
+      }
       std::vector<std::uint32_t> remap(mesh.mNumVertices);
       for (unsigned vertex = 0; vertex < mesh.mNumVertices; ++vertex) {
         VKC_ASSIGN(const auto position,
                    transform_position(world, mesh.mVertices[vertex]));
-        auto found = positions.find(position);
-        if (found == positions.end()) {
+        VertexKey key{position[0], position[1], position[2], 0, 0};
+        if (uvs != nullptr) {
+          const float u = static_cast<float>(uvs[vertex].x);
+          const float v = static_cast<float>(uvs[vertex].y);
+          if (!std::isfinite(u) || !std::isfinite(v)) {
+            refuse(core::Status::invalid_argument(
+                "load_textured_mesh: nonfinite texture coordinate"));
+          } else {
+            key[3] = u == 0 ? 0 : u;  // Canonicalize negative zero.
+            key[4] = v == 0 ? 0 : v;
+          }
+        }
+        auto found = vertices.find(key);
+        if (found == vertices.end()) {
           if (result.positions.size() >=
               std::numeric_limits<std::uint32_t>::max()) {
             return core::Status::out_of_memory(
                 "load_mesh: geometry exceeds 32-bit indexing");
           }
           const auto id = static_cast<std::uint32_t>(result.positions.size());
-          found = positions.emplace(position, id).first;
-          result.positions.push_back({position[0], position[1], position[2]});
+          found = vertices.emplace(key, id).first;
+          result.positions.push_back({key[0], key[1], key[2]});
+          if (textured) textured_result.uvs.push_back({key[3], key[4]});
         }
         remap[vertex] = found->second;
       }
@@ -200,7 +285,33 @@ core::Result<TriangleMesh> import_mesh(const std::string& path) {
   if (result.indices.empty()) {
     return core::Status::invalid_argument("load_mesh: asset has no triangles");
   }
-  return result;
+  VKC_TRY(refusal);
+  if (!diffuse || diffuse->empty()) return textured_result;
+  // Assimp names a texture held in the asset "*<index>".
+  if ((*diffuse)[0] == '*') {
+    return core::Status::unsupported(
+        "load_textured_mesh: embedded diffuse map: " + path);
+  }
+  // An OBJ's texture paths are relative to its material library; other
+  // formats define their materials in the asset itself. Assimp 6 reports an
+  // OBJ's relative to the asset, its library's directory prefixed; earlier
+  // releases, as the library writes them.
+  std::filesystem::path base = std::filesystem::path(path).parent_path();
+  if (!libraries.empty()) {
+    const std::filesystem::path library =
+        std::filesystem::path(libraries.front()).parent_path();
+    for (const std::string& other : libraries) {
+      if (std::filesystem::path(other).parent_path() != library) {
+        return core::Status::unsupported(
+            "load_textured_mesh: material libraries in more than one "
+            "directory: " +
+            path);
+      }
+    }
+    if (aiGetVersionMajor() < 6) base = library;
+  }
+  textured_result.diffuse_texture = (base / *diffuse).string();
+  return textured_result;
 }
 
 }  // namespace
@@ -228,9 +339,19 @@ core::Status check_mesh_file(const std::string& path) try {
 
 core::Result<TriangleMesh> load_mesh(const std::string& path) {
   try {
-    return import_mesh(path);
+    VKC_ASSIGN(TexturedMesh mesh, import_mesh(path, false));
+    return std::move(mesh.geometry);
   } catch (...) {
     return core::exception_status("load_mesh", core::Status::Code::IoError);
+  }
+}
+
+core::Result<TexturedMesh> load_textured_mesh(const std::string& path) {
+  try {
+    return import_mesh(path, true);
+  } catch (...) {
+    return core::exception_status("load_textured_mesh",
+                                  core::Status::Code::IoError);
   }
 }
 
