@@ -154,13 +154,29 @@ class VR_STREAM_API ChunkParser {
   const Session* session() const noexcept;
 
   /// @brief Take the next record, skipping other chunks.
+  ///
+  /// With a payload, the @ref read below into it, resized to fit.
   /// @param[out] record   Its header. Its `offset` is its chunk's offset in
   ///                      the bytes fed, as in the file they would make.
   /// @param[out] payload  Its payload, resized to fit; unspecified after a
-  ///                      failure.
+  ///                      failure. Or null: its body, checked against its
+  ///                      CRC, stays here for @ref read until the next call
+  ///                      of this, which drops it unread.
   /// @return `true` with a record; `false` when it needs more bytes; or the
   ///         failure, as @ref feed returns it.
   core::Result<bool> next(Record* record, std::vector<std::uint8_t>* payload);
+
+  /// @brief Copy the body of the record the last @ref next returned with no
+  ///        payload into caller memory, such as a decoder's input slot.
+  /// @param record    That record.
+  /// @param dst       Receives the body, `record.size` bytes.
+  /// @param capacity  Bytes at @p dst.
+  /// @return OK, the record taken; or, with nothing copied and the record
+  ///         still held, `Status::Code::InvalidArgument` for a null @p dst,
+  ///         a @p capacity under `record.size`, or a record that is not the
+  ///         one held. Nothing is allocated.
+  core::Status read(const Record& record, std::uint8_t* dst,
+                    std::size_t capacity);
 
  private:
   // Check what was fed, up to the next record: true when one is whole and

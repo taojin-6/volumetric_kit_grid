@@ -15,7 +15,9 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/core/vulkan/host_ring.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
@@ -92,6 +94,36 @@ struct DeblockInfo {
 VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
                                                      std::size_t size);
 
+/// @brief A frame recorded into a caller's batch (@ref Decoder::record), for
+///        @ref Decoder::finish or @ref Decoder::abandon once that batch has
+///        resolved.
+///
+/// A token: the decoder keeps what finishing needs, and its next record
+/// supersedes an unfinished one. Its @ref gate lives in the decoder's own
+/// heap-held buffers, so it survives a move of the decoder.
+///
+/// @code
+/// VKC_ASSIGN(core::HostSlot slot, decoder.claim_input(record.size));
+/// VKC_TRY(reader.read(record, slot.data(), slot.capacity()));
+/// VKC_ASSIGN(const codec::PendingDecode frame,
+///            decoder.record(batch, slot, record.size, grid));
+/// @endcode
+struct PendingDecode {
+  /// Which of the decoder's records this is; 0 for none.
+  std::uint64_t serial = 0;
+  /// N: the blocks the grid holds once the frame is in, which an extract
+  /// recorded after it plans for.
+  std::uint32_t blocks = 0;
+  /// 1 once every step succeeded on the device, else 0 (bound 1): what an
+  /// extract recorded after it gates on.
+  volume::DeviceCount gate;
+  /// The slot the record was parsed from (`core::HostSlot`), held so the
+  /// frame can be decoded again (@ref finish_growing).
+  core::HostSlot input;
+  /// The record's bytes at the start of @ref input.
+  std::size_t size = 0;
+};
+
 /// @brief Decodes frames into a caller's @ref volume::VoxelBlockGrid -- the
 ///        codec's playback side (the 2026-09-26 decision).
 ///
@@ -110,7 +142,7 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// The deblock (@ref set_deblock, off by default) smooths each frame it runs
 /// on across its block faces, where quantization leaves steps the mesher
 /// would draw, by a filter the frame's header chooses (@ref DeblockInfo), on
-/// the device inside the decode's last submit. It is out of loop -- a P-frame
+/// the device inside the decode's batch. It is out of loop -- a P-frame
 /// decodes from its reference's coefficients, never from a grid -- so it may
 /// change between any two frames, and it costs no bits. It writes the `tsdf`
 /// of fully observed blocks alone -- a block holding an unobserved voxel keeps
@@ -142,14 +174,20 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 /// with the deblock on, a frame it filters takes 4 bytes a block slot of the
 /// grid's heap, and one whose filter has a Gaussian 1,184 bytes a block
 /// more, each grown with 1.5x headroom. All of it is kept, sized for the
-/// largest frame decoded.
+/// largest frame decoded. The record itself is read in place from one of two
+/// input slots (@ref claim_input), and its results land in one of two
+/// results slots, each a `core::HostRing` slot.
 ///
 /// Everything but I/O and control runs on the device: the rANS decode, one
 /// segment an invocation; the reader's verdict; the merge of a P-frame's
 /// survivors with its new blocks; and the diff of the grid's blocks against
-/// the frame's. The host parses the header and tables and reads back 24
-/// bytes of verdict and counts before the grid changes. A frame the device
-/// cannot hold is refused, never decoded on the host.
+/// the frame's. The host parses the header and tables; every verdict and
+/// count stays on the device, where a one-thread gate judges rows 11 to 13
+/// before the grid changes, and every later grid write in the frame's batch,
+/// the deblock's included, is gated on it. A frame the device refuses changes
+/// neither the grid's blocks nor the reference, but moves the map's
+/// `topology_epoch` and tick. A frame the device cannot hold is refused,
+/// never decoded on the host.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time, and
@@ -157,8 +195,9 @@ VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
 class VR_CODEC_API Decoder {
  public:
   /// @brief Build the kernels: the rANS decoder's, the block lists' (the
-  ///        merge's and the grid diff's among them), the apply's, the
-  ///        inverse transform's and the deblock's.
+  ///        merge's and the grid diff's among them), the gate's, the apply's,
+  ///        the inverse transform's and the deblock's; and make the input and
+  ///        results rings, two slots each.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -187,6 +226,9 @@ class VR_CODEC_API Decoder {
   /// frame's voxels, and blocks new to this one are empty, so it is not worth
   /// meshing. The next successful decode restores it exactly, since each
   /// decode starts from whatever the grid holds.
+  ///
+  /// It is @ref claim_input, a copy of @p data, @ref record, one submit and
+  /// @ref finish.
   /// @param data     The frame.
   /// @param size     Its exact length.
   /// @param grid     The grid to decode into: 4-byte float `tsdf` and
@@ -196,16 +238,16 @@ class VR_CODEC_API Decoder {
   /// @param metrics  Optional `StageMetrics` collecting a `"codec decode"`
   ///                 row with its host, wait and device halves -- the whole
   ///                 decode's, the deblock's included -- over the breakdown
-  ///                 rows, each with all three, that tile it:
-  ///                 `"  ..rans decode"` (parsing the frame, then one
-  ///                 submit: decoding it, merging a P-frame's blocks with
-  ///                 its reference's, and diffing the grid's block set
-  ///                 against the frame's), `"  ..apply"` (removing and
-  ///                 allocating blocks: the zeroing, the hash deletes and
-  ///                 the allocations, every round) and `"  ..inverse"`
-  ///                 (making the frame's blocks from the reference and the
-  ///                 payload, the transform and the deblock, in one
-  ///                 submit). Named apart from the @ref Encoder's, so both
+  ///                 rows, each with all three, that tile its one submit:
+  ///                 `"  ..rans decode"` (parsing the frame, decoding it,
+  ///                 merging a P-frame's blocks with its reference's, and
+  ///                 diffing the grid's block set against the frame's),
+  ///                 `"  ..apply"` (the gate, then removing and allocating
+  ///                 blocks: the zeroing, the hash deletes and the
+  ///                 allocations, every round) and `"  ..inverse"` (making
+  ///                 the frame's blocks from the reference and the payload,
+  ///                 the transform and the deblock, then gathering the
+  ///                 results). Named apart from the @ref Encoder's, so both
   ///                 timed into one `StageMetrics` stay apart. `nullptr`
   ///                 measures nothing.
   /// @return OK, or: whatever the frame reader refuses
@@ -234,18 +276,103 @@ class VR_CODEC_API Decoder {
   ///         @ref volume::VoxelBlockGrid::resize and decoding again recovers
   ///         (@ref decode_growing does both);
   ///         `Status::Code::IoError` only when bucket-lock contention
-  ///         outlasts the retries over a table with room (decode again; a
-  ///         resize would not help); otherwise a buffer or
+  ///         outlasts the device rounds
+  ///         (`volume::VoxelHashMap::kRecordedRounds`) over a table with room
+  ///         (decode again; a resize would not help); otherwise a buffer or
   ///         dispatch failure.
   core::Status decode(const std::uint8_t* data, std::size_t size,
                       volume::VoxelBlockGrid& grid,
                       core::StageMetrics* metrics = nullptr);
 
-  /// @brief Turn the deblock on or off for every frame decoded or rebuilt
-  ///        from here on: on, a frame is smoothed across its block faces by
-  ///        the filter its header picks (none at a fine step), after its
-  ///        inverse transform, in the same submit; off, the default, the grid
-  ///        holds the exact decode.
+  /// @brief A slot of this decoder's input ring with room for a record of
+  ///        @p bytes and the 8 bytes of slack after it: read the record into
+  ///        `data()`, then @ref record it.
+  ///
+  /// Two persistent slots, grown as a larger record asks: one held by a
+  /// recorded frame until its batch has resolved and its token is dropped,
+  /// and one being filled. @ref record zeroes the slack.
+  /// @param bytes  The record's exact size; not 0.
+  /// @return The slot; `Status::Code::InvalidArgument` for a moved-from
+  ///         decoder, 0 bytes, or both slots held; or an allocation failure.
+  core::Result<core::HostSlot> claim_input(std::size_t bytes);
+
+  /// @brief Record decoding the record at the start of @p slot into @p grid,
+  ///        into @p batch: the whole decode, every count on the device,
+  ///        nothing read back.
+  ///
+  /// The host parses the record in place and checks what @ref decode checks
+  /// before the grid changes: the grid, the header, sections and tables, a
+  /// P-frame's reference, and N against the grid's heap. Then it records:
+  /// - the rANS decode, the merge and the diff (`"  ..rans decode"`);
+  /// - the gate, and the removal and allocation rounds, which fold their
+  ///   outcome into @ref PendingDecode::gate (`"  ..apply"`);
+  /// - the apply, the inverse, the deblock as @ref set_deblock stands now
+  ///   (each sized by N and gated), then the results @ref finish reads
+  ///   (`"  ..inverse"`).
+  /// @param batch    Records the decode; the caller submits it.
+  /// @param slot     From @ref claim_input, the record at its start; unchanged
+  ///                 until the batch has resolved.
+  /// @param size     The record's exact length.
+  /// @param grid     As @ref decode takes it; nothing but @p batch changes it
+  ///                 until the batch has resolved.
+  /// @param metrics  As @ref decode's rows: host halves now, device halves
+  ///                 from `PendingBatch::device_rows`.
+  /// @return The pending frame; or, with nothing recorded:
+  ///         - what the frame reader refuses (`Status::Code::Unsupported`;
+  ///           `Status::Code::InvalidArgument` for a malformed frame);
+  ///         - `Status::Code::NotFound` for a P-frame whose reference this
+  ///           decoder does not hold;
+  ///         - `Status::Code::OutOfMemory` for more blocks than the grid's
+  ///           heap (@ref record_growing grows it first) or past free device
+  ///           memory;
+  ///         - `Status::Code::InvalidArgument` for a moved-from decoder, a
+  ///           slot shorter than @p size and its slack, or a grid
+  ///           @ref decode refuses;
+  ///         - or a buffer failure.
+  /// @pre The batch of this decoder's last record has resolved.
+  core::Result<PendingDecode> record(core::CommandBatch& batch,
+                                     const core::HostSlot& slot,
+                                     std::size_t size,
+                                     volume::VoxelBlockGrid& grid,
+                                     core::StageMetrics* metrics = nullptr);
+
+  /// @brief Once @p pending's batch has resolved: judge it and, for a frame
+  ///        that succeeded, make it the reference.
+  ///
+  /// Settles the grid's map from the rounds, reads the results (the verdict,
+  /// row 13's collision, the apply's faults, the inverse's rejects, the
+  /// blocks the deblock kept), then sets @ref last_deblock and
+  /// @ref last_rounds.
+  /// @param pending  From this decoder's last @ref record.
+  /// @param grid     The grid it recorded into.
+  /// @return OK; or, the reference unchanged, the statuses @ref decode
+  ///         returns once a frame is parsed (rows 11 to 13's
+  ///         `Status::Code::InvalidArgument` with the grid's blocks untouched,
+  ///         a heap that refused a removed block, `Status::Code::OutOfMemory`
+  ///         for a table that cannot place the frame, `Status::Code::IoError`
+  ///         for lost races past the rounds, the apply's and the inverse's
+  ///         faults); or `Status::Code::InvalidArgument` for a pending this
+  ///         decoder no longer holds, or another grid.
+  core::Status finish(const PendingDecode& pending,
+                      volume::VoxelBlockGrid& grid);
+
+  /// @brief Drop @p pending without judging it: its batch failed, was never
+  ///        submitted, or ran a frame no longer wanted. The reference stays;
+  ///        the grid holds what the batch left, and the map's heap copy stays
+  ///        as it was, until the next decode.
+  /// @param pending  From this decoder; one it no longer holds is ignored.
+  void abandon(const PendingDecode& pending) noexcept;
+
+  /// @return The most rounds the removal or the allocation ran in the frame
+  ///         the last @ref finish judged (`AllocFailures::rounds`), for M2's
+  ///         histogram; 0 before one.
+  std::uint32_t last_rounds() const noexcept { return last_rounds_; }
+
+  /// @brief Turn the deblock on or off for every frame recorded or rebuilt
+  ///        from here on (@ref record and @ref rebuild read it): on, a frame
+  ///        is smoothed across its block faces by the filter its header picks
+  ///        (none at a fine step), after its inverse transform, in the same
+  ///        batch; off, the default, the grid holds the exact decode.
   ///
   /// The per-block fallback: a block holding an unobserved voxel -- as
   /// nearly every block of a fused RGB-D frame does, and a true-SDF frame's
@@ -265,8 +392,10 @@ class VR_CODEC_API Decoder {
   ///        paused player calls after @ref set_deblock to show the change on
   ///        the frame it shows, without reading the frame again.
   ///
-  /// The inverse transform and the deblock, in one submit, as the decode
-  /// ran them, stamping as it does. The reference is unchanged.
+  /// One batch, submitted and waited on: the diff of the grid's blocks
+  /// against the frame's, then the inverse transform and the deblock as the
+  /// decode records them, gated on that diff and stamping as they do, and
+  /// the results gathered into a results slot. The reference is unchanged.
   /// @param grid     The grid the last decode wrote: the frame's geometry,
   ///                 and exactly its blocks, whatever their values.
   /// @param metrics  Optional; a `"codec decode"` row with its host, wait and
@@ -281,9 +410,8 @@ class VR_CODEC_API Decoder {
   core::Status rebuild(volume::VoxelBlockGrid& grid,
                        core::StageMetrics* metrics = nullptr);
 
-  /// @return What the deblock did to the frame the last successful
-  ///         @ref decode or @ref rebuild left; `"off"` and zeros before
-  ///         one.
+  /// @return What the deblock did to the frame the last @ref finish or
+  ///         @ref rebuild that succeeded left; `"off"` and zeros before one.
   const DeblockInfo& last_deblock() const noexcept { return last_deblock_; }
 
   /// @return `true` if this owns a live transform (`false` when moved-from).
@@ -305,6 +433,7 @@ class VR_CODEC_API Decoder {
   std::unique_ptr<detail::Deblock> deblock_;
   bool deblock_on_ = false;
   DeblockInfo last_deblock_;
+  std::uint32_t last_rounds_ = 0;
   // Device spans for the transform; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;
 };

@@ -227,6 +227,24 @@ class VR_VOLUME_API VoxelBlockGrid {
                                      AllocFailures* out_failures = nullptr,
                                      core::GpuStageScope* stage = nullptr);
 
+  /// @brief Record @ref remove's work into @p batch, the count on the device:
+  ///        the zeroing of every listed block the table holds, then
+  ///        @ref VoxelHashMap::record_remove over the same list, so every
+  ///        block is zeroed before its index is freed. Settle it with
+  ///        `map().settle(...)`.
+  /// @param batch   Records the work; the caller submits it.
+  /// @param coords  As @ref VoxelHashMap::record_remove.
+  /// @param count   As @ref VoxelHashMap::record_remove.
+  /// @param gate    As @ref VoxelHashMap::record_remove; 0 also zeroes nothing.
+  /// @param stage   As @ref VoxelHashMap::record_remove.
+  /// @return As @ref VoxelHashMap::record_remove, and
+  ///         `Status::Code::InvalidArgument` for a moved-from grid.
+  /// @pre As @ref VoxelHashMap::record_remove.
+  core::Result<RecordedRounds> record_remove(
+      core::CommandBatch& batch, const core::Buffer& coords,
+      const DeviceCount& count, const DeviceCount* gate = nullptr,
+      core::GpuStageScope* stage = nullptr);
+
   /// @brief Empty the grid: clear the block index and zero every attribute.
   ///
   /// @ref VoxelHashMap::clear returns every block to the heap, so every

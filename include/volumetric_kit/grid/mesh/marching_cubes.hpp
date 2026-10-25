@@ -10,6 +10,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -78,14 +80,14 @@ struct ExtractTimings {
   double arena_alloc_ms = 0.0;
   /// Writing the kernel's descriptor bindings.
   double descriptor_ms = 0.0;
-  /// Each attempt's submit, including the blocking fence wait: the command
-  /// reset, the marching-cubes dispatch, and the command's readback -- summed
-  /// over both when a refit forced a second one (@ref dispatches).
+  /// The submit and its wait: the sizing, the marching cubes and the finalize
+  /// -- and a refit's too, summed, when one ran (@ref dispatches). Zero for
+  /// @ref MarchingCubes::finish without a refit, whose submit is the caller's.
   double dispatch_ms = 0.0;
   /// Getting the result back to the caller: the vertex copy into the host mesh
   /// when one is made. @ref MarchingCubes::extract_host makes one; @ref
-  /// MarchingCubes::extract_device does not, and its command readback rides
-  /// the dispatch's submit, so there this reads near zero.
+  /// MarchingCubes::extract_device does not, and its counts land in a ring
+  /// slot the dispatch's submit writes, so there this reads near zero.
   double readback_ms = 0.0;
 
   /// Active blocks meshed -- the dispatch's real size (occupancy, not the
@@ -138,6 +140,31 @@ struct ExtractTimings {
     return compact_ms + arena_alloc_ms + descriptor_ms + dispatch_ms +
            readback_ms;
   }
+};
+
+/// @brief An extract recorded into a caller's batch
+///        (@ref MarchingCubes::record_extract), for @ref MarchingCubes::finish
+///        or @ref MarchingCubes::abandon once that batch has resolved.
+///
+/// A token: the extractor keeps what the extract claimed. Its next record
+/// first frees a claim left unfinished, so a dropped token costs no slot.
+///
+/// @code
+/// VKC_ASSIGN(const mesh::PendingExtract pending,
+///            mc.record_extract(batch, grid, frame.blocks, &frame.gate));
+/// VKC_ASSIGN(core::PendingBatch ran,
+///            batch.submit_async({}, {pending.signal}));
+/// VKC_TRY(ran.wait());
+/// VKC_ASSIGN(const std::optional<mesh::DeviceMesh> mesh,
+///            mc.finish(pending, grid));
+/// @endcode
+struct PendingExtract {
+  /// The generation the mesh carries once finished; 0 for none.
+  std::uint64_t generation = 0;
+  /// The value on this extractor's timeline that the batch must set (in
+  /// `CommandBatch::submit_async`'s signals): the mesh's
+  /// `DeviceMesh::ready`.
+  core::TimelinePoint signal{};
 };
 
 /// @brief Extra buffer usage the mesh's *consumer* requires.
@@ -247,16 +274,20 @@ struct MarchingCubesConfig {
   /// @ref MarchingCubes::release_through as its frames complete, and an
   /// extract only ever writes -- or grows, or frees -- a slot that has been
   /// released. That is what makes the immediate destroy safe again, and it is
-  /// why this needs no fence queue inside the library and no semaphore across
-  /// the seam. A cross-library GPU wait is the one thing the shared-queue
-  /// design forbids outright.
+  /// why this needs no fence queue inside the library. A GPU wait on a value
+  /// not yet reached is what the shared-queue design forbids; the consumer's
+  /// wait on `DeviceMesh::ready`, reached at the hand-off, is not one.
   ///
-  /// Size it to the consumer's frames in flight plus one -- and no higher than
-  /// that, because **each slot costs a full vertex arena**. They are sized
-  /// independently (a slot grows when the surface it is handed needs more) and
-  /// none of them ever shrinks, so resident output memory is roughly
-  /// `slot_count` times a single arena. @ref ExtractTimings::arena_bytes
-  /// reports the sum, not one slot's share.
+  /// Size it to the consumer's frames in flight plus one for a producer that
+  /// extracts only once the consumer has taken the last mesh
+  /// (@ref MarchingCubes::extract_device), or plus two for one that records
+  /// its next extract before that take (@ref MarchingCubes::record_extract in
+  /// a frame's batch). No higher, because **each slot costs a full vertex
+  /// arena** (about 19 MiB at rafa2's 200 k triangles, 119 MiB at the live
+  /// room's 1.2 M). They are sized independently (a slot grows when the
+  /// surface it is handed needs more) and none of them ever shrinks, so
+  /// resident output memory is roughly `slot_count` times a single arena.
+  /// @ref ExtractTimings::arena_bytes reports the sum, not one slot's share.
   ///
   /// Extracting with every slot outstanding is a contract violation, reported
   /// rather than silently overwriting a live draw.
@@ -416,7 +447,8 @@ class VR_MESH_API MarchingCubes {
   /// waiting on a value the sibling library has not signalled deadlocks against
   /// a swapchain rebuild, which drains the queue while holding the submit
   /// mutex. Reporting completion after the fact costs nothing and cannot
-  /// deadlock.
+  /// deadlock. The consumer's GPU wait on `DeviceMesh::ready` is no such
+  /// wait: the value is reached before the mesh is handed over.
   ///
   /// Monotonic: a generation already released stays released, and an older
   /// value than the newest reported is ignored rather than un-releasing
@@ -539,6 +571,12 @@ class VR_MESH_API MarchingCubes {
   /// would retire slots another `Device`Mesh is still drawn from). Every
   /// `Device`Mesh this hands out is the caller's to release.
   ///
+  /// It binds the map's device list with its host count -- the list the last
+  /// compaction left while it still holds, so the encoder after an extract
+  /// reuses it -- then records what @ref record_extract records after its
+  /// compaction, submits it once setting the signal, waits, and finishes as
+  /// @ref finish does: one submit where there were two or three.
+  ///
   /// @param grid  As @ref extract_host.
   /// @param iso   As @ref extract_host.
   /// @param timings  As @ref extract_host, except
@@ -550,10 +588,10 @@ class VR_MESH_API MarchingCubes {
   ///                 @ref ExtractTimings names alike: `"  ..compact"`, the
   ///                 compaction, when the map's last list no longer holds:
   ///                 @ref volume::VoxelHashMap::compact_active_blocks_on_device
-  ///                 -- and `"  ..dispatch"`, each attempt's submit: the
-  ///                 command reset, the dispatch and the command's readback,
-  ///                 and a refit between two. `nullptr` measures nothing,
-  ///                 writes no timestamp and makes no timer.
+  ///                 -- `"  ..dispatch"`, the submit: the sizing, the
+  ///                 marching cubes and the finalize -- and `"  ..refit"`, a
+  ///                 refit's. `nullptr` measures nothing, writes no timestamp
+  ///                 and makes no timer.
   /// @return A `Device`Mesh **borrowing** this extractor's buffers -- valid
   ///         only until the next extract on this object, which overwrites them
   ///         -- or the same failures @ref extract_host reports (including its
@@ -612,6 +650,74 @@ class VR_MESH_API MarchingCubes {
       volume::VoxelBlockGrid& grid, float iso,
       const volume::DeviceBlockList& blocks, ExtractTimings* timings = nullptr,
       core::StageMetrics* metrics = nullptr);
+
+  /// @brief Record extracting the @p iso surface of every active block of
+  ///        @p grid into @p batch, after what it already holds, with no count
+  ///        reaching the host.
+  ///
+  /// Records the compaction (`"  ..compact"`), then (`"  ..dispatch"`):
+  /// - a one-thread kernel that sizes the dispatch from the compaction's
+  ///   count, giving zero groups when @p gate is 0, and resets the claimed
+  ///   slot's draw command;
+  /// - the marching cubes;
+  /// - a one-thread finalize that writes the results the host reads.
+  ///
+  /// The arena is planned for @p expected_blocks at the density the last
+  /// extract measured. A slot too small for the plan grows to 1.5x it, as
+  /// every grow does, so a later density rise under that headroom costs no
+  /// refit. If the surface outgrows the index run or the arena, or the
+  /// sharing kernel declines the grid, the finalize zeroes the command's
+  /// `indexCount`, so no draw reads an over-count, and @ref finish refits or
+  /// refuses. Claims an output slot as @ref extract_device does.
+  /// @param batch            Records the extract; the caller submits it,
+  ///                         setting the result's @ref PendingExtract::signal.
+  /// @param grid             As @ref extract_host takes it; its table is
+  ///                         quiescent but for what @p batch records first.
+  /// @param expected_blocks  The active blocks the grid should hold when the
+  ///                         batch reaches the extract (a decoded frame's N,
+  ///                         or `allocated_blocks()`). A wrong guess costs a
+  ///                         refit at @ref finish, never a triangle.
+  /// @param gate             Optional word on the device; 0 meshes nothing.
+  /// @param iso              The iso-value (0 for a TSDF surface).
+  /// @param metrics          Optional: a `"marching cubes"` row over
+  ///                         `"  ..compact"` and `"  ..dispatch"`, host halves
+  ///                         now and device halves from
+  ///                         `PendingBatch::device_rows`.
+  /// @return The pending extract; or, with nothing recorded, the refusals
+  ///         @ref extract_device makes before it claims a slot, or
+  ///         `Status::Code::InvalidArgument` when every slot is outstanding.
+  /// @pre The batch of this extractor's last record has resolved.
+  core::Result<PendingExtract> record_extract(
+      core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+      std::uint32_t expected_blocks, const volume::DeviceCount* gate = nullptr,
+      float iso = 0.0f, core::StageMetrics* metrics = nullptr);
+
+  /// @brief Once @p pending's batch has resolved: the mesh in its slot,
+  ///        stamped ready, or none when its gate was 0.
+  ///
+  /// Reads the finalize's results and records the density the next plan
+  /// reads. If the surface outgrew the slot, it grows the slot (never
+  /// published, so the immediate free is safe) and runs the marching cubes
+  /// again in a batch of its own, blocking (`"  ..refit"`). That batch sets
+  /// the next value on this extractor's timeline, which the mesh's `ready`
+  /// then names.
+  /// @param pending  From this extractor's last @ref record_extract.
+  /// @param grid     The grid it recorded.
+  /// @param timings  As @ref extract_device.
+  /// @param metrics  Optional: a refit's `"  ..refit"` row.
+  /// @return The mesh; `std::nullopt` when the gate was 0, the slot back
+  ///         unpublished as by @ref abandon; `Status::Code::InvalidArgument`
+  ///         for a pending this extractor no longer holds, a batch that did
+  ///         not set its signal, a grid the sharing kernel declined, or an
+  ///         active set past 32-bit counters; or a refit's failure.
+  core::Result<std::optional<DeviceMesh>> finish(
+      const PendingExtract& pending, volume::VoxelBlockGrid& grid,
+      ExtractTimings* timings = nullptr, core::StageMetrics* metrics = nullptr);
+
+  /// @brief Drop @p pending unpublished (its frame was refused, or is meshed
+  ///        again), freeing its slot for the next extract.
+  /// @param pending  From this extractor; one it no longer holds is ignored.
+  void abandon(const PendingExtract& pending) noexcept;
 
   /// @brief Copy a `Device`Mesh's live vertices + indices into a host
   ///        @ref Mesh.

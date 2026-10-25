@@ -12,6 +12,7 @@
 
 #include <cstdint>
 
+#include "volumetric_kit/core/vulkan/sync.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 
 namespace volumetric_kit::recon::mesh {
@@ -125,6 +126,13 @@ struct DeviceMesh {
   /// buffer handles borrow its storage -- a view must not outlive its producer,
   /// and must not be held across a move of it.
   const std::uint64_t* live_generation = nullptr;
+  /// The timeline value set by the batch that wrote this mesh, already
+  /// reached when the mesh is handed over. A consumer on another queue waits
+  /// for it before drawing (gfx's `FrameWait` at
+  /// `VERTEX_INPUT | DRAW_INDIRECT`), which makes the writes visible there.
+  /// It names the producing extractor's timeline, so it must not outlive that
+  /// extractor; it does survive a move of it.
+  core::TimelinePoint ready{};
 
   /// @return `true` when this view is the producer's *newest* extract.
   ///

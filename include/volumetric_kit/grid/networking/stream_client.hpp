@@ -109,7 +109,8 @@ class VR_NETWORKING_API StreamClient {
   ///                      has come; `milliseconds::max()` has no end.
   /// @param[out] record   Its header. Its `offset` is the chunk's offset in
   ///                      the bytes received, as in the file they would make.
-  /// @param[out] payload  Its payload, resized to fit.
+  /// @param[out] payload  Its payload, resized to fit; or null to leave it
+  ///                      for @ref read, as `stream::ChunkParser::next` does.
   /// @return `true` with a record; `false` when none was whole by then;
   ///         `Status::Code::NotFound` for a name that does not resolve;
   ///         `Status::Code::IoError` for a lookup that fails otherwise, a
@@ -131,7 +132,8 @@ class VR_NETWORKING_API StreamClient {
   /// @brief Read as @ref next, also reporting progress without a whole record.
   /// @param wait          The longest wait, as in the three-argument overload.
   /// @param[out] record   The next record's header, when one is returned.
-  /// @param[out] payload  Its payload, resized to fit, when one is returned.
+  /// @param[out] payload  Its payload, resized to fit, when one is returned;
+  ///                      or null, as in the three-argument overload.
   /// @param[out] progressed Optional; reset to false on every call. True if
   ///                       the call returned a record (already buffered or
   ///                       newly received), completed a lookup/connect step,
@@ -147,6 +149,26 @@ class VR_NETWORKING_API StreamClient {
   core::Result<bool> next(std::chrono::milliseconds wait,
                           stream::Record* record,
                           std::vector<std::uint8_t>* payload, bool* progressed);
+
+  /// @brief Copy the payload of the record the last @ref next returned with
+  ///        no payload into caller memory, such as a decoder's input slot:
+  ///        no host vector between the socket's bytes and the slot.
+  ///
+  /// @code
+  /// VKC_ASSIGN(const bool got, client->next(10ms, &record, nullptr));
+  /// if (got) {
+  ///   VKC_ASSIGN(core::HostSlot slot, decoder.claim_input(record.size));
+  ///   VKC_TRY(client->read(record, slot.data(), slot.capacity()));
+  /// }
+  /// @endcode
+  /// @param record    That record.
+  /// @param dst       Receives the payload, `record.size` bytes.
+  /// @param capacity  Bytes at @p dst.
+  /// @return OK; or `stream::ChunkParser::read`'s refusals, which leave the
+  ///         connection open and the record held; or the connection's error,
+  ///         as @ref next returns it.
+  core::Status read(const stream::Record& record, std::uint8_t* dst,
+                    std::size_t capacity);
 
  private:
   struct Impl;
