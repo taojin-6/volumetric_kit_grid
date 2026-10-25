@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 #include <string>
 #include <utility>
 
@@ -17,6 +18,7 @@
 #include "frame_hash.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/base/check.hpp"
+#include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -221,7 +223,7 @@ core::Result<core::HostSlot> Decoder::claim_input(std::size_t bytes) {
 
 core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
                              volume::VoxelBlockGrid& grid,
-                             core::StageMetrics* metrics) {
+                             core::StageMetrics* metrics) try {
   if (!valid()) {
     core::GpuStageScope stage(metrics, gpu_timer_, "codec decode");
     return fail("moved-from decoder");
@@ -238,11 +240,14 @@ core::Status Decoder::decode(const std::uint8_t* data, std::size_t size,
   }
   std::memcpy(slot->data(), data, size);
   return decode(*slot, size, grid, metrics);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Decoder::decode",
+                                core::Status::Code::OutOfMemory);
 }
 
 core::Status Decoder::decode(const core::HostSlot& slot, std::size_t size,
                              volume::VoxelBlockGrid& grid,
-                             core::StageMetrics* metrics) {
+                             core::StageMetrics* metrics) try {
   // Before any refusal, so a refused call still costs its row; its wait,
   // and the device halves the batch hands back, land in it too.
   core::GpuStageScope stage(metrics, gpu_timer_, "codec decode");
@@ -263,15 +268,21 @@ core::Status Decoder::decode(const core::HostSlot& slot, std::size_t size,
     return ran;
   }
   return finish(pending, grid);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Decoder::decode",
+                                core::Status::Code::OutOfMemory);
 }
 
 core::Result<PendingDecode> Decoder::record(core::CommandBatch& batch,
                                             const core::HostSlot& slot,
                                             std::size_t size,
                                             volume::VoxelBlockGrid& grid,
-                                            core::StageMetrics* metrics) {
+                                            core::StageMetrics* metrics) try {
   core::GpuStageScope stage(metrics, gpu_timer_, "codec decode");
   return record_frame(batch, slot, size, grid, metrics);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Decoder::record",
+                                core::Status::Code::OutOfMemory);
 }
 
 core::Result<PendingDecode> Decoder::record_frame(core::CommandBatch& batch,
@@ -317,6 +328,25 @@ core::Result<PendingDecode> Decoder::record_frame(core::CommandBatch& batch,
         " (the grid's num_blocks); grow it with VoxelBlockGrid::resize and "
         "decode again");
   }
+  // Prepare the replacement before superseding an unfinished record, so a
+  // host allocation failure leaves that token finishable. Its batch has
+  // resolved (the @pre), so the ring's other results slot is free.
+  auto recorded = std::make_unique<detail::RecordedFrame>();
+  core::Result<core::HostSlot> results =
+      results_->claim(sizeof(detail::DecodeResults));
+  VKC_CHECK(results.ok(),
+            "Decoder::record: the last record's batch has resolved, so a "
+            "results slot is free");
+  recorded->reference =
+      detail::FrameReference{detail::frame_hash(data, size), header};
+  recorded->new_count = parsed->new_count;
+  recorded->deblock = filter.info;
+  recorded->filtered = filter.runs();
+  recorded->results = std::move(results).value();
+  recorded->grid = &grid;
+  // Reserving a larger frame may replace the spare buffers this token
+  // needs, so retire it before any reserve can invalidate those contents.
+  pending_.reset();
   // Room on the device for its N blocks before anything is recorded: the
   // store's spare, list and sources, the diff's lists, and the deblock's
   // flags and snapshot. Each, like every buffer the inverse and the
@@ -336,22 +366,6 @@ core::Result<PendingDecode> Decoder::record_frame(core::CommandBatch& batch,
   VKC_TRY(lists_->reserve(n, slots));
   VKC_TRY(deblock_->reserve(n, static_cast<std::uint32_t>(gp.num_blocks),
                             filter.passes));
-  // A record left unfinished is superseded. Its batch has resolved (the
-  // @pre), so a results slot is free.
-  pending_.reset();
-  core::Result<core::HostSlot> results =
-      results_->claim(sizeof(detail::DecodeResults));
-  VKC_CHECK(results.ok(),
-            "Decoder::record: the last record's batch has resolved, so a "
-            "results slot is free");
-  auto recorded = std::make_unique<detail::RecordedFrame>();
-  recorded->reference =
-      detail::FrameReference{detail::frame_hash(data, size), header};
-  recorded->new_count = parsed->new_count;
-  recorded->deblock = filter.info;
-  recorded->filtered = filter.runs();
-  recorded->results = std::move(results).value();
-  recorded->grid = &grid;
   // Stands in for the zero pad a staged payload had.
   std::memset(data + size, 0, kSlack);
 

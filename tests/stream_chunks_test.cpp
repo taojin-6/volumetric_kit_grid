@@ -629,6 +629,49 @@ int parser_read_case(const std::string& dir) {
   return 0;
 }
 
+// A matching offset alone does not identify the held record. Both a shorter
+// body and one larger than the buffered chunk must be refused, as must altered
+// metadata. Each refusal leaves the destination and the held record intact.
+int parser_read_identity_case() {
+  auto encoder = stream::ChunkEncoder::create(session_of(2));
+  CHECK(encoder.ok());
+  const Bytes payload{1, 2, 3};
+  const auto framing =
+      encoder->frame(info(0, true, 100, 1, 5), payload.data(), payload.size());
+  CHECK(framing.ok());
+  Bytes bytes = encoder->session_chunk();
+  append_chunk(bytes, *framing, payload);
+  stream::ChunkParser parser;
+  CHECK(parser.feed(bytes.data(), bytes.size()).ok());
+  stream::Record record;
+  const auto got = parser.next(&record, nullptr);
+  CHECK(got.ok() && got.value());
+
+  std::vector<stream::Record> changed(8, record);
+  changed[0].size = 2;
+  changed[1].size = 4096;
+  changed[2].size = 0;
+  changed[3].info.track = 1;
+  changed[4].info.key = false;
+  changed[5].info.pts_ns += 1;
+  changed[6].info.seq += 1;
+  changed[7].info.set += 1;
+  Bytes slot(4096, 0xEE);
+  const Bytes untouched = slot;
+  for (const auto& other : changed) {
+    CHECK(parser.read(other, slot.data(), slot.size()).domain() ==
+          Code::InvalidArgument);
+    CHECK(slot == untouched);
+  }
+  CHECK(parser.read(record, slot.data(), slot.size()).ok());
+  CHECK(std::equal(payload.begin(), payload.end(), slot.begin()));
+  CHECK(std::equal(slot.begin() + std::ptrdiff_t(payload.size()), slot.end(),
+                   untouched.begin() + std::ptrdiff_t(payload.size())));
+  const auto end = parser.next(&record, nullptr);
+  CHECK(end.ok() && !end.value());
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -642,6 +685,7 @@ int main() {
   if (parser_refusals_case(dir) != 0) return 1;
   if (parser_latch_case(dir) != 0) return 1;
   if (parser_read_case(dir) != 0) return 1;
+  if (parser_read_identity_case() != 0) return 1;
   std::puts("stream chunks: OK");
   return 0;
 }

@@ -153,6 +153,19 @@ core::Status ChunkParser::read(const Record& record, std::uint8_t* dst,
       return core::Status::invalid_argument(
           "ChunkParser::read: the record is not the one next returned last");
     }
+    const std::uint8_t* const at =
+        buffer_.data() + static_cast<std::size_t>(next_ - base_);
+    detail::Chunk c;
+    (void)detail::decode_chunk(
+        at, detail::load_le32(at + 4),
+        static_cast<std::uint32_t>(session_->tracks.size()), &c);
+    const RecordInfo& info = record.info;
+    if (c.body_bytes != record.size || c.record.track != info.track ||
+        c.record.key != info.key || c.record.pts_ns != info.pts_ns ||
+        c.record.seq != info.seq || c.record.set != info.set) {
+      return core::Status::invalid_argument(
+          "ChunkParser::read: the record does not match its held header");
+    }
     if (capacity < record.size || (dst == nullptr && record.size != 0)) {
       return core::Status::invalid_argument(
           "ChunkParser::read: the record holds " + std::to_string(record.size) +
@@ -160,10 +173,8 @@ core::Status ChunkParser::read(const Record& record, std::uint8_t* dst,
           " bytes given (or none)");
     }
     if (record.size != 0) {
-      const std::uint8_t* const at =
-          buffer_.data() + static_cast<std::size_t>(next_ - base_);
-      std::memcpy(dst, at + detail::load_le32(at + 4),
-                  static_cast<std::size_t>(record.size));
+      std::memcpy(dst, at + c.header_bytes,
+                  static_cast<std::size_t>(c.body_bytes));
     }
     next_ += held_;
     held_ = 0;

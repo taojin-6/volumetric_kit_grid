@@ -545,10 +545,19 @@ core::Result<RecordedRounds> VoxelHashMap::record_rounds(
       return core::Status::invalid_argument(op + ": the " + what +
                                             " has no buffer");
     }
-    if (word.offset % 4 != 0 || word.offset >= word.buffer->size()) {
+    constexpr VkDeviceSize word_bytes = sizeof(std::uint32_t);
+    if (word.offset % word_bytes != 0 || word.buffer->size() < word_bytes ||
+        word.offset > word.buffer->size() - word_bytes) {
       return core::Status::invalid_argument(
           op + ": the " + what + "'s word is misaligned or past its buffer");
     }
+    const std::string named = op + ": the " + what;
+    VKC_TRY(core::StorageInput(*word.buffer)
+                .check(named.c_str(), word.offset + word_bytes));
+    // The descriptors bind the whole buffer. This also bounds the word
+    // index below the shader's 32-bit no-word sentinel.
+    VKC_TRY(core::check_storage_buffer_range(named.c_str(), word.buffer->size(),
+                                             max_storage_buffer_range_));
     return {};
   };
   VKC_TRY(check_word(count, "count"));

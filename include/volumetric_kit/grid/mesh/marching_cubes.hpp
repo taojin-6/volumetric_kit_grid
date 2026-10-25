@@ -680,7 +680,9 @@ class VR_MESH_API MarchingCubes {
   ///                         batch reaches the extract (a decoded frame's N,
   ///                         or `allocated_blocks()`). A wrong guess costs a
   ///                         refit at @ref finish, never a triangle.
-  /// @param gate             Optional word on the device; 0 meshes nothing.
+  /// @param gate             Optional valid @ref volume::DeviceCount word;
+  ///                         0 meshes nothing. Its storage-buffer metadata and
+  ///                         complete word range are checked before recording.
   /// @param iso              The iso-value (0 for a TSDF surface).
   /// @param metrics          Optional: a `"marching cubes"` row over
   ///                         `"  ..compact"` and `"  ..dispatch"`, host halves
@@ -688,7 +690,8 @@ class VR_MESH_API MarchingCubes {
   ///                         `PendingBatch::device_rows`.
   /// @return The pending extract; or, with nothing recorded, the refusals
   ///         @ref extract_device makes before it claims a slot, or
-  ///         `Status::Code::InvalidArgument` when every slot is outstanding.
+  ///         `Status::Code::InvalidArgument` for an invalid gate or when every
+  ///         slot is outstanding.
   /// @pre The batch of this extractor's last record has resolved.
   core::Result<PendingExtract> record_extract(
       core::CommandBatch& batch, volume::VoxelBlockGrid& grid,

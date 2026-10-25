@@ -139,7 +139,8 @@ struct RecordedBlockList {
 ///            grid.record_remove(batch, gone_list, gone, &gate));
 /// @endcode
 struct DeviceCount {
-  /// Holds the word: device-local, `STORAGE_BUFFER` usage.
+  /// Holds the complete four-byte word: known device-local memory,
+  /// `STORAGE_BUFFER` usage, size at most `maxStorageBufferRange`.
   const core::Buffer* buffer = nullptr;
   /// The word's byte offset in @ref buffer; a multiple of 4.
   VkDeviceSize offset = 0;
@@ -277,9 +278,10 @@ class VR_VOLUME_API VoxelHashMap {
   /// @return Where the outcome lands; or, with nothing recorded,
   ///         `Status::Code::InvalidArgument` for a moved-from map, @p coords
   ///         shorter than `count.bound` entries or past
-  ///         `maxStorageBufferRange`, a @p count or @p gate with no buffer or
-  ///         a misaligned offset, or every result slot held; or a buffer
-  ///         failure.
+  ///         `maxStorageBufferRange`, a @p count or @p gate with invalid
+  ///         storage-buffer metadata, a buffer past `maxStorageBufferRange`,
+  ///         or a misaligned or incomplete word, or every result slot held;
+  ///         or a buffer failure.
   /// @pre Every other batch this map recorded into has resolved, and @p batch
   ///      holds at most one recording of each kind.
   core::Result<RecordedRounds> record_allocate(

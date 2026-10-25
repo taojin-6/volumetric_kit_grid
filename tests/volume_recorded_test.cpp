@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -340,6 +341,86 @@ int count_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
+// Count and gate words must be complete storage words with known local
+// memory. Refusal preserves the map and its lists, runs no first-round
+// callback, and leaves the same batch available for a valid retry.
+int word_metadata_case(vr_test::Gpu& gpu) {
+  const Blocks one = {at(0, 0, 0)};
+  vkc::Result<vkc::Buffer> list =
+      vr_test::detail::device_coords(gpu, one.data(), 1);
+  vkc::Result<vkc::Buffer> counts = words(gpu, {0, 1});
+  vkc::Result<vkc::Buffer> short_word =
+      vkc::device_storage_buffer(gpu.allocator, 3);
+  vkc::Result<vkc::Buffer> short_tail =
+      vkc::device_storage_buffer(gpu.allocator, 7);
+  vkc::BufferDesc desc;
+  desc.size = sizeof(std::uint32_t);
+  desc.usage =
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  vkc::Result<vkc::Buffer> transfer = gpu.allocator.create_buffer(desc);
+  CHECK(list.ok() && counts.ok() && short_word.ok() && short_tail.ok() &&
+        transfer.ok());
+  const vkc::Buffer unknown(counts->handle(), counts->size(), counts->usage(),
+                            counts->sharing_mode(), nullptr, {}, std::nullopt);
+  CHECK(counts->memory_info().has_value());
+  vkc::MemoryInfo nonlocal_memory = *counts->memory_info();
+  nonlocal_memory.properties &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  const vkc::Buffer nonlocal(counts->handle(), counts->size(), counts->usage(),
+                             counts->sharing_mode(), nullptr, {},
+                             nonlocal_memory);
+  const vkc::Buffer oversized(
+      counts->handle(), vkc::max_storage_buffer_range(gpu.device) + 4,
+      counts->usage(), counts->sharing_mode(), nullptr, [] {},
+      counts->memory_info());
+  const vol::DeviceCount good{&*counts, 4, 1};
+  const vol::DeviceCount bad_words[] = {
+      {&*transfer, 0, 1},
+      {&*short_word, 0, 1},
+      {&*short_tail, 4, 1},
+      {&unknown, 0, 1},
+      {&nonlocal, 0, 1},
+      {&oversized, 0, 1},
+      {&*counts, std::numeric_limits<VkDeviceSize>::max() - 3, 1}};
+  for (const bool removes : {false, true}) {
+    vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
+    CHECK(map.ok());
+    if (removes) CHECK(blocking_all(gpu, *map, one, false).value() == 0);
+    vkc::Result<State> before = state_of(*map);
+    vkc::Result<vol::DeviceBlockList> held =
+        map->compact_active_blocks_on_device();
+    CHECK(before.ok() && held.ok());
+    const std::uint64_t epoch = map->topology_epoch();
+    bool prepared = false;
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    const auto record = [&](const vol::DeviceCount& count,
+                            const vol::DeviceCount* gate) {
+      return removes ? map->record_remove(batch, *list, count, gate, nullptr,
+                                          [&](vkc::CommandBatch&) {
+                                            prepared = true;
+                                            return vkc::Status{};
+                                          })
+                     : map->record_allocate(batch, *list, count, gate);
+    };
+    for (const vol::DeviceCount& bad : bad_words) {
+      CHECK(record(bad, &good).status().domain() == C::InvalidArgument);
+      CHECK(record(good, &bad).status().domain() == C::InvalidArgument);
+      CHECK(!prepared && map->topology_epoch() == epoch);
+      CHECK(map->check_device_block_list(*held, "test").ok());
+    }
+    CHECK(state_of(*map).value() == *before);
+
+    // A rejected call has not consumed a result slot or poisoned the batch.
+    vkc::Result<vol::RecordedRounds> retry = record(good, &good);
+    CHECK(retry.ok() && batch.submit().ok());
+    vkc::Result<vol::AllocFailures> result = map->settle(*retry);
+    CHECK(result.ok() && result->total == 0 && result->terminal == 0);
+    CHECK(prepared == removes);
+    CHECK(coords_of(*map).value() ==
+          (removes ? std::vector<Coord>{} : sorted(one)));
+  }
+  return 0;
+}
+
 // A closed gate runs no round of either kind: the map, its heap and its
 // stamps are bit-identical, the settle is zeros and the gate stays 0. An
 // open gate that meets no failure stays open.
@@ -614,6 +695,7 @@ int slots_case(vr_test::Gpu& gpu) {
 int gpu_main(vr_test::GpuContext& gpu) {
   if (agrees_case(gpu) != 0) return 1;
   if (count_case(gpu) != 0) return 1;
+  if (word_metadata_case(gpu) != 0) return 1;
   if (gate_case(gpu) != 0) return 1;
   if (capacity_case(gpu) != 0) return 1;
   if (contention_case(gpu) != 0) return 1;

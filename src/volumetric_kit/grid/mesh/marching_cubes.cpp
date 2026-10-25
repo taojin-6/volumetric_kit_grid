@@ -1244,11 +1244,21 @@ core::Result<PendingExtract> MarchingCubes::record_extract(
   }
   core::GpuStageScope stage(metrics, gpu_timer_, "marching cubes");
   VKC_TRY(check_grid(grid, kEntryRecord));
-  if (gate != nullptr && (gate->buffer == nullptr || gate->offset % 4 != 0)) {
-    return core::Status::invalid_argument(
-        std::string(kEntryRecord) +
-        ": the gate has no buffer, or a misaligned "
-        "word");
+  if (gate != nullptr) {
+    constexpr VkDeviceSize word_bytes = sizeof(std::uint32_t);
+    if (gate->buffer == nullptr || gate->offset % word_bytes != 0 ||
+        gate->buffer->size() < word_bytes ||
+        gate->offset > gate->buffer->size() - word_bytes) {
+      return core::Status::invalid_argument(
+          std::string(kEntryRecord) +
+          ": the gate has no complete aligned word");
+    }
+    VKC_TRY(core::StorageInput(*gate->buffer)
+                .check(kEntryRecord, gate->offset + word_bytes));
+    // The descriptor binds the whole buffer. This also keeps the word index
+    // representable in ArgsPush and below the shader's kNoWord sentinel.
+    VKC_TRY(core::check_storage_buffer_range(kEntryRecord, gate->buffer->size(),
+                                             max_storage_buffer_range_));
   }
   // Claim and bump before anything is recorded, as every extract does
   // (claim_output_slot): a refusal costs the caller nothing.
@@ -1503,9 +1513,13 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     listed = grid.map().held_device_list();
   }
   if (listed) {
-    VKC_TRY(record_body(batch, grid, iso, *listed->buffer, nullptr,
-                        listed->count, listed->count, nullptr, &stage, metrics,
-                        timings, entry));
+    // Empty subsets may have no buffer at all. The lookup table is a valid
+    // storage binding large enough for one BlockIndex; zero groups read none
+    // of it, while the sizing/finalize path still resets the reused draw slot.
+    const core::Buffer& list = listed->count == 0 ? tables_ : *listed->buffer;
+    VKC_TRY(record_body(batch, grid, iso, list, nullptr, listed->count,
+                        listed->count, nullptr, &stage, metrics, timings,
+                        entry));
   } else {
     volume::RecordedBlockList list;
     {

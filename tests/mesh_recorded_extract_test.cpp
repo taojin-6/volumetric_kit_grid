@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -268,6 +269,103 @@ int gate_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
+// Empty subsets need no list buffer, both before the first extract and after
+// a populated slot. The draw command must also be empty when that slot is
+// reused.
+int empty_subset_case(vr_test::Gpu& gpu) {
+  auto grid = sphere_grid(gpu);
+  CHECK(grid.ok());
+  for (const bool share : {false, true}) {
+    auto mc = make_mc(gpu, share);
+    CHECK(mc.ok());
+    for (int frame = 0; frame < 3; ++frame) {
+      mesh::ExtractTimings timings;
+      const vol::DeviceBlockList empty{};
+      auto got = mc->extract_device(*grid, 0.0f, empty, &timings);
+      CHECK(got.ok() && got->empty() && got->is_current());
+      CHECK(got->vertex_count == 0 && timings.active_blocks == 0);
+      CHECK(got->ready.semaphore != nullptr &&
+            got->ready.semaphore->value().value() >= got->ready.value);
+      VkDrawIndexedIndirectCommand draw{};
+      vkc::Buffer indirect(
+          got->indirect, sizeof(draw), got->indirect_usage, got->sharing_mode,
+          nullptr, [] {}, std::nullopt);
+      vkc::CommandBatch batch(gpu.device, gpu.allocator);
+      CHECK(batch.readback(indirect, 0, sizeof(draw), &draw).ok());
+      CHECK(batch.submit().ok());
+      CHECK(draw.indexCount == 0);
+      auto host = mc->download(*got);
+      CHECK(host.ok() && host->vertices.empty() && host->indices.empty());
+      auto populated = mc->extract_device(*grid);
+      CHECK(populated.ok() && populated->triangle_count > 100);
+    }
+  }
+  return 0;
+}
+
+// Refusing a gate must neither invalidate a published mesh nor record work.
+// An offset word in a valid storage buffer remains usable after each refusal.
+int gate_metadata_case(vr_test::Gpu& gpu) {
+  auto grid = sphere_grid(gpu);
+  auto mc = make_mc(gpu);
+  CHECK(grid.ok() && mc.ok());
+  const std::uint32_t words[] = {0, 1};
+  auto storage = vr_test::upload_device_buffer(gpu.device, gpu.allocator, words,
+                                               sizeof(words));
+  vkc::BufferDesc desc;
+  desc.size = sizeof(words);
+  desc.usage =
+      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  auto transfer = gpu.allocator.create_buffer(desc);
+  desc.size = 7;
+  desc.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  auto truncated = gpu.allocator.create_buffer(desc);
+  CHECK(storage.ok() && transfer.ok() && truncated.ok());
+  vkc::Buffer empty;
+  vkc::Buffer unknown(
+      storage->handle(), storage->size(), storage->usage(),
+      storage->sharing_mode(), nullptr, [] {}, std::nullopt);
+  auto memory = storage->memory_info();
+  CHECK(memory.has_value());
+  memory->properties &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  vkc::Buffer nonlocal(
+      storage->handle(), storage->size(), storage->usage(),
+      storage->sharing_mode(), nullptr, [] {}, memory);
+  vkc::Buffer oversized(
+      storage->handle(), vkc::max_storage_buffer_range(gpu.device) + 4,
+      storage->usage(), storage->sharing_mode(), nullptr, [] {},
+      storage->memory_info());
+  const vol::DeviceCount invalid[] = {
+      {nullptr, 0, 1},
+      {&empty, 0, 1},
+      {&*transfer, 0, 1},
+      {&*truncated, 4, 1},
+      {&*storage, 1, 1},
+      {&*storage, 8, 1},
+      {&*storage, std::numeric_limits<VkDeviceSize>::max() - 3, 1},
+      {&unknown, 0, 1},
+      {&nonlocal, 0, 1},
+      {&oversized, 0, 1}};
+  for (const auto& gate : invalid) {
+    auto held = mc->extract_device(*grid);
+    CHECK(held.ok() && held->triangle_count > 100);
+    const auto before = gpu.device.counters();
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    auto refused =
+        mc->record_extract(batch, *grid, grid->map().allocated_blocks(), &gate);
+    CHECK(!refused.ok() && refused.status().domain() == C::InvalidArgument);
+    CHECK(held->is_current());
+    CHECK(batch.submit().ok());
+    CHECK(gpu.device.counters().dispatches == before.dispatches);
+    const vol::DeviceCount open{&*storage, 4, 1};
+    auto next =
+        recorded(gpu, *mc, *grid, grid->map().allocated_blocks(), &open);
+    CHECK(next.ok() && next->has_value());
+    CHECK((*next)->triangle_count == held->triangle_count);
+  }
+  return 0;
+}
+
 // Abandoned extracts, and tokens dropped unfinished, give their slots back:
 // many more than slot_count, with nothing released, all record. A pending
 // superseded by the next record, or whose batch skipped the signal, is
@@ -448,6 +546,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (same_mesh_case(gpu) != 0) return 1;
   if (refit_case(gpu) != 0) return 1;
   if (gate_case(gpu) != 0) return 1;
+  if (gate_metadata_case(gpu) != 0) return 1;
+  if (empty_subset_case(gpu) != 0) return 1;
   if (slots_case(gpu) != 0) return 1;
   if (move_case(gpu) != 0) return 1;
   if (counters_case(gpu) != 0) return 1;
