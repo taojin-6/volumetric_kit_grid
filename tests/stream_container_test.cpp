@@ -6,9 +6,9 @@
 // 64 at every alignment against a bitwise one; round trips of the session,
 // every record field and the payloads; seeking by key; unknown kinds, chunks
 // and header fields; the payload limit and a body size near 2^64; every
-// writer and reader refusal, a file cut short after its open included; two
-// threads reading one reader; and a track's nominal period, 30 a second's
-// for an unknown rate.
+// writer and reader refusal, a file cut short after its open included; reads
+// into caller memory; two threads reading one reader; and a track's nominal
+// period, 30 a second's for an unknown rate.
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -737,6 +737,82 @@ int reader_refusals_case(const std::string& dir) {
   return 0;
 }
 
+// --- Reads into caller memory.
+// ------------------------------------------------
+
+// The pointer read gives what the vector read gives, into memory the caller
+// sized -- a slot with room after the payload, which stays as it was -- and a
+// payload of no bytes into none. A capacity short by one, or no memory for a
+// payload of any bytes, is refused before anything is read; a changed header,
+// a payload failing its CRC and a file cut short after the open are refused
+// as the vector read refuses them.
+int caller_memory_case(const std::string& dir) {
+  const std::string path = dir + "/caller.vrst";
+  const std::vector<Bytes> payloads = {pattern(300, 1), Bytes{},
+                                       pattern(17, 2)};
+  {
+    auto w = create(path, one_track());
+    CHECK(w != nullptr);
+    for (std::uint64_t i = 0; i < payloads.size(); ++i) {
+      CHECK(append(*w, info(0, true, i, i), payloads[i]));
+    }
+    CHECK(w->finish().ok());
+  }
+  auto r = open(path);
+  CHECK(r != nullptr);
+  std::vector<stream::Record> records;
+  stream::Position pos = r->begin();
+  for (;;) {
+    stream::Record record;
+    const vkc::Result<bool> more = r->next(&pos, &record);
+    CHECK(more.ok());
+    if (!more.value()) break;
+    records.push_back(record);
+  }
+  CHECK(records.size() == payloads.size());
+  const auto untouched = [](const Bytes& b, std::size_t from) {
+    return std::all_of(b.begin() + std::ptrdiff_t(from), b.end(),
+                       [](std::uint8_t x) { return x == 0xEE; });
+  };
+  for (std::size_t i = 0; i < records.size(); ++i) {
+    const auto size = static_cast<std::size_t>(records[i].size);
+    Bytes slot(size + 8, 0xEE);
+    CHECK(r->read(records[i], slot.data(), slot.size()).ok());
+    CHECK(Bytes(slot.begin(), slot.begin() + std::ptrdiff_t(size)) ==
+          payloads[i]);
+    CHECK(untouched(slot, size));
+    Bytes vector;
+    CHECK(r->read(records[i], &vector).ok() && vector == payloads[i]);
+  }
+  CHECK(r->read(records[1], nullptr, 0).ok());
+  Bytes slot(299, 0xEE);
+  CHECK(r->read(records[0], slot.data(), slot.size()).domain() ==
+        Code::InvalidArgument);
+  CHECK(r->read(records[0], nullptr, 300).domain() == Code::InvalidArgument);
+  CHECK(untouched(slot, 0));
+  slot.assign(308, 0xEE);
+  stream::Record changed = records[0];
+  changed.info.seq += 1;
+  CHECK(r->read(changed, slot.data(), slot.size()).domain() ==
+        Code::InvalidArgument);
+
+  // The first payload's fifth byte flipped.
+  const std::string flip = dir + "/caller_flip.vrst";
+  CHECK(vrst::write_bytes(flip, vrst::flipped(vr_test::read_bytes(path),
+                                              records[0].offset + 60, 2)));
+  auto rf = open(flip);
+  CHECK(rf != nullptr);
+  const vkc::Status crc = rf->read(records[0], slot.data(), slot.size());
+  CHECK(crc.domain() == Code::InvalidArgument &&
+        crc.message().find("CRC") != std::string::npos);
+  CHECK(rf->read(records[2], slot.data(), slot.size()).ok());
+
+  CHECK(vrst::cut(path, records[0].offset + 80));
+  CHECK(r->read(records[0], slot.data(), slot.size()).domain() ==
+        Code::IoError);
+  return 0;
+}
+
 // --- Two threads, one reader. ------------------------------------------------
 
 int concurrency_case(const std::string& dir) {
@@ -790,6 +866,7 @@ int main() {
   if (limits_case(dir) != 0) return 1;
   if (writer_refusals_case(dir) != 0) return 1;
   if (reader_refusals_case(dir) != 0) return 1;
+  if (caller_memory_case(dir) != 0) return 1;
   if (concurrency_case(dir) != 0) return 1;
   if (nominal_period_case(dir) != 0) return 1;
   std::puts("stream container: OK");

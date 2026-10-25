@@ -345,15 +345,34 @@ core::Result<std::uint32_t> VoxelBlockGrid::zero_and_remove(
     return map_.remove(list, count, out_failures, {}, stage);
   }
   // The zero kernel finds each coord's block in the table itself, so this
-  // costs the count, not the grid. It rides the map's first round, ahead of
-  // the delete in the same submit, so every block is zeroed before its index
-  // is freed.
+  // costs the count, not the grid. It rides the map's first recording, ahead
+  // of the delete in the same submit, so every block is zeroed before its
+  // index is freed.
   return map_.remove(
       list, count, out_failures,
       [&](core::CommandBatch& batch) {
-        return record_zero(batch, list, count, stage);
+        return record_zero(batch, list, count, nullptr, nullptr, stage);
       },
       stage);
+}
+
+core::Result<RecordedRounds> VoxelBlockGrid::record_remove(
+    core::CommandBatch& batch, const core::Buffer& coords,
+    const DeviceCount& count, const DeviceCount* gate,
+    core::GpuStageScope* stage) {
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        "VoxelBlockGrid::record_remove: moved-from grid");
+  }
+  if (attributes_.empty()) {
+    return map_.record_remove(batch, coords, count, gate, stage);
+  }
+  // Zeroed in the map's recording once nothing more can refuse it, ahead of
+  // its rounds, so a refused recording zeroes nothing.
+  return map_.record_remove(
+      batch, coords, count, gate, stage, [&](core::CommandBatch& b) {
+        return record_zero(b, coords, count.bound, &count, gate, stage);
+      });
 }
 
 core::Status VoxelBlockGrid::clear() {
@@ -395,11 +414,13 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   zero_push.size = sizeof(ZeroPush);
   core::ComputeKernel stamp;
   core::ComputeKernel zero;
+  core::ComputeKernel zero_args;
   core::KernelSetBuilder kb(*device_);
   VKC_TRY(kb.add(stamp, "block_stamp", vr_block_stamp_comp_spv,
                  vr_block_stamp_comp_spv_size, 5, &stamp_push));
   VKC_TRY(kb.add(zero, "block_zero", vr_block_zero_comp_spv,
                  vr_block_zero_comp_spv_size, 3, &zero_push));
+  VKC_TRY(recon::detail::add_dispatch_args(kb, zero_args, "block_zero_args"));
   VKC_ASSIGN(core::DescriptorPool pool, kb.build());
   core::KernelSets sets;
   VKC_TRY(sets.reserve(*device_, zero,
@@ -413,6 +434,7 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   block_pool_ = std::move(pool);
   zero_kernel_ = std::move(zero);
   zero_sets_ = std::move(sets);
+  zero_args_kernel_ = std::move(zero_args);
   max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   stamp_kernel_ = std::move(stamp);
   return {};
@@ -481,6 +503,8 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
 core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                                          const core::Buffer& list,
                                          std::uint32_t count,
+                                         const DeviceCount* words,
+                                         const DeviceCount* gate,
                                          core::GpuStageScope* stage) {
   const VoxelGridParams& gp = map_.grid();
   const auto voxels_per_block = static_cast<std::uint32_t>(gp.voxels_per_block);
@@ -489,6 +513,17 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
   VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid: the hash entries",
                                            entries_bytes,
                                            max_storage_buffer_range_));
+  // A workgroup a block, as many as the device's count says behind its gate.
+  recon::detail::IndirectSlices slices;
+  if (words != nullptr) {
+    VKC_TRY(recon::detail::record_dispatch_args(
+        batch, *device_, *allocator_, zero_args_kernel_, zero_slices_,
+        "grid.zero_slices",
+        recon::detail::SlicedCount{words->buffer, words->offset, count, 1,
+                                   gate != nullptr ? gate->buffer : nullptr,
+                                   gate != nullptr ? gate->offset : 0},
+        1, &slices, 0, nullptr, max_workgroup_count_x_, stage));
+  }
   for (std::size_t i = 0; i < attributes_.size(); ++i) {
     const Attribute& attr = attributes_[i];
     const core::DescriptorSet& set = zero_sets_[i];
@@ -502,8 +537,16 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                         gp.num_buckets,
                         gp.bucket_size,
                         gp.max_chain};
-    VKC_TRY(recon::detail::dispatch_items(batch, zero_kernel_, push, count, 1,
-                                          max_workgroup_count_x_, stage, &set));
+    if (words != nullptr) {
+      // An indirect dispatch binds the kernel's own set.
+      zero_kernel_.set = set;
+      VKC_TRY(recon::detail::dispatch_slices(batch, zero_kernel_, push, slices,
+                                             stage));
+    } else {
+      VKC_TRY(recon::detail::dispatch_items(batch, zero_kernel_, push, count, 1,
+                                            max_workgroup_count_x_, stage,
+                                            &set));
+    }
   }
   return {};
 }

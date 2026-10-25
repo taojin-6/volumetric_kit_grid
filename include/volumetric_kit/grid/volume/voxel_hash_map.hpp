@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -20,6 +22,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/core/vulkan/host_ring.hpp"
 #include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
@@ -123,6 +126,49 @@ struct RecordedBlockList {
   const core::Buffer* count = nullptr;
 };
 
+/// @brief A 32-bit word a kernel wrote, and the most it can hold: what a
+///        recorded dispatch is sized or gated by without the word reaching
+///        the host.
+///
+/// Borrowed, as @ref DeviceBlockList is: @ref buffer belongs to whoever wrote
+/// the word and must outlive every batch that reads it.
+///
+/// @code
+/// const volume::DeviceCount gone{&diff_counts, 0, hash_slots};
+/// VKC_ASSIGN(const volume::RecordedRounds removed,
+///            grid.record_remove(batch, gone_list, gone, &gate));
+/// @endcode
+struct DeviceCount {
+  /// Holds the complete four-byte word: known device-local memory,
+  /// `STORAGE_BUFFER` usage, size at most `maxStorageBufferRange`.
+  const core::Buffer* buffer = nullptr;
+  /// The word's byte offset in @ref buffer; a multiple of 4.
+  VkDeviceSize offset = 0;
+  /// The most the word holds: the host sizes buffers and records dispatch
+  /// slices for it, and a kernel reads a larger word as this.
+  std::uint32_t bound = 0;
+};
+
+/// @brief A removal or an allocation recorded into a caller's batch: where
+///        the batch leaves the rounds' outcome, which
+///        @ref VoxelHashMap::settle reads once the batch has run.
+///
+/// Holds one of the map's @ref VoxelHashMap::kResultSlots result slots until
+/// it is dropped.
+///
+/// @code
+/// core::CommandBatch batch(device, allocator);
+/// VKC_ASSIGN(const volume::RecordedRounds placed,
+///            map.record_allocate(batch, coords, count));
+/// VKC_TRY(batch.submit());
+/// VKC_ASSIGN(const volume::AllocFailures failed, map.settle(placed));
+/// @endcode
+struct RecordedRounds {
+  /// The outcome once the batch has run (`core::HostSlot`); empty when
+  /// nothing was recorded.
+  core::HostSlot result;
+};
+
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
 ///        the free-block heap, and the per-bucket locks -- plus the compute
 ///        pipelines that operate on them, and drives block allocation and
@@ -172,6 +218,10 @@ class VR_VOLUME_API VoxelHashMap {
   ///
   /// Only `coord` is read; each entry's `ptr` is ignored. The buffer must
   /// remain alive and unchanged until this synchronous call returns.
+  ///
+  /// It is @ref record_allocate, one submit and @ref settle, repeated while
+  /// lost races alone remain, up to 10 rounds in all: one submit for every
+  /// @ref kRecordedRounds rounds, and no readback buffer.
   /// @param coords  Storage buffer with known device-local memory holding at
   ///                least @p count block indices.
   /// @param count   Number of entries; zero is a no-op.
@@ -193,6 +243,86 @@ class VR_VOLUME_API VoxelHashMap {
                                        std::uint32_t count,
                                        AllocFailures* out_failures = nullptr,
                                        core::GpuStageScope* stage = nullptr);
+
+  /// Rounds a recorded removal or allocation runs at most: the first, then
+  /// another only while the last lost bucket-lock races and met no capacity
+  /// limit. 3: no call needed more than 2 of the host rounds that came
+  /// before in 4,230 frames on four devices (only cold I-frames needed 2), so
+  /// one round is spare; M2's histogram of device rounds confirms it.
+  static constexpr std::uint32_t kRecordedRounds = 3;
+  /// Recordings that may hold their outcome unsettled at once: both kinds,
+  /// for a batch in flight and one being recorded. The first recording makes
+  /// these slots (`core::HostRing`).
+  static constexpr std::uint32_t kResultSlots = 4;
+
+  /// @brief Record @ref allocate's work into @p batch, the count on the
+  ///        device: up to @ref kRecordedRounds rounds over the same list,
+  ///        each sized by a one-thread kernel from the tally the round before
+  ///        left, so nothing reaches the host before the batch has run.
+  ///
+  /// A coordinate one round placed takes the lock-free path in the next.
+  /// Recording makes every device list this map compacted before it stale
+  /// (@ref check_device_block_subset). The heap counter's host copy, which
+  /// @ref load_factor and @ref allocated_blocks read, moves at @ref settle.
+  /// @param batch   Records the rounds; the caller submits it.
+  /// @param coords  At least `count.bound` @ref BlockIndex entries in
+  ///                device-local memory, `coord` alone read; unchanged until
+  ///                the batch has run.
+  /// @param count   How many to allocate. A bound of 0 records nothing.
+  /// @param gate    Optional. 0 makes every round run no groups. The rounds
+  ///                set it to 0 when a capacity limit was met or lost races
+  ///                remain after the last round, so what is gated on it after
+  ///                this runs nothing.
+  /// @param stage   Optional: the caller's scope, whose tile every round
+  ///                counts to.
+  /// @return Where the outcome lands; or, with nothing recorded,
+  ///         `Status::Code::InvalidArgument` for a moved-from map, @p coords
+  ///         shorter than `count.bound` entries or past
+  ///         `maxStorageBufferRange`, a @p count or @p gate with invalid
+  ///         storage-buffer metadata, a buffer past `maxStorageBufferRange`,
+  ///         or a misaligned or incomplete word, or every result slot held;
+  ///         or a buffer failure.
+  /// @pre Every other batch this map recorded into has resolved, and @p batch
+  ///      holds at most one recording of each kind.
+  core::Result<RecordedRounds> record_allocate(
+      core::CommandBatch& batch, const core::Buffer& coords,
+      const DeviceCount& count, const DeviceCount* gate = nullptr,
+      core::GpuStageScope* stage = nullptr);
+
+  /// @brief Record @ref remove's work into @p batch, the count on the device,
+  ///        in rounds as @ref record_allocate records them.
+  ///
+  /// Moves @ref topology_epoch now, whatever the rounds do.
+  /// @warning As @ref remove: a freed block's attributes are not cleared. On
+  ///          a grid, use @ref VoxelBlockGrid::record_remove.
+  /// @param batch        As @ref record_allocate.
+  /// @param coords       As @ref record_allocate.
+  /// @param count        How many to remove. A bound of 0 records nothing.
+  /// @param gate         As @ref record_allocate; also set to 0 when the free
+  ///                     heap refused a removed block
+  ///                     (@ref AllocFailures::terminal).
+  /// @param stage        As @ref record_allocate.
+  /// @param first_round  Optional: records into @p batch once nothing more
+  ///                     can refuse, ahead of the rounds, so it runs before
+  ///                     any index is freed; @ref VoxelBlockGrid::record_remove
+  ///                     zeroes the blocks there.
+  /// @return As @ref record_allocate.
+  /// @pre As @ref record_allocate.
+  core::Result<RecordedRounds> record_remove(
+      core::CommandBatch& batch, const core::Buffer& coords,
+      const DeviceCount& count, const DeviceCount* gate = nullptr,
+      core::GpuStageScope* stage = nullptr,
+      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
+
+  /// @brief Once the batch that recorded @p rounds has run: what the rounds
+  ///        did, with the heap counter's host copy refreshed from them.
+  /// @param rounds  From this map's @ref record_allocate or
+  ///                @ref record_remove.
+  /// @return The per-reason split, @ref AllocFailures::rounds the rounds that
+  ///         ran; zeros, the copy unchanged, for a recording of nothing; or
+  ///         `Status::Code::InvalidArgument` for a moved-from map.
+  /// @pre That batch resolved without failure.
+  core::Result<AllocFailures> settle(const RecordedRounds& rounds);
 
   /// @brief Allocate voxel blocks from a posed depth frame.
   ///
@@ -335,17 +465,18 @@ class VR_VOLUME_API VoxelHashMap {
   /// Must not run concurrently with @ref allocate — the heap requires alloc and
   /// free in separate dispatches, which the fence between calls guarantees for
   /// single-threaded use. The buffer must remain alive and unchanged until
-  /// this synchronous call returns.
+  /// this synchronous call returns. It is @ref record_remove, one submit and
+  /// @ref settle, repeated as @ref allocate repeats them.
   /// @param coords  Storage buffer with known device-local memory holding at
   ///                least @p count block indices.
   /// @param count   Number of entries; zero is a no-op.
   /// @param out_failures  Optional: receives the per-reason split (see
   ///                      @ref AllocFailures). Untouched when null.
-  /// @param first_round   Optional: records into the first round's batch,
+  /// @param first_round   Optional: records into the first submit's batch,
   ///                      once the input is accepted and ahead of the
-  ///                      removal, so it runs in the same submit before any
-  ///                      index is freed; @ref VoxelBlockGrid::remove zeroes
-  ///                      the blocks there.
+  ///                      removal, so it runs before any index is freed;
+  ///                      @ref VoxelBlockGrid::remove zeroes the blocks
+  ///                      there.
   /// @param stage         As @ref allocate's.
   /// @warning This frees the block index but does **not** clear the per-voxel
   ///          attribute data it addressed -- the block index does not know what
@@ -394,13 +525,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief @ref compact_active_blocks, with the list left on the device for a
   ///        kernel to read in place; only its count reaches the host.
   ///
-  /// While the last call's list still holds, this returns it, dispatching and
-  /// reporting nothing, so the encoder after a mesh extract reuses the
-  /// extract's compaction.
+  /// While the last call's list still holds (@ref held_device_list), this
+  /// returns it, dispatching and reporting nothing, so a mesh extract after
+  /// the encoder reuses the encoder's compaction.
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
   /// @param row      The row's name instead, from a stage whose compaction
   ///                 must stay apart from another stage's timed into the same
-  ///                 `StageMetrics` (the extract's `"  ..compact"`, beside a
+  ///                 `StageMetrics` (a mesh stage's `"  ..compact"`, beside a
   ///                 fuse's `"  ..active set"`); string-literal lifetime. Null
   ///                 names it as @ref compact_active_blocks does.
   /// @return The list, which @ref check_device_block_list accepts until this
@@ -408,6 +539,16 @@ class VR_VOLUME_API VoxelHashMap {
   ///         clears or moves; or a non-OK `Status`.
   core::Result<DeviceBlockList> compact_active_blocks_on_device(
       core::StageMetrics* metrics = nullptr, const char* row = nullptr);
+
+  /// @brief The list @ref compact_active_blocks_on_device would return now
+  ///        without compacting: its last one, while that still holds.
+  ///
+  /// `mesh::MarchingCubes::extract_device` binds it when there is one, and
+  /// records a compaction into its own batch when there is not.
+  /// @return That list; or none before the first such compaction, or once
+  ///         this map has compacted the active set again, allocated, resized,
+  ///         removed, cleared or moved since.
+  std::optional<DeviceBlockList> held_device_list() const noexcept;
 
   /// @brief Whether @p list is still this map's active set, for a consumer
   ///        that needs every block to ask before it binds the list.
@@ -552,8 +693,9 @@ class VR_VOLUME_API VoxelHashMap {
   ///        constant-time read, safe to call every frame.
   ///
   /// The complement of the free-block heap, `1 - heap_free / num_blocks`, taken
-  /// from the host's copy of the heap counter, which every call that moves the
-  /// counter reads back in its own submit -- so this costs no dispatch. It
+  /// from the host's copy of the heap counter, which every blocking call that
+  /// moves the counter refreshes, and @ref settle for a recorded one -- so
+  /// this costs no dispatch. It
   /// is also the fraction of hash slots in use, derived from the heap counter
   /// instead of a slot scan, because @ref VoxelGridParams::validate forces
   /// `num_blocks == bucket_size * num_buckets` and every occupied slot holds
@@ -707,7 +849,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// non-zero, to converge past transient same-bucket lock contention, until
   /// a round has no lock failure or hits a capacity limit, or the rounds run
   /// out. Re-zeroes the tally
-  /// each round. The shared tail of every allocate/remove kernel.
+  /// each round. The host rounds of the depth, triangle and rehash
+  /// allocations; @ref allocate and @ref remove round on the device instead
+  /// (@ref record_rounds).
   /// The tally's non-retryable slot is accumulated across rounds and added to
   /// the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
@@ -736,22 +880,28 @@ class VR_VOLUME_API VoxelHashMap {
                                                const void* data,
                                                VkDeviceSize bytes);
 
-  /// Shared body of the per-element kernels (@ref allocate, @ref remove):
-  /// bind @p count elements of @p elem_size bytes at input binding (4) of
-  /// @p kernel's set, then run @p kernel over them (one thread per element)
-  /// via @ref dispatch_with_retry.
-  /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
-  /// moves @ref topology_epoch once the input is accepted, and binds a zeroed
-  /// flag per element at binding 6 (@ref remove_done_), which the kernel sets
-  /// on each coord it finishes so later rounds skip it. @p first_round, when
-  /// set, records last into the first round's batch, ahead of the dispatch.
-  /// Every round's dispatch is tagged with @p stage.
-  core::Result<std::uint32_t> run_input_kernel(
-      const char* op, const core::StorageInput& input, std::size_t elem_size,
-      std::uint32_t count, const core::ComputeKernel& kernel,
-      AllocFailures* out_failures, core::GpuStageScope* stage,
-      bool removes = false,
-      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
+  /// The body of @ref record_allocate and @ref record_remove (@p removes):
+  /// up to @p rounds rounds, each sized by the kind's `hash_rounds.comp`
+  /// from the tally the round before left, then its gather into a claimed
+  /// result slot. @p first_round, when set, records once nothing more can
+  /// refuse, ahead of the rounds. @p stale_lists makes every device list
+  /// compacted before stale now, for a recording settled later.
+  core::Result<RecordedRounds> record_rounds(
+      bool removes, core::CommandBatch& batch, const core::Buffer& coords,
+      const DeviceCount& count, const DeviceCount* gate,
+      core::GpuStageScope* stage,
+      const std::function<core::Status(core::CommandBatch&)>& first_round,
+      std::uint32_t rounds, bool stale_lists);
+
+  /// The body of @ref allocate and @ref remove: @ref record_rounds over
+  /// @p count, uploaded into @ref host_count_, one submit and @ref settle,
+  /// repeated while lost races alone remain, up to 10 rounds in all.
+  /// @p first_round records into the first submit's batch.
+  core::Result<std::uint32_t> run_rounds(
+      bool removes, const core::Buffer& coords, std::uint32_t count,
+      AllocFailures* out_failures,
+      const std::function<core::Status(core::CommandBatch&)>& first_round,
+      core::GpuStageScope* stage);
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and
@@ -789,8 +939,20 @@ class VR_VOLUME_API VoxelHashMap {
   // tracks num_blocks, so resize() grows it with the rest.
   core::Buffer fail_counts_;
   // remove's per-coord done flags, retained scratch grown to the largest
-  // count yet and re-zeroed per call.
+  // bound yet and re-zeroed per recording.
   core::Buffer remove_done_;
+  // The recorded rounds' state, four words a kind (removal first): the count
+  // the rounds read, whether the next round runs, the rounds run and the
+  // terminal failures (hash_rounds.comp). Grid-independent.
+  core::Buffer rounds_state_;
+  // Each kind's rounds' slices, kRecordedRounds rounds of a bound's, grown
+  // to the largest bound yet.
+  core::Buffer remove_slices_;
+  core::Buffer allocate_slices_;
+  // The blocking calls' count, uploaded ahead of their recording.
+  core::Buffer host_count_;
+  // The recordings' result slots, made by the first one (kResultSlots).
+  std::unique_ptr<core::HostRing> results_;
   core::Buffer compacted_;
   // The frustum compactions' output, so they leave compacted_'s list holding.
   core::Buffer frustum_compacted_;
@@ -807,8 +969,9 @@ class VR_VOLUME_API VoxelHashMap {
   // grid-independent.
   core::Buffer frustum_planes_;
   // The host's copy of heap_counter_, which load_factor() reads: set by
-  // init_table and the heap rebuild, and read back by every retry round, the
-  // only dispatches that move the counter. Copied by the defaulted move, and
+  // init_table and the heap rebuild, read back by every host retry round,
+  // and refreshed by settle() from the recorded rounds' result -- the only
+  // dispatches that move the counter. Copied by the defaulted move, and
   // harmlessly left on a moved-from map, whose load_factor() is refused.
   std::uint32_t heap_free_ = 0;
   // The last compact_active_blocks count, from which collect_compacted
@@ -853,6 +1016,10 @@ class VR_VOLUME_API VoxelHashMap {
   // draw), so per-voxel data survives a resize. Same 6-binding shape as
   // allocate_ (its input at binding 4 is BlockIndex{coord, ptr}, ptr read).
   core::ComputeKernel rehash_;
+  // hash_rounds.comp, one instance a kind, so a removal and an allocation
+  // recorded into one batch keep their own sets.
+  core::ComputeKernel remove_rounds_;
+  core::ComputeKernel allocate_rounds_;
   // The depth kernel's sets, one a frame of a call, so a round dispatches
   // several cameras in one batch; depth_.set goes unused. Grown to the most
   // frames a call has had; written whole each call, so a resize leaves none

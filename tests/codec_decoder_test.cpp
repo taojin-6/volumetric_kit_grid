@@ -776,15 +776,6 @@ int moves_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
-// A sphere that moves and grows beside one that stays, at step @p t.
-vkc::Result<vol::VoxelBlockGrid> chain_grid(Gpu& gpu, int t) {
-  const Sphere moving{
-      vr::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
-      0.07f + 0.002f * float(t)};
-  return two_sphere_grid(gpu, moving,
-                         Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
-}
-
 // Chains of P-frames at a period of 4 and open-ended, each decoded frame
 // after frame into one grid by a decoder of its own, leave that grid bit for
 // bit as an all-intra chain of the same grids leaves another, at every frame;

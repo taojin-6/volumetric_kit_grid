@@ -35,8 +35,10 @@ struct RansPush {
   std::uint32_t frame_type = 0;
   std::uint32_t reference_count = 0;  ///< M.
   std::uint32_t update_size = 0;      ///< U.
+  /// The decode's payload's first byte in its binding.
+  std::uint32_t payload_byte = 0;
 };
-static_assert(sizeof(RansPush) == 32, "RansPush must be 32 bytes");
+static_assert(sizeof(RansPush) == 36, "RansPush must be 36 bytes");
 
 /// @return Every model's symbols back to back, in TABLES order (each model
 ///         at @ref frame_model_base), as the kernels read them:

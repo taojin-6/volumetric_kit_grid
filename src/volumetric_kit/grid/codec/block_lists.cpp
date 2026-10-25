@@ -190,7 +190,6 @@ core::Status BlockLists::record_merge(core::CommandBatch& batch,
                                     " new blocks and " + std::to_string(n) +
                                     " frame blocks");
   }
-  found_[0] = found_[1] = kNoSource;
   VKC_TRY(batch.fill(collision_, 0, kPairBytes, kNoSource));
   if (entries) {
     const core::DescriptorSet& set = frame_merge_kernel_.set;
@@ -212,7 +211,7 @@ core::Status BlockLists::record_merge(core::CommandBatch& batch,
     VKC_TRY(dispatch_items(batch, frame_merge_kernel_, push, decoded.count,
                            kLanes, max_workgroup_count_x_, stage));
   }
-  return batch.readback(collision_, 0, kPairBytes, found_);
+  return {};
 }
 
 core::Status BlockLists::record_diff(core::CommandBatch& batch,
@@ -240,7 +239,6 @@ core::Status BlockLists::record_diff(core::CommandBatch& batch,
                                    std::to_string(slots) +
                                    " slots, more than were reserved");
   }
-  found_[2] = found_[3] = 0;
   const core::DescriptorSet& set = grid_diff_kernel_.set;
   set.write_storage_buffer(0, grid.map().entries_buffer(), 0, entries_bytes);
   set.write_storage_buffer(1, frame_list.handle(), 0, frame_bytes);
@@ -260,7 +258,7 @@ core::Status BlockLists::record_diff(core::CommandBatch& batch,
     VKC_TRY(dispatch_items(batch, grid_diff_kernel_, push, push.count, kLanes,
                            max_workgroup_count_x_, stage));
   }
-  return batch.readback(diff_counts_, 0, kPairBytes, found_ + 2);
+  return {};
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

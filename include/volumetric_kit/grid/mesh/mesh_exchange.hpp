@@ -27,7 +27,8 @@ namespace volumetric_kit::recon::mesh {
 ///        keeps in flight, and what it binds the buffers as.
 struct MeshExchangeConfig {
   /// Frames the consumer keeps in flight, each with a slot of its own in
-  /// @ref MeshExchange::begin_frame. The producer's ring needs one slot more
+  /// @ref MeshExchange::begin_frame. The producer's ring needs one slot more,
+  /// or two for a producer that records its next extract before the take
   /// (`MarchingCubesConfig::slot_count`).
   std::uint32_t frames_in_flight = 2;
   /// Whether the consumer reads the buffers from another queue family than
@@ -108,8 +109,9 @@ enum class ExchangeOutcome {
 /// - **The producer applies the release, on its own thread**, before the
 ///   extract it makes room for: `MarchingCubes::release_through` is not
 ///   synchronized against the extracting thread.
-/// - **The producer publishes every extract** and does not publish over a
-///   mesh not yet taken, except to supersede it.
+/// - **The producer publishes every extract it finishes** and does not
+///   publish over a mesh not yet taken, except to supersede it; an abandoned
+///   one frees its slot unpublished.
 ///
 /// The payload is whatever must stay with the mesh, such as the pixels of the
 /// camera that textured it, which its `Vertex::uv0` index into: it is
@@ -160,8 +162,9 @@ class MeshExchange {
 
   /// @brief Producer: hand @p mesh and its @p payload to the consumer.
   ///
-  /// Publish every extract, an empty one included: it holds a ring slot that
-  /// only the consumer's release can free. A mesh not yet taken is
+  /// Publish every extract finished, an empty one included: it holds a ring
+  /// slot that only the consumer's release can free (an abandoned one frees
+  /// its slot unpublished, `MarchingCubes::abandon`). A mesh not yet taken is
   /// superseded, and its slot is released with the generations before the
   /// next one committed.
   /// @param mesh  An extract's `DeviceMesh`; generation 0 is never one.

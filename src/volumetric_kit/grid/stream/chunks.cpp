@@ -4,6 +4,7 @@
 #include "volumetric_kit/recon/stream/chunks.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -114,10 +115,15 @@ const Session* ChunkParser::session() const noexcept {
 
 core::Result<bool> ChunkParser::next(Record* record,
                                      std::vector<std::uint8_t>* payload) {
-  VKC_CHECK(record != nullptr && payload != nullptr,
-            "ChunkParser::next takes a record and a payload");
+  VKC_CHECK(record != nullptr, "ChunkParser::next takes a record");
   try {
     if (!failure_.ok()) return failure_;
+    // A record returned with no payload and never read is dropped.
+    if (held_ != 0) {
+      next_ += held_;
+      held_ = 0;
+      ready_ = false;
+    }
     VKC_ASSIGN(ready_, advance());
     if (!ready_) return false;
     const std::uint8_t* const at =
@@ -126,16 +132,57 @@ core::Result<bool> ChunkParser::next(Record* record,
     (void)detail::decode_chunk(
         at, detail::load_le32(at + 4),
         static_cast<std::uint32_t>(session_->tracks.size()), &c);
-    const std::uint8_t* const body = at + c.header_bytes;
-    payload->assign(body, body + static_cast<std::size_t>(c.body_bytes));
     record->info = c.record;
     record->offset = next_;
     record->size = c.body_bytes;
-    next_ += c.header_bytes + c.body_bytes + detail::padding(c.body_bytes);
-    ready_ = false;
+    held_ = c.header_bytes + c.body_bytes + detail::padding(c.body_bytes);
+    if (payload == nullptr) return true;
+    payload->resize(static_cast<std::size_t>(c.body_bytes));
+    VKC_TRY(read(*record, payload->data(), payload->size()));
     return true;
   } catch (...) {
     return fail_on_exception();
+  }
+}
+
+core::Status ChunkParser::read(const Record& record, std::uint8_t* dst,
+                               std::size_t capacity) {
+  try {
+    if (!failure_.ok()) return failure_;
+    if (held_ == 0 || record.offset != next_) {
+      return core::Status::invalid_argument(
+          "ChunkParser::read: the record is not the one next returned last");
+    }
+    const std::uint8_t* const at =
+        buffer_.data() + static_cast<std::size_t>(next_ - base_);
+    detail::Chunk c;
+    (void)detail::decode_chunk(
+        at, detail::load_le32(at + 4),
+        static_cast<std::uint32_t>(session_->tracks.size()), &c);
+    const RecordInfo& info = record.info;
+    if (c.body_bytes != record.size || c.record.track != info.track ||
+        c.record.key != info.key || c.record.pts_ns != info.pts_ns ||
+        c.record.seq != info.seq || c.record.set != info.set) {
+      return core::Status::invalid_argument(
+          "ChunkParser::read: the record does not match its held header");
+    }
+    if (capacity < record.size || (dst == nullptr && record.size != 0)) {
+      return core::Status::invalid_argument(
+          "ChunkParser::read: the record holds " + std::to_string(record.size) +
+          " bytes, more than the " + std::to_string(capacity) +
+          " bytes given (or none)");
+    }
+    if (record.size != 0) {
+      std::memcpy(dst, at + c.header_bytes,
+                  static_cast<std::size_t>(c.body_bytes));
+    }
+    next_ += held_;
+    held_ = 0;
+    ready_ = false;
+    return {};
+  } catch (...) {
+    // Only a refusal's message allocates; the record stays held.
+    return core::exception_status(kParser, core::Status::Code::InvalidArgument);
   }
 }
 

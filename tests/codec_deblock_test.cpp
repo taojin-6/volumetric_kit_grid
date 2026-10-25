@@ -41,6 +41,7 @@
 #include "codec_deblock_oracle.hpp"
 #include "codec_fixture.hpp"
 #include "deblock.hpp"
+#include "host_slices.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
@@ -266,18 +267,52 @@ std::uint32_t slots(const Fixture& fx) {
   return std::uint32_t(fx.grid.grid().num_blocks);
 }
 
+// The deblock's slices for a frame of @p n blocks, as the decoder's gate
+// writes them for a frame it passed.
+struct Slices {
+  vr_test::HostSlices blocks;
+  vr_test::HostSlices flags;
+};
+
+vkc::Result<Slices> slices_for(Gpu& gpu, std::uint32_t n) {
+  Slices out;
+  VKC_ASSIGN(out.blocks, vr_test::host_slices(gpu, n, 1));
+  VKC_ASSIGN(out.flags, vr_test::host_slices(gpu, n, d::Deblock::kFlagLanes));
+  return out;
+}
+
+// @p deblock's record of @p frame under @p passes into @p batch, over
+// @p slices.
+vkc::Status record(d::Deblock& deblock, vkc::CommandBatch& batch,
+                   vol::VoxelBlockGrid& grid, const d::ResidentBlocks& frame,
+                   const d::DeblockPasses& passes, const Slices& slices) {
+  return deblock.record(batch, grid, frame, passes, slices.blocks.slices(),
+                        slices.flags.slices());
+}
+
+// The blocks the last record's passes kept, once its batch ran.
+vkc::Result<std::uint32_t> exact_of(Gpu& gpu, const d::Deblock& deblock) {
+  VKC_ASSIGN(const std::vector<std::uint32_t> words,
+             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                               deblock.exact(), 1));
+  return words[0];
+}
+
 // One deblock of @p fx under @p passes, at a fresh tick, in a batch of its
 // own; the blocks it kept go to @p exact.
 vkc::Status run(Gpu& gpu, d::Deblock& deblock, Fixture& fx,
                 const d::DeblockPasses& passes,
                 std::uint32_t* exact = nullptr) {
   fx.grid.map().advance_tick();
-  VKC_TRY(deblock.reserve(std::uint32_t(fx.coords.size()), slots(fx), passes));
+  const auto n = std::uint32_t(fx.coords.size());
+  VKC_TRY(deblock.reserve(n, slots(fx), passes));
+  VKC_ASSIGN(const Slices slices, slices_for(gpu, n));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  std::uint32_t kept = 0;
-  VKC_TRY(deblock.record(batch, fx.grid, fx.frame(), passes, kept));
+  VKC_TRY(record(deblock, batch, fx.grid, fx.frame(), passes, slices));
   VKC_TRY(batch.submit());
-  if (exact != nullptr) *exact = kept;
+  if (exact != nullptr) {
+    VKC_ASSIGN(*exact, exact_of(gpu, deblock));
+  }
   return {};
 }
 
@@ -586,10 +621,13 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
   d::ResidentBlocks first = fx.frame();
   first.count = 1;
   fx.grid.map().advance_tick();
+  vkc::Result<Slices> one = slices_for(gpu, 1);
+  CHECK(one.ok());
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  std::uint32_t exact = 1;
-  CHECK(deblock.record(batch, fx.grid, first, lf, exact).ok());
-  CHECK(batch.submit().ok() && exact == 0);
+  CHECK(record(deblock, batch, fx.grid, first, lf, one.value()).ok());
+  CHECK(batch.submit().ok());
+  vkc::Result<std::uint32_t> exact = exact_of(gpu, deblock);
+  CHECK(exact.ok() && exact.value() == 0);
   CHECK(unchanged(gpu, fx, fitted.value(), stamps.value()) == 0);
   CHECK(run(gpu, deblock, fx, lf).ok());
   vkc::Result<Snapshot> twice = snapshot(gpu, fx.grid);
@@ -833,12 +871,12 @@ int stamps_case(Gpu& gpu, d::Deblock& deblock) {
   return 0;
 }
 
-// 10. Recorded, not run: until the batch is submitted the grid is as it was
-// and the count of the blocks kept is every block's, the masked blocks' at
-// submit; a filter that runs nothing, or no blocks, records nothing and
-// counts every block; and the refusals, each before anything is recorded,
-// a reserve that made no room for the blocks or for the grid's slots among
-// them.
+// 10. Recorded, not run: until the batch is submitted the grid is as it was,
+// and once it is the count of the blocks kept is the masked blocks'; a
+// filter that runs nothing, or no blocks, records nothing, not a fill, so
+// the decoder counts every block itself (masked_case); and the refusals,
+// each before anything is recorded, a reserve that made no room for the
+// blocks or for the grid's slots among them.
 int record_case(Gpu& gpu, d::Deblock& deblock) {
   vkc::Result<Fixture> made = make_fixture(gpu, ramp_blocks(), ramp_field);
   CHECK(made.ok());
@@ -848,32 +886,37 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
   const d::DeblockPasses passes = d::deblock_passes(row("LG"), 0.01f);
   const std::uint32_t n = std::uint32_t(fx.coords.size());
   CHECK(deblock.reserve(n, slots(fx), passes).ok());
+  vkc::Result<Slices> all = slices_for(gpu, n);
+  CHECK(all.ok());
   {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    std::uint32_t exact = 0;
-    CHECK(deblock.record(batch, fx.grid, fx.frame(), passes, exact).ok());
-    CHECK(exact == n);
+    CHECK(
+        record(deblock, batch, fx.grid, fx.frame(), passes, all.value()).ok());
     vkc::Result<Snapshot> pending = snapshot(gpu, fx.grid);
     CHECK(pending.ok() && pending.value() == before.value());
     CHECK(batch.submit().ok());
-    CHECK(exact == kRampMasked);
+    vkc::Result<std::uint32_t> exact = exact_of(gpu, deblock);
+    CHECK(exact.ok() && exact.value() == kRampMasked);
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
     CHECK(after.ok() && !(after.value() == before.value()));
   }
   vkc::Result<Snapshot> filtered = snapshot(gpu, fx.grid);
   CHECK(filtered.ok());
   {
+    // No pass, and no block: nothing recorded.
+    const vkc::DeviceCounters was = gpu.device.counters();
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    std::uint32_t exact = 0;
-    CHECK(deblock.record(batch, fx.grid, fx.frame(), d::DeblockPasses{}, exact)
+    CHECK(record(deblock, batch, fx.grid, fx.frame(), d::DeblockPasses{},
+                 all.value())
               .ok());
-    CHECK(exact == n);
     d::ResidentBlocks none = fx.frame();
     none.count = 0;
-    CHECK(deblock.record(batch, fx.grid, none, passes, exact).ok());
-    CHECK(exact == 0);
+    CHECK(record(deblock, batch, fx.grid, none, passes, all.value()).ok());
     CHECK(batch.submit().ok());
-    CHECK(exact == 0);
+    const vkc::DeviceCounters now = gpu.device.counters();
+    CHECK(now.dispatches == was.dispatches && now.barriers == was.barriers);
+    vkc::Result<std::uint32_t> exact = exact_of(gpu, deblock);
+    CHECK(exact.ok() && exact.value() == kRampMasked);  // the last filter's
     vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
     CHECK(after.ok() && after.value() == filtered.value());
   }
@@ -881,8 +924,7 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
                            const d::DeblockPasses& p, vol::VoxelBlockGrid& grid,
                            const char* says = nullptr) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    std::uint32_t exact = 0;
-    const vkc::Status s = db.record(batch, grid, frame, p, exact);
+    const vkc::Status s = record(db, batch, grid, frame, p, all.value());
     return s.domain() == vkc::Status::Code::InvalidArgument &&
            (says == nullptr || s.message().find(says) != std::string::npos);
   };
@@ -1655,8 +1697,9 @@ int decoder_stamps_case(Gpu& gpu) {
 // unobserved, as fused depth leaves them, most of their blocks masked --
 // with the switch on: I- and P-frames each the oracle's filter of the exact
 // decode, the masked blocks kept to the bit and their stamps the exact
-// decode's, reported by the rule's filter with the masked blocks kept; and
-// rebuilt with the switch on, the decode again.
+// decode's, reported by the rule's filter with the masked blocks kept;
+// rebuilt with the switch on, the decode again; and an empty frame after
+// them reports no block kept, decoded and rebuilt.
 int masked_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 4;
@@ -1722,6 +1765,21 @@ int masked_case(Gpu& gpu) {
   CHECK(std::strcmp(again.filter, decoded.filter) == 0 &&
         again.exact_blocks == decoded.exact_blocks &&
         again.block_count == decoded.block_count);
+
+  // An empty frame whose header picks a filter: no block, so none kept,
+  // whatever the masked frame before left in the deblock's count.
+  vkc::Result<vol::VoxelBlockGrid> empty_source = player_grid(gpu);
+  CHECK(empty_source.ok());
+  vkc::Result<Bytes> empty = encode_at(gpu, empty_source.value(), 64, 0.2f);
+  CHECK(empty.ok() && decoded.exact_blocks > 0);
+  CHECK(on_dec.value()
+            .decode(empty.value().data(), empty.value().size(), on_grid.value())
+            .ok());
+  const codec::DeblockInfo& none = on_dec.value().last_deblock();
+  CHECK(std::strcmp(none.filter, "LG") == 0 && none.block_count == 0 &&
+        none.exact_blocks == 0);
+  CHECK(on_dec.value().rebuild(on_grid.value()).ok());
+  CHECK(on_dec.value().last_deblock().exact_blocks == 0);
   return 0;
 }
 

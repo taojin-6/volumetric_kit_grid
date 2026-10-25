@@ -7,7 +7,8 @@
 // finished or not, whole, a byte at a time and in pseudo-random pieces,
 // against the reader; the chunks it skips and a wider session header; each
 // refusal at the byte that completes what it refuses, bodies of 1 GiB before
-// any of them arrives; and a failure returned by every later call.
+// any of them arrives; a failure returned by every later call; and a held
+// record's body read into caller memory.
 
 #include <algorithm>
 #include <cstdint>
@@ -546,6 +547,131 @@ int parser_latch_case(const std::string&) {
   return 0;
 }
 
+// A record next returns with no payload stays held for read, which copies its
+// body into caller memory -- a slot with room after it -- and takes it: the
+// records and payloads the vector next gives. A capacity short by one, a null
+// destination for a body of any bytes, another record, or a record already
+// taken is refused, the slot untouched; the record stays held, so the read
+// after it takes it. A next before the read drops the record unread, and a
+// body failing its CRC fails the null-payload next as it fails the other.
+int parser_read_case(const std::string& dir) {
+  const std::string path = dir + "/read_into.vrst";
+  CHECK(write_file(path, session_of(2), records_on(2), true));
+  const Bytes bytes = vr_test::read_bytes(path);
+  const Parsed want = parse_whole(bytes);
+  CHECK(want.failure.ok() && want.records.size() > 2);
+  const auto untouched = [](const Bytes& b, std::size_t from) {
+    return std::all_of(b.begin() + std::ptrdiff_t(from), b.end(),
+                       [](std::uint8_t x) { return x == 0xEE; });
+  };
+  stream::ChunkParser parser;
+  CHECK(parser.feed(bytes.data(), bytes.size()).ok());
+  for (std::size_t i = 0; i < want.records.size(); ++i) {
+    stream::Record record;
+    const vkc::Result<bool> got = parser.next(&record, nullptr);
+    CHECK(got.ok() && got.value());
+    CHECK(record.offset == want.records[i].offset &&
+          record.size == want.records[i].size &&
+          same(record.info, want.records[i].info));
+    const auto size = static_cast<std::size_t>(record.size);
+    Bytes slot(size + 8, 0xEE);
+    if (size != 0) {
+      CHECK(parser.read(record, slot.data(), size - 1).domain() ==
+            Code::InvalidArgument);
+      CHECK(parser.read(record, nullptr, slot.size()).domain() ==
+            Code::InvalidArgument);
+    }
+    stream::Record other = record;
+    other.offset += 8;
+    CHECK(parser.read(other, slot.data(), slot.size()).domain() ==
+          Code::InvalidArgument);
+    CHECK(untouched(slot, 0));
+    CHECK(parser.read(record, slot.data(), slot.size()).ok());
+    CHECK(Bytes(slot.begin(), slot.begin() + std::ptrdiff_t(size)) ==
+          want.payloads[i]);
+    CHECK(untouched(slot, size));
+    CHECK(parser.read(record, slot.data(), slot.size()).domain() ==
+          Code::InvalidArgument);
+  }
+  stream::Record end;
+  const vkc::Result<bool> none = parser.next(&end, nullptr);
+  CHECK(none.ok() && !none.value());
+
+  stream::ChunkParser skipping;
+  CHECK(skipping.feed(bytes.data(), bytes.size()).ok());
+  stream::Record first;
+  stream::Record second;
+  Bytes payload;
+  CHECK(skipping.next(&first, nullptr).value());
+  CHECK(skipping.next(&second, &payload).value());
+  CHECK(second.offset == want.records[1].offset && payload == want.payloads[1]);
+
+  // The third record's body damaged: the feed stops at the first record, so
+  // the next that reaches the third finds it.
+  const std::size_t third = 2;
+  CHECK(want.records[third].size != 0);
+  const Bytes damaged =
+      vrst::flipped(bytes, std::size_t(want.records[third].offset) + 56, 1);
+  stream::ChunkParser crc;
+  CHECK(crc.feed(damaged.data(), damaged.size()).ok());
+  for (std::size_t i = 0; i < third; ++i) {
+    stream::Record record;
+    CHECK(crc.next(&record, nullptr).value());
+  }
+  stream::Record bad;
+  const vkc::Result<bool> failed = crc.next(&bad, nullptr);
+  CHECK(failed.status().domain() == Code::InvalidArgument &&
+        failed.status().message().find("fails its CRC") != std::string::npos);
+  Bytes slot(64, 0xEE);
+  CHECK(crc.read(bad, slot.data(), slot.size()).domain() ==
+        Code::InvalidArgument);
+  CHECK(untouched(slot, 0));
+  return 0;
+}
+
+// A matching offset alone does not identify the held record. Both a shorter
+// body and one larger than the buffered chunk must be refused, as must altered
+// metadata. Each refusal leaves the destination and the held record intact.
+int parser_read_identity_case() {
+  auto encoder = stream::ChunkEncoder::create(session_of(2));
+  CHECK(encoder.ok());
+  const Bytes payload{1, 2, 3};
+  const auto framing =
+      encoder->frame(info(0, true, 100, 1, 5), payload.data(), payload.size());
+  CHECK(framing.ok());
+  Bytes bytes = encoder->session_chunk();
+  append_chunk(bytes, *framing, payload);
+  stream::ChunkParser parser;
+  CHECK(parser.feed(bytes.data(), bytes.size()).ok());
+  stream::Record record;
+  const auto got = parser.next(&record, nullptr);
+  CHECK(got.ok() && got.value());
+
+  std::vector<stream::Record> changed(8, record);
+  changed[0].size = 2;
+  changed[1].size = 4096;
+  changed[2].size = 0;
+  changed[3].info.track = 1;
+  changed[4].info.key = false;
+  changed[5].info.pts_ns += 1;
+  changed[6].info.seq += 1;
+  changed[7].info.set += 1;
+  Bytes slot(4096, 0xEE);
+  const Bytes untouched = slot;
+  for (const auto& other : changed) {
+    CHECK(parser.read(other, slot.data(), slot.size()).domain() ==
+          Code::InvalidArgument);
+    CHECK(slot == untouched);
+  }
+  CHECK(parser.read(record, slot.data(), slot.size()).ok());
+  CHECK(std::equal(payload.begin(), payload.end(), slot.begin()));
+  CHECK(std::equal(slot.begin() + std::ptrdiff_t(payload.size()), slot.end(),
+                   untouched.begin() + std::ptrdiff_t(payload.size())));
+  const auto end = parser.next(&record, nullptr);
+  CHECK(end.ok() && !end.value());
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -558,6 +684,8 @@ int main() {
   if (parser_wider_session_case(dir) != 0) return 1;
   if (parser_refusals_case(dir) != 0) return 1;
   if (parser_latch_case(dir) != 0) return 1;
+  if (parser_read_case(dir) != 0) return 1;
+  if (parser_read_identity_case() != 0) return 1;
   std::puts("stream chunks: OK");
   return 0;
 }

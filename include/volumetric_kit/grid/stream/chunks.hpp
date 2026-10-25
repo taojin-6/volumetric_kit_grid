@@ -154,13 +154,30 @@ class VR_STREAM_API ChunkParser {
   const Session* session() const noexcept;
 
   /// @brief Take the next record, skipping other chunks.
+  ///
+  /// With a payload, the @ref read below into it, resized to fit.
   /// @param[out] record   Its header. Its `offset` is its chunk's offset in
   ///                      the bytes fed, as in the file they would make.
   /// @param[out] payload  Its payload, resized to fit; unspecified after a
-  ///                      failure.
+  ///                      failure. Or null: its body, checked against its
+  ///                      CRC, stays here for @ref read until the next call
+  ///                      of this, which drops it unread.
   /// @return `true` with a record; `false` when it needs more bytes; or the
   ///         failure, as @ref feed returns it.
   core::Result<bool> next(Record* record, std::vector<std::uint8_t>* payload);
+
+  /// @brief Copy the body of the record the last @ref next returned with no
+  ///        payload into caller memory, such as a decoder's input slot.
+  /// @param record    That record.
+  /// @param dst       Receives the body, `record.size` bytes.
+  /// @param capacity  Bytes at @p dst.
+  /// @return OK, the record taken; with nothing copied and the record still
+  ///         held, `Status::Code::InvalidArgument` for a @p capacity under
+  ///         `record.size`, a null @p dst for a body of any bytes, or a
+  ///         record that is not the one held; or the failure, as @ref feed
+  ///         returns it. A read that succeeds allocates nothing.
+  core::Status read(const Record& record, std::uint8_t* dst,
+                    std::size_t capacity);
 
  private:
   // Check what was fed, up to the next record: true when one is whole and
@@ -176,6 +193,9 @@ class VR_STREAM_API ChunkParser {
   std::uint64_t next_ = 0;  // the next chunk's offset; past the bytes fed
                             // while its padding is still to come
   bool ready_ = false;      // a checked record starts at next_
+  // The bytes of the chunk at next_ that next() returned and read() has not
+  // taken; 0 for none.
+  std::uint64_t held_ = 0;
   std::optional<Session> session_;
   core::Status failure_;
 };

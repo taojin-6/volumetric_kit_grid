@@ -80,9 +80,9 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   }
 
   // The active set, on the device and inside this stage, so its row is a
-  // breakdown ("  ..active set"). The map hands back the list an extract just
-  // compacted while it still holds, and keeps this one for the extract after,
-  // so encoding between two costs neither of them a compaction.
+  // breakdown ("  ..active set"). The map hands back its last list while it
+  // still holds, and keeps this one for the extract after, which then
+  // compacts nothing.
   VKC_ASSIGN(const volume::DeviceBlockList list,
              grid.map().compact_active_blocks_on_device(metrics));
   // Only the blocks with an observed voxel are coded -- with true_sdf, only

@@ -221,10 +221,29 @@ Blocks listed(const std::vector<vr::Vec3i>& coords) {
 constexpr std::size_t kGuard = 8;
 constexpr std::int32_t kGuardPtr = 0x5EED;
 
+// What the merge and the diff left on the device, as the decoder's gate
+// reads it.
+struct Found {
+  std::uint32_t collision_q = d::kNoSource;
+  std::uint32_t collision_e = d::kNoSource;
+  std::uint32_t gone = 0;
+  std::uint32_t missing = 0;
+};
+
+vkc::Result<Found> found(vr_test::Gpu& gpu, const d::BlockLists& lists) {
+  VKC_ASSIGN(const std::vector<std::uint32_t> collision,
+             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                               lists.collision(), 2));
+  VKC_ASSIGN(const std::vector<std::uint32_t> counts,
+             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                               lists.diff_counts(), 2));
+  return Found{collision[0], collision[1], counts[0], counts[1]};
+}
+
 struct Merged {
   std::vector<vr::Vec3i> coords;
   std::vector<d::ApplySource> sources;
-  d::BlockLists::Verdict verdict;
+  Found verdict;
   bool guards_kept = true;
 };
 
@@ -272,7 +291,7 @@ vkc::Result<Merged> device_merge(vr_test::Gpu& gpu, d::BlockLists& lists,
              vr_test::read_back<d::ApplySource>(gpu.device, gpu.allocator,
                                                 source_buf, n + kGuard));
   Merged out;
-  out.verdict = lists.verdict();
+  VKC_ASSIGN(out.verdict, found(gpu, lists));
   for (std::size_t i = 0; i < n + kGuard; ++i) {
     if (i < n) {
       out.coords.push_back(frame[i].coord);
@@ -525,17 +544,17 @@ vkc::Result<Diffed> device_diff(vr_test::Gpu& gpu, d::BlockLists& lists,
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   VKC_TRY(lists.record_diff(batch, grid, frame_buf, n));
   VKC_TRY(batch.submit());
-  const d::BlockLists::Verdict found = lists.verdict();
+  VKC_ASSIGN(const Found counts, found(gpu, lists));
   Diffed out;
-  if (found.gone != 0) {
+  if (counts.gone != 0) {
     VKC_ASSIGN(out.gone,
                vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
-                                                   lists.gone(), found.gone));
+                                                   lists.gone(), counts.gone));
   }
-  if (found.missing != 0) {
+  if (counts.missing != 0) {
     VKC_ASSIGN(out.missing,
                vr_test::read_back<vol::BlockIndex>(
-                   gpu.device, gpu.allocator, lists.missing(), found.missing));
+                   gpu.device, gpu.allocator, lists.missing(), counts.missing));
   }
   return out;
 }
@@ -667,7 +686,8 @@ int garbage_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   CHECK(lists.record_diff(batch, g.value(), frame_buf.value(), n).ok());
   CHECK(batch.submit().ok());
-  CHECK(lists.verdict().gone <= held.size() && lists.verdict().missing <= n);
+  const vkc::Result<Found> counts = found(gpu, lists);
+  CHECK(counts.ok() && counts->gone <= held.size() && counts->missing <= n);
   vkc::Result<Blocks> after = vr_test::read_back<vol::BlockIndex>(
       gpu.device, gpu.allocator, frame_buf.value(), n);
   CHECK(after.ok() &&

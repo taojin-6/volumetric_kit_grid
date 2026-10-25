@@ -5,7 +5,8 @@
 // any bytes: a refused port is IoError; HTTP's bytes are InvalidArgument; a
 // header claiming 1 GiB is refused before any of its body comes (a RECD's or
 // another tag's OutOfMemory, a VRST's InvalidArgument); a corrupt body is
-// InvalidArgument; the end after whole records is IoError once they are all
+// InvalidArgument; a record held by a next with no payload is read into
+// caller memory; the end after whole records is IoError once they are all
 // read, and an end before the session says so; next(20 ms) with nothing
 // returns false in about 20 ms, and within 500 ms while chunks it skips flood
 // in; next(0 ms) alone connects and reads, a 230 KB record already in the
@@ -182,6 +183,53 @@ int corrupt_body_case() {
   CHECK(!r.ok() && r.status().domain() == Code::InvalidArgument);
   CHECK(net::client_reason(r.status().message(), sender.listener.port)
             .rfind("ChunkParser: ", 0) == 0);
+  return 0;
+}
+
+// next with no payload holds the record for read, which copies it into
+// caller memory -- a slot with room after it, which stays as it was. A
+// capacity short by one is refused with the connection open and the record
+// held, so the read after it takes it; a corrupt body fails the null-payload
+// next as it fails the other, and every read after returns that error.
+int read_into_case() {
+  Sender sender;
+  auto client = net::connect(sender.listener.port);
+  CHECK(client != nullptr && sender.take(*client));
+  const Bytes a = vrst::pattern(1000, 3);
+  const Bytes b = vrst::pattern(37, 4);
+  Bytes bad = vrst::record(0, 0, 2, 2, stream::kNoSet, vrst::pattern(64, 5));
+  bad[56 + 10] ^= 0x20;
+  CHECK(net::send_bytes(
+      sender.peer.get(),
+      concat({session_bytes(), vrst::record(0, 1, 0, 0, stream::kNoSet, a),
+              vrst::record(0, 0, 1, 1, stream::kNoSet, b), bad})));
+  stream::Record record;
+  const auto held = [&]() -> vkc::Result<bool> {
+    const Clock::time_point end = Clock::now() + 5s;
+    for (;;) {
+      vkc::Result<bool> r = client->next(10ms, &record, nullptr);
+      if (!r.ok() || *r || Clock::now() >= end) return r;
+    }
+  };
+  vkc::Result<bool> r = held();
+  CHECK(r.ok() && *r && record.info.seq == 0 && record.size == a.size());
+  Bytes slot(a.size() + 8, 0xEE);
+  CHECK(client->read(record, slot.data(), a.size() - 1).domain() ==
+        Code::InvalidArgument);
+  CHECK(client->read(record, slot.data(), slot.size()).ok());
+  CHECK(Bytes(slot.begin(), slot.begin() + std::ptrdiff_t(a.size())) == a);
+  CHECK(slot[a.size()] == 0xEE);
+  r = held();
+  CHECK(r.ok() && *r && record.info.seq == 1 && record.size == b.size());
+  CHECK(client->read(record, slot.data(), slot.size()).ok());
+  CHECK(Bytes(slot.begin(), slot.begin() + std::ptrdiff_t(b.size())) == b);
+  r = held();
+  CHECK(!r.ok() && r.status().domain() == Code::InvalidArgument);
+  CHECK(net::client_reason(r.status().message(), sender.listener.port)
+            .rfind("ChunkParser: ", 0) == 0);
+  const vkc::Status after = client->read(record, slot.data(), slot.size());
+  CHECK(after.domain() == Code::InvalidArgument &&
+        after.message() == r.status().message());
   return 0;
 }
 
@@ -670,6 +718,7 @@ int main() {
   if (not_a_stream_case() != 0) return 1;
   if (huge_header_case() != 0) return 1;
   if (corrupt_body_case() != 0) return 1;
+  if (read_into_case() != 0) return 1;
   if (end_case() != 0) return 1;
   if (closed_before_session_case() != 0) return 1;
   if (wait_case() != 0) return 1;

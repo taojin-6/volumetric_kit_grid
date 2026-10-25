@@ -63,4 +63,20 @@ inline constexpr std::uint32_t kFailTable = 5;
 inline constexpr std::uint32_t kFailSlots = 6;  ///< Slots in the tally.
 /// @}
 
+/// @brief What a recorded removal's or allocation's rounds leave in its
+///        result slot: `hash_rounds.comp`'s `RoundsResult`, written whole by
+///        its gather, and @ref VoxelHashMap::settle's input.
+struct RoundsResult {
+  std::uint32_t total;      ///< The last round's retryable failures.
+  std::uint32_t lock;       ///< Of them, lost bucket-lock races.
+  std::uint32_t chain;      ///< Collision chain full.
+  std::uint32_t heap;       ///< Block heap (too) low.
+  std::uint32_t table;      ///< No free non-anchor slot.
+  std::uint32_t terminal;   ///< Non-retryable, over every round.
+  std::uint32_t rounds;     ///< Rounds run.
+  std::uint32_t heap_free;  ///< The heap counter after them.
+};
+static_assert(sizeof(RoundsResult) == 4 * 8,
+              "RoundsResult is eight words, as hash_rounds.comp writes it");
+
 }  // namespace volumetric_kit::recon::volume

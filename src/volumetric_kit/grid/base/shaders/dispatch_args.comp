@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// recon's one count-to-indirect-slices kernel (recon::detail::DispatchArgs):
+// a pass's size from a count on the device -- a compaction's, a diff's -- or
+// one the host knows, gated by an optional word, so no count reaches the host
+// between the kernel that wrote it and the passes it sizes. One invocation
+// writes the slices of up to two widths of the same count (items a group).
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Counts { uint counts[]; };
+layout(set = 0, binding = 1) readonly buffer Gates { uint gates[]; };
+#define VR_SLICES_BINDING 2
+#include "volumetric_kit/recon/core/shaders/dispatch_slices.glsl"
+
+// A word index that names no word.
+const uint kNoWord = 0xFFFFFFFFu;
+
+layout(push_constant, scalar) uniform Push {
+  uint count_word;  // the count's word in `counts`, or kNoWord for `bound`
+  uint gate_word;   // the gate's word in `gates`, or kNoWord for none
+  uint bound;       // the most the count holds; a larger word reads as this
+  uint multiplier;  // items an entry: a block's voxels, or 1
+  uint per_dispatch;
+  uint lanes0;  // the first width's items a group, and its slices
+  uint dispatches0;
+  uint lanes1;  // a second width's, its slices after the first's; 0 for none
+  uint dispatches1;
+}
+pc;
+
+void main() {
+  uint count = pc.count_word == kNoWord ? pc.bound
+                                        : min(counts[pc.count_word], pc.bound);
+  if (pc.gate_word != kNoWord && gates[pc.gate_word] == 0u) count = 0u;
+  // bound * multiplier fits 32 bits (the host's check), so this cannot wrap.
+  const uint items = count * pc.multiplier;
+  vrWriteSlices(0u, pc.dispatches0, pc.per_dispatch,
+                vrGroups(items, pc.lanes0));
+  if (pc.lanes1 != 0u) {
+    vrWriteSlices(pc.dispatches0, pc.dispatches1, pc.per_dispatch,
+                  vrGroups(items, pc.lanes1));
+  }
+}

@@ -73,6 +73,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact_frustum.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_delete_coords.comp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rehash.comp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rehash.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rounds.comp")
 
 vr_target_warnings(recon_volume)

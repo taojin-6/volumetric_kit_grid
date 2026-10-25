@@ -3,7 +3,7 @@
 
 #include "device_frame_reader.hpp"
 
-#include <cstring>
+#include <algorithm>
 
 #include "rans_dispatch.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -25,9 +25,6 @@ constexpr std::uint32_t kSlotsLanes = 256;
 constexpr std::uint32_t kDecodeLanes = 1;
 constexpr std::uint32_t kVerdictLanes = 64;
 
-// The verdict word with no failing segment: a failing one is s << 2 | kind,
-// kind 1 to 3, and s below kMaxFrameSegments, so it is never this.
-constexpr std::uint32_t kNoVerdict = ~0u;
 static_assert((kMaxFrameSegments - 1) << 2 < kNoVerdict - 3,
               "a failing segment's verdict word is below kNoVerdict");
 
@@ -61,6 +58,8 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   r.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   r.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
+  r.min_offset_alignment_ =
+      std::max<VkDeviceSize>(props.limits.minStorageBufferOffsetAlignment, 4);
   // The verdict, and the ranks of a frame with no reference entries, which
   // even a frame of no segments hands the merge.
   VKC_TRY(core::ensure_device_scratch(
@@ -73,7 +72,8 @@ core::Result<std::unique_ptr<DeviceFrameReader>> DeviceFrameReader::create(
 }
 
 core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
-    core::CommandBatch& batch, const ParsedFrame& frame,
+    core::CommandBatch& batch, const ParsedFrame& frame, VkBuffer input,
+    VkDeviceSize input_bytes, VkDeviceSize payload_at,
     core::GpuStageScope* stage) {
   VKC_TRY(
       check_frame_type(frame.header.type, "DeviceFrameReader::record_decode"));
@@ -98,12 +98,9 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
     VKC_TRY(check_segment_size("DeviceFrameReader::record_decode",
                                "update size", u_size));
   }
-  // What check() judges the frame by, once nothing else can refuse it, and
-  // the verdict reset, which a frame of no segments reads back as it is.
-  auto adopt = [&]() -> core::Status {
-    type_ = type;
-    block_count_ = n;
-    new_count_ = a;
+  // The verdict reset, once nothing else can refuse the frame, which a frame
+  // of no segments leaves as it is.
+  auto reset = [&]() -> core::Status {
     VKC_TRY(batch.fill(verdict_, 0, sizeof(std::uint32_t), kNoVerdict));
     VKC_TRY(
         batch.fill(verdict_, sizeof(std::uint32_t), sizeof(std::uint32_t), 0u));
@@ -113,9 +110,19 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   out.coefficient_count = k;
   out.ranks = &ranks_;
   if (segments == 0) {
-    VKC_TRY(adopt());
-    VKC_TRY(batch.readback(verdict_, 0, kVerdictBytes, verdict_host_));
+    VKC_TRY(reset());
     return out;
+  }
+  // The payload, bound from its offset aligned down to what a binding allows,
+  // read from the byte after (pc.payload_byte), to the word its last byte is
+  // in -- inside the record's slack.
+  const VkDeviceSize bind_at = payload_at - payload_at % min_offset_alignment_;
+  const VkDeviceSize payload_byte = payload_at - bind_at;
+  const VkDeviceSize payload_bytes =
+      (payload_byte + frame.payload_size + 3) & ~VkDeviceSize{3};
+  if (payload_at > input_bytes || payload_bytes > input_bytes - bind_at) {
+    return core::Status::invalid_argument(
+        "DeviceFrameReader::record_decode: the payload lies past the input");
   }
 
   // Every size first, so a frame the device cannot hold grows nothing.
@@ -125,8 +132,6 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   const VkDeviceSize entry_bytes = table_entries.size() * sizeof(std::uint32_t);
   const VkDeviceSize slot_bytes =
       VkDeviceSize(models) * kRansScale * sizeof(std::uint32_t);
-  const VkDeviceSize payload_bytes =
-      (frame.payload_size + 3) & ~VkDeviceSize{3};
   const VkDeviceSize word_bytes =
       (VkDeviceSize(segments) + 1) * sizeof(std::uint32_t);
   const VkDeviceSize list_bytes = VkDeviceSize(a) * sizeof(volume::BlockIndex);
@@ -146,7 +151,6 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   const Scratch scratch[] = {
       {tables_, entry_bytes, "codec.rans_decode_tables"},
       {slots_, slot_bytes, "codec.rans_slots"},
-      {payload_, payload_bytes, "codec.rans_decode_payload"},
       {segment_words_, word_bytes, "codec.rans_segment_words"},
       {list_, binding_range(list_bytes, sizeof(volume::BlockIndex)),
        "codec.rans_decode_list"},
@@ -158,6 +162,8 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
       {ranks_, rank_bytes, "codec.survivor_ranks"},
   };
   const VkDeviceSize range = max_storage_buffer_range_;
+  VKC_TRY(core::check_storage_buffer_range("codec.decode_input", payload_bytes,
+                                           range));
   for (const Scratch& b : scratch) {
     VKC_TRY(core::check_storage_buffer_range(b.name, b.bytes, range));
   }
@@ -171,20 +177,18 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   for (std::uint32_t s = 0; s < segments; ++s) {
     segment_words[s + 1] = segment_words[s] + frame.segment_lengths[s] / 2;
   }
-  VKC_TRY(adopt());
+  VKC_TRY(reset());
 
+  // Inline, as the decode's batch writes every update ahead of its first
+  // dispatch.
   VKC_TRY(batch.upload(tables_, 0, table_entries.data(), entry_bytes));
   VKC_TRY(batch.upload(segment_words_, 0, segment_words.data(), word_bytes));
-  VKC_ASSIGN(void* staged, batch.reserve_upload(payload_, 0, payload_bytes));
-  std::memcpy(staged, frame.payload, frame.payload_size);
-  std::memset(static_cast<std::uint8_t*>(staged) + frame.payload_size, 0,
-              payload_bytes - frame.payload_size);
 
   slots_kernel_.set.write_storage_buffer(0, tables_.handle(), 0, entry_bytes);
   slots_kernel_.set.write_storage_buffer(1, slots_.handle(), 0, slot_bytes);
   core::ComputeKernel& decode = decode_kernel_;
   decode.set.write_storage_buffer(0, slots_.handle(), 0, slot_bytes);
-  decode.set.write_storage_buffer(1, payload_.handle(), 0, payload_bytes);
+  decode.set.write_storage_buffer(1, input, bind_at, payload_bytes);
   decode.set.write_storage_buffer(2, segment_words_.handle(), 0, word_bytes);
   decode.set.write_storage_buffer(
       3, list_.handle(), 0,
@@ -214,6 +218,7 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   push.frame_type = static_cast<std::uint32_t>(type);
   push.reference_count = m;
   push.update_size = u_size;
+  push.payload_byte = static_cast<std::uint32_t>(payload_byte);
   VKC_TRY(dispatch_items(batch, slots_kernel_, push,
                          std::uint64_t(models) * kRansScale, kSlotsLanes,
                          max_workgroup_count_x_, stage));
@@ -223,7 +228,6 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
                          max_workgroup_count_x_, stage));
   VKC_TRY(batch.dispatch(ranks_kernel_, &push, sizeof(push), 1,
                          max_workgroup_count_x_, stage));
-  VKC_TRY(batch.readback(verdict_, 0, kVerdictBytes, verdict_host_));
 
   out.list = &list_;
   out.masks = &masks_;
@@ -234,14 +238,14 @@ core::Result<ResidentBlocks> DeviceFrameReader::record_decode(
   return out;
 }
 
-core::Status DeviceFrameReader::check() const {
-  const std::uint32_t verdict = verdict_host_[0];
-  if (verdict != kNoVerdict) {
-    VKC_TRY(
-        check_segment(verdict >> 2, static_cast<SegmentFault>(verdict & 3u)));
+core::Status DeviceFrameReader::judge(FrameType type, std::uint32_t n,
+                                      std::uint32_t a, std::uint32_t failed,
+                                      std::uint32_t survivors) {
+  if (failed != kNoVerdict) {
+    VKC_TRY(check_segment(failed >> 2, static_cast<SegmentFault>(failed & 3u)));
   }
-  if (type_ != FrameType::kInter) return {};
-  return check_survivors(verdict_host_[1], block_count_, new_count_);
+  if (type != FrameType::kInter) return {};
+  return check_survivors(survivors, n, a);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

@@ -55,8 +55,68 @@ VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
     core::Device& device, core::Allocator& allocator, const std::uint8_t* frame,
     std::size_t size, std::uint32_t max_blocks);
 
+/// @brief What @ref finish_growing did besides finishing the frame.
+///
+/// @code
+/// VKC_ASSIGN(const codec::Finished done,
+///            codec::finish_growing(decoder, frame, grid, max_blocks));
+/// if (done.redone) remesh();  // its extract ran gated off
+/// @endcode
+struct Finished {
+  /// The frame failed on the device (the grid too small, or contention past
+  /// the rounds) and was decoded again from its own slot, blocking. Whatever
+  /// its batch recorded after it, such as an extract, ran gated off.
+  bool redone = false;
+};
+
+/// @brief @ref Decoder::record @p slot's record into @p batch, first growing
+///        @p grid, blocking, when the frame holds more blocks than its heap.
+///
+/// The grow is @ref decode_growing's: to twice the grid's buckets or the
+/// frame's @ref make_decode_grid buckets, whichever is more.
+/// @param decoder     The decoder.
+/// @param batch       Records the frame; the caller submits it.
+/// @param slot        From @ref Decoder::claim_input, the record at its start.
+/// @param size        The record's exact length.
+/// @param grid        As @ref Decoder::record takes it.
+/// @param max_blocks  The most blocks a frame may hold.
+/// @param metrics     Optional: @ref Decoder::record's rows, and a grow's
+///                    `"  ..grow"`, which their `"codec decode"` holds.
+/// @return As @ref Decoder::record, out of device memory included, which no
+///         grow cures; `Status::Code::InvalidArgument` for a frame or a grow
+///         past @p max_blocks; or `volume::grow_grid`'s failure.
+/// @pre As @ref Decoder::record. A grow frees the grid's buffers at once.
+VR_CODEC_API core::Result<PendingDecode> record_growing(
+    Decoder& decoder, core::CommandBatch& batch, const core::HostSlot& slot,
+    std::size_t size, volume::VoxelBlockGrid& grid, std::uint32_t max_blocks,
+    core::StageMetrics* metrics = nullptr);
+
+/// @brief @ref Decoder::finish @p pending, recovering as @ref decode_growing
+///        does: decoding the frame again from @p pending's own slot, after a
+///        grow for `Status::Code::OutOfMemory` (once), or as it is for
+///        `Status::Code::IoError` (twice at most).
+///
+/// Each recovery blocks, in batches of its own, and is timed whole, its
+/// decode again included, as `"  ..grow"` or `"  ..retry"` inside a
+/// `"codec decode"` row. It needs no other input slot.
+/// @param decoder     The decoder that recorded @p pending.
+/// @param pending     Its batch resolved.
+/// @param grid        The grid it recorded into.
+/// @param max_blocks  The most blocks a frame may hold.
+/// @param metrics     Optional: the recoveries' rows.
+/// @return What it did; or the last finish's error as @ref decode_growing
+///         returns it, with the reference unchanged; or `volume::grow_grid`'s
+///         failure.
+VR_CODEC_API core::Result<Finished> finish_growing(
+    Decoder& decoder, const PendingDecode& pending,
+    volume::VoxelBlockGrid& grid, std::uint32_t max_blocks,
+    core::StageMetrics* metrics = nullptr);
+
 /// @brief @ref Decoder::decode @p frame into @p grid, growing the grid once
 ///        if the frame outgrows it.
+///
+/// It recovers as @ref record_growing and @ref finish_growing do, around one
+/// submit of its own.
 ///
 /// `Status::Code::OutOfMemory`, the decoder's word for a grid too small,
 /// grows @p grid once (@ref volume::grow_grid) to twice its buckets or the
@@ -77,14 +137,11 @@ VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
 /// @param grid        The grid to decode into, as @ref Decoder::decode takes
 ///                    it.
 /// @param max_blocks  The ceiling: the most blocks a frame may hold.
-/// @param metrics     Optional `StageMetrics` collecting the rows
-///                    @ref Decoder::decode gives, of the attempt that
-///                    succeeds alone, so a frame that grew the grid is timed
-///                    as one decode; the grow is not timed. `nullptr`
-///                    measures nothing. If aggregating the successful attempt
-///                    runs out of host memory, the prior metrics stay
-///                    unchanged and the decode still returns OK: its
-///                    reference has already committed.
+/// @param metrics     Optional `StageMetrics` collecting, once the decode
+///                    succeeds, the rows @ref Decoder::decode gives for the
+///                    first attempt and, after a recovery, its row as
+///                    @ref finish_growing times it. `nullptr` measures
+///                    nothing.
 /// @return OK; @ref read_frame_info's refusal of the header;
 ///         `Status::Code::InvalidArgument` for a frame or a grow past
 ///         @p max_blocks; the last decode's

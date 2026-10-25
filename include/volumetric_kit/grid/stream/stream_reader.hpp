@@ -188,6 +188,8 @@ class VR_STREAM_API StreamReader {
 
   /// @brief Read a record's payload, checking its header again and its
   ///        payload against its CRC.
+  ///
+  /// The read below, into a vector resized to fit.
   /// @param record   A record @ref next returned from this reader.
   /// @param payload  Receives the payload, resized to fit; what it holds
   ///                 after a failure is unspecified.
@@ -199,6 +201,22 @@ class VR_STREAM_API StreamReader {
   ///         than at open.
   core::Status read(const Record& record,
                     std::vector<std::uint8_t>* payload) const;
+
+  /// @brief Read a record's payload into caller memory, such as a decoder's
+  ///        input slot, checking its header again and its payload against its
+  ///        CRC.
+  /// @param record    A record @ref next returned from this reader.
+  /// @param dst       Receives the payload, `record.size` bytes; unspecified
+  ///                  after a failure.
+  /// @param capacity  Bytes at @p dst.
+  /// @return OK; `Status::Code::InvalidArgument` for a @p capacity under
+  ///         `record.size` or a null @p dst for a payload of any bytes (both
+  ///         before anything is read),
+  ///         a payload failing its CRC, or a header no longer @p record 's;
+  ///         or `Status::Code::IoError` for a read failure or a file shorter
+  ///         than at open. A read that succeeds allocates nothing.
+  core::Status read(const Record& record, std::uint8_t* dst,
+                    std::size_t capacity) const;
 
  private:
   // A key record, as the footer index or the scan found it.

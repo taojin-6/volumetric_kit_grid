@@ -107,16 +107,61 @@ std::set<std::uint32_t> tails(std::size_t m) {
   return out;
 }
 
+// A frame's bytes on the device from byte `shift` of a buffer, whatever
+// before them, then the 8 bytes of zeros a decoder's input slot holds after a
+// record, and where its payload starts there.
+struct Input {
+  vkc::Buffer buffer;
+  VkDeviceSize payload_at = 0;
+};
+
+vkc::Result<Input> upload_input(const std::uint8_t* data, std::size_t size,
+                                const d::ParsedFrame& parsed,
+                                std::size_t shift = 0) {
+  Bytes bytes(shift + size + 8, 0);
+  std::fill(bytes.begin(), bytes.begin() + std::ptrdiff_t(shift), 0xA5);
+  std::copy(data, data + size, bytes.begin() + std::ptrdiff_t(shift));
+  Input in;
+  VKC_ASSIGN(in.buffer,
+             vr_test::upload_device_buffer(*g_device, *g_allocator,
+                                           bytes.data(), bytes.size()));
+  in.payload_at = shift + VkDeviceSize(parsed.payload - data);
+  return in;
+}
+
+// @p reader's recording of @p parsed, from @p in.
+vkc::Result<d::ResidentBlocks> record(d::DeviceFrameReader& reader,
+                                      vkc::CommandBatch& batch,
+                                      const d::ParsedFrame& parsed,
+                                      const Input& in) {
+  return reader.record_decode(batch, parsed, in.buffer.handle(),
+                              in.buffer.size(), in.payload_at);
+}
+
+// The reader's verdict on @p parsed once its batch ran, as the decoder
+// judges it.
+vkc::Status verdict_of(const d::DeviceFrameReader& reader,
+                       const d::ParsedFrame& parsed) {
+  VKC_ASSIGN(const std::vector<std::uint32_t> words,
+             vr_test::read_back<std::uint32_t>(*g_device, *g_allocator,
+                                               reader.verdict(), 2));
+  return d::DeviceFrameReader::judge(parsed.header.type,
+                                     parsed.header.block_count,
+                                     parsed.new_count, words[0], words[1]);
+}
+
 // The device reader's decode of a frame, read back as the oracle's: a skip or
 // remove entry's payload, which the device leaves as it was, zero as the
-// oracle's.
+// oracle's. The frame lies at byte @p shift of its input.
 vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
                                        const std::uint8_t* data,
                                        std::size_t size,
                                        const d::FrameReference* reference,
-                                       std::uint32_t max_blocks = kMaxBlocks) {
+                                       std::uint32_t max_blocks = kMaxBlocks,
+                                       std::size_t shift = 0) {
   VKC_ASSIGN(const d::ParsedFrame parsed,
              d::parse_frame(data, size, max_blocks, reference));
+  VKC_ASSIGN(const Input input, upload_input(data, size, parsed, shift));
   const std::uint32_t k = parsed.header.params.coefficient_count;
   const std::uint32_t words = d::coefficient_words(k);
   oracle::Frame frame;
@@ -127,7 +172,7 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   frame.blocks.params = parsed.header.params;
   vkc::CommandBatch batch(*g_device, *g_allocator);
   VKC_ASSIGN(const d::ResidentBlocks resident,
-             reader.record_decode(batch, parsed));
+             record(reader, batch, parsed, input));
   const std::uint32_t entries = resident.count;
   const std::uint32_t m = resident.reference_count;
   std::vector<std::uint32_t> packed(std::size_t(entries) * words);
@@ -152,7 +197,7 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
                            list.data()));
   }
   VKC_TRY(batch.submit());
-  VKC_TRY(reader.check());
+  VKC_TRY(verdict_of(reader, parsed));
   for (const std::uint32_t mode : modes) {
     frame.modes.push_back(static_cast<d::BlockMode>(mode));
   }
@@ -177,16 +222,17 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   return frame;
 }
 
-// The oracle's decode of a frame and the device's: the same entries, or the
-// same refusal -- code and message -- which @p refusal receives.
+// The oracle's decode of a frame and the device's, from byte @p shift of its
+// input: the same entries, or the same refusal -- code and message -- which
+// @p refusal receives.
 int same_read(d::DeviceFrameReader& reader, const Bytes& bytes,
               const d::FrameReference* reference = nullptr,
               std::string* refusal = nullptr,
-              std::uint32_t max_blocks = kMaxBlocks) {
+              std::uint32_t max_blocks = kMaxBlocks, std::size_t shift = 0) {
   const vkc::Result<oracle::Frame> expected =
       oracle::read_frame(bytes.data(), bytes.size(), max_blocks, reference);
-  const vkc::Result<oracle::Frame> device =
-      device_read(reader, bytes.data(), bytes.size(), reference, max_blocks);
+  const vkc::Result<oracle::Frame> device = device_read(
+      reader, bytes.data(), bytes.size(), reference, max_blocks, shift);
   if (expected.ok() != device.ok() ||
       (!expected.ok() &&
        expected.status().message() != device.status().message())) {
@@ -322,6 +368,25 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   const oracle::Frame empty = make_frame(0, 8, 1);
   const d::FrameReference id = reference_of(oracle::write_frame(empty).value());
   CHECK(same_bytes(writer, reader, inter_frame(id, empty, empty), {}) == 0);
+  return 0;
+}
+
+// The payload read where its record lies in the decoder's input slot: from
+// every byte offset mod 4 and past the binding alignments of 64 and 256, an
+// intra frame and the worked P-frame read as the oracle reads them.
+int payload_offsets_case(d::DeviceFrameReader& reader) {
+  const Bytes intra = oracle::write_frame(make_frame(65, 20, 3)).value();
+  const d::FrameReference example = reference_of(
+      oracle::write_frame(codec_frames::example_reference()).value());
+  const Bytes inter = codec_frames::example_bytes(example.hash);
+  const std::size_t shifts[] = {1, 2, 3, 4, 5, 6, 7, 67, 257};
+  for (const std::size_t shift : shifts) {
+    if (same_read(reader, intra, nullptr, nullptr, kMaxBlocks, shift) != 0 ||
+        same_read(reader, inter, &example, nullptr, kMaxBlocks, shift) != 0) {
+      std::fprintf(stderr, "payload at shift %zu\n", shift);
+      return 1;
+    }
+  }
   return 0;
 }
 
@@ -639,12 +704,17 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
   CHECK(same_read(reader, intra) == 0);
   // The coordinates the reader holds after a decode of the intra frame.
   d::ResidentBlocks held;
+  const d::ParsedFrame intra_parsed =
+      d::parse_frame(intra.data(), intra.size(), kMaxBlocks, nullptr).value();
+  const vkc::Result<Input> intra_input =
+      upload_input(intra.data(), intra.size(), intra_parsed);
+  CHECK(intra_input.ok());
   {
     vkc::CommandBatch batch(*g_device, *g_allocator);
-    vkc::Result<d::ResidentBlocks> r = reader.record_decode(
-        batch, d::parse_frame(intra.data(), intra.size(), kMaxBlocks, nullptr)
-                   .value());
-    CHECK(r.ok() && batch.submit().ok() && reader.check().ok());
+    vkc::Result<d::ResidentBlocks> r =
+        record(reader, batch, intra_parsed, intra_input.value());
+    CHECK(r.ok() && batch.submit().ok() &&
+          verdict_of(reader, intra_parsed).ok());
     held = r.value();
   }
   auto decoded = [&held] {
@@ -659,10 +729,12 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
   };
   const std::vector<vr::Vec3i> before = decoded();
   CHECK(before == reference.coords);
+  // Refused before the payload is bound, so the intra frame's input serves.
   auto refused = [&](const d::ParsedFrame& parsed, C code,
                      const std::string& says) {
     vkc::CommandBatch batch(*g_device, *g_allocator);
-    const vkc::Status s = reader.record_decode(batch, parsed).status();
+    const vkc::Status s =
+        record(reader, batch, parsed, intra_input.value()).status();
     if (s.domain() != code || s.message().rfind(says, 0) != 0) {
       std::fprintf(stderr, "%s: %s\n", says.c_str(),
                    s.ok() ? "not refused" : s.message().c_str());
@@ -779,10 +851,14 @@ int ranks_case(d::DeviceFrameReader& reader) {
     const Bytes bytes = oracle::write_frame(p).value();
     const d::ParsedFrame parsed =
         d::parse_frame(bytes.data(), bytes.size(), kMaxBlocks, &id).value();
+    const vkc::Result<Input> input =
+        upload_input(bytes.data(), bytes.size(), parsed);
+    CHECK(input.ok());
     vkc::CommandBatch batch(*g_device, *g_allocator);
-    vkc::Result<d::ResidentBlocks> r = reader.record_decode(batch, parsed);
+    vkc::Result<d::ResidentBlocks> r =
+        record(reader, batch, parsed, input.value());
     CHECK(r.ok() && r.value().ranks != nullptr);
-    CHECK(batch.submit().ok() && reader.check().ok());
+    CHECK(batch.submit().ok() && verdict_of(reader, parsed).ok());
     vkc::Result<std::vector<std::uint32_t>> ranks =
         vr_test::read_back<std::uint32_t>(*g_device, *g_allocator,
                                           *r.value().ranks, m + 1);
@@ -942,6 +1018,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (matches_oracle_case(writer, reader) != 0) return 1;
   if (inter_case(writer, reader) != 0) return 1;
   if (golden_case(writer, reader) != 0) return 1;
+  if (payload_offsets_case(reader) != 0) return 1;
   if (corruption_case(reader) != 0) return 1;
   if (inter_refusals_case(reader) != 0) return 1;
   if (writer_refusals_case(writer) != 0) return 1;
