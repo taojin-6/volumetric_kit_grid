@@ -3,7 +3,8 @@
 
 // StreamServer and StreamClient on loopback (127.0.0.1, port 0): a raw
 // viewer's bytes are StreamWriter's file for the same session and records,
-// less its footer; a client reads the session, then every record's info,
+// less its footer, a payload in two runs too, under the CRC its
+// RecordPayload computed; a client reads the session, then every record's info,
 // payload and file offset; a viewer that sends bytes still gets every record;
 // a viewer joining gets the GOP from its key, and
 // before any key nothing; a viewer that stops reading in the first key while
@@ -208,6 +209,66 @@ int wire_is_the_file_case(const std::string& dir) {
   CHECK(Bytes(file.begin(),
               file.begin() + static_cast<std::ptrdiff_t>(wire.size())) == wire);
   CHECK(vr_test::read_bytes(unfinished) == wire);
+  return 0;
+}
+
+// A payload in two runs is published as a file holds its joined bytes: a raw
+// viewer's bytes are the unfinished file's, at every split. Its CRC is
+// RecordPayload::of's alone: bytes changed after `of` reach the viewer under
+// the CRC of what they held, which its parser refuses, so the server
+// computed none of its own.
+int two_runs_case(const std::string& dir) {
+  const stream::Session session = net::geometry_session();
+  const std::vector<Published> records = some_records();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port());
+  CHECK(viewer.valid());
+  Bytes wire;
+  const std::size_t header = net::session_chunk(session).size();
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  const std::string path = dir + "/two_runs.vrst";
+  auto writer = stream::StreamWriter::create(path, session);
+  CHECK(writer.ok());
+  std::size_t i = 0;
+  for (const Published& r : records) {
+    const std::size_t n = r.payload.size();
+    const std::size_t at = (i++ * 5) % (n + 1);
+    CHECK((*writer)->append(r.info, r.payload.data(), n).ok());
+    CHECK(server
+              ->publish(r.info, stream::RecordPayload::of(r.payload.data(), at,
+                                                          r.payload.data() + at,
+                                                          n - at))
+              .ok());
+    const std::size_t want = (*writer)->size();
+    net::read_upto(viewer.get(), want, 5s, &wire);
+    CHECK(wire.size() == want);
+  }
+  writer->reset();
+  CHECK(vr_test::read_bytes(path) == wire);
+
+  const Bytes head = vrst::pattern(32, 1);
+  Bytes tail = vrst::pattern(64, 2);
+  const stream::RecordPayload p = stream::RecordPayload::of(
+      head.data(), head.size(), tail.data(), tail.size());
+  tail[3] ^= 0xFF;  // after `of`
+  CHECK(server->publish(net::record_info(records.size(), false), p).ok());
+  stream::ChunkParser parser;
+  CHECK(parser.feed(wire.data(), wire.size()).ok());
+  Got g;
+  for (std::size_t r = 0; r < records.size(); ++r) {
+    CHECK(parser.next(&g.record, &g.payload).value());
+  }
+  const Clock::time_point end = Clock::now() + 10s;
+  vkc::Status refused;
+  while (refused.ok() && Clock::now() < end) {
+    Bytes more;
+    net::read_upto(viewer.get(), std::size_t{1} << 16, 100ms, &more);
+    refused = parser.feed(more.data(), more.size());
+    if (refused.ok()) refused = parser.next(&g.record, &g.payload).status();
+  }
+  CHECK(!refused.ok() && refused.message().find("CRC") != std::string::npos);
   return 0;
 }
 
@@ -1078,6 +1139,7 @@ int main() {
   vr_test::Scratch scratch("recon_networking_server_");
   const std::string dir = scratch.path.string();
   if (wire_is_the_file_case(dir) != 0) return 1;
+  if (two_runs_case(dir) != 0) return 1;
   if (round_trip_case(dir) != 0) return 1;
   if (viewer_sends_case() != 0) return 1;
   if (join_case() != 0) return 1;

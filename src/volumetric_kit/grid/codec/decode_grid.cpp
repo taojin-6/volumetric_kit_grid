@@ -193,6 +193,22 @@ core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
   VKC_TRY(check_ceiling("decode_growing", info.block_count, max_blocks));
   VKC_ASSIGN(const core::HostSlot slot, decoder.claim_input(size));
   std::memcpy(slot.data(), frame, size);
+  return decode_growing(decoder, slot, size, grid, max_blocks, metrics);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("decode_growing",
+                                core::Status::Code::OutOfMemory);
+}
+
+core::Status decode_growing(Decoder& decoder, const core::HostSlot& slot,
+                            std::size_t size, volume::VoxelBlockGrid& grid,
+                            std::uint32_t max_blocks,
+                            core::StageMetrics* metrics) try {
+  if (!slot.valid() || size > slot.capacity()) {
+    return core::Status::invalid_argument(
+        "decode_growing: the slot does not hold the record");
+  }
+  VKC_ASSIGN(const FrameInfo info, read_frame_info(slot.data(), size));
+  VKC_TRY(check_ceiling("decode_growing", info.block_count, max_blocks));
   // The whole call is timed, the first decode and a recovery, and its rows
   // land in the caller's metrics once the decode succeeds. A heap too small
   // is the record's refusal and a table that cannot place the frame the

@@ -79,13 +79,17 @@ vkc::Result<Laid> device_layout(vr_test::Gpu& gpu, d::StepLayout& layout,
   if (!bound.empty()) {
     VKC_ASSIGN(input, vkc::device_storage_buffer(gpu.allocator, bytes));
   }
+  // The frame words: the surplus, and every block of the bound.
+  const std::uint32_t words[2] = {
+      surplus, static_cast<std::uint32_t>(bound.size()) -
+                   std::min<std::uint32_t>(m, std::uint32_t(bound.size()))};
   VKC_ASSIGN(const vkc::Buffer word,
-             vkc::device_storage_buffer(gpu.allocator, sizeof(surplus)));
+             vkc::device_storage_buffer(gpu.allocator, sizeof(words)));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   if (!bound.empty()) {
     VKC_TRY(batch.upload(input, 0, bound.data(), bytes));
   }
-  VKC_TRY(batch.upload(word, 0, &surplus, sizeof(surplus)));
+  VKC_TRY(batch.upload(word, 0, words, sizeof(words)));
   VKC_TRY(layout.record(batch, input, word,
                         static_cast<std::uint32_t>(bound.size()), m, u, r));
   Laid out;
@@ -101,8 +105,8 @@ vkc::Result<Laid> device_layout(vr_test::Gpu& gpu, d::StepLayout& layout,
                            out.slot_offsets.size() * sizeof(std::uint32_t),
                            out.slot_offsets.data()));
   }
+  VKC_TRY(batch.readback(layout.totals(), 0, sizeof(out.totals), &out.totals));
   VKC_TRY(batch.submit());
-  out.totals = layout.totals();
   return out;
 }
 
@@ -319,8 +323,8 @@ int clamp_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
 }
 
 // What record refuses, recording nothing: a segment or update size past the
-// rule, more reference entries than entries, and steps or a surplus word the
-// input does not hold. No entries records nothing and resets the totals.
+// rule, more reference entries than entries, and steps or frame words (two)
+// the input does not hold. No entries zeroes the totals alone.
 int refusals_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
   const Steps steps(100, 9);
   vkc::Result<vkc::Buffer> input =
@@ -364,12 +368,18 @@ int refusals_case(vr_test::Gpu& gpu, d::StepLayout& layout) {
     CHECK(refused(f.n, f.m, f.u, f.r, word.value(), f.says) == 0);
   }
   CHECK(refused(100, 0, 0, 64, half_word.value(),
-                "StepLayout::record: the surplus") == 0);
+                "StepLayout::record: the frame words") == 0);
+  CHECK(refused(100, 0, 0, 64, word.value(),
+                "StepLayout::record: the frame words") == 0);
+  const auto totals = [&]() {
+    return vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                             layout.totals(), 2);
+  };
   CHECK(lays_out_as_oracle(gpu, layout, steps, 0, 0, 64, "after refusals") ==
         0);
-  CHECK(layout.totals().steps == 900);
+  CHECK(totals().value()[0] == 900);
   CHECK(lays_out_as_oracle(gpu, layout, Steps{}, 0, 0, 64, "no entries") == 0);
-  CHECK(layout.totals().steps == 0 && layout.totals().slot_words == 0);
+  CHECK(totals().value() == std::vector<std::uint32_t>({0, 0}));
   return 0;
 }
 

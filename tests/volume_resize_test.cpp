@@ -235,8 +235,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // A grow whose rehash cannot place the blocks rolls back. Five blocks in
   // five buckets of 8 all land in one bucket of 9, where two slots and a chain
   // of two hold four. The map is as it was, and so is the heap counter, the
-  // host copy load_factor() reads and the device's own.
-  {
+  // host copy load_factor() reads and the device's own. A completed allocation
+  // still awaiting settlement must remain able to refresh that host copy
+  // after the refused grow.
+  for (const bool unsettled : {false, true}) {
     vol::VoxelGridParams tight = map.grid();
     tight.bucket_size = 2;
     tight.num_buckets = 8;
@@ -259,14 +261,34 @@ int gpu_main(vr_test::GpuContext& gpu) {
       }
     }
     CHECK(clash.size() == 5);
-    vkc::Result<std::uint32_t> placed =
-        vr_test::allocate_blocks(gpu, small, clash.data(), 5);
-    CHECK(placed.ok() && placed.value() == 0);
+    vol::RecordedRounds recorded;
+    if (unsettled) {
+      auto list = vr_test::detail::device_coords(gpu, clash.data(), 5);
+      const std::uint32_t five = 5;
+      auto count = vr_test::upload_device_buffer(gpu.device, gpu.allocator,
+                                                 &five, sizeof(five));
+      CHECK(list.ok() && count.ok());
+      vkc::CommandBatch batch(gpu.device, gpu.allocator);
+      auto placed = small.record_allocate(batch, *list, {&*count, 0, five});
+      CHECK(placed.ok() && batch.submit().ok());
+      recorded = std::move(placed).value();
+      CHECK(small.allocated_blocks() == 0);
+    } else {
+      vkc::Result<std::uint32_t> placed =
+          vr_test::allocate_blocks(gpu, small, clash.data(), 5);
+      CHECK(placed.ok() && placed.value() == 0);
+    }
     const vkc::Status grow = small.resize(9);
     CHECK(grow.domain() == vkc::Status::Code::OutOfMemory);
     CHECK(small.grid().num_buckets == 8);
     vkc::Result<std::set<Coord>> kept = active_set(small);
     CHECK(kept.ok() && kept.value().size() == 5);
+    if (unsettled) {
+      CHECK(small.allocated_blocks() == 0);
+      auto placed = small.settle(recorded);
+      CHECK(placed.ok() && placed->total == 0);
+    }
+    CHECK(small.allocated_blocks() == 5);
     CHECK(occupancy_is(small, 5));
     // The device's counter rolled back too: a sixth block, in a bucket of its
     // own, takes the next free index and reads the counter back.

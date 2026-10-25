@@ -99,6 +99,12 @@ class VR_STREAM_API StreamWriter {
   core::Status append(const RecordInfo& info, const std::uint8_t* data,
                       std::size_t size);
 
+  /// @brief @ref append a payload in up to two runs: one `writev` of the
+  ///        record's header, both runs and the padding, its CRC the one
+  ///        @p payload carries, not computed again.
+  /// @return As the other @ref append.
+  core::Status append(const RecordInfo& info, const RecordPayload& payload);
+
   /// @brief Flush what is written to storage: `fsync`, or on Apple
   ///        `F_FULLFSYNC`, as `fsync` there stops at the drive's cache.
   /// @return OK; `Status::Code::InvalidArgument` once finished; the saved I/O

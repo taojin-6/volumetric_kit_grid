@@ -2,7 +2,10 @@
 // Copyright (c) 2026 Tao Jin
 
 // Each segment's byte offset in the payload: an exclusive scan of the stream
-// lengths (scan.glsl), then the total and the gather's dispatch size.
+// lengths (scan.glsl), then the total and the gather's dispatch size. The
+// host's results go out with them, as one struct in the back half's results
+// slot: whether a table refused a symbol, the payload's bytes, and each
+// segment's length, so nothing is read back per buffer.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -21,6 +24,15 @@ layout(set = 0, binding = 1, std430) writeonly buffer PayloadOffsets {
 layout(set = 0, binding = 2, std430) writeonly buffer GatherArgs {
   uvec3 gather_groups;  // rans_gather.comp's VkDispatchIndirectCommand
 };
+layout(set = 0, binding = 3, std430) readonly buffer Status {
+  uint failed;  // rans_encode.comp's
+};
+// Mirrors detail::BackResults (device_frame_writer.hpp), then the lengths.
+layout(set = 0, binding = 4, std430) writeonly buffer Results {
+  uint result_failed;
+  uint result_total;  // the payload's bytes
+  uint result_lengths[];
+};
 
 // rans_gather.comp's width, and the fewest groups every device dispatches.
 const uint kGatherLanes = 256u;
@@ -31,12 +43,17 @@ void main() {
   uint carry = 0u;
   for (uint base = 0u; base < pc.segment_count; base += kScanLanes) {
     const uint i = base + lane;
-    const uint offset =
-        vrScanChunk(i < pc.segment_count ? lengths[i] : 0u, carry);
-    if (i < pc.segment_count) payload_offsets[i] = offset;
+    const uint length = i < pc.segment_count ? lengths[i] : 0u;
+    const uint offset = vrScanChunk(length, carry);
+    if (i < pc.segment_count) {
+      payload_offsets[i] = offset;
+      result_lengths[i] = length;
+    }
   }
   if (lane == 0u) {
     payload_offsets[pc.segment_count] = carry;
+    result_failed = failed;
+    result_total = carry;
     const uint words = (carry + 3u) / 4u;
     gather_groups =
         uvec3(min((words + kGatherLanes - 1u) / kGatherLanes, kMaxGroups), 1u,

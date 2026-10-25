@@ -10,7 +10,7 @@
 layout(push_constant, std430) uniform Push {
   uint item_base;  // first entry or segment this dispatch covers
   // M + A: a P-frame's reference entries, then blocks; or for the count and
-  // layout a bound whose surplus they bind (counted_entries)
+  // layout a bound whose words they bind (counted_entries)
   uint num_entries;
   uint coefficient_count;  // K
   uint segment_size;       // R
@@ -20,17 +20,20 @@ layout(push_constant, std430) uniform Push {
   uint update_size;      // U
   // The decode's: the payload's first byte in its binding, which starts at
   // the record's offset aligned down to minStorageBufferOffsetAlignment.
+  // The gather's: the first byte it writes, 4-aligned.
   uint payload_byte;
 }
 pc;
 
-// The frame's entries, of num_entries less @p surplus: the positions past
-// the frame's, which a bounded P-frame's count and layout take off on the
-// device (ResidentBlocks::bounded), 0 otherwise. Clamped to the new blocks,
-// so every read stays inside the bound whatever the word holds; the writer
-// refuses a surplus that needed it.
-uint counted_entries(uint surplus) {
-  return pc.num_entries - min(surplus, pc.num_entries - pc.reference_count);
+// The frame's entries, on the device: its M reference entries and @p blocks
+// of the bound's blocks (num_entries less M), less @p surplus of those: the
+// survivors a bounded P-frame's bound counts twice
+// (ResidentBlocks::bounded), 0 otherwise. Each word is clamped, so every
+// read stays inside the bound whatever it holds; the writer refuses a word
+// that needed it.
+uint counted_entries(uint surplus, uint blocks) {
+  const uint found = min(blocks, pc.num_entries - pc.reference_count);
+  return pc.reference_count + found - min(surplus, found);
 }
 
 #endif  // VR_RANS_PUSH_GLSL

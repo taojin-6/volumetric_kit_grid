@@ -8,7 +8,9 @@
 // instance, so a remove and an allocate in one batch keep their own sets.
 //
 // Round 0 takes the list's count, at most its bound and 0 behind a closed
-// gate, and clears the tally. Each later round reads the tally the round
+// gate -- or the bound itself with no count word, as a depth round's one
+// round of direct dispatches has, which this sizes nothing for and only
+// judges -- and clears the tally. Each later round reads the tally the round
 // before left, as VoxelHashMap's blocking loop always has: the non-retryable
 // slot accumulates, and the round runs only while the one before lost
 // bucket-lock races and met no capacity limit -- nothing frees a block or a
@@ -58,7 +60,7 @@ const uint kNoWord = 0xFFFFFFFFu;
 const uint kLanes = 256u;
 
 layout(push_constant, scalar) uniform Push {
-  uint count_word;  // the count's word in `counts`
+  uint count_word;  // the count's word in `counts`, or kNoWord for `bound`
   uint gate_word;   // the gate's word in `gates`, or kNoWord for none
   uint bound;       // the most the count holds
   uint state_word;  // this kind's first word of `state`
@@ -76,7 +78,9 @@ void clear_tally() {
 void main() {
   const uint at = pc.state_word;
   if (pc.round == 0u) {
-    uint count = min(counts[pc.count_word], pc.bound);
+    uint count = pc.count_word == kNoWord
+                     ? pc.bound
+                     : min(counts[pc.count_word], pc.bound);
     if (pc.gate_word != kNoWord && gates[pc.gate_word] == 0u) count = 0u;
     state[at] = count;
     state[at + 1u] = count != 0u ? 1u : 0u;

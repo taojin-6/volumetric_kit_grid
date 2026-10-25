@@ -8,9 +8,10 @@
 #define VR_BLOCK_LISTS_PUSH_GLSL
 
 layout(push_constant, std430) uniform Push {
-  uint item_base;        // first item this dispatch covers
-  uint count;            // the call's items
-  uint run_length;       // block_sort_merge: the sorted runs it merges
+  uint item_base;   // first item this dispatch covers
+  uint count;       // the call's items; the sort's, a bound on them
+  uint count_word;  // the sort: its items' word in its binding 2
+  uint run_length;  // block_sort_merge: the sorted runs it merges
   uint reference_count;  // frame_merge: M, the reference's blocks
   uint new_count;        // frame_merge: A, the frame's new blocks
   uint block_count;      // frame_merge, grid_diff: N, the frame's blocks

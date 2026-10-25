@@ -326,6 +326,14 @@ std::vector<FrequencyTable> frame_tables(
 
 core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame) {
+  VKC_ASSIGN(std::vector<std::uint8_t> out,
+             assemble_head(type, frame, frame.payload.size()));
+  out.insert(out.end(), frame.payload.begin(), frame.payload.end());
+  return out;
+}
+
+core::Result<std::vector<std::uint8_t>> assemble_head(
+    FrameType type, const CodedFrame& frame, std::uint64_t payload_size) {
   VKC_TRY(check_frame_type(type, "assemble_frame"));
   const bool inter = type == FrameType::kInter;
   // The header's fields, which the caller coded the segments for.
@@ -380,13 +388,12 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
     return bad_write("tables or segment lengths disagree with the header");
   }
   // Every segment's length is at most the payload's, so this bounds both.
-  if (std::uint64_t(frame.payload.size()) >
-      std::numeric_limits<std::uint32_t>::max()) {
+  if (payload_size > std::numeric_limits<std::uint32_t>::max()) {
     return bad_write("the payload outgrows its u32 length (4 GiB)");
   }
   std::uint64_t total = 0;
   for (std::uint32_t length : frame.segment_lengths) total += length;
-  if (total != frame.payload.size()) {
+  if (total != payload_size) {
     return bad_write("the segment lengths do not sum to the payload");
   }
   std::vector<std::uint8_t> segments_body;
@@ -413,7 +420,6 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   }
   sections.emplace_back(SectionId::kTables, &tables_body);
   sections.emplace_back(SectionId::kSegments, &segments_body);
-  sections.emplace_back(SectionId::kPayload, &frame.payload);
 
   std::vector<std::uint8_t> out;
   ByteWriter w(out);
@@ -431,7 +437,7 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
   w.u32(k);  // one weight per kept basis
   w.u32(frame.block_count);
   w.u32(frame.segment_size);
-  w.u32(static_cast<std::uint32_t>(sections.size()));
+  w.u32(static_cast<std::uint32_t>(sections.size() + 1));  // and PAYLOAD
   static const auto zigzag = zigzag_order();
   for (std::uint32_t j = 0; j < k; ++j) {
     w.f32(frame.params.quantization_weights[zigzag[j]]);
@@ -441,6 +447,10 @@ core::Result<std::vector<std::uint8_t>> assemble_frame(
     w.u16(kSectionRequired);
     w.u32(static_cast<std::uint32_t>(body->size()));  // each bounded above
   }
+  // PAYLOAD last, its body the caller's.
+  w.u16(static_cast<std::uint32_t>(SectionId::kPayload));
+  w.u16(kSectionRequired);
+  w.u32(static_cast<std::uint32_t>(payload_size));
   for (const auto& [id, body] : sections) {
     w.bytes(*body);
   }

@@ -998,14 +998,17 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
         allocator,
         3 * codec::detail::coefficient_words(params.coefficient_count) *
             sizeof(std::uint32_t));
-    CHECK(masks.ok() && coefficients.ok());
+    const std::uint32_t three_word = 3;
+    vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+        device, allocator, &three_word, sizeof(three_word));
+    CHECK(masks.ok() && coefficients.ok() && word.ok());
+    const vol::DeviceCount count{&word.value(), 0, 3};
     for (const vkc::Buffer* list :
          {&none, &two.value(), &transfer_only.value()}) {
-      std::uint32_t rejected = 0;
       vkc::CommandBatch batch(device, allocator);
       const vkc::Status s =
-          t.record_forward(batch, grid, *list, 3, params, masks.value(),
-                           coefficients.value(), rejected)
+          t.record_forward(batch, grid, *list, count, params, masks.value(),
+                           coefficients.value())
               .status();
       CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
             s.message().find("the block list") != std::string::npos);
@@ -1017,17 +1020,24 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(three.ok());
     for (const bool short_masks : {true, false}) {
       const vkc::Buffer& short_one = two.value();  // 32 bytes
-      std::uint32_t rejected = 0;
       vkc::CommandBatch batch(device, allocator);
       const vkc::Status s =
-          t.record_forward(batch, grid, three.value(), 3, params,
+          t.record_forward(batch, grid, three.value(), count, params,
                            short_masks ? short_one : masks.value(),
-                           short_masks ? coefficients.value() : short_one,
-                           rejected)
+                           short_masks ? coefficients.value() : short_one)
               .status();
       CHECK(s.domain() == vkc::Status::Code::InvalidArgument &&
             s.message().find("the output buffers do not hold 3 blocks") !=
                 std::string::npos);
+    }
+    // A count word past its buffer.
+    {
+      vkc::CommandBatch batch(device, allocator);
+      CHECK(t.record_forward(batch, grid, three.value(),
+                             vol::DeviceCount{&word.value(), 4, 3}, params,
+                             masks.value(), coefficients.value())
+                .status()
+                .domain() == vkc::Status::Code::InvalidArgument);
     }
   }
   // More blocks than the heap.
@@ -1163,10 +1173,36 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   return 0;
 }
 
+// The observed pass over @p list, in a batch of its own, its count a device
+// word as the encoder's compaction leaves it: the count it left on the
+// device, read back, or its reject count's refusal.
+vkc::Result<std::uint32_t> observed_count(vkc::Device& device,
+                                          vkc::Allocator& allocator,
+                                          DctTransform& t,
+                                          const vol::VoxelBlockGrid& grid,
+                                          const vol::DeviceBlockList& list,
+                                          bool true_sdf) {
+  VKC_ASSIGN(const vkc::Buffer word,
+             vr_test::upload_device_buffer(device, allocator, &list.count,
+                                           sizeof(list.count)));
+  vkc::CommandBatch batch(device, allocator);
+  VKC_TRY(t.record_observed(batch, grid,
+                            list.buffer != nullptr ? *list.buffer : word,
+                            vol::DeviceCount{&word, 0, list.count}, true_sdf));
+  VKC_TRY(batch.submit());
+  VKC_ASSIGN(const std::vector<std::uint32_t> counts,
+             vr_test::read_back<std::uint32_t>(device, allocator,
+                                               t.observed_counts(), 2));
+  VKC_TRY(DctTransform::check_rejected("observed", counts[0], list.count));
+  if (counts[1] > list.count) {
+    return vkc::Status::invalid_argument("more observed than listed");
+  }
+  return counts[1];
+}
+
 // The observed pass keeps exactly the entries of the map's own list whose
 // block holds a voxel at or above kObservedWeight, with each original ptr,
-// on the device, and refuses a list the map has moved past. Append order is
-// unspecified.
+// on the device, its count left there. Append order is unspecified.
 int observed_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
   const vr_test::Gpu ctx{device, allocator};
@@ -1174,7 +1210,8 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   const auto observed_of = [&](const vol::VoxelBlockGrid& grid,
                                const vol::DeviceBlockList& list)
       -> vkc::Result<std::vector<vol::BlockIndex>> {
-    VKC_ASSIGN(const std::uint32_t n, t.observed(grid, list, false));
+    VKC_ASSIGN(const std::uint32_t n,
+               observed_count(device, allocator, t, grid, list, false));
     if (n == 0) return std::vector<vol::BlockIndex>{};
     return vr_test::read_back<vol::BlockIndex>(device, allocator,
                                                t.observed_list(), n);
@@ -1235,11 +1272,23 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
     }
   }
 
-  // A list an allocation has made stale is refused.
-  std::vector<vol::BlockIndex> one(1);
-  one[0].coord = vr::Vec3i(9, 9, 9);
-  CHECK(vr_test::allocate_blocks(ctx, grid.map(), one).ok());
-  CHECK(!t.observed(grid, list.value(), false).ok());
+  // A count past the grid's heap, or a word past its buffer, is refused,
+  // recording nothing.
+  {
+    const std::uint32_t four = 4;
+    vkc::Result<vkc::Buffer> word =
+        vr_test::upload_device_buffer(device, allocator, &four, sizeof(four));
+    CHECK(word.ok());
+    vkc::CommandBatch batch(device, allocator);
+    const auto past = static_cast<std::uint32_t>(grid.grid().num_blocks) + 1;
+    CHECK(t.record_observed(batch, grid, *list.value().buffer,
+                            vol::DeviceCount{&word.value(), 0, past}, false)
+              .domain() == vkc::Status::Code::InvalidArgument);
+    CHECK(t.record_observed(batch, grid, *list.value().buffer,
+                            vol::DeviceCount{&word.value(), 4, 4}, false)
+              .domain() == vkc::Status::Code::InvalidArgument);
+    CHECK(batch.submit().ok());
+  }
 
   // An empty list keeps nothing.
   vkc::Result<vol::VoxelBlockGrid> e = make_grid(device, allocator);
@@ -1305,7 +1354,8 @@ int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
     CHECK(made.ok());
     DctTransform& chunked = *made.value();
     vr::detail::set_test_groups_per_dispatch(chunk);
-    vkc::Result<std::uint32_t> n = chunked.observed(grid, list.value(), true);
+    vkc::Result<std::uint32_t> n =
+        observed_count(device, allocator, chunked, grid, list.value(), true);
     vr::detail::set_test_groups_per_dispatch(0);
     CHECK(n.ok() && n.value() == host.blocks.size());
     vkc::Result<std::vector<vol::BlockIndex>> kept =

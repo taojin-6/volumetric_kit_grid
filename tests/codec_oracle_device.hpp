@@ -17,6 +17,7 @@
 #include "buffer_readback.hpp"
 #include "codec_oracle.hpp"
 #include "dct_transform.hpp"
+#include "device_frame_writer.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
@@ -71,6 +72,15 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
                     vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
                     const DctBlocks& in);
+
+// The device writer's frame for @p counted, which it counted in a batch the
+// caller submitted: its back half recorded, submitted and finished, the head
+// and the payload joined, as the Encoder's encode joins them; or the first
+// refusal of record_code, the submit or finish.
+vkc::Result<std::vector<std::uint8_t>> write_counted(
+    const vr_test::Gpu& gpu, d::DeviceFrameWriter& writer,
+    const d::ResidentBlocks& counted, float voxel_size, float trunc_dist,
+    const codec::CodecParams& params, const d::FrameReference* reference);
 
 // encode (codec_oracle_encode.hpp) through @p t, for a test that encodes
 // many grids on one transform.

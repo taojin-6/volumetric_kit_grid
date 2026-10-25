@@ -26,6 +26,7 @@ namespace {
 struct ListsPush {
   std::uint32_t item_base = 0;
   std::uint32_t count = 0;
+  std::uint32_t count_word = 0;
   std::uint32_t run_length = 0;
   std::uint32_t reference_count = 0;
   std::uint32_t new_count = 0;
@@ -35,7 +36,7 @@ struct ListsPush {
   std::int32_t bucket_size = 0;
   std::int32_t max_chain = 0;
 };
-static_assert(sizeof(ListsPush) == 40, "ListsPush must be 40 bytes");
+static_assert(sizeof(ListsPush) == 44, "ListsPush must be 44 bytes");
 
 // The entries block_sort_tile.comp sorts a workgroup (kSortTile there), and
 // the other kernels' width.
@@ -67,17 +68,17 @@ core::Result<std::unique_ptr<BlockLists>> BlockLists::create(
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(l.sort_tile_kernel_, "codec_block_sort_tile",
                  vr_block_sort_tile_comp_spv, vr_block_sort_tile_comp_spv_size,
-                 2, &push));
+                 3, &push));
   VKC_TRY(kb.add(l.sort_merge_kernel_, "codec_block_sort_merge",
                  vr_block_sort_merge_comp_spv,
-                 vr_block_sort_merge_comp_spv_size, 2, &push));
+                 vr_block_sort_merge_comp_spv_size, 3, &push));
   VKC_TRY(kb.add(l.frame_merge_kernel_, "codec_frame_merge",
                  vr_frame_merge_comp_spv, vr_frame_merge_comp_spv_size, 7,
                  &push));
   VKC_TRY(kb.add(l.grid_diff_kernel_, "codec_grid_diff", vr_grid_diff_comp_spv,
                  vr_grid_diff_comp_spv_size, 5, &push));
   VKC_ASSIGN(l.pool_, kb.build());
-  VKC_TRY(l.sort_merge_sets_.reserve(device, l.sort_merge_kernel_, 2));
+  VKC_TRY(l.sort_merge_sets_.reserve(device, l.sort_merge_kernel_, 3));
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   l.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
@@ -102,41 +103,69 @@ core::Result<std::unique_ptr<BlockLists>> BlockLists::create(
   return owned;
 }
 
-core::Result<const core::Buffer*> BlockLists::record_sort(
-    core::CommandBatch& batch, const core::Buffer& list, std::uint32_t n,
-    core::GpuStageScope* stage) {
-  if (n == 0) return &sorted_[0];
-  const VkDeviceSize bytes = VkDeviceSize(n) * kEntryBytes;
+core::Status BlockLists::record_sort(core::CommandBatch& batch,
+                                     const core::Buffer& list,
+                                     const volume::DeviceCount& count,
+                                     const core::Buffer& out,
+                                     core::GpuStageScope* stage) {
+  const std::uint32_t bound = count.bound;
+  if (bound == 0) return {};
+  const VkDeviceSize bytes = VkDeviceSize(bound) * kEntryBytes;
+  const VkDeviceSize range = max_storage_buffer_range_;
   VKC_TRY(core::StorageInput(list).check("BlockLists::record_sort: the list",
                                          bytes));
-  const VkDeviceSize range = max_storage_buffer_range_;
   VKC_TRY(core::check_storage_buffer_range("BlockLists::record_sort: the list",
                                            bytes, range));
-  for (core::Buffer& half : sorted_) {
-    VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, half, bytes,
-                                        range, "codec.sorted_blocks", &batch));
+  if (count.buffer == nullptr || !count.buffer->valid() ||
+      count.offset % kWordBytes != 0 ||
+      count.buffer->size() < count.offset + kWordBytes || out.size() < bytes) {
+    return fail("record_sort",
+                "the count's word is missing, misaligned or past its buffer, "
+                "or the output holds fewer than the bound's entries");
   }
+  // The levels the bound needs: each doubles the sorted runs, from the
+  // tiles' to the whole list. The count may need fewer, and a level past
+  // them copies its entries through; the last level, or the tile pass with
+  // none, writes the output.
+  std::uint32_t levels = 0;
+  for (std::uint64_t run = kSortTile; run < bound; run *= 2) ++levels;
+  for (std::uint32_t h = 0; h < std::min<std::uint32_t>(levels, 2); ++h) {
+    VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, sorted_[h],
+                                        bytes, range, "codec.sorted_blocks",
+                                        &batch));
+  }
+  const core::Buffer& tiles = levels == 0 ? out : sorted_[0];
   sort_tile_kernel_.set.write_storage_buffer(0, list.handle(), 0, bytes);
-  sort_tile_kernel_.set.write_storage_buffer(1, sorted_[0].handle(), 0, bytes);
-  for (std::uint32_t d = 0; d < 2; ++d) {
-    sort_merge_sets_[d].write_storage_buffer(0, sorted_[d].handle(), 0, bytes);
-    sort_merge_sets_[d].write_storage_buffer(1, sorted_[d ^ 1u].handle(), 0,
-                                             bytes);
-  }
+  sort_tile_kernel_.set.write_storage_buffer(1, tiles.handle(), 0, bytes);
+  sort_tile_kernel_.set.write_storage_buffer(2, count.buffer->handle(), 0,
+                                             VK_WHOLE_SIZE);
+  // Level l merges sorted_[l % 2] into the other half, through set l % 2,
+  // but the last, which merges into the output through set 2.
+  const auto bind = [&](std::uint32_t set, const core::Buffer& src,
+                        const core::Buffer& dst) {
+    sort_merge_sets_[set].write_storage_buffer(0, src.handle(), 0, bytes);
+    sort_merge_sets_[set].write_storage_buffer(1, dst.handle(), 0, bytes);
+    sort_merge_sets_[set].write_storage_buffer(2, count.buffer->handle(), 0,
+                                               VK_WHOLE_SIZE);
+  };
+  if (levels >= 2) bind(0, sorted_[0], sorted_[1]);
+  if (levels >= 3) bind(1, sorted_[1], sorted_[0]);
+  if (levels >= 1) bind(2, sorted_[(levels - 1) % 2], out);
+  // Every pass over the bound's groups: a group past the count returns.
   ListsPush push;
-  push.count = n;
-  VKC_TRY(dispatch_items(batch, sort_tile_kernel_, push, n, kSortTile,
+  push.count = bound;
+  push.count_word = static_cast<std::uint32_t>(count.offset / kWordBytes);
+  VKC_TRY(dispatch_items(batch, sort_tile_kernel_, push, bound, kSortTile,
                          max_workgroup_count_x_, stage));
-  // Each level doubles the sorted runs, from the tiles' to the whole list.
-  std::uint32_t at = 0;
-  for (std::uint64_t run = kSortTile; run < n; run *= 2) {
+  std::uint32_t level = 0;
+  for (std::uint64_t run = kSortTile; run < bound; run *= 2, ++level) {
     push.run_length = static_cast<std::uint32_t>(run);
-    VKC_TRY(dispatch_items(batch, sort_merge_kernel_, push, n, kLanes,
-                           max_workgroup_count_x_, stage,
-                           &sort_merge_sets_[at]));
-    at ^= 1u;
+    const core::DescriptorSet& set =
+        sort_merge_sets_[level + 1 == levels ? 2u : level % 2];
+    VKC_TRY(dispatch_items(batch, sort_merge_kernel_, push, bound, kLanes,
+                           max_workgroup_count_x_, stage, &set));
   }
-  return &sorted_[at];
+  return {};
 }
 
 core::Status BlockLists::reserve(std::uint32_t n, std::uint32_t slots) {

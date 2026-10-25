@@ -7,7 +7,8 @@
 // at its index in its run plus the entries of the sibling run that go before
 // it -- for the left run those that sort before it, for the right run those
 // that do not sort after it -- so ties keep their order and the sort is
-// stable. The last tile may be partial.
+// stable. The last tile may be partial. The entries are the count word's, at
+// most pc.count, the bound the host recorded for.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -30,6 +31,9 @@ layout(set = 0, binding = 0, scalar) readonly buffer In {
 layout(set = 0, binding = 1, scalar) writeonly buffer Out {
   BlockIndex blocks_out[];
 };
+layout(set = 0, binding = 2, std430) readonly buffer Count {
+  uint count_words[];
+};
 
 // Two halves of a tile, which the levels ping-pong between: 8 KB.
 shared BlockIndex s_tile[2u * kSortTile];
@@ -39,8 +43,11 @@ VR_COORD_SEARCH(tile, s_tile)
 void main() {
   const uint lane = gl_LocalInvocationID.x;
   const uint first = pc.item_base + gl_WorkGroupID.x * kSortTile;
+  const uint n = min(count_words[pc.count_word], pc.count);
+  // A tile the dispatch's bound holds and the count does not: nothing.
+  if (first >= n) return;
   // Uniform across the workgroup, as every barrier below needs.
-  const uint count = min(kSortTile, pc.count - first);
+  const uint count = min(kSortTile, n - first);
   if (lane < count) s_tile[lane] = blocks_in[first + lane];
   barrier();
   uint src = 0u;

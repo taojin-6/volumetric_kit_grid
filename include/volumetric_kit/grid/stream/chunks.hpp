@@ -21,6 +21,55 @@
 
 namespace volumetric_kit::recon::stream {
 
+/// @brief A record's payload as one or two runs of bytes, and their CRC,
+///        computed once, by @ref of, for every chunk that frames it: a
+///        file's and a server's.
+///
+/// Borrowed: the bytes must outlive every call given this, unchanged since
+/// @ref of. A chunk framed from it carries the CRC @ref of computed, whatever
+/// the bytes hold by then.
+///
+/// @code
+/// const stream::RecordPayload payload =
+///     stream::RecordPayload::of(head.data(), head.size(), body, body_size);
+/// VKC_TRY(writer->append(info, payload));   // one writev, no joined copy
+/// VKC_TRY(server->publish(info, payload));  // its one copy, no second CRC
+/// @endcode
+class VR_STREAM_API RecordPayload {
+ public:
+  /// @brief The payload @p first then @p second, and its CRC.
+  /// @param first        Its first run; may be null when @p first_size is 0.
+  /// @param first_size   Its bytes.
+  /// @param second       Its second run, or null for none.
+  /// @param second_size  Its bytes; 0 with a null @p second.
+  /// @return The payload. A null run with bytes is a programmer error
+  ///         (`VKC_CHECK`).
+  static RecordPayload of(const std::uint8_t* first, std::size_t first_size,
+                          const std::uint8_t* second = nullptr,
+                          std::size_t second_size = 0) noexcept;
+  /// @return The first run.
+  const std::uint8_t* first() const noexcept { return first_; }
+  /// @return Its bytes.
+  std::size_t first_size() const noexcept { return first_size_; }
+  /// @return The second run, or null.
+  const std::uint8_t* second() const noexcept { return second_; }
+  /// @return Its bytes.
+  std::size_t second_size() const noexcept { return second_size_; }
+  /// @return Both runs' bytes.
+  std::size_t size() const noexcept { return first_size_ + second_size_; }
+  /// @return The CRC of both, as a `RECD` header carries it.
+  std::uint32_t crc() const noexcept { return crc_; }
+
+ private:
+  RecordPayload() = default;
+
+  const std::uint8_t* first_ = nullptr;
+  std::size_t first_size_ = 0;
+  const std::uint8_t* second_ = nullptr;
+  std::size_t second_size_ = 0;
+  std::uint32_t crc_ = 0;
+};
+
 /// @brief What @ref StreamWriter writes, without a file: the session chunk,
 ///        then each record's framing, by the writer's rules.
 ///
@@ -76,6 +125,12 @@ class VR_STREAM_API ChunkEncoder {
   ///         diagnostic cannot be allocated.
   core::Result<RecordFraming> frame(const RecordInfo& info,
                                     const std::uint8_t* data, std::size_t size);
+
+  /// @brief @ref frame a payload in up to two runs, its CRC the one
+  ///        @p payload carries, not computed again.
+  /// @return As the other @ref frame.
+  core::Result<RecordFraming> frame(const RecordInfo& info,
+                                    const RecordPayload& payload);
 
  private:
   // What the record rules check of a track's last framed records.

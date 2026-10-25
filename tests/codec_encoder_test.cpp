@@ -16,8 +16,13 @@
 // rule alone keeps, and none of a true distance cut -- the same bytes
 // whatever the hash table's order or heap, its scratch rebound as the heap
 // grows and cleared between frames, and the same rows. Decoding is
-// codec_decoder_test's, and a P-frame's bytes codec_inter_test's. Skips with
-// no device.
+// codec_decoder_test's, and a P-frame's bytes codec_inter_test's. The two
+// halves, each batch the caller's, give encode()'s bytes -- I and P, at
+// several K, masked and true-SDF, and on a grid of far more slots than
+// blocks -- a P-frame over nothing finishes as an I-frame of none with no
+// back batch, a token is the encoder's last record only, abandon keeps the
+// chain, a copied payload past its guess takes a tail to the same bytes, and
+// a warm encode() is 2 submits and no staging buffer. Skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -168,7 +173,7 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   const vkc::StageRow* top = find_row(m, "codec encode");
   CHECK(top != nullptr);
   for (const char* sub :
-       {"  ..active set", "  ..observed", "  ..forward", "  ..rans encode"}) {
+       {"  ..encode set", "  ..observed", "  ..forward", "  ..rans encode"}) {
     const vkc::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
@@ -204,9 +209,10 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
 }
 
 // The active set is the map's own list: the list the map last compacted
-// (another encode's, say) is taken back while it still holds, compacting
-// nothing, and is still the map's for the extract after -- and one the encoder
-// compacts is left for it too.
+// (an extract's, say) is taken back while it still holds, compacting
+// nothing, and is still the map's for the extract after. One the encoder
+// compacts into its batch leaves the map no count to hold, so the extract
+// after compacts its own.
 int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> g =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.07f});
@@ -218,21 +224,22 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::StageMetrics m;
   vkc::Result<std::vector<std::uint8_t>> a = enc.encode(grid, &m);
   CHECK(a.ok());
-  CHECK(find_row(m, "  ..active set") == nullptr);
+  CHECK(find_row(m, "  ..encode set") == nullptr);
   CHECK(grid.map().check_device_block_list(last.value(), "test").ok());
 
-  // A list the encoder compacted itself, after an allocation, holds for the
-  // next caller, and the content -- one block more, never observed -- codes
-  // the same.
+  // After an allocation the encoder compacts into its batch, and the content
+  // -- one block more, never observed -- codes the same; the map holds no
+  // list after it, so a compaction after it compacts.
   CHECK(allocate(gpu, grid, {{50, 50, 50}}).ok());
   vkc::StageMetrics again;
   vkc::Result<std::vector<std::uint8_t>> b = enc.encode(grid, &again);
   CHECK(b.ok() && b.value() == a.value());
-  CHECK(find_row(again, "  ..active set") != nullptr);
-  vkc::StageMetrics extract;  // a compaction after it, which it skips
+  CHECK(find_row(again, "  ..encode set") != nullptr);
+  CHECK(!grid.map().held_device_list().has_value());
+  vkc::StageMetrics extract;
   vkc::Result<vol::DeviceBlockList> next =
       grid.map().compact_active_blocks_on_device(&extract);
-  CHECK(next.ok() && extract.rows().empty());
+  CHECK(next.ok() && !extract.rows().empty());
   CHECK(next.value().serial != last.value().serial);
   const std::optional<vol::DeviceBlockList> held =
       grid.map().held_device_list();
@@ -458,7 +465,9 @@ int period_case(Gpu& gpu) {
 // period, force_intra(), a grid of another voxel size or of another
 // trunc_dist alone -- and the grid after each, against that one -- a grid of
 // no blocks after one of some, and a reference of no blocks, whatever the
-// grid; a P-frame otherwise, costing the same rows as an I-frame.
+// grid; a P-frame otherwise, costing the same rows as an I-frame. A grid of
+// no blocks, planned as a P-frame or not, is an I-frame of none, with no
+// back half and so no "  ..rans encode".
 int intra_rules_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;
@@ -513,7 +522,10 @@ int intra_rules_case(Gpu& gpu) {
     }
     for (const char* row :
          {"codec encode", "  ..observed", "  ..forward", "  ..rans encode"}) {
-      CHECK(find_row(m, row) != nullptr);
+      // A frame of none codes nothing: it records no back half.
+      const bool coded = std::strcmp(row, "  ..rans encode") != 0 ||
+                         step.grid != &empty.value();
+      CHECK((find_row(m, row) != nullptr) == coded);
     }
     ++i;
   }
@@ -819,6 +831,283 @@ int stale_cut_case(Gpu& gpu) {
   return 0;
 }
 
+// --- The two halves. ---------------------------------------------------------
+
+// A frame by the halves, each batch the caller's, its head and payload joined
+// as encode() joins them; with its type and whether its back batch held a
+// command, read from the device's submit count.
+struct Halves {
+  Bytes bytes;
+  codec::FrameType planned = codec::FrameType::kIntra;
+  codec::FrameType type = codec::FrameType::kIntra;
+  bool back_submitted = false;
+};
+
+vkc::Result<Halves> by_halves(Gpu& gpu, codec::Encoder& enc,
+                              vol::VoxelBlockGrid& grid,
+                              vkc::StageMetrics* m = nullptr) {
+  Halves out;
+  vkc::CommandBatch front(gpu.device, gpu.allocator);
+  VKC_ASSIGN(const codec::PendingEncode pending,
+             enc.record_front(front, grid, m));
+  out.planned = pending.type;
+  VKC_TRY(front.submit());
+  vkc::CommandBatch back(gpu.device, gpu.allocator);
+  VKC_TRY(enc.record_back(back, pending, m));
+  const std::uint64_t before = gpu.device.counters().submits;
+  VKC_TRY(back.submit());
+  out.back_submitted = gpu.device.counters().submits != before;
+  VKC_ASSIGN(const codec::EncodedFrame frame, enc.finish(pending, m));
+  out.type = frame.type;
+  out.bytes.assign(frame.head.begin(), frame.head.end());
+  out.bytes.insert(out.bytes.end(), frame.payload,
+                   frame.payload + frame.payload_size);
+  if (out.bytes.size() != frame.size() ||
+      (frame.payload == nullptr) != (frame.payload_size == 0)) {
+    return vkc::Status::invalid_argument("the frame's sizes disagree");
+  }
+  return out;
+}
+
+// The halves give encode()'s bytes frame for frame, along a chain of I- and
+// P-frames at a period of 3, at K 20, 56 and 64, masked and as a true
+// distance; and on a grid of 64 times the block slots its blocks need, whose
+// every step runs for the count under that bound, the sort's levels past it
+// copying their entries through.
+int halves_case(Gpu& gpu) {
+  struct Setting {
+    std::uint32_t k;
+    bool true_sdf;
+  };
+  using T = codec::FrameType;
+  const T types[] = {T::kIntra, T::kInter, T::kInter, T::kIntra};
+  for (const Setting s : {Setting{20, false}, Setting{56, false},
+                          Setting{64, false}, Setting{56, true}}) {
+    codec::EncoderConfig config;
+    config.intra_period = 3;
+    config.params.coefficient_count = s.k;
+    config.true_sdf = s.true_sdf;
+    vkc::Result<codec::Encoder> a =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    vkc::Result<codec::Encoder> b =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(a.ok() && b.ok());
+    for (int t = 0; t < 4; ++t) {
+      vkc::Result<vol::VoxelBlockGrid> grid =
+          s.true_sdf ? sphere_grid(gpu, chain_sphere(t), wide_band())
+                     : chain_grid(gpu, t);
+      CHECK(grid.ok());
+      vkc::Result<Bytes> want = a.value().encode(grid.value());
+      vkc::Result<Halves> got = by_halves(gpu, b.value(), grid.value());
+      CHECK(want.ok() && got.ok());
+      CHECK(got.value().bytes == want.value());
+      CHECK(got.value().planned == types[t] && got.value().type == types[t]);
+      CHECK(got.value().back_submitted);
+    }
+  }
+
+  const Sphere s{vr::Vec3f(0.003f, 0.001f, -0.002f), 0.08f};
+  const std::size_t blocks = band_blocks(s).size();
+  GridShape slots;
+  slots.num_buckets = static_cast<std::int32_t>(8 * blocks);  // 64x
+  vkc::Result<vol::VoxelBlockGrid> tight = sphere_grid(gpu, s);
+  vkc::Result<vol::VoxelBlockGrid> loose = sphere_grid(gpu, s, slots);
+  vkc::Result<codec::Encoder> a =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  vkc::Result<codec::Encoder> b =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  CHECK(tight.ok() && loose.ok() && a.ok() && b.ok());
+  CHECK(loose.value().grid().num_blocks >= std::int32_t(64 * blocks));
+  vkc::Result<Bytes> want = a.value().encode(tight.value());
+  vkc::Result<Halves> got = by_halves(gpu, b.value(), loose.value());
+  CHECK(want.ok() && got.ok() && got.value().bytes == want.value());
+  return 0;
+}
+
+// A P-frame planned over a grid with no block to code finishes as an I-frame
+// of none, recorded with no back batch: the bytes encode() gives a grid of
+// none. And the halves' own refusals: a back recorded twice, a finish before
+// its back, a token abandoned or superseded, or another encoder's.
+int halves_rules_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 30;
+  vkc::Result<codec::Encoder> made =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Encoder> other =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Encoder> fresh =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> a = sphere_grid(gpu, chain_sphere(0));
+  vkc::Result<vol::VoxelBlockGrid> b = sphere_grid(gpu, chain_sphere(1));
+  vkc::Result<vol::VoxelBlockGrid> none = make_grid(gpu);
+  CHECK(made.ok() && other.ok() && fresh.ok() && a.ok() && b.ok() && none.ok());
+  codec::Encoder& enc = made.value();
+  CHECK(enc.encode(a.value()).ok());
+  vkc::Result<Halves> empty = by_halves(gpu, enc, none.value());
+  CHECK(empty.ok());
+  CHECK(empty.value().planned == codec::FrameType::kInter);
+  CHECK(empty.value().type == codec::FrameType::kIntra);
+  CHECK(!empty.value().back_submitted);
+  CHECK(empty.value().bytes == fresh.value().encode(none.value()).value());
+
+  const auto refused = [](const vkc::Status& s) {
+    return s.domain() == vkc::Status::Code::InvalidArgument;
+  };
+  vkc::CommandBatch front(gpu.device, gpu.allocator);
+  vkc::Result<codec::PendingEncode> p = enc.record_front(front, b.value());
+  CHECK(p.ok() && front.submit().ok());
+  CHECK(refused(enc.finish(p.value()).status()));  // its back not recorded
+  CHECK(refused(other.value().finish(p.value()).status()));
+  vkc::CommandBatch back(gpu.device, gpu.allocator);
+  CHECK(refused(other.value().record_back(back, p.value())));
+  CHECK(enc.record_back(back, p.value()).ok());
+  CHECK(refused(enc.record_back(back, p.value())));  // twice
+  CHECK(back.submit().ok());
+  CHECK(enc.finish(p.value()).ok());
+  CHECK(refused(enc.finish(p.value()).status()));  // finished
+
+  // A record supersedes the last unfinished one.
+  vkc::CommandBatch first(gpu.device, gpu.allocator);
+  vkc::Result<codec::PendingEncode> p1 = enc.record_front(first, a.value());
+  CHECK(p1.ok() && first.submit().ok());
+  vkc::CommandBatch second(gpu.device, gpu.allocator);
+  vkc::Result<codec::PendingEncode> p2 = enc.record_front(second, b.value());
+  CHECK(p2.ok() && second.submit().ok());
+  vkc::CommandBatch late(gpu.device, gpu.allocator);
+  CHECK(refused(enc.record_back(late, p1.value())));
+  enc.abandon(p1.value());  // ignored: superseded
+  CHECK(enc.record_back(late, p2.value()).ok() && late.submit().ok());
+  enc.abandon(p2.value());
+  CHECK(refused(enc.finish(p2.value()).status()));
+  return 0;
+}
+
+// abandon keeps the reference and the period: an encoder that recorded a
+// frame and dropped it writes the frames after as one that never saw it --
+// a P-frame against the frame before, then the period's I-frame; and a cold
+// encoder whose first front was never submitted codes as a fresh one.
+int abandon_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 3;
+  vkc::Result<codec::Encoder> x =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Encoder> y =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  CHECK(x.ok() && y.ok());
+  std::vector<vol::VoxelBlockGrid> grids;
+  for (int t = 0; t < 4; ++t) {
+    vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, chain_sphere(t));
+    CHECK(g.ok());
+    grids.push_back(std::move(g).value());
+  }
+  vkc::Result<Bytes> first = y.value().encode(grids[0]);
+  CHECK(first.ok() && x.value().encode(grids[0]).value() == first.value());
+  // A cold encoder's first front, dropped unsubmitted, wrote no quantization
+  // steps, so its next front still records them: the same frame.
+  {
+    vkc::Result<codec::Encoder> cold =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(cold.ok());
+    {
+      vkc::CommandBatch front(gpu.device, gpu.allocator);
+      vkc::Result<codec::PendingEncode> p =
+          cold.value().record_front(front, grids[0]);
+      CHECK(p.ok());
+      cold.value().abandon(p.value());
+    }
+    vkc::Result<Bytes> got = cold.value().encode(grids[0]);
+    CHECK(got.ok() && got.value() == first.value());
+  }
+  for (const bool after_back : {false, true}) {
+    vkc::CommandBatch front(gpu.device, gpu.allocator);
+    vkc::Result<codec::PendingEncode> p =
+        x.value().record_front(front, grids[3]);
+    CHECK(p.ok() && front.submit().ok());
+    if (after_back) {
+      vkc::CommandBatch back(gpu.device, gpu.allocator);
+      CHECK(x.value().record_back(back, p.value()).ok() && back.submit().ok());
+    }
+    x.value().abandon(p.value());
+  }
+  for (int t = 1; t < 4; ++t) {
+    vkc::Result<Bytes> got = x.value().encode(grids[std::size_t(t)]);
+    vkc::Result<Bytes> want = y.value().encode(grids[std::size_t(t)]);
+    CHECK(got.ok() && want.ok() && got.value() == want.value());
+    CHECK(type_of(got.value()) ==
+          (t == 3 ? codec::FrameType::kIntra : codec::FrameType::kInter));
+  }
+  return 0;
+}
+
+// A payload past what the back batch copied is gathered again over the rest
+// ("  ..tail"), to the same bytes: a smooth frame sets the next frame's
+// guess, and a frame of noise outgrows it. In place the batch writes the
+// slot itself, so there is never a tail.
+int tail_case(Gpu& gpu) {
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  vkc::Result<codec::Encoder> fresh =
+      codec::Encoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> smooth = make_grid(gpu);
+  vkc::Result<vol::VoxelBlockGrid> noise = make_grid(gpu);
+  CHECK(enc.ok() && fresh.ok() && smooth.ok() && noise.ok());
+  std::vector<vr::Vec3i> coords;
+  for (int i = 0; i < 64; ++i) coords.push_back(vr::Vec3i(i % 8, i / 8, 49));
+  CHECK(allocate(gpu, smooth.value(), coords).ok());
+  CHECK(allocate(gpu, noise.value(), coords).ok());
+  CHECK(write_field(
+            gpu, smooth.value(), [](const vr::Vec3f& p) { return p.z - 1.98f; },
+            true)
+            .ok());
+  CHECK(write_field(
+            gpu, noise.value(),
+            [](const vr::Vec3f& p) {
+              const auto h = std::uint32_t(p.x * 7919.0f + p.y * 104729.0f +
+                                           p.z * 1299709.0f) *
+                             2654435761u;
+              return (float(h % 2001u) / 1000.0f - 1.0f) * kTrunc;
+            },
+            true)
+            .ok());
+  vkc::Result<Halves> first = by_halves(gpu, enc.value(), smooth.value());
+  vkc::StageMetrics m;
+  vkc::Result<Halves> noisy = by_halves(gpu, enc.value(), noise.value(), &m);
+  CHECK(first.ok() && noisy.ok());
+  CHECK(noisy.value().bytes == fresh.value().encode(noise.value()).value());
+  const bool in_place = gpu.device.caps().device_mapped_cached();
+  std::printf("  smooth %zu bytes, noise %zu bytes, in place %d\n",
+              first.value().bytes.size(), noisy.value().bytes.size(),
+              int(in_place));
+  CHECK((find_row(m, "  ..tail") != nullptr) == !in_place);
+  return 0;
+}
+
+// After warm-up encode() is 2 submits -- the front's and the back's -- and
+// no staging buffer, an I-frame or a P-frame.
+int counters_case(Gpu& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 30;
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  CHECK(enc.ok());
+  for (int t = 0; t < 6; ++t) {
+    vkc::Result<vol::VoxelBlockGrid> grid =
+        sphere_grid(gpu, chain_sphere(t % 2));
+    CHECK(grid.ok());
+    const vkc::DeviceCounters was = gpu.device.counters();
+    vkc::Result<Bytes> frame = enc.value().encode(grid.value());
+    const vkc::DeviceCounters now = gpu.device.counters();
+    CHECK(frame.ok());
+    if (t < 3) continue;  // the rings and scratch grow while warming
+    CHECK(type_of(frame.value()) == codec::FrameType::kInter);
+    CHECK(now.submits - was.submits == 2);
+    // A wait that finds its batch done blocks nothing and counts none.
+    CHECK(now.host_waits - was.host_waits <= 2);
+    CHECK(now.staging_buffers == was.staging_buffers);
+  }
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<codec::Encoder> made =
       codec::Encoder::create(gpu.device, gpu.allocator);
@@ -843,6 +1132,11 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (true_sdf_order_case(gpu) != 0) return 1;
   if (true_sdf_heap_case(gpu) != 0) return 1;
   if (stale_cut_case(gpu) != 0) return 1;
+  if (halves_case(gpu) != 0) return 1;
+  if (halves_rules_case(gpu) != 0) return 1;
+  if (abandon_case(gpu) != 0) return 1;
+  if (tail_case(gpu) != 0) return 1;
+  if (counters_case(gpu) != 0) return 1;
   std::printf("codec Encoder: OK\n");
   return 0;
 }

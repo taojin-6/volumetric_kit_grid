@@ -14,6 +14,7 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/networking/export.hpp"
+#include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 
 namespace volumetric_kit::recon::networking {
@@ -120,6 +121,12 @@ class VR_NETWORKING_API StreamServer {
   ///         does. Never a viewer's failure.
   core::Status publish(const stream::RecordInfo& info, const std::uint8_t* data,
                        std::size_t size);
+
+  /// @brief @ref publish a payload in up to two runs: its one copy made from
+  ///        both, its CRC the one @p payload carries, not computed again.
+  /// @return As the other @ref publish.
+  core::Status publish(const stream::RecordInfo& info,
+                       const stream::RecordPayload& payload);
 
   /// @return The port listened on: the one asked for, or the one taken for 0.
   std::uint16_t port() const noexcept;

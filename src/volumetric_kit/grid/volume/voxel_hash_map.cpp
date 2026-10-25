@@ -68,9 +68,11 @@ struct RoundsPush {
 static_assert(sizeof(RoundsPush) == 32, "RoundsPush must be 32 bytes");
 
 // hash_rounds.comp's word index that names no word, and each kind's state:
-// four words, the removal's first.
+// four words, the removal's first, then the allocation's and a depth
+// round's.
 constexpr std::uint32_t kNoWord = ~0u;
 constexpr std::uint32_t kStateWords = 4;
+constexpr std::uint32_t kDepthStateWord = 2 * kStateWords;
 
 // What a recording runs ahead of its rounds (VoxelHashMap::record_remove).
 using FirstRound = std::function<core::Status(core::CommandBatch&)>;
@@ -130,6 +132,29 @@ struct PersistentBuffers {
   core::Buffer active_count;
   core::Buffer stamps;
 };
+
+// A count or gate word a recording reads, checked as `what` for `op`: a whole
+// aligned word of a known device-local storage buffer that one binding
+// covers, which also bounds its index below the shaders' no-word sentinel.
+core::Status check_word(const std::string& op, const DeviceCount& word,
+                        const char* what, VkDeviceSize max_range) {
+  if (word.buffer == nullptr || !word.buffer->valid()) {
+    return core::Status::invalid_argument(op + ": the " + what +
+                                          " has no buffer");
+  }
+  constexpr VkDeviceSize word_bytes = sizeof(std::uint32_t);
+  if (word.offset % word_bytes != 0 || word.buffer->size() < word_bytes ||
+      word.offset > word.buffer->size() - word_bytes) {
+    return core::Status::invalid_argument(
+        op + ": the " + what + "'s word is misaligned or past its buffer");
+  }
+  const std::string named = op + ": the " + what;
+  VKC_TRY(core::StorageInput(*word.buffer)
+              .check(named.c_str(), word.offset + word_bytes));
+  // The descriptors bind the whole buffer.
+  return core::check_storage_buffer_range(named.c_str(), word.buffer->size(),
+                                          max_range);
+}
 
 core::Result<PersistentBuffers> make_persistent_buffers(
     core::Allocator& allocator, const VoxelGridParams& grid) {
@@ -199,23 +224,30 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   map.active_count_ = std::move(bufs.active_count);
   map.stamps_ = std::move(bufs.stamps);
 
-  // Camera params for allocate_from_depth: a small (96 B), fixed-size buffer,
-  // so persist it (binding 6 of every depth set) and rewrite it inline ahead
-  // of each frame's dispatch. Grid-independent, so it is not part of the
-  // resized bundle.
+  // Camera params for the depth rounds: a frame's (96 B) every
+  // minStorageBufferOffsetAlignment, written inline once a round ahead of
+  // its first dispatch and bound at binding 6 of each frame's set; one
+  // frame's to start with, grown for more. Grid-independent, so it is not
+  // part of the resized bundle.
+  VkPhysicalDeviceProperties limits{};
+  vkGetPhysicalDeviceProperties(device.physical_device(), &limits);
+  const VkDeviceSize alignment =
+      std::max<VkDeviceSize>(limits.limits.minStorageBufferOffsetAlignment, 4);
+  map.camera_stride_ =
+      (sizeof(DepthCameraParams) + alignment - 1) / alignment * alignment;
   VKC_ASSIGN(map.camera_params_,
-             core::device_storage_buffer(allocator, sizeof(DepthCameraParams)));
+             core::device_storage_buffer(allocator, map.camera_stride_));
   // Frusta for the frustum compactions: likewise small -- one frustum's count
   // and planes to start with, grown by upload_frusta for more -- and persisted
   // at binding 3 of compact_frustum_.set.
   VKC_ASSIGN(map.frustum_planes_,
              core::device_storage_buffer(
                  allocator, sizeof(std::uint32_t) + sizeof(FrustumPlanes)));
-  // The recorded rounds' state, both kinds', and the blocking calls' count:
+  // The recorded rounds' state, every kind's, and the blocking calls' count:
   // grid-independent words.
   VKC_ASSIGN(map.rounds_state_,
              core::device_storage_buffer(
-                 allocator, 2 * kStateWords * sizeof(std::uint32_t)));
+                 allocator, 3 * kStateWords * sizeof(std::uint32_t)));
   VKC_ASSIGN(map.host_count_,
              core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
 
@@ -265,6 +297,9 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
                  vr_hash_rounds_comp_spv, vr_hash_rounds_comp_spv_size, 7,
                  &rounds_push));
   VKC_TRY(kb.add(map.allocate_rounds_, "hash_allocate_rounds",
+                 vr_hash_rounds_comp_spv, vr_hash_rounds_comp_spv_size, 7,
+                 &rounds_push));
+  VKC_TRY(kb.add(map.depth_rounds_, "hash_depth_rounds",
                  vr_hash_rounds_comp_spv, vr_hash_rounds_comp_spv_size, 7,
                  &rounds_push));
   VKC_TRY(kb.add(map.depth_, "hash_allocate_depth",
@@ -325,11 +360,16 @@ void VoxelHashMap::write_persistent_bindings() {
   allocate_.set.write_storage_buffer(7, rounds, 0, VK_WHOLE_SIZE);
   delete_.set.write_storage_buffer(8, rounds, 0, VK_WHOLE_SIZE);
   for (const core::DescriptorSet* set :
-       {&remove_rounds_.set, &allocate_rounds_.set}) {
+       {&remove_rounds_.set, &allocate_rounds_.set, &depth_rounds_.set}) {
     set->write_storage_buffer(2, fail, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(3, rounds, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(4, counter, 0, VK_WHOLE_SIZE);
   }
+  // A depth round's judge reads no count and sizes no slices: its count and
+  // slices bindings name buffers it never touches.
+  depth_rounds_.set.write_storage_buffer(0, rounds, 0, VK_WHOLE_SIZE);
+  depth_rounds_.set.write_storage_buffer(5, host_count_.handle(), 0,
+                                         VK_WHOLE_SIZE);
   triangles_.set.write_storage_buffer(8, stamps, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
@@ -407,8 +447,10 @@ core::Status VoxelHashMap::init_table() {
   const PushConstants push{grid_, 0, tick_};
   VKC_TRY(core::dispatch(*device_, init_, &push, sizeof(push),
                          group_count(widest), max_workgroup_count_x_));
-  // The init kernel hands every block back to the heap.
+  // The init kernel hands every block back to the heap, after every
+  // recording so far.
   heap_free_ = static_cast<std::uint32_t>(grid_.num_blocks);
+  settled_serial_ = record_serial_;
   return {};
 }
 
@@ -441,6 +483,7 @@ core::Status VoxelHashMap::rebuild_heap_excluding(
   VKC_TRY(batch.upload(heap_counter_, 0, &free_count, sizeof(free_count)));
   VKC_TRY(batch.submit());
   heap_free_ = free_count;
+  settled_serial_ = record_serial_;
   return {};
 }
 
@@ -474,15 +517,14 @@ core::Status VoxelHashMap::rebuild_heap_excluding(
 core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     const std::function<core::Status(core::CommandBatch&)>& dispatches,
     AllocFailures* out_failures,
-    const std::function<core::Status(core::CommandBatch&)>& prepare,
-    const std::function<core::Status(core::CommandBatch&)>& then) {
+    const std::function<core::Status(core::CommandBatch&)>& prepare) {
   std::uint32_t failures = 0;
   std::uint32_t terminal = 0;
   for (std::uint32_t round = 0; round < kMaxRounds; ++round) {
     // One submit a round: the call's parameters (the first round only -- they
     // persist), the cleared tally, the dispatch, and the two small results
     // the host decides on -- the tally, and the heap counter behind
-    // load_factor(); then the caller's work, when it shares the one round.
+    // load_factor().
     std::uint32_t slots[kFailSlots] = {};
     std::uint32_t heap_free = 0;
     core::CommandBatch batch(*device_, *allocator_);
@@ -493,11 +535,9 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     VKC_TRY(dispatches(batch));
     VKC_TRY(batch.readback(fail_counts_, 0, sizeof(slots), slots));
     VKC_TRY(batch.readback(heap_counter_, 0, sizeof(heap_free), &heap_free));
-    if (then) {
-      VKC_TRY(then(batch));
-    }
     VKC_TRY(batch.submit());
     heap_free_ = heap_free;
+    settled_serial_ = record_serial_;
     failures = slots[kFailTotal];
     terminal += slots[kFailTerminal];
     // The retryable reasons describe this round; terminal accumulates, since
@@ -511,7 +551,7 @@ core::Result<std::uint32_t> VoxelHashMap::dispatch_with_retry(
     }
     // Only contention is worth another round: nothing frees a block or a slot
     // between rounds, so a capacity limit would fail again.
-    if (then || reported.lock == 0 || reported.capacity_limited()) {
+    if (reported.lock == 0 || reported.capacity_limited()) {
       break;
     }
   }
@@ -539,29 +579,10 @@ core::Result<RecordedRounds> VoxelHashMap::record_rounds(
     return core::Status::invalid_argument(op + ": moved-from map");
   }
   if (count.bound == 0) return RecordedRounds{};
-  const auto check_word = [&](const DeviceCount& word,
-                              const char* what) -> core::Status {
-    if (word.buffer == nullptr || !word.buffer->valid()) {
-      return core::Status::invalid_argument(op + ": the " + what +
-                                            " has no buffer");
-    }
-    constexpr VkDeviceSize word_bytes = sizeof(std::uint32_t);
-    if (word.offset % word_bytes != 0 || word.buffer->size() < word_bytes ||
-        word.offset > word.buffer->size() - word_bytes) {
-      return core::Status::invalid_argument(
-          op + ": the " + what + "'s word is misaligned or past its buffer");
-    }
-    const std::string named = op + ": the " + what;
-    VKC_TRY(core::StorageInput(*word.buffer)
-                .check(named.c_str(), word.offset + word_bytes));
-    // The descriptors bind the whole buffer. This also bounds the word
-    // index below the shader's 32-bit no-word sentinel.
-    VKC_TRY(core::check_storage_buffer_range(named.c_str(), word.buffer->size(),
-                                             max_storage_buffer_range_));
-    return {};
-  };
-  VKC_TRY(check_word(count, "count"));
-  if (gate != nullptr) VKC_TRY(check_word(*gate, "gate"));
+  VKC_TRY(check_word(op, count, "count", max_storage_buffer_range_));
+  if (gate != nullptr) {
+    VKC_TRY(check_word(op, *gate, "gate", max_storage_buffer_range_));
+  }
   // The input stays where its producer wrote it, bound for the count's bound,
   // which one storage binding must cover.
   const VkDeviceSize input_bytes =
@@ -569,14 +590,7 @@ core::Result<RecordedRounds> VoxelHashMap::record_rounds(
   VKC_TRY(core::StorageInput(coords).check(op.c_str(), input_bytes));
   VKC_TRY(core::check_storage_buffer_range(op.c_str(), input_bytes,
                                            max_storage_buffer_range_));
-  if (results_ == nullptr) {
-    core::HostRingDesc desc;
-    desc.slot_bytes = sizeof(RoundsResult);
-    desc.slots = kResultSlots;
-    desc.name = "hash.rounds_result";
-    VKC_ASSIGN(results_, core::HostRing::create(*device_, *allocator_, desc));
-  }
-  VKC_ASSIGN(core::HostSlot slot, results_->claim(sizeof(RoundsResult)));
+  VKC_ASSIGN(core::HostSlot slot, claim_result());
   // Each round's slices, for the bound's groups.
   const std::uint32_t per_dispatch =
       recon::detail::groups_per_dispatch(max_workgroup_count_x_);
@@ -651,7 +665,18 @@ core::Result<RecordedRounds> VoxelHashMap::record_rounds(
         dispatches, per_dispatch, kLocalSize};
     VKC_TRY(recon::detail::dispatch_slices(batch, kernel, push, round, stage));
   }
-  return RecordedRounds{std::move(slot)};
+  return RecordedRounds{std::move(slot), ++record_serial_};
+}
+
+core::Result<core::HostSlot> VoxelHashMap::claim_result() {
+  if (results_ == nullptr) {
+    core::HostRingDesc desc;
+    desc.slot_bytes = sizeof(RoundsResult);
+    desc.slots = kResultSlots;
+    desc.name = "hash.rounds_result";
+    VKC_ASSIGN(results_, core::HostRing::create(*device_, *allocator_, desc));
+  }
+  return results_->claim(sizeof(RoundsResult));
 }
 
 core::Result<std::uint32_t> VoxelHashMap::run_rounds(
@@ -717,7 +742,12 @@ core::Result<AllocFailures> VoxelHashMap::settle(const RecordedRounds& rounds) {
   if (!rounds.result.valid()) return AllocFailures{};
   RoundsResult r;
   std::memcpy(&r, rounds.result.data(), sizeof(r));
-  heap_free_ = r.heap_free;
+  // The counter as the latest recording left it: an older one, or one a
+  // blocking call has overtaken since, leaves the copy as it is.
+  if (rounds.serial > settled_serial_) {
+    heap_free_ = r.heap_free;
+    settled_serial_ = rounds.serial;
+  }
   return AllocFailures{r.total, r.lock,     r.chain, r.heap,
                        r.table, r.terminal, r.rounds};
 }
@@ -745,15 +775,52 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const std::vector<DepthInput>& frames, AllocFailures* out_failures,
-    core::StageMetrics* metrics,
-    const std::function<core::Status(core::CommandBatch&)>& then) {
+    core::StageMetrics* metrics) {
   // Before the validity check, so a refused call still costs its row -- a stage
   // silent on failure reads as one that did not run. Inert when null, and it
   // publishes both halves on every return below, including the failing ones.
   core::GpuStageScope stage(metrics, gpu_timer_, "allocate");
+  // A host array's device copy, made by the first round's batch and bound by
+  // every round after.
+  std::vector<core::Buffer> uploads(frames.size());
+  // Only contention is worth another round: nothing frees a block or a slot
+  // between rounds, so a capacity limit would fail again. The retryable
+  // reasons are the last round's; terminal failures and rounds add up.
+  AllocFailures last;
+  std::uint32_t rounds = 0;
+  while (rounds < kMaxRounds) {
+    core::CommandBatch batch(*device_, *allocator_);
+    VKC_ASSIGN(const RecordedRounds recorded,
+               record_depth(batch, frames, uploads, nullptr, &stage));
+    if (!recorded.result.valid()) break;  // no frame has pixels
+    VKC_TRY(batch.submit());
+    VKC_ASSIGN(last, settle(recorded));
+    rounds += last.rounds;
+    if (last.lock == 0 || last.capacity_limited()) break;
+  }
+  last.rounds = rounds;
+  if (out_failures != nullptr) *out_failures = last;
+  return last.total + last.terminal;
+}
+
+core::Result<RecordedRounds> VoxelHashMap::record_allocate_from_depth(
+    core::CommandBatch& batch, const std::vector<DepthInput>& frames,
+    const DeviceCount* gate, core::GpuStageScope* stage) {
+  std::vector<core::Buffer> uploads(frames.size());
+  VKC_ASSIGN(RecordedRounds recorded,
+             record_depth(batch, frames, uploads, gate, stage));
+  // A host array's copy, which the batch's commands read, goes with it.
+  for (core::Buffer& upload : uploads) batch.retain(std::move(upload));
+  return recorded;
+}
+
+core::Result<RecordedRounds> VoxelHashMap::record_depth(
+    core::CommandBatch& batch, const std::vector<DepthInput>& frames,
+    std::vector<core::Buffer>& uploads, const DeviceCount* gate,
+    core::GpuStageScope* stage) {
+  const std::string op = "VoxelHashMap::allocate_from_depth";
   if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelHashMap::allocate_from_depth: moved-from map");
+    return core::Status::invalid_argument(op + ": moved-from map");
   }
   // Every frame checked before any work. The shader indexes a pixel as
   // v*width + u in 32 bits, so an image past 2^32 pixels is refused here
@@ -765,8 +832,7 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     const std::uint64_t count =
         static_cast<std::uint64_t>(camera.width) * camera.height;
     if (count > std::numeric_limits<std::uint32_t>::max()) {
-      return core::Status::invalid_argument(
-          "VoxelHashMap::allocate_from_depth: width*height exceeds 2^32");
+      return core::Status::invalid_argument(op + ": width*height exceeds 2^32");
     }
     const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(float);
     VKC_TRY(frames[i].depth.check("VoxelHashMap::allocate_from_depth: depth",
@@ -778,59 +844,101 @@ core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
     pixels[i] = static_cast<std::uint32_t>(count);
     live.push_back(i);
   }
-  if (live.empty()) {
-    return std::uint32_t{0};
+  if (gate != nullptr) {
+    VKC_TRY(check_word(op, *gate, "gate", max_storage_buffer_range_));
   }
-  // A set a frame, and a device span a frame a round.
+  if (live.empty()) return RecordedRounds{};
   const auto count = static_cast<std::uint32_t>(live.size());
+  const VkDeviceSize camera_bytes = VkDeviceSize(count) * camera_stride_;
+  VKC_TRY(core::check_storage_buffer_range(
+      "VoxelHashMap::allocate_from_depth: the cameras", camera_bytes,
+      max_storage_buffer_range_));
+  // A set a frame, every camera a stride apart in one buffer (every batch
+  // this map recorded into before has resolved, the @pre, so a grown one
+  // replaces it), and a result slot.
   VKC_TRY(depth_sets_.reserve(*device_, depth_, count));
-  VKC_TRY(gpu_timer_.reserve(*device_, kMaxRounds * count));
+  if (camera_params_.size() < camera_bytes) {
+    VKC_ASSIGN(camera_params_,
+               core::device_storage_buffer(*allocator_, camera_bytes));
+    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
+                             core::debug_object_handle(camera_params_.handle()),
+                             "hash.camera_params");
+  }
+  VKC_ASSIGN(core::HostSlot slot, claim_result());
 
-  // Each frame's depth is per-call (binding 4: a host array's device copy, or
-  // the caller's buffer), and the camera rides the one persistent
-  // camera_params_ (binding 6), rewritten inline ahead of each dispatch: the
-  // batch's barrier around every dispatch orders the rewrite after the read.
-  std::vector<core::Buffer> uploads(frames.size());  // alive across every round
-  return dispatch_with_retry(
-      [&](core::CommandBatch& batch) -> core::Status {
-        // TODO(volume): re-dispatch only the frames that failed, from a tally
-        // of each frame's own, if retries stay common after PERF.md's P3
-        // (DECISIONS.md, 2026-09-30).
-        for (std::size_t k = 0; k < live.size(); ++k) {
-          const std::size_t i = live[k];
-          VKC_TRY(batch.upload(camera_params_, 0, &frames[i].camera,
-                               sizeof(DepthCameraParams)));
-          const DepthTiles tiles = depth_tiles(frames[i].camera);
-          const PushConstants push{grid_, tiles.x, tick_};
-          VKC_TRY(batch.dispatch(depth_, depth_sets_[k], &push, sizeof(push),
-                                 tiles.total, max_workgroup_count_x_, &stage));
-        }
-        return {};
-      },
-      out_failures,
-      [&](core::CommandBatch& batch) -> core::Status {
-        // Every binding of every set, so a set another call wrote, or one a
-        // resize left naming freed buffers, is whole again.
-        for (std::size_t k = 0; k < live.size(); ++k) {
-          const std::size_t i = live[k];
-          const VkDeviceSize bytes = VkDeviceSize(pixels[i]) * sizeof(float);
-          VKC_ASSIGN(
-              const VkBuffer depth,
-              frames[i].depth.buffer(batch, *allocator_, bytes, uploads[i]));
-          const core::DescriptorSet& set = depth_sets_[k];
-          set.write_storage_buffer(0, entries_.handle(), 0, VK_WHOLE_SIZE);
-          set.write_storage_buffer(1, heap_.handle(), 0, VK_WHOLE_SIZE);
-          set.write_storage_buffer(2, heap_counter_.handle(), 0, VK_WHOLE_SIZE);
-          set.write_storage_buffer(3, bucket_mutex_.handle(), 0, VK_WHOLE_SIZE);
-          set.write_storage_buffer(4, depth, 0, bytes);
-          set.write_storage_buffer(5, fail_counts_.handle(), 0, VK_WHOLE_SIZE);
-          set.write_storage_buffer(6, camera_params_.handle(), 0,
-                                   VK_WHOLE_SIZE);
-          set.write_storage_buffer(7, stamps_.handle(), 0, VK_WHOLE_SIZE);
-        }
-        return {};
-      },
-      then);
+  // Nothing but the batch refuses from here. Every list compacted before is
+  // stale now, as record_allocate makes it.
+  ++compaction_serial_;
+  ++frustum_serial_;
+  // Every camera first, in one inline write, ahead of the round's first
+  // dispatch, so MoltenVK opens no blit encoder between the frames. It is
+  // not the batch's first: a sender's set prep comes before it.
+  std::vector<std::uint8_t> cameras(static_cast<std::size_t>(camera_bytes), 0);
+  for (std::size_t k = 0; k < live.size(); ++k) {
+    std::memcpy(cameras.data() + k * camera_stride_, &frames[live[k]].camera,
+                sizeof(DepthCameraParams));
+  }
+  VKC_TRY(batch.upload(camera_params_, 0, cameras.data(), camera_bytes));
+  // Every binding of every set, so a set another call wrote, or one a resize
+  // left naming freed buffers, is whole again. Each frame's depth is the
+  // caller's buffer, or a host array's device copy in `uploads`, staged by
+  // the first round that needs it and bound as it is by the rounds after.
+  for (std::size_t k = 0; k < live.size(); ++k) {
+    const std::size_t i = live[k];
+    const VkDeviceSize bytes = VkDeviceSize(pixels[i]) * sizeof(float);
+    VkBuffer depth = uploads[i].handle();
+    if (!uploads[i].valid()) {
+      VKC_ASSIGN(depth,
+                 frames[i].depth.buffer(batch, *allocator_, bytes, uploads[i]));
+    }
+    const core::DescriptorSet& set = depth_sets_[k];
+    set.write_storage_buffer(0, entries_.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(1, heap_.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(2, heap_counter_.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(3, bucket_mutex_.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(4, depth, 0, bytes);
+    set.write_storage_buffer(5, fail_counts_.handle(), 0, VK_WHOLE_SIZE);
+    set.write_storage_buffer(6, camera_params_.handle(), k * camera_stride_,
+                             sizeof(DepthCameraParams));
+    set.write_storage_buffer(7, stamps_.handle(), 0, VK_WHOLE_SIZE);
+  }
+  // The round between the judge's two passes: the first clears the tally,
+  // the second gathers it with the heap counter and closes the gate on any
+  // failure. Its count is a bound of 1 with no word: one round, sizing
+  // nothing, since every frame's dispatch is direct. The first reads no
+  // gate, so the round is judged whatever the gate held before it.
+  VKC_ASSIGN(const VkBuffer result,
+             batch.output(slot, 0, sizeof(RoundsResult)));
+  depth_rounds_.set.write_storage_buffer(
+      1, gate != nullptr ? gate->buffer->handle() : rounds_state_.handle(), 0,
+      VK_WHOLE_SIZE);
+  depth_rounds_.set.write_storage_buffer(6, result, 0, sizeof(RoundsResult));
+  RoundsPush judge{kNoWord,
+                   kNoWord,
+                   1,
+                   kDepthStateWord,
+                   0,
+                   1,
+                   recon::detail::groups_per_dispatch(max_workgroup_count_x_),
+                   0};
+  VKC_TRY(batch.dispatch(depth_rounds_, &judge, sizeof(judge), 1,
+                         max_workgroup_count_x_, stage));
+  // TODO(volume): re-dispatch only the frames that failed, from a tally of
+  // each frame's own, if retries stay common after PERF.md's P3
+  // (DECISIONS.md, 2026-09-30).
+  for (std::size_t k = 0; k < live.size(); ++k) {
+    const DepthTiles tiles = depth_tiles(frames[live[k]].camera);
+    const PushConstants push{grid_, tiles.x, tick_};
+    VKC_TRY(batch.dispatch(depth_, depth_sets_[k], &push, sizeof(push),
+                           tiles.total, max_workgroup_count_x_, stage));
+  }
+  judge.round = 1;
+  if (gate != nullptr) {
+    judge.gate_word = static_cast<std::uint32_t>(gate->offset / 4);
+  }
+  VKC_TRY(batch.dispatch(depth_rounds_, &judge, sizeof(judge), 1,
+                         max_workgroup_count_x_, stage));
+  return RecordedRounds{std::move(slot), ++record_serial_};
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
@@ -1197,6 +1305,7 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
                         std::move(stamps_)};
   const VoxelGridParams old_grid = grid_;
   const std::uint32_t old_heap_free = heap_free_;
+  const std::uint64_t old_settled_serial = settled_serial_;
   auto commit = [this](PersistentBuffers& b, const VoxelGridParams& g) {
     entries_ = std::move(b.entries);
     heap_ = std::move(b.heap);
@@ -1287,6 +1396,8 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   if (!st.ok()) {
     commit(old, old_grid);  // roll back to the untouched live map
     heap_free_ = old_heap_free;
+    // A completed allocation may still need to settle into the old counter.
+    settled_serial_ = old_settled_serial;
     return st;
   }
   return {};

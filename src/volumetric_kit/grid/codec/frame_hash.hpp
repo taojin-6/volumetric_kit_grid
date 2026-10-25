@@ -25,4 +25,12 @@ namespace volumetric_kit::recon::codec::detail {
 VR_CODEC_API std::uint64_t frame_hash(const std::uint8_t* data,
                                       std::size_t size);
 
+/// @return @ref frame_hash of @p head then @p payload back to back, without
+///         joining them: the encoder's frame, whose payload stays in its
+///         slot. Either may be null at size 0.
+VR_CODEC_API std::uint64_t frame_hash(const std::uint8_t* head,
+                                      std::size_t head_size,
+                                      const std::uint8_t* payload,
+                                      std::size_t payload_size);
+
 }  // namespace volumetric_kit::recon::codec::detail

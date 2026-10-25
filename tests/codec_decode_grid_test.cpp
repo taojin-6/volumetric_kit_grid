@@ -5,7 +5,8 @@
 // geometry, layout and attributes off a frame's header, at the minimum bucket
 // count and past it, and the headers it refuses; decode_growing leaving a grid
 // the frame fits alone, growing one too small exactly once to decode what a
-// roomy grid decodes, returning the second OutOfMemory of a grid one grow
+// roomy grid decodes, from bytes or an input slot (a slot short of the record
+// refused), returning the second OutOfMemory of a grid one grow
 // leaves too small, timing the whole call once it succeeds, and passing the
 // decoder's refusals through with their codes, ungrown; and the caller's
 // ceiling, which refuses a forged header, a forged frame and a grow past it
@@ -276,6 +277,53 @@ int grows_once_case(Gpu& gpu, const Frames& f) {
   return 0;
 }
 
+// The slot form: a record copied into a claimed input slot decodes, grown
+// once, to what the bytes' form decodes; a slot shorter than the record, or
+// none, is refused with the grid as it was.
+int slot_case(Gpu& gpu, const Frames& f) {
+  GridShape few;
+  few.voxel_size = kSmallVoxel;
+  few.trunc_dist = kSmallTrunc;
+  few.num_buckets = 4;
+  vkc::Result<vol::VoxelBlockGrid> grid = make_grid(gpu, few);
+  vkc::Result<vol::VoxelBlockGrid> bytes_grid = make_grid(gpu, few);
+  vkc::Result<codec::Decoder> dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<codec::Decoder> bytes_dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(grid.ok() && bytes_grid.ok() && dec.ok() && bytes_dec.ok());
+
+  // A slot may hold more than it was claimed for: a record a byte past it.
+  vkc::Result<vkc::HostSlot> short_slot = dec->claim_input(f.small.size() / 2);
+  CHECK(short_slot.ok());
+  CHECK(codec::decode_growing(*dec, *short_slot,
+                              std::size_t(short_slot->capacity()) + 1, *grid,
+                              kMaxBlocks)
+            .domain() == Code::InvalidArgument);
+  CHECK(codec::decode_growing(*dec, vkc::HostSlot{}, f.small.size(), *grid,
+                              kMaxBlocks)
+            .domain() == Code::InvalidArgument);
+  CHECK(grid->grid().num_buckets == few.num_buckets);
+
+  vkc::Result<vkc::HostSlot> slot = dec->claim_input(f.small.size());
+  CHECK(slot.ok());
+  std::memcpy(slot->data(), f.small.data(), f.small.size());
+  vkc::StageMetrics metrics;
+  CHECK(codec::decode_growing(*dec, *slot, f.small.size(), *grid, kMaxBlocks,
+                              &metrics)
+            .ok());
+  CHECK(grid->grid().num_buckets == decode_buckets(f.small_blocks));
+  CHECK(has_row(metrics, "codec decode") && has_row(metrics, "  ..grow"));
+  CHECK(codec::decode_growing(*bytes_dec, f.small.data(), f.small.size(),
+                              *bytes_grid, kMaxBlocks)
+            .ok());
+  vkc::Result<Snapshot> got = snapshot(gpu, *grid);
+  vkc::Result<Snapshot> want = snapshot(gpu, *bytes_grid);
+  CHECK(got.ok() && want.ok() && got->coords.size() == f.small_blocks);
+  CHECK(*got == *want);
+  return 0;
+}
+
 // Two-slot buckets: one grow, to the frame's buckets, leaves half the slots
 // the frame needs, and the decoder's second OutOfMemory is returned, ungrown
 // past and untimed.
@@ -393,6 +441,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(frames.ok());
   if (make_grid_case(gpu, *frames) != 0) return 1;
   if (grows_once_case(gpu, *frames) != 0) return 1;
+  if (slot_case(gpu, *frames) != 0) return 1;
   if (second_out_of_memory_case(gpu, *frames) != 0) return 1;
   if (fits_case(gpu) != 0) return 1;
   if (ceiling_case(gpu, *frames) != 0) return 1;

@@ -344,8 +344,24 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
 core::Status StreamServer::publish(const stream::RecordInfo& info,
                                    const std::uint8_t* data, std::size_t size) {
   constexpr std::string_view kApi = "StreamServer::publish";
+  try {
+    if (data == nullptr && size != 0) {
+      return core::Status::invalid_argument(std::string(kApi) +
+                                            ": a null payload of " +
+                                            std::to_string(size) + " bytes");
+    }
+    return publish(info, stream::RecordPayload::of(data, size));
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::OutOfMemory);
+  }
+}
+
+core::Status StreamServer::publish(const stream::RecordInfo& info,
+                                   const stream::RecordPayload& payload) {
+  constexpr std::string_view kApi = "StreamServer::publish";
   Impl& s = *impl_;
   try {
+    const std::size_t size = payload.size();
     if (size > stream::ChunkParser::kMaxBodyBytes) {
       return core::Status::invalid_argument(
           std::string(kApi) + ": a payload of " + std::to_string(size) +
@@ -354,17 +370,24 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
           " a viewer reads");
     }
     core::Result<stream::ChunkEncoder::RecordFraming> framed =
-        s.encoder.frame(info, data, size);
+        s.encoder.frame(info, payload);
     if (!framed.ok()) return std::move(framed).status().with_context(kApi);
     const stream::ChunkEncoder::RecordFraming& framing = *framed;
     bool kept = false;
     bool overflow = false;
     try {
-      // The one copy, made before the lock.
+      // The one copy, made before the lock, of both runs.
       auto chunk = std::make_shared<std::vector<std::uint8_t>>();
       chunk->reserve(framing.header.size() + size + framing.padding);
       chunk->insert(chunk->end(), framing.header.begin(), framing.header.end());
-      chunk->insert(chunk->end(), data, data + size);
+      if (payload.first_size() != 0) {
+        chunk->insert(chunk->end(), payload.first(),
+                      payload.first() + payload.first_size());
+      }
+      if (payload.second_size() != 0) {
+        chunk->insert(chunk->end(), payload.second(),
+                      payload.second() + payload.second_size());
+      }
       chunk->insert(chunk->end(), kZeros, kZeros + framing.padding);
       const std::lock_guard<std::mutex> lock(s.mutex);
       const bool joins = info.key || s.log.open();

@@ -74,30 +74,46 @@ Blocks entries(const std::vector<vr::Vec3i>& coords) {
 
 // --- The sort. --------------------------------------------------------------
 
-// The device's sort of @p in, read back, with @p in read back too.
+// The device's sort of @p in, its count a device word, recorded for a bound
+// of @p bound entries (@p in's when 0), the list's entries past @p in
+// garbage, read back, with @p in read back too.
 vkc::Result<Blocks> device_sort(vr_test::Gpu& gpu, d::BlockLists& lists,
-                                const Blocks& in, Blocks* input_after) {
+                                const Blocks& in, Blocks* input_after,
+                                std::uint32_t bound = 0) {
   const auto n = static_cast<std::uint32_t>(in.size());
+  if (bound == 0) bound = n;
   vkc::Buffer list;
-  if (n != 0) {
+  vkc::Buffer out;
+  if (bound != 0) {
+    Blocks padded = in;
+    for (std::uint32_t i = n; i < bound; ++i) {
+      padded.push_back(vol::BlockIndex{vr::Vec3i(-7, int(i), 5), -1});
+    }
     VKC_ASSIGN(list, vr_test::upload_device_buffer(
-                         gpu.device, gpu.allocator, in.data(),
-                         in.size() * sizeof(vol::BlockIndex)));
+                         gpu.device, gpu.allocator, padded.data(),
+                         padded.size() * sizeof(vol::BlockIndex)));
+    VKC_ASSIGN(
+        out, vkc::device_storage_buffer(
+                 gpu.allocator, VkDeviceSize(bound) * sizeof(vol::BlockIndex)));
   }
+  VKC_ASSIGN(
+      const vkc::Buffer word,
+      vr_test::upload_device_buffer(gpu.device, gpu.allocator, &n, sizeof(n)));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_ASSIGN(const vkc::Buffer* sorted, lists.record_sort(batch, list, n));
+  VKC_TRY(
+      lists.record_sort(batch, list, vol::DeviceCount{&word, 0, bound}, out));
   VKC_TRY(batch.submit());
   if (n == 0) return Blocks{};
   if (input_after != nullptr) {
     VKC_ASSIGN(*input_after, vr_test::read_back<vol::BlockIndex>(
                                  gpu.device, gpu.allocator, list, n));
   }
-  return vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator, *sorted,
-                                             n);
+  return vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator, out, n);
 }
 
 // @p coords sorted on the device as std::stable_sort sorts them, the input
-// left as it was.
+// left as it was; and, for a few, recorded for 64 times their entries, whose
+// levels past them copy their entries through.
 int sorts_as_std(vr_test::Gpu& gpu, d::BlockLists& lists,
                  const std::vector<vr::Vec3i>& coords, const char* what) {
   const Blocks in = entries(coords);
@@ -106,13 +122,21 @@ int sorts_as_std(vr_test::Gpu& gpu, d::BlockLists& lists,
                    [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
                      return d::coord_less(a.coord, b.coord);
                    });
-  Blocks after;
-  const vkc::Result<Blocks> got = device_sort(gpu, lists, in, &after);
-  if (!got.ok() || !same(got.value(), expected) ||
-      (!in.empty() && !same(after, in))) {
-    std::fprintf(stderr, "sort, %s, n %zu: %s\n", what, coords.size(),
-                 got.ok() ? "differs" : got.status().message().c_str());
-    return 1;
+  std::vector<std::uint32_t> bounds = {0};
+  if (in.size() <= 4097) {
+    bounds.push_back(std::max<std::uint32_t>(
+        64, 64 * static_cast<std::uint32_t>(in.size())));
+  }
+  for (const std::uint32_t bound : bounds) {
+    Blocks after;
+    const vkc::Result<Blocks> got = device_sort(gpu, lists, in, &after, bound);
+    if (!got.ok() || !same(got.value(), expected) ||
+        (!in.empty() && !same(after, in))) {
+      std::fprintf(stderr, "sort, %s, n %zu, bound %u: %s\n", what,
+                   coords.size(), bound,
+                   got.ok() ? "differs" : got.status().message().c_str());
+      return 1;
+    }
   }
   return 0;
 }
@@ -177,6 +201,12 @@ int sort_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
   vkc::Result<vkc::Buffer> transfer_only = gpu.allocator.create_buffer(desc);
   CHECK(transfer_only.ok());
   const vkc::Buffer empty;
+  const std::uint32_t two_word = 2;
+  vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+      gpu.device, gpu.allocator, &two_word, sizeof(two_word));
+  vkc::Result<vkc::Buffer> out =
+      vkc::device_storage_buffer(gpu.allocator, 3 * sizeof(vol::BlockIndex));
+  CHECK(word.ok() && out.ok());
   struct Refused {
     const vkc::Buffer* list;
     std::uint32_t n;
@@ -185,13 +215,33 @@ int sort_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
        {Refused{&list.value(), 3}, Refused{&transfer_only.value(), 2},
         Refused{&empty, 1}}) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s = lists.record_sort(batch, *r.list, r.n).status();
+    const vkc::Status s = lists.record_sort(
+        batch, *r.list, vol::DeviceCount{&word.value(), 0, r.n}, out.value());
     CHECK(s.domain() == C::InvalidArgument &&
           s.message().rfind("BlockLists::record_sort: the list", 0) == 0);
     CHECK(batch.submit().ok());
   }
+  // A count word past its buffer, or an output short of the bound.
+  for (const vol::DeviceCount& count : {vol::DeviceCount{&word.value(), 4, 2},
+                                        vol::DeviceCount{&empty, 0, 2}}) {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    CHECK(lists.record_sort(batch, list.value(), count, out.value()).domain() ==
+          C::InvalidArgument);
+    CHECK(batch.submit().ok());
+  }
+  {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    CHECK(lists
+              .record_sort(batch, list.value(),
+                           vol::DeviceCount{&word.value(), 0, 2}, empty)
+              .domain() == C::InvalidArgument);
+    CHECK(batch.submit().ok());
+  }
   vkc::CommandBatch none(gpu.device, gpu.allocator);
-  CHECK(lists.record_sort(none, empty, 0).ok());
+  CHECK(lists
+            .record_sort(none, empty, vol::DeviceCount{&word.value(), 0, 0},
+                         empty)
+            .ok());
   CHECK(none.submit().ok());
   // And it sorts after them.
   CHECK(sorts_as_std(gpu, lists, {{1, 0, 0}, {0, 0, 0}}, "after refusals") ==

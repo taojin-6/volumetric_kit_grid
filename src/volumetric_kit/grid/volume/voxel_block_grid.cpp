@@ -415,12 +415,14 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   core::ComputeKernel stamp;
   core::ComputeKernel zero;
   core::ComputeKernel zero_args;
+  core::ComputeKernel stamp_args;
   core::KernelSetBuilder kb(*device_);
   VKC_TRY(kb.add(stamp, "block_stamp", vr_block_stamp_comp_spv,
                  vr_block_stamp_comp_spv_size, 5, &stamp_push));
   VKC_TRY(kb.add(zero, "block_zero", vr_block_zero_comp_spv,
                  vr_block_zero_comp_spv_size, 3, &zero_push));
   VKC_TRY(recon::detail::add_dispatch_args(kb, zero_args, "block_zero_args"));
+  VKC_TRY(recon::detail::add_dispatch_args(kb, stamp_args, "block_stamp_args"));
   VKC_ASSIGN(core::DescriptorPool pool, kb.build());
   core::KernelSets sets;
   VKC_TRY(sets.reserve(*device_, zero,
@@ -435,49 +437,14 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   zero_kernel_ = std::move(zero);
   zero_sets_ = std::move(sets);
   zero_args_kernel_ = std::move(zero_args);
+  stamp_args_kernel_ = std::move(stamp_args);
   max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   stamp_kernel_ = std::move(stamp);
   return {};
 }
 
-core::Result<std::uint32_t> VoxelBlockGrid::block_pass(
-    std::uint32_t max_age, core::GpuStageScope& stage,
-    core::StageMetrics* metrics) {
-  VKC_ASSIGN(const AttributeView weight, attribute("weight"));
-  VKC_ASSIGN(const DeviceBlockList active,
-             map_.compact_active_blocks_on_device(metrics));
-  if (active.count == 0) return std::uint32_t{0};
-  const VkDeviceSize list_bytes =
-      VkDeviceSize(active.count) * sizeof(BlockIndex);
-  if (stale_list_.size() < list_bytes) {
-    VKC_ASSIGN(stale_list_,
-               core::device_storage_buffer(*allocator_, list_bytes));
-    device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
-                             core::debug_object_handle(stale_list_.handle()),
-                             "grid.stale_list");
-  }
-  const core::DescriptorSet& set = stamp_kernel_.set;
-  set.write_storage_buffer(0, weight.buffer->handle(), 0, VK_WHOLE_SIZE);
-  set.write_storage_buffer(1, active.buffer->handle(), 0, list_bytes);
-  set.write_storage_buffer(2, map_.stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
-  set.write_storage_buffer(3, stale_list_.handle(), 0, VK_WHOLE_SIZE);
-  set.write_storage_buffer(4, stale_count_.handle(), 0, VK_WHOLE_SIZE);
-  const StampPush push{0,
-                       static_cast<std::uint32_t>(map_.grid().voxels_per_block),
-                       map_.tick(), max_age, kObservedWeight};
-  std::uint32_t stale = 0;
-  core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(batch.fill(stale_count_, 0, sizeof(stale), 0u));
-  VKC_TRY(recon::detail::dispatch_items(batch, stamp_kernel_, push,
-                                        active.count, 1, max_workgroup_count_x_,
-                                        &stage, &set));
-  VKC_TRY(batch.readback(stale_count_, 0, sizeof(stale), &stale));
-  VKC_TRY(batch.submit());
-  return std::min(stale, active.count);
-}
-
-core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
-    std::uint32_t max_age, core::StageMetrics* metrics) {
+core::Status VoxelBlockGrid::prepare_free_pass(
+    std::uint32_t max_age, const core::StageMetrics* metrics) {
   if (max_age == 0) {
     return core::Status::invalid_argument(
         "VoxelBlockGrid::free_stale_blocks: max_age must be at least 1");
@@ -489,15 +456,98 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
   if (metrics != nullptr && !gpu_timer_.valid()) {
     VKC_ASSIGN(gpu_timer_, core::GpuTimer::create(*device_));
   }
+  return {};
+}
+
+void VoxelBlockGrid::place_free_pass_rows(core::StageMetrics* metrics) {
+  // The stage's row and its compaction's, placed as the pass opens, so a
+  // batch's later stages, whose device halves come back with theirs, do not
+  // come between them.
+  if (metrics == nullptr) return;
+  metrics->add_cpu("block stamps", 0.0);
+  metrics->add_cpu("  ..stale set", 0.0);
+}
+
+core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
+    core::CommandBatch& batch, std::uint32_t max_age,
+    core::GpuStageScope& stage, std::uint32_t* initial_count) {
+  VKC_ASSIGN(const AttributeView weight, attribute("weight"));
+  // Every block slot's room, since only the device knows how many are stale;
+  // every batch this grid recorded into before has resolved (the @pre).
+  const auto slots = static_cast<std::uint32_t>(map_.grid().num_blocks);
+  const VkDeviceSize list_bytes = VkDeviceSize(slots) * sizeof(BlockIndex);
+  VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, stale_list_,
+                                      list_bytes, max_storage_buffer_range_,
+                                      "grid.stale_list"));
+  // The active set, on the device: the compaction's own breakdown, its
+  // device half alone, as the stage's row holds its host time.
+  core::StageMetrics parts;
+  RecordedBlockList active;
+  {
+    core::GpuStageScope compaction(stage.timer() != nullptr ? &parts : nullptr,
+                                   gpu_timer_, "  ..stale set");
+    VKC_ASSIGN(active, map_.record_compaction(batch, nullptr, &compaction));
+  }
+  // The stamp pass, a group an active block, sized from the compaction's
+  // count; it lists the stale blocks and counts them.
+  recon::detail::IndirectSlices groups;
+  VKC_TRY(recon::detail::record_dispatch_args(
+      batch, *device_, *allocator_, stamp_args_kernel_, stamp_slices_,
+      "grid.stamp_slices",
+      recon::detail::SlicedCount{active.count, 0, slots, 1}, 1, &groups, 0,
+      nullptr, max_workgroup_count_x_, &stage));
+  const core::DescriptorSet& set = stamp_kernel_.set;
+  set.write_storage_buffer(0, weight.buffer->handle(), 0, VK_WHOLE_SIZE);
+  set.write_storage_buffer(1, active.buffer->handle(), 0, list_bytes);
+  set.write_storage_buffer(2, map_.stamps_buffer().handle(), 0, VK_WHOLE_SIZE);
+  set.write_storage_buffer(3, stale_list_.handle(), 0, list_bytes);
+  set.write_storage_buffer(4, stale_count_.handle(), 0, VK_WHOLE_SIZE);
+  const StampPush push{0,
+                       static_cast<std::uint32_t>(map_.grid().voxels_per_block),
+                       map_.tick(), max_age, kObservedWeight};
+  VKC_TRY(batch.fill(stale_count_, 0, sizeof(std::uint32_t), 0u));
+  VKC_TRY(recon::detail::dispatch_slices(batch, stamp_kernel_, push, groups,
+                                         &stage));
+  // Each stale block zeroed, then freed, from the list and count the pass
+  // left: the removal needs no host coordinate or count.
+  VKC_ASSIGN(
+      RecordedRounds removed,
+      record_remove(batch, stale_list_, DeviceCount{&stale_count_, 0, slots},
+                    nullptr, &stage));
+  if (initial_count != nullptr) {
+    // The removal leaves the compaction's count unchanged. Read it beside
+    // the result, since an earlier unsettled recording can leave the host's
+    // occupancy stale in either direction.
+    VKC_TRY(batch.readback(*active.count, 0, sizeof(*initial_count),
+                           initial_count));
+  }
+  return removed;
+}
+
+core::Result<RecordedRounds> VoxelBlockGrid::record_free_stale(
+    core::CommandBatch& batch, std::uint32_t max_age,
+    core::StageMetrics* metrics) {
+  VKC_TRY(prepare_free_pass(max_age, metrics));
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
-  VKC_ASSIGN(const std::uint32_t stale, block_pass(max_age, stage, metrics));
-  if (stale == 0) return std::uint32_t{0};
-  // Both zeroing and deletion consume the device list the stamp pass wrote.
-  // Only the small stale/failure counts reach the host; the coordinates never
-  // make a round trip through a host vector and a second device allocation.
-  VKC_ASSIGN(const std::uint32_t failed,
-             zero_and_remove(stale_list_, stale, nullptr, &stage));
-  return stale - std::min(failed, stale);
+  place_free_pass_rows(metrics);
+  return record_stale(batch, max_age, stage);
+}
+
+core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
+    std::uint32_t max_age, core::StageMetrics* metrics) {
+  VKC_TRY(prepare_free_pass(max_age, metrics));
+  // The row spans the wait too, and takes the batch's device halves after.
+  core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
+  place_free_pass_rows(metrics);
+  std::uint32_t held = 0;
+  core::CommandBatch batch(*device_, *allocator_);
+  VKC_ASSIGN(const RecordedRounds removed,
+             record_stale(batch, max_age, stage, &held));
+  VKC_ASSIGN(core::PendingBatch pending, batch.submit_async({}, {}));
+  VKC_TRY(pending.wait());
+  if (metrics != nullptr) metrics->merge_device(pending.device_rows());
+  VKC_TRY(map_.settle(removed).status());
+  return held - std::min(held, map_.allocated_blocks());
 }
 
 core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,

@@ -326,14 +326,40 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// The stamping is one workgroup per active block, reading its `weight`
   /// attribute, so this is meant for every few ticks rather than every fuse.
   /// Its kernels are built by @ref create.
+  /// It is @ref record_free_stale, one submit and @ref VoxelHashMap::settle:
+  /// one recording of @ref VoxelHashMap::kRecordedRounds removal rounds, so a
+  /// block a lost lock race keeps waits for the next pass.
   /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
   ///                 spanning the frees too, over the compaction's
-  ///                 `"  ..active set"`.
-  /// @return The blocks freed; `Status::Code::InvalidArgument` for a
-  ///         @p max_age of 0, a moved-from grid or one without a `float`
-  ///         `weight` attribute; or what @ref VoxelHashMap::remove refuses.
+  ///                 `"  ..stale set"` with its device half.
+  /// @return The blocks freed, the heap's gain across the pass;
+  ///         `Status::Code::InvalidArgument` for a @p max_age of 0, a
+  ///         moved-from grid or one without a `float` `weight` attribute; or
+  ///         what @ref record_remove refuses.
   core::Result<std::uint32_t> free_stale_blocks(
       std::uint32_t max_age, core::StageMetrics* metrics = nullptr);
+
+  /// @brief Record @ref free_stale_blocks' work into @p batch, every count on
+  ///        the device: the active set's compaction, the stamp pass sized
+  ///        from its count, and @ref record_remove over the stale list the
+  ///        pass writes, so each stale block is zeroed before its index is
+  ///        freed. Settle it with `map().settle(...)`.
+  ///
+  /// Stamps with the map's tick as it stands now, so recorded after a fuse
+  /// in the same batch it sees that fuse's stamps. A block the removal's
+  /// rounds leave to a lost race stays for the next pass.
+  /// @param batch    Records the pass; the caller submits it.
+  /// @param max_age  As @ref free_stale_blocks.
+  /// @param metrics  Optional: `"block stamps"` over `"  ..stale set"`, the
+  ///                 host half now and the device halves from
+  ///                 `PendingBatch::device_rows`.
+  /// @return The removal's outcome; or, with nothing recorded,
+  ///         @ref free_stale_blocks' refusals or what @ref record_remove
+  ///         refuses.
+  /// @pre As @ref record_remove.
+  core::Result<RecordedRounds> record_free_stale(
+      core::CommandBatch& batch, std::uint32_t max_age,
+      core::StageMetrics* metrics = nullptr);
 
  private:
   /// Construct from an already-built block index + the allocator its attribute
@@ -377,19 +403,28 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
                            std::uint32_t count, const DeviceCount* words,
                            const DeviceCount* gate, core::GpuStageScope* stage);
-  // Every removal's body -- remove's and free_stale_blocks':
-  // zero the first `count` blocks `list` names and free them through the
-  // map, in the submit of the map's first round, each round tagged with
-  // `stage`. `list` is the caller's to check.
+  // remove's body: zero the first `count` blocks `list` names and free them
+  // through the map, in the submit of the map's first round, each round
+  // tagged with `stage`. `list` is the caller's to check.
   core::Result<std::uint32_t> zero_and_remove(const core::Buffer& list,
                                               std::uint32_t count,
                                               AllocFailures* out_failures,
                                               core::GpuStageScope* stage);
-  // The block pass: stamps, and with a max_age the stale blocks listed in
-  // stale_list_. Returns how many.
-  core::Result<std::uint32_t> block_pass(std::uint32_t max_age,
-                                         core::GpuStageScope& stage,
-                                         core::StageMetrics* metrics);
+  // record_free_stale's body under `stage`, the caller's "block stamps":
+  // the compaction (its "  ..stale set" device half alone), the stamp pass
+  // over its count into stale_list_ and stale_count_, and the removal of
+  // what it lists. For the blocking wrapper, read the initial device count
+  // into `initial_count` when the batch completes.
+  core::Result<RecordedRounds> record_stale(
+      core::CommandBatch& batch, std::uint32_t max_age,
+      core::GpuStageScope& stage, std::uint32_t* initial_count = nullptr);
+  // free_stale_blocks' and record_free_stale's first steps: the checks, and
+  // the timer a timed pass makes once.
+  core::Status prepare_free_pass(std::uint32_t max_age,
+                                 const core::StageMetrics* metrics);
+  // Place "block stamps" and "  ..stale set" in `metrics`, in that order, as
+  // a pass opens; none for null.
+  static void place_free_pass_rows(core::StageMetrics* metrics);
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
@@ -401,11 +436,16 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::ComputeKernel stamp_kernel_;
   core::ComputeKernel zero_kernel_;
   core::KernelSets zero_sets_;
-  // A recorded removal's zeroing, sized from the count on the device: recon's
-  // count-to-slices kernel and its slices.
+  // A recorded removal's zeroing, and the stamp pass, each sized from a
+  // count on the device: recon's count-to-slices kernel, an instance each,
+  // and its slices.
   core::ComputeKernel zero_args_kernel_;
   core::Buffer zero_slices_;
+  core::ComputeKernel stamp_args_kernel_;
+  core::Buffer stamp_slices_;
   core::GpuTimer gpu_timer_;
+  // The stale blocks the stamp pass lists, sized for every block slot, since
+  // only the device knows how many there are, and their count.
   core::Buffer stale_list_;
   core::Buffer stale_count_;
   std::uint32_t max_workgroup_count_x_ = 0;
