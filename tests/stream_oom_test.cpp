@@ -3,7 +3,8 @@
 
 // Allocation failures across the complete public stream calls, including
 // validation, copies of a writer's sticky error, and a parser's failure,
-// which sticks too. No GPU or camera.
+// which sticks too; and the reads into caller memory, which allocate
+// nothing. No GPU or camera.
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -413,6 +414,49 @@ int parser_failures(const std::string& dir) {
   return 0;
 }
 
+// A read into caller memory allocates nothing: the reader's and the parser's,
+// a held record taken by a parser's next with no payload included.
+int caller_memory(const std::string& dir) {
+  const std::string path = dir + "/caller.vrst";
+  const vrst::Bytes payload = vrst::pattern(5000, 3);
+  {
+    auto writer = create(path);
+    CHECK(writer != nullptr);
+    CHECK(writer->append(info(0, true, 10, 1), payload.data(), payload.size())
+              .ok());
+    CHECK(writer->finish().ok());
+  }
+  auto& failure = vr_test::allocation_failure;
+  const auto allocates = [&](const auto& call) {
+    failure = {};
+    failure.measure = true;
+    const bool ok = call();
+    failure.measure = false;
+    const bool none = failure.bytes == 0 && failure.measured_site == nullptr;
+    failure = {};
+    return ok && !none;
+  };
+  vrst::Bytes slot(payload.size() + 8, 0);
+  const auto reader = vrst::open(path);
+  CHECK(reader != nullptr);
+  stream::Position pos = reader->begin();
+  stream::Record record;
+  CHECK(reader->next(&pos, &record).value());
+  CHECK(!allocates(
+      [&] { return reader->read(record, slot.data(), slot.size()).ok(); }));
+  CHECK(vrst::Bytes(slot.begin(), slot.begin() + 5000) == payload);
+
+  const vrst::Bytes bytes = vr_test::read_bytes(path);
+  stream::ChunkParser parser;
+  CHECK(parser.feed(bytes.data(), bytes.size()).ok());
+  CHECK(!allocates([&] { return parser.next(&record, nullptr).value(); }));
+  slot.assign(slot.size(), 0);
+  CHECK(!allocates(
+      [&] { return parser.read(record, slot.data(), slot.size()).ok(); }));
+  CHECK(vrst::Bytes(slot.begin(), slot.begin() + 5000) == payload);
+  return 0;
+}
+
 }  // namespace
 
 int main() try {
@@ -425,6 +469,7 @@ int main() try {
   failed |= sticky_errors(dir);
   failed |= encoder_diagnostics();
   failed |= parser_failures(dir);
+  failed |= caller_memory(dir);
   return failed;
 } catch (const std::bad_alloc&) {
   vr_test::allocation_failure = {};

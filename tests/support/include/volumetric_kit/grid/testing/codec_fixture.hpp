@@ -206,6 +206,15 @@ inline vkc::Result<vol::VoxelBlockGrid> two_sphere_grid(
   return grid;
 }
 
+// A sphere that moves and grows beside one that stays, at step @p t.
+inline vkc::Result<vol::VoxelBlockGrid> chain_grid(Gpu& gpu, int t) {
+  const Sphere moving{
+      vr::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
+      0.07f + 0.002f * float(t)};
+  return two_sphere_grid(gpu, moving,
+                         Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
+}
+
 // --- True signed distances (EncoderConfig::true_sdf). ----------------------
 
 // A band of 16 voxels, past kTrueSdfBandVoxels, as the mesh templates code.

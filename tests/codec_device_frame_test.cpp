@@ -222,16 +222,17 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   return frame;
 }
 
-// The oracle's decode of a frame and the device's: the same entries, or the
-// same refusal -- code and message -- which @p refusal receives.
+// The oracle's decode of a frame and the device's, from byte @p shift of its
+// input: the same entries, or the same refusal -- code and message -- which
+// @p refusal receives.
 int same_read(d::DeviceFrameReader& reader, const Bytes& bytes,
               const d::FrameReference* reference = nullptr,
               std::string* refusal = nullptr,
-              std::uint32_t max_blocks = kMaxBlocks) {
+              std::uint32_t max_blocks = kMaxBlocks, std::size_t shift = 0) {
   const vkc::Result<oracle::Frame> expected =
       oracle::read_frame(bytes.data(), bytes.size(), max_blocks, reference);
-  const vkc::Result<oracle::Frame> device =
-      device_read(reader, bytes.data(), bytes.size(), reference, max_blocks);
+  const vkc::Result<oracle::Frame> device = device_read(
+      reader, bytes.data(), bytes.size(), reference, max_blocks, shift);
   if (expected.ok() != device.ok() ||
       (!expected.ok() &&
        expected.status().message() != device.status().message())) {
@@ -367,6 +368,25 @@ int inter_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
   const oracle::Frame empty = make_frame(0, 8, 1);
   const d::FrameReference id = reference_of(oracle::write_frame(empty).value());
   CHECK(same_bytes(writer, reader, inter_frame(id, empty, empty), {}) == 0);
+  return 0;
+}
+
+// The payload read where its record lies in the decoder's input slot: from
+// every byte offset mod 4 and past the binding alignments of 64 and 256, an
+// intra frame and the worked P-frame read as the oracle reads them.
+int payload_offsets_case(d::DeviceFrameReader& reader) {
+  const Bytes intra = oracle::write_frame(make_frame(65, 20, 3)).value();
+  const d::FrameReference example = reference_of(
+      oracle::write_frame(codec_frames::example_reference()).value());
+  const Bytes inter = codec_frames::example_bytes(example.hash);
+  const std::size_t shifts[] = {1, 2, 3, 4, 5, 6, 7, 67, 257};
+  for (const std::size_t shift : shifts) {
+    if (same_read(reader, intra, nullptr, nullptr, kMaxBlocks, shift) != 0 ||
+        same_read(reader, inter, &example, nullptr, kMaxBlocks, shift) != 0) {
+      std::fprintf(stderr, "payload at shift %zu\n", shift);
+      return 1;
+    }
+  }
   return 0;
 }
 
@@ -998,6 +1018,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (matches_oracle_case(writer, reader) != 0) return 1;
   if (inter_case(writer, reader) != 0) return 1;
   if (golden_case(writer, reader) != 0) return 1;
+  if (payload_offsets_case(reader) != 0) return 1;
   if (corruption_case(reader) != 0) return 1;
   if (inter_refusals_case(reader) != 0) return 1;
   if (writer_refusals_case(writer) != 0) return 1;
