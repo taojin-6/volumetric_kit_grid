@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -522,13 +523,13 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief @ref compact_active_blocks, with the list left on the device for a
   ///        kernel to read in place; only its count reaches the host.
   ///
-  /// While the last call's list still holds, this returns it, dispatching and
-  /// reporting nothing, so the encoder after a mesh extract reuses the
-  /// extract's compaction.
+  /// While the last call's list still holds (@ref held_device_list), this
+  /// returns it, dispatching and reporting nothing, so a mesh extract after
+  /// the encoder reuses the encoder's compaction.
   /// @param metrics  As @ref compact_active_blocks, under the same row name.
   /// @param row      The row's name instead, from a stage whose compaction
   ///                 must stay apart from another stage's timed into the same
-  ///                 `StageMetrics` (the extract's `"  ..compact"`, beside a
+  ///                 `StageMetrics` (a mesh stage's `"  ..compact"`, beside a
   ///                 fuse's `"  ..active set"`); string-literal lifetime. Null
   ///                 names it as @ref compact_active_blocks does.
   /// @return The list, which @ref check_device_block_list accepts until this
@@ -536,6 +537,16 @@ class VR_VOLUME_API VoxelHashMap {
   ///         clears or moves; or a non-OK `Status`.
   core::Result<DeviceBlockList> compact_active_blocks_on_device(
       core::StageMetrics* metrics = nullptr, const char* row = nullptr);
+
+  /// @brief The list @ref compact_active_blocks_on_device would return now
+  ///        without compacting: its last one, while that still holds.
+  ///
+  /// `mesh::MarchingCubes::extract_device` binds it when there is one, and
+  /// records a compaction into its own batch when there is not.
+  /// @return That list; or none before the first such compaction, or once
+  ///         this map has compacted the active set again, allocated, resized,
+  ///         removed, cleared or moved since.
+  std::optional<DeviceBlockList> held_device_list() const noexcept;
 
   /// @brief Whether @p list is still this map's active set, for a consumer
   ///        that needs every block to ask before it binds the list.

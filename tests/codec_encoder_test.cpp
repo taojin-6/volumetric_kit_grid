@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -202,10 +203,10 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
-// The active set is the map's own list: the list the map last compacted (an
-// extract's, say) is taken back while it still holds, compacting nothing, and
-// is still the map's for the extract after -- and one the encoder compacts is
-// left for it too.
+// The active set is the map's own list: the list the map last compacted
+// (another encode's, say) is taken back while it still holds, compacting
+// nothing, and is still the map's for the extract after -- and one the encoder
+// compacts is left for it too.
 int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> g =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.07f});
@@ -228,11 +229,14 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<std::vector<std::uint8_t>> b = enc.encode(grid, &again);
   CHECK(b.ok() && b.value() == a.value());
   CHECK(find_row(again, "  ..active set") != nullptr);
-  vkc::StageMetrics extract;  // the extract's compaction, which it skips
+  vkc::StageMetrics extract;  // a compaction after it, which it skips
   vkc::Result<vol::DeviceBlockList> next =
       grid.map().compact_active_blocks_on_device(&extract);
   CHECK(next.ok() && extract.rows().empty());
   CHECK(next.value().serial != last.value().serial);
+  const std::optional<vol::DeviceBlockList> held =
+      grid.map().held_device_list();
+  CHECK(held.has_value() && held->serial == next.value().serial);
   return 0;
 }
 

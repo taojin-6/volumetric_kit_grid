@@ -1132,7 +1132,8 @@ core::Status MarchingCubes::record_body(
     const core::Buffer& list, const core::Buffer* count_buffer,
     std::uint32_t bound, std::uint32_t expected_blocks,
     const volume::DeviceCount* gate, core::GpuStageScope* stage,
-    core::StageMetrics* metrics, const char* entry) {
+    core::StageMetrics* metrics, ExtractTimings* timings, const char* entry) {
+  PhaseClock clock(timings != nullptr);
   // The arena is sized to what the surface should emit, not to the
   // 5-triangles-per-cell worst case: the last extract's density scaled by the
   // blocks expected, which reads no slot, so it cannot compound across the
@@ -1148,6 +1149,7 @@ core::Status MarchingCubes::record_body(
   // A grow's identity fill is a submit of its own, the stage's alone.
   VKC_TRY(ensure_output_buffers(capacity, plan_vertex_capacity(capacity), entry,
                                 stage));
+  if (timings != nullptr) timings->arena_alloc_ms = clock.lap();
   core::GpuStageScope dispatch(metrics, gpu_timer_, "  ..dispatch");
   VKC_TRY(bind_sparse(grid, list, bound, entry));
   if (results_ == nullptr) {
@@ -1194,6 +1196,7 @@ core::Status MarchingCubes::record_body(
                                 kIndirectBufferBytes);
   finalize.write_storage_buffer(1, state_.handle(), 0, VK_WHOLE_SIZE);
   finalize.write_storage_buffer(2, result, 0, sizeof(McResults));
+  if (timings != nullptr) timings->descriptor_ms = clock.lap();
 
   const ArgsPush sizing{
       count_buffer != nullptr ? 0u : kNoWord,
@@ -1218,6 +1221,7 @@ core::Status MarchingCubes::record_body(
                             config_.share_vertices ? 1u : 0u};
   VKC_TRY(batch.dispatch(finalize_kernel_, &checks, sizeof(checks), 1,
                          max_workgroup_count_x_, &dispatch));
+  if (timings != nullptr) timings->dispatch_ms = clock.lap();
   pending_generation_ = generation_;
   pending_results_ = std::move(*claimed);
   pending_list_ = &list;
@@ -1257,7 +1261,8 @@ core::Result<PendingExtract> MarchingCubes::record_extract(
   }
   VKC_TRY(record_body(batch, grid, iso, *list.buffer, list.count,
                       static_cast<std::uint32_t>(grid.grid().num_blocks),
-                      expected_blocks, gate, &stage, metrics, kEntryRecord));
+                      expected_blocks, gate, &stage, metrics, nullptr,
+                      kEntryRecord));
   pending_signal_ = ++timeline_value_;
   return PendingExtract{generation_, {timeline_.get(), pending_signal_}};
 }
@@ -1266,6 +1271,10 @@ core::Result<std::optional<DeviceMesh>> MarchingCubes::finish(
     const PendingExtract& pending, volume::VoxelBlockGrid& grid,
     ExtractTimings* timings, core::StageMetrics* metrics) {
   if (timings != nullptr) *timings = ExtractTimings{};
+  // The call is the mesh stage's too, so a refit's row is a breakdown of its
+  // row, which comes first.
+  if (metrics != nullptr) metrics->seed("marching cubes");
+  const core::StageScope stage(metrics, "marching cubes");
   if (!valid()) {
     return core::Status::invalid_argument(std::string(kEntryFinish) +
                                           ": moved-from");
@@ -1282,7 +1291,8 @@ core::Result<std::optional<DeviceMesh>> MarchingCubes::finish(
 }
 
 void MarchingCubes::abandon(const PendingExtract& pending) noexcept {
-  if (pending.generation != 0 && pending.generation == pending_generation_) {
+  if (pending.generation != 0 && pending.generation == pending_generation_ &&
+      pending.signal.semaphore == timeline_.get()) {
     drop_pending();
   }
 }
@@ -1360,7 +1370,9 @@ core::Result<std::optional<DeviceMesh>> MarchingCubes::finish_pending(
       drop_pending();
       return sized;
     }
+    if (timings != nullptr) timings->arena_alloc_ms += clock.lap();
     VKC_TRY(bind_sparse(grid, *pending_list_, active, entry));
+    if (timings != nullptr) timings->descriptor_ms += clock.lap();
     IndirectWords reset{};
     reset.command.instanceCount = 1;
     IndirectWords words{};
@@ -1478,22 +1490,35 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
   // consumer one frame behind refuses on every frame (claim_output_slot).
   VKC_TRY(claim_output_slot(entry));
   ++generation_;
-  // The caller's subset of the map, or the map's own list: the last
-  // compaction's while it holds, so the encoder after an extract reuses it,
-  // else compacted here as this stage's "  ..compact".
-  PhaseClock clock(timings != nullptr);
-  volume::DeviceBlockList list{};
-  if (blocks != nullptr) {
-    list = *blocks;
-  } else {
-    VKC_ASSIGN(list, grid.map().compact_active_blocks_on_device(metrics,
-                                                                "  ..compact"));
-    if (timings != nullptr) timings->compact_ms = clock.lap();
-  }
+  // The caller's subset of the map, or the map's last list while it holds
+  // (the encoder's, say), each bound with its host count; else the
+  // compaction, recorded into this batch as this stage's "  ..compact", its
+  // count left on the device for the sizing, as record_extract's is.
   core::CommandBatch batch(*device_, *allocator_);
-  VKC_TRY(record_body(batch, grid, iso, *list.buffer, nullptr, list.count,
-                      list.count, nullptr, &stage, metrics, entry));
-  if (timings != nullptr) timings->arena_alloc_ms = clock.lap();
+  PhaseClock clock(timings != nullptr);
+  std::optional<volume::DeviceBlockList> listed;
+  if (blocks != nullptr) {
+    listed = *blocks;
+  } else {
+    listed = grid.map().held_device_list();
+  }
+  if (listed) {
+    VKC_TRY(record_body(batch, grid, iso, *listed->buffer, nullptr,
+                        listed->count, listed->count, nullptr, &stage, metrics,
+                        timings, entry));
+  } else {
+    volume::RecordedBlockList list;
+    {
+      core::GpuStageScope compact(metrics, gpu_timer_, "  ..compact");
+      VKC_ASSIGN(list, grid.map().record_compaction(batch, nullptr, &compact));
+    }
+    if (timings != nullptr) timings->compact_ms = clock.lap();
+    VKC_TRY(record_body(batch, grid, iso, *list.buffer, list.count,
+                        static_cast<std::uint32_t>(grid.grid().num_blocks),
+                        grid.map().allocated_blocks(), nullptr, &stage, metrics,
+                        timings, entry));
+  }
+  clock.restart();
   pending_signal_ = ++timeline_value_;
   const core::Status ran = [&]() -> core::Status {
     VKC_ASSIGN(core::PendingBatch pending,
@@ -1508,7 +1533,7 @@ core::Result<DeviceMesh> MarchingCubes::extract_device_impl(
     drop_pending();
     return ran;
   }
-  if (timings != nullptr) timings->dispatch_ms = clock.lap();
+  if (timings != nullptr) timings->dispatch_ms += clock.lap();
   // A gate-less extract always ends with a mesh.
   VKC_ASSIGN(std::optional<DeviceMesh> mesh,
              finish_pending(grid, timings, metrics, entry));

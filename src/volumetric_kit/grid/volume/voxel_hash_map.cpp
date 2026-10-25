@@ -1004,7 +1004,9 @@ core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
     core::StageMetrics* metrics, const char* row) {
   // Above the row: a list that still holds is no compaction, so none is
   // reported.
-  if (valid() && holds(last_device_list_)) return last_device_list_;
+  if (const std::optional<DeviceBlockList> held = held_device_list()) {
+    return *held;
+  }
   core::GpuStageScope stage(metrics, gpu_timer_,
                             row != nullptr ? row : active_set_row(metrics));
   if (!valid()) {
@@ -1015,6 +1017,11 @@ core::Result<DeviceBlockList> VoxelHashMap::compact_active_blocks_on_device(
              compact_into_device_list(nullptr, &stage));
   last_device_list_ = DeviceBlockList{&compacted_, count, topology_epoch_,
                                       compaction_serial_, heap_free_};
+  return last_device_list_;
+}
+
+std::optional<DeviceBlockList> VoxelHashMap::held_device_list() const noexcept {
+  if (!valid() || !holds(last_device_list_)) return std::nullopt;
   return last_device_list_;
 }
 

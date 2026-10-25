@@ -55,11 +55,10 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 /// on each call, so one instance may be reused across frames without carrying
 /// a previous call's numbers forward.
 ///
-/// The spans are **wall-clock**, and the GPU ones are end-to-end: the dispatch
-/// goes through `Device::submit_single_time`, which blocks on a fence, so
-/// @ref dispatch_ms covers host record *plus* device execution rather than
-/// either alone. The device's own time is the stage rows' (`StageMetrics`,
-/// @ref MarchingCubes::extract_device's `metrics`).
+/// The spans are **wall-clock**, and the GPU ones are end-to-end: the call
+/// waits on its submit, so @ref dispatch_ms covers host record *plus* device
+/// execution rather than either alone. The device's own time is the stage
+/// rows' (`StageMetrics`, @ref MarchingCubes::extract_device's `metrics`).
 ///
 /// Meshing covers the active set or a listed subset of it, and the buffers are
 /// fitted to the surface rather than to the 5-triangles-per-cell ceiling, so
@@ -69,22 +68,25 @@ inline constexpr std::uint32_t kIndicesPerTriangle = 3;
 /// fill ratio), @ref dispatches says whether the call had to refit and re-run,
 /// and @ref arena_bytes is what the extractor is holding across the whole ring.
 struct ExtractTimings {
-  /// Compacting the hash map's active block list on the device, near zero
-  /// when the map's last device list still holds, and 0 for a list the caller
-  /// compacted.
+  /// Recording the compaction of the hash map's active block list, which runs
+  /// in @ref dispatch_ms's submit (its device time is the `"  ..compact"`
+  /// row); 0 while the map's last device list still holds, and for a list
+  /// the caller compacted.
   double compact_ms = 0.0;
-  /// Sizing the vertex arena + recording the draw command's reset, which runs
-  /// in @ref dispatch_ms's submit, including a refit after an undersized guess
-  /// (see @ref dispatches). A grow of the unshared index run submits its
-  /// identity here, on its own. Near zero once the
-  /// retained arena already fits the call -- the steady state, since the arena
-  /// is reused across extracts (see @ref MarchingCubes).
+  /// Sizing the output buffers -- the vertex arena and the index run -- for
+  /// the plan, and again for a refit after an undersized guess (see
+  /// @ref dispatches). A grow of the unshared index run submits its identity
+  /// here, on its own. Near zero once the retained arena already fits the
+  /// call -- the steady state, since the arena is reused across extracts (see
+  /// @ref MarchingCubes).
   double arena_alloc_ms = 0.0;
-  /// Writing the kernel's descriptor bindings.
+  /// Writing the kernels' descriptor bindings and claiming the result slot,
+  /// a refit's bindings included.
   double descriptor_ms = 0.0;
-  /// The submit and its wait: the sizing, the marching cubes and the finalize
-  /// -- and a refit's too, summed, when one ran (@ref dispatches). Zero for
-  /// @ref MarchingCubes::finish without a refit, whose submit is the caller's.
+  /// Recording the sizing, the marching cubes and the finalize, then the
+  /// submit and its wait -- and a refit's too, summed, when one ran
+  /// (@ref dispatches). Zero for @ref MarchingCubes::finish without a refit,
+  /// whose batch is the caller's.
   double dispatch_ms = 0.0;
   /// Getting the result back to the caller: the vertex copy into the host mesh
   /// when one is made. @ref MarchingCubes::extract_host makes one; @ref
@@ -573,11 +575,12 @@ class VR_MESH_API MarchingCubes {
   /// would retire slots another `Device`Mesh is still drawn from). Every
   /// `Device`Mesh this hands out is the caller's to release.
   ///
-  /// It binds the map's device list with its host count -- the list the last
-  /// compaction left while it still holds, so the encoder after an extract
-  /// reuses it -- then records what @ref record_extract records after its
-  /// compaction, submits it once setting the signal, waits, and finishes as
-  /// @ref finish does: one submit where there were two or three.
+  /// It binds the map's last device list with its host count while that
+  /// still holds (@ref volume::VoxelHashMap::held_device_list), and otherwise
+  /// records the compaction as @ref record_extract does; then it records what
+  /// @ref record_extract records after its compaction, submits it once
+  /// setting the signal, waits, and finishes as @ref finish does: one submit
+  /// where there were two or three.
   ///
   /// @param grid  As @ref extract_host.
   /// @param iso   As @ref extract_host.
@@ -588,12 +591,10 @@ class VR_MESH_API MarchingCubes {
   ///                 row with its host, wait and device halves -- the whole
   ///                 call -- over the breakdown rows of the phases
   ///                 @ref ExtractTimings names alike: `"  ..compact"`, the
-  ///                 compaction, when the map's last list no longer holds:
-  ///                 @ref volume::VoxelHashMap::compact_active_blocks_on_device
-  ///                 -- `"  ..dispatch"`, the submit: the sizing, the
-  ///                 marching cubes and the finalize -- and `"  ..refit"`, a
-  ///                 refit's. `nullptr` measures nothing, writes no timestamp
-  ///                 and makes no timer.
+  ///                 compaction, when the map's last list no longer holds --
+  ///                 `"  ..dispatch"`: the sizing, the marching cubes and the
+  ///                 finalize -- and `"  ..refit"`, a refit's. `nullptr`
+  ///                 measures nothing, writes no timestamp and makes no timer.
   /// @return A `Device`Mesh **borrowing** this extractor's buffers -- valid
   ///         only until the next extract on this object, which overwrites them
   ///         -- or the same failures @ref extract_host reports (including its
@@ -706,7 +707,8 @@ class VR_MESH_API MarchingCubes {
   /// @param pending  From this extractor's last @ref record_extract.
   /// @param grid     The grid it recorded.
   /// @param timings  As @ref extract_device.
-  /// @param metrics  Optional: a refit's `"  ..refit"` row.
+  /// @param metrics  Optional: this call's host time on the
+  ///                 `"marching cubes"` row, over a refit's `"  ..refit"`.
   /// @return The mesh; `std::nullopt` when the gate was 0, the slot back
   ///         unpublished as by @ref abandon; `Status::Code::InvalidArgument`
   ///         for a pending this extractor no longer holds, a batch that did
@@ -718,7 +720,8 @@ class VR_MESH_API MarchingCubes {
 
   /// @brief Drop @p pending unpublished (its frame was refused, or is meshed
   ///        again), freeing its slot for the next extract.
-  /// @param pending  From this extractor; one it no longer holds is ignored.
+  /// @param pending  From this extractor; one it no longer holds, or another
+  ///                 extractor's, is ignored.
   void abandon(const PendingExtract& pending) noexcept;
 
   /// @brief Copy a `Device`Mesh's live vertices + indices into a host
@@ -977,9 +980,9 @@ class VR_MESH_API MarchingCubes {
 
   // The blocking extract, with the public entry points differing only in
   // whether they hand it a caller's active set: the list -- @p blocks, or the
-  // map's, compacted when its last no longer holds -- with its host count,
-  // then record_body, one submit setting the next timeline value, a wait,
-  // and finish.
+  // map's last while it holds, with its host count, or else a compaction
+  // recorded into the same batch -- then record_body, one submit setting the
+  // next timeline value, a wait, and finish.
   //
   // @p entry is the public name to report failures under -- the only thing
   // about the caller this function keeps, and it keeps it because a diagnostic
@@ -999,15 +1002,14 @@ class VR_MESH_API MarchingCubes {
   // @p metrics' `"  ..dispatch"` -- after the claim, and keep what finish
   // needs as the pending extract. The count is the word of @p count_buffer,
   // or @p bound itself when it is null; the arena is planned for
-  // @p expected_blocks, a grow's identity fill tagged with @p stage.
-  core::Status record_body(core::CommandBatch& batch,
-                           volume::VoxelBlockGrid& grid, float iso,
-                           const core::Buffer& list,
-                           const core::Buffer* count_buffer,
-                           std::uint32_t bound, std::uint32_t expected_blocks,
-                           const volume::DeviceCount* gate,
-                           core::GpuStageScope* stage,
-                           core::StageMetrics* metrics, const char* entry);
+  // @p expected_blocks, a grow's identity fill tagged with @p stage. Fills
+  // @p timings' sizing, bindings and recording.
+  core::Status record_body(
+      core::CommandBatch& batch, volume::VoxelBlockGrid& grid, float iso,
+      const core::Buffer& list, const core::Buffer* count_buffer,
+      std::uint32_t bound, std::uint32_t expected_blocks,
+      const volume::DeviceCount* gate, core::GpuStageScope* stage,
+      core::StageMetrics* metrics, ExtractTimings* timings, const char* entry);
 
   // Drop the pending extract unpublished.
   void drop_pending() noexcept;

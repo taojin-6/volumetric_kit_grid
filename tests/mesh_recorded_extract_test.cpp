@@ -4,25 +4,29 @@
 // GPU test for an extract recorded into a caller's batch
 // (MarchingCubes::record_extract, finish and abandon): the mesh is
 // extract_device's, sharing on and off; a surface past the plan refits, its
-// mesh ready at a later value; a closed gate gives no mesh and its slot back;
-// an empty set meshes nothing; abandoned and dropped extracts never exhaust the
-// slots; a batch that skipped the signal, or a pending superseded, is refused;
-// `ready` names a value reached, and outlives a move of the extractor; a
-// steady extract costs one submit and no staging buffer, recorded or blocking;
-// and a grid the sharing kernel cannot hold is refused with nothing recorded.
-// Skips with no device.
+// mesh ready at a later value, its row a breakdown of the finish's; a closed
+// gate gives no mesh and its slot back; an empty set meshes nothing; abandoned
+// and dropped extracts never exhaust the slots; a batch that skipped the
+// signal, or a pending superseded, is refused, and another extractor's token
+// is not abandoned; `ready` names a value reached, and outlives a move of the
+// extractor; a steady extract costs one submit and no staging buffer,
+// recorded or blocking, after a grid change too; and a grid the sharing
+// kernel cannot hold is refused with nothing recorded. Skips with no device.
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "device_blocks.hpp"
 #include "grid_readback.hpp"
+#include "stage_rows.hpp"
 #include "test_check.hpp"
+#include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -122,6 +126,8 @@ std::vector<std::array<float, 9>> triangles(const mesh::Mesh& m) {
   return out;
 }
 
+using vr_test::find_row;
+
 vkc::Result<mesh::MarchingCubes> make_mc(vr_test::Gpu& gpu, bool share = false,
                                          std::uint32_t slots = 1) {
   mesh::MarchingCubesConfig config;
@@ -208,10 +214,15 @@ int refit_case(vr_test::Gpu& gpu) {
       batch.submit_async({}, {pending->signal});
   CHECK(ran.ok() && ran->wait().ok());
   mesh::ExtractTimings timings;
+  vkc::StageMetrics m;
   vkc::Result<std::optional<mesh::DeviceMesh>> got =
-      b->finish(*pending, *grid, &timings);
+      b->finish(*pending, *grid, &timings, &m);
   CHECK(got.ok() && got->has_value());
   CHECK(timings.dispatches == 2);
+  // The refit's row is a breakdown of the call's "marching cubes".
+  CHECK(find_row(m, "  ..refit") != nullptr);
+  CHECK(m.rows().front().name == std::string("marching cubes"));
+  CHECK(vr_test::breakdowns_nest(m));
   CHECK((*got)->ready.value > pending->signal.value);
   CHECK((*got)->ready.semaphore->value().value() >= (*got)->ready.value);
   CHECK((*got)->triangle_count == want->triangle_count);
@@ -308,6 +319,26 @@ int slots_case(vr_test::Gpu& gpu) {
   vkc::Result<std::optional<mesh::DeviceMesh>> after =
       recorded(gpu, *mc, *grid, n);
   CHECK(after.ok() && after->has_value());
+
+  // Another extractor's token of the same generation is not this one's.
+  vkc::Result<mesh::MarchingCubes> mine = make_mc(gpu);
+  vkc::Result<mesh::MarchingCubes> other = make_mc(gpu);
+  CHECK(mine.ok() && other.ok());
+  mesh::PendingExtract tokens[2];
+  for (int i = 0; i < 2; ++i) {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vkc::Result<mesh::PendingExtract> p =
+        (i == 0 ? *mine : *other).record_extract(batch, *grid, n);
+    CHECK(p.ok());
+    tokens[i] = *p;
+    vkc::Result<vkc::PendingBatch> ran = batch.submit_async({}, {p->signal});
+    CHECK(ran.ok() && ran->wait().ok());
+  }
+  CHECK(tokens[0].generation == tokens[1].generation);
+  mine->abandon(tokens[1]);  // ignored
+  vkc::Result<std::optional<mesh::DeviceMesh>> kept =
+      mine->finish(tokens[0], *grid);
+  CHECK(kept.ok() && kept->has_value());
   return 0;
 }
 
@@ -331,8 +362,10 @@ int move_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
-// Once warm, an extract costs one submit and no staging buffer: recorded, and
-// blocking while the map's last list holds.
+// Once warm, an extract costs one submit and no staging buffer: recorded;
+// blocking after a grid change, its compaction in that submit; and blocking
+// while the map's last list holds, which it binds, compacting nothing and
+// leaving the list holding.
 int counters_case(vr_test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu);
@@ -350,14 +383,43 @@ int counters_case(vr_test::Gpu& gpu) {
   }
   vkc::Result<mesh::MarchingCubes> blocking = make_mc(gpu);
   CHECK(blocking.ok());
-  for (int frame = 0; frame < 3; ++frame) {
+  for (int frame = 0; frame < 4; ++frame) {
+    // An unobserved block far from the sphere: the grid changes, its mesh
+    // does not.
+    vol::BlockIndex extra{};
+    extra.coord = vr::Vec3i(20 + frame, 0, 0);
+    CHECK(vr_test::allocate_blocks(gpu, grid->map(), {extra}).value() == 0);
+    CHECK(!grid->map().held_device_list().has_value());
+    vkc::StageMetrics m;
+    mesh::ExtractTimings t;
     const vkc::DeviceCounters before = gpu.device.counters();
-    vkc::Result<mesh::DeviceMesh> got = blocking->extract_device(*grid);
+    vkc::Result<mesh::DeviceMesh> got =
+        blocking->extract_device(*grid, 0.0f, &t, &m);
     const vkc::DeviceCounters after = gpu.device.counters();
     CHECK(got.ok() && got->triangle_count > 100);
+    CHECK(find_row(m, "  ..compact") != nullptr);
+    CHECK(t.compact_ms > 0.0 && t.descriptor_ms > 0.0 && t.dispatch_ms > 0.0);
     if (frame == 0) continue;
     CHECK(after.submits - before.submits == 1);
     CHECK(after.staging_buffers - before.staging_buffers == 0);
+    CHECK(after.host_waits - before.host_waits == 1);
+  }
+  vkc::Result<vol::DeviceBlockList> held =
+      grid->map().compact_active_blocks_on_device();
+  CHECK(held.ok());
+  for (int frame = 0; frame < 2; ++frame) {
+    vkc::StageMetrics m;
+    mesh::ExtractTimings t;
+    const vkc::DeviceCounters before = gpu.device.counters();
+    vkc::Result<mesh::DeviceMesh> got =
+        blocking->extract_device(*grid, 0.0f, &t, &m);
+    const vkc::DeviceCounters after = gpu.device.counters();
+    CHECK(got.ok() && got->triangle_count > 100);
+    CHECK(find_row(m, "  ..compact") == nullptr && t.compact_ms == 0.0);
+    CHECK(t.descriptor_ms > 0.0);
+    CHECK(after.submits - before.submits == 1);
+    CHECK(after.staging_buffers - before.staging_buffers == 0);
+    CHECK(grid->map().check_device_block_list(*held, "test").ok());
   }
   return 0;
 }
