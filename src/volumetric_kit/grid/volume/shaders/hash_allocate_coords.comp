@@ -5,7 +5,9 @@
 // machinery (hash_allocate_common.glsl): a lock-free existence check, then a
 // bucket-locked insert into the primary bucket or, when it is full, the
 // collision overflow chain, drawing a free block from the heap. Failed
-// allocations bump fail_count by reason so the host can grow the table + retry.
+// allocations bump fail_count by reason, which hash_rounds.comp reads to run
+// another round or close the caller's gate. One of a recorded allocation's
+// rounds, a slice at a time (VoxelHashMap::record_allocate).
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
@@ -17,10 +19,12 @@ layout(local_size_x = 256) in;
 layout(set = 0, binding = 4, scalar) readonly buffer Coords {
   BlockIndex coords[];
 };
+// hash_rounds.comp's state: the count at word pc.arg.
+layout(set = 0, binding = 7) readonly buffer Rounds { uint rounds_state[]; };
 
 void main() {
-  uint gid = gl_GlobalInvocationID.x;
-  if (gid >= pc.arg) {  // pc.arg = input coord count
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
+  if (gid >= rounds_state[pc.arg]) {
     return;
   }
   report_alloc_fail(allocate_block(coords[gid].coord));

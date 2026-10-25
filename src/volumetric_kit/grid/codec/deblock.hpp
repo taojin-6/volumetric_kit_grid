@@ -42,8 +42,9 @@
 ///
 /// On the device: a first kernel, an invocation a frame block, sets the flag
 /// by slot of each fully observed block, the rest zeroed before it, and
-/// counts the masked blocks, read back into @ref Deblock::record's `exact`.
-/// Then one 64-lane workgroup per frame block in every kernel, which returns
+/// counts the masked blocks into @ref Deblock::exact, for the decoder's
+/// results. Then one 64-lane workgroup per frame block in every kernel, which
+/// returns
 /// at once for a block its own mask words mark masked. The line passes run in
 /// place on `tsdf`, a dispatch an axis: a voxel lies on at most one line of a
 /// pass, read before it is written. The Gaussian is one fused kernel per
@@ -68,6 +69,7 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
@@ -162,25 +164,25 @@ class VR_CODEC_API Deblock {
                        const DeblockPasses& passes);
 
   /// @brief Record @p passes over @p frame's blocks into @p batch, after the
-  ///        writes they read (the inverse transform's); the caller submits.
+  ///        writes they read (the inverse transform's), each kernel over its
+  ///        slices, which the device sized and gated; the caller submits.
   ///
   /// @p frame must name every block @p grid holds, each once, as a decode
   /// leaves them: a block it lacks reads as masked, and one it names twice
   /// races. Its order and `ptr`s are ignored. Records nothing for passes
-  /// that run nothing or no blocks. The readback of the masked blocks' count
-  /// comes last, after the passes.
-  /// @param batch  The batch to record into; submitted by the caller.
-  /// @param grid   The grid, its `tsdf` filtered in place; 4-byte `tsdf` and
-  ///               `weight`, `block_size` 8.
-  /// @param frame  The frame's list and masks, by list position, as the
-  ///               reference store holds them; no reference entries.
-  /// @param passes The filter.
-  /// @param exact  The blocks the deblock leaves as decoded: the frame's
-  ///               masked blocks, written at submit when the passes run, and
-  ///               every block of @p frame, set here, when they run nothing;
-  ///               must outlive the submit.
-  /// @param stage  Optional scope the dispatches record their device spans
-  ///               into.
+  /// that run nothing or no blocks; @ref exact then holds nothing the frame
+  /// needs, since every block is left as decoded.
+  /// @param batch   The batch to record into; submitted by the caller.
+  /// @param grid    The grid, its `tsdf` filtered in place; 4-byte `tsdf` and
+  ///                `weight`, `block_size` 8.
+  /// @param frame   The frame's list and masks, by list position, as the
+  ///                reference store holds them; no reference entries.
+  /// @param passes  The filter.
+  /// @param blocks  The passes' slices, a workgroup a block, for @p frame's
+  ///                count.
+  /// @param flags   The flags kernel's, a workgroup 64 blocks.
+  /// @param stage   Optional scope the dispatches record their device spans
+  ///                into.
   /// @return OK, or, before anything is recorded,
   ///         `Status::Code::InvalidArgument` for a grid of another block
   ///         size or without float `tsdf` and `weight`, a pass without a
@@ -190,8 +192,16 @@ class VR_CODEC_API Deblock {
   ///         `maxStorageBufferRange`.
   core::Status record(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
                       const ResidentBlocks& frame, const DeblockPasses& passes,
-                      std::uint32_t& exact,
+                      const recon::detail::IndirectSlices& blocks,
+                      const recon::detail::IndirectSlices& flags,
                       core::GpuStageScope* stage = nullptr);
+
+  /// @return The blocks the last @ref record's passes left as decoded, the
+  ///         frame's masked blocks, a u32, once its batch ran.
+  const core::Buffer& exact() const noexcept { return exact_; }
+
+  /// The flags kernel's blocks a workgroup (`kLanes` in deblock_common.glsl).
+  static constexpr std::uint32_t kFlagLanes = 64;
 
  private:
   Deblock() = default;
@@ -199,7 +209,6 @@ class VR_CODEC_API Deblock {
   // Borrowed (must outlive this).
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
-  std::uint32_t max_workgroup_count_x_ = 0;
   VkDeviceSize max_storage_buffer_range_ = 0;
 
   // One layout for the four (deblock_common.glsl); declared before pool_,

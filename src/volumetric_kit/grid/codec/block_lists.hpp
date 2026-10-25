@@ -51,7 +51,8 @@ namespace volumetric_kit::recon::codec::detail {
 /// @ref record_diff finds what the grid must lose and gain without sorting
 /// it: a grid block whose coordinate a search of the frame misses is gone,
 /// and a frame block the hash table does not hold is missing. Both record
-/// into the decode's batch and read back their findings, 16 bytes.
+/// into the decode's batch and leave their findings on the device
+/// (@ref collision, @ref diff_counts), for the decoder's gate and results.
 ///
 /// Every buffer is device-local and retained, grown as a call needs
 /// (`ensure_device_scratch`).
@@ -70,17 +71,6 @@ class VR_CODEC_API BlockLists {
   BlockLists& operator=(const BlockLists&) = delete;
   BlockLists(BlockLists&&) = delete;
   BlockLists& operator=(BlockLists&&) = delete;
-
-  /// @brief What @ref record_merge and @ref record_diff found, read back
-  ///        when their batch ran.
-  struct Verdict {
-    /// Row 13: the first new block on a reference entry, and that entry;
-    /// @ref kNoSource for none.
-    std::uint32_t collision_q = kNoSource;
-    std::uint32_t collision_e = kNoSource;
-    std::uint32_t gone = 0;     ///< Entries of @ref gone.
-    std::uint32_t missing = 0;  ///< Entries of @ref missing.
-  };
 
   /// @brief Record a stable sort of the first @p n `volume::BlockIndex`
   ///        entries of @p list, by @ref coord_less, into @p batch.
@@ -154,15 +144,19 @@ class VR_CODEC_API BlockLists {
                            const core::Buffer& frame_list, std::uint32_t n,
                            core::GpuStageScope* stage = nullptr);
 
-  /// @return What the last batch's merge and diff found, once it ran.
-  Verdict verdict() const noexcept {
-    return Verdict{found_[0], found_[1], found_[2], found_[3]};
-  }
+  /// @return Row 13's finding once the last merge's batch ran: the first new
+  ///         block on a reference entry, and that entry, a u32 each;
+  ///         @ref kNoSource for none.
+  const core::Buffer& collision() const noexcept { return collision_; }
+  /// @return The last diff's counts once its batch ran: the grid blocks
+  ///         @ref gone lists, then the frame blocks @ref missing lists, a u32
+  ///         each.
+  const core::Buffer& diff_counts() const noexcept { return diff_counts_; }
   /// @return The grid blocks the last diff found the frame lacks, the first
-  ///         @ref Verdict::gone of them.
+  ///         `diff_counts()[0]` of them.
   const core::Buffer& gone() const noexcept { return gone_; }
   /// @return The frame blocks the last diff found the grid lacks, the first
-  ///         @ref Verdict::missing of them.
+  ///         `diff_counts()[1]` of them.
   const core::Buffer& missing() const noexcept { return missing_; }
 
  private:
@@ -186,15 +180,12 @@ class VR_CODEC_API BlockLists {
 
   // Device-local, retained: the sort's two halves, which its levels
   // ping-pong between; the diff's lists; and the merge's collision and the
-  // diff's counts, which come back.
+  // diff's counts.
   core::Buffer sorted_[2];
   core::Buffer gone_;
   core::Buffer missing_;
   core::Buffer collision_;
   core::Buffer diff_counts_;
-  // What the last batch read back: collision_'s two words, then
-  // diff_counts_'s.
-  std::uint32_t found_[4] = {kNoSource, kNoSource, 0, 0};
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

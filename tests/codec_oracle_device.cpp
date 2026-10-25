@@ -14,6 +14,7 @@
 #include "codec_frames.hpp"
 #include "codec_oracle_encode.hpp"
 #include "grid_readback.hpp"
+#include "host_slices.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 
@@ -202,12 +203,17 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
     r.list = std::make_unique<vkc::Buffer>(std::move(list));
     r.blocks.list = r.list.get();
   }
+  VKC_ASSIGN(const vr_test::HostSlices slices,
+             vr_test::host_slices(gpu, r.blocks.count, 1));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_TRY(t.record_inverse(batch, grid, r.blocks, in.params));
-  std::uint32_t rejected = 0;
-  VKC_TRY(t.record_rejected(batch, rejected));
+  VKC_TRY(t.record_steps(batch, in.params));
+  VKC_TRY(t.record_inverse(batch, grid, r.blocks, in.params, slices.slices()));
   VKC_TRY(batch.submit());
-  return d::DctTransform::check_rejected("inverse", rejected, r.blocks.count);
+  VKC_ASSIGN(const std::vector<std::uint32_t> rejected,
+             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                               t.rejected(), 1));
+  return d::DctTransform::check_rejected("inverse", rejected[0],
+                                         r.blocks.count);
 }
 
 namespace {

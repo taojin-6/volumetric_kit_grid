@@ -11,11 +11,12 @@
 # and back), the rANS tables (rans.hpp, header-only), the frame's layout,
 # parsing and checks (bitstream.cpp; the 2026-09-27 decisions), its device
 # coders and their step layout (step_layout.cpp), the block lists' sort, merge
-# and grid diff (block_lists.cpp), and the reference a P-frame is coded and
-# decoded against (reference_store.cpp). Links recon_volume ALONE -- it reads a
-# grid's tsdf/weight and re-creates blocks through the map, and needs neither
-# the integrator that produced the field nor the mesher that consumes the
-# decoded one.
+# and grid diff (block_lists.cpp), the reference a P-frame is coded and decoded
+# against (reference_store.cpp), and the decoder's gate and results on the
+# device (frame_gate.cpp). Links recon_volume ALONE -- it reads a grid's
+# tsdf/weight and re-creates blocks through the map, and needs neither the
+# integrator that produced the field nor the mesher that consumes the decoded
+# one.
 include(GenerateExportHeader)
 
 set(_vr_codec_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
@@ -35,6 +36,7 @@ target_sources(
           device_frame_reader.cpp
           device_frame_writer.cpp
           encoder.cpp
+          frame_gate.cpp
           frame_hash.cpp
           reference_store.cpp
           step_layout.cpp)
@@ -92,7 +94,9 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_gauss.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_line.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_store.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_gate.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_merge.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_results.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_diff.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_apply.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_diff.comp"

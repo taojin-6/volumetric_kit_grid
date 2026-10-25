@@ -49,11 +49,13 @@ layout(set = 0, binding = 4, scalar) readonly buffer Coords {
   BlockIndex coords[];
 };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
-// One flag per coord, zeroed by the host before the first round.
+// One flag per coord, zeroed before the first round.
 layout(set = 0, binding = 6) buffer Done { uint done[]; };
 layout(set = 0, binding = 7, scalar) writeonly buffer Stamps {
   BlockStamp stamps[];
 };
+// hash_rounds.comp's state: the count at word pc.arg.
+layout(set = 0, binding = 8) readonly buffer Rounds { uint rounds_state[]; };
 
 // --- helpers (the allocate kernel has its own lock copies) ---
 
@@ -76,8 +78,8 @@ void unlock_bucket(uint bucket) {
 // Return a freed block index to the heap. A full heap is reported through
 // kFailTerminal, NOT kFailTotal, because it is not retryable: the entry was
 // cleared from the table before we got here, so a re-dispatch of the same
-// coord list finds it absent and counts nothing. The host accumulates this
-// slot across rounds instead (see VoxelHashMap::dispatch_with_retry).
+// coord list finds it absent and counts nothing. hash_rounds.comp accumulates
+// this slot across rounds instead.
 void free_block(uint block_idx) {
   // The slot's stamps go with its block, so the next block drawn there is
   // stamped afresh.
@@ -152,8 +154,8 @@ bool delete_linked_list(uint target_idx, uint prev_idx, uint hash_bucket) {
 }
 
 void main() {
-  uint gid = gl_GlobalInvocationID.x;
-  if (gid >= pc.arg || done[gid] != 0u) {
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
+  if (gid >= rounds_state[pc.arg] || done[gid] != 0u) {
     return;
   }
   ivec3 coord = coords[gid].coord;

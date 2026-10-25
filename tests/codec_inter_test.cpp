@@ -40,6 +40,7 @@
 #include "codec_oracle_encode.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_writer.hpp"
+#include "host_slices.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
@@ -130,6 +131,26 @@ std::vector<vr::Vec3i> held_coords(Gpu& gpu, const d::ReferenceStore& store) {
   return out;
 }
 
+// @p store's apply of @p n blocks into @p batch, a group a block, over slices
+// the host writes where the decoder sizes them on the device; @p held keeps
+// them until the batch is submitted.
+vkc::Result<d::ResidentBlocks> record_apply(Gpu& gpu, d::ReferenceStore& store,
+                                            vkc::CommandBatch& batch,
+                                            const d::ResidentBlocks& payload,
+                                            std::uint32_t n,
+                                            vr_test::HostSlices& held) {
+  VKC_ASSIGN(held, vr_test::host_slices(gpu, std::max(n, 1u), 1));
+  return store.record_apply(batch, payload, n, held.slices());
+}
+
+// The last apply's faults once its batch ran, as the decoder judges them.
+vkc::Status apply_faults(Gpu& gpu, const d::ReferenceStore& store) {
+  VKC_ASSIGN(const std::vector<std::uint32_t> faults,
+             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                               store.faults(), 1));
+  return d::ReferenceStore::check_faults(faults[0]);
+}
+
 // The spare as the last apply left it, unpacked: each block's payload, and
 // whether every odd K's pad half was written 0.
 struct Applied {
@@ -202,10 +223,11 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
   vkc::Result<Resident> up = resident(gpu, r);
   CHECK(up.ok());
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  vkc::Result<d::ResidentBlocks> spare =
-      store.record_apply(batch, up.value().blocks, std::uint32_t(m));
+  vr_test::HostSlices slices;
+  vkc::Result<d::ResidentBlocks> spare = record_apply(
+      gpu, store, batch, up.value().blocks, std::uint32_t(m), slices);
   CHECK(spare.ok());
-  CHECK(batch.submit().ok() && store.check_apply().ok());
+  CHECK(batch.submit().ok() && apply_faults(gpu, store).ok());
   vkc::Result<Applied> got = read_spare(gpu, spare.value());
   CHECK(got.ok() && got.value().pads_zero);
   for (std::size_t i = 0; i < m; ++i) {
@@ -261,10 +283,11 @@ int apply_case(Gpu& gpu) {
     d::ResidentBlocks entries = up.value().blocks;
     entries.reference_count = std::uint32_t(m);
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    vkc::Result<d::ResidentBlocks> spare =
-        store.record_apply(batch, entries, std::uint32_t(sources.size()));
+    vr_test::HostSlices slices;
+    vkc::Result<d::ResidentBlocks> spare = record_apply(
+        gpu, store, batch, entries, std::uint32_t(sources.size()), slices);
     CHECK(spare.ok());
-    CHECK(batch.submit().ok() && store.check_apply().ok());
+    CHECK(batch.submit().ok() && apply_faults(gpu, store).ok());
     vkc::Result<Applied> got = read_spare(gpu, spare.value());
     CHECK(got.ok());
     CHECK(got.value().pads_zero);
@@ -324,10 +347,11 @@ int grow_case(Gpu& gpu) {
     d::ResidentBlocks entries = up.value().blocks;
     entries.reference_count = std::uint32_t(m);
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vr_test::HostSlices slices;
     vkc::Result<d::ResidentBlocks> spare =
-        store.record_apply(batch, entries, std::uint32_t(n));
+        record_apply(gpu, store, batch, entries, std::uint32_t(n), slices);
     CHECK(spare.ok());
-    CHECK(batch.submit().ok() && store.check_apply().ok());
+    CHECK(batch.submit().ok() && apply_faults(gpu, store).ok());
     vkc::Result<Applied> got = read_spare(gpu, spare.value());
     CHECK(got.ok() && got.value().coords == row_of(n));
     oracle::DctBlocks next;
@@ -341,9 +365,11 @@ int grow_case(Gpu& gpu) {
     // but never committed: nothing changes.
     const d::FrameReference before = *store.held();
     vkc::CommandBatch refused(gpu.device, gpu.allocator);
-    CHECK(store.record_apply(refused, entries, 2 * std::uint32_t(n))
-              .status()
-              .domain() == C::InvalidArgument);
+    vr_test::HostSlices unused;
+    CHECK(
+        record_apply(gpu, store, refused, entries, 2 * std::uint32_t(n), unused)
+            .status()
+            .domain() == C::InvalidArgument);
     CHECK(store.held()->hash == before.hash &&
           held_coords(gpu, store) == row_of(m));
     d::FrameReference id;
@@ -386,12 +412,13 @@ int apply_refusals_case(Gpu& gpu) {
     d::ResidentBlocks payload = up.value().blocks;
     payload.reference_count = m;
     payload.coefficient_count = k;
+    vr_test::HostSlices slices;
     vkc::Result<d::ResidentBlocks> r =
-        store.record_apply(batch, payload, blocks);
+        record_apply(gpu, store, batch, payload, blocks, slices);
     vkc::Status s = r.status();
     if (r.ok()) {
       s = batch.submit();
-      if (s.ok()) s = store.check_apply();
+      if (s.ok()) s = apply_faults(gpu, store);
     }
     return !s.ok() && s.domain() == C::InvalidArgument &&
            s.message().find(says) != std::string::npos;
@@ -406,7 +433,8 @@ int apply_refusals_case(Gpu& gpu) {
   CHECK(refused(std::vector<d::ApplySource>(4, {0, none}), 4, 8, 100,
                 "more than were reserved"));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  CHECK(store.record_apply(batch, d::ResidentBlocks{}, 1)
+  vr_test::HostSlices unused;
+  CHECK(record_apply(gpu, store, batch, d::ResidentBlocks{}, 1, unused)
             .status()
             .message()
             .find("no payload buffers") != std::string::npos);
@@ -417,8 +445,9 @@ int apply_refusals_case(Gpu& gpu) {
   d::ResidentBlocks payload = up.value().blocks;
   payload.reference_count = 4;
   vkc::CommandBatch clean(gpu.device, gpu.allocator);
-  CHECK(store.record_apply(clean, payload, 1).ok());
-  CHECK(clean.submit().ok() && store.check_apply().ok());
+  vr_test::HostSlices slices;
+  CHECK(record_apply(gpu, store, clean, payload, 1, slices).ok());
+  CHECK(clean.submit().ok() && apply_faults(gpu, store).ok());
   return 0;
 }
 

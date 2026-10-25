@@ -78,7 +78,7 @@ static_assert(kMaskWordsPerBlock == 16, "deblock_common.glsl's kMaskWords");
 
 // The workgroup width of every kernel (kLanes in deblock_common.glsl): the
 // flags kernel's blocks a workgroup.
-constexpr std::uint32_t kLanes = 64;
+static_assert(Deblock::kFlagLanes == 64, "deblock_common.glsl's kLanes");
 
 // |v| at or above this is the clamp's kink, where a line is not fitted.
 constexpr float kSaturated = 1.0f - 1e-5f;
@@ -172,7 +172,6 @@ core::Result<std::unique_ptr<Deblock>> Deblock::create(
   VKC_ASSIGN(d.pool_, kb.build());
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
-  d.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   d.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
   // One slot's and one block's, so every call's binding names a buffer.
   VKC_TRY(core::ensure_device_scratch(device, allocator, d.full_, kFlagBytes,
@@ -208,10 +207,11 @@ core::Status Deblock::reserve(std::uint32_t n, std::uint32_t slots,
 core::Status Deblock::record(core::CommandBatch& batch,
                              volume::VoxelBlockGrid& grid,
                              const ResidentBlocks& frame,
-                             const DeblockPasses& passes, std::uint32_t& exact,
+                             const DeblockPasses& passes,
+                             const recon::detail::IndirectSlices& blocks,
+                             const recon::detail::IndirectSlices& flags,
                              core::GpuStageScope* stage) {
   const std::uint32_t n = frame.count;
-  exact = n;
   if ((!passes.linfit && !passes.gauss) || n == 0) {
     return {};
   }
@@ -307,18 +307,18 @@ core::Status Deblock::record(core::CommandBatch& batch,
   push.line_clip = passes.line_clip;
   push.gauss_g1 = passes.gauss_g1;
   push.gauss_clip = passes.gauss_clip;
-  // A workgroup a block, in as many dispatches as the device's group limit
-  // takes. The batch barriers every dispatch, so each pass sees all of the
-  // last one's writes, a chunk's included. The flags first, an invocation a
-  // block, over the zeroed flags and count.
+  // A workgroup a block, over the slices the device sized: none for a frame
+  // its gate refused, so such a frame writes no voxel and no stamp. The
+  // batch barriers every dispatch, so each pass sees all of the last one's
+  // writes, a slice's included. The flags first, an invocation a block, over
+  // the zeroed flags and count, which touch no grid buffer and stay ungated.
   const auto run = [&](const core::ComputeKernel& kernel) -> core::Status {
-    return recon::detail::dispatch_items(batch, kernel, push, n, 1,
-                                         max_workgroup_count_x_, stage);
+    return recon::detail::dispatch_slices(batch, kernel, push, blocks, stage);
   };
   VKC_TRY(batch.fill(full_, 0, full_bytes, 0u));
   VKC_TRY(batch.fill(exact_, 0, sizeof(std::uint32_t), 0u));
-  VKC_TRY(recon::detail::dispatch_items(batch, flags_kernel_, push, n, kLanes,
-                                        max_workgroup_count_x_, stage));
+  VKC_TRY(
+      recon::detail::dispatch_slices(batch, flags_kernel_, push, flags, stage));
   if (passes.linfit) {
     for (std::uint32_t axis = 0; axis < 3; ++axis) {
       push.axis = axis;
@@ -329,7 +329,7 @@ core::Status Deblock::record(core::CommandBatch& batch,
     VKC_TRY(run(gauss_kernel_));
     VKC_TRY(run(store_kernel_));
   }
-  return batch.readback(exact_, 0, sizeof(exact), &exact);
+  return {};
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

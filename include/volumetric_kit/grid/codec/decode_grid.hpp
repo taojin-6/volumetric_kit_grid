@@ -113,7 +113,8 @@ VR_CODEC_API core::Result<Finished> finish_growing(
 /// @brief @ref Decoder::decode @p frame into @p grid, growing the grid once
 ///        if the frame outgrows it.
 ///
-/// It is @ref record_growing, one submit and @ref finish_growing.
+/// It recovers as @ref record_growing and @ref finish_growing do, around one
+/// submit of its own.
 ///
 /// `Status::Code::OutOfMemory`, the decoder's word for a grid too small,
 /// grows @p grid once (@ref volume::grow_grid) to twice its buckets or the
@@ -134,10 +135,11 @@ VR_CODEC_API core::Result<Finished> finish_growing(
 /// @param grid        The grid to decode into, as @ref Decoder::decode takes
 ///                    it.
 /// @param max_blocks  The ceiling: the most blocks a frame may hold.
-/// @param metrics     Optional `StageMetrics` collecting the rows
-///                    @ref Decoder::decode gives, of the first attempt, and
-///                    a recovery's `"  ..grow"` or `"  ..retry"`. `nullptr`
-///                    measures nothing.
+/// @param metrics     Optional `StageMetrics` collecting, once the decode
+///                    succeeds, the rows @ref Decoder::decode gives for the
+///                    attempt that succeeded alone, and a recovery's
+///                    `"  ..grow"` or `"  ..retry"`. `nullptr` measures
+///                    nothing.
 /// @return OK; @ref read_frame_info's refusal of the header;
 ///         `Status::Code::InvalidArgument` for a frame or a grow past
 ///         @p max_blocks; the last decode's

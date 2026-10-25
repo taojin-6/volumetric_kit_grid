@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The decoder's gate (FrameGate::record_gate): one invocation that judges a
+// recorded frame on the device before the grid changes, so no verdict
+// reaches the host first. A decode's frame passes rows 11 to 13 -- no
+// segment failed, a P-frame's survivors are its N less its new blocks, and
+// no new block sits on a reference block; a rebuild's grid holds exactly the
+// frame's blocks. The gate word it writes gates every later grid write of the
+// batch: the removal's and the allocation's rounds close it on their own
+// failures, and the apply, the inverse, the deblock and an extract run no
+// groups behind a closed one.
+
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Verdict {
+  uint failed;  // the first failing segment, s << 2 | kind
+  uint survivors;
+};
+layout(set = 0, binding = 1) readonly buffer Collision {
+  uint collision_q;  // the first new block on a reference entry
+  uint collision_e;
+};
+layout(set = 0, binding = 2) readonly buffer DiffCounts {
+  uint gone;
+  uint missing;
+};
+layout(set = 0, binding = 3) writeonly buffer Gate { uint gate; };
+
+// detail::kNoVerdict and detail::kNoSource.
+const uint kNoVerdict = 0xFFFFFFFFu;
+const uint kNoSource = 0xFFFFFFFFu;
+
+layout(push_constant) uniform Push {
+  uint rebuild;    // 1 judges a rebuild's grid, 0 a decode's frame
+  uint inter;      // a P-frame
+  uint blocks;     // N
+  uint new_count;  // A
+}
+pc;
+
+void main() {
+  bool open;
+  if (pc.rebuild != 0u) {
+    open = gone == 0u && missing == 0u;
+  } else {
+    open = failed == kNoVerdict &&
+           (pc.inter == 0u || survivors + pc.new_count == pc.blocks) &&
+           collision_q == kNoSource;
+  }
+  gate = open ? 1u : 0u;
+}

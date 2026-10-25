@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -835,7 +836,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// non-zero, to converge past transient same-bucket lock contention, until
   /// a round has no lock failure or hits a capacity limit, or the rounds run
   /// out. Re-zeroes the tally
-  /// each round. The shared tail of every allocate/remove kernel.
+  /// each round. The host rounds of the depth, triangle and rehash
+  /// allocations; @ref allocate and @ref remove round on the device instead
+  /// (@ref record_rounds).
   /// The tally's non-retryable slot is accumulated across rounds and added to
   /// the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
@@ -864,22 +867,28 @@ class VR_VOLUME_API VoxelHashMap {
                                                const void* data,
                                                VkDeviceSize bytes);
 
-  /// Shared body of the per-element kernels (@ref allocate, @ref remove):
-  /// bind @p count elements of @p elem_size bytes at input binding (4) of
-  /// @p kernel's set, then run @p kernel over them (one thread per element)
-  /// via @ref dispatch_with_retry.
-  /// @p op names the caller for diagnostics. @p removes marks @ref remove: it
-  /// moves @ref topology_epoch once the input is accepted, and binds a zeroed
-  /// flag per element at binding 6 (@ref remove_done_), which the kernel sets
-  /// on each coord it finishes so later rounds skip it. @p first_round, when
-  /// set, records last into the first round's batch, ahead of the dispatch.
-  /// Every round's dispatch is tagged with @p stage.
-  core::Result<std::uint32_t> run_input_kernel(
-      const char* op, const core::StorageInput& input, std::size_t elem_size,
-      std::uint32_t count, const core::ComputeKernel& kernel,
-      AllocFailures* out_failures, core::GpuStageScope* stage,
-      bool removes = false,
-      const std::function<core::Status(core::CommandBatch&)>& first_round = {});
+  /// The body of @ref record_allocate and @ref record_remove (@p removes):
+  /// up to @p rounds rounds, each sized by the kind's `hash_rounds.comp`
+  /// from the tally the round before left, then its gather into a claimed
+  /// result slot. @p first_round, when set, records once nothing more can
+  /// refuse, ahead of the rounds. @p stale_lists makes every device list
+  /// compacted before stale now, for a recording settled later.
+  core::Result<RecordedRounds> record_rounds(
+      bool removes, core::CommandBatch& batch, const core::Buffer& coords,
+      const DeviceCount& count, const DeviceCount* gate,
+      core::GpuStageScope* stage,
+      const std::function<core::Status(core::CommandBatch&)>& first_round,
+      std::uint32_t rounds, bool stale_lists);
+
+  /// The body of @ref allocate and @ref remove: @ref record_rounds over
+  /// @p count, uploaded into @ref host_count_, one submit and @ref settle,
+  /// repeated while lost races alone remain, up to 10 rounds in all.
+  /// @p first_round records into the first submit's batch.
+  core::Result<std::uint32_t> run_rounds(
+      bool removes, const core::Buffer& coords, std::uint32_t count,
+      AllocFailures* out_failures,
+      const std::function<core::Status(core::CommandBatch&)>& first_round,
+      core::GpuStageScope* stage);
 
   /// Point every set at the persistent buffers (entries / heap / heap_counter /
   /// bucket_mutex / fail_counts / compacted / active_count); run at create and
@@ -917,8 +926,20 @@ class VR_VOLUME_API VoxelHashMap {
   // tracks num_blocks, so resize() grows it with the rest.
   core::Buffer fail_counts_;
   // remove's per-coord done flags, retained scratch grown to the largest
-  // count yet and re-zeroed per call.
+  // bound yet and re-zeroed per recording.
   core::Buffer remove_done_;
+  // The recorded rounds' state, four words a kind (removal first): the count
+  // the rounds read, whether the next round runs, the rounds run and the
+  // terminal failures (hash_rounds.comp). Grid-independent.
+  core::Buffer rounds_state_;
+  // Each kind's rounds' slices, kRecordedRounds rounds of a bound's, grown
+  // to the largest bound yet.
+  core::Buffer remove_slices_;
+  core::Buffer allocate_slices_;
+  // The blocking calls' count, uploaded ahead of their recording.
+  core::Buffer host_count_;
+  // The recordings' result slots, made by the first one (kResultSlots).
+  std::unique_ptr<core::HostRing> results_;
   core::Buffer compacted_;
   // The frustum compactions' output, so they leave compacted_'s list holding.
   core::Buffer frustum_compacted_;
@@ -935,8 +956,9 @@ class VR_VOLUME_API VoxelHashMap {
   // grid-independent.
   core::Buffer frustum_planes_;
   // The host's copy of heap_counter_, which load_factor() reads: set by
-  // init_table and the heap rebuild, and read back by every retry round, the
-  // only dispatches that move the counter. Copied by the defaulted move, and
+  // init_table and the heap rebuild, read back by every host retry round,
+  // and refreshed by settle() from the recorded rounds' result -- the only
+  // dispatches that move the counter. Copied by the defaulted move, and
   // harmlessly left on a moved-from map, whose load_factor() is refused.
   std::uint32_t heap_free_ = 0;
   // The last compact_active_blocks count, from which collect_compacted
@@ -981,6 +1003,10 @@ class VR_VOLUME_API VoxelHashMap {
   // draw), so per-voxel data survives a resize. Same 6-binding shape as
   // allocate_ (its input at binding 4 is BlockIndex{coord, ptr}, ptr read).
   core::ComputeKernel rehash_;
+  // hash_rounds.comp, one instance a kind, so a removal and an allocation
+  // recorded into one batch keep their own sets.
+  core::ComputeKernel remove_rounds_;
+  core::ComputeKernel allocate_rounds_;
   // The depth kernel's sets, one a frame of a call, so a round dispatches
   // several cameras in one batch; depth_.set goes unused. Grown to the most
   // frames a call has had; written whole each call, so a resize leaves none

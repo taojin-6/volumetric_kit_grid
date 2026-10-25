@@ -209,8 +209,9 @@ class VR_STREAM_API StreamReader {
   /// @param dst       Receives the payload, `record.size` bytes; unspecified
   ///                  after a failure.
   /// @param capacity  Bytes at @p dst.
-  /// @return OK; `Status::Code::InvalidArgument` for a null @p dst or a
-  ///         @p capacity under `record.size` (both before anything is read),
+  /// @return OK; `Status::Code::InvalidArgument` for a @p capacity under
+  ///         `record.size` or a null @p dst for a payload of any bytes (both
+  ///         before anything is read),
   ///         a payload failing its CRC, or a header no longer @p record 's;
   ///         or `Status::Code::IoError` for a read failure or a file shorter
   ///         than at open. A read that succeeds allocates nothing.

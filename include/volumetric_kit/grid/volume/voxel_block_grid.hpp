@@ -370,10 +370,13 @@ class VR_VOLUME_API VoxelBlockGrid {
   // Build the zeroing's and the block pass's kernels and count: once, at
   // create, for a grid with attributes.
   core::Status build_block_kernels();
-  // Record the zero kernel over the first `count` entries of `list`, an
-  // attribute a dispatch, each block found by its coord.
+  // Record the zero kernel over the first entries of `list`, an attribute a
+  // dispatch, each block found by its coord: `count` of them, or, with a
+  // device `words`, as many as its count says behind its gate, sized by
+  // recon's count-to-slices kernel.
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
-                           std::uint32_t count, core::GpuStageScope* stage);
+                           std::uint32_t count, const DeviceCount* words,
+                           const DeviceCount* gate, core::GpuStageScope* stage);
   // Every removal's body -- remove's and free_stale_blocks':
   // zero the first `count` blocks `list` names and free them through the
   // map, in the submit of the map's first round, each round tagged with
@@ -398,6 +401,10 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::ComputeKernel stamp_kernel_;
   core::ComputeKernel zero_kernel_;
   core::KernelSets zero_sets_;
+  // A recorded removal's zeroing, sized from the count on the device: recon's
+  // count-to-slices kernel and its slices.
+  core::ComputeKernel zero_args_kernel_;
+  core::Buffer zero_slices_;
   core::GpuTimer gpu_timer_;
   core::Buffer stale_list_;
   core::Buffer stale_count_;

@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// A recorded removal's or allocation's rounds, judged on the device
+// (VoxelHashMap::record_remove / record_allocate): one invocation before each
+// round sizes it, and one after the last gathers the outcome, so the rounds
+// run in one batch with no count reaching the host. Each kind has its own
+// instance, so a remove and an allocate in one batch keep their own sets.
+//
+// Round 0 takes the list's count, at most its bound and 0 behind a closed
+// gate, and clears the tally. Each later round reads the tally the round
+// before left, as VoxelHashMap's blocking loop always has: the non-retryable
+// slot accumulates, and the round runs only while the one before lost
+// bucket-lock races and met no capacity limit -- nothing frees a block or a
+// slot between rounds, so a capacity limit would fail again. A round that
+// does not run leaves the tally as the last that ran left it. The gather
+// writes that tally, the accumulated terminal failures, the rounds run and the
+// heap counter into the caller's result slot as one struct, and closes the
+// gate on any failure, so what is gated on it after the rounds runs nothing.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1) in;
+
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "hash_common.glsl"
+
+layout(set = 0, binding = 0) readonly buffer Counts { uint counts[]; };
+layout(set = 0, binding = 1) buffer Gates { uint gates[]; };
+layout(set = 0, binding = 2) buffer FailCount { uint fail_count[]; };
+// Per kind, from pc.state_word: the count the rounds read, whether the next
+// round runs, the rounds run, and the terminal failures so far.
+layout(set = 0, binding = 3) buffer State { uint state[]; };
+layout(set = 0, binding = 4) readonly buffer HeapCounter { uint heap_counter; };
+#define VR_SLICES_BINDING 5
+#include "volumetric_kit/recon/core/shaders/dispatch_slices.glsl"
+
+// Mirrors volume::detail::RoundsResult (hash.hpp).
+struct RoundsResult {
+  uint total;
+  uint lock;
+  uint chain;
+  uint heap;
+  uint table;
+  uint terminal;
+  uint rounds;
+  uint heap_free;
+};
+layout(set = 0, binding = 6, scalar) writeonly buffer Result {
+  RoundsResult result;
+};
+
+// A word index that names no word.
+const uint kNoWord = 0xFFFFFFFFu;
+// The kernels' workgroup width (hash_allocate_coords / hash_delete_coords).
+const uint kLanes = 256u;
+
+layout(push_constant, scalar) uniform Push {
+  uint count_word;  // the count's word in `counts`
+  uint gate_word;   // the gate's word in `gates`, or kNoWord for none
+  uint bound;       // the most the count holds
+  uint state_word;  // this kind's first word of `state`
+  uint round;       // the round this sizes, or `rounds` for the gather
+  uint rounds;      // the rounds recorded
+  uint per_dispatch;
+  uint dispatches;  // the slices a round takes
+}
+pc;
+
+void clear_tally() {
+  for (int i = 0; i < kFailSlots; ++i) fail_count[i] = 0u;
+}
+
+void main() {
+  const uint at = pc.state_word;
+  if (pc.round == 0u) {
+    uint count = min(counts[pc.count_word], pc.bound);
+    if (pc.gate_word != kNoWord && gates[pc.gate_word] == 0u) count = 0u;
+    state[at] = count;
+    state[at + 1u] = count != 0u ? 1u : 0u;
+    state[at + 2u] = 0u;
+    state[at + 3u] = 0u;
+    clear_tally();
+  } else if (state[at + 1u] != 0u) {
+    state[at + 2u] += 1u;
+    state[at + 3u] += fail_count[kFailTerminal];
+    const bool capacity = fail_count[kFailChain] != 0u ||
+                          fail_count[kFailHeap] != 0u ||
+                          fail_count[kFailTable] != 0u;
+    const bool again =
+        pc.round < pc.rounds && fail_count[kFailLock] != 0u && !capacity;
+    state[at + 1u] = again ? 1u : 0u;
+    if (again) clear_tally();
+  }
+  if (pc.round < pc.rounds) {
+    const uint groups = state[at + 1u] != 0u ? vrGroups(state[at], kLanes) : 0u;
+    vrWriteSlices(pc.round * pc.dispatches, pc.dispatches, pc.per_dispatch,
+                  groups);
+    return;
+  }
+  const uint terminal = state[at + 3u];
+  result = RoundsResult(fail_count[kFailTotal], fail_count[kFailLock],
+                        fail_count[kFailChain], fail_count[kFailHeap],
+                        fail_count[kFailTable], terminal, state[at + 2u],
+                        heap_counter);
+  if (pc.gate_word != kNoWord &&
+      (fail_count[kFailTotal] != 0u || terminal != 0u)) {
+    gates[pc.gate_word] = 0u;
+  }
+}

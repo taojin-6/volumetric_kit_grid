@@ -25,6 +25,7 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
+#include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
@@ -132,17 +133,18 @@ class VR_CODEC_API ReferenceStore {
 
   /// @brief Record the apply of a decoded frame of @p n blocks into the
   ///        spare, from the sources at @ref frame_buffers, which the caller
-  ///        recorded the writing of into @p batch before this.
+  ///        recorded the writing of into @p batch before this, over
+  ///        @p slices: an invocation a block, sized and gated on the device.
   ///
   /// A source past what is bound -- a reference entry when @p payload holds
   /// none, or past its M; a payload entry past its count -- is read as
-  /// absent and counted, and @ref check_apply refuses the frame after the
-  /// submit.
+  /// absent and counted in @ref faults, which @ref check_faults words.
   /// @param batch    The batch to record into; submitted by the caller.
   /// @param payload  The frame's entries by stream position, where the
   ///                 device frame reader decoded them: a P-frame's M must be
   ///                 the held reference's, at its K.
   /// @param n        The frame's blocks.
+  /// @param slices   The apply's slices, a group a block, for @p n blocks.
   /// @param stage    Optional scope the apply's device span records into.
   /// @return The spare, valid until the next call, as the inverse reads it
   ///         (no reference entries); `Status::Code::InvalidArgument` for
@@ -151,12 +153,16 @@ class VR_CODEC_API ReferenceStore {
   ///         reference's.
   core::Result<ResidentBlocks> record_apply(
       core::CommandBatch& batch, const ResidentBlocks& payload, std::uint32_t n,
+      const recon::detail::IndirectSlices& slices,
       core::GpuStageScope* stage = nullptr);
 
-  /// @return After the last @ref record_apply's batch has run, OK, or
-  ///         `Status::Code::InvalidArgument` for the blocks whose source was
-  ///         past what was bound.
-  core::Status check_apply() const;
+  /// @return The blocks the last @ref record_apply found a source past what
+  ///         was bound for, a u32, once its batch has run.
+  const core::Buffer& faults() const noexcept { return faults_; }
+
+  /// @return OK for no faults, or `Status::Code::InvalidArgument` for
+  ///         @p faults blocks whose source was past what was bound.
+  static core::Status check_faults(std::uint32_t faults);
 
   /// @brief Record a P-frame's entries against the held reference, coded
   ///        from the frame of @p n blocks the spare holds once the commands
@@ -237,8 +243,6 @@ class VR_CODEC_API ReferenceStore {
 
   bool held_ = false;
   FrameReference reference_;
-  // What the last apply's batch read back of faults_.
-  std::uint32_t faults_host_ = 0;
 };
 
 }  // namespace volumetric_kit::recon::codec::detail

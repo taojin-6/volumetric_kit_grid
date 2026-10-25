@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// An extract's sizing (MarchingCubes::record_extract): one invocation takes
+// the compaction's count -- or the host's, for a list the host counted -- at
+// most its bound and 0 behind a closed gate, writes the marching cubes'
+// slices, a workgroup a block, and resets the claimed slot's draw command, so
+// no count reaches the host before the batch has run. The count and whether
+// the gate was open land in the state the finalize reports.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Counts { uint counts[]; };
+layout(set = 0, binding = 1) readonly buffer Gates { uint gates[]; };
+// The claimed slot's VkDrawIndexedIndirectCommand and the two scratch words
+// past it (marching_cubes_sparse.comp's DrawCommand).
+layout(set = 0, binding = 2, scalar) writeonly buffer DrawCommand {
+  uint index_count;
+  uint instance_count;
+  uint first_index;
+  int vertex_offset;
+  uint first_instance;
+  uint vertex_count;
+  uint sharing_applied;
+};
+#define VR_SLICES_BINDING 3
+#include "volumetric_kit/recon/core/shaders/dispatch_slices.glsl"
+// The blocks the extract meshes, and whether its gate was open.
+layout(set = 0, binding = 4) writeonly buffer State {
+  uint meshed;
+  uint opened;
+};
+
+// A word index that names no word.
+const uint kNoWord = 0xFFFFFFFFu;
+
+layout(push_constant, scalar) uniform Push {
+  uint count_word;  // the count's word in `counts`, or kNoWord for `bound`
+  uint gate_word;   // the gate's word in `gates`, or kNoWord for none
+  uint bound;       // the blocks the list can hold
+  uint per_dispatch;
+  uint dispatches;
+}
+pc;
+
+void main() {
+  const bool gate_open = pc.gate_word == kNoWord || gates[pc.gate_word] != 0u;
+  uint count = pc.count_word == kNoWord ? pc.bound
+                                        : min(counts[pc.count_word], pc.bound);
+  if (!gate_open) count = 0u;
+  vrWriteSlices(0u, pc.dispatches, pc.per_dispatch, count);
+  // Drawable as it stands: no index yet, one instance, the run from 0.
+  index_count = 0u;
+  instance_count = 1u;
+  first_index = 0u;
+  vertex_offset = 0;
+  first_instance = 0u;
+  vertex_count = 0u;
+  sharing_applied = 0u;
+  meshed = count;
+  opened = gate_open ? 1u : 0u;
+}

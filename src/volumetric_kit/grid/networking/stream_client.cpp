@@ -230,8 +230,7 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
                                       std::vector<std::uint8_t>* payload,
                                       bool* progressed) {
   if (progressed != nullptr) *progressed = false;
-  VKC_CHECK(record != nullptr && payload != nullptr,
-            "StreamClient::next takes a record and a payload");
+  VKC_CHECK(record != nullptr, "StreamClient::next takes a record");
   Impl& s = *impl_;
   try {
     if (!s.failure.ok()) return s.failure;
@@ -267,6 +266,15 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
     }
     return core::exception_status(s.api, core::Status::Code::IoError);
   }
+}
+
+core::Status StreamClient::read(const stream::Record& record, std::uint8_t* dst,
+                                std::size_t capacity) {
+  Impl& s = *impl_;
+  if (!s.failure.ok()) return s.failure;
+  // A refusal leaves the record held and the connection open: the caller's
+  // to correct.
+  return s.parser.read(record, dst, capacity);
 }
 
 }  // namespace volumetric_kit::recon::networking

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <new>
@@ -16,6 +17,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/core/vulkan/host_ring.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
@@ -33,6 +35,7 @@
 #include "hash_delete_coords_comp.spv.hpp"
 #include "hash_init_comp.spv.hpp"
 #include "hash_rehash_comp.spv.hpp"
+#include "hash_rounds_comp.spv.hpp"
 
 namespace volumetric_kit::recon::volume {
 namespace {
@@ -47,8 +50,30 @@ constexpr std::uint32_t kLocalSize = 256;
 // though the set fit the old table -- from looping forever.
 constexpr int kReinsertPasses = 3;
 
-// dispatch_with_retry's bound on rounds; see there.
+// The bound on rounds of dispatch_with_retry and of the blocking allocate and
+// remove; see there.
 constexpr std::uint32_t kMaxRounds = 10;
+
+// hash_rounds.comp's push block.
+struct RoundsPush {
+  std::uint32_t count_word;
+  std::uint32_t gate_word;
+  std::uint32_t bound;
+  std::uint32_t state_word;
+  std::uint32_t round;
+  std::uint32_t rounds;
+  std::uint32_t per_dispatch;
+  std::uint32_t dispatches;
+};
+static_assert(sizeof(RoundsPush) == 32, "RoundsPush must be 32 bytes");
+
+// hash_rounds.comp's word index that names no word, and each kind's state:
+// four words, the removal's first.
+constexpr std::uint32_t kNoWord = ~0u;
+constexpr std::uint32_t kStateWords = 4;
+
+// What a recording runs ahead of its rounds (VoxelHashMap::record_remove).
+using FirstRound = std::function<core::Status(core::CommandBatch&)>;
 
 // The push-constant block every kernel shares: the grid shape plus one
 // kernel-specific argument (mirrors `PushConstants` in hash_common.glsl).
@@ -186,6 +211,13 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   VKC_ASSIGN(map.frustum_planes_,
              core::device_storage_buffer(
                  allocator, sizeof(std::uint32_t) + sizeof(FrustumPlanes)));
+  // The recorded rounds' state, both kinds', and the blocking calls' count:
+  // grid-independent words.
+  VKC_ASSIGN(map.rounds_state_,
+             core::device_storage_buffer(
+                 allocator, 2 * kStateWords * sizeof(std::uint32_t)));
+  VKC_ASSIGN(map.host_count_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
 
   // A 1-D dispatch's groupCountX is capped by maxComputeWorkGroupCount[0] (>=
   // 65535 guaranteed); cache it for the dispatches that split or refuse past
@@ -204,27 +236,37 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   // via KernelSetBuilder (core/vulkan/compute_kernel.hpp) -- one add() per
   // shader, its storage-buffer binding count matching that shader's set 0.
   // Every kernel pushes the shared PushConstants block. allocate-from-coords
-  // has 7 bindings; depth adds the camera-params buffer at binding 6 (8
-  // bindings), delete its done flags there; frustum compaction adds the planes
-  // buffer at binding 3 (4 bindings). The stamps go last in every kernel that
-  // writes them: init's 4, the allocators' and delete's after their own
-  // inputs.
+  // has 8 bindings, the rounds' state last; depth adds the camera-params
+  // buffer at binding 6 (8 bindings), delete its done flags there and the
+  // rounds' state at 8 (9); frustum compaction adds the planes buffer at
+  // binding 3 (4 bindings). The stamps go last in every kernel that writes
+  // them but the two the rounds drive: init's 4, the allocators' and delete's
+  // after their own inputs. Each kind's rounds kernel has 7 bindings and its
+  // own push block.
   VkPushConstantRange push{};
   push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   push.offset = 0;
   push.size = sizeof(PushConstants);
+  VkPushConstantRange rounds_push = push;
+  rounds_push.size = sizeof(RoundsPush);
 
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(map.init_, "hash_init", vr_hash_init_comp_spv,
                  vr_hash_init_comp_spv_size, 5, &push));
   VKC_TRY(kb.add(map.allocate_, "hash_allocate_coords",
                  vr_hash_allocate_coords_comp_spv,
-                 vr_hash_allocate_coords_comp_spv_size, 7, &push));
+                 vr_hash_allocate_coords_comp_spv_size, 8, &push));
   VKC_TRY(kb.add(map.compact_, "hash_compact", vr_hash_compact_comp_spv,
                  vr_hash_compact_comp_spv_size, 3, &push));
   VKC_TRY(kb.add(map.delete_, "hash_delete_coords",
                  vr_hash_delete_coords_comp_spv,
-                 vr_hash_delete_coords_comp_spv_size, 8, &push));
+                 vr_hash_delete_coords_comp_spv_size, 9, &push));
+  VKC_TRY(kb.add(map.remove_rounds_, "hash_remove_rounds",
+                 vr_hash_rounds_comp_spv, vr_hash_rounds_comp_spv_size, 7,
+                 &rounds_push));
+  VKC_TRY(kb.add(map.allocate_rounds_, "hash_allocate_rounds",
+                 vr_hash_rounds_comp_spv, vr_hash_rounds_comp_spv_size, 7,
+                 &rounds_push));
   VKC_TRY(kb.add(map.depth_, "hash_allocate_depth",
                  vr_hash_allocate_depth_comp_spv,
                  vr_hash_allocate_depth_comp_spv_size, 8, &push));
@@ -277,6 +319,17 @@ void VoxelHashMap::write_persistent_bindings() {
   init_.set.write_storage_buffer(4, stamps, 0, VK_WHOLE_SIZE);
   allocate_.set.write_storage_buffer(6, stamps, 0, VK_WHOLE_SIZE);
   delete_.set.write_storage_buffer(7, stamps, 0, VK_WHOLE_SIZE);
+  // The rounds: their state, which the two kernels they drive read their
+  // count from, and the tally and heap counter they judge.
+  const VkBuffer rounds = rounds_state_.handle();
+  allocate_.set.write_storage_buffer(7, rounds, 0, VK_WHOLE_SIZE);
+  delete_.set.write_storage_buffer(8, rounds, 0, VK_WHOLE_SIZE);
+  for (const core::DescriptorSet* set :
+       {&remove_rounds_.set, &allocate_rounds_.set}) {
+    set->write_storage_buffer(2, fail, 0, VK_WHOLE_SIZE);
+    set->write_storage_buffer(3, rounds, 0, VK_WHOLE_SIZE);
+    set->write_storage_buffer(4, counter, 0, VK_WHOLE_SIZE);
+  }
   triangles_.set.write_storage_buffer(8, stamps, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
@@ -313,6 +366,8 @@ void VoxelHashMap::write_persistent_bindings() {
         {stamps, "hash.stamps"},
         {camera_params_.handle(), "hash.camera_params"},
         {frustum_planes_.handle(), "hash.frustum_planes"},
+        {rounds, "hash.rounds_state"},
+        {host_count_.handle(), "hash.host_count"},
     };
     for (const auto& entry : named) {
       device_->set_object_name(VK_OBJECT_TYPE_BUFFER,
@@ -472,69 +527,197 @@ core::Result<core::Buffer> VoxelHashMap::upload_to_binding(
   return buf;  // caller keeps it alive until the batch has run
 }
 
-core::Result<std::uint32_t> VoxelHashMap::run_input_kernel(
-    const char* op, const core::StorageInput& input, std::size_t elem_size,
-    std::uint32_t count, const core::ComputeKernel& kernel,
-    AllocFailures* out_failures, core::GpuStageScope* stage, bool removes,
-    const std::function<core::Status(core::CommandBatch&)>& first_round) {
+core::Result<RecordedRounds> VoxelHashMap::record_rounds(
+    bool removes, core::CommandBatch& batch, const core::Buffer& coords,
+    const DeviceCount& count, const DeviceCount* gate,
+    core::GpuStageScope* stage,
+    const std::function<core::Status(core::CommandBatch&)>& first_round,
+    std::uint32_t rounds, bool stale_lists) {
+  const std::string op =
+      removes ? "VoxelHashMap::record_remove" : "VoxelHashMap::record_allocate";
   if (!valid()) {
-    return core::Status::invalid_argument(std::string(op) + ": moved-from map");
+    return core::Status::invalid_argument(op + ": moved-from map");
   }
-  if (count == 0) {
-    return std::uint32_t{0};
-  }
-  // The input stays where its producer wrote it. fail_counts_ is persistent
-  // and re-zeroed per round inside dispatch_with_retry. Bound the input to
-  // the logical count and reject a range larger than one storage binding may
-  // cover.
-  const VkDeviceSize input_bytes = VkDeviceSize(count) * elem_size;
-  VKC_TRY(input.check(op, input_bytes));
-  VKC_TRY(core::check_storage_buffer_range(op, input_bytes,
+  if (count.bound == 0) return RecordedRounds{};
+  const auto check_word = [&](const DeviceCount& word,
+                              const char* what) -> core::Status {
+    if (word.buffer == nullptr || !word.buffer->valid()) {
+      return core::Status::invalid_argument(op + ": the " + what +
+                                            " has no buffer");
+    }
+    if (word.offset % 4 != 0 || word.offset >= word.buffer->size()) {
+      return core::Status::invalid_argument(
+          op + ": the " + what + "'s word is misaligned or past its buffer");
+    }
+    return {};
+  };
+  VKC_TRY(check_word(count, "count"));
+  if (gate != nullptr) VKC_TRY(check_word(*gate, "gate"));
+  // The input stays where its producer wrote it, bound for the count's bound,
+  // which one storage binding must cover.
+  const VkDeviceSize input_bytes =
+      VkDeviceSize(count.bound) * sizeof(BlockIndex);
+  VKC_TRY(core::StorageInput(coords).check(op.c_str(), input_bytes));
+  VKC_TRY(core::check_storage_buffer_range(op.c_str(), input_bytes,
                                            max_storage_buffer_range_));
-  if (removes) {
-    // Moved once the input is accepted and BEFORE the dispatch: this is the
-    // only place a block index is handed back to the heap, so a slot-keyed
-    // cache is stale the moment the kernel runs -- whether it removes every
-    // coord, some of them, or reports failures. A caller that reads the token
-    // between the dispatch and a check placed after it would read the
-    // pre-removal value.
-    topology_epoch_ = next_topology_epoch();
+  if (results_ == nullptr) {
+    core::HostRingDesc desc;
+    desc.slot_bytes = sizeof(RoundsResult);
+    desc.slots = kResultSlots;
+    desc.name = "hash.rounds_result";
+    VKC_ASSIGN(results_, core::HostRing::create(*device_, *allocator_, desc));
   }
-  core::Buffer input_buf;  // alive across every round
-  const PushConstants push{grid_, count, tick_};
-  return dispatch_with_retry(
-      [&](core::CommandBatch& batch) {
-        return batch.dispatch(kernel, &push, sizeof(push), group_count(count),
-                              max_workgroup_count_x_, stage);
-      },
-      out_failures,
-      [&](core::CommandBatch& batch) -> core::Status {
-        VKC_ASSIGN(const VkBuffer input_handle,
-                   input.buffer(batch, *allocator_, input_bytes, input_buf));
-        kernel.set.write_storage_buffer(4, input_handle, 0, input_bytes);
-        if (removes) {
-          const VkDeviceSize bytes =
-              VkDeviceSize(count) * sizeof(std::uint32_t);
-          VKC_TRY(core::ensure_device_scratch(
-              *device_, *allocator_, remove_done_, bytes,
-              max_storage_buffer_range_, "hash.remove_done"));
-          VKC_TRY(batch.fill(remove_done_, 0, bytes, 0u));
-          kernel.set.write_storage_buffer(6, remove_done_.handle(), 0, bytes);
-        }
-        if (first_round) {
-          VKC_TRY(first_round(batch));
-        }
-        return {};
-      });
+  VKC_ASSIGN(core::HostSlot slot, results_->claim(sizeof(RoundsResult)));
+  // Each round's slices, for the bound's groups.
+  const std::uint32_t per_dispatch =
+      recon::detail::groups_per_dispatch(max_workgroup_count_x_);
+  const std::uint32_t dispatches =
+      recon::detail::slice_count(count.bound, kLocalSize, per_dispatch);
+  core::Buffer& slices = removes ? remove_slices_ : allocate_slices_;
+  const VkDeviceSize slice_bytes = VkDeviceSize(kRecordedRounds) * dispatches *
+                                   sizeof(VkDispatchIndirectCommand);
+  if (slices.size() < slice_bytes) {
+    // Every batch this map recorded into before has resolved (the @pre).
+    VKC_ASSIGN(slices, core::device_storage_buffer(
+                           *allocator_, slice_bytes,
+                           VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
+    device_->set_object_name(
+        VK_OBJECT_TYPE_BUFFER, core::debug_object_handle(slices.handle()),
+        removes ? "hash.remove_slices" : "hash.allocate_slices");
+  }
+  const VkDeviceSize done_bytes =
+      VkDeviceSize(count.bound) * sizeof(std::uint32_t);
+  if (removes) {
+    VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, remove_done_,
+                                        done_bytes, max_storage_buffer_range_,
+                                        "hash.remove_done"));
+  }
+
+  // Nothing but the batch refuses from here. A removal moves the topology
+  // epoch now, before any index goes back to the heap, so a slot-keyed cache
+  // is stale the moment the rounds may run -- whatever they free. A caller's
+  // recording of either kind makes every list compacted before it stale too,
+  // since the heap's host copy, which holds() compares, moves only at
+  // settle. The blocking calls settle before anything can ask, so an
+  // allocation of blocks already there leaves a list holding.
+  if (removes) topology_epoch_ = next_topology_epoch();
+  if (stale_lists) {
+    ++compaction_serial_;
+    ++frustum_serial_;
+  }
+  if (removes) VKC_TRY(batch.fill(remove_done_, 0, done_bytes, 0u));
+  if (first_round) VKC_TRY(first_round(batch));
+  VKC_ASSIGN(const VkBuffer result,
+             batch.output(slot, 0, sizeof(RoundsResult)));
+  core::ComputeKernel& judge = removes ? remove_rounds_ : allocate_rounds_;
+  core::ComputeKernel& kernel = removes ? delete_ : allocate_;
+  judge.set.write_storage_buffer(0, count.buffer->handle(), 0, VK_WHOLE_SIZE);
+  judge.set.write_storage_buffer(
+      1, gate != nullptr ? gate->buffer->handle() : rounds_state_.handle(), 0,
+      VK_WHOLE_SIZE);
+  judge.set.write_storage_buffer(5, slices.handle(), 0, slice_bytes);
+  judge.set.write_storage_buffer(6, result, 0, sizeof(RoundsResult));
+  kernel.set.write_storage_buffer(4, coords.handle(), 0, input_bytes);
+  if (removes) {
+    kernel.set.write_storage_buffer(6, remove_done_.handle(), 0, done_bytes);
+  }
+  RoundsPush sizing{
+      static_cast<std::uint32_t>(count.offset / 4),
+      gate != nullptr ? static_cast<std::uint32_t>(gate->offset / 4) : kNoWord,
+      count.bound,
+      removes ? 0 : kStateWords,
+      0,
+      rounds,
+      per_dispatch,
+      dispatches};
+  const PushConstants push{grid_, sizing.state_word, tick_};
+  for (std::uint32_t r = 0; r <= rounds; ++r) {
+    sizing.round = r;
+    VKC_TRY(batch.dispatch(judge, &sizing, sizeof(sizing), 1,
+                           max_workgroup_count_x_, stage));
+    if (r == rounds) break;  // that was the gather
+    const recon::detail::IndirectSlices round{
+        &slices,
+        VkDeviceSize(r) * dispatches * sizeof(VkDispatchIndirectCommand),
+        dispatches, per_dispatch, kLocalSize};
+    VKC_TRY(recon::detail::dispatch_slices(batch, kernel, push, round, stage));
+  }
+  return RecordedRounds{std::move(slot)};
+}
+
+core::Result<std::uint32_t> VoxelHashMap::run_rounds(
+    bool removes, const core::Buffer& coords, std::uint32_t count,
+    AllocFailures* out_failures,
+    const std::function<core::Status(core::CommandBatch&)>& first_round,
+    core::GpuStageScope* stage) {
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        std::string(removes ? "VoxelHashMap::remove"
+                            : "VoxelHashMap::allocate") +
+        ": moved-from map");
+  }
+  if (count == 0) return std::uint32_t{0};
+  // Only contention is worth another recording: nothing frees a block or a
+  // slot between them, so a capacity limit would fail again. The retryable
+  // reasons are the last round's; terminal failures and rounds add up.
+  AllocFailures last;
+  std::uint32_t terminal = 0;
+  std::uint32_t rounds = 0;
+  while (rounds < kMaxRounds) {
+    core::CommandBatch batch(*device_, *allocator_);
+    VKC_TRY(batch.upload(host_count_, 0, &count, sizeof(count)));
+    VKC_ASSIGN(const RecordedRounds recorded,
+               record_rounds(
+                   removes, batch, coords, DeviceCount{&host_count_, 0, count},
+                   nullptr, stage, rounds == 0 ? first_round : FirstRound(),
+                   std::min(kRecordedRounds, kMaxRounds - rounds), false));
+    VKC_TRY(batch.submit());
+    VKC_ASSIGN(last, settle(recorded));
+    terminal += last.terminal;
+    rounds += last.rounds;
+    if (last.rounds == 0 || last.lock == 0 || last.capacity_limited()) break;
+  }
+  last.terminal = terminal;
+  last.rounds = rounds;
+  if (out_failures != nullptr) *out_failures = last;
+  return last.total + terminal;
+}
+
+core::Result<RecordedRounds> VoxelHashMap::record_allocate(
+    core::CommandBatch& batch, const core::Buffer& coords,
+    const DeviceCount& count, const DeviceCount* gate,
+    core::GpuStageScope* stage) {
+  return record_rounds(false, batch, coords, count, gate, stage, nullptr,
+                       kRecordedRounds, true);
+}
+
+core::Result<RecordedRounds> VoxelHashMap::record_remove(
+    core::CommandBatch& batch, const core::Buffer& coords,
+    const DeviceCount& count, const DeviceCount* gate,
+    core::GpuStageScope* stage,
+    const std::function<core::Status(core::CommandBatch&)>& first_round) {
+  return record_rounds(true, batch, coords, count, gate, stage, first_round,
+                       kRecordedRounds, true);
+}
+
+core::Result<AllocFailures> VoxelHashMap::settle(const RecordedRounds& rounds) {
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        "VoxelHashMap::settle: moved-from map");
+  }
+  if (!rounds.result.valid()) return AllocFailures{};
+  RoundsResult r;
+  std::memcpy(&r, rounds.result.data(), sizeof(r));
+  heap_free_ = r.heap_free;
+  return AllocFailures{r.total, r.lock,     r.chain, r.heap,
+                       r.table, r.terminal, r.rounds};
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate(const core::Buffer& coords,
                                                    std::uint32_t count,
                                                    AllocFailures* out_failures,
                                                    core::GpuStageScope* stage) {
-  return run_input_kernel("VoxelHashMap::allocate", core::StorageInput(coords),
-                          sizeof(BlockIndex), count, allocate_, out_failures,
-                          stage);
+  return run_rounds(false, coords, count, out_failures, nullptr, stage);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
@@ -716,9 +899,7 @@ core::Result<std::uint32_t> VoxelHashMap::remove(
     AllocFailures* out_failures,
     const std::function<core::Status(core::CommandBatch&)>& first_round,
     core::GpuStageScope* stage) {
-  return run_input_kernel("VoxelHashMap::remove", core::StorageInput(coords),
-                          sizeof(BlockIndex), count, delete_, out_failures,
-                          stage, true, first_round);
+  return run_rounds(true, coords, count, out_failures, first_round, stage);
 }
 
 core::Result<RecordedBlockList> VoxelHashMap::record_compaction(

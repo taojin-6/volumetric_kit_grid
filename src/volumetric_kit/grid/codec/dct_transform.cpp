@@ -243,7 +243,7 @@ core::Status DctTransform::record(
     const volume::VoxelBlockGrid& grid, const GridViews& views, VkBuffer list,
     std::uint32_t count, const CodecParams& params, VkBuffer coefficients,
     VkBuffer masks, VkDeviceSize masks_bytes, const TrueSdf& true_sdf,
-    core::GpuStageScope* stage) {
+    const recon::detail::IndirectSlices* slices, core::GpuStageScope* stage) {
   // Another tier sized this one (and every resize doubles it), so it is bound
   // at its real size and range-checked, as the mesher binds it.
   const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
@@ -283,15 +283,6 @@ core::Status DctTransform::record(
   push.num_blocks = count;
   push.coefficient_count = params.coefficient_count;
   push.trunc_dist = gp.trunc_dist;
-  if (coefficients != VK_NULL_HANDLE) {
-    // The same float products validate() checked, staged before any dispatch
-    // reads them.
-    std::array<float, kVoxelsPerBlock> steps{};
-    for (std::size_t i = 0; i < steps.size(); ++i) {
-      steps[i] = params.quantization_scale * params.quantization_weights[i];
-    }
-    VKC_TRY(batch.upload(quantization_steps_, 0, steps.data(), sizeof(steps)));
-  }
   push.observed_weight = volume::kObservedWeight;
   push.decoded_weight = kDecodedWeight;
   push.num_buckets = gp.num_buckets;
@@ -309,10 +300,23 @@ core::Status DctTransform::record(
   // all of the last one's.
   for (std::uint32_t pass = 0; pass < true_sdf.passes; ++pass) {
     push.surface_pass = pass;
-    VKC_TRY(recon::detail::dispatch_items(batch, kernel, push, count, 1,
-                                          max_workgroup_count_x_, stage));
+    VKC_TRY(slices != nullptr
+                ? recon::detail::dispatch_slices(batch, kernel, push, *slices,
+                                                 stage)
+                : recon::detail::dispatch_items(batch, kernel, push, count, 1,
+                                                max_workgroup_count_x_, stage));
   }
   return {};
+}
+
+core::Status DctTransform::record_steps(core::CommandBatch& batch,
+                                        const CodecParams& params) {
+  // The same float products validate() checked.
+  std::array<float, kVoxelsPerBlock> steps{};
+  for (std::size_t i = 0; i < steps.size(); ++i) {
+    steps[i] = params.quantization_scale * params.quantization_weights[i];
+  }
+  return batch.upload(quantization_steps_, 0, steps.data(), sizeof(steps));
 }
 
 core::Status DctTransform::check_rejected(const char* op,
@@ -357,12 +361,12 @@ core::Result<std::uint32_t> DctTransform::observed(
     VKC_TRY(batch.fill(keep_, 0, keep_bytes, 0u));
     VKC_TRY(record(batch, surface_kernel_, grid, views, list.buffer->handle(),
                    list.count, CodecParams{}, VK_NULL_HANDLE, VK_NULL_HANDLE, 0,
-                   TrueSdf{true, nullptr, 2}, stage));
+                   TrueSdf{true, nullptr, 2}, nullptr, stage));
   }
   VKC_TRY(record(batch, observed_kernel_, grid, views, list.buffer->handle(),
                  list.count, CodecParams{}, VK_NULL_HANDLE,
                  observed_blocks_.handle(), list_bytes, TrueSdf{true_sdf},
-                 stage));
+                 nullptr, stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(counts), &counts));
   VKC_TRY(batch.submit());
   VKC_TRY(check_rejected("observed", counts.rejected, list.count));
@@ -419,9 +423,10 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
   VKC_TRY(core::check_storage_buffer_range("DctTransform::forward: the masks",
                                            mask_bytes,
                                            max_storage_buffer_range_));
+  VKC_TRY(record_steps(batch, params));
   VKC_TRY(record(batch, forward_kernel_, grid, views, list.handle(), count,
                  params, coefficients.handle(), masks.handle(), mask_bytes,
-                 TrueSdf{cut != nullptr, cut}, stage));
+                 TrueSdf{cut != nullptr, cut}, nullptr, stage));
   VKC_TRY(batch.readback(rejected_, 0, sizeof(rejected), &rejected));
   out.list = &list;
   out.masks = &masks;
@@ -430,12 +435,10 @@ core::Result<ResidentBlocks> DctTransform::record_forward(
   return out;
 }
 
-core::Status DctTransform::record_inverse(core::CommandBatch& batch,
-                                          volume::VoxelBlockGrid& grid,
-                                          const ResidentBlocks& in,
-                                          const CodecParams& params,
-                                          core::GpuStageScope* stage) {
-  inverse_recorded_ = false;
+core::Status DctTransform::record_inverse(
+    core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+    const ResidentBlocks& in, const CodecParams& params,
+    const recon::detail::IndirectSlices& slices, core::GpuStageScope* stage) {
   VKC_ASSIGN(GridViews views, check_inputs("inverse", grid, params));
   if (in.coefficient_count != params.coefficient_count) {
     return fail("inverse", "the blocks hold " +
@@ -453,7 +456,8 @@ core::Status DctTransform::record_inverse(core::CommandBatch& batch,
                                std::to_string(grid.grid().num_blocks) + ")");
   }
   if (in.count == 0) {
-    return {};
+    // No entry, so none is rejected.
+    return batch.fill(rejected_, 0, sizeof(Counts), 0u);
   }
   // Bound where they are, so each must hold the entries the kernel reads.
   const VkDeviceSize n = in.count;
@@ -467,22 +471,11 @@ core::Status DctTransform::record_inverse(core::CommandBatch& batch,
   }
   // The call is one tick, which every block it changes is stamped with.
   grid.map().advance_tick();
-  VKC_TRY(record(
+  return record(
       batch, inverse_kernel_, grid, views, in.list->handle(), in.count, params,
       in.coefficients->handle(), in.masks->handle(),
       VkDeviceSize(in.count) * kMaskWordsPerBlock * sizeof(std::uint32_t),
-      TrueSdf{}, stage));
-  inverse_recorded_ = true;
-  return {};
-}
-
-core::Status DctTransform::record_rejected(core::CommandBatch& batch,
-                                           std::uint32_t& rejected) {
-  rejected = 0;
-  if (!inverse_recorded_) {
-    return {};
-  }
-  return batch.readback(rejected_, 0, sizeof(rejected), &rejected);
+      TrueSdf{}, &slices, stage);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

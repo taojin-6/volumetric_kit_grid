@@ -1100,9 +1100,11 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   {
     vkc::Result<vkc::Buffer> small = vkc::device_storage_buffer(allocator, 16);
     CHECK(small.ok());
+    // Refused before anything is recorded, so no slices are read.
     const auto inverse = [&](const codec::detail::ResidentBlocks& in) {
       vkc::CommandBatch batch(device, allocator);
-      return t.record_inverse(batch, grid, in, params);
+      return t.record_inverse(batch, grid, in, params,
+                              volumetric_kit::recon::detail::IndirectSlices{});
     };
     codec::detail::ResidentBlocks resident;
     resident.count = std::uint32_t(blocks.size());

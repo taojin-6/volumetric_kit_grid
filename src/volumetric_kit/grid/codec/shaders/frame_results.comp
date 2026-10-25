@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The decoder's results (FrameGate::record_results): one invocation, last in
+// the frame's batch, that gathers every count the host judges a frame by into
+// the decoder's results slot as one struct, so nothing is read back per
+// step.
+
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Verdict {
+  uint failed;
+  uint survivors;
+};
+layout(set = 0, binding = 1) readonly buffer Collision {
+  uint collision_q;
+  uint collision_e;
+};
+layout(set = 0, binding = 2) readonly buffer DiffCounts {
+  uint gone;
+  uint missing;
+};
+layout(set = 0, binding = 3) readonly buffer Faults { uint faults; };
+layout(set = 0, binding = 4) readonly buffer Rejected { uint rejected; };
+layout(set = 0, binding = 5) readonly buffer Exact { uint exact; };
+layout(set = 0, binding = 6) readonly buffer Gate { uint gate; };
+
+// Mirrors detail::DecodeResults (frame_gate.hpp).
+struct DecodeResults {
+  uint failed;
+  uint survivors;
+  uint collision_q;
+  uint collision_e;
+  uint gone;
+  uint missing;
+  uint faults;
+  uint rejected;
+  uint exact;
+  uint gate;
+};
+layout(set = 0, binding = 7, scalar) writeonly buffer Result {
+  DecodeResults result;
+};
+
+void main() {
+  result = DecodeResults(failed, survivors, collision_q, collision_e, gone,
+                         missing, faults, rejected, exact, gate);
+}

@@ -30,7 +30,9 @@ class BlockLists;
 class DctTransform;
 class Deblock;
 class DeviceFrameReader;
+class FrameGate;
 class ReferenceStore;
+struct RecordedFrame;
 }  // namespace detail
 
 /// @brief What a frame's header says: enough to build a grid it decodes into.
@@ -284,6 +286,18 @@ class VR_CODEC_API Decoder {
                       volume::VoxelBlockGrid& grid,
                       core::StageMetrics* metrics = nullptr);
 
+  /// @brief @ref decode the record already at the start of @p slot: @ref
+  ///        record, one submit and @ref finish, with no copy -- what
+  ///        @ref finish_growing decodes a frame again with.
+  /// @param slot     From @ref claim_input, the record at its start.
+  /// @param size     The record's exact length.
+  /// @param grid     As @ref decode.
+  /// @param metrics  As @ref decode.
+  /// @return As @ref decode and @ref record.
+  core::Status decode(const core::HostSlot& slot, std::size_t size,
+                      volume::VoxelBlockGrid& grid,
+                      core::StageMetrics* metrics = nullptr);
+
   /// @brief A slot of this decoder's input ring with room for a record of
   ///        @p bytes and the 8 bytes of slack after it: read the record into
   ///        `data()`, then @ref record it.
@@ -420,6 +434,14 @@ class VR_CODEC_API Decoder {
  private:
   Decoder();
 
+  // The body of record and decode, under the "codec decode" row their
+  // caller opened.
+  core::Result<PendingDecode> record_frame(core::CommandBatch& batch,
+                                           const core::HostSlot& slot,
+                                           std::size_t size,
+                                           volume::VoxelBlockGrid& grid,
+                                           core::StageMetrics* metrics);
+
   // Borrowed (must outlive this); what the decode's batches run on.
   core::Device* device_ = nullptr;
   core::Allocator* allocator_ = nullptr;
@@ -431,6 +453,15 @@ class VR_CODEC_API Decoder {
   std::unique_ptr<detail::BlockLists> lists_;
   // The deblock's kernels and snapshot, and its switch.
   std::unique_ptr<detail::Deblock> deblock_;
+  // The gate, its slices and the results gather.
+  std::unique_ptr<detail::FrameGate> gate_;
+  // The records' input slots and the frames' result slots, two each.
+  std::unique_ptr<core::HostRing> inputs_;
+  std::unique_ptr<core::HostRing> results_;
+  // The frame recorded and not yet finished or abandoned, and the serial
+  // the next record takes.
+  std::unique_ptr<detail::RecordedFrame> pending_;
+  std::uint64_t serial_ = 0;
   bool deblock_on_ = false;
   DeblockInfo last_deblock_;
   std::uint32_t last_rounds_ = 0;

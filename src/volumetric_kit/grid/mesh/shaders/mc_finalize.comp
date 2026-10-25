@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// An extract's finalize (MarchingCubes::record_extract): one invocation after
+// the marching cubes. When the surface outgrew the index run or the arena,
+// or the sharing kernel declined the grid, it zeroes the command's
+// indexCount, so no draw reads an over-count; MarchingCubes::finish refits or
+// refuses. Then it writes what the host reads as one struct into the
+// extract's result slot.
+
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, scalar) buffer DrawCommand {
+  uint index_count;
+  uint instance_count;
+  uint first_index;
+  int vertex_offset;
+  uint first_instance;
+  uint vertex_count;
+  uint sharing_applied;
+};
+layout(set = 0, binding = 1) readonly buffer State {
+  uint meshed;
+  uint opened;
+};
+// Mirrors McResults (marching_cubes.cpp).
+struct McResults {
+  uint index_count;      // the field's, past the capacity included
+  uint vertex_count;     // the sharing kernel's
+  uint sharing_applied;  // the sharing kernel's report
+  uint meshed;           // the blocks meshed
+  uint opened;           // whether the gate was open
+};
+layout(set = 0, binding = 2, scalar) writeonly buffer Result {
+  McResults result;
+};
+
+// Indices a triangle takes (kIndicesPerTriangle).
+const uint kIndicesPerTriangle = 3u;
+
+layout(push_constant, scalar) uniform Push {
+  uint capacity;         // the triangles the slot meshes
+  uint vertex_capacity;  // the vertices its arena holds
+  uint share;            // 1 for the sharing kernel
+}
+pc;
+
+void main() {
+  const uint indices = index_count;
+  const uint triangles = indices / kIndicesPerTriangle;
+  const uint vertices =
+      pc.share != 0u ? vertex_count : triangles * kIndicesPerTriangle;
+  const bool outgrew = triangles > pc.capacity || vertices > pc.vertex_capacity;
+  const bool declined = pc.share != 0u && meshed != 0u && sharing_applied == 0u;
+  if (outgrew || declined) index_count = 0u;
+  result = McResults(indices, vertex_count, sharing_applied, meshed, opened);
+}

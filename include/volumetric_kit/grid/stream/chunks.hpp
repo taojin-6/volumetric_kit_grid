@@ -171,10 +171,11 @@ class VR_STREAM_API ChunkParser {
   /// @param record    That record.
   /// @param dst       Receives the body, `record.size` bytes.
   /// @param capacity  Bytes at @p dst.
-  /// @return OK, the record taken; or, with nothing copied and the record
-  ///         still held, `Status::Code::InvalidArgument` for a null @p dst,
-  ///         a @p capacity under `record.size`, or a record that is not the
-  ///         one held. Nothing is allocated.
+  /// @return OK, the record taken; with nothing copied and the record still
+  ///         held, `Status::Code::InvalidArgument` for a @p capacity under
+  ///         `record.size`, a null @p dst for a body of any bytes, or a
+  ///         record that is not the one held; or the failure, as @ref feed
+  ///         returns it. A read that succeeds allocates nothing.
   core::Status read(const Record& record, std::uint8_t* dst,
                     std::size_t capacity);
 
@@ -192,6 +193,9 @@ class VR_STREAM_API ChunkParser {
   std::uint64_t next_ = 0;  // the next chunk's offset; past the bytes fed
                             // while its padding is still to come
   bool ready_ = false;      // a checked record starts at next_
+  // The bytes of the chunk at next_ that next() returned and read() has not
+  // taken; 0 for none.
+  std::uint64_t held_ = 0;
   std::optional<Session> session_;
   core::Status failure_;
 };

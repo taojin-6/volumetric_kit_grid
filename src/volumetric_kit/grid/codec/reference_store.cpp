@@ -161,8 +161,7 @@ core::Status ReferenceStore::reserve(std::uint32_t n, std::uint32_t k) {
 
 core::Result<ResidentBlocks> ReferenceStore::record_apply(
     core::CommandBatch& batch, const ResidentBlocks& payload, std::uint32_t n,
-    core::GpuStageScope* stage) {
-  faults_host_ = 0;
+    const recon::detail::IndirectSlices& slices, core::GpuStageScope* stage) {
   const std::uint32_t k = payload.coefficient_count;
   const Slot& reference = slots_[current_];
   const Slot& spare = slots_[current_ ^ 1u];
@@ -196,6 +195,8 @@ core::Result<ResidentBlocks> ReferenceStore::record_apply(
   out.coefficients = &spare.coefficients;
   out.count = n;
   out.coefficient_count = k;
+  // The faults read as none for a frame that applies nothing.
+  VKC_TRY(batch.fill(faults_, 0, sizeof(std::uint32_t), 0u));
   if (n == 0) return out;
 
   const VkDeviceSize row_bytes = coefficient_bytes(k);
@@ -220,19 +221,15 @@ core::Result<ResidentBlocks> ReferenceStore::record_apply(
   push.coefficient_count = k;
   push.reference_count = m;
   push.payload_count = payload.count;
-  VKC_TRY(batch.fill(faults_, 0, sizeof(std::uint32_t), 0u));
-  VKC_TRY(
-      dispatch_items(batch, apply, push, n, 1, max_workgroup_count_x_, stage));
-  VKC_TRY(batch.readback(faults_, 0, sizeof(std::uint32_t), &faults_host_));
+  VKC_TRY(recon::detail::dispatch_slices(batch, apply, push, slices, stage));
   return out;
 }
 
-core::Status ReferenceStore::check_apply() const {
-  if (faults_host_ != 0) {
-    return fail("record_apply",
-                std::to_string(faults_host_) +
-                    " of the frame's blocks read past the reference or the "
-                    "payload");
+core::Status ReferenceStore::check_faults(std::uint32_t faults) {
+  if (faults != 0) {
+    return fail("record_apply", std::to_string(faults) +
+                                    " of the frame's blocks read past the "
+                                    "reference or the payload");
   }
   return {};
 }

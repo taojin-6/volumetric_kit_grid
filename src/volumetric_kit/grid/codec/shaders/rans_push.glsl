@@ -18,6 +18,9 @@ layout(push_constant, std430) uniform Push {
   uint frame_type;       // header byte 6
   uint reference_count;  // M, 0 for an intra frame
   uint update_size;      // U
+  // The decode's: the payload's first byte in its binding, which starts at
+  // the record's offset aligned down to minStorageBufferOffsetAlignment.
+  uint payload_byte;
 }
 pc;
 

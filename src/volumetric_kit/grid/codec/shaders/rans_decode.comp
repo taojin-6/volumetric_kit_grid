@@ -27,8 +27,10 @@ layout(local_size_x = 1) in;
 layout(set = 0, binding = 0, std430) readonly buffer Slots {
   uint slots[];  // rans_slots.comp's, 4096 a model
 };
+// The record, from its offset aligned down: the segment streams,
+// little-endian 16-bit words, start at byte pc.payload_byte.
 layout(set = 0, binding = 1, std430) readonly buffer Payload {
-  uint payload[];  // the segment streams, little-endian 16-bit words
+  uint payload[];
 };
 layout(set = 0, binding = 2, std430) readonly buffer SegmentWords {
   uint segment_words[];  // each segment's first word, segment_count + 1
@@ -60,7 +62,15 @@ uint g_pos = 0u;  // the next word
 uint g_end = 0u;  // one past the segment's last word
 bool g_failed = false;
 
-uint word_at(uint q) { return (payload[q >> 1u] >> (16u * (q & 1u))) & 0xFFFFu; }
+uint byte_at(uint b) { return (payload[b >> 2u] >> (8u * (b & 3u))) & 0xFFu; }
+
+// The stream's 16-bit word q: one load at an even byte, two bytes at an odd
+// one, which may straddle two words.
+uint word_at(uint q) {
+  const uint b = pc.payload_byte + 2u * q;
+  if ((b & 1u) == 0u) return (payload[b >> 2u] >> (8u * (b & 2u))) & 0xFFFFu;
+  return byte_at(b) | (byte_at(b + 1u) << 8u);
+}
 
 void renormalize() {
   if (g_x < kRansLower) {

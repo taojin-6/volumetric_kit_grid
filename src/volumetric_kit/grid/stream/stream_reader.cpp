@@ -304,16 +304,34 @@ core::Status StreamReader::read(const Record& record,
   constexpr std::string_view kApi = "StreamReader::read";
   VKC_CHECK(payload != nullptr, "StreamReader::read takes a payload");
   try {
+    if (record.size > options_.max_payload_bytes ||
+        record.size > payload->max_size()) {
+      return core::Status::out_of_memory(
+          std::string(kApi) + ": " + path_ + ": the record at " +
+          std::to_string(record.offset) + " holds " +
+          std::to_string(record.size) + " bytes, above the limit of " +
+          std::to_string(options_.max_payload_bytes));
+    }
+    payload->resize(static_cast<std::size_t>(record.size));
+    return read(record, payload->data(), payload->size());
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
+  }
+}
+
+core::Status StreamReader::read(const Record& record, std::uint8_t* dst,
+                                std::size_t capacity) const {
+  constexpr std::string_view kApi = "StreamReader::read";
+  try {
     const auto where = [&] {
       return std::string(kApi) + ": " + path_ + ": the record at " +
              std::to_string(record.offset);
     };
-    if (record.size > options_.max_payload_bytes ||
-        record.size > payload->max_size()) {
-      return core::Status::out_of_memory(
+    if (capacity < record.size || (dst == nullptr && record.size != 0)) {
+      return core::Status::invalid_argument(
           where() + " holds " + std::to_string(record.size) +
-          " bytes, above the limit of " +
-          std::to_string(options_.max_payload_bytes));
+          " bytes, more than the " + std::to_string(capacity) +
+          " bytes given (or none)");
     }
     const detail::FileView file{
         fd_.get(), &path_, file_size_,
@@ -332,11 +350,10 @@ core::Status StreamReader::read(const Record& record,
       return core::Status::invalid_argument(where() +
                                             " does not match its header");
     }
-    payload->resize(static_cast<std::size_t>(record.size));
+    const auto bytes = static_cast<std::size_t>(record.size);
     VKC_TRY(detail::read_at(kApi, path_, fd_.get(),
-                            record.offset + c.header_bytes, payload->data(),
-                            payload->size()));
-    if (detail::crc32(payload->data(), payload->size()) != c.body_crc) {
+                            record.offset + c.header_bytes, dst, bytes));
+    if (detail::crc32(dst, bytes) != c.body_crc) {
       return core::Status::invalid_argument(where() +
                                             ": its payload fails its CRC");
     }
