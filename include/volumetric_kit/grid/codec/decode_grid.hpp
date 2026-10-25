@@ -156,4 +156,17 @@ VR_CODEC_API core::Status decode_growing(Decoder& decoder,
                                          std::uint32_t max_blocks,
                                          core::StageMetrics* metrics = nullptr);
 
+/// @brief @ref decode_growing a record already in an input slot: one an
+///        encoder's frame was copied into, head then payload, with no other
+///        copy (the other form copies its bytes into one).
+/// @param slot  From @ref Decoder::claim_input, the record at its start.
+/// @param size  The record's exact length.
+/// @return As the other form.
+VR_CODEC_API core::Status decode_growing(Decoder& decoder,
+                                         const core::HostSlot& slot,
+                                         std::size_t size,
+                                         volume::VoxelBlockGrid& grid,
+                                         std::uint32_t max_blocks,
+                                         core::StageMetrics* metrics = nullptr);
+
 }  // namespace volumetric_kit::recon::codec

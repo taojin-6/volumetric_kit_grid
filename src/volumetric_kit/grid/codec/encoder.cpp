@@ -111,7 +111,10 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     volume::VoxelBlockGrid& grid, core::StageMetrics* metrics) try {
   // Before any refusal, so a refused call still costs its row; both
   // batches' waits, and the device halves they hand back, land in it too.
+  // Its row is placed now, ahead of its breakdowns', which the batches'
+  // device rows add while it is open.
   core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
+  if (metrics != nullptr) metrics->add_cpu("codec encode", 0.0);
   // One half's batch, submitted and waited on, its device rows kept.
   const auto run = [&](core::CommandBatch& batch) -> core::Status {
     VKC_ASSIGN(core::PendingBatch done, batch.submit_async({}, {}));

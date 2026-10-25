@@ -459,6 +459,15 @@ core::Status VoxelBlockGrid::prepare_free_pass(
   return {};
 }
 
+void VoxelBlockGrid::place_free_pass_rows(core::StageMetrics* metrics) {
+  // The stage's row and its compaction's, placed as the pass opens, so a
+  // batch's later stages, whose device halves come back with theirs, do not
+  // come between them.
+  if (metrics == nullptr) return;
+  metrics->add_cpu("block stamps", 0.0);
+  metrics->add_cpu("  ..stale set", 0.0);
+}
+
 core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
     core::CommandBatch& batch, std::uint32_t max_age,
     core::GpuStageScope& stage) {
@@ -510,6 +519,7 @@ core::Result<RecordedRounds> VoxelBlockGrid::record_free_stale(
     core::StageMetrics* metrics) {
   VKC_TRY(prepare_free_pass(max_age, metrics));
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
+  place_free_pass_rows(metrics);
   return record_stale(batch, max_age, stage);
 }
 
@@ -518,6 +528,7 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
   VKC_TRY(prepare_free_pass(max_age, metrics));
   // The row spans the wait too, and takes the batch's device halves after.
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
+  place_free_pass_rows(metrics);
   const std::uint32_t held = map_.allocated_blocks();
   core::CommandBatch batch(*device_, *allocator_);
   VKC_ASSIGN(const RecordedRounds removed, record_stale(batch, max_age, stage));

@@ -421,6 +421,9 @@ class VR_VOLUME_API VoxelBlockGrid {
   // the timer a timed pass makes once.
   core::Status prepare_free_pass(std::uint32_t max_age,
                                  const core::StageMetrics* metrics);
+  // Place "block stamps" and "  ..stale set" in `metrics`, in that order, as
+  // a pass opens; none for null.
+  static void place_free_pass_rows(core::StageMetrics* metrics);
 
   VoxelHashMap map_;
   std::vector<Attribute> attributes_;
