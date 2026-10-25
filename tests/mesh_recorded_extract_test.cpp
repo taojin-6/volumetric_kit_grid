@@ -274,7 +274,9 @@ int slots_case(vr_test::Gpu& gpu) {
     vkc::Result<vkc::PendingBatch> ran =
         batch.submit_async({}, {pending->signal});
     CHECK(ran.ok() && ran->wait().ok());
-    if (i % 2 == 0) mc->abandon(*pending);  // and the odd ones dropped
+    if (i % 2 != 0) continue;  // dropped
+    mc->abandon(*pending);
+    CHECK(mc->finish(*pending, *grid).status().domain() == C::InvalidArgument);
   }
   vkc::Result<std::optional<mesh::DeviceMesh>> held =
       recorded(gpu, *mc, *grid, n);
