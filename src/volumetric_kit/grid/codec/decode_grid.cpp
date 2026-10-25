@@ -108,22 +108,25 @@ core::Status grow_for(const char* who, volume::VoxelBlockGrid& grid,
 // Decode the record of @p blocks blocks at the start of @p slot again,
 // blocking, in batches of its own, as the decoder's refusal @p s asks: after
 // a grow for `Status::Code::OutOfMemory` (once), or as it is for
-// `Status::Code::IoError` (twice at most), each timed into @p metrics as
-// `"  ..grow"` or `"  ..retry"`, and each decode's own rows into
-// @p decode_rows. Returns OK, or the last error.
+// `Status::Code::IoError` (twice at most). Each recovery, its decode again
+// included, is one `"  ..grow"` or `"  ..retry"` row of @p metrics inside a
+// `"codec decode"` span, so the stage's row holds it. Returns OK, or the last
+// error.
 core::Status recover(Decoder& decoder, const core::HostSlot& slot,
                      std::size_t size, volume::VoxelBlockGrid& grid,
                      std::uint32_t blocks, std::uint32_t max_blocks,
-                     core::Status s, core::StageMetrics* metrics,
-                     core::StageMetrics* decode_rows) {
+                     core::Status s, core::StageMetrics* metrics) {
   int contended = 0;
   bool grown = false;
+  // The stage's row above its breakdown's, though its span closes after.
+  if (metrics != nullptr) metrics->seed("codec decode");
   for (;;) {
     const bool grow = s.domain() == core::Status::Code::OutOfMemory && !grown;
     if (!grow && (s.domain() != core::Status::Code::IoError ||
                   contended == kContendedRetries)) {
       return s;
     }
+    const core::StageScope stage(metrics, "codec decode");
     const core::StageScope row(metrics, grow ? "  ..grow" : "  ..retry");
     if (grow) {
       VKC_TRY(grow_for("decode_growing", grid, blocks, max_blocks, s));
@@ -131,8 +134,7 @@ core::Status recover(Decoder& decoder, const core::HostSlot& slot,
     } else {
       ++contended;
     }
-    if (decode_rows != nullptr) decode_rows->clear();
-    s = decoder.decode(slot, size, grid, decode_rows);
+    s = decoder.decode(slot, size, grid, nullptr);
     if (s.ok()) return s;
   }
 }
@@ -148,12 +150,16 @@ core::Result<PendingDecode> record_growing(
   core::Result<PendingDecode> recorded =
       decoder.record(batch, slot, size, grid, metrics);
   // A heap too small is refused with nothing recorded, so the frame records
-  // again once the grid has grown.
+  // again once the grid has grown. The device's own out of memory can come
+  // after the first commands, so the batch is the caller's to drop.
   if (recorded.ok() ||
-      recorded.status().domain() != core::Status::Code::OutOfMemory) {
+      recorded.status().domain() != core::Status::Code::OutOfMemory ||
+      info.block_count <= static_cast<std::uint32_t>(grid.grid().num_blocks)) {
     return recorded;
   }
   {
+    // Part of the decode, whose row the record above opened.
+    const core::StageScope stage(metrics, "codec decode");
     const core::StageScope grow(metrics, "  ..grow");
     VKC_TRY(grow_for("record_growing", grid, info.block_count, max_blocks,
                      recorded.status()));
@@ -172,7 +178,7 @@ core::Result<Finished> finish_growing(Decoder& decoder,
   const core::Status s = decoder.finish(pending, grid);
   if (s.ok()) return Finished{};
   VKC_TRY(recover(decoder, pending.input, pending.size, grid, pending.blocks,
-                  max_blocks, s, metrics, nullptr));
+                  max_blocks, s, metrics));
   return Finished{true};
 } catch (const std::bad_alloc&) {
   return core::exception_status("finish_growing",
@@ -187,24 +193,21 @@ core::Status decode_growing(Decoder& decoder, const std::uint8_t* frame,
   VKC_TRY(check_ceiling("decode_growing", info.block_count, max_blocks));
   VKC_ASSIGN(const core::HostSlot slot, decoder.claim_input(size));
   std::memcpy(slot.data(), frame, size);
-  // Only the decode that succeeds is timed, with its recovery's row, and
-  // its rows land in the caller's metrics only then. A heap too small is the
-  // record's refusal and a table that cannot place the frame the finish's,
-  // and either recovers alike.
-  core::StageMetrics attempt;
-  core::StageMetrics redo;
-  core::StageMetrics* const rows = metrics != nullptr ? &attempt : nullptr;
+  // The whole call is timed, the first decode and a recovery, and its rows
+  // land in the caller's metrics once the decode succeeds. A heap too small
+  // is the record's refusal and a table that cannot place the frame the
+  // finish's, and either recovers alike.
+  core::StageMetrics call;
+  core::StageMetrics* const rows = metrics != nullptr ? &call : nullptr;
   const core::Status s = decoder.decode(slot, size, grid, rows);
   if (!s.ok()) {
-    attempt.clear();
     VKC_TRY(recover(decoder, slot, size, grid, info.block_count, max_blocks, s,
-                    rows, metrics != nullptr ? &redo : nullptr));
+                    rows));
   }
   if (metrics != nullptr) {
     try {
       core::StageMetrics merged = *metrics;
-      merged.merge(redo);
-      merged.merge(attempt);
+      merged.merge(call);
       *metrics = std::move(merged);
     } catch (const std::bad_alloc&) {
       // The decoder already committed its reference. Dropping this decode's

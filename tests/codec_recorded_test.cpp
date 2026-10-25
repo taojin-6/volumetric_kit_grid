@@ -35,6 +35,7 @@
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 
 #include "gpu_test.hpp"
+#include "stage_rows.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
@@ -52,12 +53,7 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 constexpr std::uint64_t kPinnedDispatches = 39;
 constexpr std::uint64_t kPinnedBarriers = 47;
 
-const vkc::StageRow* find_row(const vkc::StageMetrics& m, const char* name) {
-  for (const vkc::StageRow& row : m.rows()) {
-    if (std::strcmp(row.name, name) == 0) return &row;
-  }
-  return nullptr;
-}
+using vr_test::find_row;
 
 vkc::Result<codec::Encoder> encoder(Gpu& gpu, std::uint32_t k, float scale,
                                     std::uint32_t period) {
@@ -253,7 +249,8 @@ int device_refusal_case(Gpu& gpu) {
 
 // A record superseded by the next does not finish; one abandoned keeps the
 // reference, so its frame decodes again and the frame after it, coded
-// against it, is NotFound; two input slots held refuse a third.
+// against it, is NotFound; another decoder's token neither finishes nor
+// abandons; two input slots held refuse a third.
 int tokens_case(Gpu& gpu) {
   vkc::Result<codec::Encoder> enc = encoder(gpu, 20, 0.0f, ~0u);
   CHECK(enc.ok());
@@ -304,6 +301,29 @@ int tokens_case(Gpu& gpu) {
   }
   CHECK(other->decode(p2.data(), p2.size(), *grid).domain() == C::NotFound);
   CHECK(other->decode(p1.data(), p1.size(), *grid).ok());
+
+  // Another decoder's token of the same serial is not this one's.
+  {
+    vkc::Result<codec::Decoder> x = decoder(gpu);
+    vkc::Result<codec::Decoder> y = decoder(gpu);
+    vkc::Result<vol::VoxelBlockGrid> gx = make_grid(gpu);
+    vkc::Result<vol::VoxelBlockGrid> gy = make_grid(gpu);
+    CHECK(x.ok() && y.ok() && gx.ok() && gy.ok());
+    CHECK(x->decode(i0.data(), i0.size(), *gx).ok());
+    CHECK(y->decode(i0.data(), i0.size(), *gy).ok());
+    vkc::Result<vkc::HostSlot> sx = slot_of(*x, p1);
+    vkc::Result<vkc::HostSlot> sy = slot_of(*y, p1);
+    CHECK(sx.ok() && sy.ok());
+    vkc::CommandBatch bx(gpu.device, gpu.allocator);
+    vkc::CommandBatch by(gpu.device, gpu.allocator);
+    vkc::Result<codec::PendingDecode> tx = x->record(bx, *sx, p1.size(), *gx);
+    vkc::Result<codec::PendingDecode> ty = y->record(by, *sy, p1.size(), *gy);
+    CHECK(tx.ok() && ty.ok() && tx->serial == ty->serial);
+    CHECK(bx.submit().ok() && by.submit().ok());
+    x->abandon(*ty);  // ignored
+    CHECK(x->finish(*ty, *gx).domain() == C::InvalidArgument);
+    CHECK(x->finish(*tx, *gx).ok() && y->finish(*ty, *gy).ok());
+  }
 
   vkc::Result<vkc::HostSlot> s1 = dec->claim_input(64);
   vkc::Result<vkc::HostSlot> s2 = dec->claim_input(64);
@@ -463,6 +483,8 @@ int growing_case(Gpu& gpu) {
     vkc::Result<codec::PendingDecode> pending = codec::record_growing(
         *dec, batch, *slot, f.size(), *grid, kMaxBlocks, &m);
     CHECK(pending.ok() && find_row(m, "  ..grow") != nullptr);
+    CHECK(m.rows().front().name == std::string("codec decode"));
+    CHECK(vr_test::breakdowns_nest(m));
     CHECK(grid->grid().num_buckets > few.num_buckets);
     CHECK(batch.submit().ok());
     vkc::Result<codec::Finished> done =
@@ -499,6 +521,8 @@ int growing_case(Gpu& gpu) {
       codec::finish_growing(*dec, *pending, *grid, kMaxBlocks, &m);
   CHECK(done.ok() && done->redone);
   CHECK(find_row(m, "  ..grow") != nullptr);
+  CHECK(m.rows().front().name == std::string("codec decode"));
+  CHECK(vr_test::breakdowns_nest(m));
   CHECK(grid->grid().num_buckets > cramped.num_buckets);
   CHECK(snapshot(gpu, *grid).value() == *want);
   vkc::Result<std::optional<mesh::DeviceMesh>> gated =

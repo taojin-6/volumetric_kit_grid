@@ -80,10 +80,11 @@ struct Finished {
 /// @param size        The record's exact length.
 /// @param grid        As @ref Decoder::record takes it.
 /// @param max_blocks  The most blocks a frame may hold.
-/// @param metrics     Optional: @ref Decoder::record's rows, and `"  ..grow"`.
-/// @return As @ref Decoder::record; `Status::Code::InvalidArgument` for a
-///         frame or a grow past @p max_blocks; or `volume::grow_grid`'s
-///         failure.
+/// @param metrics     Optional: @ref Decoder::record's rows, and a grow's
+///                    `"  ..grow"`, which their `"codec decode"` holds.
+/// @return As @ref Decoder::record, out of device memory included, which no
+///         grow cures; `Status::Code::InvalidArgument` for a frame or a grow
+///         past @p max_blocks; or `volume::grow_grid`'s failure.
 /// @pre As @ref Decoder::record. A grow frees the grid's buffers at once.
 VR_CODEC_API core::Result<PendingDecode> record_growing(
     Decoder& decoder, core::CommandBatch& batch, const core::HostSlot& slot,
@@ -95,8 +96,9 @@ VR_CODEC_API core::Result<PendingDecode> record_growing(
 ///        grow for `Status::Code::OutOfMemory` (once), or as it is for
 ///        `Status::Code::IoError` (twice at most).
 ///
-/// Each recovery blocks, in batches of its own, timed as `"  ..grow"` or
-/// `"  ..retry"`. It needs no other input slot.
+/// Each recovery blocks, in batches of its own, and is timed whole, its
+/// decode again included, as `"  ..grow"` or `"  ..retry"` inside a
+/// `"codec decode"` row. It needs no other input slot.
 /// @param decoder     The decoder that recorded @p pending.
 /// @param pending     Its batch resolved.
 /// @param grid        The grid it recorded into.
@@ -137,8 +139,8 @@ VR_CODEC_API core::Result<Finished> finish_growing(
 /// @param max_blocks  The ceiling: the most blocks a frame may hold.
 /// @param metrics     Optional `StageMetrics` collecting, once the decode
 ///                    succeeds, the rows @ref Decoder::decode gives for the
-///                    attempt that succeeded alone, and a recovery's
-///                    `"  ..grow"` or `"  ..retry"`. `nullptr` measures
+///                    first attempt and, after a recovery, its row as
+///                    @ref finish_growing times it. `nullptr` measures
 ///                    nothing.
 /// @return OK; @ref read_frame_info's refusal of the header;
 ///         `Status::Code::InvalidArgument` for a frame or a grow past

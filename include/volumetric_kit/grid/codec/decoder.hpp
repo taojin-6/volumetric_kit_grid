@@ -337,12 +337,14 @@ class VR_CODEC_API Decoder {
   ///         - `Status::Code::NotFound` for a P-frame whose reference this
   ///           decoder does not hold;
   ///         - `Status::Code::OutOfMemory` for more blocks than the grid's
-  ///           heap (@ref record_growing grows it first) or past free device
-  ///           memory;
+  ///           heap (@ref record_growing grows it first);
   ///         - `Status::Code::InvalidArgument` for a moved-from decoder, a
   ///           slot shorter than @p size and its slack, or a grid
-  ///           @ref decode refuses;
-  ///         - or a buffer failure.
+  ///           @ref decode refuses.
+  ///
+  ///         Or, possibly after the first commands, so the caller drops
+  ///         @p batch: `Status::Code::OutOfMemory` past free device memory,
+  ///         or another buffer failure.
   /// @pre The batch of this decoder's last record has resolved.
   core::Result<PendingDecode> record(core::CommandBatch& batch,
                                      const core::HostSlot& slot,
@@ -374,7 +376,8 @@ class VR_CODEC_API Decoder {
   ///        submitted, or ran a frame no longer wanted. The reference stays;
   ///        the grid holds what the batch left, and the map's heap copy stays
   ///        as it was, until the next decode.
-  /// @param pending  From this decoder; one it no longer holds is ignored.
+  /// @param pending  From this decoder; one it no longer holds, or another
+  ///                 decoder's, is ignored.
   void abandon(const PendingDecode& pending) noexcept;
 
   /// @return The most rounds the removal or the allocation ran in the frame
@@ -421,6 +424,7 @@ class VR_CODEC_API Decoder {
   ///         anything is written (decode the frame into it instead);
   ///         otherwise a buffer or dispatch failure, after which the grid
   ///         holds a partial rebuild until a decode or rebuild succeeds.
+  /// @pre The batch of this decoder's last @ref record has resolved.
   core::Status rebuild(volume::VoxelBlockGrid& grid,
                        core::StageMetrics* metrics = nullptr);
 
@@ -441,6 +445,8 @@ class VR_CODEC_API Decoder {
                                            std::size_t size,
                                            volume::VoxelBlockGrid& grid,
                                            core::StageMetrics* metrics);
+  // Whether @p pending is this decoder's unfinished last record.
+  bool holds(const PendingDecode& pending) const noexcept;
 
   // Borrowed (must outlive this); what the decode's batches run on.
   core::Device* device_ = nullptr;

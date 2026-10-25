@@ -135,12 +135,13 @@ FrameDeblock frame_deblock(const detail::FrameHeader& header, bool on) {
 // What the deblock did to a frame of @p n blocks: the filter @p info names,
 // and the blocks it left as decoded, those holding an unobserved voxel (the
 // 2026-10-21 decision's 2026-10-23 amendment), or every block when no filter
-// @p ran.
+// @p ran. A frame of no blocks records no filter (Deblock::record), so its
+// @p exact is an earlier frame's.
 DeblockInfo deblock_ran(const DeblockInfo& info, bool ran, std::uint32_t n,
                         std::uint32_t exact) {
   DeblockInfo out = info;
   out.block_count = n;
-  out.exact_blocks = ran ? exact : n;
+  out.exact_blocks = ran && n != 0 ? exact : n;
   return out;
 }
 
@@ -433,11 +434,10 @@ core::Status Decoder::finish(const PendingDecode& pending,
   if (!valid()) {
     return fail("moved-from decoder", "finish");
   }
-  if (pending_ == nullptr || pending.serial == 0 ||
-      pending.serial != pending_->serial) {
+  if (!holds(pending)) {
     return fail(
         "the pending frame is not this decoder's last record (finished, "
-        "abandoned or superseded)",
+        "abandoned, superseded, or another decoder's)",
         "finish");
   }
   if (&grid != pending_->grid) {
@@ -492,10 +492,15 @@ core::Status Decoder::finish(const PendingDecode& pending,
 }
 
 void Decoder::abandon(const PendingDecode& pending) noexcept {
-  if (pending_ != nullptr && pending.serial != 0 &&
-      pending.serial == pending_->serial) {
-    pending_.reset();
-  }
+  if (holds(pending)) pending_.reset();
+}
+
+// The serial counts this decoder's records alone; the gate's word, its own
+// buffer, tells another decoder's token from one of its own.
+bool Decoder::holds(const PendingDecode& pending) const noexcept {
+  return pending_ != nullptr && pending.serial != 0 &&
+         pending.serial == pending_->serial &&
+         pending.gate.buffer == &gate_->gate();
 }
 
 core::Status Decoder::rebuild(volume::VoxelBlockGrid& grid,

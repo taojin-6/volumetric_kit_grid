@@ -6,7 +6,7 @@
 // count and past it, and the headers it refuses; decode_growing leaving a grid
 // the frame fits alone, growing one too small exactly once to decode what a
 // roomy grid decodes, returning the second OutOfMemory of a grid one grow
-// leaves too small, timing only the attempt that succeeds, and passing the
+// leaves too small, timing the whole call once it succeeds, and passing the
 // decoder's refusals through with their codes, ungrown; and the caller's
 // ceiling, which refuses a forged header, a forged frame and a grow past it
 // with the grid as it was. Skips with no device.
@@ -21,6 +21,7 @@
 #include "bitstream.hpp"
 #include "codec_fixture.hpp"
 #include "gpu_test.hpp"
+#include "stage_rows.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
@@ -94,10 +95,7 @@ std::int32_t decode_buckets(std::uint32_t blocks) {
 }
 
 bool has_row(const vkc::StageMetrics& m, const char* name) {
-  for (const vkc::StageRow& row : m.rows()) {
-    if (std::strcmp(row.name, name) == 0) return true;
-  }
-  return false;
+  return vr_test::find_row(m, name) != nullptr;
 }
 
 // The grid from a frame's header: its geometry exactly, 8^3 blocks, the
@@ -247,7 +245,8 @@ int ceiling_case(Gpu& gpu, const Frames& f) {
 
 // A grid too small for the frame (32 slots) grows once, to the frame's
 // buckets (not twice its own, nor more), and holds what a decode into a
-// roomy grid holds; only that successful decode is timed.
+// roomy grid holds; the whole call is timed, the refused decode and the grow
+// with its decode again, in "codec decode", over "  ..grow".
 int grows_once_case(Gpu& gpu, const Frames& f) {
   GridShape few;
   few.voxel_size = kSmallVoxel;
@@ -263,7 +262,8 @@ int grows_once_case(Gpu& gpu, const Frames& f) {
                               kMaxBlocks, &metrics)
             .ok());
   CHECK(grid->grid().num_buckets == decode_buckets(f.small_blocks));
-  CHECK(has_row(metrics, "codec decode") && has_row(metrics, "  ..inverse"));
+  CHECK(metrics.rows().front().name == std::string("codec decode"));
+  CHECK(has_row(metrics, "  ..grow") && vr_test::breakdowns_nest(metrics));
 
   vkc::Result<vol::VoxelBlockGrid> roomy = codec::make_decode_grid(
       gpu.device, gpu.allocator, f.small.data(), f.small.size(), kMaxBlocks);
