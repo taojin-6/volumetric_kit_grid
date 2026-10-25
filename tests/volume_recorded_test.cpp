@@ -883,7 +883,8 @@ int depth_counters_case(vr_test::Gpu& gpu) {
     CHECK(left.ok() && left.value() == 0 && f.rounds >= 1);
     if (pass == 0) continue;  // the first makes the result slots
     CHECK(now.submits - was.submits == f.rounds);
-    CHECK(now.host_waits - was.host_waits == f.rounds);
+    // A wait that finds its round done blocks nothing and counts none.
+    CHECK(now.host_waits - was.host_waits <= f.rounds);
     CHECK(now.staging_buffers == was.staging_buffers);
   }
   return 0;

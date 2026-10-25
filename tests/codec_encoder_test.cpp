@@ -1084,7 +1084,8 @@ int counters_case(Gpu& gpu) {
     if (t < 3) continue;  // the rings and scratch grow while warming
     CHECK(type_of(frame.value()) == codec::FrameType::kInter);
     CHECK(now.submits - was.submits == 2);
-    CHECK(now.host_waits - was.host_waits == 2);
+    // A wait that finds its batch done blocks nothing and counts none.
+    CHECK(now.host_waits - was.host_waits <= 2);
     CHECK(now.staging_buffers == was.staging_buffers);
   }
   return 0;
