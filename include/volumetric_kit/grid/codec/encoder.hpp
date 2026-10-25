@@ -292,9 +292,12 @@ class VR_CODEC_API Encoder {
   /// @param batch    Records the half; the caller submits it.
   /// @param grid     As @ref encode; nothing but @p batch changes it until the
   ///                 batch has resolved.
-  /// @param metrics  Optional: `"codec encode"`'s host half now; from
-  ///                 `PendingBatch::device_rows` the device halves of
-  ///                 `"  ..encode set"`, `"  ..observed"` and `"  ..forward"`.
+  /// @param metrics  Optional: `"codec encode"`'s host half now, its row and
+  ///                 then `"  ..encode set"`'s, `"  ..observed"`'s and
+  ///                 `"  ..forward"`'s placed as they open, so a caller
+  ///                 sharing @p batch tells the encode's device rows by
+  ///                 name; from `PendingBatch::device_rows` the device halves
+  ///                 of those breakdowns.
   /// @return The pending frame; or, with nothing recorded, @ref encode's
   ///         refusals of the encoder and the grid, and of a frame the device
   ///         cannot hold at the grid's block slots; or, after the first
@@ -395,6 +398,9 @@ class VR_CODEC_API Encoder {
   // next frame is an I-frame at 0.
   std::uint32_t gop_position_ = 0;
   bool force_intra_ = false;
+  // The transform holds the quantization steps, which never change: a
+  // finished frame's front batch wrote them, so no later front records them.
+  bool steps_held_ = false;
   // What the halves need of the last record (encoder.cpp).
   std::unique_ptr<detail::RecordedEncode> pending_;
 };

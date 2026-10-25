@@ -207,8 +207,8 @@ class VR_CODEC_API DctTransform {
   core::Status check_grid(const volume::VoxelBlockGrid& grid) const;
 
   /// @brief Record the upload of @p params' steps, which the forward and the
-  ///        inverse read, into @p batch: inline, so a caller records it ahead
-  ///        of its batch's first dispatch, and MoltenVK opens no blit encoder
+  ///        inverse read, into @p batch: inline, so recorded ahead of a
+  ///        batch's first dispatch it opens no MoltenVK blit encoder
   ///        mid-batch.
   /// @return OK, or the batch's refusal.
   core::Status record_steps(core::CommandBatch& batch,

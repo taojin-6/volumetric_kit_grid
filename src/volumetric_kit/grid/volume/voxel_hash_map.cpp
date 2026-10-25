@@ -871,7 +871,8 @@ core::Result<RecordedRounds> VoxelHashMap::record_depth(
   ++compaction_serial_;
   ++frustum_serial_;
   // Every camera first, in one inline write, ahead of the round's first
-  // dispatch, so MoltenVK opens no blit encoder between the frames.
+  // dispatch, so MoltenVK opens no blit encoder between the frames. It is
+  // not the batch's first: a sender's set prep comes before it.
   std::vector<std::uint8_t> cameras(static_cast<std::size_t>(camera_bytes), 0);
   for (std::size_t k = 0; k < live.size(); ++k) {
     std::memcpy(cameras.data() + k * camera_stride_, &frames[live[k]].camera,

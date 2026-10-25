@@ -984,7 +984,8 @@ int halves_rules_case(Gpu& gpu) {
 
 // abandon keeps the reference and the period: an encoder that recorded a
 // frame and dropped it writes the frames after as one that never saw it --
-// a P-frame against the frame before, then the period's I-frame.
+// a P-frame against the frame before, then the period's I-frame; and a cold
+// encoder whose first front was never submitted codes as a fresh one.
 int abandon_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 3;
@@ -999,8 +1000,24 @@ int abandon_case(Gpu& gpu) {
     CHECK(g.ok());
     grids.push_back(std::move(g).value());
   }
-  CHECK(x.value().encode(grids[0]).value() ==
-        y.value().encode(grids[0]).value());
+  vkc::Result<Bytes> first = y.value().encode(grids[0]);
+  CHECK(first.ok() && x.value().encode(grids[0]).value() == first.value());
+  // A cold encoder's first front, dropped unsubmitted, wrote no quantization
+  // steps, so its next front still records them: the same frame.
+  {
+    vkc::Result<codec::Encoder> cold =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(cold.ok());
+    {
+      vkc::CommandBatch front(gpu.device, gpu.allocator);
+      vkc::Result<codec::PendingEncode> p =
+          cold.value().record_front(front, grids[0]);
+      CHECK(p.ok());
+      cold.value().abandon(p.value());
+    }
+    vkc::Result<Bytes> got = cold.value().encode(grids[0]);
+    CHECK(got.ok() && got.value() == first.value());
+  }
   for (const bool after_back : {false, true}) {
     vkc::CommandBatch front(gpu.device, gpu.allocator);
     vkc::Result<codec::PendingEncode> p =

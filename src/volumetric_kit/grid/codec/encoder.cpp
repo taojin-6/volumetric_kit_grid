@@ -146,7 +146,9 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
 core::Result<PendingEncode> Encoder::record_front(
     core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
     core::StageMetrics* metrics) try {
+  // As encode(): the stage's row placed ahead of its breakdowns'.
   core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
+  if (metrics != nullptr) metrics->add_cpu("codec encode", 0.0);
   return front(batch, grid, metrics);
 } catch (const std::bad_alloc&) {
   return core::exception_status("Encoder::record_front",
@@ -224,15 +226,22 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
   const auto bound = static_cast<std::uint32_t>(gp.num_blocks);
   const std::uint32_t k = params.coefficient_count;
   VKC_TRY(store_->reserve(bound, k));
-  // The steps the forward reads, inline, ahead of the batch's first
-  // dispatch, so MoltenVK opens no blit encoder for them mid-batch.
-  VKC_TRY(transform_->record_steps(batch, params));
+  // The steps the forward reads, inline, ahead of this half's dispatches --
+  // not the batch's first in a sender's batch, whose prep and fusion come
+  // before -- until a frame has finished with them: they never change, so a
+  // warm encoder records no update here.
+  if (!steps_held_) VKC_TRY(transform_->record_steps(batch, params));
 
   // Each breakdown's host half is the stage's own, so they record into a
   // scratch row set and keep their device halves alone, which the batch's
-  // device rows hand back by name.
+  // device rows hand back by name. Each one's row is placed in the caller's
+  // rows as it opens, its host half 0, so a caller sharing the batch tells
+  // the encode's device rows by the rows it holds.
   core::StageMetrics parts;
   core::StageMetrics* const breakdowns = metrics != nullptr ? &parts : nullptr;
+  const auto place = [metrics](const char* name) {
+    if (metrics != nullptr) metrics->add_cpu(name, 0.0);
+  };
   // The active set: the map's list while it still holds, its count set
   // here, or one compacted into this batch ("  ..encode set": apart from a
   // fuse's "  ..active set" timed into the same rows), its count left on
@@ -245,6 +254,7 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
     list = held->buffer;
   } else {
     core::GpuStageScope compaction(breakdowns, gpu_timer_, "  ..encode set");
+    place("  ..encode set");
     VKC_ASSIGN(const volume::RecordedBlockList active,
                grid.map().record_compaction(batch, nullptr, &compaction));
     list = active.buffer;
@@ -255,6 +265,7 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
   // device before the transform: a fused band is mostly never integrated.
   {
     core::GpuStageScope row(breakdowns, gpu_timer_, "  ..observed");
+    place("  ..observed");
     VKC_TRY(transform_->record_observed(batch, grid, *list, list_count,
                                         config_.true_sdf, &row));
   }
@@ -271,6 +282,7 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
   // is still slower than intra's (DECISIONS, the 2026-10-17 freeze).
   {
     core::GpuStageScope forward(breakdowns, gpu_timer_, "  ..forward");
+    place("  ..forward");
     const detail::FrameBuffers frame = store_->frame_buffers();
     const volume::DeviceCount observed = transform_->observed_count();
     VKC_TRY(lists_->record_sort(batch, transform_->observed_list(), observed,
@@ -367,6 +379,7 @@ core::Result<EncodedFrame> Encoder::finish_frame(const PendingEncode& pending,
   gop_position_ = (frame.type == FrameType::kInter ? gop_position_ : 0) + 1;
   if (gop_position_ == config_.intra_period) gop_position_ = 0;
   force_intra_ = false;
+  steps_held_ = true;  // its front batch ran, writing them
   return frame;
 }
 
