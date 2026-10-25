@@ -78,6 +78,22 @@ core::Status StreamWriter::append(const RecordInfo& info,
   constexpr std::string_view kApi = "StreamWriter::append";
   try {
     VKC_TRY(check_open(kApi));
+    if (data == nullptr && size != 0) {
+      return detail::null_payload(size).with_context(std::string(kApi) + ": " +
+                                                     path_);
+    }
+    return append(info, RecordPayload::of(data, size));
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
+  }
+}
+
+core::Status StreamWriter::append(const RecordInfo& info,
+                                  const RecordPayload& payload) {
+  constexpr std::string_view kApi = "StreamWriter::append";
+  try {
+    VKC_TRY(check_open(kApi));
+    const std::size_t size = payload.size();
     // The index entry's room comes first, before the encoder counts the
     // record, so a refused allocation leaves the writer unchanged and a
     // record once written is always indexed.
@@ -87,17 +103,18 @@ core::Status StreamWriter::append(const RecordInfo& info,
                                                 64 * detail::kKeyEntryBytes));
     }
     core::Result<ChunkEncoder::RecordFraming> framed =
-        encoder_.frame(info, data, size);
+        encoder_.frame(info, payload);
     if (!framed.ok()) {
       return std::move(framed).status().with_context(std::string(kApi) + ": " +
                                                      path_);
     }
     const ChunkEncoder::RecordFraming& framing = *framed;
-    const detail::Bytes parts[3] = {
+    const detail::Bytes parts[4] = {
         {framing.header.data(), framing.header.size()},
-        {data, size},
+        {payload.first(), payload.first_size()},
+        {payload.second(), payload.second_size()},
         {kZeros, framing.padding}};
-    core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 3);
+    core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 4);
     if (!written.ok()) {
       failure_ = std::move(written);
       return failure_;

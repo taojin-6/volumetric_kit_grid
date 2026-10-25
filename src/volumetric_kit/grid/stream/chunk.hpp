@@ -53,6 +53,10 @@ inline void store_le64(std::uint8_t* p, std::uint64_t v) {
 std::uint32_t crc32(const void* data, std::size_t size,
                     std::uint32_t crc = 0) noexcept;
 
+// The refusal of a null payload of `size` bytes, nonzero, which the
+// encoder's frame words and the writer's append wraps (InvalidArgument).
+core::Status null_payload(std::size_t size);
+
 // --- Tags and sizes. ---------------------------------------------------------
 
 // A tag as the little-endian word its four bytes make.

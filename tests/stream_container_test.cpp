@@ -7,8 +7,9 @@
 // every record field and the payloads; seeking by key; unknown kinds, chunks
 // and header fields; the payload limit and a body size near 2^64; every
 // writer and reader refusal, a file cut short after its open included; reads
-// into caller memory; two threads reading one reader; and a track's nominal
-// period, 30 a second's for an unknown rate.
+// into caller memory; a payload appended in two runs, under the one CRC its
+// RecordPayload computed; two threads reading one reader; and a track's
+// nominal period, 30 a second's for an unknown rate.
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
@@ -813,6 +815,75 @@ int caller_memory_case(const std::string& dir) {
   return 0;
 }
 
+// --- A payload in two runs. --------------------------------------------------
+
+// A payload in two runs is appended as their joined bytes: the file is the
+// one appending them joined writes, at every split, an empty run included,
+// and each record reads back joined. Its CRC is RecordPayload::of's alone:
+// bytes changed after `of` are written under the CRC of what they held, which
+// the reader then refuses, so the writer computed no CRC of its own.
+int two_runs_case(const std::string& dir) {
+  const Bytes body = pattern(300, 3);
+  const std::string joined = dir + "/joined.vrst";
+  const std::string split = dir + "/split.vrst";
+  const std::size_t splits[] = {0, 1, 7, 150, 299, 300};
+  {
+    auto a = create(joined, one_track());
+    auto b = create(split, one_track());
+    CHECK(a != nullptr && b != nullptr);
+    std::uint64_t seq = 0;
+    for (const std::size_t at : splits) {
+      CHECK(append(*a, info(0, at == 0, 0, seq), body));
+      const stream::RecordPayload p = stream::RecordPayload::of(
+          body.data(), at, body.data() + at, body.size() - at);
+      CHECK(p.first() == body.data() && p.first_size() == at);
+      CHECK(p.second_size() == body.size() - at && p.size() == body.size());
+      CHECK(p.crc() == vrst::crc32(body.data(), body.size()));
+      CHECK(b->append(info(0, at == 0, 0, seq), p).ok());
+      ++seq;
+    }
+    CHECK(a->finish().ok() && b->finish().ok());
+  }
+  CHECK(vr_test::read_bytes(joined) == vr_test::read_bytes(split));
+  auto r = open(split);
+  CHECK(r != nullptr);
+  stream::Position pos = r->begin();
+  std::size_t records = 0;
+  for (;;) {
+    stream::Record record;
+    const vkc::Result<bool> more = r->next(&pos, &record);
+    CHECK(more.ok());
+    if (!more.value()) break;
+    Bytes payload;
+    CHECK(r->read(record, &payload).ok() && payload == body);
+    ++records;
+  }
+  CHECK(records == std::size(splits));
+
+  const std::string changed = dir + "/changed.vrst";
+  {
+    auto w = create(changed, one_track());
+    CHECK(w != nullptr);
+    const Bytes head = pattern(40, 4);
+    Bytes tail = pattern(80, 5);
+    const stream::RecordPayload p = stream::RecordPayload::of(
+        head.data(), head.size(), tail.data(), tail.size());
+    tail[10] ^= 0xFF;  // after `of`
+    CHECK(w->append(info(0, true, 0, 0), p).ok());
+    CHECK(w->finish().ok());
+  }
+  auto rc = open(changed);
+  CHECK(rc != nullptr);
+  stream::Position at = rc->begin();
+  stream::Record record;
+  CHECK(rc->next(&at, &record).value());
+  Bytes payload;
+  const vkc::Status crc = rc->read(record, &payload);
+  CHECK(crc.domain() == Code::InvalidArgument &&
+        crc.message().find("CRC") != std::string::npos);
+  return 0;
+}
+
 // --- Two threads, one reader. ------------------------------------------------
 
 int concurrency_case(const std::string& dir) {
@@ -867,6 +938,7 @@ int main() {
   if (writer_refusals_case(dir) != 0) return 1;
   if (reader_refusals_case(dir) != 0) return 1;
   if (caller_memory_case(dir) != 0) return 1;
+  if (two_runs_case(dir) != 0) return 1;
   if (concurrency_case(dir) != 0) return 1;
   if (nominal_period_case(dir) != 0) return 1;
   std::puts("stream container: OK");

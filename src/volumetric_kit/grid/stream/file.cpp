@@ -31,7 +31,8 @@ static_assert(sizeof(off_t) == 8, "offsets past 2 GiB need a 64-bit off_t");
 // One read() or write() moves at most this much: macOS refuses a count above
 // INT_MAX.
 constexpr std::size_t kMaxIo = std::size_t{1} << 30;
-// The most runs one write_all takes: a record's header, payload and padding.
+// The most runs one write_all takes: a record's header, its payload's two
+// runs and its padding.
 constexpr int kMaxParts = 4;
 
 constexpr mode_t kNewFileMode =

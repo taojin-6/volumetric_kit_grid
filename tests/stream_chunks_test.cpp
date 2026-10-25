@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only tests of the .vrst chunks in memory (stream/chunks.hpp): the
-// encoder's bytes against the writer's file on 1 and 2 tracks; its refusals
+// encoder's bytes against the writer's file on 1 and 2 tracks; a payload in
+// two runs framed as their joined bytes; its refusals
 // against the writer's, messages included; the parser fed a writer's file,
 // finished or not, whole, a byte at a time and in pseudo-random pieces,
 // against the reader; the chunks it skips and a wider session header; each
@@ -144,6 +145,32 @@ int encoder_bytes_case(const std::string& dir) {
           bytes);
     CHECK(vr_test::read_bytes(base + "_unfinished.vrst") == bytes);
   }
+  return 0;
+}
+
+// A payload in two runs frames as their joined bytes do, at every split, an
+// empty run included: the same header, so the same CRC, and padding.
+int payload_runs_case() {
+  const stream::Session session = session_of(1);
+  vkc::Result<stream::ChunkEncoder> joined =
+      stream::ChunkEncoder::create(session);
+  vkc::Result<stream::ChunkEncoder> runs =
+      stream::ChunkEncoder::create(session);
+  CHECK(joined.ok() && runs.ok());
+  std::size_t i = 0;
+  for (const Appended& a : records_on(1)) {
+    const std::size_t n = a.payload.size();
+    const std::size_t at = (i++ * 7) % (n + 1);
+    const vkc::Result<stream::ChunkEncoder::RecordFraming> f =
+        joined->frame(a.info, a.payload.data(), n);
+    const vkc::Result<stream::ChunkEncoder::RecordFraming> g = runs->frame(
+        a.info, stream::RecordPayload::of(a.payload.data(), at,
+                                          a.payload.data() + at, n - at));
+    CHECK(f.ok() && g.ok());
+    CHECK(f->header == g->header && f->padding == g->padding);
+  }
+  const stream::RecordPayload none = stream::RecordPayload::of(nullptr, 0);
+  CHECK(none.size() == 0 && none.second() == nullptr);
   return 0;
 }
 
@@ -678,6 +705,7 @@ int main() {
   vr_test::Scratch scratch("recon_stream_chunks_");
   const std::string dir = scratch.path.string();
   if (encoder_bytes_case(dir) != 0) return 1;
+  if (payload_runs_case() != 0) return 1;
   if (encoder_refusals_case(dir) != 0) return 1;
   if (parser_round_trip_case(dir) != 0) return 1;
   if (parser_skips_case(dir) != 0) return 1;

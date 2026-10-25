@@ -30,6 +30,24 @@ constexpr std::uint64_t kUnbounded = ~std::uint64_t{0};
 
 }  // namespace
 
+RecordPayload RecordPayload::of(const std::uint8_t* first,
+                                std::size_t first_size,
+                                const std::uint8_t* second,
+                                std::size_t second_size) noexcept {
+  VKC_CHECK((first != nullptr || first_size == 0) &&
+                (second != nullptr || second_size == 0),
+            "RecordPayload::of takes bytes for every run with a size");
+  RecordPayload payload;
+  payload.first_ = first;
+  payload.first_size_ = first_size;
+  payload.second_ = second;
+  payload.second_size_ = second_size;
+  // The second run's CRC continues the first's, as zlib's does.
+  payload.crc_ =
+      detail::crc32(second, second_size, detail::crc32(first, first_size));
+  return payload;
+}
+
 ChunkEncoder::ChunkEncoder(std::vector<std::uint8_t> session_chunk,
                            std::size_t tracks)
     : session_chunk_(std::move(session_chunk)), state_(tracks) {}
@@ -51,6 +69,12 @@ const std::vector<std::uint8_t>& ChunkEncoder::session_chunk() const noexcept {
 
 core::Result<ChunkEncoder::RecordFraming> ChunkEncoder::frame(
     const RecordInfo& info, const std::uint8_t* data, std::size_t size) {
+  if (data == nullptr && size != 0) return detail::null_payload(size);
+  return frame(info, RecordPayload::of(data, size));
+}
+
+core::Result<ChunkEncoder::RecordFraming> ChunkEncoder::frame(
+    const RecordInfo& info, const RecordPayload& payload) {
   constexpr std::string_view kApi = "ChunkEncoder::frame";
   try {
     const auto refuse = [&](const std::string& why) {
@@ -60,9 +84,7 @@ core::Result<ChunkEncoder::RecordFraming> ChunkEncoder::frame(
       return refuse("track " + std::to_string(info.track) +
                     ", but the session has " + std::to_string(state_.size()));
     }
-    if (data == nullptr && size != 0) {
-      return refuse("a null payload of " + std::to_string(size) + " bytes");
-    }
+    const std::size_t size = payload.size();
     TrackState& state = state_[info.track];
     if (state.any && info.seq <= state.last_seq) {
       return refuse("track " + std::to_string(info.track) + "'s seq " +
@@ -76,8 +98,7 @@ core::Result<ChunkEncoder::RecordFraming> ChunkEncoder::frame(
                     std::to_string(state.last_key_pts_ns));
     }
     RecordFraming framing;
-    detail::encode_record_header(info, size, detail::crc32(data, size),
-                                 framing.header);
+    detail::encode_record_header(info, size, payload.crc(), framing.header);
     framing.padding = static_cast<std::size_t>(detail::padding(size));
     state.any = true;
     state.last_seq = info.seq;

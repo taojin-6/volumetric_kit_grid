@@ -7,8 +7,10 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <string>
 
 #include "file.hpp"
+#include "volumetric_kit/core/base/exception_status.hpp"
 
 namespace volumetric_kit::recon::stream::detail {
 namespace {
@@ -202,6 +204,17 @@ std::uint32_t crc32(const void* data, std::size_t size,
   }
   for (; size > 0; --size, ++p) c = t[0][(c ^ *p) & 0xFFu] ^ (c >> 8);
   return ~c;
+}
+
+core::Status null_payload(std::size_t size) {
+  try {
+    return core::Status::invalid_argument(
+        "ChunkEncoder::frame: a null payload of " + std::to_string(size) +
+        " bytes");
+  } catch (...) {
+    return core::exception_status("ChunkEncoder::frame",
+                                  core::Status::Code::InvalidArgument);
+  }
 }
 
 core::Status encode_session(std::string_view api, const Session& session,
