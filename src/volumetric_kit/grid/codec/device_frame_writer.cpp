@@ -393,12 +393,12 @@ core::Status DeviceFrameWriter::record_code(core::CommandBatch& batch,
     coded.update_size = update_size;
     coded.new_count = a;
   }
-  front_slot_ = core::HostSlot{};
   frame_ = std::move(coded);
   type_ = type;
   entries_ = entries;
   segments_ = segments;
   if (entries == 0) {
+    front_slot_ = core::HostSlot{};
     coded_ = true;
     return {};
   }
@@ -439,8 +439,10 @@ core::Status DeviceFrameWriter::record_code(core::CommandBatch& batch,
                       "codec.encode_back_results"));
   VKC_TRY(ensure_ring(payload_ring_, *device_, *allocator_, slot_bytes,
                       "codec.encode_payload"));
-  VKC_ASSIGN(back_slot_, back_ring_->claim(back_bytes));
-  VKC_ASSIGN(payload_slot_, payload_ring_->claim(slot_bytes));
+  // Keep failed attempts from holding a slot the next attempt needs, even
+  // when the caller still holds the preceding EncodedFrame's payload.
+  VKC_ASSIGN(core::HostSlot back_slot, back_ring_->claim(back_bytes));
+  VKC_ASSIGN(core::HostSlot payload_slot, payload_ring_->claim(slot_bytes));
   slot_bytes_ = slot_bytes;
   // In place the device writes the slot itself; copied, the batch copies the
   // payload's likely size, the last frame of its type's bytes per entry plus
@@ -459,8 +461,8 @@ core::Status DeviceFrameWriter::record_code(core::CommandBatch& batch,
   VKC_TRY(batch.upload(tables_, 0, table_entries.data(), entry_bytes));
   VKC_TRY(batch.zero(failed_, 0, kWordBytes));
   VKC_ASSIGN(const VkBuffer back_results,
-             batch.output(back_slot_, 0, back_bytes));
-  VKC_ASSIGN(const VkBuffer payload, batch.output(payload_slot_, 0, copied_));
+             batch.output(back_slot, 0, back_bytes));
+  VKC_ASSIGN(const VkBuffer payload, batch.output(payload_slot, 0, copied_));
 
   const core::Buffer& starts = layout_->starts();
   const core::Buffer& slot_offsets = layout_->slot_offsets();
@@ -501,6 +503,11 @@ core::Status DeviceFrameWriter::record_code(core::CommandBatch& batch,
                          max_workgroup_count_x_, stage));
   VKC_TRY(batch.dispatch_indirect(gather, &push, sizeof(push), gather_args_, 0,
                                   stage));
+  back_slot_ = std::move(back_slot);
+  payload_slot_ = std::move(payload_slot);
+  // Until recording succeeds, record_back must still see the front's real
+  // counts on retry, never front()'s default-zero result for a missing slot.
+  front_slot_ = core::HostSlot{};
   coded_ = true;
   return {};
 }

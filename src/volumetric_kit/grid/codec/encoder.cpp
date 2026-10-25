@@ -132,11 +132,9 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
     abandon(pending);
     return ran;
   }
-  VKC_ASSIGN(const EncodedFrame frame, finish_frame(pending, metrics));
   std::vector<std::uint8_t> bytes;
-  bytes.reserve(frame.size());
-  bytes.assign(frame.head.begin(), frame.head.end());
-  bytes.insert(bytes.end(), frame.payload, frame.payload + frame.payload_size);
+  const auto frame = finish_frame(pending, metrics, &bytes);
+  if (!frame.ok()) return frame.status();
   return bytes;
 } catch (const std::bad_alloc&) {
   return core::exception_status("Encoder::encode",
@@ -348,8 +346,9 @@ core::Status Encoder::back(core::CommandBatch& batch,
   return {};
 }
 
-core::Result<EncodedFrame> Encoder::finish_frame(const PendingEncode& pending,
-                                                 core::StageMetrics* metrics) {
+core::Result<EncodedFrame> Encoder::finish_frame(
+    const PendingEncode& pending, core::StageMetrics* metrics,
+    std::vector<std::uint8_t>* bytes) {
   if (!holds(pending)) {
     return fail("finish",
                 "the pending frame is not this encoder's last record "
@@ -371,6 +370,16 @@ core::Result<EncodedFrame> Encoder::finish_frame(const PendingEncode& pending,
                               std::to_string(header.block_count) +
                               " blocks of the " + std::to_string(set->blocks) +
                               " the forward made (a bug)");
+  }
+  // encode() returns contiguous bytes, so its allocation must succeed before
+  // this frame replaces the reference or consumes the period/force request.
+  if (bytes != nullptr) {
+    bytes->reserve(frame.size());
+    bytes->assign(frame.head.begin(), frame.head.end());
+    if (frame.payload_size != 0) {
+      bytes->insert(bytes->end(), frame.payload,
+                    frame.payload + frame.payload_size);
+    }
   }
   store_->commit(detail::FrameReference{
       detail::frame_hash(frame.head.data(), frame.head.size(), frame.payload,

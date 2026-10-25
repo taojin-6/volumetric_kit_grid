@@ -413,10 +413,11 @@ class VR_VOLUME_API VoxelBlockGrid {
   // record_free_stale's body under `stage`, the caller's "block stamps":
   // the compaction (its "  ..stale set" device half alone), the stamp pass
   // over its count into stale_list_ and stale_count_, and the removal of
-  // what it lists.
-  core::Result<RecordedRounds> record_stale(core::CommandBatch& batch,
-                                            std::uint32_t max_age,
-                                            core::GpuStageScope& stage);
+  // what it lists. For the blocking wrapper, read the initial device count
+  // into `initial_count` when the batch completes.
+  core::Result<RecordedRounds> record_stale(
+      core::CommandBatch& batch, std::uint32_t max_age,
+      core::GpuStageScope& stage, std::uint32_t* initial_count = nullptr);
   // free_stale_blocks' and record_free_stale's first steps: the checks, and
   // the timer a timed pass makes once.
   core::Status prepare_free_pass(std::uint32_t max_age,

@@ -326,6 +326,7 @@ class VR_CODEC_API Encoder {
   ///         written); `Status::Code::InvalidArgument` for a pending this
   ///         encoder no longer holds or whose back is recorded, or coded
   ///         segments that could outgrow 4 GiB; or a buffer failure.
+  ///         On failure, discard @p batch before retrying @p pending.
   /// @pre At most one @ref EncodedFrame of this encoder's is held.
   core::Status record_back(core::CommandBatch& batch,
                            const PendingEncode& pending,
@@ -375,8 +376,9 @@ class VR_CODEC_API Encoder {
                                     core::StageMetrics* metrics);
   core::Status back(core::CommandBatch& batch, const PendingEncode& pending,
                     core::StageMetrics* metrics);
-  core::Result<EncodedFrame> finish_frame(const PendingEncode& pending,
-                                          core::StageMetrics* metrics);
+  core::Result<EncodedFrame> finish_frame(
+      const PendingEncode& pending, core::StageMetrics* metrics,
+      std::vector<std::uint8_t>* bytes = nullptr);
   // Whether `pending` is this encoder's unfinished last record.
   bool holds(const PendingEncode& pending) const noexcept;
 

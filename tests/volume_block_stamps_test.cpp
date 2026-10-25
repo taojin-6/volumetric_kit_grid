@@ -306,6 +306,38 @@ int gpu_main(vr_test::GpuContext& gpu) {
   }
   vr::detail::set_test_groups_per_dispatch(0);
 
+  // A completed recording may still be unsettled when the blocking free
+  // pass starts. Count only this pass's removals: an earlier removal must not
+  // be counted twice, and an earlier allocation must not hide a removal.
+  for (const bool removes : {false, true}) {
+    auto g = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
+    CHECK(g.ok());
+    const vol::BlockIndex block = at(1900);
+    auto list = vr_test::detail::device_coords(gpu, &block, 1);
+    const std::uint32_t one = 1;
+    auto count = vr_test::upload_device_buffer(dev, alloc, &one, sizeof(one));
+    CHECK(list.ok() && count.ok());
+    if (removes) {
+      CHECK(vr_test::allocate_blocks(gpu, g->map(), &block, 1).value() == 0);
+    }
+    vkc::CommandBatch batch(dev, alloc);
+    const vol::DeviceCount n{&*count, 0, one};
+    auto earlier = removes ? g->record_remove(batch, *list, n)
+                           : g->map().record_allocate(batch, *list, n);
+    CHECK(earlier.ok() && batch.submit().ok());
+    CHECK(g->map().allocated_blocks() == (removes ? 1u : 0u));
+    auto before = slots(*g);
+    CHECK(before.ok() && before->size() == (removes ? 0u : 1u));
+    g->map().advance_tick();
+    g->map().advance_tick();
+    auto freed = g->free_stale_blocks(1);
+    CHECK(freed.ok() && freed.value() == (removes ? 0u : 1u));
+    auto after = slots(*g);
+    CHECK(after.ok() && after->empty() && g->map().allocated_blocks() == 0);
+    CHECK(g->map().settle(*earlier).value().total == 0);
+    CHECK(g->map().allocated_blocks() == 0);
+  }
+
   // The record form is the blocking pass: of two grids holding 40 blocks, 10
   // weighted, one freed by free_stale_blocks and one by record_free_stale in
   // a caller's batch keep the same 10. A block the batch allocates after the

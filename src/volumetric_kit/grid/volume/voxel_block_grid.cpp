@@ -470,7 +470,7 @@ void VoxelBlockGrid::place_free_pass_rows(core::StageMetrics* metrics) {
 
 core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
     core::CommandBatch& batch, std::uint32_t max_age,
-    core::GpuStageScope& stage) {
+    core::GpuStageScope& stage, std::uint32_t* initial_count) {
   VKC_ASSIGN(const AttributeView weight, attribute("weight"));
   // Every block slot's room, since only the device knows how many are stale;
   // every batch this grid recorded into before has resolved (the @pre).
@@ -509,9 +509,19 @@ core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
   VKC_TRY(recon::detail::dispatch_slices(batch, stamp_kernel_, push, groups,
                                          &stage));
   // Each stale block zeroed, then freed, from the list and count the pass
-  // left: no coordinate or count crosses the bus.
-  return record_remove(batch, stale_list_, DeviceCount{&stale_count_, 0, slots},
-                       nullptr, &stage);
+  // left: the removal needs no host coordinate or count.
+  VKC_ASSIGN(
+      RecordedRounds removed,
+      record_remove(batch, stale_list_, DeviceCount{&stale_count_, 0, slots},
+                    nullptr, &stage));
+  if (initial_count != nullptr) {
+    // The removal leaves the compaction's count unchanged. Read it beside
+    // the result, since an earlier unsettled recording can leave the host's
+    // occupancy stale in either direction.
+    VKC_TRY(batch.readback(*active.count, 0, sizeof(*initial_count),
+                           initial_count));
+  }
+  return removed;
 }
 
 core::Result<RecordedRounds> VoxelBlockGrid::record_free_stale(
@@ -529,9 +539,10 @@ core::Result<std::uint32_t> VoxelBlockGrid::free_stale_blocks(
   // The row spans the wait too, and takes the batch's device halves after.
   core::GpuStageScope stage(metrics, gpu_timer_, "block stamps");
   place_free_pass_rows(metrics);
-  const std::uint32_t held = map_.allocated_blocks();
+  std::uint32_t held = 0;
   core::CommandBatch batch(*device_, *allocator_);
-  VKC_ASSIGN(const RecordedRounds removed, record_stale(batch, max_age, stage));
+  VKC_ASSIGN(const RecordedRounds removed,
+             record_stale(batch, max_age, stage, &held));
   VKC_ASSIGN(core::PendingBatch pending, batch.submit_async({}, {}));
   VKC_TRY(pending.wait());
   if (metrics != nullptr) metrics->merge_device(pending.device_rows());

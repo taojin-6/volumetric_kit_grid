@@ -1305,6 +1305,7 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
                         std::move(stamps_)};
   const VoxelGridParams old_grid = grid_;
   const std::uint32_t old_heap_free = heap_free_;
+  const std::uint64_t old_settled_serial = settled_serial_;
   auto commit = [this](PersistentBuffers& b, const VoxelGridParams& g) {
     entries_ = std::move(b.entries);
     heap_ = std::move(b.heap);
@@ -1395,6 +1396,8 @@ core::Status VoxelHashMap::resize(std::int32_t new_num_buckets) {
   if (!st.ok()) {
     commit(old, old_grid);  // roll back to the untouched live map
     heap_free_ = old_heap_free;
+    // A completed allocation may still need to settle into the old counter.
+    settled_serial_ = old_settled_serial;
     return st;
   }
   return {};
