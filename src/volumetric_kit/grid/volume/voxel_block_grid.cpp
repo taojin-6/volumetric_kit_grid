@@ -445,7 +445,7 @@ core::Result<std::uint32_t> VoxelBlockGrid::block_pass(
     core::StageMetrics* metrics) {
   VKC_ASSIGN(const AttributeView weight, attribute("weight"));
   VKC_ASSIGN(const DeviceBlockList active,
-             map_.compact_active_blocks_on_device(metrics));
+             map_.compact_active_blocks_on_device(metrics, "  ..stale set"));
   if (active.count == 0) return std::uint32_t{0};
   const VkDeviceSize list_bytes =
       VkDeviceSize(active.count) * sizeof(BlockIndex);

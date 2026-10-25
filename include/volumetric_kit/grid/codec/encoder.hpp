@@ -184,9 +184,9 @@ class VR_CODEC_API Encoder {
   ///                 volume::VoxelHashMap::compact_active_blocks_on_device),
   ///                 which an extract after this takes back from it.
   /// @param metrics  Optional `StageMetrics` collecting a `"codec encode"`
-  ///                 row with both halves -- its device half is the transform
-  ///                 and the rANS kernels -- over the breakdown rows
-  ///                 `"  ..active set"` (the compaction, when the map holds
+  ///                 row with both halves over the breakdown rows, each with
+  ///                 its own device half:
+  ///                 `"  ..encode set"` (the compaction, when the map holds
   ///                 no list that is still its active set), `"  ..observed"`
   ///                 (finding the blocks to code, with
   ///                 @ref EncoderConfig::true_sdf's passes),

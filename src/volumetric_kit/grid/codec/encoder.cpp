@@ -80,11 +80,13 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   }
 
   // The active set, on the device and inside this stage, so its row is a
-  // breakdown ("  ..active set"). The map hands back its last list while it
-  // still holds, and keeps this one for the extract after, which then
-  // compacts nothing.
-  VKC_ASSIGN(const volume::DeviceBlockList list,
-             grid.map().compact_active_blocks_on_device(metrics));
+  // breakdown ("  ..encode set": apart from a fuse's "  ..active set" timed
+  // into the same rows). The map hands back its last list while it still
+  // holds, and keeps this one for the extract after, which then compacts
+  // nothing.
+  VKC_ASSIGN(
+      const volume::DeviceBlockList list,
+      grid.map().compact_active_blocks_on_device(metrics, "  ..encode set"));
   // Only the blocks with an observed voxel are coded -- with true_sdf, only
   // those holding surface, the cut set left beside them -- found on the
   // device before the transform: a fused band is mostly never integrated,
@@ -92,9 +94,9 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   // Only their count crosses.
   std::uint32_t observed = 0;
   {
-    core::StageScope row(metrics, "  ..observed");
+    core::GpuStageScope row(metrics, gpu_timer_, "  ..observed");
     VKC_ASSIGN(observed,
-               transform_->observed(grid, list, config_.true_sdf, &stage));
+               transform_->observed(grid, list, config_.true_sdf, &row));
   }
 
   // A P-frame codes against the frame returned last, unless the rules on
@@ -128,37 +130,37 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
   std::uint32_t rejected = 0;
   detail::ResidentBlocks entries;
   {
-    core::StageScope forward(metrics, "  ..forward");
+    core::GpuStageScope forward(metrics, gpu_timer_, "  ..forward");
     VKC_TRY(store_->reserve(observed, params.coefficient_count));
     const detail::FrameBuffers frame = store_->frame_buffers();
     core::CommandBatch batch(*device_, *allocator_);
     VKC_ASSIGN(const core::Buffer* sorted,
                lists_->record_sort(batch, transform_->observed_list(), observed,
-                                   &stage));
+                                   &forward));
     VKC_TRY(batch.copy(*sorted, 0, *frame.list, 0,
                        VkDeviceSize(observed) * sizeof(volume::BlockIndex),
-                       &stage));
+                       &forward));
     VKC_ASSIGN(entries, transform_->record_forward(
                             batch, grid, *frame.list, observed, params,
                             *frame.masks, *frame.coefficients, rejected,
                             config_.true_sdf ? &transform_->cut_set() : nullptr,
-                            &stage));
+                            &forward));
     if (reference != nullptr) {
       VKC_ASSIGN(entries,
                  store_->record_diff(batch, observed, params.coefficient_count,
-                                     &stage));
+                                     &forward));
     }
     VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
-                                  config_.update_size, &stage));
+                                  config_.update_size, &forward));
     VKC_TRY(batch.submit());
     VKC_TRY(
         detail::DctTransform::check_rejected("forward", rejected, observed));
   }
   std::vector<std::uint8_t> bytes;
   {
-    core::StageScope entropy(metrics, "  ..rans encode");
+    core::GpuStageScope entropy(metrics, gpu_timer_, "  ..rans encode");
     VKC_ASSIGN(bytes, writer_->finish(entries, gp.voxel_size, gp.trunc_dist,
-                                      params, reference, &stage));
+                                      params, reference, &entropy));
   }
   // Only a frame returned becomes the reference, and counts toward the
   // period. It holds every block the forward made -- a P-frame's survivors

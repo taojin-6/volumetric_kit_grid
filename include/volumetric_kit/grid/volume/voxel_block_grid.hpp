@@ -328,7 +328,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   /// Its kernels are built by @ref create.
   /// @param metrics  Optional rows: a `"block stamps"` row with both halves,
   ///                 spanning the frees too, over the compaction's
-  ///                 `"  ..active set"`.
+  ///                 `"  ..stale set"`.
   /// @return The blocks freed; `Status::Code::InvalidArgument` for a
   ///         @p max_age of 0, a moved-from grid or one without a `float`
   ///         `weight` attribute; or what @ref VoxelHashMap::remove refuses.

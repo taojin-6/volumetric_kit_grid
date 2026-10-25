@@ -12,12 +12,20 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 
 namespace vr_example {
 
 namespace vkc = volumetric_kit::core;
+
+/// @return The nearest-rank @p percent th percentile of @p sorted, ascending
+///         and not empty: its ceil(@p percent / 100 n)-th smallest.
+template <typename T>
+T nearest_rank(const std::vector<T>& sorted, std::size_t percent) {
+  return sorted[(sorted.size() * percent + 99) / 100 - 1];
+}
 
 /// @return @p rows' row named @p name, or null.
 inline const vkc::StageRow* find_row(const vkc::StageMetrics& rows,

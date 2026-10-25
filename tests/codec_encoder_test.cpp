@@ -168,7 +168,7 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
   const vkc::StageRow* top = find_row(m, "codec encode");
   CHECK(top != nullptr);
   for (const char* sub :
-       {"  ..active set", "  ..observed", "  ..forward", "  ..rans encode"}) {
+       {"  ..encode set", "  ..observed", "  ..forward", "  ..rans encode"}) {
     const vkc::StageRow* row = find_row(m, sub);
     CHECK(row != nullptr);
     CHECK(row->cpu_ms <= top->cpu_ms);
@@ -218,7 +218,7 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::StageMetrics m;
   vkc::Result<std::vector<std::uint8_t>> a = enc.encode(grid, &m);
   CHECK(a.ok());
-  CHECK(find_row(m, "  ..active set") == nullptr);
+  CHECK(find_row(m, "  ..encode set") == nullptr);
   CHECK(grid.map().check_device_block_list(last.value(), "test").ok());
 
   // A list the encoder compacted itself, after an allocation, holds for the
@@ -228,7 +228,7 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::StageMetrics again;
   vkc::Result<std::vector<std::uint8_t>> b = enc.encode(grid, &again);
   CHECK(b.ok() && b.value() == a.value());
-  CHECK(find_row(again, "  ..active set") != nullptr);
+  CHECK(find_row(again, "  ..encode set") != nullptr);
   vkc::StageMetrics extract;  // a compaction after it, which it skips
   vkc::Result<vol::DeviceBlockList> next =
       grid.map().compact_active_blocks_on_device(&extract);

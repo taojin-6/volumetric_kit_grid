@@ -165,6 +165,13 @@ int gpu_main(vr_test::GpuContext& gpu) {
     CHECK(batch.submit().ok());
   }
   map.advance_tick();
+  {
+    // A compaction of the map's own list, so the pass below compacts afresh
+    // rather than taking back the list the pass before left.
+    vkc::CommandBatch batch(dev, alloc);
+    CHECK(map.record_compaction(batch, nullptr).ok());
+    CHECK(batch.submit().ok());
+  }
   // Timed, the first timed pass, which makes the grid's timer: the stamps and
   // the frees in one row.
   vkc::StageMetrics gc;
@@ -175,6 +182,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
     const vkc::StageRow& pass = gc.rows()[0];
     CHECK(std::strcmp(pass.name, "block stamps") == 0);
     CHECK(pass.wait_ms <= pass.cpu_ms);
+    // Its compaction, named apart from a fuse's "  ..active set" and an
+    // encode's "  ..encode set", which a sender times into the same rows.
+    CHECK(gc.rows().size() >= 2 &&
+          std::strcmp(gc.rows()[1].name, "  ..stale set") == 0);
     vkc::Result<vkc::GpuTimer> probe = vkc::GpuTimer::create(dev);
     CHECK(probe.ok());
     if (probe.value().available()) {
