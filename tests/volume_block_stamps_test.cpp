@@ -8,7 +8,10 @@
 // been neither for more than max_age ticks, zeroing their voxels. A freed
 // slot's record is zeroed, resize keeps every record in its slot (the rehash
 // does not restamp), and clear zeroes them all. The first timed pass makes
-// the grid's timer and times its row. Skips where no device is present.
+// the grid's timer and times its row. record_free_stale, in a caller's batch,
+// frees what the blocking pass frees, zeroing first, in one warm submit, and
+// leaves a contended block for the next pass. Skips where no device is
+// present.
 
 #include <cstdint>
 #include <cstdio>
@@ -100,6 +103,11 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(made.ok());
   vol::VoxelBlockGrid& grid = made.value();
   vol::VoxelHashMap& map = grid.map();
+  CHECK(map.tick() == 1);
+  // The clock skips 0 both ways.
+  map.rewind_tick();
+  CHECK(map.tick() == ~std::uint32_t{0});
+  map.advance_tick();
   CHECK(map.tick() == 1);
 
   // Tick 1: three blocks, requested now and never weighted.
@@ -298,6 +306,110 @@ int gpu_main(vr_test::GpuContext& gpu) {
   }
   vr::detail::set_test_groups_per_dispatch(0);
 
+  // The record form is the blocking pass: of two grids holding 40 blocks, 10
+  // weighted, one freed by free_stale_blocks and one by record_free_stale in
+  // a caller's batch keep the same 10. A block the batch allocates after the
+  // pass reads zeros, every voxel having held 1: each stale block is zeroed
+  // before its index is freed. A warm pass is one submit, no staging buffer.
+  {
+    auto a = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
+    auto b = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
+    CHECK(a.ok() && b.ok());
+    std::vector<vol::BlockIndex> coords;
+    for (int i = 0; i < 40; ++i) coords.push_back(at(2000 + i));
+    for (vol::VoxelBlockGrid* g : {&a.value(), &b.value()}) {
+      CHECK(
+          vr_test::allocate_blocks(gpu, g->map(), coords.data(), 40).value() ==
+          0);
+      auto t = vr_test::read_attribute<float>(dev, alloc, *g, "tsdf");
+      auto w = vr_test::read_attribute<float>(dev, alloc, *g, "weight");
+      auto at_slot = slots(*g);
+      CHECK(t.ok() && w.ok() && at_slot.ok());
+      for (float& v : t.value()) v = 1.0f;
+      for (const auto& [coord, s] : at_slot.value()) {
+        if (std::get<0>(coord) < 2010) w.value()[std::size_t{s} * 512] = 1.0f;
+      }
+      CHECK(vr_test::write_attribute(dev, alloc, *g, "tsdf", t.value()).ok());
+      CHECK(vr_test::write_attribute(dev, alloc, *g, "weight", w.value()).ok());
+      g->map().advance_tick();
+      g->map().advance_tick();
+    }
+    auto freed_a = a->free_stale_blocks(1);
+    CHECK(freed_a.ok() && freed_a.value() == 30);
+
+    std::vector<vol::BlockIndex> fresh;
+    for (int i = 0; i < 30; ++i) fresh.push_back(at(3000 + i));
+    auto fresh_list = vr_test::detail::device_coords(gpu, fresh.data(), 30);
+    const std::uint32_t thirty = 30;
+    auto count =
+        vr_test::upload_device_buffer(dev, alloc, &thirty, sizeof(thirty));
+    CHECK(fresh_list.ok() && count.ok());
+    vkc::CommandBatch batch(dev, alloc);
+    auto removed = b->record_free_stale(batch, 1);
+    auto placed = b->map().record_allocate(batch, *fresh_list,
+                                           vol::DeviceCount{&*count, 0, 30});
+    CHECK(removed.ok() && placed.ok() && batch.submit().ok());
+    auto r = b->map().settle(*removed);
+    CHECK(r.ok() && r->total == 0 && r->terminal == 0);
+    CHECK(b->map().allocated_blocks() == 10);
+    auto p = b->map().settle(*placed);
+    CHECK(p.ok() && p->total == 0 && b->map().allocated_blocks() == 40);
+
+    auto kept_a = slots(*a);
+    auto kept_b = slots(*b);
+    CHECK(kept_a.ok() && kept_b.ok() && kept_a->size() == 10);
+    auto t = vr_test::read_attribute<float>(dev, alloc, *b, "tsdf");
+    CHECK(t.ok());
+    for (const auto& [coord, s] : kept_a.value()) {
+      CHECK(kept_b->count(coord) == 1);
+    }
+    for (const auto& [coord, s] : kept_b.value()) {
+      const float want = std::get<0>(coord) >= 3000 ? 0.0f : 1.0f;
+      for (std::size_t k = 0; k < 512; ++k) {
+        CHECK(t.value()[std::size_t{s} * 512 + k] == want);
+      }
+    }
+
+    for (int pass = 0; pass < 2; ++pass) {
+      const vkc::DeviceCounters was = dev.counters();
+      vkc::CommandBatch warm(dev, alloc);
+      auto again = a->record_free_stale(warm, 1);
+      CHECK(again.ok() && warm.submit().ok());
+      const vkc::DeviceCounters now = dev.counters();
+      CHECK(a->map().settle(*again).ok() && a->map().allocated_blocks() == 10);
+      CHECK(now.submits - was.submits == 1);
+      CHECK(now.staging_buffers == was.staging_buffers);
+    }
+  }
+
+  // Contention past the removal's rounds: eight stale blocks in one 8-slot
+  // bucket, every free queued on its lock. A block a lost race keeps stays
+  // for the next pass, which frees it; lavapipe frees all eight at once.
+  {
+    vol::VoxelGridParams one = params();
+    one.num_buckets = 1;
+    one.num_blocks = 8;
+    auto g = vol::VoxelBlockGrid::create(dev, alloc, one, attrs, 2);
+    CHECK(g.ok());
+    std::vector<vol::BlockIndex> eight;
+    for (int i = 0; i < 8; ++i) eight.push_back(at(i));
+    CHECK(vr_test::allocate_blocks(gpu, g->map(), eight.data(), 8).value() ==
+          0);
+    g->map().advance_tick();
+    g->map().advance_tick();
+    vkc::CommandBatch batch(dev, alloc);
+    auto removed = g->record_free_stale(batch, 1);
+    CHECK(removed.ok() && batch.submit().ok());
+    auto f = g->map().settle(*removed);
+    CHECK(f.ok() && f->total == f->lock && f->terminal == 0);
+    CHECK(g->map().allocated_blocks() == f->lock);
+    std::printf("  a contended pass left %u of 8 blocks\n", f->lock);
+    for (int pass = 0; pass < 8 && g->map().allocated_blocks() != 0; ++pass) {
+      CHECK(g->free_stale_blocks(1).ok());
+    }
+    CHECK(g->map().allocated_blocks() == 0);
+  }
+
   // Refusals: a max_age of 0, and a grid with no weight.
   CHECK(grid.free_stale_blocks(0).status().domain() ==
         vkc::Status::Code::InvalidArgument);
@@ -307,6 +419,14 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(vr_test::allocate_blocks(gpu, bare->map(), three, 1).ok());
   CHECK(bare->free_stale_blocks(1).status().domain() ==
         vkc::Status::Code::InvalidArgument);
+  {
+    vkc::CommandBatch refused(dev, alloc);
+    CHECK(bare->record_free_stale(refused, 1).status().domain() ==
+          vkc::Status::Code::InvalidArgument);
+    CHECK(grid.record_free_stale(refused, 0).status().domain() ==
+          vkc::Status::Code::InvalidArgument);
+    CHECK(refused.submit().ok());
+  }
 
   std::puts("volume_block_stamps: OK");
   return 0;

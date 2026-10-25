@@ -167,6 +167,10 @@ struct RecordedRounds {
   /// The outcome once the batch has run (`core::HostSlot`); empty when
   /// nothing was recorded.
   core::HostSlot result;
+  /// Which of the map's recordings this is, in record order, so a
+  /// @ref VoxelHashMap::settle of an older one never moves the heap's host
+  /// copy back past a later one, or past a blocking call since.
+  std::uint64_t serial = 0;
 };
 
 /// @brief Owns the device-side sparse voxel hash table -- the hash-entry index,
@@ -316,8 +320,13 @@ class VR_VOLUME_API VoxelHashMap {
 
   /// @brief Once the batch that recorded @p rounds has run: what the rounds
   ///        did, with the heap counter's host copy refreshed from them.
-  /// @param rounds  From this map's @ref record_allocate or
-  ///                @ref record_remove.
+  ///
+  /// Recordings settle in any order: the copy moves only to a recording later
+  /// than every one settled and every blocking call since
+  /// (@ref RecordedRounds::serial), so an older one, or one a blocking call
+  /// overtook, reports its failures and leaves the copy as it is.
+  /// @param rounds  From this map's @ref record_allocate,
+  ///                @ref record_remove or @ref record_allocate_from_depth.
   /// @return The per-reason split, @ref AllocFailures::rounds the rounds that
   ///         ran; zeros, the copy unchanged, for a recording of nothing; or
   ///         `Status::Code::InvalidArgument` for a moved-from map.
@@ -388,30 +397,54 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief @ref allocate_from_depth for several cameras' frames at once: one
   ///        submit a round rather than one a frame.
   ///
-  /// Each round dispatches every frame, in order, in one batch, and reads the
-  /// tally back once. A retry round dispatches them all again, the blocks
-  /// already present taking the lookup's lock-free path. The rounds are the
-  /// call's, not each frame's: a set has the retry budget one frame has.
-  /// Once every frame's blocks are in, they are the blocks allocating the
-  /// frames one after another gives, each perhaps in another slot; short of
-  /// that, a capacity limit can leave other frames' blocks out.
+  /// Each round dispatches every frame, in order, in one batch: it is
+  /// @ref record_allocate_from_depth, one submit and @ref settle, repeated
+  /// while lost races alone remain, up to 10 rounds, with no readback buffer.
+  /// A retry round dispatches them all again, the blocks already present
+  /// taking the lookup's lock-free path. The rounds are the call's, not each
+  /// frame's: a set has the retry budget one frame has. Once every frame's
+  /// blocks are in, they are the blocks allocating the frames one after
+  /// another gives, each perhaps in another slot; short of that, a capacity
+  /// limit can leave other frames' blocks out.
   /// @param frames        The frames. Every one is checked, as the
   ///                      one-frame overloads check theirs, before any work;
   ///                      none allocates nothing.
   /// @param out_failures  As @ref allocate_from_depth, over every frame.
   /// @param metrics       As @ref allocate_from_depth: one `"allocate"` row,
-  ///                      a device span per frame per round.
-  /// @param then          Optional: recorded into the first round's batch
-  ///                      after its dispatches and readbacks, so a caller's
-  ///                      work on the new blocks shares the round's submit.
-  ///                      With it the call runs that one round and no retry.
-  ///                      Not called when no frame has pixels.
+  ///                      a device span per round.
   /// @return As @ref allocate_from_depth, the failures summed over the frames.
   core::Result<std::uint32_t> allocate_from_depth(
       const std::vector<DepthInput>& frames,
       AllocFailures* out_failures = nullptr,
-      core::StageMetrics* metrics = nullptr,
-      const std::function<core::Status(core::CommandBatch&)>& then = {});
+      core::StageMetrics* metrics = nullptr);
+
+  /// @brief Record one round of @ref allocate_from_depth's work for @p frames
+  ///        into @p batch -- every frame's band, in order -- and its outcome
+  ///        into one of the map's result slots, which @ref settle reads once
+  ///        the batch has run. Nothing reaches the host before.
+  ///
+  /// One round: a block it leaves out to a lost lock race or a capacity
+  /// limit waits for the caller's next (@ref allocate_from_depth repeats the
+  /// round while lost races alone remain). Recording makes every device list
+  /// this map compacted before it stale, as @ref record_allocate does. A host
+  /// depth array is staged into @p batch, which keeps its device copy.
+  /// @param batch   Records the round; the caller submits it.
+  /// @param frames  As @ref allocate_from_depth checks them; each image
+  ///                unchanged until the batch has run.
+  /// @param gate    Optional: set to 0 when any allocation failed, so what is
+  ///                gated on it after the round -- a fuse that needs the whole
+  ///                band -- runs nothing. The round runs whatever it holds.
+  /// @param stage   Optional: the caller's scope, whose tile the round counts
+  ///                to.
+  /// @return Where the outcome lands (`AllocFailures::rounds` 1; an empty
+  ///         result, with nothing recorded, when no frame has pixels); or,
+  ///         with nothing recorded, @ref allocate_from_depth's refusals, a
+  ///         @p gate @ref record_allocate refuses, or every result slot held;
+  ///         or a buffer failure.
+  /// @pre As @ref record_allocate; this round counts as an allocation.
+  core::Result<RecordedRounds> record_allocate_from_depth(
+      core::CommandBatch& batch, const std::vector<DepthInput>& frames,
+      const DeviceCount* gate = nullptr, core::GpuStageScope* stage = nullptr);
 
   // TODO(volume): the candidate count is a host pass over the triangles, as
   // in tsdf's MeshIntegrator (the 2026-10-13 volume block-list entry's Next).
@@ -776,6 +809,14 @@ class VR_VOLUME_API VoxelHashMap {
   /// @brief Advance @ref tick by one, as a pass that writes voxels does before
   ///        it stamps. Skips 0 when it wraps.
   void advance_tick() noexcept { tick_ = tick_ + 1 == 0 ? 1 : tick_ + 1; }
+  /// @brief Step @ref tick back by one, for a pass that advanced it and
+  ///        wrote nothing: a fuse its gate closed on, which
+  ///        `tsdf::Fuser::finish` fuses again at the clock the set was
+  ///        recorded at, so a set takes one tick however it is fused. Skips 0
+  ///        as @ref advance_tick does.
+  void rewind_tick() noexcept {
+    tick_ = tick_ == 1 ? ~std::uint32_t{0} : tick_ - 1;
+  }
   /// @brief The device buffer of one @ref BlockStamp per block slot, for a
   ///        kernel that reads or writes a stamp. Every allocation stamps
   ///        `requested`, and every pass that writes voxels `changed`;
@@ -849,9 +890,9 @@ class VR_VOLUME_API VoxelHashMap {
   /// non-zero, to converge past transient same-bucket lock contention, until
   /// a round has no lock failure or hits a capacity limit, or the rounds run
   /// out. Re-zeroes the tally
-  /// each round. The host rounds of the depth, triangle and rehash
-  /// allocations; @ref allocate and @ref remove round on the device instead
-  /// (@ref record_rounds).
+  /// each round. The host rounds of the triangle and rehash allocations;
+  /// @ref allocate, @ref remove and @ref allocate_from_depth round through
+  /// recordings instead (@ref record_rounds, @ref record_depth).
   /// The tally's non-retryable slot is accumulated across rounds and added to
   /// the returned count; @p out_failures, when non-null, receives the
   /// full per-reason split.
@@ -862,13 +903,23 @@ class VR_VOLUME_API VoxelHashMap {
   /// @p prepare, when set, records the call's parameter uploads into the first
   /// round's batch, ahead of the dispatches. Each round is one submit, and
   /// reads back the heap counter into @ref heap_free_ beside the tally.
-  /// @p then, when set, is recorded last in the first round's batch, and that
-  /// round is the only one.
   core::Result<std::uint32_t> dispatch_with_retry(
       const std::function<core::Status(core::CommandBatch&)>& dispatches,
       AllocFailures* out_failures,
-      const std::function<core::Status(core::CommandBatch&)>& prepare = {},
-      const std::function<core::Status(core::CommandBatch&)>& then = {});
+      const std::function<core::Status(core::CommandBatch&)>& prepare = {});
+
+  /// @ref record_allocate_from_depth's body: the frames checked, then the
+  /// depth round's judge, every frame's dispatch and the gather, a host
+  /// array staged into @p uploads (one buffer a frame, kept by the caller
+  /// until @p batch has run, and reused when it holds the frame).
+  core::Result<RecordedRounds> record_depth(
+      core::CommandBatch& batch, const std::vector<DepthInput>& frames,
+      std::vector<core::Buffer>& uploads, const DeviceCount* gate,
+      core::GpuStageScope* stage);
+
+  /// A result slot claimed for a recording, the slots made at the first
+  /// (@ref kResultSlots).
+  core::Result<core::HostSlot> claim_result();
 
   /// Create a transient device-local buffer that @p batch fills with @p bytes
   /// of @p data, and bind it at @p binding of @p set. The caller keeps the
@@ -941,9 +992,10 @@ class VR_VOLUME_API VoxelHashMap {
   // remove's per-coord done flags, retained scratch grown to the largest
   // bound yet and re-zeroed per recording.
   core::Buffer remove_done_;
-  // The recorded rounds' state, four words a kind (removal first): the count
-  // the rounds read, whether the next round runs, the rounds run and the
-  // terminal failures (hash_rounds.comp). Grid-independent.
+  // The recorded rounds' state, four words a kind (removal, allocation, then
+  // a depth round): the count the rounds read, whether the next round runs,
+  // the rounds run and the terminal failures (hash_rounds.comp).
+  // Grid-independent.
   core::Buffer rounds_state_;
   // Each kind's rounds' slices, kRecordedRounds rounds of a bound's, grown
   // to the largest bound yet.
@@ -960,10 +1012,12 @@ class VR_VOLUME_API VoxelHashMap {
   // One BlockStamp per block slot (see stamps_buffer()), and the clock.
   core::Buffer stamps_;
   std::uint32_t tick_ = 1;
-  // Persistent camera params for allocate_from_depth (bound at binding 6 of
-  // every depth set, rewritten inline ahead of each frame's dispatch);
-  // grid-independent, so not in the bundle.
+  // Persistent camera params for the depth rounds: every frame's, a
+  // camera_stride_ apart, written inline once a round ahead of its first
+  // dispatch, each frame's set binding its own at binding 6; grown to the
+  // most frames a round has had; grid-independent, so not in the bundle.
   core::Buffer camera_params_;
+  VkDeviceSize camera_stride_ = 0;
   // Persistent frusta for the frustum compactions (bound at binding 3 of
   // compact_frustum_.set, rewritten inline per call, grown by upload_frusta);
   // grid-independent.
@@ -974,6 +1028,11 @@ class VR_VOLUME_API VoxelHashMap {
   // dispatches that move the counter. Copied by the defaulted move, and
   // harmlessly left on a moved-from map, whose load_factor() is refused.
   std::uint32_t heap_free_ = 0;
+  // The serial the next recording takes, and the newest settled or
+  // overtaken: settle() moves heap_free_ only for a later recording, and a
+  // blocking change of the counter overtakes every recording before it.
+  std::uint64_t record_serial_ = 0;
+  std::uint64_t settled_serial_ = 0;
   // The last compact_active_blocks count, from which collect_compacted
   // guesses how much of the list to read back beside the next count.
   std::uint32_t last_active_count_ = 0;
@@ -1016,10 +1075,11 @@ class VR_VOLUME_API VoxelHashMap {
   // draw), so per-voxel data survives a resize. Same 6-binding shape as
   // allocate_ (its input at binding 4 is BlockIndex{coord, ptr}, ptr read).
   core::ComputeKernel rehash_;
-  // hash_rounds.comp, one instance a kind, so a removal and an allocation
-  // recorded into one batch keep their own sets.
+  // hash_rounds.comp, one instance a kind, so a removal, an allocation and a
+  // depth round recorded into one batch keep their own sets.
   core::ComputeKernel remove_rounds_;
   core::ComputeKernel allocate_rounds_;
+  core::ComputeKernel depth_rounds_;
   // The depth kernel's sets, one a frame of a call, so a round dispatches
   // several cameras in one batch; depth_.set goes unused. Grown to the most
   // frames a call has had; written whole each call, so a resize leaves none

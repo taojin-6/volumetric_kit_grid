@@ -11,7 +11,10 @@
 // dispatch's groups; a recording makes cached lists stale; a steady
 // recording costs one submit and no staging buffer; the result slots run
 // out at the fifth recording held; and a grid zeroes a block before its index
-// is freed. Skips with no device.
+// is freed. A set's depth round (record_allocate_from_depth) places what the
+// blocking call places, closes its gate on a capacity limit, and is that
+// call's one submit a round; recordings settle in any order, a blocking call
+// overtaking them. Skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -38,6 +41,7 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 #include "gpu_test.hpp"
+#include "sphere_scene.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -692,6 +696,199 @@ int slots_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
+// --- A set's depth frames. ---------------------------------------------------
+
+// Three cameras round a sphere, their depth on the host and on the device.
+struct Sphere {
+  std::vector<vr_test::SphereView> views;
+  std::vector<vkc::Buffer> device;
+
+  std::vector<vol::DepthInput> frames(std::size_t cameras,
+                                      bool on_device) const {
+    std::vector<vol::DepthInput> out;
+    for (std::size_t c = 0; c < cameras; ++c) {
+      out.push_back({on_device ? vkc::StorageInput(device[c])
+                               : vkc::StorageInput(views[c].depth.data()),
+                     views[c].cam});
+    }
+    return out;
+  }
+};
+
+vkc::Result<Sphere> sphere(vr_test::Gpu& gpu) {
+  Sphere s;
+  for (int c = 0; c < 3; ++c) {
+    s.views.push_back(vr_test::sphere_view(c));
+    const std::vector<float>& depth = s.views.back().depth;
+    VKC_ASSIGN(vkc::Buffer buffer, vr_test::upload_device_buffer(
+                                       gpu.device, gpu.allocator, depth.data(),
+                                       depth.size() * sizeof(float)));
+    s.device.push_back(std::move(buffer));
+  }
+  return s;
+}
+
+// One round of a set's bands recorded, as the blocking call rounds them: the
+// same blocks, heap count and stamps, on one camera and on three, from host
+// arrays and from device buffers; each recording is one round.
+int depth_case(vr_test::Gpu& gpu) {
+  vkc::Result<Sphere> s = sphere(gpu);
+  CHECK(s.ok());
+  for (const bool on_device : {false, true}) {
+    for (const std::size_t cameras : {std::size_t{1}, std::size_t{3}}) {
+      const std::vector<vol::DepthInput> frames = s->frames(cameras, on_device);
+      vkc::Result<vol::VoxelHashMap> a = make_map(gpu, params(8, 4096));
+      vkc::Result<vol::VoxelHashMap> b = make_map(gpu, params(8, 4096));
+      CHECK(a.ok() && b.ok());
+      vol::AllocFailures fa;
+      CHECK(a->allocate_from_depth(frames, &fa).value() == 0);
+      vol::AllocFailures fb;
+      for (int pass = 0; pass < 8; ++pass) {
+        vkc::CommandBatch batch(gpu.device, gpu.allocator);
+        vkc::Result<vol::RecordedRounds> r =
+            b->record_allocate_from_depth(batch, frames);
+        CHECK(r.ok() && batch.submit().ok());
+        fb = b->settle(*r).value();
+        CHECK(fb.rounds == 1);
+        if (fb.lock == 0) break;
+      }
+      CHECK(fb.total == 0 && fb.terminal == 0 && same_failures(fa, fb));
+      CHECK(coords_of(*a).value() == coords_of(*b).value());
+      CHECK(a->allocated_blocks() == b->allocated_blocks());
+      CHECK(a->allocated_blocks() > 100);
+      CHECK(stamps_of(*a).value() == stamps_of(*b).value());
+    }
+  }
+
+  // A frame with no pixels records nothing, and neither does a set of them.
+  vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 4096));
+  CHECK(map.ok());
+  std::vector<vol::DepthInput> none = s->frames(1, true);
+  none[0].camera.width = 0;
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  vkc::Result<vol::RecordedRounds> nothing =
+      map->record_allocate_from_depth(batch, none);
+  CHECK(nothing.ok() && !nothing->result.valid());
+  CHECK(batch.submit().ok() && map->settle(*nothing).value().rounds == 0);
+  CHECK(map->allocated_blocks() == 0);
+  return 0;
+}
+
+// A gate the round meets a capacity limit on is closed for what is gated on
+// it, the rounds' gate words as record_allocate's; one it completes on stays
+// open. The gate is the round's output alone: a closed one still has the
+// round run and judged. A gate word past its buffer is refused with nothing
+// recorded.
+int depth_gate_case(vr_test::Gpu& gpu) {
+  vkc::Result<Sphere> s = sphere(gpu);
+  vkc::Result<vkc::Buffer> gates = words(gpu, {1, 1, 0});
+  CHECK(s.ok() && gates.ok());
+  const std::vector<vol::DepthInput> frames = s->frames(3, true);
+  for (const bool room : {false, true}) {
+    vkc::Result<vol::VoxelHashMap> map =
+        make_map(gpu, room ? params(8, 4096) : params(8, 1));
+    CHECK(map.ok());
+    const vol::DeviceCount gate{&*gates, room ? 4u : 0u, 1};
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vkc::Result<vol::RecordedRounds> r =
+        map->record_allocate_from_depth(batch, frames, &gate);
+    CHECK(r.ok() && batch.submit().ok());
+    vkc::Result<vol::AllocFailures> f = map->settle(*r);
+    CHECK(f.ok() && f->rounds == 1);
+    if (room) {
+      CHECK(word_at(gpu, *gates, 1).value() == (f->total == 0 ? 1u : 0u));
+    } else {
+      CHECK(f->capacity_limited() && map->allocated_blocks() <= 8);
+      CHECK(word_at(gpu, *gates, 0).value() == 0);
+    }
+  }
+  vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 4096));
+  CHECK(map.ok());
+  {
+    const vol::DeviceCount closed{&*gates, 8, 1};
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vkc::Result<vol::RecordedRounds> r =
+        map->record_allocate_from_depth(batch, frames, &closed);
+    CHECK(r.ok() && batch.submit().ok());
+    vkc::Result<vol::AllocFailures> f = map->settle(*r);
+    CHECK(f.ok() && f->rounds == 1 && f->terminal == 0);
+    CHECK(map->allocated_blocks() > 100 &&
+          word_at(gpu, *gates, 2).value() == 0);
+  }
+  const vol::DeviceCount past{&*gates, 12, 1};
+  vkc::CommandBatch refused(gpu.device, gpu.allocator);
+  CHECK(map->record_allocate_from_depth(refused, frames, &past)
+            .status()
+            .domain() == C::InvalidArgument);
+  CHECK(refused.submit().ok());
+  return 0;
+}
+
+// Recordings settle in any order, and a blocking call since overtakes one:
+// the heap's host copy is the latest's. A set fused again, blocking, before
+// its round settles, or a free pass, cannot be undone by that settle.
+int settle_order_case(vr_test::Gpu& gpu) {
+  vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
+  CHECK(map.ok());
+  const Blocks first = cube();
+  const Blocks second = sheet(4, 4, 5);
+  const Blocks third = sheet(4, 4, 9);
+  vkc::Result<vkc::Buffer> first_list = vr_test::detail::device_coords(
+      gpu, first.data(), std::uint32_t(first.size()));
+  vkc::Result<vkc::Buffer> second_list = vr_test::detail::device_coords(
+      gpu, second.data(), std::uint32_t(second.size()));
+  vkc::Result<vkc::Buffer> third_list = vr_test::detail::device_coords(
+      gpu, third.data(), std::uint32_t(third.size()));
+  vkc::Result<vkc::Buffer> counts = words(gpu, {27, 16});
+  CHECK(first_list.ok() && second_list.ok() && third_list.ok() && counts.ok());
+  const auto record = [&](const vkc::Buffer& list, VkDeviceSize offset,
+                          std::uint32_t n) -> vkc::Result<vol::RecordedRounds> {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    VKC_ASSIGN(vol::RecordedRounds r,
+               map->record_allocate(batch, list,
+                                    vol::DeviceCount{&*counts, offset, n}));
+    VKC_TRY(batch.submit());
+    return r;
+  };
+  vkc::Result<vol::RecordedRounds> a = record(*first_list, 0, 27);
+  vkc::Result<vol::RecordedRounds> b = record(*second_list, 4, 16);
+  CHECK(a.ok() && b.ok());
+  CHECK(map->settle(*b).value().total == 0);
+  CHECK(map->allocated_blocks() == 27 + 16);
+  CHECK(map->settle(*a).value().total == 0);
+  CHECK(map->allocated_blocks() == 27 + 16);
+
+  vkc::Result<vol::RecordedRounds> c = record(*third_list, 4, 16);
+  CHECK(c.ok());
+  CHECK(blocking_all(gpu, *map, corners(), true).value() == 0);
+  CHECK(map->allocated_blocks() == 27 + 16 + 16 - 8);
+  CHECK(map->settle(*c).value().total == 0);
+  CHECK(map->allocated_blocks() == 27 + 16 + 16 - 8);
+  CHECK(coords_of(*map).value().size() == map->allocated_blocks());
+  return 0;
+}
+
+// The blocking call over a set is one submit a round and, warm, no staging
+// buffer: each round its recording, the count word staying on the device.
+int depth_counters_case(vr_test::Gpu& gpu) {
+  vkc::Result<Sphere> s = sphere(gpu);
+  vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 4096));
+  CHECK(s.ok() && map.ok());
+  const std::vector<vol::DepthInput> frames = s->frames(3, true);
+  for (int pass = 0; pass < 3; ++pass) {
+    const vkc::DeviceCounters was = gpu.device.counters();
+    vol::AllocFailures f;
+    vkc::Result<std::uint32_t> left = map->allocate_from_depth(frames, &f);
+    const vkc::DeviceCounters now = gpu.device.counters();
+    CHECK(left.ok() && left.value() == 0 && f.rounds >= 1);
+    if (pass == 0) continue;  // the first makes the result slots
+    CHECK(now.submits - was.submits == f.rounds);
+    CHECK(now.host_waits - was.host_waits == f.rounds);
+    CHECK(now.staging_buffers == was.staging_buffers);
+  }
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   if (agrees_case(gpu) != 0) return 1;
   if (count_case(gpu) != 0) return 1;
@@ -704,6 +901,10 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (stale_case(gpu) != 0) return 1;
   if (counters_case(gpu) != 0) return 1;
   if (slots_case(gpu) != 0) return 1;
+  if (depth_case(gpu) != 0) return 1;
+  if (depth_gate_case(gpu) != 0) return 1;
+  if (settle_order_case(gpu) != 0) return 1;
+  if (depth_counters_case(gpu) != 0) return 1;
   std::printf("recon volume recorded test passed\n");
   return 0;
 }
