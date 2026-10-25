@@ -27,6 +27,7 @@
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
+#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
 
@@ -34,9 +35,9 @@ namespace volumetric_kit::recon::codec::detail {
 ///        last sized them: the store's spare, and the apply's sources. The
 ///        decoder's merge writes the list and the sources
 ///        (@ref BlockLists::record_merge) and its apply the masks and
-///        coefficients; the encoder copies its sorted list into the list and
-///        its forward writes the masks and coefficients
-///        (@ref DctTransform::record_forward).
+///        coefficients; the encoder's sort writes the list
+///        (@ref BlockLists::record_sort) and its forward the masks and
+///        coefficients (@ref DctTransform::record_forward).
 struct FrameBuffers {
   const core::Buffer* list = nullptr;     ///< `volume::BlockIndex` a block.
   const core::Buffer* sources = nullptr;  ///< An @ref ApplySource a block.
@@ -165,9 +166,10 @@ class VR_CODEC_API ReferenceStore {
   static core::Status check_faults(std::uint32_t faults);
 
   /// @brief Record a P-frame's entries against the held reference, coded
-  ///        from the frame of @p n blocks the spare holds once the commands
-  ///        @p batch already holds have run (an encoder's sorted list,
-  ///        copied in, and its forward), into this store's own buffers.
+  ///        from the frame the spare holds once the commands @p batch already
+  ///        holds have run (an encoder's sort, into the spare's list, and its
+  ///        forward), into this store's own buffers; its blocks are
+  ///        @p target's word.
   ///
   /// `inter_diff.comp` gives each reference entry its mode -- remove when
   /// the frame lacks its block, skip when the block is unchanged, keep or
@@ -176,23 +178,26 @@ class VR_CODEC_API ReferenceStore {
   /// the new blocks, its coordinate and its payload (the kernel has the
   /// rules and the price that picks zero over keep). The frame's blocks must
   /// be strictly increasing, as the encoder's sort leaves them. Reads
-  /// nothing back: only the device knows how many blocks are new.
-  /// @param batch  The batch to record into; submitted by the caller.
-  /// @param n      The frame's blocks.
-  /// @param k      Their K, the held reference's.
-  /// @param stage  As @ref record_apply.
+  /// nothing back: only the device knows how many blocks the frame holds and
+  /// how many are new, so the second pass runs over the bound.
+  /// @param batch   The batch to record into; submitted by the caller.
+  /// @param target  The frame's blocks: a word a kernel wrote, at most its
+  ///                bound, `n`.
+  /// @param k       Their K, the held reference's.
+  /// @param stage   As @ref record_apply.
   /// @return The P-frame's entries by stream position once @p batch has
   ///         run, valid until the next call, bounded
-  ///         (@ref ResidentBlocks::bounded): M + @p n of them, of which the
+  ///         (@ref ResidentBlocks::bounded): M + `n` of them, of which the
   ///         device frame writer, counting in the same batch, takes off the
-  ///         `ranks[M]` survivors to leave M + A. Or
-  ///         `Status::Code::InvalidArgument` for no reference held, a K
-  ///         other than its, more blocks than @ref reserve made room for,
-  ///         more than 2^32 - 1 entries, or a buffer past
-  ///         `maxStorageBufferRange`; otherwise a buffer failure.
+  ///         blocks the frame lacks and the `ranks[M]` survivors to leave
+  ///         M + A. Or `Status::Code::InvalidArgument` for no reference held,
+  ///         a K other than its, a count word missing, misaligned or past its
+  ///         buffer, a bound past what @ref reserve made room for, more than
+  ///         2^32 - 1 entries, or a buffer past `maxStorageBufferRange`;
+  ///         otherwise a buffer failure.
   core::Result<ResidentBlocks> record_diff(
-      core::CommandBatch& batch, std::uint32_t n, std::uint32_t k,
-      core::GpuStageScope* stage = nullptr);
+      core::CommandBatch& batch, const volume::DeviceCount& target,
+      std::uint32_t k, core::GpuStageScope* stage = nullptr);
 
   /// @brief Hold the spare as the reference: the only call that changes
   ///        @ref held and @ref reference_list.

@@ -43,6 +43,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
+namespace vol = volumetric_kit::recon::volume;
 namespace oracle = codec_oracle;
 using codec_frames::extreme_frame;
 using codec_frames::inter_frame;
@@ -91,8 +92,9 @@ vkc::Result<Bytes> device_write(
   VKC_TRY(writer.record_count(batch, r.blocks, options.segment_size,
                               options.update_size));
   VKC_TRY(batch.submit());
-  return writer.finish(
-      r.blocks, frame.voxel_size, frame.blocks.trunc_dist, frame.blocks.params,
+  return oracle::write_counted(
+      {*g_device, *g_allocator}, writer, r.blocks, frame.voxel_size,
+      frame.blocks.trunc_dist, frame.blocks.params,
       frame.type == d::FrameType::kInter ? &frame.reference : nullptr);
 }
 
@@ -877,7 +879,7 @@ int ranks_case(d::DeviceFrameReader& reader) {
 // The writer's own refusals: entries it cannot walk -- more reference
 // entries than entries, or without the modes or list they need, or bounded
 // without ranks -- and a segment or update size past the rule, each counting
-// nothing, so finish refuses, rather than coding stale steps; a finish whose
+// nothing, so record_code refuses, rather than coding stale steps; a code whose
 // blocks have another entry or reference count than were counted, or are
 // exact where bounded ones were counted or the reverse; a bounded set's
 // survivors past its reference entries or its blocks; reference entries
@@ -894,14 +896,15 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   const Resident r = resident(p).value();
   auto finish = [&](d::DeviceFrameWriter& w, const d::ResidentBlocks& blocks,
                     const d::FrameReference& held) {
-    return w.finish(blocks, p.voxel_size, p.blocks.trunc_dist, p.blocks.params,
-                    &held);
+    return oracle::write_counted({*g_device, *g_allocator}, w, blocks,
+                                 p.voxel_size, p.blocks.trunc_dist,
+                                 p.blocks.params, &held);
   };
   auto uncounted = [](const vkc::Result<Bytes>& written) {
     return !written.ok() &&
            written.status().message() ==
-               "DeviceFrameWriter::finish: these blocks were not the ones "
-               "record_count saw";
+               "DeviceFrameWriter::record_code: these blocks were not the "
+               "ones record_count saw";
   };
 
   vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> fresh =
@@ -974,10 +977,10 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(b.submit().ok());
     const vkc::Result<Bytes> written =
         finish(writer, planted.blocks, p.reference);
-    const std::string says = "DeviceFrameWriter::finish: " + std::to_string(s) +
-                             " survivors of " + std::to_string(m) +
-                             " reference entries and " +
-                             std::to_string(blocks) + " blocks";
+    const std::string says =
+        "DeviceFrameWriter::record_code: " + std::to_string(s) +
+        " survivors of " + std::to_string(m) + " reference entries and " +
+        std::to_string(blocks) + " blocks";
     if (written.ok() || written.status().domain() != C::InvalidArgument ||
         written.status().message() != says) {
       std::fprintf(
@@ -1004,6 +1007,53 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   return 0;
 }
 
+// The frame's blocks a word on the device, under a bound 40 entries past
+// them, as the encoder's forward leaves an intra frame's: the device codes
+// the word's blocks alone, the oracle's bytes for them, the garbage after
+// them unread. A word past its bound, or bounding other than the entries'
+// blocks, is refused before anything is recorded.
+int device_count_case(d::DeviceFrameWriter& writer) {
+  constexpr std::uint32_t kGarbage = 40;
+  for (const std::uint32_t n : {0u, 1u, 300u}) {
+    const oracle::Frame f = make_frame(n, 16, 71 + n);
+    oracle::Frame big = f;
+    Lcg rng{n + 5};
+    for (std::uint32_t i = 0; i < kGarbage; ++i) {
+      big.coords.push_back(vr::Vec3i(-9000 - int(i), 3, int(rng.below(9))));
+      for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
+        big.blocks.masks.push_back(rng.next());
+      }
+      for (std::uint32_t j = 0; j < 16; ++j) {
+        big.blocks.coefficients.push_back(
+            static_cast<std::int16_t>(int(rng.below(2000)) - 1000));
+      }
+    }
+    vkc::Result<Resident> r = resident(big);
+    vkc::Result<vkc::Buffer> word =
+        vr_test::upload_device_buffer(*g_device, *g_allocator, &n, sizeof(n));
+    CHECK(r.ok() && word.ok() && r->blocks.count == n + kGarbage);
+    const vol::DeviceCount blocks{&word.value(), 0, n + kGarbage};
+    vkc::CommandBatch batch(*g_device, *g_allocator);
+    CHECK(writer.record_count(batch, r->blocks, 64, 64, nullptr, &blocks).ok());
+    CHECK(batch.submit().ok());
+    CHECK(writer.front().blocks == n);
+    vkc::Result<Bytes> bytes = oracle::write_counted(
+        {*g_device, *g_allocator}, writer, r->blocks, f.voxel_size,
+        f.blocks.trunc_dist, f.blocks.params, nullptr);
+    CHECK(bytes.ok() && bytes.value() == oracle::write_frame(f).value());
+
+    vkc::CommandBatch refused(*g_device, *g_allocator);
+    for (const vol::DeviceCount& bad :
+         {vol::DeviceCount{&word.value(), 4, n + kGarbage},
+          vol::DeviceCount{&word.value(), 0, n + kGarbage - 1}}) {
+      CHECK(writer.record_count(refused, r->blocks, 64, 64, nullptr, &bad)
+                .domain() == C::InvalidArgument);
+    }
+    CHECK(refused.submit().ok());
+  }
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> w =
       d::DeviceFrameWriter::create(gpu.device, gpu.allocator);
@@ -1027,6 +1077,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (verdict_case(reader) != 0) return 1;
   if (ranks_case(reader) != 0) return 1;
   if (refusals_case(gpu.device, gpu.allocator, writer) != 0) return 1;
+  if (device_count_case(writer) != 0) return 1;
   std::puts("codec device frame: OK");
   return 0;
 }

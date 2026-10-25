@@ -17,6 +17,7 @@
 #include "host_slices.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
+#include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 
 namespace codec_oracle {
 
@@ -147,11 +148,17 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                                     gpu.allocator, VkDeviceSize(count) * words *
                                                        sizeof(std::uint32_t)));
   }
+  // The count as the encoder's observed pass leaves it, a device word.
+  VKC_ASSIGN(const vkc::Buffer word,
+             vr_test::upload_device_buffer(gpu.device, gpu.allocator, &count,
+                                           sizeof(count)));
   std::uint32_t rejected = 0;
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  VKC_ASSIGN(const d::ResidentBlocks resident,
-             t.record_forward(batch, grid, list, count, params, mask_out,
-                              coefficient_out, rejected, cut));
+  if (params.validate().ok()) VKC_TRY(t.record_steps(batch, params));
+  VKC_ASSIGN(
+      const d::ResidentBlocks resident,
+      t.record_forward(batch, grid, list, vol::DeviceCount{&word, 0, count},
+                       params, mask_out, coefficient_out, cut));
   const std::size_t n = resident.count;
   std::vector<std::uint32_t> packed(n * words);
   std::vector<std::uint32_t> masks(n * codec::kMaskWordsPerBlock);
@@ -161,6 +168,7 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
                            packed.data()));
     VKC_TRY(batch.readback(*resident.masks, 0,
                            masks.size() * sizeof(std::uint32_t), masks.data()));
+    VKC_TRY(batch.readback(t.rejected(), 0, sizeof(rejected), &rejected));
     VKC_TRY(batch.submit());
     VKC_TRY(
         d::DctTransform::check_rejected("forward", rejected, resident.count));
@@ -355,6 +363,21 @@ vkc::Result<SurfaceSet> surface_set(const vr_test::Gpu& gpu,
               return d::coord_less(a.coord, b.coord);
             });
   return out;
+}
+
+vkc::Result<std::vector<std::uint8_t>> write_counted(
+    const vr_test::Gpu& gpu, d::DeviceFrameWriter& writer,
+    const d::ResidentBlocks& counted, float voxel_size, float trunc_dist,
+    const codec::CodecParams& params, const d::FrameReference* reference) {
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  VKC_TRY(writer.record_code(batch, counted, voxel_size, trunc_dist, params,
+                             reference));
+  VKC_TRY(batch.submit());
+  VKC_ASSIGN(vkc::GpuTimer timer, vkc::GpuTimer::create(gpu.device));
+  VKC_ASSIGN(const codec::EncodedFrame frame, writer.finish(nullptr, timer));
+  std::vector<std::uint8_t> bytes(frame.head.begin(), frame.head.end());
+  bytes.insert(bytes.end(), frame.payload, frame.payload + frame.payload_size);
+  return bytes;
 }
 
 vkc::Result<std::vector<std::uint8_t>> encode(

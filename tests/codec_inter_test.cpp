@@ -1519,9 +1519,17 @@ int diff_refusals_case(Gpu& gpu) {
       d::DeviceFrameWriter::create(gpu.device, gpu.allocator);
   CHECK(made.ok() && writer.ok());
   d::ReferenceStore& store = *made.value();
+  // The frame's blocks, a device word as the encoder's forward leaves them:
+  // none.
+  const std::uint32_t zero = 0;
+  vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+      gpu.device, gpu.allocator, &zero, sizeof(zero));
+  CHECK(word.ok());
   auto refused = [&](std::uint32_t n, std::uint32_t k, const char* says) {
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    const vkc::Status s = store.record_diff(batch, n, k).status();
+    const vkc::Status s =
+        store.record_diff(batch, vol::DeviceCount{&word.value(), 0, n}, k)
+            .status();
     return !s.ok() && s.domain() == C::InvalidArgument &&
            s.message().find(says) != std::string::npos;
   };
@@ -1532,8 +1540,15 @@ int diff_refusals_case(Gpu& gpu) {
   CHECK(store.reserve(4, 8).ok());
   CHECK(refused(4, 9, "a frame at K 9 on a reference at K 8"));
   CHECK(refused(1000, 8, "1000 blocks, more than were reserved"));
+  {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    CHECK(store.record_diff(batch, vol::DeviceCount{&word.value(), 4, 0}, 8)
+              .status()
+              .domain() == C::InvalidArgument);
+  }
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  vkc::Result<d::ResidentBlocks> entries = store.record_diff(batch, 0, 8);
+  vkc::Result<d::ResidentBlocks> entries =
+      store.record_diff(batch, vol::DeviceCount{&word.value(), 0, 0}, 8);
   CHECK(entries.ok() && entries.value().count == 5 &&
         entries.value().reference_count == 5 && entries.value().bounded);
   const oracle::FrameWriteOptions sizes;
@@ -1557,8 +1572,9 @@ int diff_refusals_case(Gpu& gpu) {
   removed.blocks.trunc_dist = held.trunc_dist;
   removed.blocks.masks.assign(5 * codec::kMaskWordsPerBlock, 0);
   removed.blocks.coefficients.assign(5 * 8, 0);
-  vkc::Result<Bytes> written = writer.value()->finish(
-      entries.value(), kVoxel, held.trunc_dist, held.params, store.held());
+  vkc::Result<Bytes> written =
+      oracle::write_counted(gpu, *writer.value(), entries.value(), kVoxel,
+                            held.trunc_dist, held.params, store.held());
   CHECK(written.ok() &&
         written.value() == oracle::write_frame(removed, sizes).value());
   CHECK(store.held()->hash == 3);

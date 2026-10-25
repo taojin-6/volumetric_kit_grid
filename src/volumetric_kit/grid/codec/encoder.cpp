@@ -3,6 +3,9 @@
 
 #include "volumetric_kit/recon/codec/encoder.hpp"
 
+#include <atomic>
+#include <new>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,17 +16,49 @@
 #include "device_frame_writer.hpp"
 #include "frame_hash.hpp"
 #include "reference_store.hpp"
+#include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
+#include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 
 namespace volumetric_kit::recon::codec {
+namespace detail {
+
+// What the halves need of a recorded frame: the reference a P-frame is
+// coded against, the grid's geometry, the entries the front counted, the
+// blocks it found, and how far the frame has come.
+struct RecordedEncode {
+  std::uint64_t serial = 0;
+  FrameType type = FrameType::kIntra;
+  FrameReference reference;
+  float voxel_size = 0.0f;
+  float trunc_dist = 0.0f;
+  ResidentBlocks entries;
+  std::uint32_t blocks = 0;
+  bool back = false;
+};
+
+}  // namespace detail
+
 namespace {
 
 // The public default restates the frame's, which the installed header cannot
 // name; this is what keeps the pair one number.
 static_assert(EncoderConfig{}.segment_size == detail::kDefaultSegmentSize,
               "EncoderConfig's default segment size is the frame's");
+
+// A record's serial, unique in the process, so a token names one encoder's
+// record and no other's.
+std::uint64_t next_serial() noexcept {
+  static std::atomic<std::uint64_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+core::Status fail(const char* op, const std::string& why) {
+  return core::Status::invalid_argument(std::string("Encoder::") + op + ": " +
+                                        why);
+}
 
 }  // namespace
 
@@ -63,123 +98,273 @@ core::Result<Encoder> Encoder::create(core::Device& device,
   VKC_ASSIGN(e.lists_, detail::BlockLists::create(device, allocator));
   VKC_ASSIGN(e.writer_, detail::DeviceFrameWriter::create(device, allocator));
   VKC_ASSIGN(e.store_, detail::ReferenceStore::create(device, allocator));
+  VKC_ASSIGN(e.list_count_,
+             core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  device.set_object_name(VK_OBJECT_TYPE_BUFFER,
+                         core::debug_object_handle(e.list_count_.handle()),
+                         "codec.encode_list_count");
   VKC_ASSIGN(e.gpu_timer_, core::GpuTimer::create(device));
   return e;
 }
 
 core::Result<std::vector<std::uint8_t>> Encoder::encode(
-    volume::VoxelBlockGrid& grid, core::StageMetrics* metrics) {
-  // Before any refusal, so a refused call still costs its row.
+    volume::VoxelBlockGrid& grid, core::StageMetrics* metrics) try {
+  // Before any refusal, so a refused call still costs its row; both
+  // batches' waits, and the device halves they hand back, land in it too.
   core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "Encoder::encode: moved-from encoder");
+  // One half's batch, submitted and waited on, its device rows kept.
+  const auto run = [&](core::CommandBatch& batch) -> core::Status {
+    VKC_ASSIGN(core::PendingBatch done, batch.submit_async({}, {}));
+    VKC_TRY(done.wait());
+    if (metrics != nullptr) metrics->merge_device(done.device_rows());
+    return {};
+  };
+  core::CommandBatch front_batch(*device_, *allocator_);
+  VKC_ASSIGN(const PendingEncode pending, front(front_batch, grid, metrics));
+  core::Status ran = run(front_batch);
+  core::CommandBatch back_batch(*device_, *allocator_);
+  if (ran.ok()) ran = back(back_batch, pending, metrics);
+  if (ran.ok()) ran = run(back_batch);
+  if (!ran.ok()) {
+    abandon(pending);
+    return ran;
   }
-  if (!grid.valid()) {
-    return core::Status::invalid_argument("Encoder::encode: moved-from grid");
-  }
+  VKC_ASSIGN(const EncodedFrame frame, finish_frame(pending, metrics));
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(frame.size());
+  bytes.assign(frame.head.begin(), frame.head.end());
+  bytes.insert(bytes.end(), frame.payload, frame.payload + frame.payload_size);
+  return bytes;
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Encoder::encode",
+                                core::Status::Code::OutOfMemory);
+}
 
-  // The active set, on the device and inside this stage, so its row is a
-  // breakdown ("  ..encode set": apart from a fuse's "  ..active set" timed
-  // into the same rows). The map hands back its last list while it still
-  // holds, and keeps this one for the extract after, which then compacts
-  // nothing.
-  VKC_ASSIGN(
-      const volume::DeviceBlockList list,
-      grid.map().compact_active_blocks_on_device(metrics, "  ..encode set"));
-  // Only the blocks with an observed voxel are coded -- with true_sdf, only
-  // those holding surface, the cut set left beside them -- found on the
-  // device before the transform: a fused band is mostly never integrated,
-  // and transforming those blocks only to drop them read every one back.
-  // Only their count crosses.
-  std::uint32_t observed = 0;
-  {
-    core::GpuStageScope row(metrics, gpu_timer_, "  ..observed");
-    VKC_ASSIGN(observed,
-               transform_->observed(grid, list, config_.true_sdf, &row));
-  }
+core::Result<PendingEncode> Encoder::record_front(
+    core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+    core::StageMetrics* metrics) try {
+  core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
+  return front(batch, grid, metrics);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Encoder::record_front",
+                                core::Status::Code::OutOfMemory);
+}
+
+core::Status Encoder::record_back(core::CommandBatch& batch,
+                                  const PendingEncode& pending,
+                                  core::StageMetrics* metrics) try {
+  core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
+  return back(batch, pending, metrics);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Encoder::record_back",
+                                core::Status::Code::OutOfMemory);
+}
+
+core::Result<EncodedFrame> Encoder::finish(const PendingEncode& pending,
+                                           core::StageMetrics* metrics) try {
+  core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
+  return finish_frame(pending, metrics);
+} catch (const std::bad_alloc&) {
+  return core::exception_status("Encoder::finish",
+                                core::Status::Code::OutOfMemory);
+}
+
+void Encoder::abandon(const PendingEncode& pending) noexcept {
+  if (!holds(pending)) return;
+  pending_.reset();
+  writer_->drop();
+}
+
+bool Encoder::holds(const PendingEncode& pending) const noexcept {
+  return pending_ != nullptr && pending.serial != 0 &&
+         pending.serial == pending_->serial;
+}
+
+core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
+                                           volume::VoxelBlockGrid& grid,
+                                           core::StageMetrics* metrics) {
+  if (!valid()) return fail("encode", "moved-from encoder");
+  if (!grid.valid()) return fail("encode", "moved-from grid");
+  const volume::VoxelGridParams& gp = grid.grid();
+  const CodecParams& params = config_.params;
+  // Everything refusable before anything is recorded: the grid as the
+  // transform takes it, and the geometry the header carries.
+  VKC_TRY(transform_->check_grid(grid));
+  VKC_TRY(detail::check_coding(gp.voxel_size, gp.trunc_dist, params));
 
   // A P-frame codes against the frame returned last, unless the rules on
   // encode() make this an I-frame. The encoder's params never change, so of
-  // the coding parameters only the grid's geometry can differ. When either
-  // side holds no block, an I-frame is the smaller: an empty reference leaves
-  // nothing to predict, and an empty grid would cost a remove for every
-  // reference entry, 8 bytes an update segment.
-  const volume::VoxelGridParams& gp = grid.grid();
-  const CodecParams& params = config_.params;
+  // the coding parameters only the grid's geometry can differ. An empty
+  // reference leaves nothing to predict. Whether the grid has a block to
+  // code is the device's to say: a frame of none is an I-frame of none
+  // (back), which costs no remove for every reference entry.
   const detail::FrameReference* reference = store_->held();
   if (reference != nullptr &&
       (force_intra_ || gop_position_ == 0 ||
-       reference->header.block_count == 0 || observed == 0 ||
+       reference->header.block_count == 0 ||
        detail::coding_difference(reference->header, gp.voxel_size,
                                  gp.trunc_dist, params) != nullptr)) {
     reference = nullptr;
   }
+  // Made before an unfinished record is superseded, so a host allocation
+  // failure leaves that token finishable.
+  auto recorded = std::make_unique<detail::RecordedEncode>();
+  recorded->type = reference != nullptr ? FrameType::kInter : FrameType::kIntra;
+  if (reference != nullptr) recorded->reference = *reference;
+  recorded->voxel_size = gp.voxel_size;
+  recorded->trunc_dist = gp.trunc_dist;
+  pending_.reset();
+  writer_->drop();
 
-  // Then, in one batch, into the order the frame requires -- the hash
-  // table's order is whatever the allocate atomics left, so sorting is also
-  // what makes the same content give the same bytes -- and through the
-  // forward, into the reference store's spare: the frame the decoder will
-  // hold, which this one holds too once it returns the frame. A P-frame's
-  // entries are coded against the reference there too, bounded at M plus
-  // the frame's blocks since only the device knows how many are new; the
-  // count takes the survivors off on the device. Either frame's symbols are
-  // counted in the same batch, and only counts cross before the coding.
+  // Every step is sized for the grid's block slots, the most the active
+  // set, and so the frame, can hold; the device finds the counts.
+  const auto bound = static_cast<std::uint32_t>(gp.num_blocks);
+  const std::uint32_t k = params.coefficient_count;
+  VKC_TRY(store_->reserve(bound, k));
+  // The steps the forward reads, inline, ahead of the batch's first
+  // dispatch, so MoltenVK opens no blit encoder for them mid-batch.
+  VKC_TRY(transform_->record_steps(batch, params));
+
+  // Each breakdown's host half is the stage's own, so they record into a
+  // scratch row set and keep their device halves alone, which the batch's
+  // device rows hand back by name.
+  core::StageMetrics parts;
+  core::StageMetrics* const breakdowns = metrics != nullptr ? &parts : nullptr;
+  // The active set: the map's list while it still holds, its count set
+  // here, or one compacted into this batch ("  ..encode set": apart from a
+  // fuse's "  ..active set" timed into the same rows), its count left on
+  // the device.
+  const core::Buffer* list = nullptr;
+  volume::DeviceCount list_count{&list_count_, 0, bound};
+  if (const std::optional<volume::DeviceBlockList> held =
+          grid.map().held_device_list()) {
+    VKC_TRY(batch.fill(list_count_, 0, sizeof(std::uint32_t), held->count));
+    list = held->buffer;
+  } else {
+    core::GpuStageScope compaction(breakdowns, gpu_timer_, "  ..encode set");
+    VKC_ASSIGN(const volume::RecordedBlockList active,
+               grid.map().record_compaction(batch, nullptr, &compaction));
+    list = active.buffer;
+    list_count.buffer = active.count;
+  }
+  // Only the blocks with an observed voxel are coded -- with true_sdf, only
+  // those holding surface, the cut set left beside them -- found on the
+  // device before the transform: a fused band is mostly never integrated.
+  {
+    core::GpuStageScope row(breakdowns, gpu_timer_, "  ..observed");
+    VKC_TRY(transform_->record_observed(batch, grid, *list, list_count,
+                                        config_.true_sdf, &row));
+  }
+  // Then into the order the frame requires -- the hash table's order is
+  // whatever the allocate atomics left, so sorting is also what makes the
+  // same content give the same bytes -- the sort's last level writing the
+  // reference store's spare list, and through the forward into the spare:
+  // the frame the decoder will hold, which this one holds too once it
+  // returns the frame. A P-frame's entries are coded against the reference
+  // there too, bounded at M plus the frame's blocks; the count takes the
+  // survivors off on the device. Either frame's symbols are counted, laid
+  // out and gathered for the host in the same batch.
   // TODO(codec): trim a P-frame's host overhead at small R, where its encode
   // is still slower than intra's (DECISIONS, the 2026-10-17 freeze).
-  std::uint32_t rejected = 0;
-  detail::ResidentBlocks entries;
   {
-    core::GpuStageScope forward(metrics, gpu_timer_, "  ..forward");
-    VKC_TRY(store_->reserve(observed, params.coefficient_count));
+    core::GpuStageScope forward(breakdowns, gpu_timer_, "  ..forward");
     const detail::FrameBuffers frame = store_->frame_buffers();
-    core::CommandBatch batch(*device_, *allocator_);
-    VKC_ASSIGN(const core::Buffer* sorted,
-               lists_->record_sort(batch, transform_->observed_list(), observed,
-                                   &forward));
-    VKC_TRY(batch.copy(*sorted, 0, *frame.list, 0,
-                       VkDeviceSize(observed) * sizeof(volume::BlockIndex),
-                       &forward));
-    VKC_ASSIGN(entries, transform_->record_forward(
-                            batch, grid, *frame.list, observed, params,
-                            *frame.masks, *frame.coefficients, rejected,
-                            config_.true_sdf ? &transform_->cut_set() : nullptr,
-                            &forward));
+    const volume::DeviceCount observed = transform_->observed_count();
+    VKC_TRY(lists_->record_sort(batch, transform_->observed_list(), observed,
+                                *frame.list, &forward));
+    VKC_ASSIGN(
+        recorded->entries,
+        transform_->record_forward(
+            batch, grid, *frame.list, observed, params, *frame.masks,
+            *frame.coefficients,
+            config_.true_sdf ? &transform_->cut_set() : nullptr, &forward));
     if (reference != nullptr) {
-      VKC_ASSIGN(entries,
-                 store_->record_diff(batch, observed, params.coefficient_count,
-                                     &forward));
+      VKC_ASSIGN(recorded->entries,
+                 store_->record_diff(batch, observed, k, &forward));
     }
-    VKC_TRY(writer_->record_count(batch, entries, config_.segment_size,
-                                  config_.update_size, &forward));
-    VKC_TRY(batch.submit());
+    VKC_TRY(writer_->record_count(
+        batch, recorded->entries, config_.segment_size, config_.update_size,
+        &forward, &observed,
+        detail::TransformWords{&transform_->observed_counts(),
+                               &transform_->rejected()}));
+  }
+  recorded->serial = next_serial();
+  pending_ = std::move(recorded);
+  return PendingEncode{pending_->serial, pending_->type};
+}
+
+core::Status Encoder::back(core::CommandBatch& batch,
+                           const PendingEncode& pending,
+                           core::StageMetrics* metrics) {
+  if (!holds(pending)) {
+    return fail("record_back",
+                "the pending frame is not this encoder's last record "
+                "(finished, abandoned, superseded, or another encoder's)");
+  }
+  detail::RecordedEncode& set = *pending_;
+  if (set.back) {
+    return fail("record_back", "the frame's back half is already recorded");
+  }
+  // The front's refusals: entries the transform found no block for, which a
+  // grid changed under the batch would leave.
+  const detail::FrontResults r = writer_->front();
+  const std::uint32_t bound = set.entries.count - set.entries.reference_count;
+  VKC_TRY(detail::DctTransform::check_rejected("observed", r.observed_rejected,
+                                               bound));
+  VKC_TRY(detail::DctTransform::check_rejected("forward", r.forward_rejected,
+                                               r.blocks));
+  set.blocks = r.blocks;
+  if (r.blocks == 0) {
+    // No block to code: an I-frame of none, the smaller, with no back batch.
     VKC_TRY(
-        detail::DctTransform::check_rejected("forward", rejected, observed));
+        writer_->record_none(set.voxel_size, set.trunc_dist, config_.params));
+    set.type = FrameType::kIntra;
+    set.back = true;
+    return {};
   }
-  std::vector<std::uint8_t> bytes;
-  {
-    core::GpuStageScope entropy(metrics, gpu_timer_, "  ..rans encode");
-    VKC_ASSIGN(bytes, writer_->finish(entries, gp.voxel_size, gp.trunc_dist,
-                                      params, reference, &entropy));
+  core::StageMetrics parts;
+  core::GpuStageScope entropy(metrics != nullptr ? &parts : nullptr, gpu_timer_,
+                              "  ..rans encode");
+  VKC_TRY(writer_->record_code(
+      batch, set.entries, set.voxel_size, set.trunc_dist, config_.params,
+      set.type == FrameType::kInter ? &set.reference : nullptr, metrics,
+      &entropy));
+  set.back = true;
+  return {};
+}
+
+core::Result<EncodedFrame> Encoder::finish_frame(const PendingEncode& pending,
+                                                 core::StageMetrics* metrics) {
+  if (!holds(pending)) {
+    return fail("finish",
+                "the pending frame is not this encoder's last record "
+                "(finished, abandoned, superseded, or another encoder's)");
   }
+  if (!pending_->back) {
+    return fail("finish", "the frame's back half is not recorded");
+  }
+  const std::unique_ptr<detail::RecordedEncode> set = std::move(pending_);
+  VKC_ASSIGN(EncodedFrame frame, writer_->finish(metrics, gpu_timer_));
   // Only a frame returned becomes the reference, and counts toward the
   // period. It holds every block the forward made -- a P-frame's survivors
   // and new blocks, an I-frame's all -- which the spare holds in frame order,
   // so the next P-frame's M is the spare's list.
   VKC_ASSIGN(const detail::FrameHeader header,
-             detail::read_frame_header(bytes.data(), bytes.size()));
-  if (header.block_count != observed) {
-    return core::Status::invalid_argument(
-        "Encoder::encode: the frame holds " +
-        std::to_string(header.block_count) + " blocks of the " +
-        std::to_string(observed) + " the forward made (a bug)");
+             detail::read_frame_header(frame.head.data(), frame.head.size()));
+  if (header.block_count != set->blocks) {
+    return fail("encode", "the frame holds " +
+                              std::to_string(header.block_count) +
+                              " blocks of the " + std::to_string(set->blocks) +
+                              " the forward made (a bug)");
   }
   store_->commit(detail::FrameReference{
-      detail::frame_hash(bytes.data(), bytes.size()), header});
-  gop_position_ = (reference != nullptr ? gop_position_ : 0) + 1;
+      detail::frame_hash(frame.head.data(), frame.head.size(), frame.payload,
+                         frame.payload_size),
+      header});
+  gop_position_ = (frame.type == FrameType::kInter ? gop_position_ : 0) + 1;
   if (gop_position_ == config_.intra_period) gop_position_ = 0;
   force_intra_ = false;
-  return bytes;
+  return frame;
 }
 
 }  // namespace volumetric_kit::recon::codec

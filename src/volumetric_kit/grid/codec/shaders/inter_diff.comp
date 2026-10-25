@@ -23,7 +23,8 @@
 // yet: emit_payload walked with a symbol costing bit_length(symbol) + 1
 // bits, a byte model's 8, and a raw field its bits. Integer only, so every
 // device chooses alike; it changes the encoder's bytes, never what a frame
-// decodes to. Writes stay below the bound buffers' entries.
+// decodes to. Writes stay below the bound buffers' entries. Pass 1 runs
+// over the target's bound, an invocation past its count returning.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -39,9 +40,10 @@ layout(local_size_x = 64) in;
 layout(push_constant, std430) uniform Push {
   uint item_base;          // first item this dispatch covers
   uint reference_count;    // M, the reference's blocks
-  uint target_count;       // the target's blocks
+  uint target_bound;       // the most the target holds
   uint coefficient_count;  // K, the reference's and the target's
   uint pass;               // 0 the reference's entries, 1 the target's blocks
+  uint target_word;        // the target's blocks' word in TargetCount
 }
 pc;
 
@@ -79,6 +81,15 @@ layout(set = 0, binding = 9, std430) readonly buffer Ranks {
 layout(set = 0, binding = 10, scalar) writeonly buffer Added {
   BlockIndex added[];  // the new blocks, ptr 0
 };
+// The target's blocks, a word a kernel wrote, read as at most target_bound:
+// only the device knows how many the forward made.
+layout(set = 0, binding = 11, std430) readonly buffer TargetCount {
+  uint target_words[];
+};
+
+uint target_count() {
+  return min(target_words[pc.target_word], pc.target_bound);
+}
 
 VR_COORD_SEARCH(in_reference, reference_list)
 VR_COORD_SEARCH(in_target, target_list)
@@ -125,7 +136,7 @@ uint sub_halves(uint a, uint b) {
 
 void reference_entry(uint e, uint words) {
   const ivec3 c = reference_list[e].coord;
-  const uint n = pc.target_count;
+  const uint n = target_count();
   const uint t = in_target_lower(c, 0u, n);
   if (t >= n || target_list[t].coord != c) {
     modes[e] = kModeRemove;
@@ -197,7 +208,7 @@ void main() {
   const uint words = (pc.coefficient_count + 1u) / 2u;  // coefficient_words
   if (pc.pass == 0u) {
     if (i < pc.reference_count) reference_entry(i, words);
-  } else if (i < pc.target_count) {
+  } else if (i < target_count()) {
     target_block(i, words);
   }
 }

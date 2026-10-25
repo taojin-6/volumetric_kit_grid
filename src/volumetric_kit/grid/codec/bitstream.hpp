@@ -319,6 +319,15 @@ struct CodedFrame {
 VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame);
 
+/// @brief @ref assemble_frame's bytes but PAYLOAD's body, which comes last:
+///        the head, for a payload of @p payload_size bytes the caller holds
+///        elsewhere (the encoder's payload slot). @p frame's `payload` is not
+///        read. The head then the payload are @ref assemble_frame's bytes.
+/// @return The head; or @ref assemble_frame's refusals, the segment lengths
+///         summed against @p payload_size.
+VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_head(
+    FrameType type, const CodedFrame& frame, std::uint64_t payload_size);
+
 /// @brief A frame parsed and checked up to its segment streams: what the
 ///        device reader, and the tests' CPU oracle, decode them from.
 struct ParsedFrame {

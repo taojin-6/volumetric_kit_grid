@@ -7,13 +7,17 @@
 /// @brief Encode a grid's geometry, frame after frame, as intra frames or
 ///        P-frames against the frame encoded before.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/core/vulkan/host_ring.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
@@ -26,6 +30,7 @@ class BlockLists;
 class DctTransform;
 class DeviceFrameWriter;
 class ReferenceStore;
+struct RecordedEncode;
 }  // namespace detail
 
 /// The band, in voxels from the zero level, that holds every voxel an
@@ -96,6 +101,46 @@ struct VR_CODEC_API EncoderConfig {
   core::Status validate() const;
 };
 
+/// @brief A frame whose front half was recorded into a caller's batch
+///        (@ref Encoder::record_front): for @ref Encoder::record_back,
+///        @ref Encoder::finish or @ref Encoder::abandon.
+///
+/// A token: the encoder keeps what the halves need, and its next
+/// @ref Encoder::record_front supersedes an unfinished one.
+struct PendingEncode {
+  /// Which record this is, unique in the process; 0 for none.
+  std::uint64_t serial = 0;
+  /// What the frame is coded as, decided at record by @ref Encoder::encode's
+  /// rules; a P-frame whose grid turns out to hold no block to code finishes
+  /// as an I-frame of none.
+  FrameType type = FrameType::kIntra;
+};
+
+/// @brief A frame @ref Encoder::finish returned: its bytes are @ref head then
+///        the payload, back to back, the payload where the device wrote it in
+///        one of the encoder's slots, held until this is dropped.
+///
+/// @code
+/// VKC_ASSIGN(const codec::EncodedFrame frame, encoder.finish(pending));
+/// const stream::RecordPayload bytes = stream::RecordPayload::of(
+///     frame.head.data(), frame.head.size(), frame.payload,
+///     frame.payload_size);
+/// @endcode
+struct EncodedFrame {
+  FrameType type = FrameType::kIntra;  ///< An I-frame or a P-frame.
+  std::uint32_t blocks = 0;            ///< The blocks it carries.
+  /// The header, the section table and every section but PAYLOAD's body,
+  /// which comes last.
+  std::vector<std::uint8_t> head;
+  /// The PAYLOAD section's body, @ref payload_size bytes in @ref slot; null
+  /// for a frame of no blocks.
+  const std::uint8_t* payload = nullptr;
+  std::size_t payload_size = 0;  ///< Its bytes.
+  core::HostSlot slot;           ///< Holds @ref payload.
+  /// @return The frame's bytes: the head's and the payload's.
+  std::size_t size() const noexcept { return head.size() + payload_size; }
+};
+
 /// @brief Encodes a @ref volume::VoxelBlockGrid's geometry as frames -- the
 ///        codec's capture side (the 2026-09-26 decision).
 ///
@@ -140,6 +185,23 @@ struct VR_CODEC_API EncoderConfig {
 /// and the frame cross the bus. A frame the device cannot hold is refused,
 /// never coded on the host.
 ///
+/// A frame is two batches, the caller's: the front half
+/// (@ref record_front), recorded after what the batch holds -- a sender's
+/// fusion -- with every count on the device, and the back half
+/// (@ref record_back), the rANS coding, sized on the host from the front's
+/// counts. @ref finish lays the frame out. @ref encode is those, a submit
+/// and a wait each.
+///
+/// @code
+/// VKC_ASSIGN(const codec::PendingEncode pending,
+///            encoder.record_front(front, grid));
+/// VKC_TRY(front.submit());
+/// core::CommandBatch back(device, allocator);
+/// VKC_TRY(encoder.record_back(back, pending));
+/// VKC_TRY(back.submit());
+/// VKC_ASSIGN(const codec::EncodedFrame frame, encoder.finish(pending));
+/// @endcode
+///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time.
 class VR_CODEC_API Encoder {
@@ -176,13 +238,17 @@ class VR_CODEC_API Encoder {
   /// or when @p grid has no block to code (an I-frame is then the smaller);
   /// otherwise a P-frame. A frame returned becomes the reference and counts
   /// toward the period; a refusal changes neither.
+  ///
+  /// @ref record_front, a submit and its wait, @ref record_back, a submit
+  /// and its wait, and @ref finish, the head and payload joined into one
+  /// vector: 2 submits.
   /// @param grid     A grid with 4-byte float `tsdf` and `weight` attributes
   ///                 and `block_size` 8. Its blocks and voxels are read,
   ///                 never written; the reference is non-const only because
-  ///                 the active set is the map's own list
-  ///                 (@ref
-  ///                 volume::VoxelHashMap::compact_active_blocks_on_device),
-  ///                 which an extract after this takes back from it.
+  ///                 the active set is the map's own list: the one it holds
+  ///                 (@ref volume::VoxelHashMap::held_device_list), or one
+  ///                 compacted into the front's batch, which an extract after
+  ///                 this compacts again.
   /// @param metrics  Optional `StageMetrics` collecting a `"codec encode"`
   ///                 row with both halves over the breakdown rows, each with
   ///                 its own device half:
@@ -192,9 +258,10 @@ class VR_CODEC_API Encoder {
   ///                 @ref EncoderConfig::true_sdf's passes),
   ///                 `"  ..forward"` (sorting them, the transform, a
   ///                 P-frame's diff against the reference, and the symbol
-  ///                 count: one batch)
+  ///                 count: the front's batch)
   ///                 and `"  ..rans encode"` (coding and laying out the
-  ///                 frame).
+  ///                 frame); and `"  ..tables"`, the host's normalization of
+  ///                 the counts, with its host half alone.
   ///                 Named apart from the
   ///                 @ref Decoder's, so both timed into one
   ///                 `StageMetrics` stay apart. `nullptr` measures
@@ -210,6 +277,82 @@ class VR_CODEC_API Encoder {
   core::Result<std::vector<std::uint8_t>> encode(
       volume::VoxelBlockGrid& grid, core::StageMetrics* metrics = nullptr);
 
+  /// @brief Record the front half of coding @p grid into @p batch, after what
+  ///        it holds -- the set's fusion -- with every count on the device:
+  ///        the active set, the blocks to code and their sort, the transform,
+  ///        a P-frame's diff against the reference, the symbol count and the
+  ///        coder steps' layout, then the results @ref record_back reads.
+  ///
+  /// Decides I or P now by @ref encode's rules, all but "no block to code",
+  /// which the device answers. Every step is sized for the grid's block slots
+  /// and runs for the count the device found; the sort records its levels for
+  /// that bound, and a level the count does not need passes its entries
+  /// through. While the map's last device list still holds, it is bound with
+  /// its count instead of a compaction.
+  /// @param batch    Records the half; the caller submits it.
+  /// @param grid     As @ref encode; nothing but @p batch changes it until the
+  ///                 batch has resolved.
+  /// @param metrics  Optional: `"codec encode"`'s host half now; from
+  ///                 `PendingBatch::device_rows` the device halves of
+  ///                 `"  ..encode set"`, `"  ..observed"` and `"  ..forward"`.
+  /// @return The pending frame; or, with nothing recorded, @ref encode's
+  ///         refusals of the encoder and the grid, and of a frame the device
+  ///         cannot hold at the grid's block slots; or, after the first
+  ///         commands, so the caller drops @p batch, a buffer failure.
+  /// @pre Every batch of this encoder's last frame has resolved.
+  core::Result<PendingEncode> record_front(
+      core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+      core::StageMetrics* metrics = nullptr);
+
+  /// @brief Once @p pending's front batch has resolved: build the frame's
+  ///        tables from the device's counts, on the host, then record the rANS
+  ///        coding into @p batch -- the tables, each entry's coder steps, each
+  ///        segment's stream, and their gathering into a payload slot.
+  ///
+  /// Records nothing for a frame of no blocks, which @ref finish makes an
+  /// I-frame of none. The payload slot has room for the coding's bound.
+  /// Where it is copied (`core::HostRing::in_place` false), the batch copies
+  /// the payload's likely size, and @ref finish copies any rest.
+  /// @param batch    Records the half; the caller submits it.
+  /// @param pending  From this encoder's last @ref record_front.
+  /// @param metrics  Optional: `"codec encode"`'s host half over
+  ///                 `"  ..tables"`, and from `PendingBatch::device_rows` the
+  ///                 device half of `"  ..rans encode"`.
+  /// @return OK; with nothing recorded, the front's refusals (entries the
+  ///         transform found no block for, a motion mode or a -32768
+  ///         written); `Status::Code::InvalidArgument` for a pending this
+  ///         encoder no longer holds or whose back is recorded, or coded
+  ///         segments that could outgrow 4 GiB; or a buffer failure.
+  /// @pre At most one @ref EncodedFrame of this encoder's is held.
+  core::Status record_back(core::CommandBatch& batch,
+                           const PendingEncode& pending,
+                           core::StageMetrics* metrics = nullptr);
+
+  /// @brief Once @p pending's back batch has resolved: check the coding,
+  ///        assemble the head, and make the frame the reference.
+  ///
+  /// A payload that outgrew what its batch copied is gathered again over the
+  /// rest, in a batch of its own that this waits on (`"  ..tail"`, rare). The
+  /// reference's hash is XXH64 over the head and the payload.
+  /// @param pending  From this encoder's last @ref record_front, its back
+  ///                 recorded and resolved.
+  /// @param metrics  Optional: `"codec encode"`'s host half, and a tail's
+  ///                 `"  ..tail"`.
+  /// @return The frame, now the reference; `Status::Code::IoError` if a
+  ///         kernel's table refused a symbol it was counted from (a bug);
+  ///         `Status::Code::InvalidArgument` for a pending this encoder no
+  ///         longer holds or whose back is not recorded, or a frame the
+  ///         container would refuse; or a tail's failure. A refusal keeps
+  ///         the reference, and the pending frame is gone.
+  core::Result<EncodedFrame> finish(const PendingEncode& pending,
+                                    core::StageMetrics* metrics = nullptr);
+
+  /// @brief Drop @p pending: its batch failed, or the grid it read changed
+  ///        before the frame was finished (a fusion done again). The
+  ///        reference and the period stay.
+  /// @param pending  From this encoder; one it no longer holds is ignored.
+  void abandon(const PendingEncode& pending) noexcept;
+
   /// @brief Make the next frame @ref encode returns an I-frame: what a
   ///        caller does when a frame it was returned did not reach the
   ///        decoder, so the P-frames after it would be refused there
@@ -222,6 +365,18 @@ class VR_CODEC_API Encoder {
  private:
   Encoder();
 
+  // The halves' bodies, inside the caller's "codec encode" scope, which
+  // encode() holds open across both batches and their waits.
+  core::Result<PendingEncode> front(core::CommandBatch& batch,
+                                    volume::VoxelBlockGrid& grid,
+                                    core::StageMetrics* metrics);
+  core::Status back(core::CommandBatch& batch, const PendingEncode& pending,
+                    core::StageMetrics* metrics);
+  core::Result<EncodedFrame> finish_frame(const PendingEncode& pending,
+                                          core::StageMetrics* metrics);
+  // Whether `pending` is this encoder's unfinished last record.
+  bool holds(const PendingEncode& pending) const noexcept;
+
   EncoderConfig config_;
   // Borrowed (must outlive this); what the coding's batches run on.
   core::Device* device_ = nullptr;
@@ -231,12 +386,17 @@ class VR_CODEC_API Encoder {
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
   // The reference a P-frame is coded against, and the diff against it.
   std::unique_ptr<detail::ReferenceStore> store_;
+  // A held active list's count, set in the front's batch, for the passes
+  // the device sizes from it.
+  core::Buffer list_count_;
   // Device spans for the kernels; idle until a caller asks for metrics.
   core::GpuTimer gpu_timer_;
   // Frames coded since the last I-frame, below config_.intra_period: the
   // next frame is an I-frame at 0.
   std::uint32_t gop_position_ = 0;
   bool force_intra_ = false;
+  // What the halves need of the last record (encoder.cpp).
+  std::unique_ptr<detail::RecordedEncode> pending_;
 };
 
 }  // namespace volumetric_kit::recon::codec

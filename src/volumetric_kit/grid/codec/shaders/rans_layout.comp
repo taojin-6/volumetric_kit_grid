@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Tao Jin
 
 // The device frame's step layout (step_layout.hpp), one workgroup on
-// scan.glsl, over the frame's N entries: num_entries less the surplus
-// (counted_entries), so a bounded P-frame's count lays out only its own.
+// scan.glsl, over the frame's N entries, which the frame words take from
+// the bound num_entries (counted_entries), so a frame whose count only the
+// device knows lays out only its own.
 // First each entry's first step, starts[p]: the steps of the entries before
 // it in stream order, an exclusive scan, with their total at starts[N]. Then
 // each segment's output slot, in 16-bit words: a word a step and the final
@@ -41,8 +42,9 @@ layout(set = 0, binding = 1, std430) coherent buffer Starts {
 layout(set = 0, binding = 2, std430) writeonly buffer SlotOffsets {
   uint slot_offsets[];  // in 16-bit words, S + 1, each even
 };
-layout(set = 0, binding = 3, std430) readonly buffer Surplus {
-  uint surplus;  // the entries past the frame's (counted_entries)
+layout(set = 0, binding = 3, std430) readonly buffer FrameWords {
+  uint surplus;  // counted_entries' words
+  uint frame_blocks;
 };
 layout(set = 0, binding = 4, std430) writeonly buffer Totals {
   uint step_total;  // starts[N]
@@ -54,7 +56,7 @@ const uint kRun = 8u;  // a chunk spans kScanLanes * kRun values
 
 void main() {
   const uint lane = gl_LocalInvocationID.x;
-  const uint n = counted_entries(surplus);
+  const uint n = counted_entries(surplus, frame_blocks);
   uint carry = 0u;
   for (uint base = 0u; base < n; base += kScanLanes * kRun) {
     const uint first = base + lane * kRun;

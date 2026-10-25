@@ -7,8 +7,9 @@
 // every writer refusal; every reader refusal, each made by editing one field
 // or section of a valid frame; the frame type the container writes; the
 // section rules; coordinates out of order across segments; truncation and
-// random corruption, which must fail cleanly and never read out of bounds; and
-// what an all-zero frame costs. CPU-only, so these always run.
+// random corruption, which must fail cleanly and never read out of bounds;
+// what an all-zero frame costs; and the encoder's frame unjoined, its head
+// and payload apart, and their hash. CPU-only, so these always run.
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include "codec_frames.hpp"
 #include "codec_oracle.hpp"
 #include "dct_tables.hpp"
+#include "frame_hash.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
@@ -311,6 +313,50 @@ int assemble_refusals_case() {
   f = good;
   f.new_count = f.block_count;
   CHECK(names(f, "new_count"));
+  return 0;
+}
+
+// The encoder's frame unjoined: assemble_head then the payload is
+// assemble_frame's bytes, for frames of every type and size, PAYLOAD's body
+// last, and a head for another payload size than the lengths sum to is
+// refused; and frame_hash over the head and payload unjoined, split
+// anywhere, is the hash of the joined bytes.
+int head_case() {
+  for (const std::size_t n :
+       {std::size_t{0}, std::size_t{1}, std::size_t{37}, std::size_t{300}}) {
+    const oracle::Frame f = make_frame(n, 16, 9 + n);
+    const std::vector<std::uint8_t> bytes = oracle::write_frame(f).value();
+    // The frame laid out again, from its own parse, by both forms.
+    vkc::Result<d::ParsedFrame> parsed =
+        d::parse_frame(bytes.data(), bytes.size(), 1u << 20, nullptr);
+    CHECK(parsed.ok());
+    d::CodedFrame coded;
+    coded.voxel_size = parsed->header.voxel_size;
+    coded.trunc_dist = parsed->header.trunc_dist;
+    coded.params = parsed->header.params;
+    coded.block_count = parsed->header.block_count;
+    coded.segment_size = parsed->header.segment_size;
+    coded.tables = parsed->tables;
+    coded.segment_lengths = parsed->segment_lengths;
+    coded.payload.assign(parsed->payload, bytes.data() + bytes.size());
+    vkc::Result<std::vector<std::uint8_t>> whole =
+        d::assemble_frame(d::FrameType::kIntra, coded);
+    vkc::Result<std::vector<std::uint8_t>> head =
+        d::assemble_head(d::FrameType::kIntra, coded, coded.payload.size());
+    CHECK(whole.ok() && head.ok() && whole.value() == bytes);
+    std::vector<std::uint8_t> joined = head.value();
+    joined.insert(joined.end(), coded.payload.begin(), coded.payload.end());
+    CHECK(joined == bytes);
+    CHECK(
+        !d::assemble_head(d::FrameType::kIntra, coded, coded.payload.size() + 1)
+             .ok());
+    for (std::size_t split = 0; split <= bytes.size(); split += 1 + split / 7) {
+      CHECK(d::frame_hash(bytes.data(), split, bytes.data() + split,
+                          bytes.size() - split) ==
+            d::frame_hash(bytes.data(), bytes.size()));
+    }
+  }
+  CHECK(d::frame_hash(nullptr, 0, nullptr, 0) == d::frame_hash(nullptr, 0));
   return 0;
 }
 
@@ -715,6 +761,7 @@ int main() {
   if (write_refusals_case() != 0) return 1;
   if (model_layout_case() != 0) return 1;
   if (assemble_refusals_case() != 0) return 1;
+  if (head_case() != 0) return 1;
   if (header_refusals_case() != 0) return 1;
   if (frame_type_case() != 0) return 1;
   if (section_rules_case() != 0) return 1;

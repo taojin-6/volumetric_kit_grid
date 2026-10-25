@@ -16,6 +16,11 @@
 #include "rans_layout_comp.spv.hpp"
 
 namespace volumetric_kit::recon::codec::detail {
+namespace {
+
+constexpr VkDeviceSize kTotalsBytes = sizeof(StepLayout::Totals);
+
+}  // namespace
 
 core::Result<std::unique_ptr<StepLayout>> StepLayout::create(
     core::Device& device, core::Allocator& allocator) {
@@ -35,8 +40,7 @@ core::Result<std::unique_ptr<StepLayout>> StepLayout::create(
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
   l.max_workgroup_count_x_ = props.limits.maxComputeWorkGroupCount[0];
   l.max_storage_buffer_range_ = props.limits.maxStorageBufferRange;
-  VKC_ASSIGN(l.totals_,
-             core::device_storage_buffer(allocator, sizeof(l.totals_host_)));
+  VKC_ASSIGN(l.totals_, core::device_storage_buffer(allocator, kTotalsBytes));
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(l.totals_.handle()),
                          "codec.rans_layout_totals");
@@ -45,7 +49,7 @@ core::Result<std::unique_ptr<StepLayout>> StepLayout::create(
 
 core::Status StepLayout::record(
     core::CommandBatch& batch, const core::Buffer& steps,
-    const core::Buffer& surplus, std::uint32_t entries,
+    const core::Buffer& words, std::uint32_t entries,
     std::uint32_t reference_count, std::uint32_t update_size,
     std::uint32_t segment_size, core::GpuStageScope* stage) {
   const std::uint32_t m = reference_count;
@@ -61,8 +65,8 @@ core::Status StepLayout::record(
     VKC_TRY(
         check_segment_size("StepLayout::record", "update_size", update_size));
   }
-  totals_host_[0] = totals_host_[1] = 0;
-  if (entries == 0) return {};
+  // No entries lays out nothing, and its totals are 0.
+  if (entries == 0) return batch.fill(totals_, 0, kTotalsBytes, 0u);
 
   // The bound's, which the frame's never exceed; below 2^32 together, as
   // m + (entries - m) is.
@@ -75,8 +79,8 @@ core::Status StepLayout::record(
       (VkDeviceSize(segments) + 1) * sizeof(std::uint32_t);
   VKC_TRY(core::StorageInput(steps).check("StepLayout::record: the steps",
                                           step_bytes));
-  VKC_TRY(core::StorageInput(surplus).check("StepLayout::record: the surplus",
-                                            sizeof(std::uint32_t)));
+  VKC_TRY(core::StorageInput(words).check("StepLayout::record: the frame words",
+                                          kFrameWordsBytes));
   VKC_TRY(core::ensure_device_scratch(*device_, *allocator_, starts_,
                                       start_bytes, range, "codec.rans_starts",
                                       &batch));
@@ -86,18 +90,15 @@ core::Status StepLayout::record(
   kernel_.set.write_storage_buffer(0, steps.handle(), 0, step_bytes);
   kernel_.set.write_storage_buffer(1, starts_.handle(), 0, start_bytes);
   kernel_.set.write_storage_buffer(2, slot_offsets_.handle(), 0, offset_bytes);
-  kernel_.set.write_storage_buffer(3, surplus.handle(), 0,
-                                   sizeof(std::uint32_t));
-  kernel_.set.write_storage_buffer(4, totals_.handle(), 0,
-                                   sizeof(totals_host_));
+  kernel_.set.write_storage_buffer(3, words.handle(), 0, kFrameWordsBytes);
+  kernel_.set.write_storage_buffer(4, totals_.handle(), 0, kTotalsBytes);
   RansPush push;
   push.num_entries = entries;
   push.segment_size = segment_size;
   push.reference_count = m;
   push.update_size = update_size;
-  VKC_TRY(batch.dispatch(kernel_, &push, sizeof(push), 1,
-                         max_workgroup_count_x_, stage));
-  return batch.readback(totals_, 0, sizeof(totals_host_), totals_host_);
+  return batch.dispatch(kernel_, &push, sizeof(push), 1, max_workgroup_count_x_,
+                        stage);
 }
 
 }  // namespace volumetric_kit::recon::codec::detail

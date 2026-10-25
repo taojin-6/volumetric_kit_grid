@@ -37,7 +37,7 @@ namespace volumetric_kit::recon::codec::detail {
 /// takes every int32 coordinate with no key transform. A tile kernel sorts
 /// each 256 entries in shared memory; each level after it merges pairs of
 /// sorted runs, an entry an invocation, each placed at its index in its run
-/// plus a binary search of its sibling run. So n entries take
+/// plus a binary search of its sibling run. So a bound of n entries takes
 /// `1 + ceil(log2(ceil(n / 256)))` dispatches, and every entry's place depends
 /// only on the keys: unique keys, as a hash table's are, give one order
 /// whatever order they came in.
@@ -72,25 +72,33 @@ class VR_CODEC_API BlockLists {
   BlockLists(BlockLists&&) = delete;
   BlockLists& operator=(BlockLists&&) = delete;
 
-  /// @brief Record a stable sort of the first @p n `volume::BlockIndex`
-  ///        entries of @p list, by @ref coord_less, into @p batch.
+  /// @brief Record a stable sort of the first `n` `volume::BlockIndex`
+  ///        entries of @p list, by @ref coord_less, into @p out, `n` the
+  ///        word @p count names, so it never reaches the host.
   ///
-  /// @p list is read, never written. The levels bind sets this object keeps,
-  /// so a batch holds at most one of these calls.
+  /// The tile pass and every level the bound needs are recorded over the
+  /// bound's groups, a group past `n` returning, and a level past what `n`
+  /// needs copies its entries through: the order is `n` entries' sort,
+  /// whatever the bound. The last level, or the tile pass when the bound
+  /// needs none, writes @p out, so the sorted list lands where its reader
+  /// binds it with no copy. @p list is read, never written. The levels bind
+  /// sets this object keeps, so a batch holds at most one of these calls.
   /// @param batch  The batch to record into; submitted by the caller.
-  /// @param list   A storage buffer of at least @p n entries.
-  /// @param n      The entries to sort.
+  /// @param list   A storage buffer of at least the bound's entries.
+  /// @param count  `n`, a word a kernel wrote, at most its bound.
+  /// @param out    Where the sorted entries go: at least the bound's.
   /// @param stage  Optional scope the caller's stage row is open under; the
   ///               dispatches record their device spans into it.
-  /// @return This object's buffer that holds the sorted entries once
-  ///         @p batch has run, valid until the next call (one with no
-  ///         entries for @p n 0, which records nothing); or
+  /// @return OK, recording nothing for a bound of 0; or
   ///         `Status::Code::InvalidArgument` for a @p list
-  ///         `StorageInput::check` refuses or entries past
-  ///         `maxStorageBufferRange`; otherwise a buffer failure.
-  core::Result<const core::Buffer*> record_sort(
-      core::CommandBatch& batch, const core::Buffer& list, std::uint32_t n,
-      core::GpuStageScope* stage = nullptr);
+  ///         `StorageInput::check` refuses, entries past
+  ///         `maxStorageBufferRange`, a count word missing, misaligned or past
+  ///         its buffer, or an @p out short of the bound; otherwise a buffer
+  ///         failure.
+  core::Status record_sort(core::CommandBatch& batch, const core::Buffer& list,
+                           const volume::DeviceCount& count,
+                           const core::Buffer& out,
+                           core::GpuStageScope* stage = nullptr);
 
   /// @brief Make the diff's lists hold a frame of @p n blocks into a grid of
   ///        @p slots hash slots, before anything is recorded.
@@ -174,8 +182,8 @@ class VR_CODEC_API BlockLists {
   core::ComputeKernel frame_merge_kernel_;
   core::ComputeKernel grid_diff_kernel_;
   core::DescriptorPool pool_;
-  // The merge levels' sets, one a direction: sorted_[0] into sorted_[1],
-  // then back.
+  // The merge levels' sets: sorted_[0] into sorted_[1], back, and the last
+  // level's half into the caller's output.
   core::KernelSets sort_merge_sets_;
 
   // Device-local, retained: the sort's two halves, which its levels

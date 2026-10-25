@@ -120,10 +120,11 @@ struct ResidentBlocks {
 /// is recorded into the caller's batch and writes its output where the
 /// caller says (the encoder's reference store, from which the device frame
 /// writer codes it), and the inverse reads its input where the reference
-/// store's apply wrote it, in the caller's batch too. The forward reads back
-/// its reject count alone, the inverse leaves it on the device for the
-/// decoder's results (@ref rejected), and the observed filter reads back its
-/// count and reject tally.
+/// store's apply wrote it, in the caller's batch too. Nothing is read back:
+/// the forward and the inverse leave their reject count on the device for
+/// the caller's results (@ref rejected), and the observed filter its count
+/// and reject tally (@ref observed_counts), which size the encoder's later
+/// passes there.
 /// The observed list, the cut set and the keep flags grow when needed and
 /// remain allocated for later calls. The coefficients travel two to a word,
 /// 16 bits each.
@@ -145,27 +146,30 @@ class VR_CODEC_API DctTransform {
   DctTransform(const DctTransform&) = delete;
   DctTransform& operator=(const DctTransform&) = delete;
 
-  /// @brief Record the transform and quantization of the first @p count
-  ///        blocks of @p list into @p batch, its output into @p masks and
-  ///        @p coefficients by list position.
+  /// @brief Record the transform and quantization of the first `n` blocks of
+  ///        @p list into @p batch, `n` the word @p count names, its output
+  ///        into @p masks and @p coefficients by list position.
   ///
-  /// When @p batch is submitted, @p rejected receives the entries the
-  /// kernel found no block for, which @ref check_rejected turns into a
-  /// refusal.
+  /// The groups are the count's, a block each, sized on the device; every
+  /// buffer is bound for the bound. Once @p batch has run, @ref rejected
+  /// holds the entries the kernel found no block for, which
+  /// @ref check_rejected turns into a refusal.
   /// @param batch         The batch to record into; submitted by the caller.
+  ///                      @ref record_steps for @p params must be recorded
+  ///                      into it before.
   /// @param grid          The grid the list names; must carry 4-byte `tsdf`
   ///                      and `weight` attributes and have `block_size` 8.
   /// @param list          `volume::BlockIndex` entries on the device, found
   ///                      by `coord` (each `ptr` is ignored); must outlive
   ///                      the output.
-  /// @param count         The entries to transform.
+  /// @param count         The entries to transform: a word a kernel wrote,
+  ///                      at most its bound.
   /// @param params        The coefficient count and steps.
   /// @param masks         Where each entry's `kMaskWordsPerBlock` mask words
   ///                      go; must outlive the output.
   /// @param coefficients  Where each entry's @ref coefficient_words(K)
   ///                      words go, an odd K's pad half 0; must outlive the
   ///                      output.
-  /// @param rejected      Written at submit; must outlive it.
   /// @param cut           Optional cut set, one bit per voxel of the grid's
   ///                      heap (slot s at bit s % 32 of word s / 32), whose
   ///                      set voxels are coded as unobserved
@@ -174,21 +178,22 @@ class VR_CODEC_API DctTransform {
   /// @param stage         Optional scope the caller's stage row is open
   ///                      under; the dispatches record their device spans
   ///                      into it. `nullptr` times nothing.
-  /// @return The output, borrowing @p list, @p masks and @p coefficients
-  ///         (no entries for @p count 0, which records nothing), or, before
-  ///         anything is recorded, `Status::Code::InvalidArgument` for
-  ///         invalid @p params, a grid that is moved-from, has another block
-  ///         size, a non-positive `trunc_dist`, or lacks a float `tsdf` /
-  ///         `weight`; more entries than the grid's block heap; a @p list
-  ///         `StorageInput::check` refuses for them; output buffers smaller
-  ///         than they need; a @p cut smaller than the grid's heap; or a
-  ///         buffer that would exceed `maxStorageBufferRange`. Otherwise a
-  ///         buffer failure.
+  /// @return The output, borrowing @p list, @p masks and @p coefficients,
+  ///         its count the bound (no entries for a bound of 0, which records
+  ///         the reject count's reset alone), or, before anything is
+  ///         recorded, `Status::Code::InvalidArgument` for invalid @p params,
+  ///         a grid that is moved-from, has another block size, a
+  ///         non-positive `trunc_dist`, or lacks a float `tsdf` / `weight`; a
+  ///         count word missing, misaligned or past its buffer; a bound past
+  ///         the grid's block heap; a @p list `StorageInput::check` refuses
+  ///         for it; output buffers smaller than it needs; a @p cut smaller
+  ///         than the grid's heap; or a buffer that would exceed
+  ///         `maxStorageBufferRange`. Otherwise a buffer failure.
   core::Result<ResidentBlocks> record_forward(
       core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
-      const core::Buffer& list, std::uint32_t count, const CodecParams& params,
-      const core::Buffer& masks, const core::Buffer& coefficients,
-      std::uint32_t& rejected, const core::Buffer* cut = nullptr,
+      const core::Buffer& list, const volume::DeviceCount& count,
+      const CodecParams& params, const core::Buffer& masks,
+      const core::Buffer& coefficients, const core::Buffer* cut = nullptr,
       core::GpuStageScope* stage = nullptr);
 
   /// @return The refusal for @p rejected entries of @p count the kernels
@@ -196,10 +201,15 @@ class VR_CODEC_API DctTransform {
   static core::Status check_rejected(const char* op, std::uint32_t rejected,
                                      std::uint32_t count);
 
+  /// @return OK for a grid the transform takes, as @ref record_observed
+  ///         checks it; its refusal otherwise: what a caller checks before
+  ///         it records anything else.
+  core::Status check_grid(const volume::VoxelBlockGrid& grid) const;
+
   /// @brief Record the upload of @p params' steps, which the forward and the
-  ///        inverse read, into @p batch: inline, so a decode's batch records
-  ///        it ahead of its first dispatch. @ref record_forward records its
-  ///        own.
+  ///        inverse read, into @p batch: inline, so a caller records it ahead
+  ///        of its batch's first dispatch, and MoltenVK opens no blit encoder
+  ///        mid-batch.
   /// @return OK, or the batch's refusal.
   core::Status record_steps(core::CommandBatch& batch,
                             const CodecParams& params);
@@ -243,46 +253,68 @@ class VR_CODEC_API DctTransform {
   ///         for @ref check_rejected.
   const core::Buffer& rejected() const noexcept { return rejected_; }
 
-  /// @brief Gather the entries of @p list whose block holds an observed
-  ///        voxel (`weight >= volume::kObservedWeight`) into
-  ///        @ref observed_list, in unspecified order -- or, with @p true_sdf,
-  ///        those `EncoderConfig::true_sdf` codes, its cut set left in
+  /// @brief Record the gathering of the first `n` entries of @p list whose
+  ///        block holds an observed voxel (`weight >= volume::kObservedWeight`)
+  ///        into @ref observed_list, `n` the word @p count names, in
+  ///        unspecified order -- or, with @p true_sdf, those
+  ///        `EncoderConfig::true_sdf` codes, its cut set left in
   ///        @ref cut_set.
   ///
   /// What the encoder keeps, found before the forward transform rather than
   /// after it. This reads each block's weights alone and appends only observed
-  /// entries to a device list; only the count and the reject tally come back.
-  /// With @p true_sdf, two passes over the list come first in the same batch:
-  /// the cut, then the flags of the blocks holding a corner of a cell kept,
-  /// which the append then takes instead. The encoder sorts the entries by
+  /// entries to a device list, a group an entry, sized on the device; their
+  /// count and the reject tally stay there (@ref observed_counts). With
+  /// @p true_sdf, two passes over the list come first in the same batch: the
+  /// cut, then the flags of the blocks holding a corner of a cell kept, which
+  /// the append then takes instead. The encoder sorts the entries by
   /// coordinate on the device before transforming them, so append order
   /// cannot affect bytes.
+  /// @param batch     The batch to record into; submitted by the caller.
   /// @param grid      As @ref record_forward.
-  /// @param list      The map's own active list, bound where it is
-  ///                  (@ref
-  ///                  volume::VoxelHashMap::compact_active_blocks_on_device).
+  /// @param list      The map's own active list, bound where it is: one
+  ///                  `record_compaction` wrote into @p batch, or one
+  ///                  @ref volume::VoxelHashMap::held_device_list holds.
+  /// @param count     Its entries: a word a kernel wrote or the caller set, at
+  ///                  most its bound, at most the grid's heap.
   /// @param true_sdf  Whether to keep the blocks `EncoderConfig::true_sdf`
   ///                  codes.
   /// @param stage     As @ref record_forward.
-  /// @return How many entries @ref observed_list holds;
-  ///         `Status::Code::InvalidArgument` for a list
-  ///         @ref volume::VoxelHashMap::check_device_block_list refuses, a
-  ///         grid @ref record_forward refuses, or a buffer past
-  ///         `maxStorageBufferRange`; otherwise a buffer or dispatch failure.
-  core::Result<std::uint32_t> observed(const volume::VoxelBlockGrid& grid,
-                                       const volume::DeviceBlockList& list,
-                                       bool true_sdf,
-                                       core::GpuStageScope* stage = nullptr);
+  /// @return OK, recording the counts' reset alone for a bound of 0; or,
+  ///         before anything is recorded, `Status::Code::InvalidArgument` for
+  ///         a grid @ref record_forward refuses, a count word missing,
+  ///         misaligned or past its buffer, a bound past the grid's heap, a
+  ///         @p list `StorageInput::check` refuses for it, or a buffer past
+  ///         `maxStorageBufferRange`; otherwise a buffer failure.
+  core::Status record_observed(core::CommandBatch& batch,
+                               const volume::VoxelBlockGrid& grid,
+                               const core::Buffer& list,
+                               const volume::DeviceCount& count, bool true_sdf,
+                               core::GpuStageScope* stage = nullptr);
 
-  /// @return The last @ref observed call's entries, `volume::BlockIndex`
-  ///         each, valid until its next call; empty until one keeps any.
+  /// @return The last @ref record_observed's two words, once its batch ran:
+  ///         the entries it found no block for, then how many entries
+  ///         @ref observed_list holds.
+  const core::Buffer& observed_counts() const noexcept {
+    return observed_counts_;
+  }
+
+  /// @return How many entries @ref observed_list holds, once the last
+  ///         @ref record_observed's batch has run: its word in
+  ///         @ref observed_counts, bound by that call's list.
+  volume::DeviceCount observed_count() const noexcept {
+    return volume::DeviceCount{&observed_counts_, sizeof(std::uint32_t),
+                               observed_bound_};
+  }
+
+  /// @return The last @ref record_observed's entries, `volume::BlockIndex`
+  ///         each, valid until its next call; at least its bound's.
   const core::Buffer& observed_list() const noexcept {
     return observed_blocks_;
   }
 
-  /// @return The cut set of the last @ref observed call with `true_sdf` and
-  ///         a non-empty list, laid out as @ref record_forward takes it, valid
-  ///         until the next such call.
+  /// @return The cut set of the last @ref record_observed with `true_sdf`
+  ///         and a non-empty list, laid out as @ref record_forward takes it,
+  ///         valid until the next such call.
   const core::Buffer& cut_set() const noexcept { return cut_; }
 
  private:
@@ -311,8 +343,8 @@ class VR_CODEC_API DctTransform {
 
   /// Bind the call's buffers and record @p kernel over the @p count entries
   /// of @p list into @p batch, a workgroup an entry, once per pass of
-  /// @p true_sdf (a batch takes no set rewritten after a dispatch), the
-  /// reject count zeroed first; over @p slices when given, which the device
+  /// @p true_sdf (a batch takes no set rewritten after a dispatch), its
+  /// @p counts zeroed first; over @p slices when given, which the device
   /// sized. @p coefficients and @p masks may be null for a kernel that reads
   /// none.
   core::Status record(core::CommandBatch& batch, core::ComputeKernel& kernel,
@@ -322,7 +354,10 @@ class VR_CODEC_API DctTransform {
                       VkBuffer coefficients, VkBuffer masks,
                       VkDeviceSize masks_bytes, const TrueSdf& true_sdf,
                       const recon::detail::IndirectSlices* slices,
-                      core::GpuStageScope* stage);
+                      const core::Buffer& counts, core::GpuStageScope* stage);
+  /// A count word's checks, and its bound against the grid's heap.
+  core::Status check_count(const char* op, const volume::VoxelBlockGrid& grid,
+                           const volume::DeviceCount& count) const;
   /// Grow @p buffer if needed, retaining it for later calls
   /// (`ensure_device_scratch`).
   core::Status ensure_scratch(core::Buffer& buffer, VkDeviceSize bytes,
@@ -344,21 +379,32 @@ class VR_CODEC_API DctTransform {
   core::ComputeKernel inverse_kernel_;
   core::ComputeKernel observed_kernel_;
   core::ComputeKernel surface_kernel_;
+  // The count-to-slices kernels (recon::detail::add_dispatch_args) of the
+  // observed pass and the forward, one each, so both size in one batch.
+  core::ComputeKernel observed_args_kernel_;
+  core::ComputeKernel forward_args_kernel_;
   core::DescriptorPool pool_;
+  // The slices those write.
+  core::Buffer observed_slices_;
+  core::Buffer forward_slices_;
   // The basis + zigzag tables (binding 3), uploaded once.
   core::Buffer tables_;
   // Canonical per-basis effective steps (binding 9), computed on the host
   // and uploaded in each transform batch.
   core::Buffer quantization_steps_;
-  // Rejected entries followed by the observed count (binding 7), zeroed
-  // in each call's batch. Forward/inverse use the first word alone.
+  // The forward's and the inverse's rejected entries (binding 7, the first
+  // word), and the observed pass's rejected entries and count (its binding
+  // 7), each zeroed in its call's batch.
   core::Buffer rejected_;
+  core::Buffer observed_counts_;
+  // The last record_observed's bound.
+  std::uint32_t observed_bound_ = 0;
   // Scratch stays alive between calls; each binding uses its logical range,
   // not the retained capacity. No allocation when a call fits it.
   core::Buffer observed_blocks_;
   // The true SDF passes' cut set (binding 10, a bit a voxel slot) and keep
   // flags (binding 11, a word a block slot), sized to the grid's heap and
-  // zeroed in each observed() batch that uses them.
+  // zeroed in each record_observed batch that uses them.
   core::Buffer cut_;
   core::Buffer keep_;
 };

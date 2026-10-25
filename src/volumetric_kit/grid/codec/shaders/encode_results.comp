@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The encoder's front-half results (DeviceFrameWriter::record_count): one
+// workgroup, last in the front's batch, that gathers what the host builds the
+// frame's tables and refusals from into the front's results slot as one
+// struct -- the transform's reject counts, what check_entries refuses, the
+// frame words, the step layout's totals, then every model's symbol counts --
+// so nothing is read back per buffer. Whole fields only: the host reads every
+// byte of the struct and of the counts.
+
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+  uint count_words;    // the symbol counts' words
+  uint has_transform;  // 0: the transform's words are not bound, read 0
+}
+pc;
+
+layout(set = 0, binding = 0, std430) readonly buffer ObservedCounts {
+  uint observed_rejected;  // DctTransform's observed pass
+  uint observed;
+};
+layout(set = 0, binding = 1, std430) readonly buffer Rejected {
+  uint forward_rejected;  // DctTransform's forward
+};
+layout(set = 0, binding = 2, std430) readonly buffer Refusal {
+  uint largest_mode;
+  uint out_of_range;
+};
+layout(set = 0, binding = 3, std430) readonly buffer FrameWords {
+  uint surplus;
+  uint blocks;
+};
+layout(set = 0, binding = 4, std430) readonly buffer Totals {
+  uint step_total;
+  uint slot_total;
+};
+layout(set = 0, binding = 5, std430) readonly buffer Counts {
+  uint counts[];
+};
+
+// Mirrors detail::FrontResults (device_frame_writer.hpp).
+struct FrontResults {
+  uint observed_rejected;
+  uint forward_rejected;
+  uint largest_mode;
+  uint out_of_range;
+  uint surplus;
+  uint blocks;
+  uint step_total;
+  uint slot_total;
+};
+layout(set = 0, binding = 6, scalar) writeonly buffer Result {
+  FrontResults result;
+  uint result_counts[];
+};
+
+void main() {
+  const uint lane = gl_LocalInvocationID.x;
+  if (lane == 0u) {
+    const bool t = pc.has_transform != 0u;
+    result = FrontResults(t ? observed_rejected : 0u,
+                          t ? forward_rejected : 0u, largest_mode,
+                          out_of_range, surplus, blocks, step_total,
+                          slot_total);
+  }
+  for (uint i = lane; i < pc.count_words; i += gl_WorkGroupSize.x) {
+    result_counts[i] = counts[i];
+  }
+}

@@ -5,7 +5,9 @@
 // 32-bit word at a time, finding the segment each of its two 16-bit halves
 // came from. Streams are 16-bit aligned, so no word is written twice.
 // rans_scan.comp sizes the dispatch from the payload, so no invocation starts
-// past it; a payload past the group cap loops.
+// past it; a payload past the group cap loops. The words before
+// pc.payload_byte are left as they are: a tail's gather writes only the
+// window past what its frame's batch copied out.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require
@@ -52,7 +54,8 @@ void main() {
   const uint total = payload_offsets[pc.segment_count];
   const uint words = (total + 3u) / 4u;
   const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
-  for (uint w = gl_GlobalInvocationID.x; w < words; w += stride) {
+  for (uint w = pc.payload_byte / 4u + gl_GlobalInvocationID.x; w < words;
+       w += stride) {
     const uint low = payload16(2u * w);
     const uint high = 4u * w + 2u < total ? payload16(2u * w + 1u) : 0u;
     payload[w] = low | (high << 16u);

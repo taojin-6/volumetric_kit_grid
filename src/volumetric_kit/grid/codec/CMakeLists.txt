@@ -94,6 +94,7 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_gauss.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_line.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/deblock_store.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/encode_results.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_gate.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_merge.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/frame_results.comp"

@@ -36,14 +36,15 @@ static_assert(sizeof(ApplyPush) == 20, "ApplyPush must be 20 bytes");
 struct DiffPush {
   std::uint32_t item_base = 0;
   std::uint32_t reference_count = 0;
-  std::uint32_t target_count = 0;
+  std::uint32_t target_bound = 0;
   std::uint32_t coefficient_count = 0;
   std::uint32_t pass = 0;
+  std::uint32_t target_word = 0;
 };
-static_assert(sizeof(DiffPush) == 20, "DiffPush must be 20 bytes");
+static_assert(sizeof(DiffPush) == 24, "DiffPush must be 24 bytes");
 
 constexpr std::uint32_t kApplyBindings = 8;
-constexpr std::uint32_t kDiffBindings = 11;
+constexpr std::uint32_t kDiffBindings = 12;
 constexpr std::uint32_t kRanksBindings = 3;
 // inter_diff.comp's workgroup width.
 constexpr std::uint32_t kDiffLanes = 64;
@@ -235,9 +236,19 @@ core::Status ReferenceStore::check_faults(std::uint32_t faults) {
 }
 
 core::Result<ResidentBlocks> ReferenceStore::record_diff(
-    core::CommandBatch& batch, std::uint32_t n, std::uint32_t k,
-    core::GpuStageScope* stage) {
+    core::CommandBatch& batch, const volume::DeviceCount& target,
+    std::uint32_t k, core::GpuStageScope* stage) {
   if (!held_) return fail("record_diff", "no reference is held");
+  // The target's bound, which every buffer and the second pass are sized
+  // for; its count stays on the device.
+  const std::uint32_t n = target.bound;
+  if (target.buffer == nullptr || !target.buffer->valid() ||
+      target.offset % kWordBytes != 0 ||
+      target.buffer->size() < target.offset + kWordBytes) {
+    return fail("record_diff",
+                "the target's count word is missing, misaligned or past its "
+                "buffer");
+  }
   const std::uint32_t held_k = reference_.header.params.coefficient_count;
   if (k != held_k) {
     return fail("record_diff", "a frame at K " + std::to_string(k) +
@@ -302,6 +313,7 @@ core::Result<ResidentBlocks> ReferenceStore::record_diff(
   diff.write_storage_buffer(8, modes_.handle(), 0, range(m, kWordBytes));
   diff.write_storage_buffer(9, ranks_.handle(), 0, rank_bytes);
   diff.write_storage_buffer(10, added_.handle(), 0, range(n, kEntryBytes));
+  diff.write_storage_buffer(11, target.buffer->handle(), 0, VK_WHOLE_SIZE);
   const core::DescriptorSet& ranks = ranks_kernel_.set;
   ranks.write_storage_buffer(0, modes_.handle(), 0, range(m, kWordBytes));
   ranks.write_storage_buffer(1, ranks_.handle(), 0, rank_bytes);
@@ -309,8 +321,9 @@ core::Result<ResidentBlocks> ReferenceStore::record_diff(
 
   DiffPush push;
   push.reference_count = m;
-  push.target_count = n;
+  push.target_bound = n;
   push.coefficient_count = k;
+  push.target_word = static_cast<std::uint32_t>(target.offset / kWordBytes);
   VKC_TRY(dispatch_items(batch, diff_kernel_, push, m, kDiffLanes,
                          max_workgroup_count_x_, stage));
   RansPush ranks_push;
