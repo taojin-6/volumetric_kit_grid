@@ -4,10 +4,11 @@
 // GPU test for the map's recorded rounds (VoxelHashMap::record_allocate,
 // record_remove and settle) and VoxelBlockGrid::record_remove: what a caller's
 // batch leaves is what the blocking calls leave, on the cube, delete and sheet
-// fixtures; the count comes from the device, clamped to its bound; a closed
-// gate changes nothing; a capacity limit, or contention past the rounds,
-// closes it; a removal and an allocation share one batch; the rounds split
-// past a dispatch's groups; a recording makes cached lists stale; a steady
+// fixtures, stamps and failures included; the count comes from the device,
+// clamped to its bound; a closed gate changes nothing; a capacity limit, or
+// contention past the rounds, closes it; a removal and an allocation share
+// one batch, each settling its own outcome; the rounds split past a
+// dispatch's groups; a recording makes cached lists stale; a steady
 // recording costs one submit and no staging buffer; the result slots run
 // out at the fifth recording held; and a grid zeroes a block before its index
 // is freed. Skips with no device.
@@ -193,17 +194,41 @@ vkc::Result<vol::AllocFailures> recorded_all(vr_test::Gpu& gpu,
   return f;
 }
 
-// The blocking call, every lost race re-driven as a caller does.
-vkc::Result<std::uint32_t> blocking_all(vr_test::Gpu& gpu,
-                                        vol::VoxelHashMap& map,
-                                        const Blocks& blocks, bool removes) {
+// The blocking call, every lost race re-driven as a caller does; the last
+// call's failures land in @p failures.
+vkc::Result<std::uint32_t> blocking_all(
+    vr_test::Gpu& gpu, vol::VoxelHashMap& map, const Blocks& blocks,
+    bool removes, vol::AllocFailures* failures = nullptr) {
   std::uint32_t left = 0;
   for (int pass = 0; pass < 8; ++pass) {
-    VKC_ASSIGN(left, removes ? vr_test::remove_blocks(gpu, map, blocks)
-                             : vr_test::allocate_blocks(gpu, map, blocks));
+    VKC_ASSIGN(left,
+               removes ? vr_test::remove_blocks(gpu, map, blocks, failures)
+                       : vr_test::allocate_blocks(gpu, map, blocks, failures));
     if (left == 0) break;
   }
   return left;
+}
+
+// Every block slot's stamp, sorted: what two maps' slots hold, wherever
+// their blocks landed.
+vkc::Result<
+    std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>>>
+stamps_of(const vol::VoxelHashMap& map) {
+  VKC_ASSIGN(const std::vector<vol::BlockStamp> stamps,
+             map.read_block_stamps());
+  std::vector<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> out;
+  for (const vol::BlockStamp& s : stamps) {
+    out.emplace_back(s.requested, s.weighted, s.changed);
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// The failures two maps' calls report alike: all but the lost races and the
+// rounds, which contention decides.
+bool same_failures(const vol::AllocFailures& a, const vol::AllocFailures& b) {
+  return a.total == b.total && a.chain == b.chain && a.heap == b.heap &&
+         a.table == b.table && a.terminal == b.terminal;
 }
 
 vkc::Result<vol::VoxelHashMap> make_map(vr_test::Gpu& gpu,
@@ -215,7 +240,8 @@ vkc::Result<vol::VoxelHashMap> make_map(vr_test::Gpu& gpu,
 
 // Two maps, one driven by the blocking calls and one by recordings, through
 // the cube's allocation, the corners' delete (chains of 2-slot buckets) and
-// a 1 024-block sheet in a wide table.
+// a 1 024-block sheet in a wide table: the same blocks, heap count, slot
+// stamps and failures.
 int agrees_case(vr_test::Gpu& gpu) {
   for (const auto& [g, all, gone] :
        {std::make_tuple(params(2, 1024), cube(), corners()),
@@ -223,21 +249,26 @@ int agrees_case(vr_test::Gpu& gpu) {
     vkc::Result<vol::VoxelHashMap> a = make_map(gpu, g);
     vkc::Result<vol::VoxelHashMap> b = make_map(gpu, g);
     CHECK(a.ok() && b.ok());
-    CHECK(blocking_all(gpu, *a, all, false).value() == 0);
+    vol::AllocFailures fa;
+    CHECK(blocking_all(gpu, *a, all, false, &fa).value() == 0);
     vkc::Result<vol::AllocFailures> placed = recorded_all(gpu, *b, all, false);
     CHECK(placed.ok() && placed->total == 0 && placed->terminal == 0);
     CHECK(placed->rounds >= 1 && placed->rounds <= kRounds);
+    CHECK(same_failures(fa, *placed));
     CHECK(coords_of(*a).value() == sorted(all));
     CHECK(coords_of(*b).value() == sorted(all));
     CHECK(a->allocated_blocks() == b->allocated_blocks());
     CHECK(b->allocated_blocks() == all.size());
+    CHECK(stamps_of(*a).value() == stamps_of(*b).value());
 
-    CHECK(blocking_all(gpu, *a, gone, true).value() == 0);
+    CHECK(blocking_all(gpu, *a, gone, true, &fa).value() == 0);
     vkc::Result<vol::AllocFailures> removed = recorded_all(gpu, *b, gone, true);
     CHECK(removed.ok() && removed->total == 0 && removed->terminal == 0);
+    CHECK(same_failures(fa, *removed));
     CHECK(coords_of(*a).value() == coords_of(*b).value());
     CHECK(a->allocated_blocks() == b->allocated_blocks());
     CHECK(b->allocated_blocks() == all.size() - gone.size());
+    CHECK(stamps_of(*a).value() == stamps_of(*b).value());
 
     // The freed blocks go back to the heap: allocating them again restores
     // the set, recorded as blocking.
@@ -441,7 +472,10 @@ int one_batch_case(vr_test::Gpu& gpu) {
   vkc::Result<vol::RecordedRounds> placed = grid->map().record_allocate(
       batch, *fresh_list, vol::DeviceCount{&*counts, 4, 8}, &gate);
   CHECK(removed.ok() && placed.ok() && batch.submit().ok());
+  // The removal's outcome is its own, gathered before the allocation's
+  // rounds: the heap as the corners left it, before the new blocks drew.
   vkc::Result<vol::AllocFailures> r = grid->map().settle(*removed);
+  CHECK(grid->map().allocated_blocks() == all.size() - gone.size());
   vkc::Result<vol::AllocFailures> p = grid->map().settle(*placed);
   CHECK(r.ok() && r->total == 0 && r->terminal == 0);
   CHECK(p.ok() && p->total == 0);
@@ -494,10 +528,13 @@ int stale_case(vr_test::Gpu& gpu) {
     vkc::Result<vol::DeviceBlockList> list =
         map->compact_active_blocks_on_device();
     CHECK(list.ok() && map->check_device_block_list(*list, "test").ok());
+    CHECK(map->held_device_list().has_value() &&
+          map->held_device_list()->serial == list->serial);
     const std::uint64_t epoch = map->topology_epoch();
     const Blocks absent = {at(50, 50, 50)};
     CHECK(recorded(gpu, *map, absent, removes).ok());
     CHECK(!map->check_device_block_list(*list, "test").ok());
+    CHECK(!map->held_device_list().has_value());
     CHECK((map->topology_epoch() != epoch) == removes);
   }
   return 0;
