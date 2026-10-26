@@ -645,7 +645,23 @@ class VR_VOLUME_API VoxelHashMap {
   /// Nothing reaches the host, so a dispatch sized from the count follows in
   /// the same submit (`tsdf::TsdfIntegrator` fuses this way). A list from the
   /// on-device compaction of the same kind no longer holds.
-  /// @param batch   Records the compaction.
+  ///
+  /// `const`, so a caller holding the map, or its grid, read-only records
+  /// one too, as `codec::Encoder` does for the grid it codes. It changes no
+  /// block, voxel, @ref BlockStamp, heap count, @ref topology_epoch or
+  /// @ref tick. What it writes is the map's compaction output, which every
+  /// compaction rewrites: the list, its count, the serial that marks an
+  /// earlier list of the same kind stale, and the frusta it uploads. As for
+  /// every call on the map, no other call may overlap it, const or not.
+  /// @param batch   Records the compaction, binding the map's own kernel
+  ///                sets. Until it has resolved, the map must not be
+  ///                resized, nor its frusta grown (a frustum compaction of
+  ///                more frusta than any before). After a resize, which
+  ///                waits for the map's queue before it replaces a buffer,
+  ///                the core refuses the batch at its wait, its readbacks
+  ///                unwritten. A frusta grow waits for nothing: while the
+  ///                batch may still run, it rewrites the set and frees the
+  ///                buffer the batch uses, which is undefined behaviour.
   /// @param frusta  The frusta, none keeping no block; or null.
   /// @param stage   Optional span around the dispatch; open until @p batch is
   ///                submitted.
@@ -654,7 +670,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///         batch's refusal.
   core::Result<RecordedBlockList> record_compaction(
       core::CommandBatch& batch, const std::vector<FrustumPlanes>* frusta,
-      core::GpuStageScope* stage = nullptr);
+      core::GpuStageScope* stage = nullptr) const;
 
   /// @brief Reset the table to empty (re-runs the init kernel).
   /// @return An OK `Status`, or a non-OK one if the init dispatch fails or
@@ -874,7 +890,8 @@ class VR_VOLUME_API VoxelHashMap {
   /// frustum kernel's scalar layout -- growing and rebinding the buffer first
   /// when it is too small. Called before the batch records the dispatch.
   core::Status upload_frusta(core::CommandBatch& batch,
-                             const FrustumPlanes* frusta, std::uint32_t count);
+                             const FrustumPlanes* frusta,
+                             std::uint32_t count) const;
 
   /// The row label both compaction entry points report under, carrying
   /// `StageMetrics::kBreakdownPrefix` or not according to whether @p metrics
@@ -1020,8 +1037,9 @@ class VR_VOLUME_API VoxelHashMap {
   VkDeviceSize camera_stride_ = 0;
   // Persistent frusta for the frustum compactions (bound at binding 3 of
   // compact_frustum_.set, rewritten inline per call, grown by upload_frusta);
-  // grid-independent.
-  core::Buffer frustum_planes_;
+  // grid-independent. Mutable: compaction scratch, which the const
+  // record_compaction grows.
+  mutable core::Buffer frustum_planes_;
   // The host's copy of heap_counter_, which load_factor() reads: set by
   // init_table and the heap rebuild, read back by every host retry round,
   // and refreshed by settle() from the recorded rounds' result -- the only
@@ -1038,9 +1056,10 @@ class VR_VOLUME_API VoxelHashMap {
   std::uint32_t last_active_count_ = 0;
   // Bumped by every write to compacted_ (a compaction) and every swap of it (a
   // resize), so a DeviceBlockList can be checked against it; frustum_serial_
-  // likewise for frustum_compacted_.
-  std::uint64_t compaction_serial_ = 0;
-  std::uint64_t frustum_serial_ = 0;
+  // likewise for frustum_compacted_. Mutable: the const record_compaction
+  // rewrites the list, so it moves the list's serial too.
+  mutable std::uint64_t compaction_serial_ = 0;
+  mutable std::uint64_t frustum_serial_ = 0;
   // The last compact_active_blocks_on_device list, returned again while
   // holds() says it is still the active set.
   DeviceBlockList last_device_list_{};

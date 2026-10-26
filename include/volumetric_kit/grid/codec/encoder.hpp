@@ -244,11 +244,12 @@ class VR_CODEC_API Encoder {
   /// vector: 2 submits.
   /// @param grid     A grid with 4-byte float `tsdf` and `weight` attributes
   ///                 and `block_size` 8. Its blocks and voxels are read,
-  ///                 never written; the reference is non-const only because
-  ///                 the active set is the map's own list: the one it holds
+  ///                 never written. The active set is the map's own list:
+  ///                 the one it holds
   ///                 (@ref volume::VoxelHashMap::held_device_list), or one
-  ///                 compacted into the front's batch, which an extract after
-  ///                 this compacts again.
+  ///                 compacted into the front's batch
+  ///                 (@ref volume::VoxelHashMap::record_compaction), which an
+  ///                 extract after this compacts again.
   /// @param metrics  Optional `StageMetrics` collecting a `"codec encode"`
   ///                 row with both halves over the breakdown rows, each with
   ///                 its own device half:
@@ -275,7 +276,8 @@ class VR_CODEC_API Encoder {
   ///         `Status::Code::OutOfMemory` past free device memory; otherwise a
   ///         compaction, buffer, pipeline or dispatch failure.
   core::Result<std::vector<std::uint8_t>> encode(
-      volume::VoxelBlockGrid& grid, core::StageMetrics* metrics = nullptr);
+      const volume::VoxelBlockGrid& grid,
+      core::StageMetrics* metrics = nullptr);
 
   /// @brief Record the front half of coding @p grid into @p batch, after what
   ///        it holds -- the set's fusion -- with every count on the device:
@@ -304,7 +306,7 @@ class VR_CODEC_API Encoder {
   ///         commands, so the caller drops @p batch, a buffer failure.
   /// @pre Every batch of this encoder's last frame has resolved.
   core::Result<PendingEncode> record_front(
-      core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+      core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
       core::StageMetrics* metrics = nullptr);
 
   /// @brief Once @p pending's front batch has resolved: build the frame's
@@ -372,7 +374,7 @@ class VR_CODEC_API Encoder {
   // The halves' bodies, inside the caller's "codec encode" scope, which
   // encode() holds open across both batches and their waits.
   core::Result<PendingEncode> front(core::CommandBatch& batch,
-                                    volume::VoxelBlockGrid& grid,
+                                    const volume::VoxelBlockGrid& grid,
                                     core::StageMetrics* metrics);
   core::Status back(core::CommandBatch& batch, const PendingEncode& pending,
                     core::StageMetrics* metrics);
