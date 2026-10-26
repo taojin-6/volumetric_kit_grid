@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "codec_config.hpp"
 #include "codec_fixture.hpp"
 #include "gpu_test.hpp"
 #include "mesh_sequence.hpp"
@@ -43,6 +44,7 @@ namespace cfg = volumetric_kit::core::config;
 namespace io = volumetric_kit::recon::io;
 namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
+namespace sender = volumetric_kit::recon::sender;
 namespace stream = volumetric_kit::recon::stream;
 namespace ts = volumetric_kit::recon::tsdf;
 namespace fs = std::filesystem;
@@ -52,6 +54,12 @@ using volumetric_kit::recon::Vec3d;
 using volumetric_kit::recon::Vec3f;
 
 namespace {
+
+// A codec_mesh stream's session, its transform left out.
+stream::Session geometry_session() {
+  return vr_example::codec_session("example_mesh_sequence",
+                                   {vr_example::kNominalFps, 1});
+}
 
 // An axis-aligned cube, wound outward: vertex i at centre + half * (bit 0, bit
 // 1, bit 2 of i, each as -1 or +1).
@@ -544,13 +552,15 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   CHECK(sequence.ok());
   vkc::Result<std::string> params = io::encode_transform(sequence->transform());
   CHECK(params.ok());
-  vr_example::CodecOutputs outputs;
+  sender::CodecOutputs outputs;
   outputs.stream = (scratch.path / "moving" / "frames.vrst").string();
-  vkc::Result<vr_example::CodecStream> made = vr_example::CodecStream::create(
-      gpu.device, gpu.allocator, {}, outputs, "example_mesh_sequence",
-      {vr_example::kNominalFps, 1}, *params);
+  vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
+      gpu.device, gpu.allocator, {},
+      vr_example::codec_session("example_mesh_sequence",
+                                {vr_example::kNominalFps, 1}, *params),
+      outputs);
   CHECK(made.ok());
-  vr_example::CodecStream coder = std::move(made).value();
+  sender::CodecStream coder = std::move(made).value();
   vkc::Result<ts::MeshIntegrator> integrator =
       ts::MeshIntegrator::create(gpu.device, gpu.allocator);
   CHECK(integrator.ok());
@@ -558,10 +568,13 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   CHECK(grid.ok());
   vkc::StageMetrics conversion;
   std::vector<std::vector<vol::BlockIndex>> blocks;
+  std::vector<sender::SentFrame> sent;
   for (std::uint32_t n = 5; n <= 7; ++n) {
     vkc::Result<vr_example::CodedFrame> coded = vr_example::code_frame(
         *sequence, n, *grid, *integrator, {}, coder, &conversion);
     CHECK(coded.ok() && coded->frame.number == n && coded->stats.blocks > 0);
+    CHECK(coded->sent.bytes > 0 && coded->sent.blocks > 0);
+    sent.push_back(coded->sent);
     vkc::Result<std::vector<vol::BlockIndex>> active =
         codec_fixture::active_sorted(*grid);
     CHECK(active.ok());
@@ -571,11 +584,11 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   CHECK(conversion.rows().size() >= 2);
   CHECK(std::string(conversion.rows()[0].name) == "allocate");
   CHECK(coder.finish().ok());
-  CHECK(coder.rows().size() == 3);
+  CHECK(coder.coded() == 3);
   // The player holds frame 7's blocks, no more.
   vkc::Result<std::vector<vol::BlockIndex>> played =
       codec_fixture::active_sorted(*coder.player());
-  CHECK(played.ok() && played->size() == coder.rows()[2].blocks);
+  CHECK(played.ok() && played->size() == sent[2].blocks);
 
   vkc::Result<std::unique_ptr<stream::StreamReader>> opened =
       stream::StreamReader::open(outputs.stream);
@@ -627,7 +640,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     CHECK(dec->decode(payload.data(), payload.size(), *alone).ok());
     vkc::Result<std::vector<vol::BlockIndex>> decoded =
         codec_fixture::active_sorted(*alone);
-    CHECK(decoded.ok() && decoded->size() == coder.rows()[i].blocks);
+    CHECK(decoded.ok() && decoded->size() == sent[i].blocks);
+    CHECK(payload.size() == sent[i].bytes);
     if (n == 7) {
       for (std::size_t b = 0; b < decoded->size(); ++b) {
         CHECK((*decoded)[b].coord == (*played)[b].coord);
@@ -649,8 +663,8 @@ int refused_once_placed(vr_test::GpuContext& gpu,
   vkc::Result<vr_example::MeshSequence> sequence =
       collapsing(scratch.path / "collapsing_gpu", "");
   CHECK(sequence.ok());
-  vkc::Result<vr_example::CodecStream> coder =
-      vr_example::CodecStream::create(gpu.device, gpu.allocator, {});
+  vkc::Result<sender::CodecStream> coder = sender::CodecStream::create(
+      gpu.device, gpu.allocator, {}, geometry_session());
   vkc::Result<ts::MeshIntegrator> integrator =
       ts::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
@@ -659,7 +673,7 @@ int refused_once_placed(vr_test::GpuContext& gpu,
                                        *coder, nullptr)
                     .status(),
                 Code::InvalidArgument, "frame 7"));
-  CHECK(coder->rows().empty());
+  CHECK(coder->coded() == 0);
   return 0;
 }
 
@@ -685,8 +699,8 @@ int holes_in_code_frame(vr_test::GpuContext& gpu,
     CHECK(settings.ok());
     vkc::Result<vr_example::MeshSequence> sequence =
         vr_example::MeshSequence::open(*settings);
-    vkc::Result<vr_example::CodecStream> coder =
-        vr_example::CodecStream::create(gpu.device, gpu.allocator, {});
+    vkc::Result<sender::CodecStream> coder = sender::CodecStream::create(
+        gpu.device, gpu.allocator, {}, geometry_session());
     vkc::Result<ts::MeshIntegrator> integrator =
         ts::MeshIntegrator::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
@@ -694,7 +708,7 @@ int holes_in_code_frame(vr_test::GpuContext& gpu,
     coded[allowed] = vr_example::code_frame(*sequence, 1, *grid, *integrator,
                                             {}, *coder, nullptr)
                          .status();
-    rows[allowed] = coder->rows().size();
+    rows[allowed] = coder->coded();
   }
   CHECK(refused(coded[0], Code::InvalidArgument, "source.allow_holes"));
   CHECK(rows[0] == 0);
@@ -713,10 +727,10 @@ int single_record(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   vkc::Result<vr_example::MeshSequence> sequence =
       vr_example::MeshSequence::open(*settings);
   CHECK(sequence.ok());
-  vr_example::CodecOutputs outputs;
+  sender::CodecOutputs outputs;
   outputs.stream = (dir / "one.vrst").string();
-  vkc::Result<vr_example::CodecStream> coder =
-      vr_example::CodecStream::create(gpu.device, gpu.allocator, {}, outputs);
+  vkc::Result<sender::CodecStream> coder = sender::CodecStream::create(
+      gpu.device, gpu.allocator, {}, geometry_session(), outputs);
   vkc::Result<ts::MeshIntegrator> integrator =
       ts::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
