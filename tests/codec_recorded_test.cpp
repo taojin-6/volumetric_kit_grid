@@ -8,7 +8,8 @@
 // a refusal before recording records nothing and moves neither the map's
 // epoch nor its tick; a frame the device refuses leaves the extract after it
 // meshing nothing; a superseded record does not finish, an abandoned one
-// keeps the reference; both input slots held refuse a third; the rows; a
+// keeps the reference; both input slots held refuse a third, and an input
+// slot is cached on every device, as the host reads it; the rows; a
 // steady frame costs one submit and no staging buffer; a rafa2-like P-frame's
 // one batch, decode and mesh, records a pinned number of dispatches and
 // barriers; and the growing calls grow before recording, or decode again
@@ -26,6 +27,7 @@
 
 #include "codec_fixture.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
@@ -250,7 +252,7 @@ int device_refusal_case(Gpu& gpu) {
 // A record superseded by the next does not finish; one abandoned keeps the
 // reference, so its frame decodes again and the frame after it, coded
 // against it, is NotFound; another decoder's token neither finishes nor
-// abandons; two input slots held refuse a third.
+// abandons; two input slots held refuse a third; an input slot is cached.
 int tokens_case(Gpu& gpu) {
   vkc::Result<codec::Encoder> enc = encoder(gpu, 20, 0.0f, ~0u);
   CHECK(enc.ok());
@@ -328,6 +330,11 @@ int tokens_case(Gpu& gpu) {
   vkc::Result<vkc::HostSlot> s1 = dec->claim_input(64);
   vkc::Result<vkc::HostSlot> s2 = dec->claim_input(64);
   CHECK(s1.ok() && s2.ok());
+  // The host checks, parses and hashes a record in its slot, so the input
+  // ring stays HostAccess::Random: cached, never write-combined.
+  const std::optional<vkc::MemoryInfo> input = s1->memory_info();
+  CHECK(input.has_value() &&
+        (input->properties & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0);
   CHECK(dec->claim_input(64).status().domain() == C::InvalidArgument);
   CHECK(dec->claim_input(0).status().domain() == C::InvalidArgument);
   return 0;
