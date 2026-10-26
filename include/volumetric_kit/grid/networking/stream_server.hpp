@@ -38,7 +38,8 @@ struct ServerOptions {
   /// after it) may hold: a record that would pass it is dropped with the
   /// whole GOP, and so is every record until the next key, the viewers frozen
   /// until it. Without, how far behind the newest record a viewer may fall:
-  /// one that a record would take past it waits for the next key, alone.
+  /// one that a record would take past it waits for the next key, alone, and
+  /// a record past it on its own goes to none, logged at Warning.
   std::uint64_t max_gop_bytes = std::uint64_t{64} << 20;
   /// A viewer that takes no byte for this long, with bytes waiting for it, is
   /// closed: a peer that vanished. A byte its end acknowledges is taken, so a
@@ -47,12 +48,13 @@ struct ServerOptions {
   /// nothing waiting (before the first key, or while nothing is published).
   /// Positive; `milliseconds::max()` is never.
   std::chrono::milliseconds stall_limit{10'000};
-  /// true: a joiner gets the GOP since the newest key, which the server keeps
-  /// (newest key wins), so a sender that cannot make a key, as one replaying
-  /// a file, still serves a joiner at once. false, for a sender that makes a
-  /// key when @ref StreamServer::key_wanted rises: a joiner waits for the
-  /// next key, and the log keeps only what connected viewers still need, at
-  /// most @ref max_gop_bytes behind; a slower viewer waits for the next key.
+  /// true: a joiner gets the GOP since the newest key, which the server
+  /// keeps, so a sender that cannot make a key, as one replaying a file,
+  /// still serves a joiner at once. false, for a sender that makes a key when
+  /// @ref StreamServer::key_wanted rises: a joiner waits for the next key,
+  /// and the log keeps only what connected viewers still need, at most
+  /// @ref max_gop_bytes behind; a viewer that would fall further waits for
+  /// the next key. Newest key wins either way.
   bool replay_gop = true;
 };
 
@@ -69,22 +71,26 @@ struct ServerOptions {
 /// unsent (`TCP_NOTSENT_LOWAT`), so little backlog hides in the kernel. A
 /// P-frame is never sent without the records it is predicted from.
 ///
-/// **Newest key wins** (@ref ServerOptions::replay_gop, the default). The
+/// **Newest key wins.** When a newer key arrives before a viewer has sent
+/// the records before it, the viewer finishes the chunk under way, skips the
+/// rest and goes on from that key, so one slower than the stream stays
+/// within about a GOP of it.
+///
+/// **Joining at the GOP** (@ref ServerOptions::replay_gop, the default). The
 /// server keeps one GOP: the newest key record and every record after it. A
-/// viewer joins at that key, so it decodes at once. When a newer key arrives
-/// before it has sent the GOP, it finishes the chunk under way, skips the
-/// rest and goes on from that key. A viewer's first record, after its `VRST`
-/// chunk, is the GOP's key, and the server keeps every record since. So once
-/// a viewer has the session, it misses no record published after, except by
-/// newest key wins.
+/// viewer joins at that key, so it decodes at once. A viewer's first record,
+/// after its `VRST` chunk, is the GOP's key, and the server keeps every
+/// record since. So once a viewer has the session, it misses no record
+/// published after, except by newest key wins.
 ///
 /// **Keys on demand** (`replay_gop` false). A viewer joins waiting for the
-/// next key, and from it gets every record, in order, while it stays within
-/// @ref ServerOptions::max_gop_bytes of the newest. One that a record would
-/// take further behind finishes the chunk under way and waits for the next
-/// key again. The server keeps only the records a viewer still has to send.
-/// Each join and each fall-back counts in @ref key_wanted, so a live sender
-/// makes its next frame a key and the viewer waits one frame.
+/// next key, and from it gets every record, in order, except by newest key
+/// wins, while it stays within @ref ServerOptions::max_gop_bytes of the
+/// newest. One that a record would take further behind finishes the chunk
+/// under way and waits for the next key again. The server keeps only the
+/// records a viewer still has to send. Each join and each fall-back counts in
+/// @ref key_wanted, so a live sender makes its next frame a key and the
+/// viewer waits one frame.
 ///
 /// **Threads.** @ref publish never waits on a socket or a viewer: it copies
 /// the record once, takes one lock and wakes the viewers. One thread accepts
@@ -153,8 +159,11 @@ class VR_NETWORKING_API StreamServer {
   /// @brief Viewers that joined or fell back to waiting for a key: without
   ///        @ref ServerOptions::replay_gop, each viewer counted as it joins,
   ///        and again each time it falls back, past `max_gop_bytes` behind or
-  ///        when a record is lost (`publish`'s `OutOfMemory`). A sender that
-  ///        sees it rise makes its next frame a key. Safe from any thread.
+  ///        when a record is lost (`publish`'s `OutOfMemory`), a waiting
+  ///        viewer too when the lost record is a key. A key within
+  ///        `max_gop_bytes` counts none, as every viewer goes on from it. A
+  ///        sender that sees it rise makes its next frame a key. Safe from
+  ///        any thread.
   /// @return The count so far, which never falls; always 0 with
   ///         `replay_gop`, whose joiners start at the GOP's key.
   std::uint64_t key_wanted() const noexcept;

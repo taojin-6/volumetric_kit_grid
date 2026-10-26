@@ -8,8 +8,8 @@
 // and a key after every jump. Then the server is destroyed while the viewers
 // are mid-chunk, within 1 s. Replaying the GOP, and again with keys on
 // demand at a 1 MiB max_gop_bytes, the publisher reading key_wanted from its
-// own thread and keying each record after it rises: there every jump
-// follows a counted fall-back, and replaying none is counted.
+// own thread and keying each record after it rises: there the joins are
+// counted, and replaying none is.
 
 #include <atomic>
 #include <chrono>
@@ -160,7 +160,7 @@ int stress_case(bool replay) {
   CHECK(!tally.broken);
   CHECK(tally.connections > 4);
   CHECK(tally.records > 0);
-  CHECK(replay ? wanted == 0 : wanted > 0 && tally.jumps <= wanted);
+  CHECK(replay ? wanted == 0 : wanted > 0);
   return 0;
 }
 

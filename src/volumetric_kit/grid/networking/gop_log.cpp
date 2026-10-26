@@ -38,13 +38,13 @@ bool GopLog::append_replay(Chunk chunk, bool key) {
   if (!open_) return false;
   const std::uint64_t size = chunk->size();
   if (size > max_gop_bytes_ - bytes_) {
-    break_gop();
+    break_gop(key);
     return false;
   }
   try {
     chunks_.push_back(std::move(chunk));
   } catch (...) {
-    break_gop();
+    break_gop(key);
     throw;
   }
   bytes_ += size;
@@ -53,33 +53,43 @@ bool GopLog::append_replay(Chunk chunk, bool key) {
 
 bool GopLog::append_on_demand(Chunk chunk, bool key) {
   const std::uint64_t size = chunk->size();
+  if (key && size <= max_gop_bytes_) {
+    // Newest key wins: every viewer goes on from this key, the waiting ones
+    // let in, so what came before goes and none falls behind by it.
+    first_ = head();
+    held_.clear();
+    if (viewers_.empty()) return false;
+    try {
+      held_.push_back({std::move(chunk), kept_});
+    } catch (...) {
+      break_gop(true);
+      throw;
+    }
+    kept_ += size;
+    for (Cursor* viewer : viewers_) *viewer = {0, first_, false};
+    return true;
+  }
   // Every viewer in has at most max_gop_bytes behind it, so none of these
-  // differences wraps; one chunk past the limit alone takes every viewer.
+  // differences wraps; one chunk past the limit alone, a key too, takes
+  // every viewer.
   for (Cursor* viewer : viewers_) {
     if (!viewer->waiting && size > max_gop_bytes_ - behind(*viewer)) {
       fall_back(viewer);
     }
   }
   trim();
-  const bool admits = key && size <= max_gop_bytes_;
-  if (!open() && !(admits && !viewers_.empty())) return false;
+  if (!open()) return false;
   try {
     held_.push_back({std::move(chunk), kept_});
   } catch (...) {
-    break_gop();
+    break_gop(key);
     throw;
   }
   kept_ += size;
-  if (admits) {
-    const std::uint64_t number = head() - 1;
-    for (Cursor* viewer : viewers_) {
-      if (viewer->waiting) *viewer = {0, number, false};
-    }
-  }
   return true;
 }
 
-void GopLog::break_gop() noexcept {
+void GopLog::break_gop(bool key) noexcept {
   if (replay_) {
     chunks_.clear();
     bytes_ = 0;
@@ -87,7 +97,7 @@ void GopLog::break_gop() noexcept {
     return;
   }
   for (Cursor* viewer : viewers_) {
-    if (!viewer->waiting) fall_back(viewer);
+    if (!viewer->waiting || key) fall_back(viewer);
   }
   trim();
 }
@@ -107,6 +117,8 @@ bool GopLog::open() const noexcept {
   return std::any_of(viewers_.begin(), viewers_.end(),
                      [](const Cursor* viewer) { return !viewer->waiting; });
 }
+
+bool GopLog::joined() const noexcept { return !viewers_.empty(); }
 
 std::uint64_t GopLog::key_wanted() const noexcept { return key_wanted_; }
 

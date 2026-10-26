@@ -16,9 +16,13 @@
 // Keys on demand (replay_gop false): a viewer joins waiting for the next key,
 // then gets every record after it, in order, while it stays within
 // max_gop_bytes of the newest; one that would fall further behind waits for
-// the next key again. The log keeps only the records some viewer still has
-// to send. Each join and each fall-back counts in key_wanted(), which a
-// sender reads to make its next frame a key.
+// the next key again. Newest key wins here too: a key lets every waiting
+// viewer in, and a viewer in that has not sent what came before it goes on
+// from it, at a chunk boundary. The log keeps only the records some viewer
+// still has to send, none before the newest key. Each join and each
+// fall-back counts in key_wanted(), which a sender reads to make its next
+// frame a key; a key within max_gop_bytes counts none, as every viewer goes
+// on from it.
 
 #include <cstddef>
 #include <cstdint>
@@ -60,18 +64,20 @@ class GopLog {
   // starts a new GOP, replacing the log, and any other record joins the
   // GOP, unless no key has come yet or the GOP is broken; a chunk that would
   // take the GOP past max_gop_bytes breaks it: the chunk and the GOP's are
-  // dropped, and every record until the next key. Keys on demand, a viewer
-  // the chunk would leave more than max_gop_bytes behind falls back to
-  // waiting, a key lets every waiting viewer in, and the chunk is kept only
-  // while a viewer is in; what no viewer still needs is dropped. A chunk the
-  // log has no room to hold breaks the GOP too (break_gop), and what its
-  // container threw is thrown on.
+  // dropped, and every record until the next key. Keys on demand, a key
+  // within max_gop_bytes drops what came before and is kept while a viewer
+  // has joined, every viewer going on from it; any other chunk makes a
+  // viewer it would leave more than max_gop_bytes behind fall back to
+  // waiting, and is kept only while a viewer is in, what no viewer still
+  // needs dropped. A chunk the log has no room to hold is lost (break_gop),
+  // and what its container threw is thrown on.
   bool append(Chunk chunk, bool key);
 
-  // A record is lost (it could not be copied): replaying, break the GOP,
-  // dropping its chunks; keys on demand, every viewer in falls back to
-  // waiting, its chunks dropped.
-  void break_gop() noexcept;
+  // A record is lost (it could not be copied), a key when `key`: replaying,
+  // break the GOP, dropping its chunks; keys on demand, every viewer in falls
+  // back to waiting, its chunks dropped, and, for a key, every viewer that
+  // waited for it is counted again.
+  void break_gop(bool key) noexcept;
 
   // The next chunk for the viewer at `cursor`, which it moves on: replaying,
   // from the key of a newer GOP than the cursor's, else the GOP's next; keys
@@ -82,6 +88,10 @@ class GopLog {
   // Replaying: whether a GOP is open, a key has come and the GOP is not
   // broken. Keys on demand: whether a viewer is in.
   bool open() const noexcept;
+
+  // Keys on demand: whether a viewer has joined, in or waiting. Replaying:
+  // false.
+  bool joined() const noexcept;
 
   // Keys on demand: the joins and fall-backs so far. Replaying: 0.
   std::uint64_t key_wanted() const noexcept;

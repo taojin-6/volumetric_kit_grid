@@ -10,10 +10,12 @@
 // before any key nothing, and none is counted wanting a key; a viewer that
 // stops reading in the first key while
 // 3 GOPs of 1 MiB records are published gets that key whole, then the newest
-// GOP whole, with every publish back at once; without replay_gop, a joiner
-// is counted and gets nothing until the next key, then every record, and one
-// that stops reading falls back, counted, past max_gop_bytes, then gets the
-// next key, while one reading gets every record; a GOP past
+// GOP whole, with every publish back at once, with keys on demand too;
+// without replay_gop, a joiner is counted and gets nothing until the next
+// key, then every record, and one that stops reading falls back, counted,
+// past max_gop_bytes, then gets the next key, while one reading gets every
+// record, and a record past max_gop_bytes on its own is logged at Warning
+// (a copy that fails: networking_server_oom_test.cpp); a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
 // is closed after stall_limit, never when it is milliseconds::max(), and on
 // Linux one that takes too few for its socket to poll writable within it is
@@ -436,13 +438,16 @@ int join_case() {
 // reads the first key's header before the rest is published, so the server
 // is sending it then, and under the low-water mark the kernel holds well
 // under 1 MiB of a viewer that does not read: the key is under way, however
-// late its thread ran, until the viewer drains.
-int newest_key_wins_case() {
+// late its thread ran, until the viewer drains. Replaying the GOP and with
+// keys on demand alike, the viewer counted only as it joined there.
+int newest_key_wins_case(bool replay) {
   constexpr std::uint64_t kGop = 4;
   constexpr std::uint64_t kRecords = 3 * kGop;
   constexpr std::size_t kSize = 1 << 20;
   const stream::Session session = net::geometry_session();
-  auto server = net::serve(session);
+  networking::ServerOptions options;
+  options.replay_gop = replay;
+  auto server = net::serve(session, options);
   CHECK(server != nullptr);
   const vkc::UniqueFd viewer = net::connect_loopback(server->port(), 4096);
   CHECK(viewer.valid());
@@ -472,6 +477,7 @@ int newest_key_wins_case() {
     CHECK(got[i].record.info.key == (seq % kGop == 0));
     CHECK(got[i].payload == net::record_payload(seq, kSize));
   }
+  CHECK(server->key_wanted() == (replay ? 0 : 1));
   return 0;
 }
 
@@ -589,6 +595,53 @@ int on_demand_fall_back_case() {
   CHECK(server->key_wanted() == 3);
   std::printf("on demand: fell back after %llu records, %zu sent before\n",
               static_cast<unsigned long long>(key), run);
+  return 0;
+}
+
+// Without replay_gop, at a max_gop_bytes of 3 records of 1000 bytes: a key
+// past it on its own goes to none, logged at Warning, and the joiner waiting
+// for it is not counted again; a P-frame past it sends the viewer in back,
+// counted, at Warning too; the records after each, which no viewer takes,
+// warn no more; a key within it lets the viewer in.
+int on_demand_limit_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  networking::ServerOptions options;
+  options.replay_gop = false;
+  options.max_gop_bytes = 3 * (56 + 1000);
+  auto server = net::serve(net::geometry_session(), options);
+  CHECK(server != nullptr);
+  auto client = net::connect(server->port());
+  CHECK(client != nullptr && net::wait_session(*client));
+  CHECK(server->key_wanted() == 1);
+  const auto publish = [&](std::uint64_t seq, bool key, std::size_t size) {
+    const Bytes payload = net::record_payload(seq, size);
+    return server
+        ->publish(net::record_info(seq, key), payload.data(), payload.size())
+        .ok();
+  };
+  const auto warned = [&log] {
+    return log.count("StreamServer::publish: a record of ",
+                     " bytes, past max_gop_bytes (3168): the viewers wait "
+                     "for the next key",
+                     vkc::LogLevel::Warning);
+  };
+  Got got;
+  CHECK(publish(0, true, 3 * 1056));
+  CHECK(publish(1, false, 10));
+  CHECK(warned() == 1);
+  CHECK(!net::next_within(*client, &got, 200ms));
+  CHECK(server->key_wanted() == 1);
+  CHECK(publish(2, true, 1000));
+  CHECK(net::next_within(*client, &got) && got.record.info.seq == 2);
+  CHECK(publish(3, false, 3 * 1056));
+  CHECK(publish(4, false, 10));
+  CHECK(warned() == 2);
+  CHECK(server->key_wanted() == 2);
+  CHECK(!net::next_within(*client, &got, 200ms));
+  CHECK(publish(5, true, 10));
+  CHECK(net::next_within(*client, &got) && got.record.info.seq == 5);
+  CHECK(warned() == 2 && server->key_wanted() == 2);
   return 0;
 }
 
@@ -1266,9 +1319,11 @@ int main() {
   if (round_trip_case(dir) != 0) return 1;
   if (viewer_sends_case() != 0) return 1;
   if (join_case() != 0) return 1;
-  if (newest_key_wins_case() != 0) return 1;
+  if (newest_key_wins_case(true) != 0) return 1;
+  if (newest_key_wins_case(false) != 0) return 1;
   if (on_demand_join_case() != 0) return 1;
   if (on_demand_fall_back_case() != 0) return 1;
+  if (on_demand_limit_case() != 0) return 1;
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
   if (stall_never_case() != 0) return 1;

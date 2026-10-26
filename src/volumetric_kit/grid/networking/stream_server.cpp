@@ -392,13 +392,14 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
         s.encoder.frame(info, payload);
     if (!framed.ok()) return std::move(framed).status().with_context(kApi);
     const stream::ChunkEncoder::RecordFraming& framing = *framed;
+    const std::size_t bytes = framing.header.size() + size + framing.padding;
     bool kept = false;
     bool overflow = false;
     std::uint64_t fell_back = 0;  // viewers that now wait for a key
     try {
       // The one copy, made before the lock, of both runs.
       auto chunk = std::make_shared<std::vector<std::uint8_t>>();
-      chunk->reserve(framing.header.size() + size + framing.padding);
+      chunk->reserve(bytes);
       chunk->insert(chunk->end(), framing.header.begin(), framing.header.end());
       if (payload.first_size() != 0) {
         chunk->insert(chunk->end(), payload.first(),
@@ -410,17 +411,25 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
       }
       chunk->insert(chunk->end(), kZeros, kZeros + framing.padding);
       const std::lock_guard<std::mutex> lock(s.mutex);
-      const bool joins = info.key || s.log.open();
+      // Whether a viewer would take it: replaying, a key or a record of an
+      // open GOP; on demand, a key while a viewer has joined, or a record
+      // while one is in.
+      const bool joins =
+          info.key ? s.options.replay_gop || s.log.joined() : s.log.open();
       const std::uint64_t wanted = s.log.key_wanted();
       kept = s.log.append(std::move(chunk), info.key);
-      overflow = s.options.replay_gop && joins && !kept;
+      // Replaying, the GOP went past max_gop_bytes; on demand, the record
+      // alone is past it, so no viewer can take it.
+      overflow =
+          joins &&
+          (s.options.replay_gop ? !kept : bytes > s.options.max_gop_bytes);
       fell_back = s.log.key_wanted() - wanted;
       s.count_key_wanted();
     } catch (...) {
       // Lost, so the records after it until the next key are too.
       try {
         const std::lock_guard<std::mutex> lock(s.mutex);
-        s.log.break_gop();
+        s.log.break_gop(info.key);
         s.count_key_wanted();
       } catch (...) {
       }
@@ -429,11 +438,14 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
     if (kept) s.wake.notify_all();
     if (overflow) {
       log_at(core::LogLevel::Warning,
-             std::string(kApi) + ": a GOP past max_gop_bytes (" +
+             std::string(kApi) + ": a " +
+                 (s.options.replay_gop
+                      ? std::string("GOP")
+                      : "record of " + std::to_string(bytes) + " bytes,") +
+                 " past max_gop_bytes (" +
                  std::to_string(s.options.max_gop_bytes) +
                  "): the viewers wait for the next key");
-    }
-    if (fell_back != 0) {
+    } else if (fell_back != 0) {
       // At Info, as viewers come and go: the sender's next key brings it
       // back.
       log_at(core::LogLevel::Info,
