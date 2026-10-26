@@ -2,10 +2,13 @@
 // Copyright (c) 2026 Tao Jin
 
 // The integration boundary: core-validated settings reach the runtime options
-// unchanged, and the codec checks the steps and sizes core leaves to it; the
-// codec sweep codes every row intra. No file assets, device or camera are
-// opened.
+// unchanged -- the stream's outputs, decoding for a sender only with a CSV or
+// a sweep, its session and the sender's config among them -- and the codec
+// checks the steps and sizes core leaves to it; the codec sweep codes every
+// row intra. No file assets, device or camera are opened.
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -73,7 +76,7 @@ int main() {
     CHECK(loaded->output.csv.empty() != coded);
     CHECK(loaded->output.stream.empty() != (coded || served));
     CHECK(loaded->output.serve == (served ? 47801 : 0));
-    const vr_example::CodecOutputs outputs =
+    const vr::sender::CodecOutputs outputs =
         vr_example::codec_outputs(loaded.value().output);
     CHECK(outputs.serve.has_value() == served);
     CHECK(!served || (outputs.serve->host.empty() &&
@@ -189,10 +192,10 @@ int main() {
   })",
                                   cfg::Application::FuseOrbbec);
   CHECK(on_port);
-  const vr_example::CodecOutputs to_port =
+  const vr::sender::CodecOutputs to_port =
       vr_example::codec_outputs(on_port.value().output);
   const vr::networking::ServerOptions defaults_served;
-  CHECK(to_port.csv.empty() && to_port.stream.empty());
+  CHECK(on_port->output.csv.empty() && to_port.stream.empty());
   CHECK(to_port.serve && to_port.serve->host.empty() &&
         to_port.serve->port == 5000);
   CHECK(!to_port.serve->replay_gop && defaults_served.replay_gop);
@@ -255,12 +258,51 @@ int main() {
         row->params.quantization_scale == 0.4F);
   CHECK(row->params.quantization_weights[1] == 1.25F);  // band's, (1, 0, 0)
   CHECK(!vr_example::sweep_encoder_config(*encoder, {"none", 84, 0.4F}).ok());
-  // The outputs, relative to the scenario's directory.
-  const vr_example::CodecOutputs outputs =
+  // The outputs, relative to the scenario's directory; the CSV is the
+  // report's.
+  const vr::sender::CodecOutputs outputs =
       vr_example::codec_outputs(encoded.value().output);
-  CHECK(outputs.csv == "/tmp/scenarios/results/rows.csv");
+  CHECK(encoded->output.csv == "/tmp/scenarios/results/rows.csv");
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
-  CHECK(!outputs.serve);
+  CHECK(!outputs.serve && outputs.decode);
+
+  // A sender's stream decodes each frame only with output.csv or
+  // codec.sweep, which read the decode, not for a recording or a server
+  // alone; served live, without replay_gop.
+  cfg::Config live_out;
+  live_out.output.stream = "rig.vrst";
+  live_out.output.serve = 47801;
+  const vr::sender::CodecOutputs live_sent =
+      vr_example::set_codec_outputs(live_out);
+  CHECK(!live_sent.decode && live_sent.stream == "rig.vrst");
+  CHECK(live_sent.serve && live_sent.serve->port == 47801 &&
+        !live_sent.serve->replay_gop);
+  cfg::Config listed = live_out;
+  listed.output.csv = "rig.csv";
+  CHECK(vr_example::set_codec_outputs(listed).decode);
+  cfg::Config swept = live_out;
+  swept.codec.sweep = true;
+  CHECK(vr_example::set_codec_outputs(swept).decode);
+  // The sender fuses as `fusion` says and codes every code_every-th set.
+  cfg::Config fusing;
+  fusing.fusion.max_weight = 7.5F;
+  fusing.fusion.dynamic = true;
+  fusing.fusion.free_after = 12;
+  const vr::sender::SetSender::Config sending =
+      vr_example::sender_config(fusing, 3);
+  CHECK(sending.max_weight == 7.5F && sending.free_after == 12);
+  CHECK(sending.mode == vr::tsdf::IntegrationMode::Dynamic);
+  CHECK(sending.code_every == 3);
+  // The stream's session: the program, and one Geometry track at the
+  // source's rate whose params are the given bytes; no id or start time.
+  const vr::stream::Session session =
+      vr_example::codec_session("codec_mesh", {30, 1}, "placed");
+  CHECK(session.writer == "codec_mesh" && session.tracks.size() == 1);
+  CHECK(session.created_ns == 0 &&
+        session.id == (std::array<std::uint8_t, 16>{}));
+  CHECK(session.tracks[0].kind == vr::stream::TrackKind::Geometry);
+  CHECK(session.tracks[0].rate.num == 30 && session.tracks[0].rate.den == 1);
+  CHECK(session.tracks[0].params == "placed");
 
   // Both codec profiles: the period as given, and with P-frames the update
   // size as given, core's 0 included, up to the format's longest segment;

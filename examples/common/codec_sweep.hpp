@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "codec_quantization.hpp"
-#include "codec_stream.hpp"
+#include "codec_report.hpp"
 #include "stage_table.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
