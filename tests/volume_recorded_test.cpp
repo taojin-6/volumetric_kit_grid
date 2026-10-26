@@ -14,7 +14,13 @@
 // is freed. A set's depth round (record_allocate_from_depth) places what the
 // blocking call places, closes its gate on a capacity limit, and is that
 // call's one submit a round; recordings settle in any order, a blocking call
-// overtaking them. Skips with no device.
+// overtaking them. A compaction records through a const map (record_compaction
+// is const): the whole set and a frustum's subset, each the blocking
+// compaction's list, in the caller's one submit with no staging buffer; a held
+// list of its kind goes stale and the other kind's holds, and no block,
+// pointer, stamp, heap count, epoch or tick moves. A grid grown while a
+// reader's batch is pending refuses that batch at its wait, its count
+// unwritten, with nothing in use freed. Skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -22,6 +28,7 @@
 #include <limits>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -35,6 +42,7 @@
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
@@ -121,11 +129,24 @@ std::vector<Coord> sorted(const Blocks& blocks) {
   return out;
 }
 
+// Blocks with their pointers, sorted: what two lists of one map's blocks
+// share, whatever order each was compacted in.
+using Placed = std::vector<std::tuple<int, int, int, std::int32_t>>;
+
+Placed with_ptrs(const Blocks& blocks) {
+  Placed out;
+  for (const vol::BlockIndex& b : blocks) {
+    out.emplace_back(b.coord.x, b.coord.y, b.coord.z, b.ptr);
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 // Everything a gated-off recording must leave as it was, bit for bit: the
 // active blocks with their pointers, in the compaction's order, the heap's
 // host copy, and every slot's stamp.
 struct State {
-  std::vector<std::tuple<int, int, int, std::int32_t>> blocks;
+  Placed blocks;
   std::uint32_t allocated = 0;
   std::vector<std::uint32_t> stamps;
 
@@ -137,10 +158,7 @@ struct State {
 vkc::Result<State> state_of(vol::VoxelHashMap& map) {
   State s;
   VKC_ASSIGN(const Blocks active, map.compact_active_blocks());
-  for (const vol::BlockIndex& b : active) {
-    s.blocks.emplace_back(b.coord.x, b.coord.y, b.coord.z, b.ptr);
-  }
-  std::sort(s.blocks.begin(), s.blocks.end());
+  s.blocks = with_ptrs(active);
   s.allocated = map.allocated_blocks();
   VKC_ASSIGN(const std::vector<vol::BlockStamp> stamps,
              map.read_block_stamps());
@@ -625,6 +643,129 @@ int stale_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
+// --- A reader holding the map read-only. -------------------------------------
+
+static_assert(
+    std::is_same_v<
+        decltype(std::declval<const vol::VoxelHashMap&>().record_compaction(
+            std::declval<vkc::CommandBatch&>(), nullptr)),
+        vkc::Result<vol::RecordedBlockList>>,
+    "a const map records a compaction");
+
+// A camera 1 m behind the cube, looking down +Z, its far plane 0.99 m ahead:
+// it keeps the cube's z = -1 slab, which ends 1 m ahead, alone.
+vol::FrustumPlanes front_frustum() {
+  vr::Mat4f pose(1.0f);
+  pose[3] = vr::Vec4f(0.0f, 0.0f, -1.0f, 1.0f);
+  return vol::make_frustum_planes(100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 0.1f,
+                                  0.99f, pose);
+}
+
+// Through a const map, as a reader handed the map or its grid read-only
+// holds it: the whole active set, then the blocks one frustum keeps, each
+// recorded into the reader's own batch -- one submit, one dispatch, no
+// staging buffer -- and each the blocking compaction's list, pointers
+// included, in that list's buffer. A held list of the kind recorded goes
+// stale and the other kind's still holds; the blocks, pointers, stamps, heap
+// count, epoch and tick are as they were.
+int const_case(vr_test::Gpu& gpu) {
+  vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
+  CHECK(map.ok());
+  const Blocks all = cube();
+  CHECK(blocking_all(gpu, *map, all, false).value() == 0);
+  vkc::Result<State> before = state_of(*map);
+  CHECK(before.ok() && before->blocks.size() == all.size());
+  const std::uint64_t epoch = map->topology_epoch();
+  const std::uint32_t tick = map->tick();
+  const std::vector<vol::FrustumPlanes> frustum = {front_frustum()};
+  Blocks front;
+  for (const vol::BlockIndex& b : all) {
+    if (b.coord.z == -1) front.push_back(b);
+  }
+  const vol::VoxelHashMap& reader = *map;
+  for (const bool culled : {false, true}) {
+    // A list of each kind from the blocking compactions, the frustum's read
+    // back: what the reader's must list.
+    vkc::Result<vol::DeviceBlockList> whole =
+        map->compact_active_blocks_on_device();
+    vkc::Result<vol::DeviceBlockList> kept =
+        map->compact_active_blocks_in_frusta_on_device(frustum);
+    CHECK(whole.ok() && kept.ok() && whole->count == all.size());
+    vkc::Result<Blocks> kept_blocks = vr_test::read_back<vol::BlockIndex>(
+        gpu.device, gpu.allocator, *kept->buffer, kept->count);
+    CHECK(kept_blocks.ok() && sorted(*kept_blocks) == sorted(front));
+
+    const vkc::DeviceCounters was = gpu.device.counters();
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vkc::Result<vol::RecordedBlockList> list =
+        reader.record_compaction(batch, culled ? &frustum : nullptr);
+    CHECK(list.ok() && batch.submit().ok());
+    const vkc::DeviceCounters now = gpu.device.counters();
+    CHECK(now.submits - was.submits == 1);
+    CHECK(now.dispatches - was.dispatches == 1);
+    CHECK(now.staging_buffers == was.staging_buffers);
+
+    const vol::DeviceBlockList& mine = culled ? *kept : *whole;
+    const vol::DeviceBlockList& other = culled ? *whole : *kept;
+    CHECK(list->buffer == mine.buffer && list->count != nullptr);
+    vkc::Result<std::uint32_t> n = word_at(gpu, *list->count, 0);
+    CHECK(n.ok() && n.value() == mine.count);
+    CHECK(culled || n.value() == reader.allocated_blocks());
+    vkc::Result<Blocks> got = vr_test::read_back<vol::BlockIndex>(
+        gpu.device, gpu.allocator, *list->buffer, n.value());
+    CHECK(got.ok() && with_ptrs(*got) ==
+                          (culled ? with_ptrs(*kept_blocks) : before->blocks));
+
+    CHECK(!reader.check_device_block_subset(mine, "test").ok());
+    CHECK(reader.check_device_block_subset(other, "test").ok());
+    CHECK(reader.held_device_list().has_value() == culled);
+    CHECK(reader.topology_epoch() == epoch && reader.tick() == tick);
+  }
+  CHECK(state_of(*map).value() == *before);
+  CHECK(map->topology_epoch() == epoch && map->tick() == tick);
+  return 0;
+}
+
+// record_compaction's precondition broken by the grid's owner: a reader's
+// compaction of each kind, recorded through a const grid and submitted, not
+// yet waited on, while the owner grows the grid. The resize waits for the
+// map's queue before it replaces a buffer, so the validation layer sees no
+// buffer or set in use freed or rewritten; the core refuses the reader's
+// batch at its wait, its count unwritten; and the reader's next batch,
+// recorded after the resize, counts the blocks again.
+int resize_pending_case(vr_test::Gpu& gpu) {
+  const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
+  vkc::Result<vol::VoxelBlockGrid> grid = vol::VoxelBlockGrid::create(
+      gpu.device, gpu.allocator, params(2, 1024), attrs, 2);
+  CHECK(grid.ok());
+  CHECK(blocking_all(gpu, grid->map(), cube(), false).value() == 0);
+  const std::vector<vol::FrustumPlanes> frustum = {front_frustum()};
+  const vol::VoxelBlockGrid& view = *grid;
+  constexpr std::uint32_t kUnwritten = 0xffffffffu;
+  for (const bool culled : {false, true}) {
+    const std::vector<vol::FrustumPlanes>* frusta = culled ? &frustum : nullptr;
+    std::uint32_t count = kUnwritten;
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    vkc::Result<vol::RecordedBlockList> list =
+        view.map().record_compaction(batch, frusta);
+    CHECK(list.ok());
+    CHECK(batch.readback(*list->count, 0, sizeof(count), &count).ok());
+    vkc::Result<vkc::PendingBatch> pending = batch.submit_async({}, {});
+    CHECK(pending.ok());
+    CHECK(grid->resize(2 * view.map().grid().num_buckets).ok());
+    const vkc::Status refused = pending->wait();
+    CHECK(refused.domain() == C::InvalidArgument && count == kUnwritten);
+
+    vkc::CommandBatch again(gpu.device, gpu.allocator);
+    vkc::Result<vol::RecordedBlockList> next =
+        view.map().record_compaction(again, frusta);
+    CHECK(next.ok() && again.submit().ok());
+    vkc::Result<std::uint32_t> n = word_at(gpu, *next->count, 0);
+    CHECK(n.ok() && n.value() == (culled ? 9u : 27u));
+  }
+  return 0;
+}
+
 // --- Steady state and the result slots. --------------------------------------
 
 // Once warm, a batch holding a removal and an allocation costs one submit,
@@ -900,6 +1041,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
   if (one_batch_case(gpu) != 0) return 1;
   if (slices_case(gpu) != 0) return 1;
   if (stale_case(gpu) != 0) return 1;
+  if (const_case(gpu) != 0) return 1;
+  if (resize_pending_case(gpu) != 0) return 1;
   if (counters_case(gpu) != 0) return 1;
   if (slots_case(gpu) != 0) return 1;
   if (depth_case(gpu) != 0) return 1;

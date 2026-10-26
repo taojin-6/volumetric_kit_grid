@@ -108,7 +108,7 @@ core::Result<Encoder> Encoder::create(core::Device& device,
 }
 
 core::Result<std::vector<std::uint8_t>> Encoder::encode(
-    volume::VoxelBlockGrid& grid, core::StageMetrics* metrics) try {
+    const volume::VoxelBlockGrid& grid, core::StageMetrics* metrics) try {
   // Before any refusal, so a refused call still costs its row; both
   // batches' waits, and the device halves they hand back, land in it too.
   // Its row is placed now, ahead of its breakdowns', which the batches'
@@ -142,7 +142,7 @@ core::Result<std::vector<std::uint8_t>> Encoder::encode(
 }
 
 core::Result<PendingEncode> Encoder::record_front(
-    core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+    core::CommandBatch& batch, const volume::VoxelBlockGrid& grid,
     core::StageMetrics* metrics) try {
   // As encode(): the stage's row placed ahead of its breakdowns'.
   core::GpuStageScope stage(metrics, gpu_timer_, "codec encode");
@@ -184,7 +184,7 @@ bool Encoder::holds(const PendingEncode& pending) const noexcept {
 }
 
 core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
-                                           volume::VoxelBlockGrid& grid,
+                                           const volume::VoxelBlockGrid& grid,
                                            core::StageMetrics* metrics) {
   if (!valid()) return fail("encode", "moved-from encoder");
   if (!grid.valid()) return fail("encode", "moved-from grid");

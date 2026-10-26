@@ -1021,7 +1021,7 @@ core::Result<std::uint32_t> VoxelHashMap::remove(
 
 core::Result<RecordedBlockList> VoxelHashMap::record_compaction(
     core::CommandBatch& batch, const std::vector<FrustumPlanes>* frusta,
-    core::GpuStageScope* stage) {
+    core::GpuStageScope* stage) const {
   if (!valid()) {
     return core::Status::invalid_argument(
         "VoxelHashMap::record_compaction: moved-from map");
@@ -1202,11 +1202,13 @@ VoxelHashMap::compact_active_blocks_in_frusta_on_device(
 
 core::Status VoxelHashMap::upload_frusta(core::CommandBatch& batch,
                                          const FrustumPlanes* frusta,
-                                         std::uint32_t count) {
+                                         std::uint32_t count) const {
   const VkDeviceSize bytes = VkDeviceSize(count) * sizeof(FrustumPlanes);
   if (frustum_planes_.size() < sizeof(count) + bytes) {
-    // Every earlier submit has waited, so nothing still reads the old buffer,
-    // and this batch has not yet recorded the dispatch that binds the new one.
+    // record_compaction's precondition: no batch that bound the old buffer is
+    // still pending, so nothing reads it, and this batch has not yet recorded
+    // the dispatch that binds the new one. Nothing here can check it: a grow
+    // under a batch still running rewrites its set and frees its buffer.
     VKC_ASSIGN(frustum_planes_,
                core::device_storage_buffer(*allocator_, sizeof(count) + bytes));
     compact_frustum_.set.write_storage_buffer(3, frustum_planes_.handle(), 0,

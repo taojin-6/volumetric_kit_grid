@@ -22,7 +22,9 @@
 // blocks -- a P-frame over nothing finishes as an I-frame of none with no
 // back batch, a token is the encoder's last record only, abandon keeps the
 // chain, a copied payload past its guess takes a tail to the same bytes, and
-// a warm encode() is 2 submits and no staging buffer. Skips with no device.
+// a warm encode() is 2 submits and no staging buffer. encode() and the front
+// half take the grid read-only, the map's own list or one compacted into the
+// front's batch alike. Skips with no device.
 
 #include <algorithm>
 #include <cstdint>
@@ -212,17 +214,18 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
 // (an extract's, say) is taken back while it still holds, compacting
 // nothing, and is still the map's for the extract after. One the encoder
 // compacts into its batch leaves the map no count to hold, so the extract
-// after compacts its own.
+// after compacts its own. Both encodes are handed the grid read-only.
 int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> g =
       sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.07f});
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
+  const vol::VoxelBlockGrid& view = grid;
   vkc::Result<vol::DeviceBlockList> last =
       grid.map().compact_active_blocks_on_device();
   CHECK(last.ok());
   vkc::StageMetrics m;
-  vkc::Result<std::vector<std::uint8_t>> a = enc.encode(grid, &m);
+  vkc::Result<std::vector<std::uint8_t>> a = enc.encode(view, &m);
   CHECK(a.ok());
   CHECK(find_row(m, "  ..encode set") == nullptr);
   CHECK(grid.map().check_device_block_list(last.value(), "test").ok());
@@ -232,7 +235,7 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   // list after it, so a compaction after it compacts.
   CHECK(allocate(gpu, grid, {{50, 50, 50}}).ok());
   vkc::StageMetrics again;
-  vkc::Result<std::vector<std::uint8_t>> b = enc.encode(grid, &again);
+  vkc::Result<std::vector<std::uint8_t>> b = enc.encode(view, &again);
   CHECK(b.ok() && b.value() == a.value());
   CHECK(find_row(again, "  ..encode set") != nullptr);
   CHECK(!grid.map().held_device_list().has_value());
@@ -835,7 +838,8 @@ int stale_cut_case(Gpu& gpu) {
 
 // A frame by the halves, each batch the caller's, its head and payload joined
 // as encode() joins them; with its type and whether its back batch held a
-// command, read from the device's submit count.
+// command, read from the device's submit count. The front is handed the grid
+// read-only.
 struct Halves {
   Bytes bytes;
   codec::FrameType planned = codec::FrameType::kIntra;
@@ -844,7 +848,7 @@ struct Halves {
 };
 
 vkc::Result<Halves> by_halves(Gpu& gpu, codec::Encoder& enc,
-                              vol::VoxelBlockGrid& grid,
+                              const vol::VoxelBlockGrid& grid,
                               vkc::StageMetrics* m = nullptr) {
   Halves out;
   vkc::CommandBatch front(gpu.device, gpu.allocator);
