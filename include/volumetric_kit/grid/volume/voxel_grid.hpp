@@ -7,6 +7,7 @@
 /// @brief Voxel-grid resolution + hash-table capacity -- the parameters every
 ///        voxel-hash operation is measured against.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,39 @@ static_assert(std::is_standard_layout_v<VoxelGridParams>,
 inline constexpr std::int32_t kDefaultBucketSize = 8;
 /// A default `max_chain`: longest collision chain. Callers may choose others.
 inline constexpr std::int32_t kDefaultMaxChain = 128;
+
+/// @brief 8x8x8-voxel blocks in the default hash layout
+///        (@ref kDefaultBucketSize, @ref kDefaultMaxChain), as many blocks as
+///        bucket entries.
+///
+/// `tsdf::create_fusion_grid` and `codec::make_decode_grid` build with it
+/// rather than each writing it out; the resolution, the band and the table's
+/// size are the caller's.
+/// @param voxel_size   Voxel edge (metres).
+/// @param trunc_dist   Truncation distance (metres).
+/// @param num_buckets  Hash-bucket count.
+/// @return The parameters, which @ref VoxelGridParams::validate accepts for a
+///         finite positive @p voxel_size and @p trunc_dist within its band
+///         limit and @p num_buckets from 1 to 524,287 (a block pointer within
+///         `int32_t`).
+constexpr VoxelGridParams block_grid_params(float voxel_size, float trunc_dist,
+                                            std::int32_t num_buckets) {
+  VoxelGridParams grid{};
+  grid.voxel_size = voxel_size;
+  grid.block_size = 8;
+  grid.voxels_per_block = 512;
+  grid.trunc_dist = trunc_dist;
+  grid.bucket_size = kDefaultBucketSize;
+  grid.num_buckets = num_buckets;
+  // Widened, where the int32 product could overflow: blocks past int32
+  // saturate, which validate() refuses as not bucket_size * num_buckets.
+  grid.num_blocks = static_cast<std::int32_t>(
+      std::clamp<std::int64_t>(std::int64_t{grid.bucket_size} * num_buckets,
+                               std::numeric_limits<std::int32_t>::min(),
+                               std::numeric_limits<std::int32_t>::max()));
+  grid.max_chain = kDefaultMaxChain;
+  return grid;
+}
 
 inline core::Status VoxelGridParams::validate() const {
   // Positivity alone admits infinity; <= 0 alone also admits NaN. Neither can

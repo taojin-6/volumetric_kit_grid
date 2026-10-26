@@ -29,7 +29,6 @@
 
 #include "codec_fixture.hpp"
 #include "gpu_test.hpp"
-#include "grid_layout.hpp"
 #include "mesh_sequence.hpp"
 #include "scratch_dir.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
@@ -37,6 +36,7 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/io/mesh_io.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace cfg = volumetric_kit::core::config;
@@ -486,8 +486,7 @@ vkc::Result<vol::VoxelBlockGrid> small_grid(vr_test::GpuContext& gpu) {
                                       {"weight", sizeof(float)}};
   return vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator,
-      vr_example::example_grid_params(codec_fixture::kVoxel,
-                                      codec_fixture::kTrunc, 2),
+      vol::block_grid_params(codec_fixture::kVoxel, codec_fixture::kTrunc, 2),
       attrs, 2);
 }
 
