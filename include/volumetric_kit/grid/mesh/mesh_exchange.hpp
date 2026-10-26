@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -27,9 +28,12 @@ namespace volumetric_kit::recon::mesh {
 ///        keeps in flight, and what it binds the buffers as.
 struct MeshExchangeConfig {
   /// Frames the consumer keeps in flight, each with a slot of its own in
-  /// @ref MeshExchange::begin_frame. The producer's ring needs one slot more,
-  /// or two for a producer that records its next extract before the take
-  /// (`MarchingCubesConfig::slot_count`).
+  /// @ref MeshExchange::begin_frame. The producer's ring needs one slot more
+  /// than these frames, or two for a producer that records its next extract
+  /// before the take, and one more for each mesh the consumer may drop
+  /// (@ref CommitDecision::kDrop) before it commits the next, one frame in
+  /// flight counting as two (`MarchingCubesConfig::slot_count` says why).
+  /// Parking needs none: a parked mesh holds the producer back.
   std::uint32_t frames_in_flight = 2;
   /// Whether the consumer reads the buffers from another queue family than
   /// the producer's. Reading an EXCLUSIVE buffer from a family that does not
@@ -68,6 +72,19 @@ inline const char* unbindable_reason(
   return nullptr;
 }
 
+/// @brief What a @ref MeshExchange::begin_frame commit decides for the mesh it
+///        is handed.
+enum class CommitDecision {
+  kCommit,  ///< It becomes the live mesh.
+  kPark,    ///< Kept back, the live mesh drawn; handed again next frame.
+  /// Let go undrawn: the live mesh stays, and the newest mesh published is
+  /// taken at the next @ref MeshExchange::begin_frame. No work the frame
+  /// records may read the dropped mesh, whose slot may be released before
+  /// the frame completes; its payload is destroyed in `begin_frame` unless
+  /// the commit moved from it.
+  kDrop,
+};
+
 /// @brief What @ref MeshExchange::begin_frame did with the mesh it took.
 enum class ExchangeOutcome {
   kNone,       ///< Nothing was taken or parked: the live mesh is unchanged.
@@ -76,6 +93,7 @@ enum class ExchangeOutcome {
   /// It cannot be bound (@ref MeshExchange::refused says why). Latched: no
   /// later mesh is taken.
   kRefused,
+  kDropped,  ///< The consumer let it go undrawn (@ref CommitDecision::kDrop).
 };
 
 /// @brief The handoff of `MarchingCubes::extract_device`'s meshes, each with a
@@ -100,6 +118,13 @@ enum class ExchangeOutcome {
 /// - **A taken mesh the consumer cannot commit yet is parked**, retried every
 ///   frame, and covered by no mark until it is committed. A newer mesh is not
 ///   taken meanwhile, so at most one is held uncommitted.
+/// - **A taken mesh the consumer drops never becomes live**: the live mesh
+///   stays, and the drop frees the place a parked mesh holds, so the next
+///   frame takes the newest mesh published. The mark cannot skip a
+///   generation, so the dropped one keeps its slot, as a superseded mesh
+///   does, until the frames drawing the meshes before the next one committed
+///   retire; dropped before any commit, it is released at the next frame.
+///   The exchange keeps no deadline: when to drop is the consumer's choice.
 /// - **An empty mesh is handed to the commit with its payload**, skips the
 ///   bindable check, and draws nothing once committed; it holds a slot like
 ///   any other.
@@ -201,8 +226,8 @@ class MeshExchange {
   /// holds @ref live for @p slot until @p slot is retired again.
   ///
   /// A mesh taken now or parked earlier that is not empty and cannot be bound
-  /// is refused, which latches. Any other is committed once @p commit accepts
-  /// it, and parked when it does not.
+  /// is refused, which latches. Any other is handed to @p commit, which
+  /// commits, parks or drops it.
   ///
   /// @p commit runs after the take, outside the exchange's lock, so the
   /// producer may be extracting and publishing the next mesh meanwhile.
@@ -215,7 +240,9 @@ class MeshExchange {
   ///                the mesh parked and the live one drawn. It is called for
   ///                an empty mesh too, which may name null buffers and needs
   ///                nothing made: return `false` for one only while its
-  ///                payload cannot be applied yet.
+  ///                payload cannot be applied yet. It may return a
+  ///                @ref CommitDecision instead: `kCommit` is `true`, `kPark`
+  ///                is `false`, and `kDrop` lets the mesh go undrawn.
   /// @return What happened to the mesh taken or parked.
   template <typename Commit>
   ExchangeOutcome begin_frame(std::uint32_t slot, Commit&& commit) {
@@ -241,11 +268,17 @@ class MeshExchange {
       if (why != nullptr) {
         refused_ = why;
         outcome = ExchangeOutcome::kRefused;
-      } else if (commit(std::as_const(parked_->mesh), parked_->payload)) {
-        live_ = parked_->mesh;
-        outcome = ExchangeOutcome::kCommitted;
       } else {
-        outcome = ExchangeOutcome::kParked;
+        const CommitDecision decided =
+            decision(commit(std::as_const(parked_->mesh), parked_->payload));
+        if (decided == CommitDecision::kCommit) {
+          live_ = parked_->mesh;
+          outcome = ExchangeOutcome::kCommitted;
+        } else if (decided == CommitDecision::kDrop) {
+          outcome = ExchangeOutcome::kDropped;
+        } else {
+          outcome = ExchangeOutcome::kParked;
+        }
       }
       if (outcome != ExchangeOutcome::kParked) parked_.reset();
     }
@@ -268,6 +301,17 @@ class MeshExchange {
   };
 
   static constexpr std::chrono::milliseconds kCancelPoll{2};
+
+  // A commit's answer: a CommitDecision as it is, anything else read as a
+  // condition, true to commit and false to park.
+  template <typename Decided>
+  static CommitDecision decision(Decided&& decided) {
+    if constexpr (std::is_same_v<std::decay_t<Decided>, CommitDecision>) {
+      return decided;
+    } else {
+      return decided ? CommitDecision::kCommit : CommitDecision::kPark;
+    }
+  }
 
   // Clears `slot` and returns the mark: below the oldest generation a frame
   // in flight holds, else below the live one, else, before any commit,

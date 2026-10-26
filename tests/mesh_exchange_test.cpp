@@ -9,9 +9,14 @@
 // buffers skips the bindable check but not the commit, which gets its payload
 // and may park it, and once committed draws nothing; an unbindable mesh
 // latches; the producer's bounded wait; generations at the top of the range;
-// and a seeded run of producer and consumer steps, failures included, in
-// which no slot the consumer holds is ever reclaimed and the ring never
-// stalls. Host only: no device.
+// a seeded run of producer and consumer steps, failures included, in which
+// no slot the consumer holds is ever reclaimed and the ring never stalls; a
+// dropped mesh, which never becomes live, frees the next take and keeps its
+// slot until a later commit, and whose payload goes with it unless moved
+// from; seeded runs under one and two frames in flight, with and without
+// drops, at the ring size the exchange documents and one slot under it; and
+// the bool commit, step for step the same as kCommit and kPark. Host only:
+// no device.
 
 #include <algorithm>
 #include <atomic>
@@ -35,6 +40,7 @@ namespace rmesh = volumetric_kit::recon::mesh;
 
 namespace {
 
+using rmesh::CommitDecision;
 using rmesh::ExchangeOutcome;
 
 VkBuffer fake_buffer(std::uint64_t value) {
@@ -616,6 +622,369 @@ int test_seeded_run() {
   return 0;
 }
 
+// A dropped mesh is let go undrawn: the outcome says so, the live mesh stays,
+// the commit is not asked about it again, and it never becomes live. The
+// take freed the producer, so the next mesh is published and taken.
+int test_drop_keeps_the_live_mesh() {
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(4);
+  CommitDecision decision = CommitDecision::kCommit;
+  std::vector<std::uint64_t> asked;
+  bool mismatched = false;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    mismatched = mismatched || !tag_matches(mesh, payload);
+    asked.push_back(mesh.generation);
+    return decision;
+  };
+  const auto g1 = ring.extract(4);
+  exchange.publish(*g1, tag(*g1));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.release_and_may_publish(ring));
+
+  const auto g2 = ring.extract(5);
+  exchange.publish(*g2, tag(*g2));
+  decision = CommitDecision::kDrop;
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kDropped);
+  CHECK(exchange.live().generation == g1->generation);
+  CHECK(exchange.live().triangle_count == 4);
+  CHECK(exchange.release_and_may_publish(ring));
+  for (std::uint32_t frame = 0; frame < 4; ++frame) {
+    CHECK(exchange.begin_frame(frame % 2, commit) == ExchangeOutcome::kNone);
+    CHECK(exchange.live().generation == g1->generation);
+  }
+  CHECK((asked == std::vector<std::uint64_t>{g1->generation, g2->generation}));
+
+  const auto g3 = ring.extract(6);
+  exchange.publish(*g3, tag(*g3));
+  decision = CommitDecision::kCommit;
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.live().generation == g3->generation);
+  CHECK(!mismatched);
+  return 0;
+}
+
+// After a drop, the next frame takes the newest mesh published. A mesh
+// parked and then dropped frees the place it held: of the two published
+// while it was parked, the second, which superseded the first, is taken.
+int test_take_after_a_drop() {
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(5);
+  CommitDecision decision = CommitDecision::kCommit;
+  std::vector<std::uint64_t> asked;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    asked.push_back(tag_matches(mesh, payload) ? *payload : 0);
+    return decision;
+  };
+  const auto g1 = ring.extract(4);
+  exchange.publish(*g1, tag(*g1));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g2 = ring.extract(4);
+  exchange.publish(*g2, tag(*g2));
+  decision = CommitDecision::kPark;
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kParked);
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g3 = ring.extract(4);
+  exchange.publish(*g3, tag(*g3));
+  const auto g4 = ring.extract(4);  // supersedes g3
+  CHECK(g4.has_value());
+  exchange.publish(*g4, tag(*g4));
+  CHECK(!exchange.release_and_may_publish(ring));
+
+  decision = CommitDecision::kDrop;
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kDropped);
+  CHECK(exchange.live().generation == g1->generation);
+  CHECK(!exchange.release_and_may_publish(ring));  // g4 still waits
+  decision = CommitDecision::kCommit;
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.live().generation == g4->generation);
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK((asked == std::vector<std::uint64_t>{g1->generation, g2->generation,
+                                             g2->generation, g4->generation}));
+  return 0;
+}
+
+// A dropped generation keeps its slot until a later mesh is committed and
+// every frame that drew the mesh before it has retired: the mark cannot skip
+// a generation, so each mesh dropped before that commit holds a slot. Dropped
+// before any commit, it is released at the next frame.
+int test_dropped_release_mark() {
+  auto drop = [](const rmesh::DeviceMesh&, Tag&) {
+    return CommitDecision::kDrop;
+  };
+  auto commit = [](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    return tag_matches(mesh, payload) ? CommitDecision::kCommit
+                                      : CommitDecision::kPark;
+  };
+  {
+    rmesh::MeshExchange<Tag> exchange(two_frames());
+    FakeRing ring(3);
+    const auto g1 = ring.extract(4);
+    exchange.publish(*g1, tag(*g1));
+    CHECK(exchange.begin_frame(0, drop) == ExchangeOutcome::kDropped);
+    CHECK(exchange.release_and_may_publish(ring));
+    CHECK(ring.released() == 0);  // that frame's mark came before the take
+    CHECK(exchange.begin_frame(1, drop) == ExchangeOutcome::kNone);
+    CHECK(exchange.release_and_may_publish(ring));
+    CHECK(ring.released() == g1->generation);
+    CHECK(exchange.live().generation == 0);
+  }
+
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(5);
+  const auto g1 = ring.extract(4);
+  exchange.publish(*g1, tag(*g1));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kNone);
+
+  // Two dropped in a row: both keep their slots while g1 is drawn.
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g2 = ring.extract(4);
+  exchange.publish(*g2, tag(*g2));
+  CHECK(exchange.begin_frame(0, drop) == ExchangeOutcome::kDropped);
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g3 = ring.extract(0);
+  exchange.publish(*g3, tag(*g3));
+  CHECK(exchange.begin_frame(1, drop) == ExchangeOutcome::kDropped);
+  for (std::uint32_t frame = 0; frame < 4; ++frame) {
+    CHECK(exchange.begin_frame(frame % 2, commit) == ExchangeOutcome::kNone);
+  }
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK(ring.released() == 0);
+  CHECK(ring.holds(g1->generation) && ring.holds(g2->generation) &&
+        ring.holds(g3->generation));
+
+  // Committed in slot 0's frame, g4 releases nothing while slot 1's frame
+  // still draws g1; once it retires, g1 and both dropped ones go together.
+  const auto g4 = ring.extract(4);
+  exchange.publish(*g4, tag(*g4));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK(ring.released() == 0);
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kNone);
+  CHECK(exchange.release_and_may_publish(ring));
+  CHECK(ring.released() == g3->generation);
+  CHECK(exchange.live().generation == g4->generation);
+  return 0;
+}
+
+// An empty mesh may be dropped like any other: the commit gets its payload,
+// the drawn mesh stays live, and the next mesh is taken.
+int test_empty_mesh_drops() {
+  rmesh::MeshExchange<Tag> exchange(two_frames());
+  FakeRing ring(4);
+  std::vector<std::uint64_t> asked;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    asked.push_back(tag_matches(mesh, payload) ? *payload : 0);
+    return mesh.empty() ? CommitDecision::kDrop : CommitDecision::kCommit;
+  };
+  const auto g1 = ring.extract(4);
+  exchange.publish(*g1, tag(*g1));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+
+  CHECK(exchange.release_and_may_publish(ring));
+  auto empty = ring.extract(0);
+  CHECK(empty.has_value() && empty->empty() && !empty->valid());
+  empty->sharing_mode = VK_SHARING_MODE_EXCLUSIVE;  // unchecked when empty
+  exchange.publish(*empty, tag(*empty));
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kDropped);
+  CHECK(exchange.refused() == nullptr);
+  CHECK(exchange.live().generation == g1->generation);
+  CHECK(!exchange.live().empty());
+
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g3 = ring.extract(4);
+  exchange.publish(*g3, tag(*g3));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kCommitted);
+  CHECK(exchange.live().generation == g3->generation);
+  CHECK((asked == std::vector<std::uint64_t>{g1->generation, empty->generation,
+                                             g3->generation}));
+  return 0;
+}
+
+// A dropped mesh's payload is destroyed in begin_frame, a parked one's kept,
+// and what the commit moved from a dropped one stays with the consumer.
+int test_dropped_payload_goes() {
+  using Held = std::shared_ptr<int>;
+  rmesh::MeshExchange<Held> exchange(two_frames());
+  FakeRing ring(4);
+  CommitDecision decision = CommitDecision::kPark;
+  bool keep = false;
+  Held kept;
+  auto commit = [&](const rmesh::DeviceMesh&, Held& payload) {
+    if (keep) kept = std::move(payload);
+    return decision;
+  };
+  const auto g1 = ring.extract(4);
+  Held first = std::make_shared<int>(1);
+  const std::weak_ptr<int> first_alive = first;
+  exchange.publish(*g1, std::move(first));
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kParked);
+  CHECK(!first_alive.expired());
+  decision = CommitDecision::kDrop;
+  CHECK(exchange.begin_frame(1, commit) == ExchangeOutcome::kDropped);
+  CHECK(first_alive.expired());
+
+  CHECK(exchange.release_and_may_publish(ring));
+  const auto g2 = ring.extract(4);
+  exchange.publish(*g2, std::make_shared<int>(2));
+  keep = true;
+  CHECK(exchange.begin_frame(0, commit) == ExchangeOutcome::kDropped);
+  CHECK(kept != nullptr && *kept == 2 && kept.use_count() == 1);
+  return 0;
+}
+
+// What test_ring_with_drops' runs did, summed over its seeds.
+struct DropRuns {
+  std::size_t refusals = 0;
+  std::size_t committed = 0;
+  std::size_t parked = 0;
+  std::size_t dropped = 0;
+  std::uint32_t most_in_a_row = 0;
+};
+
+// One seeded run of commits, parks and up to `drops` drops before each
+// commit, empty meshes included, under `frames` frames in flight on a ring of
+// `slots`, the producer extracting whenever a take frees it and the producer
+// and the frames each sometimes skipping a step. Every generation a frame in
+// flight draws or the consumer has parked stays in its slot, refused extracts
+// or not; those are counted.
+int run_with_drops(std::uint32_t seed, std::uint32_t frames,
+                   std::uint32_t drops, std::size_t slots, DropRuns& runs) {
+  std::mt19937 random(seed);
+  auto roll = [&] { return std::uniform_int_distribution<int>(0, 99)(random); };
+  rmesh::MeshExchangeConfig config = two_frames();
+  config.frames_in_flight = frames;
+  rmesh::MeshExchange<Tag> exchange(config);
+  FakeRing ring(slots);
+  std::vector<std::uint64_t> drawn(frames, 0);
+  std::uint64_t parked = 0;
+  std::uint32_t in_a_row = 0;  // dropped since the last commit
+  bool mismatched = false;
+  auto commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+    mismatched = mismatched || !tag_matches(mesh, payload);
+    const int r = roll();
+    if (r < 40 && in_a_row < drops) {
+      runs.most_in_a_row = std::max(runs.most_in_a_row, ++in_a_row);
+      parked = 0;
+      return CommitDecision::kDrop;
+    }
+    if (r < 65) {
+      parked = mesh.generation;
+      return CommitDecision::kPark;
+    }
+    in_a_row = 0;
+    parked = 0;
+    return CommitDecision::kCommit;
+  };
+  std::uint32_t frame = 0;
+  for (int step = 0; step < 400; ++step) {
+    if (roll() < 75 && exchange.release_and_may_publish(ring)) {
+      const auto mesh = ring.extract(roll() < 10 ? 0 : 4);
+      if (mesh) exchange.publish(*mesh, tag(*mesh));
+    }
+    if (roll() < 75) {
+      const std::uint32_t slot = frame++ % frames;
+      const ExchangeOutcome outcome = exchange.begin_frame(slot, commit);
+      CHECK(outcome != ExchangeOutcome::kRefused);
+      runs.committed += outcome == ExchangeOutcome::kCommitted ? 1 : 0;
+      runs.parked += outcome == ExchangeOutcome::kParked ? 1 : 0;
+      runs.dropped += outcome == ExchangeOutcome::kDropped ? 1 : 0;
+      drawn[slot] = exchange.live().generation;
+    }
+    CHECK(!mismatched);
+    for (const std::uint64_t g : drawn) CHECK(g == 0 || ring.holds(g));
+    CHECK(parked == 0 || ring.holds(parked));
+  }
+  runs.refusals += ring.refusals();
+  return 0;
+}
+
+// The ring the class documents: the frames in flight, one counting as two,
+// one more for a producer that extracts once a take frees it (the model of
+// test_release_mark), and one more for each mesh the consumer may drop
+// before it commits the next. At that size no run refuses an extract; one
+// slot fewer, some do. With one frame in flight, a consumer that never drops
+// needs three: the mesh a commit replaces keeps its slot until the committing
+// frame retires, so the producer's next extract needs a third slot, past that
+// mesh's and the new live mesh's.
+int test_ring_with_drops() {
+  for (std::uint32_t frames = 1; frames <= 2; ++frames) {
+    const std::size_t base = std::max<std::size_t>(frames, 2) + 1;
+    for (std::uint32_t drops = 0; drops <= 2; ++drops) {
+      DropRuns sized;
+      DropRuns short_by_one;
+      for (std::uint32_t seed = 1; seed <= 300; ++seed) {
+        if (const int rc =
+                run_with_drops(seed, frames, drops, base + drops, sized))
+          return rc;
+        if (const int rc = run_with_drops(seed, frames, drops, base + drops - 1,
+                                          short_by_one))
+          return rc;
+      }
+      CHECK(sized.refusals == 0);
+      CHECK(sized.committed > 0 && sized.parked > 0);
+      CHECK((sized.dropped > 0) == (drops > 0));
+      CHECK(sized.most_in_a_row == drops);
+      CHECK(short_by_one.refusals > 0);
+    }
+  }
+  return 0;
+}
+
+// The bool commit is kCommit and kPark: two exchanges run the same seeded
+// steps, failures included, one told true or false and the other kCommit or
+// kPark, and agree on every outcome, live mesh and release mark.
+int test_bool_commit_matches_decision() {
+  constexpr std::uint32_t kFrames = 2;
+  for (std::uint32_t seed = 1; seed <= 200; ++seed) {
+    std::mt19937 random(seed);
+    auto chance = [&](int percent) {
+      return std::uniform_int_distribution<int>(0, 99)(random) < percent;
+    };
+    rmesh::MeshExchange<Tag> by_bool(two_frames());
+    rmesh::MeshExchange<Tag> by_decision(two_frames());
+    FakeRing bool_ring(kFrames + 1);
+    FakeRing decision_ring(kFrames + 1);
+    bool accept = true;
+    auto bool_commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+      return accept && tag_matches(mesh, payload);
+    };
+    auto decision_commit = [&](const rmesh::DeviceMesh& mesh, Tag& payload) {
+      return (accept && tag_matches(mesh, payload)) ? CommitDecision::kCommit
+                                                    : CommitDecision::kPark;
+    };
+    std::uint32_t frame = 0;
+    for (int step = 0; step < 300; ++step) {
+      if (chance(50)) {
+        const bool may = by_bool.release_and_may_publish(bool_ring);
+        CHECK(may == by_decision.release_and_may_publish(decision_ring));
+        if (may || chance(10)) {
+          const bool fail = chance(10);
+          const std::uint32_t triangles = chance(10) ? 0 : 4;
+          const auto a = bool_ring.extract(triangles, fail);
+          const auto b = decision_ring.extract(triangles, fail);
+          CHECK(a.has_value() == b.has_value());
+          if (a) {
+            CHECK(a->generation == b->generation);
+            by_bool.publish(*a, tag(*a));
+            by_decision.publish(*b, tag(*b));
+          }
+        }
+      } else {
+        accept = !chance(30);
+        const std::uint32_t slot = frame++ % kFrames;
+        CHECK(by_bool.begin_frame(slot, bool_commit) ==
+              by_decision.begin_frame(slot, decision_commit));
+        CHECK(by_bool.live().generation == by_decision.live().generation);
+      }
+      CHECK(bool_ring.released() == decision_ring.released());
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -631,6 +1000,13 @@ int main() {
   if (const int rc = test_wait_collected()) return rc;
   if (const int rc = test_generations_at_top_of_range()) return rc;
   if (const int rc = test_seeded_run()) return rc;
+  if (const int rc = test_drop_keeps_the_live_mesh()) return rc;
+  if (const int rc = test_take_after_a_drop()) return rc;
+  if (const int rc = test_dropped_release_mark()) return rc;
+  if (const int rc = test_empty_mesh_drops()) return rc;
+  if (const int rc = test_dropped_payload_goes()) return rc;
+  if (const int rc = test_ring_with_drops()) return rc;
+  if (const int rc = test_bool_commit_matches_decision()) return rc;
   std::puts("mesh_exchange: OK");
   return 0;
 }
