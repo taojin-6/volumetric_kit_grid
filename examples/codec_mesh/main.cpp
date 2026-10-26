@@ -17,7 +17,6 @@
 #include "codec_sweep.hpp"
 #include "config.hpp"
 #include "geometry_mesh.hpp"
-#include "grid_layout.hpp"
 #include "mesh_sequence.hpp"
 #include "stage_table.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -29,6 +28,7 @@
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
+#include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -44,7 +44,7 @@ vkc::Status run(const Options& opt) {
       opt.source.sdf_mode == vr_example::config::SdfMode::Signed;
   const float trunc = opt.fusion.truncation_m;
   const vr::volume::VoxelGridParams grid =
-      vr_example::example_grid_params(opt.fusion.voxel_size_m, trunc, 1024);
+      vr::volume::block_grid_params(opt.fusion.voxel_size_m, trunc, 1024);
   // Before any GPU work, and before the first pass loads every frame: a
   // step the codec or the conversion refuses costs neither.
   vr::codec::EncoderConfig config;

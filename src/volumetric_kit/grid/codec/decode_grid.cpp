@@ -23,6 +23,9 @@ constexpr std::int32_t kMinBuckets = 1024;
 // Decodes again after the decoder's IoError, its lock contention.
 constexpr int kContendedRetries = 2;
 
+static_assert(volume::block_grid_params(1.0f, 1.0f, 1).block_size == kBlockSize,
+              "a decode grid's blocks are the codec's");
+
 // Buckets for twice @p blocks, at least kMinBuckets. Capped so the heap's
 // slot count fits an int32_t; no grid holds that many blocks anyway, which
 // VoxelBlockGrid::create and grow_grid refuse.
@@ -61,18 +64,13 @@ core::Result<volume::VoxelBlockGrid> make_decode_grid(
       return parsed.status();
     }
   }
-  volume::VoxelGridParams grid{};
-  grid.voxel_size = info.voxel_size;
-  grid.block_size = kBlockSize;
-  grid.voxels_per_block = std::int32_t(kVoxelsPerBlock);
-  grid.trunc_dist = info.trunc_dist;
-  grid.bucket_size = volume::kDefaultBucketSize;
-  grid.num_buckets = decode_buckets(info.block_count);
-  grid.num_blocks = grid.bucket_size * grid.num_buckets;
-  grid.max_chain = volume::kDefaultMaxChain;
   const volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                          {"weight", sizeof(float)}};
-  return volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2);
+  return volume::VoxelBlockGrid::create(
+      device, allocator,
+      volume::block_grid_params(info.voxel_size, info.trunc_dist,
+                                decode_buckets(info.block_count)),
+      attrs, 2);
 } catch (const std::bad_alloc&) {
   return core::exception_status("make_decode_grid",
                                 core::Status::Code::OutOfMemory);
