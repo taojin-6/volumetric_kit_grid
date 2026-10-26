@@ -3,14 +3,32 @@
 
 #include "gop_log.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace volumetric_kit::recon::networking::detail {
 
-GopLog::GopLog(std::uint64_t max_gop_bytes) noexcept
-    : max_gop_bytes_(max_gop_bytes) {}
+GopLog::GopLog(std::uint64_t max_gop_bytes, bool replay) noexcept
+    : max_gop_bytes_(max_gop_bytes), replay_(replay) {}
+
+void GopLog::join(Cursor* cursor) {
+  if (replay_) return;
+  *cursor = {};
+  viewers_.push_back(cursor);
+  ++key_wanted_;
+}
+
+void GopLog::leave(const Cursor* cursor) noexcept {
+  viewers_.erase(std::remove(viewers_.begin(), viewers_.end(), cursor),
+                 viewers_.end());
+}
 
 bool GopLog::append(Chunk chunk, bool key) {
+  return replay_ ? append_replay(std::move(chunk), key)
+                 : append_on_demand(std::move(chunk), key);
+}
+
+bool GopLog::append_replay(Chunk chunk, bool key) {
   if (key) {
     ++gop_;
     chunks_.clear();
@@ -33,18 +51,91 @@ bool GopLog::append(Chunk chunk, bool key) {
   return true;
 }
 
+bool GopLog::append_on_demand(Chunk chunk, bool key) {
+  const std::uint64_t size = chunk->size();
+  // Every viewer in has at most max_gop_bytes behind it, so none of these
+  // differences wraps; one chunk past the limit alone takes every viewer.
+  for (Cursor* viewer : viewers_) {
+    if (!viewer->waiting && size > max_gop_bytes_ - behind(*viewer)) {
+      fall_back(viewer);
+    }
+  }
+  trim();
+  const bool admits = key && size <= max_gop_bytes_;
+  if (!open() && !(admits && !viewers_.empty())) return false;
+  try {
+    held_.push_back({std::move(chunk), kept_});
+  } catch (...) {
+    break_gop();
+    throw;
+  }
+  kept_ += size;
+  if (admits) {
+    const std::uint64_t number = head() - 1;
+    for (Cursor* viewer : viewers_) {
+      if (viewer->waiting) *viewer = {0, number, false};
+    }
+  }
+  return true;
+}
+
 void GopLog::break_gop() noexcept {
-  chunks_.clear();
-  bytes_ = 0;
-  open_ = false;
+  if (replay_) {
+    chunks_.clear();
+    bytes_ = 0;
+    open_ = false;
+    return;
+  }
+  for (Cursor* viewer : viewers_) {
+    if (!viewer->waiting) fall_back(viewer);
+  }
+  trim();
 }
 
 Chunk GopLog::next(Cursor* cursor) const noexcept {
-  if (cursor->gop != gop_) *cursor = {gop_, 0};
+  if (!replay_) {
+    if (cursor->waiting || cursor->next >= head()) return nullptr;
+    return held_[cursor->next++ - first_].chunk;
+  }
+  if (cursor->gop != gop_) *cursor = {gop_, 0, false};
   if (cursor->next >= chunks_.size()) return nullptr;
   return chunks_[cursor->next++];
 }
 
-bool GopLog::open() const noexcept { return open_; }
+bool GopLog::open() const noexcept {
+  if (replay_) return open_;
+  return std::any_of(viewers_.begin(), viewers_.end(),
+                     [](const Cursor* viewer) { return !viewer->waiting; });
+}
+
+std::uint64_t GopLog::key_wanted() const noexcept { return key_wanted_; }
+
+std::uint64_t GopLog::bytes() const noexcept {
+  if (replay_) return bytes_;
+  return held_.empty() ? 0 : kept_ - held_.front().start;
+}
+
+std::uint64_t GopLog::head() const noexcept { return first_ + held_.size(); }
+
+std::uint64_t GopLog::behind(const Cursor& cursor) const noexcept {
+  if (cursor.next >= head()) return 0;
+  return kept_ - held_[cursor.next - first_].start;
+}
+
+void GopLog::trim() noexcept {
+  std::uint64_t needed = head();
+  for (const Cursor* viewer : viewers_) {
+    if (!viewer->waiting) needed = std::min(needed, viewer->next);
+  }
+  while (first_ < needed) {
+    held_.pop_front();
+    ++first_;
+  }
+}
+
+void GopLog::fall_back(Cursor* cursor) noexcept {
+  cursor->waiting = true;
+  ++key_wanted_;
+}
 
 }  // namespace volumetric_kit::recon::networking::detail

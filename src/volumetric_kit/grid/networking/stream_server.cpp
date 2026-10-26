@@ -52,6 +52,9 @@ struct StreamServer::Impl {
     core::UniqueFd fd;  // its thread's, which closes it
     std::string name;   // its address, for the log
     bool done = false;  // under the mutex: its thread has ended
+    // Under the mutex: its place in the log, which it joins as its thread
+    // starts and leaves as it ends.
+    detail::GopLog::Cursor cursor;
     std::thread thread;
   };
 
@@ -63,7 +66,7 @@ struct StreamServer::Impl {
         session_chunk(std::move(session_chunk_)),
         listener(std::move(listener_)),
         port(port_),
-        log(options_.max_gop_bytes) {}
+        log(options_.max_gop_bytes, options_.replay_gop) {}
 
   // The accept thread: take each connection, admit it or close it, and join
   // the threads of viewers that have ended, until the stop.
@@ -73,11 +76,15 @@ struct StreamServer::Impl {
   void admit(core::UniqueFd fd, std::string name);
   // Join the threads of the viewers that have ended.
   void reap();
-  // A viewer's thread: send it everything, then close it and say why.
+  // A viewer's thread: join the log, send it everything, then close it, leave
+  // the log and say why.
   void serve(Viewer& viewer) noexcept;
   // Send the session chunk, then the log's chunks as the socket takes them,
   // until the viewer leaves, fails or stalls, or the server stops: why.
   std::string send_all(Viewer& viewer);
+  // Publish the log's count of the viewers that wanted a key. Under the
+  // mutex.
+  void count_key_wanted() noexcept { key_wanted = log.key_wanted(); }
 
   stream::ChunkEncoder encoder;  // the publishing thread's
   const ServerOptions options;
@@ -90,6 +97,8 @@ struct StreamServer::Impl {
   detail::GopLog log;             // under the mutex
   std::size_t live = 0;           // under the mutex: viewers being served
   std::atomic<bool> stop{false};  // set under the mutex
+  // The log's key_wanted(), set under the mutex and read from any thread.
+  std::atomic<std::uint64_t> key_wanted{0};
 
   std::list<Viewer> viewers;  // the accept thread's, then the destructor's
   // The accept thread's: when a refusal was last logged at Warning.
@@ -198,6 +207,13 @@ void StreamServer::Impl::reap() {
 void StreamServer::Impl::serve(Viewer& viewer) noexcept {
   std::string why;
   try {
+    {
+      // Counted before its first byte, so a live sender's key is on its way
+      // while the session chunk goes.
+      const std::lock_guard<std::mutex> lock(mutex);
+      log.join(&viewer.cursor);
+      count_key_wanted();
+    }
     why = send_all(viewer);
   } catch (...) {
     try {
@@ -210,6 +226,7 @@ void StreamServer::Impl::serve(Viewer& viewer) noexcept {
   viewer.fd.reset();
   {
     const std::lock_guard<std::mutex> lock(mutex);
+    log.leave(&viewer.cursor);
     viewer.done = true;
     --live;
   }
@@ -226,8 +243,9 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
   detail::Chunk chunk = session_chunk;  // the chunk under way; null between
   std::size_t sent = 0;                 // its bytes sent
   // Its place in the log, which it enters after the session chunk at the
-  // GOP's key: the log keeps every record since.
-  detail::GopLog::Cursor cursor;
+  // GOP's key, or at the next key, waited for as it joined: the log keeps
+  // every record since that it still needs.
+  detail::GopLog::Cursor& cursor = viewer.cursor;
   // When the viewer last took a byte, or its socket could take one.
   Clock::time_point taking = Clock::now();
   std::uint64_t written = 0;  // the bytes sent on the socket
@@ -262,7 +280,8 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
     }
     taking = Clock::now();
     if (!chunk) {
-      // A chunk boundary: the next chunk, from a newer key if one has come.
+      // A chunk boundary: the next chunk, from a newer key if one has come
+      // (replaying), or from the next key while it waits (keys on demand).
       std::unique_lock<std::mutex> lock(mutex);
       chunk = log.next(&cursor);
       if (!chunk) {
@@ -375,6 +394,7 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
     const stream::ChunkEncoder::RecordFraming& framing = *framed;
     bool kept = false;
     bool overflow = false;
+    std::uint64_t fell_back = 0;  // viewers that now wait for a key
     try {
       // The one copy, made before the lock, of both runs.
       auto chunk = std::make_shared<std::vector<std::uint8_t>>();
@@ -391,13 +411,17 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
       chunk->insert(chunk->end(), kZeros, kZeros + framing.padding);
       const std::lock_guard<std::mutex> lock(s.mutex);
       const bool joins = info.key || s.log.open();
+      const std::uint64_t wanted = s.log.key_wanted();
       kept = s.log.append(std::move(chunk), info.key);
-      overflow = joins && !kept;
+      overflow = s.options.replay_gop && joins && !kept;
+      fell_back = s.log.key_wanted() - wanted;
+      s.count_key_wanted();
     } catch (...) {
       // Lost, so the records after it until the next key are too.
       try {
         const std::lock_guard<std::mutex> lock(s.mutex);
         s.log.break_gop();
+        s.count_key_wanted();
       } catch (...) {
       }
       return core::exception_status(kApi, core::Status::Code::OutOfMemory);
@@ -409,6 +433,16 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
                  std::to_string(s.options.max_gop_bytes) +
                  "): the viewers wait for the next key");
     }
+    if (fell_back != 0) {
+      // At Info, as viewers come and go: the sender's next key brings it
+      // back.
+      log_at(core::LogLevel::Info,
+             std::string(kApi) + ": " + std::to_string(fell_back) +
+                 (fell_back == 1 ? " viewer" : " viewers") +
+                 " past max_gop_bytes (" +
+                 std::to_string(s.options.max_gop_bytes) +
+                 ") behind: waiting for the next key");
+    }
     return {};
   } catch (...) {
     return core::exception_status(kApi, core::Status::Code::OutOfMemory);
@@ -416,5 +450,9 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
 }
 
 std::uint16_t StreamServer::port() const noexcept { return impl_->port; }
+
+std::uint64_t StreamServer::key_wanted() const noexcept {
+  return impl_->key_wanted.load();
+}
 
 }  // namespace volumetric_kit::recon::networking

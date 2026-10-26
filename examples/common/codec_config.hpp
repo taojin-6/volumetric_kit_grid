@@ -79,12 +79,15 @@ inline std::string codec_settings(
 /// @return Where a codec stream writes besides its report: core's
 ///         `output.csv` and `output.stream`, already relative to the
 ///         scenario's directory, an empty path writing nothing; and
-///         `output.serve`, every interface on that port, 0 serving nothing.
+///         `output.serve`, every interface on that port, 0 serving nothing,
+///         without `replay_gop`: the stream codes live, so a viewer that
+///         joins or falls behind gets a key at the next frame.
 inline CodecOutputs codec_outputs(const config::Output& output) {
   CodecOutputs outputs{output.csv, output.stream};
   if (output.serve != 0) {
     outputs.serve.emplace();  // every interface
     outputs.serve->port = output.serve;
+    outputs.serve->replay_gop = false;
   }
   return outputs;
 }

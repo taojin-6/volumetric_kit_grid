@@ -7,9 +7,13 @@
 // RecordPayload computed; a client reads the session, then every record's info,
 // payload and file offset; a viewer that sends bytes still gets every record;
 // a viewer joining gets the GOP from its key, and
-// before any key nothing; a viewer that stops reading in the first key while
+// before any key nothing, and none is counted wanting a key; a viewer that
+// stops reading in the first key while
 // 3 GOPs of 1 MiB records are published gets that key whole, then the newest
-// GOP whole, with every publish back at once; a GOP past
+// GOP whole, with every publish back at once; without replay_gop, a joiner
+// is counted and gets nothing until the next key, then every record, and one
+// that stops reading falls back, counted, past max_gop_bytes, then gets the
+// next key, while one reading gets every record; a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
 // is closed after stall_limit, never when it is milliseconds::max(), and on
 // Linux one that takes too few for its socket to poll writable within it is
@@ -418,6 +422,8 @@ int join_case() {
             .ok());
   CHECK(net::next_within(*early, &got));
   CHECK(got.record.info.seq == 2 && got.record.info.key);
+  // Every joiner started at a key, so none was counted wanting one.
+  CHECK(server->key_wanted() == 0 && fresh->key_wanted() == 0);
   return 0;
 }
 
@@ -466,6 +472,123 @@ int newest_key_wins_case() {
     CHECK(got[i].record.info.key == (seq % kGop == 0));
     CHECK(got[i].payload == net::record_payload(seq, kSize));
   }
+  return 0;
+}
+
+// --- Keys on demand.
+// ---------------------------------------------------------
+
+// Without replay_gop: a viewer that joins after K P is counted at once and
+// gets its session, then nothing until the next key, then every record; a
+// second joiner waits for the next key while the first gets every record;
+// one leaving is not counted.
+int on_demand_join_case() {
+  networking::ServerOptions options;
+  options.replay_gop = false;
+  auto server = net::serve(net::geometry_session(), options);
+  CHECK(server != nullptr);
+  const auto publish = [&](std::uint64_t seq, bool key) {
+    const Bytes payload = net::record_payload(seq, 100 + seq);
+    return server
+        ->publish(net::record_info(seq, key), payload.data(), payload.size())
+        .ok();
+  };
+  CHECK(publish(0, true));
+  CHECK(publish(1, false));
+  CHECK(server->key_wanted() == 0);
+  // A client connects as it reads, so its session comes first; it was
+  // counted before the session was sent.
+  auto first = net::connect(server->port());
+  CHECK(first != nullptr && net::wait_session(*first));
+  CHECK(server->key_wanted() == 1);
+  Got got;
+  CHECK(publish(2, false));
+  CHECK(!net::next_within(*first, &got, 200ms));
+  CHECK(publish(3, true));
+  CHECK(publish(4, false));
+  CHECK(net::next_within(*first, &got));
+  CHECK(got.record.info.seq == 3 && got.record.info.key);
+  CHECK(got.payload == net::record_payload(3, 103));
+  CHECK(net::next_within(*first, &got) && got.record.info.seq == 4);
+  auto second = net::connect(server->port());
+  CHECK(second != nullptr && net::wait_session(*second));
+  CHECK(server->key_wanted() == 2);
+  CHECK(publish(5, false));
+  CHECK(net::next_within(*first, &got) && got.record.info.seq == 5);
+  CHECK(!net::next_within(*second, &got, 200ms));
+  CHECK(publish(6, true));
+  for (auto* client : {first.get(), second.get()}) {
+    CHECK(net::next_within(*client, &got) && got.record.info.seq == 6);
+  }
+  second.reset();
+  CHECK(publish(7, false));
+  CHECK(net::next_within(*first, &got) && got.record.info.seq == 7);
+  CHECK(server->key_wanted() == 2);
+  return 0;
+}
+
+// Without replay_gop, at a max_gop_bytes of 512 KiB: a raw viewer that reads
+// its session, then nothing, while one GOP of 64 KiB records is published,
+// falls back, counted, once a record would leave it more than that behind
+// what its socket took, each publish back at once; a client reading each
+// record as it comes gets every one and is not counted. Then a key and two
+// P-frames: the raw viewer, draining, gets each chunk whole, a run from the
+// first key, then the new key and the P-frames after it, so no P-frame
+// without the records it is predicted from; the client gets them all.
+int on_demand_fall_back_case() {
+  constexpr std::size_t kSize = 64 << 10;
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.replay_gop = false;
+  options.max_gop_bytes = 512 << 10;
+  options.stall_limit = std::chrono::milliseconds::max();
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  auto fast = net::connect(server->port());
+  CHECK(fast != nullptr && net::wait_session(*fast));
+  const vkc::UniqueFd slow = net::connect_loopback(server->port(), 4096);
+  CHECK(slow.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(slow.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  CHECK(server->key_wanted() == 2);  // counted before their sessions
+  const auto publish = [&](std::uint64_t seq, bool key) {
+    const Bytes payload = net::record_payload(seq, kSize);
+    const Clock::time_point start = Clock::now();
+    return server
+               ->publish(net::record_info(seq, key), payload.data(),
+                         payload.size())
+               .ok() &&
+           Clock::now() - start < 1s;
+  };
+  std::uint64_t seq = 0;
+  Got got;
+  while (server->key_wanted() == 2 && seq < 1024) {  // 64 MiB at most
+    CHECK(publish(seq, seq == 0));
+    CHECK(net::next_within(*fast, &got) && got.record.info.seq == seq);
+    ++seq;
+  }
+  CHECK(server->key_wanted() == 3);
+  const std::uint64_t key = seq;
+  for (; seq < key + 3; ++seq) {
+    CHECK(publish(seq, seq == key));
+    CHECK(net::next_within(*fast, &got) && got.record.info.seq == seq);
+  }
+  std::vector<Got> drained;
+  CHECK(drain(slow.get(), wire, key + 2, &drained) == 0);
+  CHECK(drained.size() > 3);
+  const std::size_t run = drained.size() - 3;
+  CHECK(run < key);  // it missed records
+  for (std::size_t i = 0; i < drained.size(); ++i) {
+    const std::uint64_t want = i < run ? i : key + (i - run);
+    CHECK(drained[i].record.info.seq == want);
+    CHECK(drained[i].record.info.key == (want == 0 || want == key));
+    CHECK(drained[i].payload == net::record_payload(want, kSize));
+  }
+  CHECK(server->key_wanted() == 3);
+  std::printf("on demand: fell back after %llu records, %zu sent before\n",
+              static_cast<unsigned long long>(key), run);
   return 0;
 }
 
@@ -1144,6 +1267,8 @@ int main() {
   if (viewer_sends_case() != 0) return 1;
   if (join_case() != 0) return 1;
   if (newest_key_wins_case() != 0) return 1;
+  if (on_demand_join_case() != 0) return 1;
+  if (on_demand_fall_back_case() != 0) return 1;
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
   if (stall_never_case() != 0) return 1;

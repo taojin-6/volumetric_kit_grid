@@ -62,7 +62,8 @@ int main() {
                    loaded.status().message().c_str());
     CHECK(loaded);
     // codec_orbbec alone writes codec rows, and it and serve_orbbec frames;
-    // serve_orbbec alone serves them, on the default port to every interface.
+    // serve_orbbec alone serves them, on the default port to every interface,
+    // a joiner waiting for the key the stream makes for it.
     // Every live example fuses Dynamic, by core's default, the rest Classic.
     const bool coded = std::string(example.file) == "codec_orbbec";
     const bool served = std::string(example.file) == "serve_orbbec";
@@ -76,7 +77,8 @@ int main() {
         vr_example::codec_outputs(loaded.value().output);
     CHECK(outputs.serve.has_value() == served);
     CHECK(!served || (outputs.serve->host.empty() &&
-                      outputs.serve->port == vr::networking::kDefaultPort));
+                      outputs.serve->port == vr::networking::kDefaultPort &&
+                      !outputs.serve->replay_gop));
     // No scenario codes a true SDF: codec_mesh alone sets it, in code.
     const auto encoder = vr_example::encoder_config(loaded->codec);
     CHECK(encoder.ok() && !encoder->true_sdf);
@@ -177,8 +179,9 @@ int main() {
         (results / "rig.vrst").lexically_normal().string());
   CHECK(serving->output.path ==
         (results / "rig_end.ply").lexically_normal().string());
-  // Any port maps to every interface on it, the server's other options at
-  // their defaults; serving alone needs no file.
+  // Any port maps to every interface on it, keys on demand (fuse_orbbec codes
+  // live), the server's other options at their defaults; serving alone needs
+  // no file.
   const auto on_port = cfg::parse(R"({
     "version": 1, "operation": "fuse",
     "source": {"kind": "live", "sync_config": "sync.json"},
@@ -192,6 +195,7 @@ int main() {
   CHECK(to_port.csv.empty() && to_port.stream.empty());
   CHECK(to_port.serve && to_port.serve->host.empty() &&
         to_port.serve->port == 5000);
+  CHECK(!to_port.serve->replay_gop && defaults_served.replay_gop);
   CHECK(to_port.serve->max_viewers == defaults_served.max_viewers &&
         to_port.serve->max_gop_bytes == defaults_served.max_gop_bytes &&
         to_port.serve->stall_limit == defaults_served.stall_limit);

@@ -89,6 +89,8 @@ vkc::Status serve(const Args& args) {
              vr_example::ReplayLoop::create(*reader));
   networking::ServerOptions options;
   options.port = args.port;
+  // A recording cannot make a key: a joiner takes the GOP since the newest.
+  options.replay_gop = true;
   VKC_ASSIGN(const auto server,
              networking::StreamServer::start(reader->session(), options));
   std::printf("serving %s on port %u: %zu records a pass\n", args.path.c_str(),

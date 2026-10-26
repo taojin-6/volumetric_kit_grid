@@ -6,7 +6,10 @@
 // connect, read for a while and leave, over and over, more than max_viewers
 // at once at times; each connection's records are whole, rising, from a key,
 // and a key after every jump. Then the server is destroyed while the viewers
-// are mid-chunk, within 1 s.
+// are mid-chunk, within 1 s. Replaying the GOP, and again with keys on
+// demand at a 1 MiB max_gop_bytes, the publisher reading key_wanted from its
+// own thread and keying each record after it rises: there every jump
+// follows a counted fall-back, and replaying none is counted.
 
 #include <atomic>
 #include <chrono>
@@ -45,8 +48,10 @@ struct Tally {
 };
 
 // One viewer: connect, check the records it gets for a while, leave; again,
-// until `stop`. The last connection stays until the server goes.
-void viewer(std::uint16_t port, std::uint32_t seed,
+// until `stop`. The last connection stays until the server goes. Every 30th
+// record is a key and, `replay`ing, no other; with keys on demand, others
+// may be.
+void viewer(std::uint16_t port, std::uint32_t seed, bool replay,
             const std::atomic<bool>& stop, Tally& tally) {
   std::mt19937 rng(seed);
   while (!stop) {
@@ -78,7 +83,9 @@ void viewer(std::uint16_t port, std::uint32_t seed,
       }
       if (!*got) continue;
       const std::uint64_t seq = record.info.seq;
-      if (record.info.key != (seq % kGop == 0) ||
+      const bool periodic = seq % kGop == 0;
+      if ((replay ? record.info.key != periodic
+                  : periodic && !record.info.key) ||
           payload != net::record_payload(seq, size_of(seq)) ||
           (!any && !record.info.key) || (any && seq <= last) ||
           (any && seq != last + 1 && !record.info.key)) {
@@ -97,30 +104,41 @@ void viewer(std::uint16_t port, std::uint32_t seed,
   }
 }
 
-int stress_case() {
+int stress_case(bool replay) {
   networking::ServerOptions options;
   options.max_viewers = 3;  // the 4 viewers are past it at times
+  options.replay_gop = replay;
+  if (!replay) options.max_gop_bytes = 1 << 20;  // so viewers fall back
   auto server = net::serve(net::geometry_session(), options);
   CHECK(server != nullptr);
   std::atomic<bool> stop_viewers{false};
   Tally tally;
   std::vector<std::thread> viewers;
   for (std::uint32_t v = 0; v < 4; ++v) {
-    viewers.emplace_back(viewer, server->port(), 100 + v,
+    viewers.emplace_back(viewer, server->port(), 100 + v, replay,
                          std::cref(stop_viewers), std::ref(tally));
   }
   // Checked once the viewers are joined.
   std::uint64_t seq = 0;
+  std::uint64_t wanted = 0;  // key_wanted() at the last record
+  std::uint64_t forced = 0;  // keys made for it
   bool published = true;
   const Clock::time_point end = Clock::now() + 1500ms;
   while (published && Clock::now() < end) {
     const Bytes payload = net::record_payload(seq, size_of(seq));
+    bool key = seq % kGop == 0;
+    if (server->key_wanted() != wanted) {
+      wanted = server->key_wanted();
+      forced += key ? 0 : 1;
+      key = true;
+    }
     published = server
-                    ->publish(net::record_info(seq, seq % kGop == 0),
-                              payload.data(), payload.size())
+                    ->publish(net::record_info(seq, key), payload.data(),
+                              payload.size())
                     .ok();
     ++seq;
   }
+  wanted = server->key_wanted();
   // Destroy it under the viewers, with records still to send.
   const Clock::time_point start = Clock::now();
   server.reset();
@@ -130,14 +148,19 @@ int stress_case() {
   CHECK(published);
   CHECK(took < 1s);
   std::printf(
-      "stress: %llu published; %llu connections, %llu records, %llu jumps\n",
+      "stress, %s: %llu published, %llu keys forced; %llu connections, %llu "
+      "records, %llu jumps; %llu wanted a key\n",
+      replay ? "replaying" : "keys on demand",
       static_cast<unsigned long long>(seq),
+      static_cast<unsigned long long>(forced),
       static_cast<unsigned long long>(tally.connections.load()),
       static_cast<unsigned long long>(tally.records.load()),
-      static_cast<unsigned long long>(tally.jumps.load()));
+      static_cast<unsigned long long>(tally.jumps.load()),
+      static_cast<unsigned long long>(wanted));
   CHECK(!tally.broken);
   CHECK(tally.connections > 4);
   CHECK(tally.records > 0);
+  CHECK(replay ? wanted == 0 : wanted > 0 && tally.jumps <= wanted);
   return 0;
 }
 
@@ -180,7 +203,8 @@ int join_under_keys_case() {
 }  // namespace
 
 int main() {
-  if (stress_case() != 0) return 1;
+  if (stress_case(true) != 0) return 1;
+  if (stress_case(false) != 0) return 1;
   if (join_under_keys_case() != 0) return 1;
   std::puts("networking stress: OK");
   return 0;
