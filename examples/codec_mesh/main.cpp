@@ -13,7 +13,7 @@
 #include <string>
 
 #include "codec_config.hpp"
-#include "codec_stream.hpp"
+#include "codec_report.hpp"
 #include "codec_sweep.hpp"
 #include "config.hpp"
 #include "geometry_mesh.hpp"
@@ -27,6 +27,7 @@
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
+#include "volumetric_kit/recon/sender/codec_stream.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
@@ -34,6 +35,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace mesh = volumetric_kit::recon::mesh;
 namespace eval = volumetric_kit::recon::eval;
+namespace sender = volumetric_kit::recon::sender;
 namespace {
 
 using Options = vr_example::config::Config;
@@ -89,11 +91,17 @@ vkc::Status run(const Options& opt) {
              mesh::MarchingCubes::create(device, allocator));
   // Made before any frame is converted or written, so a rerun onto an
   // existing stream is refused before any conversion or output.
+  const sender::CodecOutputs outputs = vr_example::codec_outputs(opt.output);
+  VKC_ASSIGN(sender::CodecStream stream,
+             sender::CodecStream::create(
+                 device, allocator, config,
+                 vr_example::codec_session(
+                     "codec_mesh", {vr_example::kNominalFps, 1}, placement),
+                 outputs));
   VKC_ASSIGN(
-      vr_example::CodecStream stream,
-      vr_example::CodecStream::create(
-          device, allocator, config, vr_example::codec_outputs(opt.output),
-          "codec_mesh", {vr_example::kNominalFps, 1}, placement));
+      vr_example::CodecReport report,
+      vr_example::CodecReport::create(opt.output.csv, outputs.stream,
+                                      outputs.decode, config.intra_period));
   std::printf(
       "codec: %s\n",
       vr_example::codec_settings(config, opt.codec.quantization_table).c_str());
@@ -106,6 +114,7 @@ vkc::Status run(const Options& opt) {
     last.reset();  // one frame's geometry held at a time
     VKC_ASSIGN(last, vr_example::code_frame(sequence, n, volume, integrator,
                                             sdf, stream, &conversion));
+    VKC_TRY(report.add(n, last->sent));
     const std::string defects =
         vr_example::topology_defects(last->frame.topology);
     if (defects.empty()) continue;
@@ -132,7 +141,7 @@ vkc::Status run(const Options& opt) {
   vr_example::print_stage_rows("mesh conversion, per frame", conversion,
                                sequence.count(), 2);
   // A single mesh is no measured sequence: it has no bitrate.
-  stream.report(vr_example::kNominalFps, sequence.count() > 1 ? 1 : 0);
+  report.print(vr_example::kNominalFps, sequence.count() > 1 ? 1 : 0);
 
   // The last frame's surfaces, written first so a comparison that refuses a
   // mesh still leaves them to look at.

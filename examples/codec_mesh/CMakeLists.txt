@@ -9,13 +9,8 @@ target_include_directories(
                          "${CMAKE_CURRENT_SOURCE_DIR}/../common")
 target_link_libraries(
   vr_example_mesh
-  PUBLIC volumetric_kit::core_config
-         volumetric_kit::recon_codec
-         volumetric_kit::recon_eval
-         volumetric_kit::recon_networking
-         volumetric_kit::recon_stream
-         volumetric_kit::recon_tsdf
-         volumetric_kit::recon_io_assimp)
+  PUBLIC volumetric_kit::core_config volumetric_kit::recon_eval
+         volumetric_kit::recon_sender volumetric_kit::recon_io_assimp)
 target_compile_features(vr_example_mesh PUBLIC cxx_std_17)
 vr_target_warnings(vr_example_mesh)
 
