@@ -282,15 +282,20 @@ struct MarchingCubesConfig {
   /// not yet reached is what the shared-queue design forbids; the consumer's
   /// wait on `DeviceMesh::ready`, reached at the hand-off, is not one.
   ///
-  /// Size it to the consumer's frames in flight plus one for a producer that
-  /// extracts only once the consumer has taken the last mesh
-  /// (@ref MarchingCubes::extract_device), or plus two for one that records
-  /// its next extract before that take (@ref MarchingCubes::record_extract in
-  /// a frame's batch). No higher, because **each slot costs a full vertex
-  /// arena** (about 19 MiB at rafa2's 200 k triangles, 119 MiB at the live
-  /// room's 1.2 M). They are sized independently (a slot grows when the
-  /// surface it is handed needs more) and none of them ever shrinks, so
-  /// resident output memory is roughly `slot_count` times a single arena.
+  /// Size it to the consumer's frames in flight, counting one as two, plus
+  /// one for a producer that extracts only once the consumer has taken the
+  /// last mesh (@ref MarchingCubes::extract_device), or plus two for one that
+  /// records its next extract before that take
+  /// (@ref MarchingCubes::record_extract in a frame's batch), and one more
+  /// for each mesh the consumer may drop before it commits the next
+  /// (@ref CommitDecision::kDrop). One frame counts as two because the mesh a
+  /// commit replaces keeps its slot until the committing frame retires; with
+  /// two or more frames in flight, the frame before still draws it until
+  /// then. No higher, because **each slot costs a full vertex arena** (about
+  /// 19 MiB at rafa2's 200 k triangles, 119 MiB at the live room's 1.2 M).
+  /// They are sized independently (a slot grows when the surface it is
+  /// handed needs more) and none of them ever shrinks, so resident output
+  /// memory is roughly `slot_count` times a single arena.
   /// @ref ExtractTimings::arena_bytes reports the sum, not one slot's share.
   ///
   /// Extracting with every slot outstanding is a contract violation, reported
