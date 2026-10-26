@@ -14,9 +14,9 @@
 
 #include "codec_config.hpp"
 #include "codec_sweep.hpp"
-#include "grid_layout.hpp"
 #include "replica_config.hpp"
 #include "volumetric_kit/recon/networking/stream_server.hpp"
+#include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #ifdef VR_TEST_ORBBEC_CONFIG
 #include "orbbec_config.hpp"
 #endif
@@ -353,8 +353,8 @@ int main() {
                                cfg::Application::CodecMesh);
   CHECK(mesh);
   const auto grid = [](const cfg::Fusion& fusion) {
-    return vr_example::example_grid_params(fusion.voxel_size_m,
-                                           fusion.truncation_m, 1024);
+    return vr::volume::block_grid_params(fusion.voxel_size_m,
+                                         fusion.truncation_m, 1024);
   };
   const auto sdf =
       vr_example::mesh_sdf_config(mesh.value().source, grid(mesh->fusion));
@@ -394,8 +394,8 @@ int main() {
   shelled.shell_voxels = 2.F;
   for (int mm = 1; mm <= 50; ++mm) {
     const auto band = [mm](int voxels) {
-      return vr_example::example_grid_params(float(mm / 1000.0),
-                                             float(voxels * mm / 1000.0), 1024);
+      return vr::volume::block_grid_params(float(mm / 1000.0),
+                                           float(voxels * mm / 1000.0), 1024);
     };
     CHECK(vr_example::check_true_sdf_band(solid, band(15)).ok());
     CHECK(vr_example::check_true_sdf_band(shelled, band(17)).ok());

@@ -4,8 +4,9 @@
 // Coordinate-math tests for the sparse voxel grid: world <-> voxel <-> block
 // round-trips, the negative-coordinate block-indexing bias (the subtle part),
 // round-half-to-even tie-breaking, the truncation-band width, params
-// validation (including the NaN floats an `x <= 0` guard would admit), and the
-// default hash layout. Pure host math -- no device -- so it always runs.
+// validation (including the NaN floats an `x <= 0` guard would admit), the
+// default hash layout and the block layout built on it (block_grid_params).
+// Pure host math -- no device -- so it always runs.
 
 #include <cmath>
 #include <cstdint>
@@ -124,6 +125,29 @@ int main() {
   layout.max_chain = vol::kDefaultMaxChain;
   CHECK(layout.validate().ok());
   CHECK(!vol::VoxelGridParams{}.validate().ok());
+
+  // --- block_grid_params: 8^3-voxel blocks in that layout, as many blocks
+  // as bucket entries, at the caller's resolution, band and table; it
+  // validates.
+  const vol::VoxelGridParams blocks = vol::block_grid_params(0.005f, 0.04f, 30);
+  CHECK(blocks.voxel_size == 0.005f && blocks.trunc_dist == 0.04f);
+  CHECK(blocks.block_size == 8 && blocks.voxels_per_block == 512);
+  CHECK(blocks.bucket_size == vol::kDefaultBucketSize &&
+        blocks.max_chain == vol::kDefaultMaxChain);
+  CHECK(blocks.num_buckets == 30 &&
+        blocks.num_blocks == vol::kDefaultBucketSize * 30);
+  CHECK(blocks.validate().ok());
+  // The most buckets whose block pointers fit int32 validate; one more is
+  // refused, and so is a count whose blocks pass int32, either sign, with no
+  // overflow on the way.
+  CHECK(vol::block_grid_params(0.005f, 0.04f, 524287).validate().ok());
+  CHECK(!vol::block_grid_params(0.005f, 0.04f, 524288).validate().ok());
+  using i32 = std::numeric_limits<std::int32_t>;
+  // Constant evaluation refuses an overflow, so every build checks this.
+  static_assert(vol::block_grid_params(0.005f, 0.04f, i32::max()).num_blocks ==
+                i32::max());
+  CHECK(!vol::block_grid_params(0.005f, 0.04f, i32::max()).validate().ok());
+  CHECK(!vol::block_grid_params(0.005f, 0.04f, i32::min()).validate().ok());
 
   // --- validate() must not be defeated by the arithmetic it validates with.
   // Each of these passed before the products were bounded/widened, and each
