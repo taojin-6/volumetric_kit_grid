@@ -14,6 +14,7 @@
 #include <limits>
 #include <type_traits>
 
+#include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 
 namespace volumetric_kit::recon::volume {
@@ -51,7 +52,8 @@ struct VoxelGridParams {
   /// Metric fields and the block extent must be finite. The truncation radius
   /// must be at most 127 blocks so a depth tile's candidate count fits uint32.
   /// @return An OK `Status` when every field is valid, otherwise
-  ///         `Status::invalid_argument` naming the offending field.
+  ///         `Status::invalid_argument` naming the offending field, or
+  ///         `OutOfMemory` if its diagnostic cannot be allocated.
   core::Status validate() const;
 };
 
@@ -115,7 +117,7 @@ constexpr VoxelGridParams block_grid_params(float voxel_size, float trunc_dist,
   return grid;
 }
 
-inline core::Status VoxelGridParams::validate() const {
+inline core::Status VoxelGridParams::validate() const try {
   // Positivity alone admits infinity; <= 0 alone also admits NaN. Neither can
   // reach the coordinate math or the float-to-int truncation-radius conversion.
   if (!(voxel_size > 0.0f) || !std::isfinite(voxel_size)) {
@@ -206,6 +208,9 @@ inline core::Status VoxelGridParams::validate() const {
         "VoxelGridParams: max_chain must be > 0");
   }
   return {};
+} catch (...) {
+  return core::exception_status("VoxelGridParams::validate",
+                                core::Status::Code::InvalidArgument);
 }
 
 }  // namespace volumetric_kit::recon::volume
