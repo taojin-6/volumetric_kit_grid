@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <new>
 #include <type_traits>
 
+#include "test_allocation_failure.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
@@ -105,6 +107,36 @@ int main() {
   // (which would make the spatial hash divide by zero) is rejected, as is a
   // stale precomputed field.
   CHECK(grid.validate().ok());
+  // Even the invalid-input diagnostic is inside the fallible API boundary.
+  // Measure its allocation instead of assuming a standard library's string
+  // capacity. Repeating the call after a failure must report the input error.
+  {
+    auto invalid = grid;
+    invalid.voxel_size = 0.0f;
+    auto& failure = vr_test::allocation_failure;
+    failure = {};
+    failure.measure = true;
+    const auto measured = invalid.validate();
+    failure.measure = false;
+    CHECK(!measured.ok());
+    CHECK(failure.bytes != 0);
+    failure.armed = true;
+    volumetric_kit::core::Status failed;
+    bool escaped = false;
+    try {
+      failed = invalid.validate();
+    } catch (const std::bad_alloc&) {
+      escaped = true;
+    }
+    failure.armed = false;
+    CHECK(failure.injected);
+    CHECK(!escaped);
+    CHECK(failed.domain() == volumetric_kit::core::Status::Code::OutOfMemory);
+    CHECK(invalid.validate().domain() ==
+          volumetric_kit::core::Status::Code::InvalidArgument);
+    CHECK(grid.validate().ok());
+    failure = {};
+  }
   vol::VoxelGridParams bad = grid;
   bad.num_buckets = 0;
   CHECK(!bad.validate().ok());
