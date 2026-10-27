@@ -171,7 +171,7 @@ int main() {
   CHECK(coding->output.path ==
         (results / "rig_end.ply").lexically_normal().string());
   // The rig served live as it is coded and recorded, at the same period, for
-  // 216000 camera frames: 30 minutes of four cameras at 30 fps.
+  // 216000 camera frames: 36 minutes of four cameras at 25 fps.
   const auto serving =
       cfg::load(std::string(VR_CONFIG_FIXTURES) + "/serve_orbbec.json",
                 cfg::Application::FuseOrbbec);
