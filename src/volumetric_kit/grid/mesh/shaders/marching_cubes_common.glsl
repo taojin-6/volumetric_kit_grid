@@ -130,6 +130,26 @@ vec3 mcCellNormal(float sdf[8]) {
 // emitters would disagree, by ulps normally and by a whole voxel on a tangent
 // cell. Ordering by corner shift is exactly the rule mcEdgeOwner uses to name
 // the edge, so the two cannot disagree about which end is which.
+//
+// A corner whose distance IS the iso-value is the crossing, so the vertex is
+// that corner, bit for bit, with that corner's attributes: selected, not
+// interpolated, because the ratio reaches the corner only in exact
+// arithmetic. At the high end it is (iso - sa) / (iso - sa), which a device's
+// division need not round to 1: NVIDIA's and Apple's give 1 - 2^-24 for some
+// distances, and not the same ones. mix() then stops 6e-8 of a step short,
+// an ulp or more wherever the coordinate is small against the step (the
+// corner at 0 comes out at -6e-10). Under the near-tangent guard, an inside
+// corner within 1e-6 of the iso-value puts the vertex up to a step away.
+// Only a crossing edge's outside corner can be at the iso-value.
+//
+// The corners are `precise`: each is one correctly rounded product,
+// `vec3(ivec3) * vec3(voxel_size)`, before anything uses it, so a selected
+// corner is the same bits on every device, and so is what mix() starts from.
+// Without it NVIDIA's compiler fused the product into mix() (an FMA) where
+// Apple's rounds it first, and an interpolated vertex differed between them by
+// an ulp. The voxel size is splatted on purpose: MoltenVK drops `precise` on a
+// vector times a scalar (DESIGN.md, Key gotchas), so `* voxel_size` would
+// reach Metal unguarded.
 void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8],
                   ivec3 base_voxel, float voxel_size, float iso, uint has_color,
                   out vec3 position, out vec3 color) {
@@ -147,9 +167,15 @@ void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8],
     shift_a = shift_b;
     shift_b = swap_shift;
   }
+  precise vec3 pa = vec3(base_voxel + shift_a) * vec3(voxel_size);
+  precise vec3 pb = vec3(base_voxel + shift_b) * vec3(voxel_size);
+  if (sdf[a] == iso || sdf[b] == iso) {
+    bool at_b = sdf[b] == iso;
+    position = at_b ? pb : pa;
+    color = has_color != 0u ? corner_color[at_b ? b : a] : vec3(1.0);
+    return;
+  }
   float ratio = mcEdgeRatio(sdf[a], sdf[b], iso);
-  vec3 pa = vec3(base_voxel + shift_a) * voxel_size;
-  vec3 pb = vec3(base_voxel + shift_b) * voxel_size;
   position = mix(pa, pb, ratio);
   // LINEAR working values (each kernel decodes at the gather), because this is
   // an average -- the 2026-08-02 colour decision. White is 1.0 either way.
