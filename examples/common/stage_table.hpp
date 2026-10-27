@@ -8,6 +8,7 @@
 ///        device milliseconds per unit of work. Header-only, the core's
 ///        `StageMetrics` alone.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +26,22 @@ namespace vkc = volumetric_kit::core;
 template <typename T>
 T nearest_rank(const std::vector<T>& sorted, std::size_t percent) {
   return sorted[(sorted.size() * percent + 99) / 100 - 1];
+}
+
+/// @return The mean, p50, p95 and max of @p values, each `%8.3f` and
+///         space-separated, the percentiles by @ref nearest_rank: the cells
+///         a table over many units of work prints for one figure.
+/// @pre @p values is not empty.
+inline std::string format_stats(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  double sum = 0.0;
+  for (const double v : values) sum += v;
+  char text[64];
+  std::snprintf(text, sizeof text, "%8.3f %8.3f %8.3f %8.3f",
+                sum / static_cast<double>(values.size()),
+                nearest_rank(values, 50), nearest_rank(values, 95),
+                values.back());
+  return text;
 }
 
 /// @return @p rows' row named @p name, or null.

@@ -5,10 +5,12 @@
 // divided by the unit count, host busy beside its wait, the device column a
 // number, n/t, n/a or a dash as the row's device half says, breakdown rows
 // keeping their indent, the indent applied to title and rows, nothing for no
-// rows or no units, and a row found by name. Host only.
+// rows or no units, a row found by name, and a figure's mean, nearest-rank
+// p50 and p95 and max. Host only.
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "stage_table.hpp"
 #include "test_check.hpp"
@@ -58,6 +60,17 @@ int main() {
   CHECK(row != nullptr && row->cpu_ms == 4.0 &&
         row->device == vkc::DeviceTime::Measured);
   CHECK(vr_example::find_row(rows, "extract") == nullptr);
+
+  // A figure over many units: the mean and the nearest-rank p50 and p95 of
+  // the values in any order, and the max.
+  CHECK(vr_example::format_stats({4.0, 1.0, 3.0, 2.0}) ==
+        "   2.500    2.000    4.000    4.000");
+  CHECK(vr_example::format_stats({0.25}) ==
+        "   0.250    0.250    0.250    0.250");
+  std::vector<double> ramp;
+  for (int i = 1; i <= 100; ++i) ramp.push_back(i);
+  CHECK(vr_example::format_stats(ramp) ==
+        "  50.500   50.000   95.000  100.000");
   std::puts("example_stage_table: OK");
   return 0;
 }
