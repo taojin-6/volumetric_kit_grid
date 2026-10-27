@@ -478,6 +478,32 @@ int main() {
   CHECK(streams.fps == 25);
   CHECK(streams.min_depth == 0.25F && streams.max_depth == 5.F);
   CHECK(streams.device == nullptr && streams.allocator == nullptr);
+
+  // A live scenario that names no colour mode streams H.265 3840x2160 at 25
+  // fps, depth 640x576: the driver's own defaults, and no colour controls
+  // (the calibration carries those).
+  for (const auto& [app, operation] :
+       {std::pair{cfg::Application::FuseOrbbec, "fuse"},
+        std::pair{cfg::Application::RigViewer, "view"}}) {
+    const auto unnamed = cfg::parse(
+        std::string(R"({"version": 1, "operation": ")") + operation +
+            R"(", "source": {"kind": "live", "sync_config": "sync.json"}})",
+        app);
+    CHECK(unnamed);
+    const auto mapped = vr_example::orbbec_stream_options(unnamed.value());
+    const vr::sensor::OrbbecStreamOptions driver;
+    CHECK(mapped.color_codec == vr::sensor::OrbbecColorCodec::Hevc);
+    CHECK(mapped.color_width == 3840 && mapped.color_height == 2160);
+    CHECK(mapped.depth_width == 640 && mapped.depth_height == 576);
+    CHECK(mapped.fps == 25);
+    CHECK(mapped.color_codec == driver.color_codec &&
+          mapped.color_width == driver.color_width &&
+          mapped.color_height == driver.color_height &&
+          mapped.depth_width == driver.depth_width &&
+          mapped.depth_height == driver.depth_height &&
+          mapped.fps == driver.fps);
+    CHECK(!mapped.color_controls);
+  }
 #endif
   return 0;
 }
