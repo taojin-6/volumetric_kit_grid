@@ -10,7 +10,8 @@ target_include_directories(
 target_link_libraries(
   vr_example_mesh
   PUBLIC volumetric_kit::core_config volumetric_kit::recon_eval
-         volumetric_kit::recon_sender volumetric_kit::recon_io_assimp)
+         volumetric_kit::recon_sender volumetric_kit::recon_voxelize
+         volumetric_kit::recon_io_assimp)
 target_compile_features(vr_example_mesh PUBLIC cxx_std_17)
 vr_target_warnings(vr_example_mesh)
 

@@ -65,7 +65,7 @@ struct VR_CODEC_API EncoderConfig {
   /// @ref Encoder::encode allow.
   std::uint32_t intra_period = 1;
   /// Whether the grid holds a true (Euclidean) signed distance, as
-  /// @ref tsdf::MeshIntegrator converts a mesh to. `false`, the default,
+  /// @ref voxelize::MeshIntegrator converts a mesh to. `false`, the default,
   /// codes every block with an observed voxel under its observed mask, as
   /// fused depth needs. `true` codes, without writing the grid:
   /// - only the blocks holding a corner of a cell whose 8 voxels, across

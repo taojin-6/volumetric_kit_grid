@@ -1,0 +1,124 @@
+#version 450
+
+// Bin a mesh's triangles into the blocks their truncation band reaches, so the
+// integrate pass can give each voxel the short list of triangles that can be
+// within trunc_dist of it instead of the whole mesh.
+//
+// One work item per (triangle, candidate block) pair -- the decomposition
+// VoxelHashMap::allocate_from_triangles allocates over, decoded and pruned by
+// the same triangle_candidates.glsl -- so this bins a triangle into exactly the
+// blocks that allocation made, and a large triangle costs more work items
+// rather than a longer one. The prior engine signed its field brute force,
+// every voxel against every triangle of the mesh, which is the long-dispatch
+// shape the 2026-08-08 overflow-scan entry records hanging an M5 iPad.
+//
+// Dispatched twice over the same items (pc.pass):
+//   count -- probes each item's block and records the answer in
+//            item_slot[gid]: the block's heap SLOT (ptr / voxels_per_block),
+//            or kNoSlot for an item the band test prunes. It counts the
+//            triangle into counts[slot] and stores the block's coordinate in
+//            slot_coord[slot]. GPU scan/compaction builds the occupied-bin
+//            list, and the integrate pass reads where each is (every item
+//            of a slot stores the same
+//            coordinate). An item whose band block the table does not hold
+//            adds 1 to `missing` instead -- one per (triangle, block) pair, not
+//            per block -- which the host reads, and refuses, before anything is
+//            written. The scan rewrites counts[] in place as each bin's
+//            first entry (an exclusive prefix sum), and they become cursors.
+//   fill  -- replays the count pass's slots rather than re-deriving them: an
+//            item takes the next entry of its slot's bin and writes its
+//            triangle there. The same items land in the same slots, so every
+//            bin fills exactly to its count. A fill that re-ran the probe and
+//            the band test would only agree by assumption, and a bin one short
+//            leaves an entry nobody wrote for the integrate pass to read as a
+//            triangle index.
+//
+// Keyed by the block's heap SLOT (ptr / voxels_per_block) rather than a dense
+// grid over the mesh's bounding box, which the prior engine's shell mode built:
+// a 20 m cube at its 2*trunc_dist cell -- 80 mm at the default band -- is ~16M
+// cells whatever the surface looks like, while the slot arrays are the grid's
+// num_blocks, 16 bytes apiece (a count and a coordinate).
+
+#extension GL_GOOGLE_include_directive : require
+#define VR_HASH_ENTRIES_BINDING 0
+#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#define VR_TRI_OFFSETS_BINDING 3
+#include "volumetric_kit/recon/volume/shaders/triangle_candidates.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 0: the grid's hash entries (hash_lookup.glsl). Count pass only.
+// binding 1: mesh vertices, tightly packed vec3 (scalar stride 12, the host
+// Vec3f array byte for byte). Count pass only.
+layout(set = 0, binding = 1, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+// binding 2: triangle indices, 3 per triangle, bounds-checked on the host.
+// Count pass only.
+layout(set = 0, binding = 2, scalar) readonly buffer Indices { uint indices[]; };
+// binding 3: the per-triangle candidate offsets (triangle_candidates.glsl).
+// binding 4: per-slot triangle counts (count pass), then per-slot cursors, each
+// starting at its bin's first entry (fill pass).
+layout(set = 0, binding = 4, scalar) buffer Counts { uint counts[]; };
+// binding 5: each work item's slot, or kNoSlot: written by the count pass,
+// replayed by the fill pass.
+layout(set = 0, binding = 5, scalar) buffer ItemSlots { uint item_slot[]; };
+// binding 6: count pass only -- each binned slot's block coordinate.
+layout(set = 0, binding = 6, scalar) writeonly buffer SlotCoords {
+  ivec3 slot_coord[];
+};
+// binding 7: count pass only -- (triangle, block) pairs whose band block the
+// table does not hold.
+layout(set = 0, binding = 7, scalar) buffer Missing { uint missing; };
+// binding 8: fill pass only -- the bins, concatenated.
+layout(set = 0, binding = 8, scalar) writeonly buffer BinTris {
+  uint bin_tris[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+  VoxelGridParams grid;
+  uint tri_count;
+  uint pass;  // kPassCount or kPassFill
+  uint item_base;  // the first work item this dispatch covers
+} pc;
+
+const uint kPassCount = 0u;
+const uint kPassFill = 1u;
+const uint kNoSlot = 0xFFFFFFFFu;
+
+void main() {
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
+  if (gid >= vr_tri_offsets[pc.tri_count]) {
+    return;
+  }
+
+  if (pc.pass == kPassFill) {
+    uint slot = item_slot[gid];
+    if (slot != kNoSlot) {
+      bin_tris[atomicAdd(counts[slot], 1u)] = vrTriangleOf(gid, pc.tri_count);
+    }
+    return;
+  }
+
+  uint t = vrTriangleOf(gid, pc.tri_count);
+  uint local = gid - vr_tri_offsets[t];
+  vec3 v0 = vertices[indices[3u * t]];
+  vec3 v1 = vertices[indices[3u * t + 1u]];
+  vec3 v2 = vertices[indices[3u * t + 2u]];
+
+  uint slot = kNoSlot;
+  ivec3 coord;
+  if (vrCandidateBlock(local, v0, v1, v2, pc.grid, coord) &&
+      vrBlockInBand(coord, v0, v1, v2, pc.grid)) {
+    int ptr = vrFindBlockPtr(coord, pc.grid.num_buckets, pc.grid.bucket_size,
+                             pc.grid.max_chain);
+    if (ptr < 0) {
+      atomicAdd(missing, 1u);
+    } else {
+      slot = uint(ptr) / uint(pc.grid.voxels_per_block);
+      slot_coord[slot] = coord;
+      atomicAdd(counts[slot], 1u);
+    }
+  }
+  item_slot[gid] = slot;
+}

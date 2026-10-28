@@ -187,7 +187,7 @@ struct MeshTopology {
   /// That needs a component, no non-manifold or inconsistently oriented
   /// edge, no degenerate triangle, and every component's signed volume
   /// positive. Boundary edges are refused unless @p allow_holes: the signed
-  /// conversion (`tsdf::MeshSdfMode::Signed`) grows an open mesh a skirt
+  /// conversion (`voxelize::MeshSdfMode::Signed`) grows an open mesh a skirt
   /// past its rim.
   bool supports_signed(bool allow_holes = false) const noexcept {
     return components > 0 && (allow_holes || boundary_edges == 0) &&

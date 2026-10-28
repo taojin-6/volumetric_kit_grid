@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(scalar, binding = 0) buffer Counts { uint counts[]; };
+layout(scalar, binding = 1) readonly buffer Groups { uvec4 groups[]; };
+layout(scalar, binding = 2) readonly buffer Total { uvec4 total; };
+struct MeshBin { int ptr; uint begin; uint count; };
+layout(scalar, binding = 3) writeonly buffer Blocks { MeshBin blocks[]; };
+layout(push_constant, scalar) uniform Push {
+  uint size; uint voxels_per_block; uint capacity; uint max_bin; uint first_group;
+} pc;
+#include "mesh_scan.glsl"
+void main() {
+  // On a first/growing call the host can grow and retry only this pass: do not
+  // modify the local prefixes until the compact output fits and is valid.
+  if (total.y > pc.capacity || total.z > pc.max_bin || total.w != 0u) return;
+  uint group = pc.first_group + gl_WorkGroupID.x;
+  uint lane = gl_LocalInvocationID.x;
+  uint slot = group * 256u + lane;
+  uint begin = 0u;
+  uint count = 0u;
+  if (slot < pc.size) {
+    uint local_begin = counts[slot];
+    begin = groups[group].x + local_begin;
+    if (lane == 255u || slot + 1u == pc.size) {
+      uint next_group = group + 1u;
+      uint end = next_group < (pc.size + 255u) / 256u ? groups[next_group].x : total.x;
+      count = end - begin;
+    } else {
+      count = counts[slot + 1u] - local_begin;
+    }
+  }
+  // Neighbor prefixes are loaded before any invocation changes counts. The
+  // scan's workgroup barrier also orders those storage-buffer loads.
+  memoryBarrierBuffer();
+  uvec4 prefix = meshScan(uvec4(0u, uint(count != 0u), 0u, 0u));
+  if (slot < pc.size) counts[slot] = begin;
+  if (count != 0u) {
+    uint dst = groups[group].y + prefix.y;
+    blocks[dst] = MeshBin(int(slot * pc.voxels_per_block), begin, count);
+  }
+}
