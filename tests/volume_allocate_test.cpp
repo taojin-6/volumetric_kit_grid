@@ -12,8 +12,11 @@
 // intrinsic or a transposed pose would diverge. Also covers a frame of several
 // ragged tiles at two band widths, lock contention + retry on a one-bucket
 // table, negative-bias blocks, idempotent re-run, clear(), and null/zero-count
-// guards. Skips where no device is present.
+// guards. Pins the blocks, heap count and stamps three posed frames allocate,
+// one frame alone and two as a set, blocking and recorded, as recorded on main
+// at d8b8bda1. Skips where no device is present.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -23,8 +26,10 @@
 #include <utility>
 #include <vector>
 
+#include "fnv1a.hpp"
 #include "test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -141,8 +146,251 @@ int truncation_bounds_case(const vr_test::Gpu& gpu) {
   return 0;
 }
 
+// --- allocate_from_depth's result, pinned -----------------------------------
+// The grid the pinned frames allocate into: 1 cm voxels, 8 cm blocks, a band
+// of one block, and room for every frame's.
+vol::VoxelGridParams golden_grid() {
+  vol::VoxelGridParams g{};
+  g.voxel_size = 0.01f;
+  g.block_size = 8;
+  g.voxels_per_block = 512;
+  g.trunc_dist = 0.04f;
+  g.bucket_size = 8;
+  g.num_buckets = 4096;
+  g.num_blocks = 8 * 4096;
+  g.max_chain = 128;
+  return g;
+}
+
+// The rotation of the integer quaternion (a, b, c, d), each entry one rounded
+// division, and translation t: the same bits from every compiler.
+vr::Mat4f golden_pose(const int (&q)[4], vr::Vec3f t) {
+  const int a = q[0], b = q[1], c = q[2], d = q[3];
+  const auto e = [n = a * a + b * b + c * c + d * d](int num) {
+    return static_cast<float>(num) / static_cast<float>(n);
+  };
+  vr::Mat4f m(1.0f);  // column-major: m[column][row]
+  m[0] = vr::Vec4f(e(a * a + b * b - c * c - d * d), e(2 * (b * c + a * d)),
+                   e(2 * (b * d - a * c)), 0.0f);
+  m[1] = vr::Vec4f(e(2 * (b * c - a * d)), e(a * a - b * b + c * c - d * d),
+                   e(2 * (c * d + a * b)), 0.0f);
+  m[2] = vr::Vec4f(e(2 * (b * d + a * c)), e(2 * (c * d - a * b)),
+                   e(a * a - b * b - c * c + d * d), 0.0f);
+  m[3] = vr::Vec4f(t, 1.0f);
+  return m;
+}
+
+// Whether the world point at pixel (u, v) and depth d lies more than a
+// hundredth of a voxel from every boundary between blocks, in double. They sit
+// half a voxel short of each block_size-th voxel, as worldToVoxel rounds.
+// Drivers round the kernel's float arithmetic a few ulps apart, a millionth of
+// a metre here, so a point this clear lands in one block on every device.
+bool clear_of_boundaries(const vr::DepthCameraParams& c,
+                         const vol::VoxelGridParams& g, std::uint32_t u,
+                         std::uint32_t v, float d) {
+  const double z = d;
+  const double x = (static_cast<double>(u) - c.cx) * z / c.fx;
+  const double y = (static_cast<double>(v) - c.cy) * z / c.fy;
+  for (int r = 0; r < 3; ++r) {
+    const double w = c.cam_to_world[0][r] * x + c.cam_to_world[1][r] * y +
+                     c.cam_to_world[2][r] * z + c.cam_to_world[3][r];
+    const double blocks = (w / g.voxel_size + 0.5) / g.block_size;
+    if (std::abs(blocks - std::round(blocks)) * g.block_size < 0.01) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Frame `index` of three: a pinhole of its own, depth from integer arithmetic
+// (exact in float), a smooth plane on the left half and a rough surface on the
+// right, with holes, negative, NaN, infinite and out-of-range samples, and
+// both range bounds. A sample near a boundary between blocks is a hole
+// (clear_of_boundaries).
+struct GoldenFrame {
+  vr::DepthCameraParams cam{};
+  std::vector<float> depth;
+};
+
+GoldenFrame golden_frame(int index, const vol::VoxelGridParams& g) {
+  // (width, height), (fx, fy, cx, cy), the pose's quaternion and translation.
+  // 100 x 75 and 161 x 83 are no multiples of the kernel's 16 x 16 groups.
+  const std::uint32_t sizes[3][2] = {{128, 96}, {100, 75}, {161, 83}};
+  const vr::Vec4f intrinsics[3] = {vr::Vec4f(211.37f, 209.81f, 63.29f, 47.61f),
+                                   vr::Vec4f(150.5f, 151.25f, 49.75f, 37.125f),
+                                   vr::Vec4f(300.3f, 299.7f, 80.9f, 41.2f)};
+  const int quaternions[3][4] = {{5, 1, 2, 1}, {3, -1, 1, 2}, {4, 2, -1, 3}};
+  const vr::Vec3f translations[3] = {vr::Vec3f(0.13f, -0.27f, 0.41f),
+                                     vr::Vec3f(-0.62f, 0.08f, 0.35f),
+                                     vr::Vec3f(0.21f, 0.33f, -0.57f)};
+  GoldenFrame f;
+  f.cam.fx = intrinsics[index].x;
+  f.cam.fy = intrinsics[index].y;
+  f.cam.cx = intrinsics[index].z;
+  f.cam.cy = intrinsics[index].w;
+  f.cam.min_depth = 0.25f;
+  f.cam.max_depth = 3.0f;
+  f.cam.width = sizes[index][0];
+  f.cam.height = sizes[index][1];
+  f.cam.cam_to_world = golden_pose(quaternions[index], translations[index]);
+  f.depth.resize(std::size_t{f.cam.width} * f.cam.height);
+  const auto i = static_cast<std::uint32_t>(index);
+  for (std::uint32_t v = 0; v < f.cam.height; ++v) {
+    for (std::uint32_t u = 0; u < f.cam.width; ++u) {
+      const std::uint32_t k = u < f.cam.width / 2
+                                  ? 1200 + 3 * u + 2 * v
+                                  : 1024 + (37 * u + 23 * v + 101 * i) % 997;
+      float d = static_cast<float>(k) / 1024.0f;
+      const auto at = [u, v](std::uint32_t a, std::uint32_t b,
+                             std::uint32_t m) {
+        return (a * u + b * v) % m == 0;
+      };
+      if (at(7, 3, 41)) {
+        d = 0.0f;  // no return
+      } else if (at(1, 5, 53)) {
+        d = -d;
+      } else if (at(3, 1, 59)) {
+        d = std::numeric_limits<float>::quiet_NaN();
+      } else if (at(1, 1, 61)) {
+        d = std::numeric_limits<float>::infinity();
+      } else if (at(5, 2, 67)) {
+        d = 0.125f;  // nearer than min_depth
+      } else if (at(2, 7, 71)) {
+        d = 3.5f;  // farther than max_depth
+      } else if (at(4, 1, 73)) {
+        d = f.cam.min_depth;  // the bounds are kept
+      } else if (at(1, 4, 79)) {
+        d = f.cam.max_depth;
+      }
+      const bool kept =
+          d > 0.0f && d >= f.cam.min_depth && d <= f.cam.max_depth;
+      if (kept && !clear_of_boundaries(f.cam, g, u, v, d)) d = 0.0f;
+      f.depth[std::size_t{v} * f.cam.width + u] = d;
+    }
+  }
+  return f;
+}
+
+// What an allocation left: the blocks, the heap's count, and FNV-1a over the
+// sorted coordinates and over each sorted block's coordinate and stamp.
+struct Pinned {
+  std::size_t blocks = 0;
+  std::uint32_t allocated = 0;
+  std::uint32_t coords = 0;
+  std::uint32_t stamps = 0;
+
+  bool operator==(const Pinned& o) const {
+    return blocks == o.blocks && allocated == o.allocated &&
+           coords == o.coords && stamps == o.stamps;
+  }
+};
+
+vkc::Result<Pinned> pinned(const char* what, vol::VoxelHashMap& map) {
+  VKC_ASSIGN(std::vector<vol::BlockIndex> active, map.compact_active_blocks());
+  VKC_ASSIGN(const std::vector<vol::BlockStamp> stamps,
+             map.read_block_stamps());
+  std::sort(active.begin(), active.end(),
+            [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
+              return vol::coord_less(a.coord, b.coord);
+            });
+  std::vector<std::int32_t> coords;
+  std::vector<std::uint32_t> stamped;
+  for (const vol::BlockIndex& b : active) {
+    coords.insert(coords.end(), {b.coord.x, b.coord.y, b.coord.z});
+    const vol::BlockStamp& s =
+        stamps[std::size_t(b.ptr) / std::size_t(map.grid().voxels_per_block)];
+    stamped.insert(
+        stamped.end(),
+        {std::uint32_t(b.coord.x), std::uint32_t(b.coord.y),
+         std::uint32_t(b.coord.z), s.requested, s.weighted, s.changed});
+  }
+  const Pinned p{active.size(), map.allocated_blocks(), vr_test::fnv1a(coords),
+                 vr_test::fnv1a(stamped)};
+  std::printf("  pinned %s: %zu blocks, heap %u, coords %08x, stamps %08x\n",
+              what, p.blocks, p.allocated, p.coords, p.stamps);
+  return p;
+}
+
+// Recorded on main at d8b8bda1: the same on an Apple M5 Max (MoltenVK), an
+// RTX 5090 and lavapipe.
+constexpr Pinned kOneFrame{3376, 3376, 0x606d08c9, 0xf44db715};
+constexpr Pinned kSet{8740, 8740, 0x0b3645e7, 0xedec4629};
+
+// The first frame alone at tick 3, from a host array and from a device buffer;
+// then the other two as a set at tick 5 over its blocks, blocking from host
+// arrays and recorded from device buffers. Every path gives the pinned values.
+int golden_case(vr_test::Gpu& gpu) {
+  const vol::VoxelGridParams grid = golden_grid();
+  std::vector<GoldenFrame> frames;
+  std::vector<vkc::Buffer> device;
+  for (int i = 0; i < 3; ++i) {
+    frames.push_back(golden_frame(i, grid));
+    const std::vector<float>& depth = frames.back().depth;
+    vkc::Result<vkc::Buffer> up = vr_test::upload_device_buffer(
+        gpu.device, gpu.allocator, depth.data(), depth.size() * sizeof(float));
+    CHECK(up.ok());
+    device.push_back(std::move(up).value());
+  }
+  const auto input = [&](int i, bool on_device) {
+    return vol::DepthInput{on_device
+                               ? vkc::StorageInput(device[i])
+                               : vkc::StorageInput(frames[i].depth.data()),
+                           frames[i].cam};
+  };
+  const auto at_tick_3 = [&]() {
+    vkc::Result<vol::VoxelHashMap> map =
+        vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
+    if (map.ok()) {
+      map->advance_tick();
+      map->advance_tick();
+    }
+    return map;
+  };
+
+  for (const bool on_device : {false, true}) {
+    vkc::Result<vol::VoxelHashMap> map = at_tick_3();
+    CHECK(map.ok());
+    vol::AllocFailures f;
+    vkc::Result<std::uint32_t> left =
+        on_device ? map->allocate_from_depth(device[0], frames[0].cam, &f)
+                  : map->allocate_from_depth(frames[0].depth.data(),
+                                             frames[0].cam, &f);
+    CHECK(left.ok() && left.value() == 0);
+    vkc::Result<Pinned> got = pinned("one frame", *map);
+    CHECK(got.ok() && got.value() == kOneFrame);
+  }
+
+  for (const bool recorded : {false, true}) {
+    vkc::Result<vol::VoxelHashMap> map = at_tick_3();
+    CHECK(map.ok());
+    CHECK(map->allocate_from_depth({input(0, recorded)}).value() == 0);
+    map->advance_tick();
+    map->advance_tick();
+    const std::vector<vol::DepthInput> set{input(1, recorded),
+                                           input(2, recorded)};
+    if (!recorded) {
+      CHECK(map->allocate_from_depth(set).value() == 0);
+    } else {
+      vol::AllocFailures f;
+      for (int pass = 0; pass < 8; ++pass) {
+        vkc::CommandBatch batch(gpu.device, gpu.allocator);
+        vkc::Result<vol::RecordedRounds> r =
+            map->record_allocate_from_depth(batch, set);
+        CHECK(r.ok() && batch.submit().ok());
+        f = map->settle(*r).value();
+        if (f.lock == 0) break;
+      }
+      CHECK(f.total == 0 && f.terminal == 0);
+    }
+    vkc::Result<Pinned> got = pinned(recorded ? "set, recorded" : "set", *map);
+    CHECK(got.ok() && got.value() == kSet);
+  }
+  return 0;
+}
+
 int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(truncation_bounds_case(gpu) == 0);
+  CHECK(golden_case(gpu) == 0);
   // A small grid: 1024 buckets x 8, 8192-block heap -- ample for a couple of
   // 27-block bands, and cheap to init.
   vol::VoxelGridParams grid{};
