@@ -87,7 +87,7 @@ int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
 // so the expected block for a pixel is derived INDEPENDENTLY of the shader --
 // a wrong fx/fy/cx/cy or a transposed cam_to_world changes this result and the
 // on-device set no longer matches. (The device path is GLSL; this is glm/C++.)
-vr::Vec3i unproject_to_block(const vr::DepthCameraParams& cam,
+vr::Vec3i unproject_to_block(const vol::DepthPinhole& cam,
                              const vol::VoxelGridParams& grid, std::uint32_t u,
                              std::uint32_t v, float d) {
   const float x = (static_cast<float>(u) - cam.cx) * d / cam.fx;
@@ -185,7 +185,7 @@ vr::Mat4f golden_pose(const int (&q)[4], vr::Vec3f t) {
 // half a voxel short of each block_size-th voxel, as worldToVoxel rounds.
 // Drivers round the kernel's float arithmetic a few ulps apart, a millionth of
 // a metre here, so a point this clear lands in one block on every device.
-bool clear_of_boundaries(const vr::DepthCameraParams& c,
+bool clear_of_boundaries(const vol::DepthPinhole& c,
                          const vol::VoxelGridParams& g, std::uint32_t u,
                          std::uint32_t v, float d) {
   const double z = d;
@@ -208,7 +208,7 @@ bool clear_of_boundaries(const vr::DepthCameraParams& c,
 // both range bounds. A sample near a boundary between blocks is a hole
 // (clear_of_boundaries).
 struct GoldenFrame {
-  vr::DepthCameraParams cam{};
+  vol::DepthPinhole cam{};
   std::vector<float> depth;
 };
 
@@ -311,8 +311,8 @@ vkc::Result<Pinned> pinned(const char* what, vol::VoxelHashMap& map) {
   return p;
 }
 
-// Recorded on main at d8b8bda1: the same on an Apple M5 Max (MoltenVK), an
-// RTX 5090 and lavapipe.
+// Recorded on main at d8b8bda1, when the frames' camera was DepthCameraParams:
+// the same on an Apple M5 Max (MoltenVK), an RTX 5090 and lavapipe.
 constexpr Pinned kOneFrame{3376, 3376, 0x606d08c9, 0xf44db715};
 constexpr Pinned kSet{8740, 8740, 0x0b3645e7, 0xedec4629};
 
@@ -422,7 +422,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // differ by enough to move the band: the kernel packs them as
   // vec4(fx, fy, cx, cy), and swapping either pair changes the blocks, which
   // the host checks below.
-  vr::DepthCameraParams cam{};
+  vol::DepthPinhole cam{};
   cam.fx = 40.0f;
   cam.fy = 120.0f;
   cam.cx = 2.5f;
@@ -455,7 +455,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // want = the union of every valid pixel's band, unprojected on the HOST (so
   // the shader's unprojection is what's under test, not just the band
   // dilation).
-  const auto band_of = [&](const vr::DepthCameraParams& c) {
+  const auto band_of = [&](const vol::DepthPinhole& c) {
     std::set<Coord> want;
     for (std::uint32_t v = 0; v < c.height; ++v) {
       for (std::uint32_t u = 0; u < c.width; ++u) {
@@ -467,9 +467,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
   const std::set<Coord> depth_want = band_of(cam);
   // The frame tells the packing apart: swapped focal lengths, or a swapped
   // principal point, would allocate other blocks.
-  vr::DepthCameraParams swapped_f = cam;
+  vol::DepthPinhole swapped_f = cam;
   std::swap(swapped_f.fx, swapped_f.fy);
-  vr::DepthCameraParams swapped_c = cam;
+  vol::DepthPinhole swapped_c = cam;
   std::swap(swapped_c.cx, swapped_c.cy);
   CHECK(band_of(swapped_f) != depth_want && band_of(swapped_c) != depth_want);
 
@@ -558,7 +558,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     vkc::Result<vol::VoxelHashMap> tiled_map =
         vol::VoxelHashMap::create(gpu.device, gpu.allocator, tiled);
     CHECK(tiled_map.ok());
-    vr::DepthCameraParams wide = cam;
+    vol::DepthPinhole wide = cam;
     wide.fx = 128.0f;
     wide.fy = 128.0f;
     wide.cx = 0.5f;
