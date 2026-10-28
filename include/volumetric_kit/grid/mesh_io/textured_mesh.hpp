@@ -12,7 +12,7 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/io/assimp_export.hpp"
+#include "volumetric_kit/recon/io/mesh_io_assimp_export.hpp"
 #include "volumetric_kit/recon/io/triangle_mesh.hpp"
 
 namespace volumetric_kit::recon::io {
@@ -50,7 +50,7 @@ struct TexturedMesh {
 ///         InvalidArgument for a nonfinite coordinate, and Unsupported when
 ///         meshes name different diffuse maps, the map is embedded in the
 ///         asset, or material libraries lie in more than one directory.
-VR_IO_ASSIMP_API core::Result<TexturedMesh> load_textured_mesh(
+VR_MESH_IO_ASSIMP_API core::Result<TexturedMesh> load_textured_mesh(
     const std::string& path);
 
 }  // namespace volumetric_kit::recon::io
