@@ -35,7 +35,7 @@
 // pipeline resolved neighbours on-device the same way.
 //
 // Only how a vertex slot is claimed differs from the sharing kernel; the
-// per-cell body (cube index, gradient normal, reversed-winding triangle
+// per-cell body (cube index, vertex normal, reversed-winding triangle
 // emission, hybrid vertex colour) is the shared marching_cubes_common.glsl
 // both kernels include.
 //
@@ -147,14 +147,14 @@ layout(push_constant, scalar) uniform PushConstants {
   uint item_base;  // the first active block this dispatch covers
 } pc;
 
-// mcCornerShift / mcCellNormal / mcEdgeVertex / mcCellTriangleCount /
-// mcWriteTriangle + the near-tangent edge guard, over the Tables / Vertices /
-// DrawCommand bindings declared above.
+// mcCornerShift / mcEdgeVertex / mcCellTriangleCount / mcWriteTriangle + the
+// near-tangent edge guard, over the Tables / Vertices / DrawCommand bindings
+// declared above.
 #include "marching_cubes_common.glsl"
 
 // vgridLocalIndex / vgridLocalBase / s_neighbour / vgridResolveNeighbourhood /
-// vgridCornerStorage / mcGather / mcCellSigns -- everything this kernel and the
-// sharing one do identically.
+// vgridCornerStorage / mcGather / mcCellSigns / mcCornerGradients --
+// everything this kernel and the sharing one do identically.
 #include "marching_cubes_sparse_common.glsl"
 
 // ---------------------------------------------------------------------------
@@ -275,6 +275,7 @@ void main() {
   }
   vgridResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
                          pc.bucket_size, pc.max_chain);
+  mcResolveGradientBlocks(block.coord, block.ptr, tid);
   barrier();
 
   // PHASE ONE -- count, and cache each cell's TRIANGLE COUNT for phase three.
@@ -394,14 +395,14 @@ void main() {
     if (first + uint(n) > block_end) {
       continue;
     }
-    vec3 normal = mcCellNormal(sdf);
+    mcCornerGradients(sdf, base, false);
     for (int t = 0; t < n; ++t) {
       uint tri = first + uint(t);
       if (tri >= pc.capacity) {
         break;  // counted in phase one, dropped here -- and `tri` only grows
       }
       mcWriteTriangle(cube_index, t, sdf, corner_color,
-                      block.coord * bs + base, pc.voxel_size, normal, pc.iso,
+                      block.coord * bs + base, pc.voxel_size, pc.iso,
                       pc.has_color, tri);
     }
   }

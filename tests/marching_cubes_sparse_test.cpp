@@ -17,7 +17,9 @@
 // table shaped to spill, which is the only thing that exercises the on-device
 // probe's chain walk at all.
 //
-// Also verifies the sphere shape (radius, outward normals, winding),
+// Also verifies the sphere shape (radius, outward normals, winding), the
+// per-vertex normals (one per welded position in both kernels, near the
+// sphere's, and finite past an unobserved or unallocated neighbour),
 // cross-block colour interpolation, the vertex-arena growth policy and that
 // the two output buffers grow independently, the refit-and-re-run path an
 // undersized arena takes -- over one block and over a run of 27, where the
@@ -1530,6 +1532,143 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         0);
     CHECK(list_mc.value().extract_device(list_grid, 0.0f, &t).ok());
     CHECK(t.active_blocks == last.value().count + 1);
+  }
+
+  // --- Per-vertex normals ----------------------------------------------------
+  // A vertex's normal is the field's gradient at the vertex, a function of its
+  // edge alone: every corner at one welded position carries one normal (no
+  // seam between cells or blocks), both kernels give the same one, and on the
+  // sphere it is a small fraction of a degree from the true normal (one
+  // normal per cell was 2.7 degrees off on average, and differed between the
+  // cells meeting at a vertex). A neighbour that is unobserved, its distance
+  // NaN, or unallocated is never used: that axis takes the one-sided
+  // difference, and the normal stays finite, unit and close.
+  {
+    using NormalsByPos =
+        std::map<std::array<float, 3>, std::vector<vgrid::Vec3f>>;
+    const auto by_pos = [](const mesh::Mesh& m) {
+      NormalsByPos by;
+      for (const std::uint32_t i : m.indices) {
+        const mesh::Vertex& v = m.vertices[i];
+        by[{v.position.x, v.position.y, v.position.z}].push_back(v.normal);
+      }
+      return by;
+    };
+    // The largest difference between two normals at one position.
+    const auto spread = [](const NormalsByPos& by) {
+      double worst = 0.0;
+      for (const auto& entry : by) {
+        for (const vgrid::Vec3f& n : entry.second) {
+          worst = std::max(
+              worst, static_cast<double>(vgrid::length(n - entry.second[0])));
+        }
+      }
+      return worst;
+    };
+    // The largest difference between two meshes' normals at one position;
+    // infinite when they hold different positions.
+    const auto gap = [](const NormalsByPos& a, const NormalsByPos& b) {
+      double worst = a.size() == b.size() ? 0.0 : HUGE_VAL;
+      for (const auto& entry : a) {
+        const auto it = b.find(entry.first);
+        if (it == b.end()) return HUGE_VAL;
+        worst = std::max(worst, static_cast<double>(vgrid::length(
+                                    it->second[0] - entry.second[0])));
+      }
+      return worst;
+    };
+    // Degrees from the sphere's normal at each vertex: the worst and the mean.
+    const auto angles = [](const mesh::Mesh& m) {
+      double worst = 0.0;
+      double sum = 0.0;
+      for (const mesh::Vertex& v : m.vertices) {
+        const vgrid::Vec3f r = glm::normalize(v.position - sphere_center());
+        const double c = std::max(
+            -1.0, std::min(1.0, static_cast<double>(vgrid::dot(r, v.normal))));
+        const double a = std::acos(c) * 180.0 / 3.14159265358979;
+        worst = std::max(worst, a);
+        sum += a;
+      }
+      return std::array<double, 2>{
+          worst, sum / static_cast<double>(m.vertices.size())};
+    };
+
+    const NormalsByPos plain = by_pos(sphere);
+    const NormalsByPos shared = by_pos(share_mesh);
+    CHECK(spread(plain) < 1e-5);
+    CHECK(spread(shared) < 1e-5);
+    CHECK(gap(plain, shared) < 1e-5);
+    const std::array<double, 2> whole = angles(sphere);
+    CHECK(whole[0] < 0.5);
+    CHECK(whole[1] < 0.1);
+
+    // The sphere below voxel x = 16 unobserved, its distances NaN, and the
+    // blocks from x = 4 (voxel 32) on removed: the cells at voxels 16 and 30
+    // take a one-sided difference there, one each way.
+    vkc::Result<vol::VoxelBlockGrid> cut_result =
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
+    CHECK(cut_result.ok());
+    vol::VoxelBlockGrid cut = std::move(cut_result).value();
+    CHECK(fill_sphere_grid(gpu, cut, /*with_color=*/false));
+    constexpr int kObservedFrom = 16;
+    constexpr int kAllocatedBelow = 32;
+    vkc::Result<std::vector<vol::BlockIndex>> active =
+        cut.map().compact_active_blocks();
+    auto tsdf = vgrid_test::read_attribute<float>(gpu.device, gpu.allocator,
+                                                  cut, vol::kTsdfAttribute);
+    auto weight = vgrid_test::read_attribute<float>(gpu.device, gpu.allocator,
+                                                    cut, vol::kWeightAttribute);
+    CHECK(active.ok() && tsdf.ok() && weight.ok());
+    for (const vol::BlockIndex& b : active.value()) {
+      for (int l = 0; l < kBlock * kBlock * kBlock; ++l) {
+        if (b.coord.x * kBlock + l % kBlock < kObservedFrom) {
+          const auto i = static_cast<std::size_t>(b.ptr) + l;
+          tsdf.value()[i] = std::nanf("");
+          weight.value()[i] = 0.0f;
+        }
+      }
+    }
+    CHECK(write_attributes(gpu, cut, tsdf.value(), weight.value()));
+    std::vector<vol::BlockIndex> gone;
+    for (const vol::BlockIndex& b : cube_blocks()) {
+      if (b.coord.x * kBlock >= kAllocatedBelow) gone.push_back(b);
+    }
+    vkc::Result<std::uint32_t> removed =
+        vgrid_test::remove_blocks(gpu, cut.map(), gone);
+    CHECK(removed.ok() && removed.value() == 0);
+
+    vkc::Result<mesh::Mesh> cut_plain = moved.extract_host(cut, 0.0f);
+    vkc::Result<mesh::Mesh> cut_shared = share_mc.extract_host(cut, 0.0f);
+    CHECK(cut_plain.ok() && cut_shared.ok());
+    CHECK(cut_plain.value().triangle_count() > 100);
+    CHECK(cut_plain.value().triangle_count() < sphere.triangle_count());
+    CHECK(canonical_triangles(cut_shared.value()) ==
+          canonical_triangles(cut_plain.value()));
+    // Vertices on both one-sided layers, so the cases below are reached.
+    float lo = HUGE_VALF;
+    float hi = -HUGE_VALF;
+    for (const mesh::Mesh* m : {&cut_plain.value(), &cut_shared.value()}) {
+      for (const mesh::Vertex& v : m->vertices) {
+        CHECK(std::isfinite(v.normal.x) && std::isfinite(v.normal.y) &&
+              std::isfinite(v.normal.z));
+        CHECK(std::fabs(vgrid::length(v.normal) - 1.0f) < 1e-4f);
+        lo = std::min(lo, v.position.x);
+        hi = std::max(hi, v.position.x);
+      }
+    }
+    CHECK(lo <= static_cast<float>(kObservedFrom) * kH);
+    CHECK(hi >= static_cast<float>(kAllocatedBelow - 1) * kH);
+    const NormalsByPos cut_by = by_pos(cut_plain.value());
+    CHECK(spread(cut_by) < 1e-5);
+    CHECK(spread(by_pos(cut_shared.value())) < 1e-5);
+    CHECK(gap(cut_by, by_pos(cut_shared.value())) < 1e-5);
+    const std::array<double, 2> one_sided = angles(cut_plain.value());
+    CHECK(one_sided[0] < 4.0);
+    std::printf(
+        "vertex normals from the sphere's: mean %.3f, worst %.3f degrees; "
+        "worst %.3f with one-sided differences at an unobserved and an "
+        "unallocated neighbour\n",
+        whole[1], whole[0], one_sided[0]);
   }
 
   std::printf(
