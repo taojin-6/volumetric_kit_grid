@@ -30,9 +30,9 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_scalar_block_layout : require
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/coord_order.glsl"
 
 layout(local_size_x = 64) in;
 
@@ -91,10 +91,10 @@ uint target_count() {
   return min(target_words[pc.target_word], pc.target_bound);
 }
 
-VR_COORD_SEARCH(in_reference, reference_list)
-VR_COORD_SEARCH(in_target, target_list)
+VGRID_COORD_SEARCH(in_reference, reference_list)
+VGRID_COORD_SEARCH(in_target, target_list)
 
-#define VR_FRAME_WRITER
+#define VGRID_FRAME_WRITER
 #include "frame_grammar.glsl"
 
 // What the price walks: the target entry's first coefficient word, the

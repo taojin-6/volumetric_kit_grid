@@ -4,8 +4,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
 
 layout(local_size_x = 1) in;
 layout(set = 0, binding = 0, scalar) readonly buffer Grids {

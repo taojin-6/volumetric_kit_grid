@@ -26,7 +26,7 @@
 
 layout(local_size_x = 1) in;
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
 #include "hash_common.glsl"
 
 layout(set = 0, binding = 0) readonly buffer Counts { uint counts[]; };
@@ -36,8 +36,8 @@ layout(set = 0, binding = 2) buffer FailCount { uint fail_count[]; };
 // round runs, the rounds run, and the terminal failures so far.
 layout(set = 0, binding = 3) buffer State { uint state[]; };
 layout(set = 0, binding = 4) readonly buffer HeapCounter { uint heap_counter; };
-#define VR_SLICES_BINDING 5
-#include "volumetric_kit/recon/core/shaders/dispatch_slices.glsl"
+#define VGRID_SLICES_BINDING 5
+#include "volumetric_kit/grid/base/shaders/dispatch_slices.glsl"
 
 // Mirrors volume::detail::RoundsResult (hash.hpp).
 struct RoundsResult {
@@ -99,8 +99,8 @@ void main() {
     if (again) clear_tally();
   }
   if (pc.round < pc.rounds) {
-    const uint groups = state[at + 1u] != 0u ? vrGroups(state[at], kLanes) : 0u;
-    vrWriteSlices(pc.round * pc.dispatches, pc.dispatches, pc.per_dispatch,
+    const uint groups = state[at + 1u] != 0u ? vgridGroups(state[at], kLanes) : 0u;
+    vgridWriteSlices(pc.round * pc.dispatches, pc.dispatches, pc.per_dispatch,
                   groups);
     return;
   }

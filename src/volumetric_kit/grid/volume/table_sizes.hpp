@@ -14,11 +14,11 @@
 #include <cstdint>
 
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
 
 #include "hash.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// The map's grid-sized buffers, in bytes, for one grid.
 struct TableSizes {
@@ -53,4 +53,4 @@ inline TableSizes table_sizes(std::uint64_t num_buckets,
   return sizes;
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

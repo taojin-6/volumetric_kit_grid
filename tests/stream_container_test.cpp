@@ -23,14 +23,14 @@
 #include <thread>
 #include <vector>
 
-#include "stream_files.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
 
 namespace {
 
@@ -927,7 +927,7 @@ int nominal_period_case(const std::string&) {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_stream_container_");
+  vkc::test::Scratch scratch("grid_stream_container_");
   const std::string dir = scratch.path.string();
   if (crc_case(dir) != 0) return 1;
   if (golden_case(dir) != 0) return 1;

@@ -14,7 +14,7 @@
 #include <atomic>
 #include <csignal>
 
-namespace vr_example {
+namespace vgrid_example {
 
 /// Set by the handler @ref catch_interrupts installs. Lock-free, as a signal
 /// handler may only touch such an atomic.
@@ -22,7 +22,7 @@ inline std::atomic<bool> g_interrupted{false};
 static_assert(std::atomic<bool>::is_always_lock_free,
               "the interrupt flag must be safe to set from a signal handler");
 
-extern "C" inline void vr_example_on_interrupt(int signal) {
+extern "C" inline void vgrid_example_on_interrupt(int signal) {
   g_interrupted.store(true);
   std::signal(signal, SIG_DFL);
 }
@@ -30,12 +30,12 @@ extern "C" inline void vr_example_on_interrupt(int signal) {
 /// @brief Catch SIGINT and SIGTERM: the first of either sets
 ///        @ref interrupted and restores that signal's default.
 inline void catch_interrupts() {
-  std::signal(SIGINT, vr_example_on_interrupt);
-  std::signal(SIGTERM, vr_example_on_interrupt);
+  std::signal(SIGINT, vgrid_example_on_interrupt);
+  std::signal(SIGTERM, vgrid_example_on_interrupt);
 }
 
 /// @return Whether a SIGINT or a SIGTERM has come since
 ///         @ref catch_interrupts.
 inline bool interrupted() noexcept { return g_interrupted.load(); }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

@@ -18,7 +18,6 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "hash.hpp"
 #include "hash_map_internal.hpp"
 #include "volume_hash_oracle.hpp"
@@ -27,17 +26,18 @@
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -59,8 +59,8 @@ std::vector<vol::BlockIndex> coords_in_bucket(int target_bucket,
   for (int x = 1; x < 64 && out.size() < n; ++x) {
     for (int y = 1; y < 64 && out.size() < n; ++y) {
       for (int z = 1; z < 64 && out.size() < n; ++z) {
-        const vr::Vec3i c(x, y, z);
-        if (static_cast<int>(vr_test::hash_bucket(c, num_buckets)) ==
+        const vgrid::Vec3i c(x, y, z);
+        if (static_cast<int>(vgrid_test::hash_bucket(c, num_buckets)) ==
             target_bucket) {
           vol::BlockIndex block{};
           block.coord = c;
@@ -103,7 +103,7 @@ int device_allocate_case(vkc::test::GpuContext& gpu,
   vol::VoxelHashMap map = std::move(made).value();
   const auto at = [](int x, int y, int z) {
     vol::BlockIndex b{};
-    b.coord = vr::Vec3i(x, y, z);
+    b.coord = vgrid::Vec3i(x, y, z);
     b.ptr = 12345;  // never read
     return b;
   };
@@ -114,7 +114,7 @@ int device_allocate_case(vkc::test::GpuContext& gpu,
   };
   // Two present, three new, one new twice, and a live entry past the count.
   const std::vector<vol::BlockIndex> present = {at(1, 1, 1), at(2, 1, 1)};
-  CHECK(vr_test::allocate_blocks(gpu, map, present.data(), 2).value() == 0);
+  CHECK(vgrid_test::allocate_blocks(gpu, map, present.data(), 2).value() == 0);
   const std::vector<vol::BlockIndex> list = {
       at(1, 1, 1), at(3, 1, 1), at(4, 1, 1), at(2, 1, 1),
       at(5, 1, 1), at(4, 1, 1), at(9, 9, 9)};
@@ -142,7 +142,7 @@ int device_allocate_case(vkc::test::GpuContext& gpu,
   // The heap's blocks back: removed, then allocated from the device list,
   // they take the indices they had.
   const std::set<int> ptrs_before = active_ptrs(map);
-  CHECK(vr_test::remove_blocks(gpu, map, list.data() + 1, 2).value() == 0);
+  CHECK(vgrid_test::remove_blocks(gpu, map, list.data() + 1, 2).value() == 0);
   failed = map.allocate(device_list.value(), count);
   CHECK(failed.ok() && failed.value() == 0);
   CHECK(active_ptrs(map) == ptrs_before);
@@ -229,7 +229,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     for (int y = -1; y <= 1; ++y) {
       for (int z = -1; z <= 1; ++z) {
         vol::BlockIndex block{};
-        block.coord = vr::Vec3i(x, y, z);
+        block.coord = vgrid::Vec3i(x, y, z);
         coords.push_back(block);
         want.insert({x, y, z});
       }
@@ -238,14 +238,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // Allocate; every insert should succeed.
   vkc::Result<std::uint32_t> failures =
-      vr_test::allocate_blocks(gpu, map, coords);
+      vgrid_test::allocate_blocks(gpu, map, coords);
   CHECK(failures.ok());
   CHECK(failures.value() == 0);
 
   // Idempotent: re-inserting the same coords allocates nothing new and fails
   // nothing (the block-exists fast path dedups).
   vkc::Result<std::uint32_t> failures2 =
-      vr_test::allocate_blocks(gpu, map, coords);
+      vgrid_test::allocate_blocks(gpu, map, coords);
   CHECK(failures2.ok() && failures2.value() == 0);
 
   // Compact: exactly the input set comes back, each block drawing a DISTINCT
@@ -310,11 +310,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
     CHECK(lmap_result.ok());
     vol::VoxelHashMap lmap = std::move(lmap_result).value();
-    CHECK(vr_test::allocate_blocks(gpu, lmap, coords.data(), n).value() == 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, lmap, coords.data(), n).value() ==
+          0);
     vkc::Result<vol::DeviceBlockList> before_remove =
         lmap.compact_active_blocks_on_device();
     CHECK(before_remove.ok() && before_remove.value().count == want.size());
-    CHECK(vr_test::remove_blocks(gpu, lmap, coords.data(), 1).ok());
+    CHECK(vgrid_test::remove_blocks(gpu, lmap, coords.data(), 1).ok());
     CHECK(!lmap.check_device_block_list(before_remove.value(), "test").ok());
     vkc::Result<vol::DeviceBlockList> before_resize =
         lmap.compact_active_blocks_on_device();
@@ -332,12 +333,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vkc::Result<vol::DeviceBlockList> again =
         lmap.compact_active_blocks_on_device();
     CHECK(again.ok() && again.value().serial == fresh.value().serial);
-    CHECK(vr_test::allocate_blocks(gpu, lmap, coords.data(), n).value() == 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, lmap, coords.data(), n).value() ==
+          0);
     CHECK(!lmap.check_device_block_list(fresh.value(), "test").ok());
     vkc::Result<vol::DeviceBlockList> regrown =
         lmap.compact_active_blocks_on_device();
     CHECK(regrown.ok() && regrown.value().count == want.size());
-    CHECK(vr_test::allocate_blocks(gpu, lmap, coords.data(), n).value() == 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, lmap, coords.data(), n).value() ==
+          0);
     CHECK(lmap.check_device_block_list(regrown.value(), "test").ok());
   }
 
@@ -373,7 +376,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // not chain refuses the three past its four slots. The oracle chose them,
     // so a GLSL hash drifted from it would scatter them, build no chain, and
     // leave every check below passing.
-    vkc::Result<std::uint32_t> crefused = vr_test::chain_refusals(gpu, cg, cc);
+    vkc::Result<std::uint32_t> crefused =
+        vgrid_test::chain_refusals(gpu, cg, cc);
     CHECK(crefused.ok() &&
           crefused.value() == kColliding - std::size_t(cg.bucket_size));
     std::set<Coord> cwant;
@@ -388,7 +392,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // cross-dispatch retry the host is expected to do.
     for (const vol::BlockIndex& block : cc) {
       vkc::Result<std::uint32_t> f =
-          vr_test::allocate_blocks(gpu, cmap, &block, 1);
+          vgrid_test::allocate_blocks(gpu, cmap, &block, 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -409,7 +413,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // Idempotent under collisions: re-inserting the same coords must find the
     // chained ones by TRAVERSING `offset` and allocate nothing new -- if offset
     // were mis-read the chained coords would be re-inserted and the count grow.
-    vkc::Result<std::uint32_t> cfail2 = vr_test::allocate_blocks(gpu, cmap, cc);
+    vkc::Result<std::uint32_t> cfail2 =
+        vgrid_test::allocate_blocks(gpu, cmap, cc);
     CHECK(cfail2.ok() && cfail2.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> cactive2 =
         cmap.compact_active_blocks();
@@ -464,7 +469,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // The device must agree they share bucket 0, or the chain is never deep:
     // where it may not grow, all but the bucket's eight slots are refused.
     vkc::Result<std::uint32_t> prefused =
-        vr_test::chain_refusals(gpu, pg, deep);
+        vgrid_test::chain_refusals(gpu, pg, deep);
     CHECK(prefused.ok() &&
           prefused.value() == kDeepChain - std::size_t(pg.bucket_size));
 
@@ -473,7 +478,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // would muddle what this is measuring.
     for (const vol::BlockIndex& block : deep) {
       vkc::Result<std::uint32_t> f =
-          vr_test::allocate_blocks(gpu, pmap, &block, 1);
+          vgrid_test::allocate_blocks(gpu, pmap, &block, 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -495,7 +500,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // ONE dispatch has to find every one of them by hopping the chain, so a bad
     // link re-inserts instead and the count grows.
     vkc::Result<std::uint32_t> prefail =
-        vr_test::allocate_blocks(gpu, pmap, deep);
+        vgrid_test::allocate_blocks(gpu, pmap, deep);
     CHECK(prefail.ok() && prefail.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> pactive2 =
         pmap.compact_active_blocks();
@@ -539,7 +544,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // 1's anchor.
     for (std::size_t i = 0; i < 3; ++i) {
       vkc::Result<std::uint32_t> f =
-          vr_test::allocate_blocks(gpu, tmap, &b0[i], 1);
+          vgrid_test::allocate_blocks(gpu, tmap, &b0[i], 1);
       CHECK(f.ok() && f.value() == 0);
     }
 
@@ -552,7 +557,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(tlf.ok() && tlf.value() < 1.0f);
     vol::AllocFailures tf{};
     vkc::Result<std::uint32_t> f4 =
-        vr_test::allocate_blocks(gpu, tmap, &b0[3], 1, &tf);
+        vgrid_test::allocate_blocks(gpu, tmap, &b0[3], 1, &tf);
     CHECK(f4.ok() && f4.value() > 0);
     CHECK(tf.table > 0);
     CHECK(tf.heap == 0);
@@ -562,7 +567,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> b1 = coords_in_bucket(1, tg.num_buckets, 1);
     CHECK(b1.size() == 1);
     vkc::Result<std::uint32_t> f5 =
-        vr_test::allocate_blocks(gpu, tmap, &b1[0], 1);
+        vgrid_test::allocate_blocks(gpu, tmap, &b1[0], 1);
     CHECK(f5.ok() && f5.value() == 0);
     vkc::Result<float> tfull = tmap.load_factor();
     CHECK(tfull.ok() && tfull.value() == 1.0f);
@@ -576,7 +581,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // the pair.
     vol::AllocFailures hf{};
     vkc::Result<std::uint32_t> f6 =
-        vr_test::allocate_blocks(gpu, tmap, &b0[3], 1, &hf);
+        vgrid_test::allocate_blocks(gpu, tmap, &b0[3], 1, &hf);
     CHECK(f6.ok() && f6.value() > 0);
     CHECK(hf.heap > 0);
     CHECK(hf.table == 0);
@@ -607,14 +612,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(b0.size() == 16);
     for (std::size_t i = 0; i < 15; ++i) {
       vkc::Result<std::uint32_t> f =
-          vr_test::allocate_blocks(gpu, rmap.value(), &b0[i], 1);
+          vgrid_test::allocate_blocks(gpu, rmap.value(), &b0[i], 1);
       CHECK(f.ok() && f.value() == 0);
     }
     vkc::Result<float> rlf = rmap.value().load_factor();
     CHECK(rlf.ok() && rlf.value() == 15.0f / 16.0f);
     vol::AllocFailures rf{};
     vkc::Result<std::uint32_t> f16 =
-        vr_test::allocate_blocks(gpu, rmap.value(), &b0[15], 1, &rf);
+        vgrid_test::allocate_blocks(gpu, rmap.value(), &b0[15], 1, &rf);
     CHECK(f16.ok() && f16.value() > 0);
     CHECK(rf.heap > 0);
     CHECK(rf.table == 0);
@@ -626,7 +631,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // Move-construct: the source empties, the destination lives. A device list
   // compacted before the move is refused by the map it moved into, and the
   // moved-from map compacts nothing.
-  CHECK(vr_test::allocate_blocks(gpu, map, coords.data(), n).value() == 0);
+  CHECK(vgrid_test::allocate_blocks(gpu, map, coords.data(), n).value() == 0);
   vkc::Result<vol::DeviceBlockList> before_move =
       map.compact_active_blocks_on_device();
   CHECK(before_move.ok() && before_move.value().count == want.size());
@@ -666,7 +671,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(moved.valid());
 
   std::printf(
-      "recon volume hash-map test passed: allocated + compacted %zu blocks; "
+      "grid volume hash-map test passed: allocated + compacted %zu blocks; "
       "chained blocks found again through their overflow chains\n",
       want.size());
   return 0;
@@ -675,5 +680,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

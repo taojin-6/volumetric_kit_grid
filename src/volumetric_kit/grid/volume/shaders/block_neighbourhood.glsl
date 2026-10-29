@@ -8,14 +8,14 @@
 // so each reaches the same voxels.
 //
 // The includer must have included hash_lookup.glsl (for `BlockIndex`,
-// `vrFindBlockPtr` and grid_types.glsl's in-block index, vrLocalIndex and
-// vrLocalBase) first, and runs one workgroup per block. The hash table's
+// `vgridFindBlockPtr` and grid_types.glsl's in-block index, vgridLocalIndex and
+// vgridLocalBase) first, and runs one workgroup per block. The hash table's
 // shape arrives as arguments, since each includer has its own push constants.
 
-#ifndef VR_BLOCK_NEIGHBOURHOOD_GLSL
-#define VR_BLOCK_NEIGHBOURHOOD_GLSL
+#ifndef VGRID_BLOCK_NEIGHBOURHOOD_GLSL
+#define VGRID_BLOCK_NEIGHBOURHOOD_GLSL
 
-#ifndef VR_HASH_LOOKUP_GLSL
+#ifndef VGRID_HASH_LOOKUP_GLSL
 #error "include hash_lookup.glsl before block_neighbourhood.glsl"
 #endif
 
@@ -27,7 +27,7 @@
 shared int s_neighbour[8];
 
 // s_neighbour's index of octant @p o, each component 0 or 1.
-int vrOctantIndex(ivec3 o) {
+int vgridOctantIndex(ivec3 o) {
   return o.x + 2 * o.y + 4 * o.z;
 }
 
@@ -37,7 +37,7 @@ int vrOctantIndex(ivec3 o) {
 // already known, and only thread 0's @p self_ptr is read. A caller that reads
 // two octants probes two blocks, not seven. The caller must `barrier()`
 // before any cell reads it.
-void vrResolveOctants(ivec3 coord, int self_ptr, uint tid, uint octants,
+void vgridResolveOctants(ivec3 coord, int self_ptr, uint tid, uint octants,
                       int num_buckets, int bucket_size, int max_chain) {
   if (tid < 8u) {
     uint oi = tid;
@@ -48,12 +48,12 @@ void vrResolveOctants(ivec3 coord, int self_ptr, uint tid, uint octants,
     } else {
       ivec3 off = ivec3(int(oi & 1u), int((oi >> 1) & 1u), int((oi >> 2) & 1u));
       s_neighbour[oi] =
-          vrFindBlockPtr(coord + off, num_buckets, bucket_size, max_chain);
+          vgridFindBlockPtr(coord + off, num_buckets, bucket_size, max_chain);
     }
   }
 }
 
-// The whole neighbourhood: vrResolveOctants with every octant.
+// The whole neighbourhood: vgridResolveOctants with every octant.
 //
 // TODO(mesh): this prologue, not an occupancy change, is what the on-device
 // probe costs -- 8 lanes each walking a bucket while the rest wait at the
@@ -67,10 +67,10 @@ void vrResolveOctants(ivec3 coord, int self_ptr, uint tid, uint octants,
 // reduction -- not the cell or block count. Left unmeasured rather than guessed
 // at; the repo's own lesson is to profile the phase before optimising it. Note
 // that an early exit on the first free slot is NOT one of the levers: see the
-// primary-scan note on vrFindBlockPtr.
-void vrResolveNeighbourhood(ivec3 coord, int self_ptr, uint tid,
+// primary-scan note on vgridFindBlockPtr.
+void vgridResolveNeighbourhood(ivec3 coord, int self_ptr, uint tid,
                             int num_buckets, int bucket_size, int max_chain) {
-  vrResolveOctants(coord, self_ptr, tid, 0xFFu, num_buckets, bucket_size,
+  vgridResolveOctants(coord, self_ptr, tid, 0xFFu, num_buckets, bucket_size,
                    max_chain);
 }
 
@@ -92,16 +92,16 @@ void vrResolveNeighbourhood(ivec3 coord, int self_ptr, uint tid,
 // and the full gather cannot land on different voxels -- they must not, because
 // the count reserves the range the gather writes into -- and the codec
 // resolves corners exactly as the mesher does.
-bool vrCornerStorage(int bs, ivec3 c, out uint si) {
+bool vgridCornerStorage(int bs, ivec3 c, out uint si) {
   si = 0u;
   ivec3 octant = c / bs;
   ivec3 lc = c - octant * bs;
-  int nptr = s_neighbour[vrOctantIndex(octant)];
+  int nptr = s_neighbour[vgridOctantIndex(octant)];
   if (nptr < 0) {
     return false;
   }
-  si = uint(nptr) + uint(vrLocalIndex(lc, bs));
+  si = uint(nptr) + uint(vgridLocalIndex(lc, bs));
   return true;
 }
 
-#endif  // VR_BLOCK_NEIGHBOURHOOD_GLSL
+#endif  // VGRID_BLOCK_NEIGHBOURHOOD_GLSL

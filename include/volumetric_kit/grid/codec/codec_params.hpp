@@ -12,9 +12,9 @@
 #include <limits>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 
 /// The only block edge the codec transforms. Its zigzag order and cosine table
 /// are 8-specific, so a grid with another `block_size` is refused, never
@@ -108,7 +108,7 @@ enum class FrameType : std::uint8_t {
 /// settings. TODO(codec): tune per-basis tables at matched rates across room0,
 /// normalized Rafa2 and the analytic sphere before changing the defaults;
 /// the first band/radial candidates did not establish a consistent win.
-struct VR_CODEC_API CodecParams {
+struct VGRID_CODEC_API CodecParams {
   /// Coefficients kept per block, taken in 3-D zigzag order (lowest `x+y+z`
   /// first). In [1, @ref kVoxelsPerBlock]; @ref kVoxelsPerBlock keeps the
   /// whole transform. This cutoff is independent of the quantization table.
@@ -136,4 +136,4 @@ struct VR_CODEC_API CodecParams {
   core::Status validate() const;
 };
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

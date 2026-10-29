@@ -29,7 +29,7 @@ void main() {
   }
 
   int ptr = entries[gid].ptr;
-  if (vrEntryActive(ptr)) {
+  if (vgridEntryActive(ptr)) {
     uint index = atomicAdd(active_count, 1u);
     if (index < pc.arg) {
       active_blocks[index].coord = entries[gid].pos;

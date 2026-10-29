@@ -23,9 +23,6 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
-#include "grid_readback.hpp"
-#include "stage_rows.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -33,20 +30,23 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/sync.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/testing/stage_rows.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace vol = volumetric_kit::grid::volume;
+namespace mesh = volumetric_kit::grid::mesh;
 using C = vkc::Status::Code;
 
 namespace {
@@ -81,33 +81,33 @@ vkc::Result<vol::VoxelBlockGrid> sphere_grid(vkc::test::Gpu& gpu,
   for (int i = 0; i < blocks * blocks * blocks; ++i) {
     vol::BlockIndex b{};
     b.coord =
-        vr::Vec3i(i % blocks, (i / blocks) % blocks, i / (blocks * blocks));
+        vgrid::Vec3i(i % blocks, (i / blocks) % blocks, i / (blocks * blocks));
     coords.push_back(b);
   }
   if (coords.empty()) return grid;
   VKC_ASSIGN(const std::uint32_t failed,
-             vr_test::allocate_blocks(gpu, grid.map(), coords));
+             vgrid_test::allocate_blocks(gpu, grid.map(), coords));
   if (failed != 0) return vkc::Status::io_error("blocks left unallocated");
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
   VKC_ASSIGN(std::vector<float> tsdf,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vol::kTsdfAttribute));
+             vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                               vol::kTsdfAttribute));
   std::vector<float> weight(tsdf.size(), 0.0f);
   const float c = 0.5f * float(blocks * 8 - 1) * kH;
   for (const vol::BlockIndex& b : active) {
     for (int v = 0; v < 512; ++v) {
-      const vr::Vec3i voxel =
-          b.coord * 8 + vr::Vec3i(v % 8, (v / 8) % 8, v / 64);
-      const vr::Vec3f p = vr::Vec3f(voxel) * kH - vr::Vec3f(c, c, c);
-      tsdf[std::size_t(b.ptr) + v] = vr::length(p) - kRadius;
+      const vgrid::Vec3i voxel =
+          b.coord * 8 + vgrid::Vec3i(v % 8, (v / 8) % 8, v / 64);
+      const vgrid::Vec3f p = vgrid::Vec3f(voxel) * kH - vgrid::Vec3f(c, c, c);
+      tsdf[std::size_t(b.ptr) + v] = vgrid::length(p) - kRadius;
       weight[std::size_t(b.ptr) + v] = 1.0f;
     }
   }
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kTsdfAttribute, tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kWeightAttribute, weight));
+  VKC_TRY(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kTsdfAttribute, tsdf));
+  VKC_TRY(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kWeightAttribute, weight));
   return grid;
 }
 
@@ -118,7 +118,7 @@ std::vector<std::array<float, 9>> triangles(const mesh::Mesh& m) {
   for (std::size_t i = 0; i + 2 < m.indices.size(); i += 3) {
     std::array<float, 9> t{};
     for (std::size_t k = 0; k < 3; ++k) {
-      const vr::Vec3f p = m.vertices[m.indices[i + k]].position;
+      const vgrid::Vec3f p = m.vertices[m.indices[i + k]].position;
       t[3 * k] = p.x;
       t[3 * k + 1] = p.y;
       t[3 * k + 2] = p.z;
@@ -129,7 +129,7 @@ std::vector<std::array<float, 9>> triangles(const mesh::Mesh& m) {
   return out;
 }
 
-using vr_test::find_row;
+using vgrid_test::find_row;
 
 vkc::Result<mesh::MarchingCubes> make_mc(vkc::test::Gpu& gpu,
                                          bool share = false,
@@ -226,7 +226,7 @@ int refit_case(vkc::test::Gpu& gpu) {
   // The refit's row is a breakdown of the call's "marching cubes".
   CHECK(find_row(m, "  ..refit") != nullptr);
   CHECK(m.rows().front().name == std::string("marching cubes"));
-  CHECK(vr_test::breakdowns_nest(m));
+  CHECK(vgrid_test::breakdowns_nest(m));
   CHECK((*got)->ready.value > pending->signal.value);
   CHECK((*got)->ready.semaphore->value().value() >= (*got)->ready.value);
   CHECK((*got)->triangle_count == want->triangle_count);
@@ -488,8 +488,8 @@ int counters_case(vkc::test::Gpu& gpu) {
     // An unobserved block far from the sphere: the grid changes, its mesh
     // does not.
     vol::BlockIndex extra{};
-    extra.coord = vr::Vec3i(20 + frame, 0, 0);
-    CHECK(vr_test::allocate_blocks(gpu, grid->map(), {extra}).value() == 0);
+    extra.coord = vgrid::Vec3i(20 + frame, 0, 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, grid->map(), {extra}).value() == 0);
     CHECK(!grid->map().held_device_list().has_value());
     vkc::StageMetrics m;
     mesh::ExtractTimings t;
@@ -556,12 +556,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   if (move_case(gpu) != 0) return 1;
   if (counters_case(gpu) != 0) return 1;
   if (refusal_case(gpu) != 0) return 1;
-  std::printf("recon mesh recorded extract test passed\n");
+  std::printf("grid mesh recorded extract test passed\n");
   return 0;
 }
 
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

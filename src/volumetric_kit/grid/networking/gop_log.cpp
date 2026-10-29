@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <utility>
 
-namespace volumetric_kit::recon::networking::detail {
+namespace volumetric_kit::grid::networking::detail {
 
 GopLog::GopLog(std::uint64_t max_gop_bytes, bool replay) noexcept
     : max_gop_bytes_(max_gop_bytes), replay_(replay) {}
@@ -150,4 +150,4 @@ void GopLog::fall_back(Cursor* cursor) noexcept {
   ++key_wanted_;
 }
 
-}  // namespace volumetric_kit::recon::networking::detail
+}  // namespace volumetric_kit::grid::networking::detail

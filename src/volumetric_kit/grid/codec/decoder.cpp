@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -24,7 +24,7 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 namespace detail {
 
 // What finish needs of a recorded frame: the reference it becomes, its new
@@ -581,4 +581,4 @@ core::Status Decoder::rebuild(volume::VoxelBlockGrid& grid,
   return {};
 }
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

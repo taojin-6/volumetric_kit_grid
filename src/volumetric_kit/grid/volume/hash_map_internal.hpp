@@ -14,11 +14,11 @@
 /// (`grid_types.glsl`), never a slot.
 
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "table_sizes.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 class VoxelHashMap::Internal {
  public:
@@ -79,4 +79,4 @@ class VoxelHashMap::Internal {
   }
 };
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

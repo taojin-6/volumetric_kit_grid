@@ -24,7 +24,7 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
 
-namespace volumetric_kit::recon::networking::detail {
+namespace volumetric_kit::grid::networking::detail {
 
 // The longest a thread waits on a socket at a time, so it sees a stop within
 // it with no shutdown semantics that differ by OS.
@@ -125,4 +125,4 @@ struct Received {
 core::Result<Received> receive_some(std::string_view api, int fd,
                                     std::uint8_t* out, std::size_t size);
 
-}  // namespace volumetric_kit::recon::networking::detail
+}  // namespace volumetric_kit::grid::networking::detail

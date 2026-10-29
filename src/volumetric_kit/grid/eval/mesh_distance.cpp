@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/eval/mesh_distance.hpp"
+#include "volumetric_kit/grid/eval/mesh_distance.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +10,7 @@
 #include <thread>
 #include <utility>
 
-namespace volumetric_kit::recon::eval {
+namespace volumetric_kit::grid::eval {
 namespace {
 
 // Cells per reach: a cell is half the reach on a side, so anything within
@@ -405,4 +405,4 @@ core::Result<MeshComparison> ReferenceMesh::compare(
   return combine(std::move(acc), std::move(cov), options_);
 }
 
-}  // namespace volumetric_kit::recon::eval
+}  // namespace volumetric_kit::grid::eval

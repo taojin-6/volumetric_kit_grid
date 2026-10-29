@@ -32,22 +32,22 @@
 #include <vector>
 
 #include "codec_config.hpp"
-#include "codec_fixture.hpp"
 #include "codec_report.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace codec_stream = volumetric_kit::recon::codec_stream;
-namespace eval = volumetric_kit::recon::eval;
-namespace stream = volumetric_kit::recon::stream;
+namespace codec = volumetric_kit::grid::codec;
+namespace codec_stream = volumetric_kit::grid::codec_stream;
+namespace eval = volumetric_kit::grid::eval;
+namespace stream = volumetric_kit::grid::stream;
 namespace fs = std::filesystem;
 using namespace codec_fixture;
 
@@ -56,7 +56,7 @@ namespace {
 constexpr double kFps = 30.0;
 
 std::uint64_t pts(std::size_t frame) {
-  return vr_example::frame_pts_ns(frame, kFps);
+  return vgrid_example::frame_pts_ns(frame, kFps);
 }
 
 int row_times() {
@@ -72,36 +72,37 @@ int row_times() {
   vkc::StageMetrics decode;  // no timer ran
   decode.add_cpu("codec decode", 2.0);
   decode.add_cpu("  ..rans decode", 1.5);
-  const vr_example::CodecRow row = vr_example::make_codec_row(
+  const vgrid_example::CodecRow row = vgrid_example::make_codec_row(
       7, codec::FrameType::kInter, 4096, 12, encode, &decode);
   CHECK(row.frame == 7 && row.type == codec::FrameType::kInter);
   CHECK(row.bytes == 4096 && row.blocks == 12);
   CHECK(row.encode_ms == 3.0 && row.encode_device_ms == 1.0);
   CHECK(row.decode_ms == 2.0 && !row.decode_device_ms);
   // A frame not decoded has no decode columns.
-  const vr_example::CodecRow encoded = vr_example::make_codec_row(
+  const vgrid_example::CodecRow encoded = vgrid_example::make_codec_row(
       7, codec::FrameType::kInter, 4096, 12, encode, nullptr);
   CHECK(encoded.encode_ms == 3.0 && encoded.encode_device_ms == 1.0);
   CHECK(!encoded.decode_ms && !encoded.decode_device_ms);
   // The sweep's device columns count the same way.
-  CHECK(vr_example::device_ms(encode) == 1.0 && !vr_example::device_ms(decode));
+  CHECK(vgrid_example::device_ms(encode) == 1.0 &&
+        !vgrid_example::device_ms(decode));
   // A stage whose device work ran untimed leaves the column unset, as does
   // one the queue cannot time; an untimed breakdown under a timed stage
   // does not.
   vkc::StageMetrics partial = encode;
   partial.add_device("codec encode", vkc::DeviceTime::NotTimed);
-  CHECK(!vr_example::device_ms(partial));
+  CHECK(!vgrid_example::device_ms(partial));
   vkc::StageMetrics unavailable;
   unavailable.add_cpu("codec decode", 2.0);
   unavailable.add_device("codec decode", vkc::DeviceTime::Unavailable);
-  CHECK(!vr_example::device_ms(unavailable));
+  CHECK(!vgrid_example::device_ms(unavailable));
   vkc::StageMetrics beside = encode;  // a timed stage beside an untimed one
   beside.add_cpu("resize", 1.0);
   beside.add_device("resize", vkc::DeviceTime::NotTimed);
-  CHECK(!vr_example::device_ms(beside));
+  CHECK(!vgrid_example::device_ms(beside));
   vkc::StageMetrics deep = encode;
   deep.add_device("  ..observed", vkc::DeviceTime::NotTimed);
-  CHECK(vr_example::device_ms(deep) == 1.0);
+  CHECK(vgrid_example::device_ms(deep) == 1.0);
   return 0;
 }
 
@@ -110,14 +111,14 @@ int csv_lines() {
   // empty: a device column, or both decode columns of a frame not decoded.
   constexpr codec::FrameType I = codec::FrameType::kIntra;
   constexpr codec::FrameType P = codec::FrameType::kInter;
-  const vr_example::CodecRow rows[] = {
+  const vgrid_example::CodecRow rows[] = {
       {3, I, 1000, 10, 1.5, 0.5, 2.0, std::nullopt},
       {7, P, 3000, 30, 2.5, std::nullopt, 1.0, std::nullopt},
       {11, P, 2000, 20, 0.25, 0.75, 3.0, std::nullopt},
       {13, P, 500, 5, 0.5, 0.25, std::nullopt, std::nullopt}};
-  std::string text = vr_example::kCodecRowsCsvHeader;
-  for (const vr_example::CodecRow& row : rows) {
-    text += vr_example::codec_row_csv(row);
+  std::string text = vgrid_example::kCodecRowsCsvHeader;
+  for (const vgrid_example::CodecRow& row : rows) {
+    text += vgrid_example::codec_row_csv(row);
   }
   CHECK(text ==
         "frame,type,bytes,blocks,encode_host_ms,encode_device_ms,"
@@ -133,23 +134,23 @@ int type_sizes() {
   // Each type's frames apart: two I-frames, and between them P-frames of 200
   // down to 10 bytes, whose nearest-rank p50 and p95 are the 10th and 19th
   // smallest of 20.
-  std::vector<vr_example::CodecRow> rows(2);
+  std::vector<vgrid_example::CodecRow> rows(2);
   rows[0].bytes = 1000;
   rows[1].bytes = 3000;
   for (std::size_t i = 1; i <= 20; ++i) {
-    vr_example::CodecRow row;
+    vgrid_example::CodecRow row;
     row.type = codec::FrameType::kInter;
     row.bytes = 10 * i;
     rows.insert(rows.begin() + 1, row);
   }
-  const auto intra = vr_example::frame_sizes(rows, codec::FrameType::kIntra);
+  const auto intra = vgrid_example::frame_sizes(rows, codec::FrameType::kIntra);
   CHECK(intra.count == 2 && intra.mean == 2000.0 && intra.p50 == 1000);
   CHECK(intra.p95 == 3000 && intra.max == 3000);
-  const auto inter = vr_example::frame_sizes(rows, codec::FrameType::kInter);
+  const auto inter = vgrid_example::frame_sizes(rows, codec::FrameType::kInter);
   CHECK(inter.count == 20 && inter.mean == 105.0 && inter.p50 == 100);
   CHECK(inter.p95 == 190 && inter.max == 200);
   rows.resize(1);
-  const auto none = vr_example::frame_sizes(rows, codec::FrameType::kInter);
+  const auto none = vgrid_example::frame_sizes(rows, codec::FrameType::kInter);
   CHECK(none.count == 0 && none.mean == 0.0 && none.max == 0);
   return 0;
 }
@@ -157,23 +158,23 @@ int type_sizes() {
 int gop_rates() {
   // An I-frame of 1000 bytes and P-frames of 100: a GOP of 4 holds one
   // I-frame and three P-frames, 325 bytes a frame; a GOP of 1 the I-frame.
-  vr_example::FrameSizes intra;
+  vgrid_example::FrameSizes intra;
   intra.mean = 1000.0;
-  vr_example::FrameSizes inter;
+  vgrid_example::FrameSizes inter;
   inter.mean = 100.0;
-  CHECK(vr_example::gop_bytes(intra, inter, 4) == 325.0);
-  CHECK(vr_example::gop_bytes(intra, inter, 1) == 1000.0);
-  CHECK(vr_example::mbit_per_s(325.0, 30.0) == 0.078);
+  CHECK(vgrid_example::gop_bytes(intra, inter, 4) == 325.0);
+  CHECK(vgrid_example::gop_bytes(intra, inter, 1) == 1000.0);
+  CHECK(vgrid_example::mbit_per_s(325.0, 30.0) == 0.078);
   return 0;
 }
 
 int frame_times() {
   // From frame 0 at 0, to the nearest ns.
-  CHECK(vr_example::frame_pts_ns(0, 30.0) == 0);
-  CHECK(vr_example::frame_pts_ns(1, 30.0) == 33'333'333);
-  CHECK(vr_example::frame_pts_ns(2, 30.0) == 66'666'667);
-  CHECK(vr_example::frame_pts_ns(3, 30.0) == 100'000'000);
-  CHECK(vr_example::frame_pts_ns(400, 30.0) == 13'333'333'333);
+  CHECK(vgrid_example::frame_pts_ns(0, 30.0) == 0);
+  CHECK(vgrid_example::frame_pts_ns(1, 30.0) == 33'333'333);
+  CHECK(vgrid_example::frame_pts_ns(2, 30.0) == 66'666'667);
+  CHECK(vgrid_example::frame_pts_ns(3, 30.0) == 100'000'000);
+  CHECK(vgrid_example::frame_pts_ns(400, 30.0) == 13'333'333'333);
   return 0;
 }
 
@@ -181,11 +182,11 @@ int compare_options() {
   // The band's width of reach, 2 cm at least; 1 vertex in 4; F at half a
   // voxel.
   const eval::CompareOptions wide =
-      vr_example::codec_compare_options(0.01f, 0.04f);
+      vgrid_example::codec_compare_options(0.01f, 0.04f);
   CHECK(wide.reach == 0.04f && wide.stride == 4 &&
         wide.fscore_threshold == 0.005f);
   const eval::CompareOptions narrow =
-      vr_example::codec_compare_options(0.002f, 0.008f);
+      vgrid_example::codec_compare_options(0.002f, 0.008f);
   CHECK(narrow.reach == 0.02f && narrow.fscore_threshold == 0.001f);
   return 0;
 }
@@ -194,7 +195,7 @@ int compare_options() {
 // output that does not exist, is taken; a link to the stream or the CSV is
 // refused, naming both; and a path that cannot be looked up is refused.
 int apart() {
-  vkc::test::Scratch scratch("recon_example_codec_report_apart_");
+  vkc::test::Scratch scratch("grid_example_codec_report_apart_");
   const std::string stream_path = (scratch.path / "frames.vrst").string();
   const std::string csv_path = (scratch.path / "rows.csv").string();
   const std::vector<std::string> outputs = {stream_path, csv_path};
@@ -203,26 +204,27 @@ int apart() {
        {fs::path(stream_path), fs::path(csv_path), other}) {
     std::ofstream(file) << "x";
   }
-  CHECK(vr_example::check_apart((scratch.path / "rig.ply").string(), outputs)
+  CHECK(vgrid_example::check_apart((scratch.path / "rig.ply").string(), outputs)
             .ok());
-  CHECK(vr_example::check_apart(other.string(), outputs).ok());
-  CHECK(vr_example::check_apart(other.string(), {}).ok());
-  CHECK(vr_example::check_apart(other.string(), {"", ""}).ok());
+  CHECK(vgrid_example::check_apart(other.string(), outputs).ok());
+  CHECK(vgrid_example::check_apart(other.string(), {}).ok());
+  CHECK(vgrid_example::check_apart(other.string(), {"", ""}).ok());
   for (const std::string& target : outputs) {
     const fs::path link =
         scratch.path / (fs::path(target).filename().string() + ".ply");
     fs::create_symlink(target, link);
-    const vkc::Status refused = vr_example::check_apart(link.string(), outputs);
+    const vkc::Status refused =
+        vgrid_example::check_apart(link.string(), outputs);
     CHECK(refused.domain() == vkc::Status::Code::InvalidArgument);
     CHECK(refused.message().find(link.string()) != std::string::npos &&
           refused.message().find(target) != std::string::npos);
   }
-  CHECK(vr_example::check_apart(other.string(),
-                                {(scratch.path / "missing.vrst").string()})
+  CHECK(vgrid_example::check_apart(other.string(),
+                                   {(scratch.path / "missing.vrst").string()})
             .ok());
   // A name past every file system's limit cannot be looked up.
   const fs::path unknowable = scratch.path / std::string(300, 'x');
-  CHECK(vr_example::check_apart(unknowable.string(), outputs).domain() ==
+  CHECK(vgrid_example::check_apart(unknowable.string(), outputs).domain() ==
         vkc::Status::Code::IoError);
   return 0;
 }
@@ -235,7 +237,7 @@ std::vector<std::string> lines_of(const std::string& path) {
 }
 
 stream::Session session() {
-  return vr_example::codec_session("example_codec_report", {30, 1});
+  return vgrid_example::codec_session("example_codec_report", {30, 1});
 }
 
 // A CSV refused once the stream is made fails the report's create, naming
@@ -250,8 +252,8 @@ int csv_refused(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
         codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                           session(), outputs);
     CHECK(made.ok() && fs::exists(outputs.stream));
-    const vkc::Result<vr_example::CodecReport> report =
-        vr_example::CodecReport::create(csv, outputs.stream, true, 1);
+    const vkc::Result<vgrid_example::CodecReport> report =
+        vgrid_example::CodecReport::create(csv, outputs.stream, true, 1);
     CHECK(!report.ok() &&
           report.status().domain() == vkc::Status::Code::IoError &&
           report.status().message().find(csv) != std::string::npos);
@@ -292,9 +294,9 @@ int aliased_outputs(vkc::test::GpuContext& gpu,
           codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                             session(), outputs);
       CHECK(made.ok());
-      const vkc::Result<vr_example::CodecReport> report =
-          vr_example::CodecReport::create(csv_path.string(), outputs.stream,
-                                          false, 1);
+      const vkc::Result<vgrid_example::CodecReport> report =
+          vgrid_example::CodecReport::create(csv_path.string(), outputs.stream,
+                                             false, 1);
       CHECK(!report.ok());
       CHECK(report.status().domain() == vkc::Status::Code::InvalidArgument);
       CHECK(report.status().message().find(csv_path.string()) !=
@@ -312,11 +314,11 @@ int aliased_outputs(vkc::test::GpuContext& gpu,
       codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                         session(), outputs);
   CHECK(made.ok());
-  const vkc::Result<vr_example::CodecReport> report =
-      vr_example::CodecReport::create(separate, outputs.stream, false, 1);
+  const vkc::Result<vgrid_example::CodecReport> report =
+      vgrid_example::CodecReport::create(separate, outputs.stream, false, 1);
   CHECK(report.ok() && made->finish().ok());
   const vkc::Result<std::string> csv = vkc::read_file(separate);
-  CHECK(csv.ok() && *csv == vr_example::kCodecRowsCsvHeader);
+  CHECK(csv.ok() && *csv == vgrid_example::kCodecRowsCsvHeader);
   CHECK(stream::StreamReader::open(outputs.stream).ok());
   return 0;
 }
@@ -342,13 +344,13 @@ int rows_and_stages(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
       codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
                                         session(), outputs);
   CHECK(made.ok());
-  vkc::Result<vr_example::CodecReport> listed =
-      vr_example::CodecReport::create(csv, outputs.stream, true, 4);
+  vkc::Result<vgrid_example::CodecReport> listed =
+      vgrid_example::CodecReport::create(csv, outputs.stream, true, 4);
   CHECK(listed.ok());
-  vr_example::CodecReport& report = listed.value();
+  vgrid_example::CodecReport& report = listed.value();
   const std::vector<std::string> started = lines_of(csv);
   CHECK(started.size() == 1 &&
-        started[0] + "\n" == vr_example::kCodecRowsCsvHeader);
+        started[0] + "\n" == vgrid_example::kCodecRowsCsvHeader);
   const codec::FrameType types[] = {I, P, P, I, I, I, P, P, P, I};
   std::vector<codec_stream::SentFrame> sent;
   for (std::size_t frame = 0; frame < std::size(types); ++frame) {
@@ -363,7 +365,7 @@ int rows_and_stages(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   }
   CHECK(made->finish().ok());
   const std::size_t decoded[] = {0, 1, 2, 5, 6, 7, 8, 9};
-  const std::vector<vr_example::CodecRow>& rows = report.rows();
+  const std::vector<vgrid_example::CodecRow>& rows = report.rows();
   const std::vector<std::string> lines = lines_of(csv);
   CHECK(rows.size() == std::size(decoded) && lines.size() == rows.size() + 1);
   for (std::size_t i = 0; i < rows.size(); ++i) {
@@ -371,7 +373,7 @@ int rows_and_stages(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     CHECK(rows[i].bytes == sent[i].bytes && rows[i].blocks == sent[i].blocks);
     CHECK(rows[i].encode_ms > 0.0 && rows[i].decode_ms &&
           *rows[i].decode_ms > 0.0);
-    CHECK(lines[i + 1] + "\n" == vr_example::codec_row_csv(rows[i]));
+    CHECK(lines[i + 1] + "\n" == vgrid_example::codec_row_csv(rows[i]));
   }
   const auto near = [](double a, double b) {
     return std::fabs(a - b) <= 1e-9 * std::fabs(b);
@@ -382,7 +384,7 @@ int rows_and_stages(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   for (const codec::FrameType type : {I, P}) {
     double encode = 0.0;
     double decode = 0.0;
-    for (const vr_example::CodecRow& row : rows) {
+    for (const vgrid_example::CodecRow& row : rows) {
       if (row.type != type) continue;
       encode += row.encode_ms;
       decode += row.decode_ms.value_or(0.0);
@@ -405,10 +407,10 @@ int csv_fails(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   vkc::Result<codec_stream::CodecStream> made =
       codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                         session());
-  vkc::Result<vr_example::CodecReport> listed =
-      vr_example::CodecReport::create(csv, "", true, 1);
+  vkc::Result<vgrid_example::CodecReport> listed =
+      vgrid_example::CodecReport::create(csv, "", true, 1);
   CHECK(made.ok() && listed.ok());
-  vr_example::CodecReport& report = listed.value();
+  vgrid_example::CodecReport& report = listed.value();
   vkc::Result<codec_stream::SentFrame> first = made->code(source, 0, pts(0));
   CHECK(first.ok() && report.add(0, *first).ok());
   const std::uintmax_t size = fs::file_size(csv);
@@ -456,24 +458,24 @@ int decode_off(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   vkc::Result<codec_stream::CodecStream> made =
       codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
                                         session(), outputs);
-  vkc::Result<vr_example::CodecReport> listed =
-      vr_example::CodecReport::create(csv, "", false, 3);
+  vkc::Result<vgrid_example::CodecReport> listed =
+      vgrid_example::CodecReport::create(csv, "", false, 3);
   CHECK(made.ok() && listed.ok());
-  vr_example::CodecReport& report = listed.value();
+  vgrid_example::CodecReport& report = listed.value();
   for (std::size_t frame = 0; frame < std::size(types); ++frame) {
     vkc::Result<codec_stream::SentFrame> s =
         made->code(source, frame, pts(frame));
     CHECK(s.ok() && report.add(frame, *s).ok());
   }
   CHECK(made->finish().ok());
-  const std::vector<vr_example::CodecRow>& rows = report.rows();
+  const std::vector<vgrid_example::CodecRow>& rows = report.rows();
   const std::vector<std::string> lines = lines_of(csv);
   CHECK(rows.size() == std::size(types) && lines.size() == rows.size() + 1);
   for (std::size_t i = 0; i < rows.size(); ++i) {
     CHECK(rows[i].frame == i && rows[i].type == types[i]);
     CHECK(rows[i].bytes > 0 && rows[i].encode_ms > 0.0);
     CHECK(!rows[i].decode_ms && !rows[i].decode_device_ms);
-    CHECK(lines[i + 1] + "\n" == vr_example::codec_row_csv(rows[i]));
+    CHECK(lines[i + 1] + "\n" == vgrid_example::codec_row_csv(rows[i]));
   }
   for (const codec::FrameType type : {I, P}) {
     CHECK(!report.encode_stages(type).rows().empty());
@@ -484,7 +486,7 @@ int decode_off(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 }
 
 int gpu_main(vkc::test::GpuContext& gpu) {
-  const Sphere sphere{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  const Sphere sphere{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> source = sphere_grid(gpu, sphere);
   CHECK(source.ok());
   GridShape coarser;
@@ -492,7 +494,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<vol::VoxelBlockGrid> other = sphere_grid(gpu, sphere, coarser);
   CHECK(other.ok());
 
-  vkc::test::Scratch scratch("recon_example_codec_report_");
+  vkc::test::Scratch scratch("grid_example_codec_report_");
   CHECK(csv_refused(gpu, scratch) == 0);
   CHECK(aliased_outputs(gpu, scratch) == 0);
   CHECK(rows_and_stages(gpu, *source, *other, scratch) == 0);
@@ -512,5 +514,5 @@ int main() {
   CHECK(frame_times() == 0);
   CHECK(compare_options() == 0);
   CHECK(apart() == 0);
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

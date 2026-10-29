@@ -17,7 +17,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "deblock_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/block_neighbourhood.glsl"
+#include "volumetric_kit/grid/volume/shaders/block_neighbourhood.glsl"
 
 layout(local_size_x = kLanes) in;
 
@@ -36,16 +36,16 @@ void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup: a masked B fits no face.
-  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
+  if (entry >= pc.num_blocks || !vgridEntryFull(entry)) {
     return;
   }
   ivec3 coord = blocks[entry].coord;
   uint next = 1u << pc.axis;  // N's octant
   // Lane 0 finds B while lane `next` finds N.
-  int self_ptr = lane == 0u ? vrFindBlockPtr(coord, pc.num_buckets,
+  int self_ptr = lane == 0u ? vgridFindBlockPtr(coord, pc.num_buckets,
                                              pc.bucket_size, pc.max_chain)
                             : -1;
-  vrResolveOctants(coord, self_ptr, lane, 1u | (1u << next), pc.num_buckets,
+  vgridResolveOctants(coord, self_ptr, lane, 1u | (1u << next), pc.num_buckets,
                    pc.bucket_size, pc.max_chain);
   if (lane == 0u) {
     s_wrote_self = 0u;
@@ -54,7 +54,7 @@ void main() {
   barrier();
   // Uniform: shared values and flags no dispatch of this pass writes.
   if (s_neighbour[0] < 0 || s_neighbour[next] < 0 ||
-      !vrFull(s_neighbour[next])) {
+      !vgridFull(s_neighbour[next])) {
     return;
   }
 
@@ -65,10 +65,10 @@ void main() {
   float p[3], q[3];
   bool saturated = false;
   for (int i = 0; i < 3; ++i) {
-    vrCornerStorage(int(kEdge), line_voxel(int(kEdge) - 1 - i, u, w), ps[i]);
-    vrCornerStorage(int(kEdge), line_voxel(int(kEdge) + i, u, w), qs[i]);
-    p[i] = vrNormalized(tsdf[ps[i]]);
-    q[i] = vrNormalized(tsdf[qs[i]]);
+    vgridCornerStorage(int(kEdge), line_voxel(int(kEdge) - 1 - i, u, w), ps[i]);
+    vgridCornerStorage(int(kEdge), line_voxel(int(kEdge) + i, u, w), qs[i]);
+    p[i] = vgridNormalized(tsdf[ps[i]]);
+    q[i] = vgridNormalized(tsdf[qs[i]]);
     saturated =
         saturated || abs(p[i]) >= pc.saturated || abs(q[i]) >= pc.saturated;
   }
@@ -105,7 +105,7 @@ void main() {
   }
   barrier();
   if (lane == 0u) {
-    if (s_wrote_self != 0u) vrStampChanged(s_neighbour[0]);
-    if (s_wrote_next != 0u) vrStampChanged(s_neighbour[next]);
+    if (s_wrote_self != 0u) vgridStampChanged(s_neighbour[0]);
+    if (s_wrote_next != 0u) vgridStampChanged(s_neighbour[next]);
   }
 }

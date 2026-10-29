@@ -11,11 +11,11 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/io/mesh_io_assimp_export.hpp"
-#include "volumetric_kit/recon/io/triangle_mesh.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_io_assimp_export.hpp"
+#include "volumetric_kit/grid/mesh_io/triangle_mesh.hpp"
 
-namespace volumetric_kit::recon::io {
+namespace volumetric_kit::grid::mesh_io {
 
 /// @brief Triangle geometry with one texture coordinate per vertex, split at
 ///        UV seams.
@@ -50,7 +50,7 @@ struct TexturedMesh {
 ///         InvalidArgument for a nonfinite coordinate, and Unsupported when
 ///         meshes name different diffuse maps, the map is embedded in the
 ///         asset, or material libraries lie in more than one directory.
-VR_MESH_IO_ASSIMP_API core::Result<TexturedMesh> load_textured_mesh(
+VGRID_MESH_IO_ASSIMP_API core::Result<TexturedMesh> load_textured_mesh(
     const std::string& path);
 
-}  // namespace volumetric_kit::recon::io
+}  // namespace volumetric_kit::grid::mesh_io

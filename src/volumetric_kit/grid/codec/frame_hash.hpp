@@ -16,21 +16,21 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "volumetric_kit/recon/codec/export.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// @return XXH64, seed 0, of the @p size bytes at @p data (which may be null
 ///         when @p size is 0).
-VR_CODEC_API std::uint64_t frame_hash(const std::uint8_t* data,
-                                      std::size_t size);
+VGRID_CODEC_API std::uint64_t frame_hash(const std::uint8_t* data,
+                                         std::size_t size);
 
 /// @return @ref frame_hash of @p head then @p payload back to back, without
 ///         joining them: the encoder's frame, whose payload stays in its
 ///         slot. Either may be null at size 0.
-VR_CODEC_API std::uint64_t frame_hash(const std::uint8_t* head,
-                                      std::size_t head_size,
-                                      const std::uint8_t* payload,
-                                      std::size_t payload_size);
+VGRID_CODEC_API std::uint64_t frame_hash(const std::uint8_t* head,
+                                         std::size_t head_size,
+                                         const std::uint8_t* payload,
+                                         std::size_t payload_size);
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

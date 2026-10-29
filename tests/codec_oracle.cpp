@@ -11,7 +11,7 @@
 
 namespace codec_oracle {
 
-using vr::Vec3i;
+using vgrid::Vec3i;
 
 // The kernels' own models and block grammar, compiled here as C++ once these
 // four names are defined: in a namespace of their own, so a model function
@@ -41,9 +41,9 @@ struct BlockWriter {
   void sink_bits(uint value, uint bits) { sink.bits(value, bits); }
   int coefficient(uint j) const { return coefficients[j]; }
 
-#define VR_FRAME_WRITER
+#define VGRID_FRAME_WRITER
 #include "shaders/frame_grammar.glsl"
-#undef VR_FRAME_WRITER
+#undef VGRID_FRAME_WRITER
 };
 
 struct CountSink {
@@ -93,9 +93,9 @@ struct BlockReader {
     coefficients[j] = static_cast<std::int16_t>(value);
   }
 
-#define VR_FRAME_READER
+#define VGRID_FRAME_READER
 #include "shaders/frame_grammar.glsl"
-#undef VR_FRAME_READER
+#undef VGRID_FRAME_READER
 };
 
 }  // namespace glsl

@@ -4,8 +4,8 @@
 // Every rANS kernel's push constants. Mirrors `RansPush` in
 // rans_dispatch.hpp.
 
-#ifndef VR_RANS_PUSH_GLSL
-#define VR_RANS_PUSH_GLSL
+#ifndef VGRID_RANS_PUSH_GLSL
+#define VGRID_RANS_PUSH_GLSL
 
 layout(push_constant, std430) uniform Push {
   uint item_base;  // first entry or segment this dispatch covers
@@ -36,4 +36,4 @@ uint counted_entries(uint surplus, uint blocks) {
   return pc.reference_count + found - min(surplus, found);
 }
 
-#endif  // VR_RANS_PUSH_GLSL
+#endif  // VGRID_RANS_PUSH_GLSL

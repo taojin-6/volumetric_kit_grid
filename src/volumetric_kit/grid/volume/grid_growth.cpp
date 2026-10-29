@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/volume/grid_growth.hpp"
+#include "volumetric_kit/grid/volume/grid_growth.hpp"
 
 #include <algorithm>
 #include <new>
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 core::Status grow_grid(VoxelBlockGrid& grid, std::int32_t at_least,
                        core::StageMetrics* metrics) try {
@@ -28,4 +28,4 @@ core::Status grow_grid(VoxelBlockGrid& grid, std::int32_t at_least,
   return core::Status::out_of_memory("grow_grid: host allocation failed");
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

@@ -21,7 +21,6 @@
 #include <tuple>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
@@ -29,16 +28,17 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -71,7 +71,7 @@ vkc::Result<std::map<Coord, std::uint32_t>> slots(vol::VoxelBlockGrid& g) {
 
 vol::BlockIndex at(int x) {
   vol::BlockIndex b{};
-  b.coord = vr::Vec3i(x, 0, 0);
+  b.coord = vgrid::Vec3i(x, 0, 0);
   return b;
 }
 
@@ -112,7 +112,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // Tick 1: three blocks, requested now and never weighted.
   const vol::BlockIndex three[] = {at(0), at(1), at(2)};
-  CHECK(vr_test::allocate_blocks(gpu, map, three, 3).ok());
+  CHECK(vgrid_test::allocate_blocks(gpu, map, three, 3).ok());
   auto slot = slots(grid);
   CHECK(slot.ok() && slot.value().size() == 3);
   const std::uint32_t a = slot.value()[Coord{0, 0, 0}];
@@ -129,10 +129,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // the pass. At tick 3 the pass stamps the first, and asking for the third
   // again restamps that one.
   {
-    auto w =
-        vr_test::read_attribute<float>(dev, alloc, grid, vol::kWeightAttribute);
-    auto t =
-        vr_test::read_attribute<float>(dev, alloc, grid, vol::kTsdfAttribute);
+    auto w = vgrid_test::read_attribute<float>(dev, alloc, grid,
+                                               vol::kWeightAttribute);
+    auto t = vgrid_test::read_attribute<float>(dev, alloc, grid,
+                                               vol::kTsdfAttribute);
     CHECK(w.ok() && t.ok());
     w.value()[std::size_t{a} * 512 + 7] = 1.0f;
     w.value()[std::size_t{b} * 512 + 7] = 0.5f * vol::kObservedWeight;
@@ -140,11 +140,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     for (std::size_t k = 0; k < 512; ++k) {
       t.value()[std::size_t{b} * 512 + k] = 0.5f;
     }
-    CHECK(vr_test::write_attribute(dev, alloc, grid, vol::kWeightAttribute,
-                                   w.value())
+    CHECK(vgrid_test::write_attribute(dev, alloc, grid, vol::kWeightAttribute,
+                                      w.value())
               .ok());
-    CHECK(vr_test::write_attribute(dev, alloc, grid, vol::kTsdfAttribute,
-                                   t.value())
+    CHECK(vgrid_test::write_attribute(dev, alloc, grid, vol::kTsdfAttribute,
+                                      t.value())
               .ok());
   }
   map.advance_tick();
@@ -152,7 +152,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // The block pass, freeing nothing at this age.
   auto kept = grid.free_stale_blocks(1000);
   CHECK(kept.ok() && kept.value() == 0);
-  CHECK(vr_test::allocate_blocks(gpu, map, &three[2], 1).ok());
+  CHECK(vgrid_test::allocate_blocks(gpu, map, &three[2], 1).ok());
   st = map.read_block_stamps();
   CHECK(st.ok());
   CHECK(st.value()[a].requested == 1 && st.value()[a].weighted == 3);
@@ -217,10 +217,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(st.value()[a].weighted == 4);
   // Its voxels are zeroed, every attribute, and the kept block's stay.
   {
-    auto w =
-        vr_test::read_attribute<float>(dev, alloc, grid, vol::kWeightAttribute);
-    auto t =
-        vr_test::read_attribute<float>(dev, alloc, grid, vol::kTsdfAttribute);
+    auto w = vgrid_test::read_attribute<float>(dev, alloc, grid,
+                                               vol::kWeightAttribute);
+    auto t = vgrid_test::read_attribute<float>(dev, alloc, grid,
+                                               vol::kTsdfAttribute);
     CHECK(w.ok() && t.ok());
     for (std::size_t k = 0; k < 512; ++k) {
       CHECK(w.value()[std::size_t{b} * 512 + k] == 0.0f &&
@@ -246,7 +246,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   map.advance_tick();  // 5
   auto before = slots(grid);
   CHECK(before.ok());
-  const vr::Vec3f tri[] = {
+  const vgrid::Vec3f tri[] = {
       {-1.0f, 1.0f, 0.0f}, {-0.9f, 1.0f, 0.0f}, {-1.0f, 1.1f, 0.0f}};
   const std::uint32_t idx[] = {0, 1, 2};
   CHECK(map.allocate_from_triangles(tri, 3, idx, 1).ok());
@@ -262,8 +262,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   cam.min_depth = 0.1f;
   cam.max_depth = 5.0f;
   cam.width = cam.height = 16;
-  cam.cam_to_world = vr::Mat4f(1.0f);
-  cam.cam_to_world[3] = vr::Vec4f(0.0f, -1.0f, 0.0f, 1.0f);
+  cam.cam_to_world = vgrid::Mat4f(1.0f);
+  cam.cam_to_world[3] = vgrid::Vec4f(0.0f, -1.0f, 0.0f, 1.0f);
   const std::vector<float> depth(16 * 16, 0.5f);
   CHECK(map.allocate_from_depth(depth.data(), cam).ok());
   stamped = new_blocks_requested_now(grid, before.value());
@@ -296,12 +296,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // list must delete only its live prefix, without stale entries from the
   // longer previous pass or a host coordinate copy. At 16 blocks a dispatch,
   // the 120-block passes split as a list past the device's limit does.
-  vr::detail::set_test_groups_per_dispatch(16);
+  vgrid::detail::set_test_groups_per_dispatch(16);
   for (const int count : {7, 120, 3}) {
     std::vector<vol::BlockIndex> coords;
     for (int i = 0; i < count; ++i) coords.push_back(at(1000 + i));
-    auto placed = vr_test::allocate_blocks(gpu, map, coords.data(),
-                                           static_cast<std::uint32_t>(count));
+    auto placed = vgrid_test::allocate_blocks(
+        gpu, map, coords.data(), static_cast<std::uint32_t>(count));
     CHECK(placed.ok() && placed.value() == 0);
     map.advance_tick();
     map.advance_tick();
@@ -312,7 +312,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     auto again = grid.free_stale_blocks(1);
     CHECK(again.ok() && again.value() == 0);
   }
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
 
   // A completed recording may still be unsettled when the blocking free
   // pass starts. Count only this pass's removals: an earlier removal must not
@@ -321,12 +321,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     auto g = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
     CHECK(g.ok());
     const vol::BlockIndex block = at(1900);
-    auto list = vr_test::detail::device_coords(gpu, &block, 1);
+    auto list = vgrid_test::detail::device_coords(gpu, &block, 1);
     const std::uint32_t one = 1;
     auto count = vkc::test::upload_device_buffer(dev, alloc, &one, sizeof(one));
     CHECK(list.ok() && count.ok());
     if (removes) {
-      CHECK(vr_test::allocate_blocks(gpu, g->map(), &block, 1).value() == 0);
+      CHECK(vgrid_test::allocate_blocks(gpu, g->map(), &block, 1).value() == 0);
     }
     vkc::CommandBatch batch(dev, alloc);
     const vol::DeviceCount n{&*count, 0, one};
@@ -358,24 +358,23 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> coords;
     for (int i = 0; i < 40; ++i) coords.push_back(at(2000 + i));
     for (vol::VoxelBlockGrid* g : {&a.value(), &b.value()}) {
-      CHECK(
-          vr_test::allocate_blocks(gpu, g->map(), coords.data(), 40).value() ==
-          0);
-      auto t =
-          vr_test::read_attribute<float>(dev, alloc, *g, vol::kTsdfAttribute);
-      auto w =
-          vr_test::read_attribute<float>(dev, alloc, *g, vol::kWeightAttribute);
+      CHECK(vgrid_test::allocate_blocks(gpu, g->map(), coords.data(), 40)
+                .value() == 0);
+      auto t = vgrid_test::read_attribute<float>(dev, alloc, *g,
+                                                 vol::kTsdfAttribute);
+      auto w = vgrid_test::read_attribute<float>(dev, alloc, *g,
+                                                 vol::kWeightAttribute);
       auto at_slot = slots(*g);
       CHECK(t.ok() && w.ok() && at_slot.ok());
       for (float& v : t.value()) v = 1.0f;
       for (const auto& [coord, s] : at_slot.value()) {
         if (std::get<0>(coord) < 2010) w.value()[std::size_t{s} * 512] = 1.0f;
       }
-      CHECK(vr_test::write_attribute(dev, alloc, *g, vol::kTsdfAttribute,
-                                     t.value())
+      CHECK(vgrid_test::write_attribute(dev, alloc, *g, vol::kTsdfAttribute,
+                                        t.value())
                 .ok());
-      CHECK(vr_test::write_attribute(dev, alloc, *g, vol::kWeightAttribute,
-                                     w.value())
+      CHECK(vgrid_test::write_attribute(dev, alloc, *g, vol::kWeightAttribute,
+                                        w.value())
                 .ok());
       g->map().advance_tick();
       g->map().advance_tick();
@@ -385,7 +384,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
     std::vector<vol::BlockIndex> fresh;
     for (int i = 0; i < 30; ++i) fresh.push_back(at(3000 + i));
-    auto fresh_list = vr_test::detail::device_coords(gpu, fresh.data(), 30);
+    auto fresh_list = vgrid_test::detail::device_coords(gpu, fresh.data(), 30);
     const std::uint32_t thirty = 30;
     auto count =
         vkc::test::upload_device_buffer(dev, alloc, &thirty, sizeof(thirty));
@@ -405,7 +404,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     auto kept_b = slots(*b);
     CHECK(kept_a.ok() && kept_b.ok() && kept_a->size() == 10);
     auto t =
-        vr_test::read_attribute<float>(dev, alloc, *b, vol::kTsdfAttribute);
+        vgrid_test::read_attribute<float>(dev, alloc, *b, vol::kTsdfAttribute);
     CHECK(t.ok());
     for (const auto& [coord, s] : kept_a.value()) {
       CHECK(kept_b->count(coord) == 1);
@@ -440,7 +439,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(g.ok());
     std::vector<vol::BlockIndex> eight;
     for (int i = 0; i < 8; ++i) eight.push_back(at(i));
-    CHECK(vr_test::allocate_blocks(gpu, g->map(), eight.data(), 8).value() ==
+    CHECK(vgrid_test::allocate_blocks(gpu, g->map(), eight.data(), 8).value() ==
           0);
     g->map().advance_tick();
     g->map().advance_tick();
@@ -463,7 +462,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   const vol::AttributeSpec no_weight[] = {{vol::kTsdfAttribute, sizeof(float)}};
   auto bare = vol::VoxelBlockGrid::create(dev, alloc, params(), no_weight, 1);
   CHECK(bare.ok());
-  CHECK(vr_test::allocate_blocks(gpu, bare->map(), three, 1).ok());
+  CHECK(vgrid_test::allocate_blocks(gpu, bare->map(), three, 1).ok());
   CHECK(bare->free_stale_blocks(1).status().domain() ==
         vkc::Status::Code::InvalidArgument);
   {
@@ -482,5 +481,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

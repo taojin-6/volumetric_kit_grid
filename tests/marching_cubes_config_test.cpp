@@ -4,7 +4,7 @@
 // GPU test for MarchingCubesConfig -- the usage bits a *consumer* of the mesh
 // declares, OR-ed onto STORAGE_BUFFER for the vertex arena and the index run.
 //
-// The feature has no in-tree consumer (recon itself only ever needs storage),
+// The feature has no in-tree consumer (grid itself only ever needs storage),
 // so without this test the one behavioural line -- `desc.usage | extra_usage`
 // -- would never execute with a non-zero value in any CI leg, and dropping
 // `config_` from the grow path would pass the whole suite. What makes the
@@ -37,21 +37,21 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-#include "device_blocks.hpp"
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace vol = volumetric_kit::grid::volume;
+namespace mesh = volumetric_kit::grid::mesh;
 
 namespace {
 
@@ -86,13 +86,13 @@ bool fill_sphere(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& g,
     for (int cy = 0; cy < blocks; ++cy) {
       for (int cx = 0; cx < blocks; ++cx) {
         vol::BlockIndex b{};
-        b.coord = vr::Vec3i(cx, cy, cz);
+        b.coord = vgrid::Vec3i(cx, cy, cz);
         coords.push_back(b);
       }
     }
   }
   vkc::Result<std::uint32_t> failed =
-      vr_test::allocate_blocks(gpu, g.map(), coords);
+      vgrid_test::allocate_blocks(gpu, g.map(), coords);
   if (!failed || failed.value() != 0) {
     return false;
   }
@@ -102,9 +102,9 @@ bool fill_sphere(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& g,
     return false;
   }
 
-  vkc::Result<std::vector<float>> tsdf = vr_test::read_attribute<float>(
+  vkc::Result<std::vector<float>> tsdf = vgrid_test::read_attribute<float>(
       gpu.device, gpu.allocator, g, vol::kTsdfAttribute);
-  vkc::Result<std::vector<float>> weight = vr_test::read_attribute<float>(
+  vkc::Result<std::vector<float>> weight = vgrid_test::read_attribute<float>(
       gpu.device, gpu.allocator, g, vol::kWeightAttribute);
   if (!tsdf || !weight) {
     return false;
@@ -130,11 +130,11 @@ bool fill_sphere(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& g,
       }
     }
   }
-  return vr_test::write_attribute(gpu.device, gpu.allocator, g,
-                                  vol::kTsdfAttribute, tsdf.value())
+  return vgrid_test::write_attribute(gpu.device, gpu.allocator, g,
+                                     vol::kTsdfAttribute, tsdf.value())
              .ok() &&
-         vr_test::write_attribute(gpu.device, gpu.allocator, g,
-                                  vol::kWeightAttribute, weight.value())
+         vgrid_test::write_attribute(gpu.device, gpu.allocator, g,
+                                     vol::kWeightAttribute, weight.value())
              .ok();
 }
 
@@ -240,7 +240,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
 
   // --- The default is exactly STORAGE_BUFFER and the transfer bits ----------
-  // A recon-only consumer pays for nothing it does not use; the transfer bits
+  // A grid-only consumer pays for nothing it does not use; the transfer bits
   // are how the host reaches the device-local buffers at all.
   constexpr VkBufferUsageFlags kBase = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -254,7 +254,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(plain_mesh.ok());
   CHECK(plain_mesh.value().vertex_usage == kBase);
   CHECK(plain_mesh.value().index_usage == kBase);
-  // The command is unconditional, not config-gated: a recon-only consumer still
+  // The command is unconditional, not config-gated: a grid-only consumer still
   // gets one. Asserted on the *default* extractor specifically, because every
   // other command assertion here runs through a configured one -- gating the
   // buffer on config would otherwise leave the suite green while a default
@@ -387,7 +387,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(cmd.indexCount == cmd_mesh.value().triangle_count * 3);
     CHECK(cmd.indexCount == cmd_mesh.value().vertex_count);
     // The four fields that make it *drawable* rather than just a number. They
-    // have no effect until something issues a draw, and nothing in recon can --
+    // have no effect until something issues a draw, and nothing in grid can --
     // which is exactly why they need pinning here instead of downstream.
     CHECK(cmd.instanceCount == 1);
     CHECK(cmd.firstIndex == 0);
@@ -721,7 +721,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(c.ok() && index_count(c.value()) == 0);
   }
 
-  // --- A device without recon's features is refused -------------------------
+  // --- A device without grid's features is refused --------------------------
   // The core's default requirements leave scalarBlockLayout off. The kernels
   // would build and run on such a device, reading their buffers at the wrong
   // offsets, so create refuses it.
@@ -750,5 +750,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

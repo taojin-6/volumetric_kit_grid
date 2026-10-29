@@ -1,31 +1,31 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// recon_subproject_headers compiles this in the sibling that fetches recon and
+// grid_subproject_headers compiles this in the sibling that fetches grid and
 // never runs it. The hash table's internals stay out of the public headers:
 // volume/hash.hpp and volume/hash_map_internal.hpp are not on the include path
-// recon's targets give a consumer; every public volume header, and every
-// public recon header that includes one, compiles without them; none of them
+// grid's targets give a consumer; every public volume header, and every
+// public grid header that includes one, compiles without them; none of them
 // declares one of the names below in the volume namespace; and VoxelHashMap
 // hands out no hash-entry array (its Internal is defined only in
 // hash_map_internal.hpp).
 
-#if __has_include("volumetric_kit/recon/volume/hash.hpp")
+#if __has_include("volumetric_kit/grid/volume/hash.hpp")
 #error "volume/hash.hpp is public, but the hash table's layout is internal"
 #endif
-#if __has_include("volumetric_kit/recon/volume/hash_map_internal.hpp")
+#if __has_include("volumetric_kit/grid/volume/hash_map_internal.hpp")
 #error "volume/hash_map_internal.hpp is public, but the entries are internal"
 #endif
 
 #include <type_traits>
 #include <utility>
 
-// Those headers, as subproject/CMakeLists.txt finds them in recon's include/.
-#include "vr_volume_headers.hpp"
+// Those headers, as subproject/CMakeLists.txt finds them in grid's include/.
+#include "vgrid_volume_headers.hpp"
 
 // An alias is ill-formed after any other declaration of its name: a class or
 // its forward declaration, a variable, a function or another alias.
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 struct InternalNameProbe {};
 using HashEntry = InternalNameProbe;
 using hash_bucket = InternalNameProbe;
@@ -69,4 +69,4 @@ static_assert(!HasEntriesBufferSize<VoxelHashMap>::value,
               "VoxelHashMap::entries_buffer_size() is public");
 static_assert(!IsComplete<VoxelHashMap::Internal>::value,
               "VoxelHashMap::Internal is defined in a public header");
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

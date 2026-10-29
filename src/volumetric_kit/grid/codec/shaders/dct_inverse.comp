@@ -21,25 +21,25 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "dct_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/grid_types.glsl"
+#include "volumetric_kit/grid/volume/shaders/grid_types.glsl"
 
 layout(local_size_x = kLanes) in;
 
-layout(set = 0, binding = VR_DCT_BINDING_TSDF, scalar) buffer Tsdf {
+layout(set = 0, binding = VGRID_DCT_BINDING_TSDF, scalar) buffer Tsdf {
   float tsdf[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) buffer Weight {
+layout(set = 0, binding = VGRID_DCT_BINDING_WEIGHT, scalar) buffer Weight {
   float weight[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_COEFFICIENTS, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_COEFFICIENTS, scalar) readonly buffer
     Coefficients {
   uint coefficients[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_MASKS, scalar) readonly buffer
     Masks {
   uint masks[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_STAMPS, scalar) buffer Stamps {
+layout(set = 0, binding = VGRID_DCT_BINDING_STAMPS, scalar) buffer Stamps {
   BlockStamp stamps[];
 };
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
 
 #include <unistd.h>
 
@@ -13,7 +13,7 @@
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 namespace {
 
 constexpr std::uint8_t kZeros[8] = {};
@@ -168,4 +168,4 @@ core::Status StreamWriter::finish() {
 
 std::uint64_t StreamWriter::size() const noexcept { return size_; }
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

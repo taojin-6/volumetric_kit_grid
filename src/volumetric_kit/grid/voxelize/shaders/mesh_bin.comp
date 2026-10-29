@@ -40,10 +40,10 @@
 // num_blocks, 16 bytes apiece (a count and a coordinate).
 
 #extension GL_GOOGLE_include_directive : require
-#define VR_HASH_ENTRIES_BINDING 0
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
-#define VR_TRI_OFFSETS_BINDING 3
-#include "volumetric_kit/recon/volume/shaders/triangle_candidates.glsl"
+#define VGRID_HASH_ENTRIES_BINDING 0
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
+#define VGRID_TRI_OFFSETS_BINDING 3
+#include "volumetric_kit/grid/volume/shaders/triangle_candidates.glsl"
 
 layout(local_size_x = 256) in;
 
@@ -88,29 +88,29 @@ const uint kNoSlot = 0xFFFFFFFFu;
 
 void main() {
   uint gid = pc.item_base + gl_GlobalInvocationID.x;
-  if (gid >= vr_tri_offsets[pc.tri_count]) {
+  if (gid >= vgrid_tri_offsets[pc.tri_count]) {
     return;
   }
 
   if (pc.pass == kPassFill) {
     uint slot = item_slot[gid];
     if (slot != kNoSlot) {
-      bin_tris[atomicAdd(counts[slot], 1u)] = vrTriangleOf(gid, pc.tri_count);
+      bin_tris[atomicAdd(counts[slot], 1u)] = vgridTriangleOf(gid, pc.tri_count);
     }
     return;
   }
 
-  uint t = vrTriangleOf(gid, pc.tri_count);
-  uint local = gid - vr_tri_offsets[t];
+  uint t = vgridTriangleOf(gid, pc.tri_count);
+  uint local = gid - vgrid_tri_offsets[t];
   vec3 v0 = vertices[indices[3u * t]];
   vec3 v1 = vertices[indices[3u * t + 1u]];
   vec3 v2 = vertices[indices[3u * t + 2u]];
 
   uint slot = kNoSlot;
   ivec3 coord;
-  if (vrCandidateBlock(local, v0, v1, v2, pc.grid, coord) &&
-      vrBlockInBand(coord, v0, v1, v2, pc.grid)) {
-    int ptr = vrFindBlockPtr(coord, pc.grid.num_buckets, pc.grid.bucket_size,
+  if (vgridCandidateBlock(local, v0, v1, v2, pc.grid, coord) &&
+      vgridBlockInBand(coord, v0, v1, v2, pc.grid)) {
+    int ptr = vgridFindBlockPtr(coord, pc.grid.num_buckets, pc.grid.bucket_size,
                              pc.grid.max_chain);
     if (ptr < 0) {
       atomicAdd(missing, 1u);

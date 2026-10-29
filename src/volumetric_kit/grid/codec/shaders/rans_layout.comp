@@ -66,7 +66,7 @@ void main() {
       run[i] = first + i < n ? steps[first + i] : 0u;
       sum += run[i];
     }
-    uint at = vrScanChunk(sum, carry);
+    uint at = vgridScanChunk(sum, carry);
     carry = min(carry, kStepCap);
     for (uint i = 0u; i < kRun && first + i < n; ++i) {
       starts[first + i] = at;
@@ -98,7 +98,7 @@ void main() {
       }
       sum += run[i];
     }
-    uint at = vrScanChunk(sum, carry);
+    uint at = vgridScanChunk(sum, carry);
     for (uint i = 0u; i < kRun && first + i < segments; ++i) {
       slot_offsets[first + i] = at;
       at += run[i];

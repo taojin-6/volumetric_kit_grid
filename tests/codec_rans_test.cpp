@@ -22,7 +22,7 @@
 #include "rans.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 
-namespace d = volumetric_kit::recon::codec::detail;
+namespace d = volumetric_kit::grid::codec::detail;
 namespace oracle = codec_oracle;
 
 namespace {

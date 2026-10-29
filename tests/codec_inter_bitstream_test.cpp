@@ -31,12 +31,12 @@
 #include "fnv1a.hpp"
 #include "frame_hash.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 namespace oracle = codec_oracle;
 
 namespace {
@@ -154,7 +154,7 @@ int worked_example_case() {
   CHECK(p.type == d::FrameType::kInter);
   CHECK(p.modes ==
         std::vector<d::BlockMode>({d::BlockMode::kKeep, d::BlockMode::kSkip}));
-  CHECK(p.coords == std::vector<vr::Vec3i>({{2, 0, 0}}));
+  CHECK(p.coords == std::vector<vgrid::Vec3i>({{2, 0, 0}}));
   // Positions 0 (a), 1 (b) and 2 (c).
   CHECK(p.blocks.coefficients == std::vector<std::int16_t>({1, 0, 3}));
   const std::vector<std::uint32_t> none(codec::kMaskWordsPerBlock, 0u);
@@ -341,7 +341,7 @@ int golden_case() {
     CHECK(round_trip(c.reference, c.target, c.p,
                      sizes(g.segment_size, g.update_size), &bytes) == 0);
     const std::uint32_t content = codec_frames::content_hash(c.p);
-    const std::uint32_t hash = vr_test::fnv1a(bytes);
+    const std::uint32_t hash = vgrid_test::fnv1a(bytes);
     if (content != g.content || bytes.size() != g.size || hash != g.hash) {
       std::fprintf(stderr,
                    "%s, R %u, U %u: content 0x%08xu, %zu bytes, hash "
@@ -489,7 +489,7 @@ int refusals_case() {
     CHECK(at != p.modes.end());
     const auto e = static_cast<std::size_t>(at - p.modes.begin());
     oracle::Frame twice = p;
-    const vr::Vec3i c = reference.coords[e];
+    const vgrid::Vec3i c = reference.coords[e];
     const auto q = static_cast<std::size_t>(
         std::lower_bound(twice.coords.begin(), twice.coords.end(), c,
                          ZyxLess{}) -

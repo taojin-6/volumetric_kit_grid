@@ -8,33 +8,33 @@
 // and uploads the exclusive prefix sum this file searches.
 //
 // Shared rather than restated by every triangle-driven kernel.
-// hash_allocate_triangles.comp allocates the blocks that pass vrBlockInBand,
+// hash_allocate_triangles.comp allocates the blocks that pass vgridBlockInBand,
 // and voxelize's mesh_bin.comp bins triangles into exactly the blocks that
 // pass it. A second copy of the test would compile clean and let the
 // integrator look for a block the allocator never made -- or skip one it did.
 //
 // The includer must include hash_common.glsl first (directly, or through
 // hash_lookup.glsl), for VoxelGridParams and worldToBlock, and must #define
-// VR_TRI_OFFSETS_BINDING to the set-0 binding it reserved for the offsets.
+// VGRID_TRI_OFFSETS_BINDING to the set-0 binding it reserved for the offsets.
 
-#ifndef VR_TRIANGLE_CANDIDATES_GLSL
-#define VR_TRIANGLE_CANDIDATES_GLSL
+#ifndef VGRID_TRIANGLE_CANDIDATES_GLSL
+#define VGRID_TRIANGLE_CANDIDATES_GLSL
 
-#ifndef VR_HASH_COMMON_GLSL
+#ifndef VGRID_HASH_COMMON_GLSL
 #error "include hash_common.glsl (or hash_lookup.glsl) before triangle_candidates.glsl"
 #endif
-#ifndef VR_TRI_OFFSETS_BINDING
-#error "define VR_TRI_OFFSETS_BINDING before including triangle_candidates.glsl"
+#ifndef VGRID_TRI_OFFSETS_BINDING
+#error "define VGRID_TRI_OFFSETS_BINDING before including triangle_candidates.glsl"
 #endif
 
-#include "volumetric_kit/recon/volume/shaders/triangle_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/triangle_common.glsl"
 
 // Exclusive prefix sum of per-triangle candidate-block counts, tri_count + 1
-// entries. vr_tri_offsets[tri_count] is the total work-item count, which is
+// entries. vgrid_tri_offsets[tri_count] is the total work-item count, which is
 // how a kernel learns its own bound without a second push constant.
-layout(set = 0, binding = VR_TRI_OFFSETS_BINDING, scalar) readonly buffer
-    VrTriOffsets {
-  uint vr_tri_offsets[];
+layout(set = 0, binding = VGRID_TRI_OFFSETS_BINDING, scalar) readonly buffer
+    VgridTriOffsets {
+  uint vgrid_tri_offsets[];
 };
 
 // The triangle owning work item `gid`: the largest t with offsets[t] <= gid.
@@ -45,12 +45,12 @@ layout(set = 0, binding = VR_TRI_OFFSETS_BINDING, scalar) readonly buffer
 // triangle that actually owns the item. offsets[tri_count] is the total and
 // gid is below it, so `hi` is never itself an answer and the invariant
 // offsets[lo] <= gid < offsets[hi] holds throughout.
-uint vrTriangleOf(uint gid, uint tri_count) {
+uint vgridTriangleOf(uint gid, uint tri_count) {
   uint lo = 0u;  // offsets[0] == 0 <= gid, so lo always names a valid answer
   uint hi = tri_count;
   while (hi - lo > 1u) {
     uint mid = lo + (hi - lo) / 2u;
-    if (vr_tri_offsets[mid] <= gid) {
+    if (vgrid_tri_offsets[mid] <= gid) {
       lo = mid;
     } else {
       hi = mid;
@@ -67,7 +67,7 @@ uint vrTriangleOf(uint gid, uint tri_count) {
 // and min/max/subtract are exact in IEEE, so the two agree bit-for-bit. The
 // `local >= n` refusal is what makes a future divergence fail SAFE: it drops a
 // candidate, rather than decoding `local` onto some unrelated coordinate.
-bool vrCandidateBlock(uint local, vec3 v0, vec3 v1, vec3 v2,
+bool vgridCandidateBlock(uint local, vec3 v0, vec3 v1, vec3 v2,
                       VoxelGridParams grid, out ivec3 coord) {
   float trunc = grid.trunc_dist;
   vec3 lo_world = min(v0, min(v1, v2)) - vec3(trunc);
@@ -100,14 +100,14 @@ bool vrCandidateBlock(uint local, vec3 v0, vec3 v1, vec3 v2,
 // of the block's nominal extent. Measuring the half-diagonal off the nominal
 // bs*voxel_size instead would still be conservative, just needlessly looser by
 // a voxel in each axis.
-bool vrBlockInBand(ivec3 coord, vec3 v0, vec3 v1, vec3 v2,
+bool vgridBlockInBand(ivec3 coord, vec3 v0, vec3 v1, vec3 v2,
                    VoxelGridParams grid) {
   float span = float(grid.block_size - 1) * grid.voxel_size;
   vec3 centre = vec3(coord * grid.block_size) * grid.voxel_size + vec3(0.5 * span);
   float half_diag = 0.5 * sqrt(3.0) * span;
   vec3 closest;
-  float dist = vrPointTriangleDistance(centre, v0, v1, v2, closest);
+  float dist = vgridPointTriangleDistance(centre, v0, v1, v2, closest);
   return dist <= grid.trunc_dist + half_diag;
 }
 
-#endif  // VR_TRIANGLE_CANDIDATES_GLSL
+#endif  // VGRID_TRIANGLE_CANDIDATES_GLSL

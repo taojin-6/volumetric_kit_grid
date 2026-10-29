@@ -13,11 +13,11 @@
 #include <string>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/networking/export.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
+#include "volumetric_kit/grid/networking/export.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
 
-namespace volumetric_kit::recon::networking {
+namespace volumetric_kit::grid::networking {
 
 /// The port a sender serves on, and a viewer connects to when none is named.
 inline constexpr std::uint16_t kDefaultPort = 47801;
@@ -106,7 +106,7 @@ struct ServerOptions {
 /// @endcode
 ///
 /// @warning Call @ref publish from one thread at a time.
-class VR_NETWORKING_API StreamServer {
+class VGRID_NETWORKING_API StreamServer {
  public:
   /// @brief Listen on @p options' address and start accepting viewers.
   /// @param session  What each viewer gets first: a session
@@ -174,4 +174,4 @@ class VR_NETWORKING_API StreamServer {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace volumetric_kit::recon::networking
+}  // namespace volumetric_kit::grid::networking

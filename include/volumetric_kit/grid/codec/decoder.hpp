@@ -19,11 +19,11 @@
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 
 namespace detail {
 class BlockLists;
@@ -93,8 +93,8 @@ struct DeblockInfo {
 ///         `Status::Code::InvalidArgument` for anything else malformed. It
 ///         does not check the rest of the frame, which @ref Decoder::decode
 ///         does.
-VR_CODEC_API core::Result<FrameInfo> read_frame_info(const std::uint8_t* data,
-                                                     std::size_t size);
+VGRID_CODEC_API core::Result<FrameInfo> read_frame_info(
+    const std::uint8_t* data, std::size_t size);
 
 /// @brief A frame recorded into a caller's batch (@ref Decoder::record), for
 ///        @ref Decoder::finish or @ref Decoder::abandon once that batch has
@@ -194,7 +194,7 @@ struct PendingDecode {
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time, and
 ///          nothing else may modify the grid during one.
-class VR_CODEC_API Decoder {
+class VGRID_CODEC_API Decoder {
  public:
   /// @brief Build the kernels: the rANS decoder's, the block lists' (the
   ///        merge's and the grid diff's among them), the gate's, the apply's,
@@ -475,4 +475,4 @@ class VR_CODEC_API Decoder {
   core::GpuTimer gpu_timer_;
 };
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

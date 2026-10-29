@@ -14,9 +14,9 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_scalar_block_layout : require
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/coord_order.glsl"
 
 #include "block_lists_push.glsl"
 
@@ -38,7 +38,7 @@ layout(set = 0, binding = 2, std430) readonly buffer Count {
 // Two halves of a tile, which the levels ping-pong between: 8 KB.
 shared BlockIndex s_tile[2u * kSortTile];
 
-VR_COORD_SEARCH(tile, s_tile)
+VGRID_COORD_SEARCH(tile, s_tile)
 
 void main() {
   const uint lane = gl_LocalInvocationID.x;

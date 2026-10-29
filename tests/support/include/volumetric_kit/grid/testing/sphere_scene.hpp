@@ -12,13 +12,13 @@
 #include <cstdint>
 #include <vector>
 
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace vr_test {
+namespace vgrid_test {
 
 inline constexpr std::uint32_t kSphereWidth = 160;
 inline constexpr std::uint32_t kSphereHeight = 120;
@@ -35,14 +35,15 @@ struct SphereView {
 
 template <typename Camera>
 SphereView<Camera> sphere_view(int index) {
-  namespace vr = volumetric_kit::recon;
+  namespace vgrid = volumetric_kit::grid;
   const float angle = 2.1f * static_cast<float>(index);
-  const vr::Vec3f eye(0.9f * std::sin(angle), 0.1f * static_cast<float>(index),
-                      -0.9f * std::cos(angle));
+  const vgrid::Vec3f eye(0.9f * std::sin(angle),
+                         0.1f * static_cast<float>(index),
+                         -0.9f * std::cos(angle));
   // OpenCV axes: z forward, y down, x = y cross z.
-  const vr::Vec3f z = glm::normalize(-eye);
-  const vr::Vec3f x = glm::normalize(glm::cross(vr::Vec3f(0, 1, 0), z));
-  const vr::Vec3f y = glm::cross(z, x);
+  const vgrid::Vec3f z = glm::normalize(-eye);
+  const vgrid::Vec3f x = glm::normalize(glm::cross(vgrid::Vec3f(0, 1, 0), z));
+  const vgrid::Vec3f y = glm::cross(z, x);
   SphereView<Camera> v;
   v.cam.fx = 140.0f;
   v.cam.fy = 140.0f;
@@ -52,13 +53,13 @@ SphereView<Camera> sphere_view(int index) {
   v.cam.max_depth = 5.0f;
   v.cam.width = kSphereWidth;
   v.cam.height = kSphereHeight;
-  v.cam.cam_to_world = vr::Mat4f(vr::Vec4f(x, 0), vr::Vec4f(y, 0),
-                                 vr::Vec4f(z, 0), vr::Vec4f(eye, 1));
+  v.cam.cam_to_world = vgrid::Mat4f(vgrid::Vec4f(x, 0), vgrid::Vec4f(y, 0),
+                                    vgrid::Vec4f(z, 0), vgrid::Vec4f(eye, 1));
   v.depth.assign(kSphereWidth * kSphereHeight, 0.0f);
   v.color.assign(kSphereWidth * kSphereHeight, 0u);
   for (std::uint32_t row = 0; row < kSphereHeight; ++row) {
     for (std::uint32_t col = 0; col < kSphereWidth; ++col) {
-      const vr::Vec3f ray = glm::normalize(
+      const vgrid::Vec3f ray = glm::normalize(
           (static_cast<float>(col) + 0.5f - v.cam.cx) / v.cam.fx * x +
           (static_cast<float>(row) + 0.5f - v.cam.cy) / v.cam.fy * y + z);
       // |eye + t ray| = r, the nearer root.
@@ -77,4 +78,4 @@ SphereView<Camera> sphere_view(int index) {
   return v;
 }
 
-}  // namespace vr_test
+}  // namespace vgrid_test

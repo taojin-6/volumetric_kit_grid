@@ -27,23 +27,23 @@
 
 #include "bitstream.hpp"
 #include "block_lists.hpp"
-#include "codec_fixture.hpp"
 #include "codec_frames.hpp"
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace vol = volumetric_kit::grid::volume;
+namespace d = volumetric_kit::grid::codec::detail;
 using codec_frames::kMax32;
 using codec_frames::kMin32;
 using codec_frames::Lcg;
@@ -65,7 +65,7 @@ bool same(const Blocks& a, const Blocks& b) {
 
 // @p coords as entries, each ptr its index: distinct, so a reordered tie
 // shows.
-Blocks entries(const std::vector<vr::Vec3i>& coords) {
+Blocks entries(const std::vector<vgrid::Vec3i>& coords) {
   Blocks out(coords.size());
   for (std::size_t i = 0; i < coords.size(); ++i) {
     out[i] = vol::BlockIndex{coords[i], std::int32_t(i)};
@@ -88,7 +88,7 @@ vkc::Result<Blocks> device_sort(vkc::test::Gpu& gpu, d::BlockLists& lists,
   if (bound != 0) {
     Blocks padded = in;
     for (std::uint32_t i = n; i < bound; ++i) {
-      padded.push_back(vol::BlockIndex{vr::Vec3i(-7, int(i), 5), -1});
+      padded.push_back(vol::BlockIndex{vgrid::Vec3i(-7, int(i), 5), -1});
     }
     VKC_ASSIGN(list, vkc::test::upload_device_buffer(
                          gpu.device, gpu.allocator, padded.data(),
@@ -117,7 +117,7 @@ vkc::Result<Blocks> device_sort(vkc::test::Gpu& gpu, d::BlockLists& lists,
 // left as it was; and, for a few, recorded for 64 times their entries, whose
 // levels past them copy their entries through.
 int sorts_as_std(vkc::test::Gpu& gpu, d::BlockLists& lists,
-                 const std::vector<vr::Vec3i>& coords, const char* what) {
+                 const std::vector<vgrid::Vec3i>& coords, const char* what) {
   const Blocks in = entries(coords);
   Blocks expected = in;
   std::stable_sort(expected.begin(), expected.end(),
@@ -147,40 +147,41 @@ int sort_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   Lcg rng{11};
   const std::int32_t picks[] = {kMin32, kMin32 + 1, -1,    0,
                                 1,      kMax32 - 1, kMax32};
-  const std::vector<vr::Vec3i> extreme = codec_frames::extreme_frame().coords;
+  const std::vector<vgrid::Vec3i> extreme =
+      codec_frames::extreme_frame().coords;
   const std::size_t counts[] = {0,   1,   2,    255,   256,
                                 257, 511, 4097, 65537, 200000};
   for (const std::size_t n : counts) {
     // All of int32, each axis's extremes and extreme_frame's coordinates
     // among them.
-    std::vector<vr::Vec3i> wide(n);
+    std::vector<vgrid::Vec3i> wide(n);
     for (std::size_t i = 0; i < n; ++i) {
       const auto any = [&]() {
         return rng.below(4) == 0 ? picks[rng.below(7)]
                                  : static_cast<std::int32_t>(rng.next());
       };
       wide[i] =
-          i < extreme.size() ? extreme[i] : vr::Vec3i(any(), any(), any());
+          i < extreme.size() ? extreme[i] : vgrid::Vec3i(any(), any(), any());
     }
     CHECK(sorts_as_std(gpu, lists, wide, "int32") == 0);
     // A room's worth of space, with many repeats at the larger counts.
-    std::vector<vr::Vec3i> room(n);
-    for (vr::Vec3i& c : room) {
-      c = vr::Vec3i(int(rng.below(120)) - 60, int(rng.below(40)) - 10,
-                    int(rng.below(120)) - 60);
+    std::vector<vgrid::Vec3i> room(n);
+    for (vgrid::Vec3i& c : room) {
+      c = vgrid::Vec3i(int(rng.below(120)) - 60, int(rng.below(40)) - 10,
+                       int(rng.below(120)) - 60);
     }
     CHECK(sorts_as_std(gpu, lists, room, "room") == 0);
     // All one key, and seven keys, each repeated across tiles.
-    CHECK(sorts_as_std(gpu, lists, std::vector<vr::Vec3i>(n, {3, -2, 7}),
+    CHECK(sorts_as_std(gpu, lists, std::vector<vgrid::Vec3i>(n, {3, -2, 7}),
                        "equal") == 0);
-    std::vector<vr::Vec3i> seven(n);
-    for (vr::Vec3i& c : seven) {
+    std::vector<vgrid::Vec3i> seven(n);
+    for (vgrid::Vec3i& c : seven) {
       const auto k = static_cast<std::int32_t>(rng.below(7));
-      c = vr::Vec3i(k % 2 == 0 ? kMax32 : -k, k, k == 3 ? kMin32 : 0);
+      c = vgrid::Vec3i(k % 2 == 0 ? kMax32 : -k, k, k == 3 ? kMin32 : 0);
     }
     CHECK(sorts_as_std(gpu, lists, seven, "seven keys") == 0);
     // Already sorted, and reversed.
-    std::vector<vr::Vec3i> sorted = room;
+    std::vector<vgrid::Vec3i> sorted = room;
     std::sort(sorted.begin(), sorted.end(), d::coord_less);
     CHECK(sorts_as_std(gpu, lists, sorted, "sorted") == 0);
     std::reverse(sorted.begin(), sorted.end());
@@ -262,9 +263,9 @@ vkc::Result<vkc::Buffer> upload(vkc::test::Gpu& gpu, std::vector<T> v) {
                                          v.size() * sizeof(T));
 }
 
-Blocks listed(const std::vector<vr::Vec3i>& coords) {
+Blocks listed(const std::vector<vgrid::Vec3i>& coords) {
   Blocks out;
-  for (const vr::Vec3i& c : coords) out.push_back(vol::BlockIndex{c, 0});
+  for (const vgrid::Vec3i& c : coords) out.push_back(vol::BlockIndex{c, 0});
   return out;
 }
 
@@ -293,7 +294,7 @@ vkc::Result<Found> found(vkc::test::Gpu& gpu, const d::BlockLists& lists) {
 }
 
 struct Merged {
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   std::vector<d::ApplySource> sources;
   Found verdict;
   bool guards_kept = true;
@@ -311,9 +312,9 @@ std::vector<std::uint32_t> ranks_of(const std::vector<Mode>& modes) {
 }
 
 vkc::Result<Merged> device_merge(vkc::test::Gpu& gpu, d::BlockLists& lists,
-                                 const std::vector<vr::Vec3i>& reference,
+                                 const std::vector<vgrid::Vec3i>& reference,
                                  const std::vector<Mode>& modes,
-                                 const std::vector<vr::Vec3i>& added,
+                                 const std::vector<vgrid::Vec3i>& added,
                                  std::uint32_t n,
                                  const std::vector<std::uint32_t>& ranks) {
   std::vector<std::uint32_t> mode_words;
@@ -351,7 +352,7 @@ vkc::Result<Merged> device_merge(vkc::test::Gpu& gpu, d::BlockLists& lists,
       continue;
     }
     out.guards_kept = out.guards_kept && frame[i].ptr == kGuardPtr &&
-                      frame[i].coord == vr::Vec3i(7, 7, 7) &&
+                      frame[i].coord == vgrid::Vec3i(7, 7, 7) &&
                       sources[i].reference == 0x5EED &&
                       sources[i].payload == 0xFEED;
   }
@@ -372,9 +373,9 @@ bool same_sources(const std::vector<d::ApplySource>& a,
 // The device's merge of a sound frame is the oracle's, with no collision and
 // nothing written past N.
 int merges_as_oracle(vkc::test::Gpu& gpu, d::BlockLists& lists,
-                     const std::vector<vr::Vec3i>& reference,
+                     const std::vector<vgrid::Vec3i>& reference,
                      const std::vector<Mode>& modes,
-                     const std::vector<vr::Vec3i>& added, const char* what) {
+                     const std::vector<vgrid::Vec3i>& added, const char* what) {
   const codec_frames::Merged want =
       codec_frames::merge_oracle(reference, modes, added);
   const vkc::Result<Merged> got = device_merge(
@@ -395,20 +396,20 @@ int merges_as_oracle(vkc::test::Gpu& gpu, d::BlockLists& lists,
 // @p total distinct coordinates, sorted, from a box with int32's extremes
 // mixed in, split at random into a reference and new blocks.
 void split_coords(Lcg& rng, std::size_t total, std::uint32_t added_per_mille,
-                  std::vector<vr::Vec3i>& reference,
-                  std::vector<vr::Vec3i>& added) {
+                  std::vector<vgrid::Vec3i>& reference,
+                  std::vector<vgrid::Vec3i>& added) {
   const std::int32_t picks[] = {kMin32, -3, 0, 5, kMax32};
-  std::set<vr::Vec3i, ZyxLess> all;
+  std::set<vgrid::Vec3i, ZyxLess> all;
   while (all.size() < total) {
     const auto axis = [&](std::uint32_t span) {
       return rng.below(16) == 0 ? picks[rng.below(5)]
                                 : std::int32_t(rng.below(span)) - 40;
     };
-    all.insert(vr::Vec3i(axis(80), axis(30), axis(80)));
+    all.insert(vgrid::Vec3i(axis(80), axis(30), axis(80)));
   }
   reference.clear();
   added.clear();
-  for (const vr::Vec3i& c : all) {
+  for (const vgrid::Vec3i& c : all) {
     (rng.below(1000) < added_per_mille ? added : reference).push_back(c);
   }
 }
@@ -423,14 +424,14 @@ std::vector<Mode> modes_of(Lcg& rng, std::size_t m, const Mode* pool,
 int merge_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   // The worked example: a <- (0, 0), c <- (none, 2), b <- (1, none).
   {
-    const std::vector<vr::Vec3i> reference = {{0, 0, 0}, {4, 0, 0}};
+    const std::vector<vgrid::Vec3i> reference = {{0, 0, 0}, {4, 0, 0}};
     const std::vector<Mode> modes = {Mode::kKeep, Mode::kSkip};
-    const std::vector<vr::Vec3i> added = {{2, 0, 0}};
+    const std::vector<vgrid::Vec3i> added = {{2, 0, 0}};
     vkc::Result<Merged> got =
         device_merge(gpu, lists, reference, modes, added, 3, ranks_of(modes));
     CHECK(got.ok());
     CHECK(got.value().coords ==
-          std::vector<vr::Vec3i>({{0, 0, 0}, {2, 0, 0}, {4, 0, 0}}));
+          std::vector<vgrid::Vec3i>({{0, 0, 0}, {2, 0, 0}, {4, 0, 0}}));
     const std::uint32_t no = d::kNoSource;
     CHECK(same_sources(got.value().sources, {{0, 0}, {no, 2}, {1, no}}));
   }
@@ -449,8 +450,8 @@ int merge_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   const Mix mixes[] = {{"every mode", every, 4}, {"survivors", survive, 3},
                        {"all keep", keep, 1},    {"all skip", skip, 1},
                        {"all zero", zero, 1},    {"all remove", remove, 1}};
-  std::vector<vr::Vec3i> reference;
-  std::vector<vr::Vec3i> added;
+  std::vector<vgrid::Vec3i> reference;
+  std::vector<vgrid::Vec3i> added;
   for (const Mix& mix : mixes) {
     // Both sides, no new blocks (A = 0), no reference (M = 0), and nothing.
     for (const std::uint32_t added_per_mille : {300u, 0u, 1000u}) {
@@ -466,7 +467,8 @@ int merge_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   }
   // int32's extremes alone.
   {
-    const std::vector<vr::Vec3i> extreme = codec_frames::extreme_frame().coords;
+    const std::vector<vgrid::Vec3i> extreme =
+        codec_frames::extreme_frame().coords;
     reference.clear();
     added.clear();
     for (std::size_t i = 0; i < extreme.size(); ++i) {
@@ -494,8 +496,8 @@ int merge_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
 // The first new block on a reference block in frame order, by a walk: the
 // pair row 13 names.
 std::pair<std::uint32_t, std::uint32_t> first_collision(
-    const std::vector<vr::Vec3i>& reference,
-    const std::vector<vr::Vec3i>& added) {
+    const std::vector<vgrid::Vec3i>& reference,
+    const std::vector<vgrid::Vec3i>& added) {
   std::size_t e = 0;
   std::size_t q = 0;
   while (e < reference.size() && q < added.size()) {
@@ -516,8 +518,8 @@ int collision_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   Lcg rng{43};
   const Mode every[] = {Mode::kKeep, Mode::kSkip, Mode::kZero, Mode::kRemove};
   for (int trial = 0; trial < 60; ++trial) {
-    std::vector<vr::Vec3i> reference;
-    std::vector<vr::Vec3i> added;
+    std::vector<vgrid::Vec3i> reference;
+    std::vector<vgrid::Vec3i> added;
     split_coords(rng, 50 + rng.below(400), 300, reference, added);
     CHECK(reference.size() > 8);
     std::vector<Mode> modes = modes_of(rng, reference.size(), every, 4);
@@ -556,14 +558,14 @@ int collision_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
 // @p coords into @p grid, in the order given, a few at a time and again
 // while lock races leave any out.
 vkc::Status place(vkc::test::Gpu& gpu, vol::VoxelBlockGrid& grid,
-                  const std::vector<vr::Vec3i>& coords) {
+                  const std::vector<vgrid::Vec3i>& coords) {
   const Blocks blocks = listed(coords);
   for (std::size_t first = 0; first < blocks.size(); first += 16) {
     const auto count = static_cast<std::uint32_t>(
         std::min<std::size_t>(16, blocks.size() - first));
     std::uint32_t failed = 1;
     for (int call = 0; call < 16 && failed != 0; ++call) {
-      VKC_ASSIGN(failed, vr_test::allocate_blocks(
+      VKC_ASSIGN(failed, vgrid_test::allocate_blocks(
                              gpu, grid.map(), blocks.data() + first, count));
     }
     if (failed != 0) return vkc::Status::io_error("place: lock races");
@@ -571,8 +573,8 @@ vkc::Status place(vkc::test::Gpu& gpu, vol::VoxelBlockGrid& grid,
   return {};
 }
 
-std::vector<vr::Vec3i> sorted_coords(const Blocks& blocks) {
-  std::vector<vr::Vec3i> out;
+std::vector<vgrid::Vec3i> sorted_coords(const Blocks& blocks) {
+  std::vector<vgrid::Vec3i> out;
   for (const vol::BlockIndex& b : blocks) out.push_back(b.coord);
   std::sort(out.begin(), out.end(), d::coord_less);
   return out;
@@ -587,7 +589,7 @@ struct Diffed {
 
 vkc::Result<Diffed> device_diff(vkc::test::Gpu& gpu, d::BlockLists& lists,
                                 const vol::VoxelBlockGrid& grid,
-                                const std::vector<vr::Vec3i>& frame) {
+                                const std::vector<vgrid::Vec3i>& frame) {
   const auto n = static_cast<std::uint32_t>(frame.size());
   VKC_ASSIGN(const vkc::Buffer frame_buf, upload(gpu, listed(frame)));
   const vol::VoxelGridParams& gp = grid.grid();
@@ -614,15 +616,15 @@ vkc::Result<Diffed> device_diff(vkc::test::Gpu& gpu, d::BlockLists& lists,
 // The diff is std::set_difference both ways, in any order, each gone block
 // with the grid's ptr and each missing one with 0.
 int diffs_as_std(vkc::test::Gpu& gpu, d::BlockLists& lists,
-                 vol::VoxelBlockGrid& grid, const std::vector<vr::Vec3i>& frame,
-                 const char* what) {
+                 vol::VoxelBlockGrid& grid,
+                 const std::vector<vgrid::Vec3i>& frame, const char* what) {
   vkc::Result<Blocks> active = grid.map().compact_active_blocks();
   CHECK(active.ok());
-  std::map<vr::Vec3i, std::int32_t, ZyxLess> ptr_of;
+  std::map<vgrid::Vec3i, std::int32_t, ZyxLess> ptr_of;
   for (const vol::BlockIndex& b : active.value()) ptr_of[b.coord] = b.ptr;
-  const std::vector<vr::Vec3i> held = sorted_coords(active.value());
-  std::vector<vr::Vec3i> gone;
-  std::vector<vr::Vec3i> missing;
+  const std::vector<vgrid::Vec3i> held = sorted_coords(active.value());
+  std::vector<vgrid::Vec3i> gone;
+  std::vector<vgrid::Vec3i> missing;
   std::set_difference(held.begin(), held.end(), frame.begin(), frame.end(),
                       std::back_inserter(gone), ZyxLess{});
   std::set_difference(frame.begin(), frame.end(), held.begin(), held.end(),
@@ -657,18 +659,18 @@ int diff_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
        {codec_fixture::GridShape{}, tiny}) {
     const auto room = static_cast<std::size_t>(shape.bucket_size) *
                       static_cast<std::size_t>(shape.num_buckets) / 2;
-    std::vector<vr::Vec3i> grid_coords;
-    std::vector<vr::Vec3i> frame;
+    std::vector<vgrid::Vec3i> grid_coords;
+    std::vector<vgrid::Vec3i> frame;
     split_coords(rng, room, 500, grid_coords, frame);
     // Some of the frame's blocks in the grid too: an overlap.
-    std::vector<vr::Vec3i> shared;
+    std::vector<vgrid::Vec3i> shared;
     for (std::size_t i = 0; i < grid_coords.size(); i += 3) {
       shared.push_back(grid_coords[i]);
     }
-    std::vector<vr::Vec3i> overlap = frame;
+    std::vector<vgrid::Vec3i> overlap = frame;
     overlap.insert(overlap.end(), shared.begin(), shared.end());
     std::sort(overlap.begin(), overlap.end(), d::coord_less);
-    std::vector<vr::Vec3i> shuffled = grid_coords;
+    std::vector<vgrid::Vec3i> shuffled = grid_coords;
     for (std::size_t i = shuffled.size(); i > 1; --i) {
       std::swap(shuffled[i - 1], shuffled[rng.below(std::uint32_t(i))]);
     }
@@ -700,8 +702,8 @@ int garbage_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   Lcg rng{53};
   const Mode every[] = {Mode::kKeep, Mode::kSkip, Mode::kZero, Mode::kRemove};
   for (int trial = 0; trial < 40; ++trial) {
-    std::vector<vr::Vec3i> reference;
-    std::vector<vr::Vec3i> added;
+    std::vector<vgrid::Vec3i> reference;
+    std::vector<vgrid::Vec3i> added;
     split_coords(rng, 20 + rng.below(300), 400, reference, added);
     for (std::size_t i = added.size(); i > 1; --i) {
       std::swap(added[i - 1], added[rng.below(std::uint32_t(i))]);
@@ -720,8 +722,8 @@ int garbage_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   }
   vkc::Result<vol::VoxelBlockGrid> g = codec_fixture::make_grid(gpu);
   CHECK(g.ok());
-  std::vector<vr::Vec3i> held;
-  std::vector<vr::Vec3i> frame;
+  std::vector<vgrid::Vec3i> held;
+  std::vector<vgrid::Vec3i> frame;
   split_coords(rng, 600, 500, held, frame);
   CHECK(place(gpu, g.value(), held).ok());
   frame.insert(frame.end(), held.begin(), held.begin() + 100);
@@ -795,5 +797,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

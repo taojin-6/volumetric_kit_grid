@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/io/ply_writer.hpp"
+#include "volumetric_kit/grid/mesh_io/ply_writer.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -14,14 +14,14 @@
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
 
-namespace volumetric_kit::recon::io {
+namespace volumetric_kit::grid::mesh_io {
 namespace {
 
 namespace tinyply = detail::tinyply;
 
 // The exact piecewise sRGB encode, one channel: the published formula, the
 // mesh files' own copy so they need no camera or colour vocabulary.
-// recon_io_ply holds it to the voxel colour format's curve
+// grid_io_ply holds it to the voxel colour format's curve
 // (volume/voxel_color.hpp), code for code.
 float linear_to_srgb(float l) {
   return l <= 0.0031308f ? l * 12.92f
@@ -113,6 +113,8 @@ core::Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
   std::vector<std::int32_t> faces(mesh.indices.begin(), mesh.indices.end());
 
   tinyply::PlyFile ply;
+  // The comment keeps the name the writer had when the format was fixed, so
+  // a file is byte for byte what it was before the writer moved to grid.
   ply.get_comments().push_back("volumetric_kit_recon");
   ply.add_properties_to_element(
       "vertex", {"x", "y", "z"}, tinyply::Type::FLOAT32, vertex_count,
@@ -147,4 +149,4 @@ core::Status write_ply(const std::string& path, const mesh::Mesh& mesh) try {
   return core::exception_status("write_ply", core::Status::Code::IoError);
 }
 
-}  // namespace volumetric_kit::recon::io
+}  // namespace volumetric_kit::grid::mesh_io

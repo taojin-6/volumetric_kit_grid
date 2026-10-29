@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The networking tier's socket calls (src/volumetric_kit/recon/networking/
+// The networking tier's socket calls (src/volumetric_kit/grid/networking/
 // socket.hpp) on loopback, 127.0.0.1 port 0 only: what each socket is set to,
 // read back (non-blocking and close-on-exec on every one, the listener's
 // SO_REUSEADDR, the accepted sender's TCP_NODELAY and 128 KiB
@@ -36,7 +36,7 @@
 #include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace detail = volumetric_kit::recon::networking::detail;
+namespace detail = volumetric_kit::grid::networking::detail;
 
 namespace {
 

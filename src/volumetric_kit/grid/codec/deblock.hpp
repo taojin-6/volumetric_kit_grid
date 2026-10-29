@@ -9,7 +9,7 @@
 ///
 /// Internal (under src/, never installed): the `Decoder` runs it, inside the
 /// decode's last submit, when `Decoder::set_deblock` is on. It carries
-/// `VR_CODEC_API` so the tier's tests reach it in a shared-library build.
+/// `VGRID_CODEC_API` so the tier's tests reach it in a shared-library build.
 ///
 /// The filters are the 2026-10-21 quantization study's, on the field
 /// `v = tsdf / trunc_dist`, under the per-block fallback (that decision's
@@ -68,12 +68,12 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// A block's shell: its voxels with a coordinate 0 or 7 on some axis, which a
 /// neighbour's 1-voxel halo reaches.
@@ -121,15 +121,15 @@ inline constexpr DeblockRow kDeblockRule[] = {
 ///         voxel, its step times its basis function's peak, in the study's
 ///         arithmetic (DC's step the transform's float product, the others'
 ///         in double) so the rule's thresholds fall where the study's did.
-VR_CODEC_API float step_scale(const CodecParams& params);
+VGRID_CODEC_API float step_scale(const CodecParams& params);
 
 /// @return The first row of @ref kDeblockRule that K @p k and @p t_mm
 ///         (T in millimetres) match, or null for none.
-VR_CODEC_API const DeblockRow* deblock_rule(std::uint32_t k, double t_mm);
+VGRID_CODEC_API const DeblockRow* deblock_rule(std::uint32_t k, double t_mm);
 
 /// @return @p row's filter at T @p t: its clips times @p t in double, and
 ///         `exp(-1 / (2 sigma^2))`, each rounded to float.
-VR_CODEC_API DeblockPasses deblock_passes(const DeblockRow& row, float t);
+VGRID_CODEC_API DeblockPasses deblock_passes(const DeblockRow& row, float t);
 
 /// @brief The deblock's kernels, its flags and its shell snapshot.
 ///
@@ -140,7 +140,7 @@ VR_CODEC_API DeblockPasses deblock_passes(const DeblockRow& row, float t);
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must outlive
 ///          this object. Not thread-safe.
-class VR_CODEC_API Deblock {
+class VGRID_CODEC_API Deblock {
  public:
   /// @brief Build the four kernels, a one-slot flags buffer and a one-block
   ///        snapshot.
@@ -190,11 +190,12 @@ class VR_CODEC_API Deblock {
   ///         heap, or more blocks or slots than @ref reserve made room for,
   ///         buffers smaller than the count, or a hash table past
   ///         `maxStorageBufferRange`.
-  core::Status record(core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
-                      const ResidentBlocks& frame, const DeblockPasses& passes,
-                      const recon::detail::IndirectSlices& blocks,
-                      const recon::detail::IndirectSlices& flags,
-                      core::GpuStageScope* stage = nullptr);
+  core::Status record(
+      core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+      const ResidentBlocks& frame, const DeblockPasses& passes,
+      const volumetric_kit::grid::detail::IndirectSlices& blocks,
+      const volumetric_kit::grid::detail::IndirectSlices& flags,
+      core::GpuStageScope* stage = nullptr);
 
   /// @return The blocks the last @ref record's passes left as decoded, the
   ///         frame's masked blocks, a u32, once its batch ran.
@@ -226,4 +227,4 @@ class VR_CODEC_API Deblock {
   core::Buffer shell_;
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

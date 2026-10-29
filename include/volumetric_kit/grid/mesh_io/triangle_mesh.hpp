@@ -10,9 +10,9 @@
 #include <cstdint>
 #include <vector>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
 
-namespace volumetric_kit::recon::io {
+namespace volumetric_kit::grid::mesh_io {
 
 /// @brief Owned, indexed triangle geometry in its source's coordinates.
 ///
@@ -26,4 +26,4 @@ struct TriangleMesh {
   std::vector<std::uint32_t> indices;  ///< Three in-range indices per triangle.
 };
 
-}  // namespace volumetric_kit::recon::io
+}  // namespace volumetric_kit::grid::mesh_io

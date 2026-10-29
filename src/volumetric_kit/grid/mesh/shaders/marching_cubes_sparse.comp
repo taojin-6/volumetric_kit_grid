@@ -50,7 +50,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 // Cross-tier: the voxel colour attribute's format, from the volume tier.
-#include "volumetric_kit/recon/volume/shaders/voxel_color.glsl"
+#include "volumetric_kit/grid/volume/shaders/voxel_color.glsl"
 
 // One workgroup per block. 256 is fixed rather than sized from
 // voxels_per_block, which is a push constant and so cannot set local_size
@@ -63,8 +63,8 @@ layout(local_size_x = 256) in;
 // block's voxel-array base, which also supplies the shared BlockIndex /
 // HashEntry layouts and hash constants from the volume tier's hash_common.glsl
 // (one definition, not a mirror -- see hash_lookup.glsl).
-#define VR_HASH_ENTRIES_BINDING 2
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#define VGRID_HASH_ENTRIES_BINDING 2
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
 
 // One mesh vertex (mirrors mesh::Vertex).
 struct Vertex {
@@ -152,8 +152,8 @@ layout(push_constant, scalar) uniform PushConstants {
 // DrawCommand bindings declared above.
 #include "marching_cubes_common.glsl"
 
-// vrLocalIndex / vrLocalBase / s_neighbour / vrResolveNeighbourhood /
-// vrCornerStorage / mcGather / mcCellSigns -- everything this kernel and the
+// vgridLocalIndex / vgridLocalBase / s_neighbour / vgridResolveNeighbourhood /
+// vgridCornerStorage / mcGather / mcCellSigns -- everything this kernel and the
 // sharing one do identically.
 #include "marching_cubes_sparse_common.glsl"
 
@@ -273,7 +273,7 @@ void main() {
     s_block_base = 0u;
     s_cursor = 0u;
   }
-  vrResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
+  vgridResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
                          pc.bucket_size, pc.max_chain);
   barrier();
 
@@ -309,7 +309,7 @@ void main() {
   uint mine = 0u;
   uint cache = 0u;  // this invocation's first kCachedSlots counts, one per byte
   for (uint local = tid; local < vpb; local += group_threads) {
-    int n = mcCellTriangleCount(mcCellSigns(bs, vrLocalBase(local, bs)));
+    int n = mcCellTriangleCount(mcCellSigns(bs, vgridLocalBase(local, bs)));
     if (n != 0) {
       uint slot = mcCacheSlot(local, tid, group_threads);
       if (slot < kCachedSlots) {
@@ -360,7 +360,7 @@ void main() {
     if (slot < kCachedSlots && ((cache >> (slot * 8u)) & 0xFFu) == 0u) {
       continue;
     }
-    ivec3 base = vrLocalBase(local, bs);
+    ivec3 base = vgridLocalBase(local, bs);
     float sdf[8];
     vec3 corner_color[8];
     int cube_index;

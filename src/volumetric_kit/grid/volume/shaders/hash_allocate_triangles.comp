@@ -40,12 +40,12 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "hash_common.glsl"
-#define VR_STAMPS_BINDING 8
+#define VGRID_STAMPS_BINDING 8
 #include "hash_allocate_common.glsl"
 // The decode and the band test, shared with voxelize's mesh_bin.comp so the
 // blocks allocated here and the blocks the mesh integrator bins cannot drift
 // apart. It brings the closest-point primitive with it.
-#define VR_TRI_OFFSETS_BINDING 7
+#define VGRID_TRI_OFFSETS_BINDING 7
 #include "triangle_candidates.glsl"
 
 const uint kLanes = 256u;
@@ -75,18 +75,18 @@ void main() {
   uint lid = gl_LocalInvocationID.x;
   uint tri_count = pc.arg;  // pc.arg = triangle count
   uint gid = pc.item_base + gl_GlobalInvocationID.x;
-  bool valid = gid < vr_tri_offsets[tri_count];
+  bool valid = gid < vgrid_tri_offsets[tri_count];
   ivec3 coord = ivec3(0);
   if (valid) {
-    uint t = vrTriangleOf(gid, tri_count);
-    uint local = gid - vr_tri_offsets[t];
+    uint t = vgridTriangleOf(gid, tri_count);
+    uint local = gid - vgrid_tri_offsets[t];
 
     vec3 v0 = vertices[indices[3u * t]];
     vec3 v1 = vertices[indices[3u * t + 1u]];
     vec3 v2 = vertices[indices[3u * t + 2u]];
 
-    valid = vrCandidateBlock(local, v0, v1, v2, pc.grid, coord) &&
-            vrBlockInBand(coord, v0, v1, v2, pc.grid);
+    valid = vgridCandidateBlock(local, v0, v1, v2, pc.grid, coord) &&
+            vgridBlockInBand(coord, v0, v1, v2, pc.grid);
   }
   s_block[lid] = coord;
   s_slot[lid] = 0u;

@@ -11,7 +11,7 @@
 
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 
-namespace vr_test {
+namespace vgrid_test {
 
 // The row named @p name, or null.
 inline const volumetric_kit::core::StageRow* find_row(
@@ -38,4 +38,4 @@ inline bool breakdowns_nest(const volumetric_kit::core::StageMetrics& m) {
   return true;
 }
 
-}  // namespace vr_test
+}  // namespace vgrid_test

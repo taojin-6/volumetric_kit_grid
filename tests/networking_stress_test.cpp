@@ -19,13 +19,13 @@
 #include <thread>
 #include <vector>
 
-#include "networking_loopback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
+#include "volumetric_kit/grid/testing/networking_loopback.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace networking = volumetric_kit::recon::networking;
-namespace stream = volumetric_kit::recon::stream;
-namespace net = vr_test::net;
+namespace networking = volumetric_kit::grid::networking;
+namespace stream = volumetric_kit::grid::stream;
+namespace net = vgrid_test::net;
 
 namespace {
 

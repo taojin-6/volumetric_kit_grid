@@ -42,30 +42,30 @@
 #include <utility>
 #include <vector>
 
-#include "codec_fixture.hpp"
-#include "networking_loopback.hpp"
-#include "stage_rows.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/networking/stream_client.hpp"
-#include "volumetric_kit/recon/networking/stream_server.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/networking/stream_client.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/testing/networking_loopback.hpp"
+#include "volumetric_kit/grid/testing/stage_rows.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace codec_stream = volumetric_kit::recon::codec_stream;
-namespace networking = volumetric_kit::recon::networking;
-namespace stream = volumetric_kit::recon::stream;
-namespace net = vr_test::net;
+namespace codec = volumetric_kit::grid::codec;
+namespace codec_stream = volumetric_kit::grid::codec_stream;
+namespace networking = volumetric_kit::grid::networking;
+namespace stream = volumetric_kit::grid::stream;
+namespace net = vgrid_test::net;
 namespace fs = std::filesystem;
 using namespace codec_fixture;
 
@@ -79,7 +79,7 @@ std::uint64_t pts(std::size_t frame) {
 // The session the tests write: one Geometry track at `rate`.
 stream::Session session(stream::Rate rate = {}) {
   stream::Session s;
-  s.writer = "recon_codec_stream";
+  s.writer = "grid_codec_stream";
   stream::Track track;
   track.kind = stream::TrackKind::Geometry;
   track.rate = rate;
@@ -97,8 +97,8 @@ codec::EncoderConfig unusable_config() {
 
 // Whether `frame` holds its encode's rows and, when decoded, its decode's.
 bool rows_of(const codec_stream::SentFrame& frame, bool decoded) {
-  return vr_test::find_row(frame.encode, "codec encode") != nullptr &&
-         (vr_test::find_row(frame.decode, "codec decode") != nullptr) ==
+  return vgrid_test::find_row(frame.encode, "codec encode") != nullptr &&
+         (vgrid_test::find_row(frame.decode, "codec decode") != nullptr) ==
              decoded;
 }
 
@@ -300,7 +300,7 @@ int check_records(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   CHECK(opened.ok());
   const stream::StreamReader& reader = **opened;
   const stream::Session& s = reader.session();
-  CHECK(s.writer == "recon_codec_stream");
+  CHECK(s.writer == "grid_codec_stream");
   CHECK(s.id == (std::array<std::uint8_t, 16>{}));
   CHECK(s.created_ns == 0 && s.calibration.empty());
   CHECK(s.tracks.size() == 1);
@@ -499,7 +499,7 @@ int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
       stream::StreamReader::open(outputs.stream);
   CHECK(opened.ok());
   const stream::StreamReader& reader = **opened;
-  CHECK(vr_test::vrst::same(*client->session(), reader.session()));
+  CHECK(vgrid_test::vrst::same(*client->session(), reader.session()));
   CHECK(reader.stats()[0].records == got.size());
   stream::Position pos = reader.begin();
   stream::Record record;
@@ -511,7 +511,7 @@ int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     const stream::Record& served = got[i].record;
     CHECK(served.info.seq == i && served.info.set == i);
     CHECK(served.info.pts_ns == pts(i));
-    CHECK(vr_test::vrst::same(served.info, record.info));
+    CHECK(vgrid_test::vrst::same(served.info, record.info));
     CHECK(served.offset == record.offset && got[i].payload == payload);
   }
   return 0;
@@ -563,7 +563,7 @@ int halves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     return pending;
   };
   const auto timed = [](const vkc::StageMetrics& rows, const char* name) {
-    const vkc::StageRow* row = vr_test::find_row(rows, name);
+    const vkc::StageRow* row = vgrid_test::find_row(rows, name);
     return row != nullptr && row->device != vkc::DeviceTime::None;
   };
   for (std::size_t frame = 0; frame < 5; ++frame) {
@@ -577,19 +577,19 @@ int halves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     CHECK(pending.ok());
     // The caller's scope holds its device half; the frame's are not here.
     CHECK(timed(rows, "set") &&
-          vr_test::find_row(rows, "  ..forward") == nullptr);
+          vgrid_test::find_row(rows, "  ..forward") == nullptr);
     int published = 0;
     const vkc::Result<codec_stream::SentFrame> y = b->finish_frame(
         *pending, frame, pts(frame), &rows, [&published] { ++published; });
     CHECK(y.ok() != refused && published == 1);
     for (const char* row : {"codec encode", "  ..forward", "crc", "write",
                             "publish", "wait: frame"}) {
-      CHECK(vr_test::find_row(rows, row) != nullptr);
+      CHECK(vgrid_test::find_row(rows, row) != nullptr);
     }
     if (refused) continue;
     CHECK(y->type == x->type && y->bytes == x->bytes && y->blocks == x->blocks);
     CHECK(rows_of(*y, true) && timed(y->encode, "  ..forward"));
-    CHECK(vr_test::find_row(y->encode, "set") == nullptr);
+    CHECK(vgrid_test::find_row(y->encode, "set") == nullptr);
   }
   // Out of order: refused, its pending frame dropped, so the next records
   // afresh.
@@ -612,7 +612,8 @@ int halves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   CHECK(first.ok());
   vkc::Result<codec::PendingEncode> again =
       b->redo(*first, source, &again_rows);
-  CHECK(again.ok() && vr_test::find_row(again_rows, "wait: redo") != nullptr);
+  CHECK(again.ok() &&
+        vgrid_test::find_row(again_rows, "wait: redo") != nullptr);
   CHECK(b->finish_frame(*first, 6, pts(6)).status().domain() ==
         vkc::Status::Code::InvalidArgument);
   const vkc::Result<codec_stream::SentFrame> redone =
@@ -874,7 +875,7 @@ int decode_off(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 }
 
 int gpu_main(vkc::test::GpuContext& gpu) {
-  const Sphere sphere{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  const Sphere sphere{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> source = sphere_grid(gpu, sphere);
   CHECK(source.ok());
   GridShape coarser;
@@ -882,7 +883,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<vol::VoxelBlockGrid> other = sphere_grid(gpu, sphere, coarser);
   CHECK(other.ok());
 
-  vkc::test::Scratch scratch("recon_codec_stream_");
+  vkc::test::Scratch scratch("grid_codec_stream_");
   CHECK(refused(gpu, scratch) == 0);
   CHECK(writes_nothing(gpu, *source, scratch) == 0);
 
@@ -916,12 +917,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(unrecorded_unserved(gpu, *source, scratch) == 0);
   CHECK(refused_publish(gpu, *source, scratch) == 0);
   CHECK(decode_off(gpu, *source, scratch) == 0);
-  std::puts("recon_codec_stream: OK");
+  std::puts("grid_codec_stream: OK");
   return 0;
 }
 
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

@@ -11,11 +11,11 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief Count each triangle's candidate blocks, as an exclusive prefix sum.
 ///
@@ -57,10 +57,10 @@ namespace volumetric_kit::recon::volume {
 ///         @p indices with triangles to read, an index at or past
 ///         @p vertex_count, or a total past 2^32 (a mesh grossly mis-scaled
 ///         against the grid -- millimetres read as metres, say).
-VR_VOLUME_API core::Result<std::vector<std::uint32_t>>
+VGRID_VOLUME_API core::Result<std::vector<std::uint32_t>>
 triangle_candidate_offsets(const VoxelGridParams& grid, const Vec3f* vertices,
                            std::uint32_t vertex_count,
                            const std::uint32_t* indices,
                            std::uint32_t triangle_count, const char* who);
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

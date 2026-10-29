@@ -3,12 +3,12 @@
 
 // The voxel grid's device contract, volume/shaders/grid_types.glsl, against
 // volume's host types on the device (shaders/grid_types_cases.comp), built
-// through the include root recon_volume exports, as a consumer's kernel is:
+// through the include root grid_volume exports, as a consumer's kernel is:
 //
-//   * vrTickAfter is volume::tick_after on every case, across the clock's
+//   * vgridTickAfter is volume::tick_after on every case, across the clock's
 //     wrap;
-//   * vrLocalBase inverts the in-block index, x + bs (y + bs z), and
-//     vrLocalIndex gives it back, for every voxel of five block sizes;
+//   * vgridLocalBase inverts the in-block index, x + bs (y + bs z), and
+//     vgridLocalIndex gives it back, for every voxel of five block sizes;
 //   * VoxelGridParams, BlockIndex and BlockStamp read every field of the host
 //     PODs at its offset, under scalar block layout.
 //
@@ -24,16 +24,16 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
 #include "grid_types_cases_comp.spv.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
-namespace vol = volumetric_kit::recon::volume;
+namespace vgrid = volumetric_kit::grid;
+namespace vol = volumetric_kit::grid::volume;
 namespace vkc = volumetric_kit::core;
 
 namespace {
@@ -81,8 +81,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   const std::vector<glm::uvec2> locals = local_cases();
   Structs structs{};
   structs.grid = {0.0125f, 8, 512, 0.04f, 4, 1024, 4096, 128};
-  structs.blocks[0] = {vr::Vec3i(-3, 17, -2147483647), 512};
-  structs.blocks[1] = {vr::Vec3i(2147483647, -1, 0), -1};
+  structs.blocks[0] = {vgrid::Vec3i(-3, 17, -2147483647), 512};
+  structs.blocks[1] = {vgrid::Vec3i(2147483647, -1, 0), -1};
   structs.stamps[0] = {1u, 0xFFFFFFFFu, 0x80000000u};
   structs.stamps[1] = {7u, 0u, 123456789u};
   const auto n_ticks = static_cast<std::uint32_t>(ticks.size());
@@ -92,8 +92,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::ComputeKernel kernel;
   vkc::KernelSetBuilder builder(gpu.device);
   CHECK(builder
-            .add(kernel, "grid_types_cases", vr_grid_types_cases_comp_spv,
-                 vr_grid_types_cases_comp_spv_size, 6)
+            .add(kernel, "grid_types_cases", vgrid_grid_types_cases_comp_spv,
+                 vgrid_grid_types_cases_comp_spv_size, 6)
             .ok());
   auto pool = builder.build();
   auto ticks_buf = vkc::test::upload_device_buffer(
@@ -176,7 +176,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
   CHECK(failures == 0);
   std::printf(
-      "recon volume grid types: %u tick cases, %u in-block voxels and %u "
+      "grid volume grid types: %u tick cases, %u in-block voxels and %u "
       "struct fields matched the host's\n",
       n_ticks, n_locals, kFields);
   return 0;
@@ -185,5 +185,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

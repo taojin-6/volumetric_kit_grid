@@ -1,5 +1,5 @@
-#ifndef VR_MARCHING_CUBES_COMMON_GLSL
-#define VR_MARCHING_CUBES_COMMON_GLSL
+#ifndef VGRID_MARCHING_CUBES_COMMON_GLSL
+#define VGRID_MARCHING_CUBES_COMMON_GLSL
 
 // Shared marching-cubes per-cell body for the two sparse kernels:
 // marching_cubes_sparse.comp (three private vertices per triangle) and
@@ -273,4 +273,4 @@ void mcWriteTriangle(int cube_index, int t, float sdf[8], vec3 corner_color[8],
   mcWriteVertex(vbase + 2u, p[1], normal, col[1]);
 }
 
-#endif  // VR_MARCHING_CUBES_COMMON_GLSL
+#endif  // VGRID_MARCHING_CUBES_COMMON_GLSL

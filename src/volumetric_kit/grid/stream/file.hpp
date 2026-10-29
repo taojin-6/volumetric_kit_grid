@@ -16,7 +16,7 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
 
-namespace volumetric_kit::recon::stream::detail {
+namespace volumetric_kit::grid::stream::detail {
 
 // "<api>: <what> <path>: <the system's reason>", in the domain `error` says:
 // NotFound for a missing file or directory, InvalidArgument for something
@@ -66,4 +66,4 @@ core::Status close_file(std::string_view api, const std::string& path,
 core::Status read_at(std::string_view api, const std::string& path, int fd,
                      std::uint64_t offset, void* out, std::size_t size);
 
-}  // namespace volumetric_kit::recon::stream::detail
+}  // namespace volumetric_kit::grid::stream::detail

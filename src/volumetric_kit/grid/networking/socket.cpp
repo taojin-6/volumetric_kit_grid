@@ -24,7 +24,7 @@
 #include <memory>
 #include <system_error>
 
-namespace volumetric_kit::recon::networking::detail {
+namespace volumetric_kit::grid::networking::detail {
 namespace {
 
 #ifdef __APPLE__
@@ -300,4 +300,4 @@ core::Result<Received> receive_some(std::string_view api, int fd,
   }
 }
 
-}  // namespace volumetric_kit::recon::networking::detail
+}  // namespace volumetric_kit::grid::networking::detail

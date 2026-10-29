@@ -15,22 +15,22 @@
 #include <cstdio>
 #include <vector>
 
-#include "device_blocks.hpp"
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
 namespace codec_fixture {
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 constexpr float kVoxel = 0.005f;
 constexpr float kTrunc = 0.04f;
@@ -85,13 +85,13 @@ inline vkc::Result<std::vector<vol::BlockIndex>> active_sorted(
 }
 
 inline vkc::Status allocate(Gpu& gpu, vol::VoxelBlockGrid& grid,
-                            const std::vector<vr::Vec3i>& coords) {
+                            const std::vector<vgrid::Vec3i>& coords) {
   std::vector<vol::BlockIndex> blocks(coords.size());
   for (std::size_t i = 0; i < coords.size(); ++i) {
     blocks[i].coord = coords[i];
   }
   VKC_ASSIGN(const std::uint32_t failed,
-             vr_test::allocate_blocks(gpu, grid.map(), blocks));
+             vgrid_test::allocate_blocks(gpu, grid.map(), blocks));
   if (failed != 0) {
     return vkc::Status::out_of_memory("fixture: allocation failed");
   }
@@ -100,21 +100,22 @@ inline vkc::Status allocate(Gpu& gpu, vol::VoxelBlockGrid& grid,
 
 // A sphere: centre and radius in metres.
 struct Sphere {
-  vr::Vec3f centre;
+  vgrid::Vec3f centre;
   float radius;
   // Signed distance of a world point to the surface.
-  float sdf(const vr::Vec3f& p) const {
-    const vr::Vec3f d = p - centre;
+  float sdf(const vgrid::Vec3f& p) const {
+    const vgrid::Vec3f d = p - centre;
     return std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z) - radius;
   }
 };
 
 // Every block whose voxels come within the truncation band of the sphere.
-inline std::vector<vr::Vec3i> band_blocks(const Sphere& s, float voxel = kVoxel,
-                                          float trunc = kTrunc) {
+inline std::vector<vgrid::Vec3i> band_blocks(const Sphere& s,
+                                             float voxel = kVoxel,
+                                             float trunc = kTrunc) {
   const float block = 8 * voxel;
   const float reach = s.radius + trunc + 2 * block;
-  std::vector<vr::Vec3i> out;
+  std::vector<vgrid::Vec3i> out;
   const int lo_x = int(std::floor((s.centre.x - reach) / block));
   const int hi_x = int(std::ceil((s.centre.x + reach) / block));
   const int lo_y = int(std::floor((s.centre.y - reach) / block));
@@ -126,13 +127,13 @@ inline std::vector<vr::Vec3i> band_blocks(const Sphere& s, float voxel = kVoxel,
       for (int x = lo_x; x <= hi_x; ++x) {
         bool near = false;
         for (int v = 0; v < int(kVpb) && !near; ++v) {
-          const vr::Vec3f p(float(x * 8 + v % 8) * voxel,
-                            float(y * 8 + (v / 8) % 8) * voxel,
-                            float(z * 8 + v / 64) * voxel);
+          const vgrid::Vec3f p(float(x * 8 + v % 8) * voxel,
+                               float(y * 8 + (v / 8) % 8) * voxel,
+                               float(z * 8 + v / 64) * voxel);
           near = std::fabs(s.sdf(p)) <= trunc;
         }
         if (near) {
-          out.push_back(vr::Vec3i(x, y, z));
+          out.push_back(vgrid::Vec3i(x, y, z));
         }
       }
     }
@@ -149,44 +150,45 @@ template <typename Sdf>
 vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf,
                         bool observe_all = false) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vol::kTsdfAttribute, active));
-  VKC_ASSIGN(vr_test::AttributeSpan<float> weight,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vol::kWeightAttribute, active));
+  VKC_ASSIGN(vgrid_test::AttributeSpan<float> tsdf,
+             vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                          vol::kTsdfAttribute, active));
+  VKC_ASSIGN(vgrid_test::AttributeSpan<float> weight,
+             vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                          vol::kWeightAttribute, active));
   const float voxel = grid.grid().voxel_size;
   const float trunc = grid.grid().trunc_dist;
   for (const vol::BlockIndex& b : active) {
     const std::size_t at = std::size_t(b.ptr) - tsdf.first;
     for (std::uint32_t v = 0; v < kVpb; ++v) {
-      const vr::Vec3f p(float(b.coord.x * 8 + int(v % 8)) * voxel,
-                        float(b.coord.y * 8 + int((v / 8) % 8)) * voxel,
-                        float(b.coord.z * 8 + int(v / 64)) * voxel);
+      const vgrid::Vec3f p(float(b.coord.x * 8 + int(v % 8)) * voxel,
+                           float(b.coord.y * 8 + int((v / 8) % 8)) * voxel,
+                           float(b.coord.z * 8 + int(v / 64)) * voxel);
       const float d = sdf(p);
       const bool obs = observe_all || std::fabs(d) <= trunc;
       tsdf.values[at + v] = obs ? std::clamp(d, -trunc, trunc) : 0.0f;
       weight.values[at + v] = obs ? 2.0f : 0.0f;
     }
   }
-  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid,
-                              vol::kTsdfAttribute, tsdf));
-  return vr_test::write_span(gpu.device, gpu.allocator, grid,
-                             vol::kWeightAttribute, weight);
+  VKC_TRY(vgrid_test::write_span(gpu.device, gpu.allocator, grid,
+                                 vol::kTsdfAttribute, tsdf));
+  return vgrid_test::write_span(gpu.device, gpu.allocator, grid,
+                                vol::kWeightAttribute, weight);
 }
 
 // write_field of one sphere.
 inline vkc::Status write_sphere(Gpu& gpu, vol::VoxelBlockGrid& grid,
                                 const Sphere& s) {
-  return write_field(gpu, grid, [&s](const vr::Vec3f& p) { return s.sdf(p); });
+  return write_field(gpu, grid,
+                     [&s](const vgrid::Vec3f& p) { return s.sdf(p); });
 }
 
 // The band blocks of every sphere in @p spheres, each coordinate once.
-inline std::vector<vr::Vec3i> union_blocks(const std::vector<Sphere>& spheres,
-                                           const GridShape& shape = {}) {
-  std::vector<vr::Vec3i> coords;
+inline std::vector<vgrid::Vec3i> union_blocks(
+    const std::vector<Sphere>& spheres, const GridShape& shape = {}) {
+  std::vector<vgrid::Vec3i> coords;
   for (const Sphere& s : spheres) {
-    for (const vr::Vec3i& c :
+    for (const vgrid::Vec3i& c :
          band_blocks(s, shape.voxel_size, shape.trunc_dist)) {
       if (std::find(coords.begin(), coords.end(), c) == coords.end()) {
         coords.push_back(c);
@@ -203,7 +205,7 @@ inline vkc::Result<vol::VoxelBlockGrid> two_sphere_grid(
     Gpu& gpu, const Sphere& a, const Sphere& b, const GridShape& shape = {}) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
   VKC_TRY(allocate(gpu, grid, union_blocks({a, b}, shape)));
-  VKC_TRY(write_field(gpu, grid, [&a, &b](const vr::Vec3f& p) {
+  VKC_TRY(write_field(gpu, grid, [&a, &b](const vgrid::Vec3f& p) {
     return std::min(a.sdf(p), b.sdf(p));
   }));
   return grid;
@@ -212,10 +214,10 @@ inline vkc::Result<vol::VoxelBlockGrid> two_sphere_grid(
 // A sphere that moves and grows beside one that stays, at step @p t.
 inline vkc::Result<vol::VoxelBlockGrid> chain_grid(Gpu& gpu, int t) {
   const Sphere moving{
-      vr::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
+      vgrid::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
       0.07f + 0.002f * float(t)};
   return two_sphere_grid(gpu, moving,
-                         Sphere{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
+                         Sphere{vgrid::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f});
 }
 
 // --- True signed distances (EncoderConfig::true_sdf). ----------------------
@@ -233,7 +235,7 @@ inline GridShape wide_band() {
 // the near rule keeps those 8 blocks.
 inline Sphere speck(int b) {
   const float c = (8.0f * float(b) - 0.5f) * kVoxel;
-  return Sphere{vr::Vec3f(c, c, c), 0.3f * kVoxel};
+  return Sphere{vgrid::Vec3f(c, c, c), 0.3f * kVoxel};
 }
 
 // A sphere's distance with a curtain: negated in a slab more than 20 mm out
@@ -246,14 +248,14 @@ struct Curtain {
   Sphere sphere;
   bool with_speck = true;
   float slab_y = 0.0f;
-  float sdf(const vr::Vec3f& p) const {
+  float sdf(const vgrid::Vec3f& p) const {
     const float d = sphere.sdf(p);
-    const vr::Vec3f q = p - sphere.centre;
+    const vgrid::Vec3f q = p - sphere.centre;
     const float field =
         d > 0.02f && q.x > 0.0f && std::fabs(q.y - slab_y) < 0.0175f ? -d : d;
     return with_speck ? std::min(field, speck(10).sdf(p)) : field;
   }
-  std::vector<vr::Vec3i> blocks(const GridShape& shape) const {
+  std::vector<vgrid::Vec3i> blocks(const GridShape& shape) const {
     return with_speck ? union_blocks({sphere, speck(10)}, shape)
                       : union_blocks({sphere}, shape);
   }
@@ -265,11 +267,11 @@ inline vkc::Result<vol::VoxelBlockGrid> curtain_grid(
     Gpu& gpu, const Curtain& c, const GridShape& shape = wide_band(),
     bool in_order = true) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
-  std::vector<vr::Vec3i> coords = c.blocks(shape);
+  std::vector<vgrid::Vec3i> coords = c.blocks(shape);
   if (!in_order) std::reverse(coords.begin(), coords.end());
   VKC_TRY(allocate(gpu, grid, coords));
   VKC_TRY(
-      write_field(gpu, grid, [&c](const vr::Vec3f& p) { return c.sdf(p); }));
+      write_field(gpu, grid, [&c](const vgrid::Vec3f& p) { return c.sdf(p); }));
   return grid;
 }
 
@@ -277,9 +279,9 @@ inline vkc::Result<vol::VoxelBlockGrid> curtain_grid(
 // `extra` blocks far from it that are allocated and never observed.
 inline vkc::Result<vol::VoxelBlockGrid> sphere_grid(
     Gpu& gpu, const Sphere& s, const GridShape& shape = {},
-    const std::vector<vr::Vec3i>& extra = {}) {
+    const std::vector<vgrid::Vec3i>& extra = {}) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
-  std::vector<vr::Vec3i> coords =
+  std::vector<vgrid::Vec3i> coords =
       band_blocks(s, shape.voxel_size, shape.trunc_dist);
   coords.insert(coords.end(), extra.begin(), extra.end());
   VKC_TRY(allocate(gpu, grid, coords));
@@ -290,7 +292,7 @@ inline vkc::Result<vol::VoxelBlockGrid> sphere_grid(
 // Per active block, its tsdf and weight -- a grid's full observable state,
 // for "nothing changed" checks.
 struct Snapshot {
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   std::vector<float> tsdf;
   std::vector<float> weight;
   bool operator==(const Snapshot& o) const {
@@ -300,15 +302,15 @@ struct Snapshot {
 
 inline vkc::Result<Snapshot> snapshot(Gpu& gpu, vol::VoxelBlockGrid& grid) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VKC_ASSIGN(const vr_test::AttributeSpan<float> tsdf,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vol::kTsdfAttribute, active));
-  VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vol::kWeightAttribute, active));
+  VKC_ASSIGN(const vgrid_test::AttributeSpan<float> tsdf,
+             vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                          vol::kTsdfAttribute, active));
+  VKC_ASSIGN(const vgrid_test::AttributeSpan<float> weight,
+             vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                          vol::kWeightAttribute, active));
   Snapshot out;
   for (const vol::BlockIndex& b : active) {
-    const auto at = [&](const vr_test::AttributeSpan<float>& a) {
+    const auto at = [&](const vgrid_test::AttributeSpan<float>& a) {
       return a.values.begin() + std::ptrdiff_t(std::size_t(b.ptr) - a.first);
     };
     out.coords.push_back(b.coord);

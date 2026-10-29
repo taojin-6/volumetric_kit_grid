@@ -30,7 +30,7 @@
 #include <memory>
 #include <vector>
 
-namespace volumetric_kit::recon::networking::detail {
+namespace volumetric_kit::grid::networking::detail {
 
 // A record's whole chunk (stream::ChunkEncoder's header, the payload and its
 // padding), shared by the log and every viewer sending it.
@@ -132,4 +132,4 @@ class GopLog {
   std::uint64_t key_wanted_ = 0;
 };
 
-}  // namespace volumetric_kit::recon::networking::detail
+}  // namespace volumetric_kit::grid::networking::detail

@@ -35,26 +35,26 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace vol = volumetric_kit::grid::volume;
+namespace mesh = volumetric_kit::grid::mesh;
 
 namespace {
 
@@ -244,23 +244,23 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       for (int y = r.lo[1]; y <= r.hi[1]; ++y) {
         for (int x = r.lo[0]; x <= r.hi[0]; ++x) {
           vol::BlockIndex b{};
-          b.coord = vr::Vec3i(x, y, z);
+          b.coord = vgrid::Vec3i(x, y, z);
           blocks.push_back(b);
         }
       }
     }
   }
   vkc::Result<std::uint32_t> failed =
-      vr_test::allocate_blocks(gpu, grid.map(), blocks);
+      vgrid_test::allocate_blocks(gpu, grid.map(), blocks);
   CHECK(failed.ok() && failed.value() == 0);
   vkc::Result<std::vector<vol::BlockIndex>> active =
       grid.map().compact_active_blocks();
   CHECK(active.ok() && active.value().size() == blocks.size());
-  auto tsdf = vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                             vol::kTsdfAttribute);
-  auto weight = vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                               vol::kWeightAttribute);
-  auto color = vr_test::read_attribute<std::uint32_t>(
+  auto tsdf = vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                                vol::kTsdfAttribute);
+  auto weight = vgrid_test::read_attribute<float>(gpu.device, gpu.allocator,
+                                                  grid, vol::kWeightAttribute);
+  auto color = vgrid_test::read_attribute<std::uint32_t>(
       gpu.device, gpu.allocator, grid, vol::kColorAttribute);
   CHECK(tsdf.ok() && weight.ok() && color.ok());
 
@@ -285,14 +285,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         }
       }
     }
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kTsdfAttribute, tsdf.value())
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kTsdfAttribute, tsdf.value())
               .ok());
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kWeightAttribute, weight.value())
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kWeightAttribute, weight.value())
               .ok());
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kColorAttribute, color.value())
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kColorAttribute, color.value())
               .ok());
 
     for (const bool share : {false, true}) {
@@ -318,5 +318,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

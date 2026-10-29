@@ -17,24 +17,24 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "volume_hash_oracle.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -47,7 +47,7 @@ std::vector<vol::BlockIndex> cube(int cx, int cy, int cz) {
     for (int y = -1; y <= 1; ++y) {
       for (int z = -1; z <= 1; ++z) {
         vol::BlockIndex block{};
-        block.coord = vr::Vec3i(cx + x, cy + y, cz + z);
+        block.coord = vgrid::Vec3i(cx + x, cy + y, cz + z);
         out.push_back(block);
       }
     }
@@ -63,7 +63,7 @@ std::vector<vol::BlockIndex> block_grid(int base, int side) {
     for (int y = 0; y < side; ++y) {
       for (int z = 0; z < side; ++z) {
         vol::BlockIndex block{};
-        block.coord = vr::Vec3i(base + x, base + y, base + z);
+        block.coord = vgrid::Vec3i(base + x, base + y, base + z);
         out.push_back(block);
       }
     }
@@ -142,7 +142,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   for (const vol::BlockIndex& b : a) {
     want.insert({b.coord.x, b.coord.y, b.coord.z});
   }
-  vkc::Result<std::uint32_t> alloc_a = vr_test::allocate_blocks(gpu, map, a);
+  vkc::Result<std::uint32_t> alloc_a = vgrid_test::allocate_blocks(gpu, map, a);
   CHECK(alloc_a.ok() && alloc_a.value() == 0);
 
   // Snapshot each block's index before growing; the rehash must preserve it
@@ -179,7 +179,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   for (const vol::BlockIndex& block : b) {
     want.insert({block.coord.x, block.coord.y, block.coord.z});
   }
-  vkc::Result<std::uint32_t> alloc_b = vr_test::allocate_blocks(gpu, map, b);
+  vkc::Result<std::uint32_t> alloc_b = vgrid_test::allocate_blocks(gpu, map, b);
   CHECK(alloc_b.ok() && alloc_b.value() == 0);
   vkc::Result<std::set<Coord>> both = active_set(map);
   CHECK(both.ok());
@@ -201,7 +201,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   std::uint32_t big_failed = 1;
   for (int pass = 0; pass < 8 && big_failed != 0; ++pass) {
     vkc::Result<std::uint32_t> alloc_big =
-        vr_test::allocate_blocks(gpu, map, big);
+        vgrid_test::allocate_blocks(gpu, map, big);
     CHECK(alloc_big.ok());
     big_failed = alloc_big.value();
   }
@@ -253,9 +253,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> clash;
     std::set<std::uint32_t> old_buckets;
     for (int i = 0; i < 4096 && clash.size() < 5; ++i) {
-      const vr::Vec3i c(i % 64, i / 64, 0);
-      if (vr_test::hash_bucket(c, 9) == 0 &&
-          old_buckets.insert(vr_test::hash_bucket(c, 8)).second) {
+      const vgrid::Vec3i c(i % 64, i / 64, 0);
+      if (vgrid_test::hash_bucket(c, 9) == 0 &&
+          old_buckets.insert(vgrid_test::hash_bucket(c, 8)).second) {
         vol::BlockIndex block{};
         block.coord = c;
         clash.push_back(block);
@@ -264,7 +264,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(clash.size() == 5);
     vol::RecordedRounds recorded;
     if (unsettled) {
-      auto list = vr_test::detail::device_coords(gpu, clash.data(), 5);
+      auto list = vgrid_test::detail::device_coords(gpu, clash.data(), 5);
       const std::uint32_t five = 5;
       auto count = vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
                                                    &five, sizeof(five));
@@ -276,7 +276,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       CHECK(small.allocated_blocks() == 0);
     } else {
       vkc::Result<std::uint32_t> placed =
-          vr_test::allocate_blocks(gpu, small, clash.data(), 5);
+          vgrid_test::allocate_blocks(gpu, small, clash.data(), 5);
       CHECK(placed.ok() && placed.value() == 0);
     }
     const vkc::Status grow = small.resize(9);
@@ -295,15 +295,15 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // own, takes the next free index and reads the counter back.
     vol::BlockIndex sixth{};
     for (int i = 0; i < 4096; ++i) {
-      const vr::Vec3i c(i % 64, i / 64, 1);
-      if (old_buckets.count(vr_test::hash_bucket(c, 8)) == 0) {
+      const vgrid::Vec3i c(i % 64, i / 64, 1);
+      if (old_buckets.count(vgrid_test::hash_bucket(c, 8)) == 0) {
         sixth.coord = c;
         break;
       }
     }
-    CHECK(old_buckets.count(vr_test::hash_bucket(sixth.coord, 8)) == 0);
+    CHECK(old_buckets.count(vgrid_test::hash_bucket(sixth.coord, 8)) == 0);
     vkc::Result<std::uint32_t> placed_sixth =
-        vr_test::allocate_blocks(gpu, small, &sixth, 1);
+        vgrid_test::allocate_blocks(gpu, small, &sixth, 1);
     CHECK(placed_sixth.ok() && placed_sixth.value() == 0);
     CHECK(occupancy_is(small, 6));
     vkc::Result<std::map<Coord, std::int32_t>> six = active_ptrs(small);
@@ -311,7 +311,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
 
   std::printf(
-      "recon volume resize test passed: grew 256 -> 1024 buckets, %zu blocks "
+      "grid volume resize test passed: grew 256 -> 1024 buckets, %zu blocks "
       "survived, and %zu blocks (past the old 2048 capacity) allocated\n",
       both.value().size(), grown.value().size());
   return 0;
@@ -320,5 +320,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

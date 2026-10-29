@@ -17,7 +17,7 @@
 
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 namespace vkc = volumetric_kit::core;
 
@@ -106,4 +106,4 @@ inline void print_stage_rows(const std::string& title,
   std::fputs(format_stage_rows(title, rows, per, indent).c_str(), stdout);
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

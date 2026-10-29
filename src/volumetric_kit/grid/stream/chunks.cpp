@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -13,7 +13,7 @@
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 namespace {
 
 static_assert(sizeof(ChunkEncoder::RecordFraming::header) ==
@@ -286,4 +286,4 @@ core::Status ChunkParser::fail_on_exception() noexcept {
   return core::exception_status(kParser, core::Status::Code::InvalidArgument);
 }
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

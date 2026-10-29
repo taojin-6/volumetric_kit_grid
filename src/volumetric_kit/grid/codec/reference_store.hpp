@@ -25,11 +25,11 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// @brief Where the next frame's blocks go, as @ref ReferenceStore::reserve
 ///        last sized them: the store's spare, and the apply's sources. The
@@ -72,7 +72,7 @@ struct FrameBuffers {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
-class VR_CODEC_API ReferenceStore {
+class VGRID_CODEC_API ReferenceStore {
  public:
   /// @brief Build the apply's and the diff's kernels and the store's first,
   ///        smallest buffers.
@@ -154,7 +154,7 @@ class VR_CODEC_API ReferenceStore {
   ///         reference's.
   core::Result<ResidentBlocks> record_apply(
       core::CommandBatch& batch, const ResidentBlocks& payload, std::uint32_t n,
-      const recon::detail::IndirectSlices& slices,
+      const volumetric_kit::grid::detail::IndirectSlices& slices,
       core::GpuStageScope* stage = nullptr);
 
   /// @return The blocks the last @ref record_apply found a source past what
@@ -250,4 +250,4 @@ class VR_CODEC_API ReferenceStore {
   FrameReference reference_;
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

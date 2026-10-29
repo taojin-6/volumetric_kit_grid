@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
 
 #include <atomic>
 #include <new>
@@ -22,7 +22,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 namespace detail {
 
 // What the halves need of a recorded frame: the reference a P-frame is
@@ -392,4 +392,4 @@ core::Result<EncodedFrame> Encoder::finish_frame(
   return frame;
 }
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

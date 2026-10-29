@@ -4,8 +4,8 @@
 #pragma once
 
 // Indirect slices whose sizes the host writes, for a test that records a pass
-// the decoder sizes on the device (recon::detail::IndirectSlices). Reaches
-// the internal core/dispatch.hpp by src/.
+// the decoder sizes on the device (vgrid::detail::IndirectSlices,
+// base/dispatch.hpp).
 
 #include <cstdint>
 #include <vector>
@@ -15,9 +15,9 @@
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
 
-namespace vr_test {
+namespace vgrid_test {
 
 namespace vkc = volumetric_kit::core;
 
@@ -28,7 +28,7 @@ struct HostSlices {
   std::uint32_t per_dispatch = 0;
   std::uint32_t lanes = 1;
 
-  volumetric_kit::recon::detail::IndirectSlices slices() const {
+  volumetric_kit::grid::detail::IndirectSlices slices() const {
     return {&buffer, 0, dispatches, per_dispatch, lanes};
   }
 };
@@ -36,7 +36,7 @@ struct HostSlices {
 inline vkc::Result<HostSlices> host_slices(const vkc::test::Gpu& gpu,
                                            std::uint32_t items,
                                            std::uint32_t lanes) {
-  namespace rd = volumetric_kit::recon::detail;
+  namespace rd = volumetric_kit::grid::detail;
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(gpu.device.physical_device(), &props);
   HostSlices out;
@@ -62,4 +62,4 @@ inline vkc::Result<HostSlices> host_slices(const vkc::test::Gpu& gpu,
   return out;
 }
 
-}  // namespace vr_test
+}  // namespace vgrid_test

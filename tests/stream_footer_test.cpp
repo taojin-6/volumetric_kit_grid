@@ -26,15 +26,15 @@
 #include <utility>
 #include <vector>
 
-#include "stream_files.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
 
 namespace {
 
@@ -589,7 +589,7 @@ int huge_index_case(const std::string& dir) {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_stream_footer_");
+  vkc::test::Scratch scratch("grid_stream_footer_");
   const std::string dir = scratch.path.string();
   if (footer_equals_scan_case(dir) != 0) return 1;
   if (forged_footer_case(dir) != 0) return 1;

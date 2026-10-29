@@ -11,7 +11,7 @@
 
 #include "volumetric_kit/core/config/config.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 namespace config = volumetric_kit::core::config;
 
@@ -44,4 +44,4 @@ int configured_main(int argc, char** argv, config::Application application,
   return std::forward<Run>(run)(settings.value());
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

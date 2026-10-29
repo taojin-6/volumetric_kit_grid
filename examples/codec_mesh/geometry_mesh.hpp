@@ -5,15 +5,15 @@
 
 // codec_mesh's input as the host mesh the evaluator and the PLY writer take.
 
-#include "volumetric_kit/recon/io/triangle_mesh.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/mesh_io/triangle_mesh.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 
 /// Convert positions to the evaluator/exporter's host mesh container, with
 /// area-weighted vertex normals.
-vr::mesh::Mesh geometry_mesh(const vr::io::TriangleMesh& geometry);
+vgrid::mesh::Mesh geometry_mesh(const vgrid::mesh_io::TriangleMesh& geometry);
 
-}  // namespace vr_example
+}  // namespace vgrid_example

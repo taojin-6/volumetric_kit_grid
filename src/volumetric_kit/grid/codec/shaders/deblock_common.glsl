@@ -11,8 +11,8 @@
 // the grid's hash; its ptr is never read. deblock_flags.comp alone runs an
 // invocation a block.
 
-#ifndef VR_DEBLOCK_COMMON_GLSL
-#define VR_DEBLOCK_COMMON_GLSL
+#ifndef VGRID_DEBLOCK_COMMON_GLSL
+#define VGRID_DEBLOCK_COMMON_GLSL
 
 #extension GL_EXT_scalar_block_layout : require
 
@@ -25,20 +25,20 @@ const uint kMaskWords = 16u;
 const uint kShellVoxels = 296u;  // kBlockVoxels - 6^3
 
 // The set-0 bindings, mirroring `Binding` in deblock.cpp.
-#define VR_DEBLOCK_BINDING_BLOCKS 0
-#define VR_DEBLOCK_BINDING_MASKS 1
-#define VR_DEBLOCK_BINDING_ENTRIES 2
-#define VR_DEBLOCK_BINDING_TSDF 3
-#define VR_DEBLOCK_BINDING_WEIGHT 4
-#define VR_DEBLOCK_BINDING_STAMPS 5
-#define VR_DEBLOCK_BINDING_SHELL 6
-#define VR_DEBLOCK_BINDING_FULL 7
-#define VR_DEBLOCK_BINDING_EXACT 8
+#define VGRID_DEBLOCK_BINDING_BLOCKS 0
+#define VGRID_DEBLOCK_BINDING_MASKS 1
+#define VGRID_DEBLOCK_BINDING_ENTRIES 2
+#define VGRID_DEBLOCK_BINDING_TSDF 3
+#define VGRID_DEBLOCK_BINDING_WEIGHT 4
+#define VGRID_DEBLOCK_BINDING_STAMPS 5
+#define VGRID_DEBLOCK_BINDING_SHELL 6
+#define VGRID_DEBLOCK_BINDING_FULL 7
+#define VGRID_DEBLOCK_BINDING_EXACT 8
 
 // BlockIndex, BlockStamp and the read-only hash lookup from the volume tier
 // (one definition; see hash_lookup.glsl).
-#define VR_HASH_ENTRIES_BINDING VR_DEBLOCK_BINDING_ENTRIES
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#define VGRID_HASH_ENTRIES_BINDING VGRID_DEBLOCK_BINDING_ENTRIES
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in deblock.cpp; all 4-byte scalars, so scalar layout
 // places each at its host offset (68 bytes).
@@ -63,29 +63,29 @@ layout(push_constant, scalar) uniform PushConstants {
 }
 pc;
 
-layout(set = 0, binding = VR_DEBLOCK_BINDING_BLOCKS, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_BLOCKS, scalar) readonly buffer
     Blocks {
   BlockIndex blocks[];
 };
 // The frame's masks by list position: voxel l of entry e is bit l % 32 of
 // word e * kMaskWords + l / 32, as the inverse read them.
-layout(set = 0, binding = VR_DEBLOCK_BINDING_MASKS, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_MASKS, scalar) readonly buffer
     Masks {
   uint masks[];
 };
-layout(set = 0, binding = VR_DEBLOCK_BINDING_TSDF, scalar) buffer Tsdf {
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_TSDF, scalar) buffer Tsdf {
   float tsdf[];
 };
-layout(set = 0, binding = VR_DEBLOCK_BINDING_WEIGHT, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_WEIGHT, scalar) readonly buffer
     Weight {
   float weight[];
 };
-layout(set = 0, binding = VR_DEBLOCK_BINDING_STAMPS, scalar) buffer Stamps {
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_STAMPS, scalar) buffer Stamps {
   BlockStamp stamps[];
 };
 // The Gaussian's shell snapshot: kShellVoxels metres an entry, by list
 // position, kUnobserved where the store leaves tsdf as it is.
-layout(set = 0, binding = VR_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
   float shell[];
 };
 // The per-block fallback's flags, a word a slot of the grid's heap, zeroed
@@ -93,12 +93,12 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_SHELL, scalar) buffer Shell {
 // ones: fully observed, which the passes may write. A 0 is a masked block --
 // one holding an unobserved voxel, which keeps its exact decode -- or a slot
 // the frame does not list. Read by the dispatches after it alone.
-layout(set = 0, binding = VR_DEBLOCK_BINDING_FULL, scalar) buffer Full {
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_FULL, scalar) buffer Full {
   uint full[];
 };
 // The frame's masked blocks, counted by deblock_flags.comp into a word zeroed
 // before it: the blocks the deblock leaves as decoded.
-layout(set = 0, binding = VR_DEBLOCK_BINDING_EXACT, scalar) buffer
+layout(set = 0, binding = VGRID_DEBLOCK_BINDING_EXACT, scalar) buffer
     ExactBlocks {
   uint exact_blocks;
 };
@@ -107,13 +107,13 @@ layout(set = 0, binding = VR_DEBLOCK_BINDING_EXACT, scalar) buffer
 // entry the store skips. Observed values lie in [-1, 1] (metres within the
 // band), so the test below is exact; finite, so fast math keeps it.
 const float kUnobserved = 3.0e38;
-bool vrObserved(float v) { return v < 1.0e38; }
+bool vgridObserved(float v) { return v < 1.0e38; }
 
 // tsdf / trunc_dist correctly rounded, as the CPU's float division: the
 // product with the correctly rounded reciprocal is within an ulp, and one
 // fused residual step rounds it correctly (Markstein), whatever division
 // instruction fast math would pick.
-float vrNormalized(float t) {
+float vgridNormalized(float t) {
   precise float q = t * pc.inv_trunc;
   precise float r = fma(-q, pc.trunc_dist, t);
   precise float v = fma(r, pc.inv_trunc, q);
@@ -124,7 +124,7 @@ float vrNormalized(float t) {
 // kMaskWords mask words all ones. Each kernel asks it of its own entry first
 // thing, so a masked block's workgroup returns before it probes the hash:
 // every lane reads the same words, so the return is uniform.
-bool vrEntryFull(uint entry) {
+bool vgridEntryFull(uint entry) {
   uint all = ~0u;
   for (uint w = 0u; w < kMaskWords; ++w) {
     all &= masks[entry * kMaskWords + w];
@@ -136,7 +136,7 @@ bool vrEntryFull(uint entry) {
 // write it: a neighbour's flag. Every lane of a workgroup that asks of one
 // block reads the same word, which no dispatch after deblock_flags.comp
 // writes, so a return on it is uniform.
-bool vrFull(int ptr) {
+bool vgridFull(int ptr) {
   return full[uint(ptr) / kBlockVoxels] != 0u;
 }
 
@@ -144,7 +144,7 @@ bool vrFull(int ptr) {
 // block's kShellVoxels shell voxels in local-index order -- the z = 0 face,
 // then each z = 1..6 slice's 28-voxel ring, then the z = 7 face -- or
 // kShellVoxels for an interior voxel, which no neighbour's halo reaches.
-uint vrShellIndex(uvec3 p) {
+uint vgridShellIndex(uvec3 p) {
   if (p.z == 0u) return p.x + kEdge * p.y;
   if (p.z == kEdge - 1u) return 232u + p.x + kEdge * p.y;
   uint ring = 64u + 28u * (p.z - 1u);
@@ -157,8 +157,8 @@ uint vrShellIndex(uvec3 p) {
 
 // Stamp the block at voxel base @p ptr changed at the pass's tick. Atomic,
 // since a line pass's two workgroups may stamp one block.
-void vrStampChanged(int ptr) {
+void vgridStampChanged(int ptr) {
   atomicExchange(stamps[uint(ptr) / kBlockVoxels].changed, pc.tick);
 }
 
-#endif  // VR_DEBLOCK_COMMON_GLSL
+#endif  // VGRID_DEBLOCK_COMMON_GLSL

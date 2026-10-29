@@ -21,11 +21,11 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 
 /// @brief Build a grid to decode a stream into, from one of its frames.
 ///
@@ -50,7 +50,7 @@ namespace volumetric_kit::recon::codec {
 ///         @ref volume::VoxelBlockGrid::create's error, an allocation failure
 ///         included. Host allocation failures, including header diagnostics,
 ///         return `Status::Code::OutOfMemory`.
-VR_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
+VGRID_CODEC_API core::Result<volume::VoxelBlockGrid> make_decode_grid(
     core::Device& device, core::Allocator& allocator, const std::uint8_t* frame,
     std::size_t size, std::uint32_t max_blocks);
 
@@ -85,7 +85,7 @@ struct Finished {
 ///         grow cures; `Status::Code::InvalidArgument` for a frame or a grow
 ///         past @p max_blocks; or `volume::grow_grid`'s failure.
 /// @pre As @ref Decoder::record. A grow frees the grid's buffers at once.
-VR_CODEC_API core::Result<PendingDecode> record_growing(
+VGRID_CODEC_API core::Result<PendingDecode> record_growing(
     Decoder& decoder, core::CommandBatch& batch, const core::HostSlot& slot,
     std::size_t size, volume::VoxelBlockGrid& grid, std::uint32_t max_blocks,
     core::StageMetrics* metrics = nullptr);
@@ -106,7 +106,7 @@ VR_CODEC_API core::Result<PendingDecode> record_growing(
 /// @return What it did; or the last finish's error as @ref decode_growing
 ///         returns it, with the reference unchanged; or `volume::grow_grid`'s
 ///         failure.
-VR_CODEC_API core::Result<Finished> finish_growing(
+VGRID_CODEC_API core::Result<Finished> finish_growing(
     Decoder& decoder, const PendingDecode& pending,
     volume::VoxelBlockGrid& grid, std::uint32_t max_blocks,
     core::StageMetrics* metrics = nullptr);
@@ -148,12 +148,10 @@ VR_CODEC_API core::Result<Finished> finish_growing(
 ///         `Status::Code::OutOfMemory` at the device's largest grid; or
 ///         `Status::Code::OutOfMemory` for a host allocation failure before
 ///         the decode succeeds.
-VR_CODEC_API core::Status decode_growing(Decoder& decoder,
-                                         const std::uint8_t* frame,
-                                         std::size_t size,
-                                         volume::VoxelBlockGrid& grid,
-                                         std::uint32_t max_blocks,
-                                         core::StageMetrics* metrics = nullptr);
+VGRID_CODEC_API core::Status decode_growing(
+    Decoder& decoder, const std::uint8_t* frame, std::size_t size,
+    volume::VoxelBlockGrid& grid, std::uint32_t max_blocks,
+    core::StageMetrics* metrics = nullptr);
 
 /// @brief @ref decode_growing a record already in an input slot: one an
 ///        encoder's frame was copied into, head then payload, with no other
@@ -161,11 +159,9 @@ VR_CODEC_API core::Status decode_growing(Decoder& decoder,
 /// @param slot  From @ref Decoder::claim_input, the record at its start.
 /// @param size  The record's exact length.
 /// @return As the other form.
-VR_CODEC_API core::Status decode_growing(Decoder& decoder,
-                                         const core::HostSlot& slot,
-                                         std::size_t size,
-                                         volume::VoxelBlockGrid& grid,
-                                         std::uint32_t max_blocks,
-                                         core::StageMetrics* metrics = nullptr);
+VGRID_CODEC_API core::Status decode_growing(
+    Decoder& decoder, const core::HostSlot& slot, std::size_t size,
+    volume::VoxelBlockGrid& grid, std::uint32_t max_blocks,
+    core::StageMetrics* metrics = nullptr);
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

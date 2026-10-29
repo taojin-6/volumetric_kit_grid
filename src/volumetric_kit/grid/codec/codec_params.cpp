@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
 #include <cmath>
 #include <string>
 
 #include "dct_tables.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 namespace {
 
 core::Status check_step(std::size_t index, float step) {
@@ -53,4 +53,4 @@ core::Status CodecParams::validate() const {
   return {};
 }
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

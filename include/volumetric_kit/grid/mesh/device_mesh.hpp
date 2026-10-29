@@ -15,7 +15,7 @@
 #include "volumetric_kit/core/vulkan/sync.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 
-namespace volumetric_kit::recon::mesh {
+namespace volumetric_kit::grid::mesh {
 
 /// @brief A mesh still in the device buffers that produced it -- the handoff
 ///        between two GPU passes with no host copy in between.
@@ -186,4 +186,4 @@ struct DeviceMesh {
   }
 };
 
-}  // namespace volumetric_kit::recon::mesh
+}  // namespace volumetric_kit::grid::mesh

@@ -13,8 +13,8 @@
 // resolves to a vertex, an edge, or the interior without ever forming the plane
 // projection explicitly.
 
-#ifndef VR_TRIANGLE_COMMON_GLSL
-#define VR_TRIANGLE_COMMON_GLSL
+#ifndef VGRID_TRIANGLE_COMMON_GLSL
+#define VGRID_TRIANGLE_COMMON_GLSL
 
 // The closest point to `p` on triangle (a, b, c).
 //
@@ -33,7 +33,7 @@
 // lets the sum through with barycentrics that do not describe a point of the
 // triangle, they are clamped onto it, so the closest point is always one the
 // triangle actually has.
-vec3 vrClosestPointOnTriangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+vec3 vgridClosestPointOnTriangle(vec3 p, vec3 a, vec3 b, vec3 c) {
   vec3 ab = b - a;
   vec3 ac = c - a;
   vec3 ap = p - a;
@@ -83,9 +83,9 @@ vec3 vrClosestPointOnTriangle(vec3 p, vec3 a, vec3 b, vec3 c) {
 // Distance from `p` to triangle (a, b, c), with the closest point itself in
 // `closest` -- the mesh-to-SDF sign test needs the point, the allocation prune
 // needs only the distance, and computing one without the other saves nothing.
-float vrPointTriangleDistance(vec3 p, vec3 a, vec3 b, vec3 c, out vec3 closest) {
-  closest = vrClosestPointOnTriangle(p, a, b, c);
+float vgridPointTriangleDistance(vec3 p, vec3 a, vec3 b, vec3 c, out vec3 closest) {
+  closest = vgridClosestPointOnTriangle(p, a, b, c);
   return length(p - closest);
 }
 
-#endif  // VR_TRIANGLE_COMMON_GLSL
+#endif  // VGRID_TRIANGLE_COMMON_GLSL

@@ -37,14 +37,14 @@ std::string contents(std::FILE* file) {
 int main() {
   std::FILE* file = std::tmpfile();
   CHECK(file != nullptr);
-  const vkc::LogHandler handler = vr_example::info_log_handler(file);
+  const vkc::LogHandler handler = vgrid_example::info_log_handler(file);
   const std::string_view joined = "viewer 127.0.0.1:5 joined, 1 of 4, unread";
-  handler(vkc::LogLevel::Debug, "vr", "a debug line");
-  handler(vkc::LogLevel::Info, "vr", joined.substr(0, 33));
+  handler(vkc::LogLevel::Debug, "vgrid", "a debug line");
+  handler(vkc::LogLevel::Info, "vgrid", joined.substr(0, 33));
   handler(vkc::LogLevel::Warning, "core", "a warning");
   handler(vkc::LogLevel::Error, "gfx", "");
   CHECK(contents(file) ==
-        "[vr info] viewer 127.0.0.1:5 joined, 1 of 4\n"
+        "[vgrid info] viewer 127.0.0.1:5 joined, 1 of 4\n"
         "[core warning] a warning\n"
         "[gfx error] \n");
   std::fclose(file);
@@ -52,11 +52,11 @@ int main() {
   // Installed, it serves log_message.
   file = std::tmpfile();
   CHECK(file != nullptr);
-  vkc::set_log_handler(vr_example::info_log_handler(file));
-  vkc::log_message(vkc::LogLevel::Debug, "vr", "dropped");
-  vkc::log_message(vkc::LogLevel::Info, "vr", "viewer 127.0.0.1:5 left");
+  vkc::set_log_handler(vgrid_example::info_log_handler(file));
+  vkc::log_message(vkc::LogLevel::Debug, "vgrid", "dropped");
+  vkc::log_message(vkc::LogLevel::Info, "vgrid", "viewer 127.0.0.1:5 left");
   vkc::set_log_handler({});
-  CHECK(contents(file) == "[vr info] viewer 127.0.0.1:5 left\n");
+  CHECK(contents(file) == "[vgrid info] viewer 127.0.0.1:5 left\n");
   std::fclose(file);
 
   // Lines from 4 threads at once, each whole.
@@ -65,7 +65,7 @@ int main() {
   const std::string padding(200, 'x');
   file = std::tmpfile();
   CHECK(file != nullptr);
-  const vkc::LogHandler shared = vr_example::info_log_handler(file);
+  const vkc::LogHandler shared = vgrid_example::info_log_handler(file);
   std::vector<std::thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&, t] {

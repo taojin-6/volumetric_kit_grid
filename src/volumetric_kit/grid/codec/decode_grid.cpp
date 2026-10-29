@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -12,10 +12,10 @@
 
 #include "bitstream.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
-#include "volumetric_kit/recon/volume/grid_growth.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/grid_growth.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 namespace {
 
 // The grid's fewest buckets.
@@ -236,4 +236,4 @@ core::Status decode_growing(Decoder& decoder, const core::HostSlot& slot,
                                 core::Status::Code::OutOfMemory);
 }
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

@@ -21,11 +21,11 @@
 #include "dct_tables.hpp"
 #include "fnv1a.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
+namespace codec = volumetric_kit::grid::codec;
 using codec::kVoxelsPerBlock;
 using codec::detail::kBasisSize;
 using codec::detail::kEdge;
@@ -249,7 +249,7 @@ int zigzag_case() {
   // The whole table: FNV-1a over its 512 voxel indices (x + 8y + 64z), one
   // index per step, computed from zigzag_table.cuh's kZigZagOrder when the
   // order was ported. Any entry out of place changes it.
-  CHECK(vr_test::fnv1a(order) == 0x26fa5e49u);
+  CHECK(vgrid_test::fnv1a(order) == 0x26fa5e49u);
   return 0;
 }
 

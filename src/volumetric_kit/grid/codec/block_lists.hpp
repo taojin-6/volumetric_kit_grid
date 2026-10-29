@@ -23,10 +23,10 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// @brief Block lists in frame order, made on the device: the encoder's
 ///        observed blocks sorted by coordinate, and a decoded frame's blocks
@@ -59,7 +59,7 @@ namespace volumetric_kit::recon::codec::detail {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time.
-class VR_CODEC_API BlockLists {
+class VGRID_CODEC_API BlockLists {
  public:
   /// @brief Build the kernels.
   /// @return The lists, or a pipeline or pool failure.
@@ -196,4 +196,4 @@ class VR_CODEC_API BlockLists {
   core::Buffer diff_counts_;
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

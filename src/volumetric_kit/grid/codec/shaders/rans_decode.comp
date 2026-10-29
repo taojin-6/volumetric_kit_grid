@@ -16,12 +16,12 @@
 
 layout(local_size_x = 1) in;
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
 
 #include "rans_push.glsl"
 
-#define VR_FRAME_READER
+#define VGRID_FRAME_READER
 #include "frame_grammar.glsl"
 
 layout(set = 0, binding = 0, std430) readonly buffer Slots {

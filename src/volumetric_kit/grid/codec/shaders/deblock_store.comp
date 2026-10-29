@@ -21,11 +21,11 @@ void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup: a masked block's shell was not written.
-  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
+  if (entry >= pc.num_blocks || !vgridEntryFull(entry)) {
     return;
   }
   if (lane == 0u) {
-    s_ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+    s_ptr = vgridFindBlockPtr(blocks[entry].coord, pc.num_buckets,
                            pc.bucket_size, pc.max_chain);
     s_wrote = 0u;
   }
@@ -37,13 +37,13 @@ void main() {
   bool wrote = false;
   for (uint j = 0u; j < kBlockVoxels / kLanes; ++j) {
     uint l = lane + kLanes * j;
-    uint si = vrShellIndex(uvec3(l % kEdge, (l / kEdge) % kEdge,
+    uint si = vgridShellIndex(uvec3(l % kEdge, (l / kEdge) % kEdge,
                                  l / (kEdge * kEdge)));
     if (si == kShellVoxels) {
       continue;
     }
     float metres = shell[entry * kShellVoxels + si];
-    if (vrObserved(metres)) {
+    if (vgridObserved(metres)) {
       tsdf[uint(ptr) + l] = metres;
       wrote = true;
     }
@@ -53,6 +53,6 @@ void main() {
   }
   barrier();
   if (lane == 0u && s_wrote != 0u) {
-    vrStampChanged(ptr);
+    vgridStampChanged(ptr);
   }
 }

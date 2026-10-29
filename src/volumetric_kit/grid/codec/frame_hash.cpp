@@ -5,7 +5,7 @@
 
 #include <algorithm>
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 namespace {
 
 constexpr std::uint64_t kPrime1 = 0x9E3779B185EBCA87ull;
@@ -118,4 +118,4 @@ std::uint64_t frame_hash(const std::uint8_t* head, std::size_t head_size,
   return h.digest();
 }
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

@@ -4,7 +4,7 @@
 // Host-only PLY export checks. Read bytes directly to pin the public layout
 // and color encoding independently of the writer's backend. The writer's
 // sRGB encode is a copy of its own, held here to the voxel colour format's
-// curve (volume/voxel_color.hpp, which recon_volume_voxel_color pins to the
+// curve (volume/voxel_color.hpp, which grid_volume_voxel_color pins to the
 // published curve), code for code.
 
 #include <array>
@@ -19,12 +19,12 @@
 
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/io/ply_writer.hpp"
-#include "volumetric_kit/recon/volume/voxel_color.hpp"
+#include "volumetric_kit/grid/mesh_io/ply_writer.hpp"
+#include "volumetric_kit/grid/volume/voxel_color.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace vr = volumetric_kit::recon;
-namespace vol = volumetric_kit::recon::volume;
+namespace vgrid = volumetric_kit::grid;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -45,8 +45,8 @@ float read_float(const std::uint8_t* p) {
   return result;
 }
 
-vr::mesh::Mesh triangle() {
-  vr::mesh::Mesh mesh;
+vgrid::mesh::Mesh triangle() {
+  vgrid::mesh::Mesh mesh;
   mesh.vertices.resize(3);
   mesh.vertices[0].position = {1.25f, -2.0f, 3.5f};
   mesh.vertices[1].position = {4.0f, 5.25f, -6.0f};
@@ -100,13 +100,13 @@ std::vector<float> code_edges() {
 // srgb_code's.
 int check_srgb_parity(const std::string& path) {
   const std::vector<float> values = code_edges();
-  vr::mesh::Mesh mesh;
+  vgrid::mesh::Mesh mesh;
   mesh.vertices.resize(values.size() / 3);
   for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
     mesh.vertices[i].color = {values[3 * i], values[3 * i + 1],
                               values[3 * i + 2], 1.0f};
   }
-  CHECK(vr::io::write_ply(path, mesh));
+  CHECK(vgrid::mesh_io::write_ply(path, mesh));
   const auto bytes = read_bytes(path);
   const std::string text(bytes.begin(), bytes.end());
   const auto end = text.find("end_header\n");
@@ -130,10 +130,10 @@ int check_srgb_parity(const std::string& path) {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_io_ply_");
+  vkc::test::Scratch scratch("grid_io_ply_");
   const auto path = (scratch.path / "mesh.ply").string();
   const auto mesh = triangle();
-  CHECK(vr::io::write_ply(path, mesh));
+  CHECK(vgrid::mesh_io::write_ply(path, mesh));
   const auto bytes = read_bytes(path);
   const std::string text(bytes.begin(), bytes.end());
   const auto end = text.find("end_header\n");
@@ -171,7 +171,7 @@ int main() {
   // A refused mesh leaves the existing file intact.
   auto invalid = mesh;
   invalid.indices.back() = 3;
-  CHECK(!vr::io::write_ply(path, invalid));
+  CHECK(!vgrid::mesh_io::write_ply(path, invalid));
   CHECK(read_bytes(path) == bytes);
 
   CHECK(check_srgb_parity((scratch.path / "codes.ply").string()) == 0);

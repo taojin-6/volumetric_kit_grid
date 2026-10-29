@@ -5,17 +5,17 @@
 // rans_ops.comp: frame_grammar.glsl's writer half over the forward output,
 // in the order it emits them. The includer defines the two sinks.
 
-#ifndef VR_RANS_WALK_GLSL
-#define VR_RANS_WALK_GLSL
+#ifndef VGRID_RANS_WALK_GLSL
+#define VGRID_RANS_WALK_GLSL
 
 #extension GL_EXT_scalar_block_layout : require
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
 
 #include "rans_push.glsl"
 
-#define VR_FRAME_WRITER
+#define VGRID_FRAME_WRITER
 #include "frame_grammar.glsl"
 
 layout(set = 0, binding = 0, scalar) readonly buffer Blocks {
@@ -73,4 +73,4 @@ void walk_entry(uint p) {
   emit_block(first, prev, cur, pc.coefficient_count);
 }
 
-#endif  // VR_RANS_WALK_GLSL
+#endif  // VGRID_RANS_WALK_GLSL

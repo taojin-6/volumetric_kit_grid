@@ -15,7 +15,7 @@
 
 #include "volumetric_kit/core/base/log.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 /// @brief A log handler that writes each Info, Warning and Error message to
 ///        @p out as the core's default sink writes a line,
@@ -45,4 +45,4 @@ inline void print_info_log() {
   volumetric_kit::core::set_log_handler(info_log_handler(stderr));
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

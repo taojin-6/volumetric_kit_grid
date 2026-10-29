@@ -25,13 +25,13 @@
 #include <glm/glm.hpp>
 
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/eval/mesh_distance.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
+#include "volumetric_kit/grid/eval/mesh_distance.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace eval = volumetric_kit::recon::eval;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace eval = volumetric_kit::grid::eval;
+namespace mesh = volumetric_kit::grid::mesh;
 
 namespace {
 
@@ -44,8 +44,8 @@ vkc::Result<eval::MeshComparison> compare(
   return indexed.compare(test);
 }
 
-bool near(vr::Vec3f a, vr::Vec3f b, float eps = 1e-6f) {
-  return vr::length(a - b) <= eps;
+bool near(vgrid::Vec3f a, vgrid::Vec3f b, float eps = 1e-6f) {
+  return vgrid::length(a - b) <= eps;
 }
 
 bool near(double a, double b, double eps = 1e-6) {
@@ -60,7 +60,7 @@ mesh::Mesh plane(int n, float cell, float z, float keep_x = 1e9f) {
   for (int j = 0; j <= n; ++j) {
     for (int i = 0; i <= n; ++i) {
       mesh::Vertex v{};
-      v.position = vr::Vec3f(float(i) * cell, float(j) * cell, z);
+      v.position = vgrid::Vec3f(float(i) * cell, float(j) * cell, z);
       m.vertices.push_back(v);
     }
   }
@@ -110,8 +110,8 @@ struct Lcg {
 // The distance from p to triangle abc in double, where a thin triangle at room
 // coordinates is still well conditioned: to the face when p projects inside
 // it, else to the nearest edge.
-double triangle_distance(const vr::Vec3f& pf, const vr::Vec3f& af,
-                         const vr::Vec3f& bf, const vr::Vec3f& cf) {
+double triangle_distance(const vgrid::Vec3f& pf, const vgrid::Vec3f& af,
+                         const vgrid::Vec3f& bf, const vgrid::Vec3f& cf) {
   const glm::dvec3 p(pf), a(af), b(bf), c(cf);
   const auto segment = [&p](const glm::dvec3& u, const glm::dvec3& v) {
     const glm::dvec3 uv = v - u;
@@ -147,7 +147,7 @@ bool identical(const eval::MeshComparison& a, const eval::MeshComparison& b) {
 }
 
 int closest_point_case() {
-  const vr::Vec3f a(0, 0, 0), b(1, 0, 0), c(0, 1, 0);
+  const vgrid::Vec3f a(0, 0, 0), b(1, 0, 0), c(0, 1, 0);
   // Face interior: straight down.
   CHECK(near(eval::closest_point_on_triangle({0.25f, 0.25f, 1.0f}, a, b, c),
              {0.25f, 0.25f, 0.0f}));
@@ -167,15 +167,15 @@ int closest_point_case() {
              {0.2f, 0.3f, 0.0f}));
   // A degenerate triangle collapses to its segment, whichever two corners
   // coincide: with the first two, Ericson's edge region read 0 / 0.
-  const vr::Vec3f p(0.001f, 0.5f, 0.0f);
-  const vr::Vec3f on_ac(0.0f, 0.5f, 0.0f);
+  const vgrid::Vec3f p(0.001f, 0.5f, 0.0f);
+  const vgrid::Vec3f on_ac(0.0f, 0.5f, 0.0f);
   for (const auto& [x, y, z] :
        {std::tuple{a, a, c}, std::tuple{a, c, a}, std::tuple{c, a, a},
         std::tuple{a, c, c}, std::tuple{c, a, c}, std::tuple{c, c, a}}) {
     CHECK(near(eval::closest_point_on_triangle(p, x, y, z), on_ac));
   }
   // Three distinct corners on one line: the segment they span.
-  const vr::Vec3f mid(0.0f, 0.25f, 0.0f);
+  const vgrid::Vec3f mid(0.0f, 0.25f, 0.0f);
   for (const auto& [x, y, z] :
        {std::tuple{a, mid, c}, std::tuple{mid, a, c}, std::tuple{c, mid, a}}) {
     CHECK(near(eval::closest_point_on_triangle({0.001f, 0.75f, 0}, x, y, z),
@@ -200,25 +200,26 @@ int thin_triangle_case() {
   constexpr int kDraws = 50000;
 #endif
   Lcg rng;
-  const vr::Vec3f base(3.2f, 1.7f, 2.9f);
+  const vgrid::Vec3f base(3.2f, 1.7f, 2.9f);
   const auto around = [&rng](float r) {
-    return vr::Vec3f(rng(-r, r), rng(-r, r), rng(-r, r));
+    return vgrid::Vec3f(rng(-r, r), rng(-r, r), rng(-r, r));
   };
-  const auto matches = [](vr::Vec3f p, vr::Vec3f a, vr::Vec3f b, vr::Vec3f c) {
-    const vr::Vec3f q = eval::closest_point_on_triangle(p, a, b, c);
+  const auto matches = [](vgrid::Vec3f p, vgrid::Vec3f a, vgrid::Vec3f b,
+                          vgrid::Vec3f c) {
+    const vgrid::Vec3f q = eval::closest_point_on_triangle(p, a, b, c);
     return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) &&
-           std::fabs(double(vr::length(p - q)) -
+           std::fabs(double(vgrid::length(p - q)) -
                      triangle_distance(p, a, b, c)) <= 0.5e-6;
   };
   for (int i = 0; i < kDraws; ++i) {
-    const vr::Vec3f a = base + around(0.01f);
-    const vr::Vec3f b = a + around(0.01f);
-    const vr::Vec3f p = base + around(0.04f);
+    const vgrid::Vec3f a = base + around(0.01f);
+    const vgrid::Vec3f b = a + around(0.01f);
+    const vgrid::Vec3f p = base + around(0.04f);
     for (float sine : {1e-6f, 1e-5f, 3e-5f, 1e-4f, 1e-3f, 1e-2f}) {
-      const vr::Vec3f ab = b - a;
-      const vr::Vec3f off = glm::normalize(vr::cross(ab, around(1.0f)));
-      const vr::Vec3f c = a + ab * rng(0.2f, 0.8f) +
-                          off * (sine * vr::length(ab) * rng(0.5f, 1.5f));
+      const vgrid::Vec3f ab = b - a;
+      const vgrid::Vec3f off = glm::normalize(vgrid::cross(ab, around(1.0f)));
+      const vgrid::Vec3f c = a + ab * rng(0.2f, 0.8f) +
+                             off * (sine * vgrid::length(ab) * rng(0.5f, 1.5f));
       CHECK(matches(p, a, b, c));
       CHECK(matches(p, c, a, b));
       CHECK(matches(p, b, c, a));
@@ -237,8 +238,8 @@ int search_case() {
   Lcg rng;
   mesh::Mesh m = plane(30, 0.01f, 0.0f);
   for (mesh::Vertex& v : m.vertices) {
-    v.position += vr::Vec3f(rng(-0.004f, 0.004f), rng(-0.004f, 0.004f),
-                            rng(-0.006f, 0.006f));
+    v.position += vgrid::Vec3f(rng(-0.004f, 0.004f), rng(-0.004f, 0.004f),
+                               rng(-0.006f, 0.006f));
   }
   for (std::size_t t = 0; t < m.indices.size(); t += 3 * 17) {
     m.indices[t + 1] = m.indices[t];  // a segment, still surface
@@ -248,15 +249,15 @@ int search_case() {
   CHECK(d.ok());
   int within = 0;
   for (int i = 0; i < 500; ++i) {
-    const vr::Vec3f p(rng(-0.05f, 0.35f), rng(-0.05f, 0.35f),
-                      rng(-0.05f, 0.05f));
+    const vgrid::Vec3f p(rng(-0.05f, 0.35f), rng(-0.05f, 0.35f),
+                         rng(-0.05f, 0.05f));
     float best = reach;
     for (std::size_t t = 0; t < m.indices.size(); t += 3) {
       best = std::min(
-          best, vr::length(p - eval::closest_point_on_triangle(
-                                   p, m.vertices[m.indices[t]].position,
-                                   m.vertices[m.indices[t + 1]].position,
-                                   m.vertices[m.indices[t + 2]].position)));
+          best, vgrid::length(p - eval::closest_point_on_triangle(
+                                      p, m.vertices[m.indices[t]].position,
+                                      m.vertices[m.indices[t + 1]].position,
+                                      m.vertices[m.indices[t + 2]].position)));
     }
     CHECK(near(double(d.value().distance(p)), double(best), 1e-7));
     within += best < reach ? 1 : 0;
@@ -286,8 +287,9 @@ int distance_case() {
   // A mesh triangle whose first two corners coincide is the segment to the
   // third, not a hole.
   mesh::Mesh sliver;
-  for (const vr::Vec3f& q : {vr::Vec3f(0, 0, 0), vr::Vec3f(0.5f, 0.5f, 0.5f),
-                             vr::Vec3f(0, 0.01f, 0)}) {
+  for (const vgrid::Vec3f& q :
+       {vgrid::Vec3f(0, 0, 0), vgrid::Vec3f(0.5f, 0.5f, 0.5f),
+        vgrid::Vec3f(0, 0.01f, 0)}) {
     mesh::Vertex v{};
     v.position = q;
     sliver.vertices.push_back(v);
@@ -407,12 +409,12 @@ int surface_case() {
 
   mesh::Mesh stale = reference;
   mesh::Vertex far{};
-  far.position = vr::Vec3f(0.05f, 0.05f, 0.01f);  // 1 cm off, within reach
-  stale.vertices.push_back(far);                  // referenced by nothing
+  far.position = vgrid::Vec3f(0.05f, 0.05f, 0.01f);  // 1 cm off, within reach
+  stale.vertices.push_back(far);                     // referenced by nothing
   const auto retired = static_cast<std::uint32_t>(stale.vertices.size());
   for (int k = 0; k < 3; ++k) {  // the default kernel's retired triangle
     mesh::Vertex o{};
-    o.position = vr::Vec3f(0.05f, 0.05f, -0.01f);
+    o.position = vgrid::Vec3f(0.05f, 0.05f, -0.01f);
     stale.vertices.push_back(o);
   }
   stale.indices.insert(stale.indices.end(),
@@ -420,7 +422,7 @@ int surface_case() {
   stale.indices.insert(stale.indices.end(), {0, 0, 0});  // the shared one's
   // A vertex nothing uses may even be garbage.
   mesh::Vertex nan{};
-  nan.position = vr::Vec3f(std::numeric_limits<float>::quiet_NaN());
+  nan.position = vgrid::Vec3f(std::numeric_limits<float>::quiet_NaN());
   stale.vertices.push_back(nan);
 
   const mesh::Mesh* const clean_mesh = &reference;
@@ -569,8 +571,9 @@ int refusals_case() {
   // A reach too small for the triangles, refused before it is paid for: one
   // 1 cm triangle at a micron once took seconds and gigabytes.
   mesh::Mesh one;
-  for (const vr::Vec3f& q : {vr::Vec3f(0, 0, 0), vr::Vec3f(0.01f, 0, 0.01f),
-                             vr::Vec3f(0, 0.01f, 0.005f)}) {
+  for (const vgrid::Vec3f& q :
+       {vgrid::Vec3f(0, 0, 0), vgrid::Vec3f(0.01f, 0, 0.01f),
+        vgrid::Vec3f(0, 0.01f, 0.005f)}) {
     mesh::Vertex v{};
     v.position = q;
     one.vertices.push_back(v);

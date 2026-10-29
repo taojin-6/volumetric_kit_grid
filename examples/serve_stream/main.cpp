@@ -22,12 +22,12 @@
 #include "info_log.hpp"
 #include "stream_replay.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/networking/stream_server.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace networking = volumetric_kit::recon::networking;
-namespace stream = volumetric_kit::recon::stream;
+namespace networking = volumetric_kit::grid::networking;
+namespace stream = volumetric_kit::grid::stream;
 
 namespace {
 
@@ -85,8 +85,8 @@ std::optional<Args> parse(int argc, char** argv, std::string* why) {
 // Serve until stopped; returns only a failure.
 vkc::Status serve(const Args& args) {
   VKC_ASSIGN(const auto reader, stream::StreamReader::open(args.path));
-  VKC_ASSIGN(const vr_example::ReplayLoop loop,
-             vr_example::ReplayLoop::create(*reader));
+  VKC_ASSIGN(const vgrid_example::ReplayLoop loop,
+             vgrid_example::ReplayLoop::create(*reader));
   networking::ServerOptions options;
   options.port = args.port;
   // A recording cannot make a key: a joiner takes the GOP since the newest.
@@ -96,8 +96,8 @@ vkc::Status serve(const Args& args) {
   std::printf("serving %s on port %u: %zu records a pass\n", args.path.c_str(),
               unsigned{server->port()}, loop.records().size());
   std::fflush(stdout);
-  const vr_example::ReplayLoop::Clock::time_point start =
-      vr_example::ReplayLoop::Clock::now();
+  const vgrid_example::ReplayLoop::Clock::time_point start =
+      vgrid_example::ReplayLoop::Clock::now();
   const auto publish = [&](const stream::RecordInfo& info,
                            const std::vector<std::uint8_t>& payload) {
     return server->publish(info, payload.data(), payload.size());
@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     std::printf("%s\n", kUsage);
     return 0;
   }
-  vr_example::print_info_log();  // each viewer joining and leaving
+  vgrid_example::print_info_log();  // each viewer joining and leaving
   const vkc::Status failed = serve(*args);
   std::fprintf(stderr, "serve_stream: %s\n", failed.message().c_str());
   return 1;

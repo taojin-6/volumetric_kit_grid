@@ -16,7 +16,7 @@
 
 namespace codec_oracle {
 
-namespace d = volumetric_kit::recon::codec::detail;
+namespace d = volumetric_kit::grid::codec::detail;
 
 // L, the state's lower bound: the state the encoder starts in, so the one a
 // correct decode ends in.

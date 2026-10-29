@@ -17,11 +17,11 @@
 
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
 
 /// @brief One track's records, replayed pass after pass: each due at its pts
@@ -37,13 +37,13 @@ class ReplayLoop {
   /// @return The loop; `InvalidArgument` for a track the session lacks;
   ///         `NotFound` for a track with no key read whole; the reader's
   ///         `IoError`; `OutOfMemory`, the reader's or the loop's own.
-  static vkc::Result<ReplayLoop> create(const vr::stream::StreamReader& reader,
-                                        std::uint16_t track = 0) {
+  static vkc::Result<ReplayLoop> create(
+      const vgrid::stream::StreamReader& reader, std::uint16_t track = 0) {
     try {
-      VKC_ASSIGN(vr::stream::Position pos, reader.key(track, 0));
+      VKC_ASSIGN(vgrid::stream::Position pos, reader.key(track, 0));
       ReplayLoop loop;
       for (;;) {
-        vr::stream::Record record;
+        vgrid::stream::Record record;
         const vkc::Result<bool> more = reader.next(&pos, &record);
         if (!more.ok()) {
           // Only damage leaves pos past it; anything else is the loop's
@@ -69,7 +69,7 @@ class ReplayLoop {
       }
       std::uint64_t least = loop.records_.front().info.pts_ns;
       std::uint64_t most = least;
-      for (const vr::stream::Record& r : loop.records_) {
+      for (const vgrid::stream::Record& r : loop.records_) {
         least = std::min(least, r.info.pts_ns);
         most = std::max(most, r.info.pts_ns);
       }
@@ -80,8 +80,8 @@ class ReplayLoop {
         step = (most - least) / (loop.records_.size() - 1);
       }
       if (step == 0) {
-        step =
-            vr::stream::nominal_period_ns(reader.session().tracks[track].rate);
+        step = vgrid::stream::nominal_period_ns(
+            reader.session().tracks[track].rate);
       }
       loop.first_pts_ = least;
       loop.pass_ns_ = most - least + step;
@@ -95,7 +95,7 @@ class ReplayLoop {
   }
 
   /// @return The records each pass replays, in file order.
-  const std::vector<vr::stream::Record>& records() const noexcept {
+  const std::vector<vgrid::stream::Record>& records() const noexcept {
     return records_;
   }
 
@@ -112,8 +112,8 @@ class ReplayLoop {
   /// @return @p info as pass @p pass sends it: seq past the passes' before,
   ///         and pts a pass's span (the records' pts span and one mean step)
   ///         later each pass. Pass 0 is unchanged.
-  vr::stream::RecordInfo restamp(vr::stream::RecordInfo info,
-                                 std::uint64_t pass) const {
+  vgrid::stream::RecordInfo restamp(vgrid::stream::RecordInfo info,
+                                    std::uint64_t pass) const {
     info.seq += pass * pass_seqs_;
     info.pts_ns += pass * pass_ns_;
     return info;
@@ -126,18 +126,19 @@ class ReplayLoop {
   ///        which lack their reference, up to the pass's next key; pass 0
   ///        prints each such record to stderr, as every pass meets the same.
   /// @param reader  The reader the loop was made from.
-  /// @param send    Called as `vkc::Status send(const vr::stream::RecordInfo&,
+  /// @param send    Called as `vkc::Status send(const
+  /// vgrid::stream::RecordInfo&,
   ///                const std::vector<std::uint8_t>&)`.
   /// @return OK; `NotFound` when no key's payload reads whole, so the pass
   ///         sends nothing; the reader's other errors; or @p send 's.
   template <typename Send>
-  vkc::Status send_pass(const vr::stream::StreamReader& reader,
+  vkc::Status send_pass(const vgrid::stream::StreamReader& reader,
                         Clock::time_point start, std::uint64_t pass,
                         Send&& send) const {
     std::vector<std::uint8_t> payload;
     bool resync = false;  // past a damaged payload, until the next key
     bool sent = false;
-    for (const vr::stream::Record& record : records_) {
+    for (const vgrid::stream::Record& record : records_) {
       if (resync && !record.info.key) continue;
       resync = false;
       std::this_thread::sleep_until(due(start, pass, record.info.pts_ns));
@@ -166,10 +167,10 @@ class ReplayLoop {
  private:
   ReplayLoop() = default;
 
-  std::vector<vr::stream::Record> records_;
+  std::vector<vgrid::stream::Record> records_;
   std::uint64_t first_pts_ = 0;  // the records' least pts
   std::uint64_t pass_ns_ = 0;    // a pass's pts span and one mean step
   std::uint64_t pass_seqs_ = 0;  // a pass's seq span and one
 };
 
-}  // namespace vr_example
+}  // namespace vgrid_example

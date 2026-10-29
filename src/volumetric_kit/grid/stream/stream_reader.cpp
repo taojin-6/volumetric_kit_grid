@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -13,7 +13,7 @@
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 namespace {
 
 // What a footer's key entries are read in: whole entries.
@@ -363,4 +363,4 @@ core::Status StreamReader::read(const Record& record, std::uint8_t* dst,
   }
 }
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

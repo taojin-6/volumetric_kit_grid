@@ -1,5 +1,5 @@
-#ifndef VR_MARCHING_CUBES_SPARSE_COMMON_GLSL
-#define VR_MARCHING_CUBES_SPARSE_COMMON_GLSL
+#ifndef VGRID_MARCHING_CUBES_SPARSE_COMMON_GLSL
+#define VGRID_MARCHING_CUBES_SPARSE_COMMON_GLSL
 
 // What both sparse marching-cubes kernels do identically: address a block's
 // voxels, resolve its 2x2x2 +neighbourhood on-device, and gather a cell's eight
@@ -32,13 +32,13 @@
 // `block_size`, `voxels_per_block`, `iso`, `weight_threshold`, `has_color`,
 // `num_buckets`, `bucket_size`, `max_chain`), the `active_blocks` / `tsdf` /
 // `weight` / `color_attr` buffers, and have included hash_lookup.glsl (for
-// `BlockIndex` + `vrFindBlockPtr`, which block_neighbourhood.glsl needs),
+// `BlockIndex` + `vgridFindBlockPtr`, which block_neighbourhood.glsl needs),
 // voxel_color.glsl and marching_cubes_common.glsl (for `mcCornerShift`).
 
-// vrLocalIndex / vrLocalBase / s_neighbour / vrResolveNeighbourhood /
-// vrCornerStorage: the block's +neighbourhood and the one cross-block corner
+// vgridLocalIndex / vgridLocalBase / s_neighbour / vgridResolveNeighbourhood /
+// vgridCornerStorage: the block's +neighbourhood and the one cross-block corner
 // addressing, from the volume tier, which the codec's surface passes walk too.
-#include "volumetric_kit/recon/volume/shaders/block_neighbourhood.glsl"
+#include "volumetric_kit/grid/volume/shaders/block_neighbourhood.glsl"
 
 // Gather a cell's eight corners through the shared neighbourhood: sdf values,
 // linear colours, and the cube index. False when a corner is unavailable --
@@ -54,7 +54,7 @@ bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
   cube_index = 0;
   for (int i = 0; i < 8; ++i) {
     uint si;
-    if (!vrCornerStorage(bs, base + mcCornerShift(i), si) ||
+    if (!vgridCornerStorage(bs, base + mcCornerShift(i), si) ||
         weight[si] < pc.weight_threshold) {
       cube_index = 0;  // drop the partial mask -- see the note above
       return false;
@@ -66,7 +66,7 @@ bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
       // the integrator's first-observation-assigns anti-darkening rule.
       // Decoded to LINEAR working values, because the edge interpolation is
       // an average (the 2026-08-02 decision).
-      corner_color[i] = vrVoxelColorToLinear(color_attr[si]);
+      corner_color[i] = vgridVoxelColorToLinear(color_attr[si]);
     }
     if (sdf[i] < pc.iso) {
       cube_index |= (1 << i);
@@ -84,21 +84,21 @@ bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
 // expensive part, and the sparse kernel's counting phase runs over 100% of
 // cells: no `out float[8]` / `out vec3[8]` copy-out (GLSL passes arrays by
 // value, so each is a real 128-byte copy at every call), and no colour decode --
-// vrUnpackSrgbToLinear is a transfer curve per corner, up to 24 of them per
+// vgridUnpackSrgbToLinear is a transfer curve per corner, up to 24 of them per
 // cell, for values a count cannot use.
 //
 // The sign test below is the one line this shares with mcGather by convention
 // rather than by construction, and the two must agree exactly: the count taken
 // here reserves the range mcGather's caller then writes into. Both read
 // `tsdf[si] < pc.iso` over the same quiescent buffer through the same
-// vrCornerStorage, so they can only diverge if the two lines are edited apart --
+// vgridCornerStorage, so they can only diverge if the two lines are edited apart --
 // and the emitter bounds its writes to the reserved range, so even that drops
 // triangles rather than writing over the next block's.
 int mcCellSigns(int bs, ivec3 base) {
   int cube_index = 0;
   for (int i = 0; i < 8; ++i) {
     uint si;
-    if (!vrCornerStorage(bs, base + mcCornerShift(i), si) ||
+    if (!vgridCornerStorage(bs, base + mcCornerShift(i), si) ||
         weight[si] < pc.weight_threshold) {
       return 0;
     }
@@ -109,4 +109,4 @@ int mcCellSigns(int bs, ivec3 base) {
   return cube_index;
 }
 
-#endif  // VR_MARCHING_CUBES_SPARSE_COMMON_GLSL
+#endif  // VGRID_MARCHING_CUBES_SPARSE_COMMON_GLSL

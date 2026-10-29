@@ -26,14 +26,14 @@ void (*handler_of(int signal))(int) {
 }  // namespace
 
 int main() {
-  CHECK(!vr_example::interrupted());
-  vr_example::catch_interrupts();
+  CHECK(!vgrid_example::interrupted());
+  vgrid_example::catch_interrupts();
   CHECK(handler_of(SIGINT) != SIG_DFL && handler_of(SIGINT) != SIG_ERR);
   CHECK(handler_of(SIGTERM) != SIG_DFL && handler_of(SIGTERM) != SIG_ERR);
-  CHECK(!vr_example::interrupted());
+  CHECK(!vgrid_example::interrupted());
 
   CHECK(std::raise(SIGINT) == 0);
-  CHECK(vr_example::interrupted());
+  CHECK(vgrid_example::interrupted());
   CHECK(handler_of(SIGINT) == SIG_DFL);
   CHECK(handler_of(SIGTERM) != SIG_DFL);
   std::puts("example_interrupt: OK");

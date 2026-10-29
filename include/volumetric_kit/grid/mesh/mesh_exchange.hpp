@@ -20,9 +20,9 @@
 
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/mesh/device_mesh.hpp"
+#include "volumetric_kit/grid/mesh/device_mesh.hpp"
 
-namespace volumetric_kit::recon::mesh {
+namespace volumetric_kit::grid::mesh {
 
 /// @brief How the consumer of a @ref MeshExchange reads a mesh: the frames it
 ///        keeps in flight, and what it binds the buffers as.
@@ -346,4 +346,4 @@ class MeshExchange {
   const char* refused_ = nullptr;
 };
 
-}  // namespace volumetric_kit::recon::mesh
+}  // namespace volumetric_kit::grid::mesh

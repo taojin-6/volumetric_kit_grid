@@ -38,31 +38,31 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_map_internal.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/triangle_candidates.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
-#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/hash_map_internal.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/triangle_candidates.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
-#include "grid_readback.hpp"
 #include "mesh_integrate_reference_comp.spv.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace vx = volumetric_kit::recon::voxelize;
+namespace vol = volumetric_kit::grid::volume;
+namespace vx = volumetric_kit::grid::voxelize;
 
 namespace {
 
 using test_meshes::Mesh;
-using vr::Vec3f;
+using vgrid::Vec3f;
 
-// mesh_integrate.comp's VR_MAX_SORTED: a bin past it has an unsorted tail.
+// mesh_integrate.comp's VGRID_MAX_SORTED: a bin past it has an unsorted tail.
 constexpr std::uint32_t kKernelSorted = 2048;
 constexpr float kVoxel = 0.005f;
 
@@ -70,7 +70,7 @@ constexpr float kVoxel = 0.005f;
 
 // Mirrors the reference kernel's RefBlock and push constants (scalar).
 struct RefBlock {
-  vr::Vec3i coord;
+  vgrid::Vec3i coord;
   std::uint32_t begin;
   std::uint32_t count;
 };
@@ -438,8 +438,8 @@ std::vector<Fixture> fixtures() {
                      float(bz + int(r.r(-4, 5))) * kVoxel);
       };
       const Vec3f a = node(), b = node(), c = node();
-      const Vec3f n = vr::cross(b - a, c - a);
-      if (!(vr::dot(n, n) > 0.0f)) continue;
+      const Vec3f n = vgrid::cross(b - a, c - a);
+      if (!(vgrid::dot(n, n) > 0.0f)) continue;
       if (r.u() < 0.5) {
         add_triangle(m, a, b, c);
       } else {
@@ -470,11 +470,11 @@ std::vector<Fixture> fixtures() {
       const Vec3f e = r.v(-1, 1);
       const float len = float(r.r(0.002, 0.08));
       const double aspect = std::pow(10.0, -r.r(1, 7));
-      const Vec3f b = a + d * (len / vr::length(d));
-      const Vec3f c = a + d * (float(r.r(0, 1)) * len / vr::length(d)) +
-                      e * float(aspect * len / vr::length(e));
-      const Vec3f n = vr::cross(b - a, c - a);
-      if (!(vr::dot(n, n) > 0.0f)) continue;
+      const Vec3f b = a + d * (len / vgrid::length(d));
+      const Vec3f c = a + d * (float(r.r(0, 1)) * len / vgrid::length(d)) +
+                      e * float(aspect * len / vgrid::length(e));
+      const Vec3f n = vgrid::cross(b - a, c - a);
+      if (!(vgrid::dot(n, n) > 0.0f)) continue;
       if (r.u() < 0.5) {
         add_triangle(f.mesh, a, b, c);
       } else {
@@ -609,10 +609,10 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
 
   // Both block by block, in `active`'s order.
   const std::vector<float> tsdf =
-      vr_test::read_blocks<float>(gpu, grid, vol::kTsdfAttribute, active)
+      vgrid_test::read_blocks<float>(gpu, grid, vol::kTsdfAttribute, active)
           .value();
   const std::vector<float> weight =
-      vr_test::read_blocks<float>(gpu, grid, vol::kWeightAttribute, active)
+      vgrid_test::read_blocks<float>(gpu, grid, vol::kWeightAttribute, active)
           .value();
   const auto vpb = static_cast<std::size_t>(gp.voxels_per_block);
   std::size_t differ = 0;
@@ -640,7 +640,7 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
   if (f.minus_zero_at_origin) {
     bool found = false;
     for (std::size_t b = 0; b < active.size(); ++b) {
-      if (active[b].coord == vr::Vec3i(0)) {
+      if (active[b].coord == vgrid::Vec3i(0)) {
         found = true;
         CHECK(std::signbit(tsdf[b * vpb]));
         CHECK(tsdf[b * vpb] == 0.0f);
@@ -665,8 +665,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vkc::KernelSetBuilder builder(gpu.device);
     CHECK(builder
               .add(ref.kernel, "mesh_integrate_reference",
-                   vr_mesh_integrate_reference_comp_spv,
-                   vr_mesh_integrate_reference_comp_spv_size, 9, &range)
+                   vgrid_mesh_integrate_reference_comp_spv,
+                   vgrid_mesh_integrate_reference_comp_spv_size, 9, &range)
               .ok());
     vkc::Result<vkc::DescriptorPool> pool = builder.build();
     CHECK(pool.ok());
@@ -698,5 +698,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

@@ -17,8 +17,8 @@
 // the passes ping-pong between (4 KB of shared memory, against a guaranteed
 // 16 KB).
 
-#ifndef VR_DCT_COMMON_GLSL
-#define VR_DCT_COMMON_GLSL
+#ifndef VGRID_DCT_COMMON_GLSL
+#define VGRID_DCT_COMMON_GLSL
 
 #extension GL_EXT_scalar_block_layout : require
 
@@ -41,30 +41,30 @@ const uint kHalf = kBlockVoxels;         // offset of s_work's second half
 
 // The set-0 bindings, mirroring `Binding` in dct_transform.cpp -- the compute
 // core is explicit, not reflected (2026-07-05).
-#define VR_DCT_BINDING_BLOCKS 0
-#define VR_DCT_BINDING_TSDF 1
-#define VR_DCT_BINDING_WEIGHT 2
-#define VR_DCT_BINDING_TABLES 3
-#define VR_DCT_BINDING_COEFFICIENTS 4
-#define VR_DCT_BINDING_MASKS 5
-#define VR_DCT_BINDING_ENTRIES 6
-#define VR_DCT_BINDING_REJECTED 7
-#define VR_DCT_BINDING_STAMPS 8
-#define VR_DCT_BINDING_QUANTIZATION 9
+#define VGRID_DCT_BINDING_BLOCKS 0
+#define VGRID_DCT_BINDING_TSDF 1
+#define VGRID_DCT_BINDING_WEIGHT 2
+#define VGRID_DCT_BINDING_TABLES 3
+#define VGRID_DCT_BINDING_COEFFICIENTS 4
+#define VGRID_DCT_BINDING_MASKS 5
+#define VGRID_DCT_BINDING_ENTRIES 6
+#define VGRID_DCT_BINDING_REJECTED 7
+#define VGRID_DCT_BINDING_STAMPS 8
+#define VGRID_DCT_BINDING_QUANTIZATION 9
 // EncoderConfig::true_sdf's scratch (dct_surface.comp): the cut set, one bit
 // per voxel of the grid's heap (slot s at bit s % 32 of word s / 32), and the
 // keep flags, one word per block slot.
-#define VR_DCT_BINDING_CUT 10
-#define VR_DCT_BINDING_KEEP 11
+#define VGRID_DCT_BINDING_CUT 10
+#define VGRID_DCT_BINDING_KEEP 11
 // Whether slot s's bit is set in a bit-per-slot set such as the cut set.
-#define VR_SLOT_BIT(set, s) \
+#define VGRID_SLOT_BIT(set, s) \
   ((((set)[(s) / kMaskWordBits] >> ((s) % kMaskWordBits)) & 1u) != 0u)
 
 // BlockIndex and the read-only hash lookup from the volume tier (one
 // definition, not a mirror -- see hash_lookup.glsl), which brings hash_common
 // without its push constants: this kernel has its own, below.
-#define VR_HASH_ENTRIES_BINDING VR_DCT_BINDING_ENTRIES
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#define VGRID_HASH_ENTRIES_BINDING VGRID_DCT_BINDING_ENTRIES
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
 
 // Mirrors PushConstants in dct_transform.cpp; all 4-byte scalars, so scalar
 // layout places each at its host offset (60 bytes).
@@ -89,7 +89,7 @@ layout(push_constant, scalar) uniform PushConstants {
 }
 pc;
 
-layout(set = 0, binding = VR_DCT_BINDING_BLOCKS, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_BLOCKS, scalar) readonly buffer
     Blocks {
   BlockIndex blocks[];
 };
@@ -98,7 +98,7 @@ layout(set = 0, binding = VR_DCT_BINDING_BLOCKS, scalar) readonly buffer
 // transforms against the same bits rather than its own cos().
 //   basis[k * kEdge + n]  orthonormal 1-D DCT-II: X[k] = sum_n basis[k][n] x[n]
 //   zigzag[j]             voxel index of kept coefficient j
-layout(set = 0, binding = VR_DCT_BINDING_TABLES, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_TABLES, scalar) readonly buffer
     Tables {
   float basis[kBasisSize];
   uint zigzag[kBlockVoxels];
@@ -106,14 +106,14 @@ layout(set = 0, binding = VR_DCT_BINDING_TABLES, scalar) readonly buffer
 
 // One effective step per canonical frequency x + 8*y + 64*z, staged for
 // this call after the host multiplies the scale and weights.
-layout(set = 0, binding = VR_DCT_BINDING_QUANTIZATION, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_QUANTIZATION, scalar) readonly buffer
     Quantization {
   float quantization_steps[kBlockVoxels];
 };
 
 // Mirrors Counts in dct_transform.cpp: rejected entries and the observed
 // kernel's append count, summed over every dispatch in the call.
-layout(set = 0, binding = VR_DCT_BINDING_REJECTED, scalar) buffer Rejected {
+layout(set = 0, binding = VGRID_DCT_BINDING_REJECTED, scalar) buffer Rejected {
   uint rejected;
   uint observed_count;
 };
@@ -131,7 +131,7 @@ shared int s_ptr;
 // into the map, the same quiescence hash_lookup.glsl states.
 int block_ptr(uint entry, uint lane) {
   if (lane == 0u) {
-    s_ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+    s_ptr = vgridFindBlockPtr(blocks[entry].coord, pc.num_buckets,
                            pc.bucket_size, pc.max_chain);
     if (s_ptr < 0) {
       atomicAdd(rejected, 1u);
@@ -196,4 +196,4 @@ float step_for(uint j) {
 // with 0. Each fits 16 bits, being within +-max_quantized.
 uint coefficient_words() { return (pc.coefficient_count + 1u) / 2u; }
 
-#endif  // VR_DCT_COMMON_GLSL
+#endif  // VGRID_DCT_COMMON_GLSL

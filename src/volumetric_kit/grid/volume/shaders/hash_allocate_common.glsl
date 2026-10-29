@@ -14,7 +14,7 @@
 // transforms (worldToBlock / truncationBlocks), and the push-constant block.
 // The heap comes from hash_heap.glsl, which the delete kernel shares.
 //
-// A kernel that defines VR_STAMPS_BINDING before including this has
+// A kernel that defines VGRID_STAMPS_BINDING before including this has
 // allocate_block stamp every block it asks for -- inserted or already there --
 // with the map's tick (BlockStamp::requested). Rehash does not, since a grow
 // keeps every record where it was.
@@ -32,8 +32,8 @@ layout(set = 0, binding = 0, scalar) coherent buffer Entries {
 };
 layout(set = 0, binding = 3) coherent buffer BucketMutex { int bucket_mutex[]; };
 layout(set = 0, binding = 5) buffer FailCount { uint fail_count[]; };
-#ifdef VR_STAMPS_BINDING
-layout(set = 0, binding = VR_STAMPS_BINDING, scalar) buffer Stamps {
+#ifdef VGRID_STAMPS_BINDING
+layout(set = 0, binding = VGRID_STAMPS_BINDING, scalar) buffer Stamps {
   BlockStamp stamps[];
 };
 #endif
@@ -372,7 +372,7 @@ int insert_block(ivec3 coord, int preset_ptr, out int ptr) {
 int allocate_block(ivec3 coord) {
   int ptr;
   int fail = insert_block(coord, kNoPresetPtr, ptr);
-#ifdef VR_STAMPS_BINDING
+#ifdef VGRID_STAMPS_BINDING
   if (fail < 0) {
     // Atomic only because a band's blocks are asked for by many lanes at
     // once; they all write the same tick. An exchange, not a max, so the

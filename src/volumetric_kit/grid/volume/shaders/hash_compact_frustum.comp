@@ -57,7 +57,7 @@ void main() {
   }
 
   int ptr = entries[gid].ptr;
-  if (!vrEntryActive(ptr)) {
+  if (!vgridEntryActive(ptr)) {
     return;
   }
 

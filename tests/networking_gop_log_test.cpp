@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The server's GOP log (src/volumetric_kit/recon/networking/gop_log.hpp), with
+// The server's GOP log (src/volumetric_kit/grid/networking/gop_log.hpp), with
 // no sockets: before any key nothing is handed out; a viewer joining mid-GOP
 // starts at its key; a viewer skips only at a chunk boundary and only to a
 // newer key, and the chunk it holds survives the log's replacement; a GOP past
@@ -33,7 +33,7 @@
 #include "gop_log.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 
-namespace detail = volumetric_kit::recon::networking::detail;
+namespace detail = volumetric_kit::grid::networking::detail;
 
 namespace {
 

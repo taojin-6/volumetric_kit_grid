@@ -17,9 +17,9 @@
 
 layout(local_size_x = 64) in;
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/coord_order.glsl"
 
 #include "frame_models.glsl"
 #include "rans_push.glsl"
@@ -46,7 +46,7 @@ void main() {
   const uvec2 range = segment_range(s, m, pc.update_size, pc.num_entries - m,
                                     pc.segment_size);
   if (kind == 0u && range.x > m &&
-      !vrCoordLess(blocks[range.x - m - 1u].coord, blocks[range.x - m].coord)) {
+      !vgridCoordLess(blocks[range.x - m - 1u].coord, blocks[range.x - m].coord)) {
     kind = kFaultOutOfOrder;
   }
   if (kind != 0u) atomicMin(verdict, (s << 2u) | kind);

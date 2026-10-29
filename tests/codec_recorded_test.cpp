@@ -14,7 +14,7 @@
 // one batch, decode and mesh, records a pinned number of dispatches and
 // barriers; and the growing calls grow before recording, or decode again
 // from the pending frame's own slot after the device refused it. Links
-// recon_mesh, which the codec tier itself may not. Skips with no device.
+// grid_mesh, which the codec tier itself may not. Skips with no device.
 
 #include <cmath>
 #include <cstdint>
@@ -25,25 +25,25 @@
 #include <utility>
 #include <vector>
 
-#include "codec_fixture.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
-#include "stage_rows.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/stage_rows.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace codec = volumetric_kit::grid::codec;
+namespace mesh = volumetric_kit::grid::mesh;
 using namespace codec_fixture;
 using C = vkc::Status::Code;
 
@@ -57,7 +57,7 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 constexpr std::uint64_t kPinnedDispatches = 39;
 constexpr std::uint64_t kPinnedBarriers = 47;
 
-using vr_test::find_row;
+using vgrid_test::find_row;
 
 vkc::Result<codec::Encoder> encoder(Gpu& gpu, std::uint32_t k, float scale,
                                     std::uint32_t period) {
@@ -493,7 +493,7 @@ int growing_case(Gpu& gpu) {
         *dec, batch, *slot, f.size(), *grid, kMaxBlocks, &m);
     CHECK(pending.ok() && find_row(m, "  ..grow") != nullptr);
     CHECK(m.rows().front().name == std::string("codec decode"));
-    CHECK(vr_test::breakdowns_nest(m));
+    CHECK(vgrid_test::breakdowns_nest(m));
     CHECK(grid->grid().num_buckets > few.num_buckets);
     CHECK(batch.submit().ok());
     vkc::Result<codec::Finished> done =
@@ -531,7 +531,7 @@ int growing_case(Gpu& gpu) {
   CHECK(done.ok() && done->redone);
   CHECK(find_row(m, "  ..grow") != nullptr);
   CHECK(m.rows().front().name == std::string("codec decode"));
-  CHECK(vr_test::breakdowns_nest(m));
+  CHECK(vgrid_test::breakdowns_nest(m));
   CHECK(grid->grid().num_buckets > cramped.num_buckets);
   CHECK(snapshot(gpu, *grid).value() == *want);
   vkc::Result<std::optional<mesh::DeviceMesh>> gated =
@@ -551,12 +551,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   if (counters_case(gpu) != 0) return 1;
   if (pin_case(gpu) != 0) return 1;
   if (growing_case(gpu) != 0) return 1;
-  std::printf("recon codec recorded test passed\n");
+  std::printf("grid codec recorded test passed\n");
   return 0;
 }
 
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

@@ -22,103 +22,104 @@
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/eval/mesh_distance.hpp"
-#include "volumetric_kit/recon/io/mesh_normalization.hpp"
-#include "volumetric_kit/recon/io/ply_writer.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/eval/mesh_distance.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_normalization.hpp"
+#include "volumetric_kit/grid/mesh_io/ply_writer.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace mesh = volumetric_kit::recon::mesh;
-namespace eval = volumetric_kit::recon::eval;
-namespace codec_stream = volumetric_kit::recon::codec_stream;
+namespace mesh = volumetric_kit::grid::mesh;
+namespace eval = volumetric_kit::grid::eval;
+namespace codec_stream = volumetric_kit::grid::codec_stream;
 namespace {
 
-using Options = vr_example::config::Config;
+using Options = vgrid_example::config::Config;
 
 vkc::Status run(const Options& opt) {
   const bool inspect = opt.codec.inspect_only;
   const bool is_signed =
-      opt.source.sdf_mode == vr_example::config::SdfMode::Signed;
+      opt.source.sdf_mode == vgrid_example::config::SdfMode::Signed;
   const float trunc = opt.fusion.truncation_m;
-  const vr::volume::VoxelGridParams grid =
-      vr::volume::block_grid_params(opt.fusion.voxel_size_m, trunc, 1024);
+  const vgrid::volume::VoxelGridParams grid =
+      vgrid::volume::block_grid_params(opt.fusion.voxel_size_m, trunc, 1024);
   // Before any GPU work, and before the first pass loads every frame: a
   // step the codec or the conversion refuses costs neither.
-  vr::codec::EncoderConfig config;
-  vr::voxelize::MeshSdfParams sdf;
+  vgrid::codec::EncoderConfig config;
+  vgrid::voxelize::MeshSdfParams sdf;
   if (!inspect) {
-    VKC_ASSIGN(config, vr_example::encoder_config(opt.codec));
-    VKC_ASSIGN(sdf, vr_example::mesh_sdf_config(opt.source, grid));
+    VKC_ASSIGN(config, vgrid_example::encoder_config(opt.codec));
+    VKC_ASSIGN(sdf, vgrid_example::mesh_sdf_config(opt.source, grid));
     // A mesh's field is a true distance: it codes without the observed mask
     // (DECISIONS 2026-10-21), in a band that observes every voxel it codes.
     config.true_sdf = true;
-    VKC_TRY(vr_example::check_true_sdf_band(sdf, grid));
+    VKC_TRY(vgrid_example::check_true_sdf_band(sdf, grid));
   }
-  VKC_ASSIGN(const vr_example::MeshSequence sequence,
-             vr_example::MeshSequence::open(opt));
+  VKC_ASSIGN(const vgrid_example::MeshSequence sequence,
+             vgrid_example::MeshSequence::open(opt));
   sequence.print();
   VKC_ASSIGN(const std::string placement,
-             vr::io::encode_transform(sequence.transform()));
+             vgrid::mesh_io::encode_transform(sequence.transform()));
   if (inspect) {
-    VKC_ASSIGN(const vr_example::Inspection inspected,
-               vr_example::inspect_frames(sequence));
-    vr_example::print_frame(inspected.last);
+    VKC_ASSIGN(const vgrid_example::Inspection inspected,
+               vgrid_example::inspect_frames(sequence));
+    vgrid_example::print_frame(inspected.last);
     if (opt.output.prefix.empty()) return {};
-    return vr::io::write_ply(opt.output.prefix + "_input.ply",
-                             vr_example::geometry_mesh(inspected.last.mesh));
+    return vgrid::mesh_io::write_ply(
+        opt.output.prefix + "_input.ply",
+        vgrid_example::geometry_mesh(inspected.last.mesh));
   }
 
   VKC_ASSIGN(vkc::Instance instance, vkc::Instance::create({}));
   VKC_ASSIGN(vkc::PhysicalDeviceInfo gpu,
-             instance.select_physical_device(vr::device_requirements()));
+             instance.select_physical_device(vgrid::device_requirements()));
   VKC_ASSIGN(vkc::Device device,
-             vkc::Device::create(instance, gpu, vr::device_requirements()));
+             vkc::Device::create(instance, gpu, vgrid::device_requirements()));
   VKC_ASSIGN(vkc::Allocator allocator,
              vkc::Allocator::create(instance.handle(), device));
-  const vr::volume::AttributeSpec attrs[] = {
-      {vr::volume::kTsdfAttribute, sizeof(float)},
-      {vr::volume::kWeightAttribute, sizeof(float)}};
+  const vgrid::volume::AttributeSpec attrs[] = {
+      {vgrid::volume::kTsdfAttribute, sizeof(float)},
+      {vgrid::volume::kWeightAttribute, sizeof(float)}};
   VKC_ASSIGN(
-      vr::volume::VoxelBlockGrid volume,
-      vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2));
-  VKC_ASSIGN(vr::voxelize::MeshIntegrator integrator,
-             vr::voxelize::MeshIntegrator::create(device, allocator));
+      vgrid::volume::VoxelBlockGrid volume,
+      vgrid::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2));
+  VKC_ASSIGN(vgrid::voxelize::MeshIntegrator integrator,
+             vgrid::voxelize::MeshIntegrator::create(device, allocator));
   VKC_ASSIGN(mesh::MarchingCubes extractor,
              mesh::MarchingCubes::create(device, allocator));
   // Made before any frame is converted or written, so a rerun onto an
   // existing stream is refused before any conversion or output.
   const codec_stream::CodecOutputs outputs =
-      vr_example::codec_outputs(opt.output);
+      vgrid_example::codec_outputs(opt.output);
   VKC_ASSIGN(codec_stream::CodecStream stream,
              codec_stream::CodecStream::create(
                  device, allocator, config,
-                 vr_example::codec_session(
-                     "codec_mesh", {vr_example::kNominalFps, 1}, placement),
+                 vgrid_example::codec_session(
+                     "codec_mesh", {vgrid_example::kNominalFps, 1}, placement),
                  outputs));
   VKC_ASSIGN(
-      vr_example::CodecReport report,
-      vr_example::CodecReport::create(opt.output.csv, outputs.stream,
-                                      outputs.decode, config.intra_period));
-  std::printf(
-      "codec: %s\n",
-      vr_example::codec_settings(config, opt.codec.quantization_table).c_str());
+      vgrid_example::CodecReport report,
+      vgrid_example::CodecReport::create(opt.output.csv, outputs.stream,
+                                         outputs.decode, config.intra_period));
+  std::printf("codec: %s\n", vgrid_example::codec_settings(
+                                 config, opt.codec.quantization_table)
+                                 .c_str());
 
   vkc::StageMetrics conversion;
   std::size_t defective = 0;
-  std::optional<vr_example::CodedFrame> last;
+  std::optional<vgrid_example::CodedFrame> last;
   for (std::uint32_t n = sequence.first(), i = 0; i < sequence.count();
        ++i, ++n) {
     last.reset();  // one frame's geometry held at a time
-    VKC_ASSIGN(last, vr_example::code_frame(sequence, n, volume, integrator,
-                                            sdf, stream, &conversion));
+    VKC_ASSIGN(last, vgrid_example::code_frame(sequence, n, volume, integrator,
+                                               sdf, stream, &conversion));
     VKC_TRY(report.add(n, last->sent));
     const std::string defects =
-        vr_example::topology_defects(last->frame.topology);
+        vgrid_example::topology_defects(last->frame.topology);
     if (defects.empty()) continue;
     ++defective;
     std::printf("frame %u: %s; coded %s\n", n, defects.c_str(),
@@ -140,25 +141,27 @@ vkc::Status run(const Options& opt) {
         "shell offset\n",
         double(opt.source.shell_voxels * opt.fusion.voxel_size_m));
   }
-  vr_example::print_stage_rows("mesh conversion, per frame", conversion,
-                               sequence.count(), 2);
+  vgrid_example::print_stage_rows("mesh conversion, per frame", conversion,
+                                  sequence.count(), 2);
   // A single mesh is no measured sequence: it has no bitrate.
-  report.print(vr_example::kNominalFps, sequence.count() > 1 ? 1 : 0);
+  report.print(vgrid_example::kNominalFps, sequence.count() > 1 ? 1 : 0);
 
   // The last frame's surfaces, written first so a comparison that refuses a
   // mesh still leaves them to look at.
-  vr_example::print_frame(last->frame);
-  const mesh::Mesh input = vr_example::geometry_mesh(last->frame.mesh);
+  vgrid_example::print_frame(last->frame);
+  const mesh::Mesh input = vgrid_example::geometry_mesh(last->frame.mesh);
   VKC_ASSIGN(const mesh::Mesh source, extractor.extract_host(volume));
   VKC_ASSIGN(const mesh::Mesh decoded,
              extractor.extract_host(*stream.player()));
   if (!opt.output.prefix.empty()) {
-    VKC_TRY(vr::io::write_ply(opt.output.prefix + "_input.ply", input));
-    VKC_TRY(vr::io::write_ply(opt.output.prefix + "_source.ply", source));
-    VKC_TRY(vr::io::write_ply(opt.output.prefix + "_decoded.ply", decoded));
+    VKC_TRY(vgrid::mesh_io::write_ply(opt.output.prefix + "_input.ply", input));
+    VKC_TRY(
+        vgrid::mesh_io::write_ply(opt.output.prefix + "_source.ply", source));
+    VKC_TRY(
+        vgrid::mesh_io::write_ply(opt.output.prefix + "_decoded.ply", decoded));
   }
   const eval::CompareOptions compare =
-      vr_example::codec_compare_options(opt.fusion.voxel_size_m, trunc);
+      vgrid_example::codec_compare_options(opt.fusion.voxel_size_m, trunc);
   VKC_ASSIGN(const eval::ReferenceMesh input_reference,
              eval::ReferenceMesh::create(input, compare));
   VKC_ASSIGN(const eval::ReferenceMesh source_reference,
@@ -173,16 +176,16 @@ vkc::Status run(const Options& opt) {
       decoded.triangle_count());
   std::printf(
       "conversion: uncompressed TSDF surface against normalized input:\n");
-  vr_example::print_comparison(conversion_error, opt.fusion.voxel_size_m);
+  vgrid_example::print_comparison(conversion_error, opt.fusion.voxel_size_m);
   std::printf(
       "codec only: decoded surface against uncompressed TSDF surface:\n");
-  vr_example::print_comparison(codec_error, opt.fusion.voxel_size_m);
+  vgrid_example::print_comparison(codec_error, opt.fusion.voxel_size_m);
   std::printf("total: decoded surface against normalized input:\n");
-  vr_example::print_comparison(total_error, opt.fusion.voxel_size_m);
+  vgrid_example::print_comparison(total_error, opt.fusion.voxel_size_m);
   if (opt.codec.sweep) {
-    VKC_TRY(vr_example::run_codec_sweep(device, allocator, volume,
-                                        source_reference, extractor, config,
-                                        *stream.player()));
+    VKC_TRY(vgrid_example::run_codec_sweep(device, allocator, volume,
+                                           source_reference, extractor, config,
+                                           *stream.player()));
   }
   return {};
 }
@@ -198,7 +201,7 @@ int run_main(const Options& opt) {
 }
 
 int main(int argc, char** argv) {
-  return vr_example::configured_main(argc, argv,
-                                     vr_example::config::Application::CodecMesh,
-                                     "codec_mesh", run_main);
+  return vgrid_example::configured_main(
+      argc, argv, vgrid_example::config::Application::CodecMesh, "codec_mesh",
+      run_main);
 }

@@ -23,21 +23,21 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "dct_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/block_neighbourhood.glsl"
+#include "volumetric_kit/grid/volume/shaders/block_neighbourhood.glsl"
 
 layout(local_size_x = kLanes) in;
 
-layout(set = 0, binding = VR_DCT_BINDING_TSDF, scalar) readonly buffer Tsdf {
+layout(set = 0, binding = VGRID_DCT_BINDING_TSDF, scalar) readonly buffer Tsdf {
   float tsdf[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_WEIGHT, scalar) readonly buffer
     Weight {
   float weight[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_CUT, scalar) buffer Cut {
+layout(set = 0, binding = VGRID_DCT_BINDING_CUT, scalar) buffer Cut {
   uint cut[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_KEEP, scalar) buffer Keep {
+layout(set = 0, binding = VGRID_DCT_BINDING_KEEP, scalar) buffer Keep {
   uint keep[];
 };
 
@@ -72,7 +72,7 @@ void main() {
   if (any) {
     atomicOr(s_any, 1u);
   }
-  vrResolveNeighbourhood(blocks[entry].coord, ptr, lane, pc.num_buckets,
+  vgridResolveNeighbourhood(blocks[entry].coord, ptr, lane, pc.num_buckets,
                          pc.bucket_size, pc.max_chain);
   barrier();
   if (s_any == 0u) {
@@ -91,9 +91,9 @@ void main() {
     bool any_near = false;
     for (int i = 0; i < 8; ++i) {
       ivec3 c = anchor + ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
-      if (!vrCornerStorage(bs, c, si[i]) ||
+      if (!vgridCornerStorage(bs, c, si[i]) ||
           weight[si[i]] < pc.observed_weight ||
-          (pc.surface_pass == 1u && VR_SLOT_BIT(cut, si[i]))) {
+          (pc.surface_pass == 1u && VGRID_SLOT_BIT(cut, si[i]))) {
         counted = false;
         break;
       }
@@ -101,7 +101,7 @@ void main() {
       inside += t < 0.0 ? 1u : 0u;
       any_far = any_far || abs(t) > pc.cut_distance;
       any_near = any_near || abs(t) < pc.near_distance;
-      octants |= 1u << uint(vrOctantIndex(c / bs));
+      octants |= 1u << uint(vgridOctantIndex(c / bs));
     }
     if (!counted) {
       continue;

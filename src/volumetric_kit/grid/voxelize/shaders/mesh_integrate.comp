@@ -32,7 +32,7 @@
 //   support plane -- u.(x - c) + min over T's vertices v of u.(c - v), for a
 //                    unit u and a point c: T lies behind that plane. Here c is
 //                    the block's centre and u points to it from the closest
-//                    point vrClosestPointOnTriangle finds.
+//                    point vgridClosestPointOnTriangle finds.
 //   ball          -- |x - m| - R: T lies within R of m, R being its farthest
 //                    vertex from m (the centroid here).
 //   cylinder      -- the distance from x to the cylinder around m with axis a
@@ -65,44 +65,44 @@
 // same floats, and the minimum over (d^2, index) does not depend on the order
 // -- so the voxel's minimum, and what it writes, are its whole bin's.
 //
-// The order. The workgroup sorts its bin into VR_BUCKETS buckets of the
+// The order. The workgroup sorts its bin into VGRID_BUCKETS buckets of the
 // support-plane bound at c, less m_T (a counting sort in shared memory). A
 // bucket's floor, bucket * step, is at most every entry's bound from its first
 // position on, so from a voxel x each of them has a support-plane bound of at
 // least that floor less |x - c|; less the block's own margin for rounding the
 // floor and |x - c|, that is the stop: the voxel stops scanning at the first
-// chunk it rules out. Each chunk of VR_CHUNK entries is staged in shared memory
+// chunk it rules out. Each chunk of VGRID_CHUNK entries is staged in shared memory
 // with its bounds. Each culling group -- 32 invocations, a 4x4x2 brick of an
 // 8^3 block -- keeps the chunk's triangles that the support plane and the ball
 // do not rule out anywhere in its voxels' box at the largest limit among them;
 // each voxel then measures those the support plane and the cylinder do not
-// rule out at its own. A bin past VR_MAX_SORTED sorts its first VR_MAX_SORTED
+// rule out at its own. A bin past VGRID_MAX_SORTED sorts its first VGRID_MAX_SORTED
 // entries; the rest follow in bin order, scanned by every voxel to the end.
 
 #extension GL_GOOGLE_include_directive : require
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/triangle_common.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/triangle_common.glsl"
 
 // Sizes, as macros so the preprocessor can check the shared memory they take.
-#define VR_THREADS 256      // a round of a block's voxels
-#define VR_GROUP 32         // a culling group: consecutive invocations
-#define VR_GROUPS 8         // VR_THREADS / VR_GROUP
-#define VR_CHUNK 64         // bin entries staged at a time
-#define VR_BUCKETS 256      // of the sort key: 8 bits, 4 to a word
-#define VR_MAX_SORTED 2048  // bin entries sorted: 16-bit indices, 2 to a word
+#define VGRID_THREADS 256      // a round of a block's voxels
+#define VGRID_GROUP 32         // a culling group: consecutive invocations
+#define VGRID_GROUPS 8         // VGRID_THREADS / VGRID_GROUP
+#define VGRID_CHUNK 64         // bin entries staged at a time
+#define VGRID_BUCKETS 256      // of the sort key: 8 bits, 4 to a word
+#define VGRID_MAX_SORTED 2048  // bin entries sorted: 16-bit indices, 2 to a word
 // The shared arrays below, in 4-byte words: the sort's keys, order, starts and
 // cursors; a chunk's triangles, 9 coordinates and 3 vec4s; each group's box,
 // limit, count and list; and s_any. 4,033 words, 16,132 bytes: inside the
 // 16,384 every Vulkan device offers (maxComputeSharedMemorySize).
-#define VR_SHARED_WORDS                                      \
-  (VR_MAX_SORTED / 4 + VR_MAX_SORTED / 2 + 2 * VR_BUCKETS +  \
-   VR_CHUNK * (1 + 9 + 3 * 4) + VR_GROUPS * (6 + 2 + VR_CHUNK) + 1)
-#if VR_SHARED_WORDS * 4 > 16384 || VR_GROUPS * VR_GROUP != VR_THREADS
+#define VGRID_SHARED_WORDS                                      \
+  (VGRID_MAX_SORTED / 4 + VGRID_MAX_SORTED / 2 + 2 * VGRID_BUCKETS +  \
+   VGRID_CHUNK * (1 + 9 + 3 * 4) + VGRID_GROUPS * (6 + 2 + VGRID_CHUNK) + 1)
+#if VGRID_SHARED_WORDS * 4 > 16384 || VGRID_GROUPS * VGRID_GROUP != VGRID_THREADS
 #error "mesh_integrate.comp: shared memory past 16,384 bytes"
 #endif
 
-layout(local_size_x = VR_THREADS) in;
+layout(local_size_x = VGRID_THREADS) in;
 
 // One block to write: where its voxels live, and its bin.
 // Scalar layout, 12 bytes, byte-identical to MeshBin in mesh_integrator.cpp.
@@ -147,35 +147,35 @@ const uint kModeSigned = 0u;
 const uint kModeShell = 1u;
 const uint kNoTriangle = 0xFFFFFFFFu;
 
-const uint kThreads = uint(VR_THREADS);
-const uint kGroup = uint(VR_GROUP);
-const uint kChunk = uint(VR_CHUNK);
-const uint kBuckets = uint(VR_BUCKETS);
-const uint kMaxSorted = uint(VR_MAX_SORTED);
+const uint kThreads = uint(VGRID_THREADS);
+const uint kGroup = uint(VGRID_GROUP);
+const uint kChunk = uint(VGRID_CHUNK);
+const uint kBuckets = uint(VGRID_BUCKETS);
+const uint kMaxSorted = uint(VGRID_MAX_SORTED);
 // 2^-14: the margin per metre of coordinate magnitude and of band (see the
 // top), about 1,000 times float's unit roundoff.
 const float kMargin = 1.0 / 16384.0;
 
 // The sort: each entry's bucket (4 to a word), then the bin's indices in
 // bucket order (2 to a word), and each bucket's first sorted position.
-shared uint s_bucket[VR_MAX_SORTED / 4];
-shared uint s_order[VR_MAX_SORTED / 2];
-shared uint s_start[VR_BUCKETS];
-shared uint s_cursor[VR_BUCKETS];
+shared uint s_bucket[VGRID_MAX_SORTED / 4];
+shared uint s_order[VGRID_MAX_SORTED / 2];
+shared uint s_start[VGRID_BUCKETS];
+shared uint s_cursor[VGRID_BUCKETS];
 // One staged chunk: triangle, vertices, support plane (u, its bound at c less
 // m_T), ball (centroid, radius plus m_T), cylinder axis (normal, half-height
 // plus m_T).
-shared uint s_tri[VR_CHUNK];
-shared float s_vtx[9 * VR_CHUNK];
-shared vec4 s_plane[VR_CHUNK];
-shared vec4 s_ball[VR_CHUNK];
-shared vec4 s_axis[VR_CHUNK];
+shared uint s_tri[VGRID_CHUNK];
+shared float s_vtx[9 * VGRID_CHUNK];
+shared vec4 s_plane[VGRID_CHUNK];
+shared vec4 s_ball[VGRID_CHUNK];
+shared vec4 s_axis[VGRID_CHUNK];
 // Per culling group: its voxels' box, the largest limit among its scanning
 // voxels (as float bits + 1; 0 for none), and the chunk entries it keeps.
-shared int s_gbox[6 * VR_GROUPS];
-shared uint s_glimit[VR_GROUPS];
-shared uint s_kept[VR_GROUPS];
-shared uint s_list[VR_GROUPS * VR_CHUNK];
+shared int s_gbox[6 * VGRID_GROUPS];
+shared uint s_glimit[VGRID_GROUPS];
+shared uint s_kept[VGRID_GROUPS];
+shared uint s_list[VGRID_GROUPS * VGRID_CHUNK];
 shared uint s_any;
 
 vec3 vertexOf(uint t, uint k) { return vertices[indices[3u * t + k]]; }
@@ -190,7 +190,7 @@ float triangleMargin(float centre_size, float band, vec3 a, vec3 b, vec3 c) {
 
 // The support plane of triangle (a, b, cc) facing c: u, and its bound at c.
 vec4 supportPlane(vec3 c, vec3 a, vec3 b, vec3 cc) {
-  vec3 dir = c - vrClosestPointOnTriangle(c, a, b, cc);
+  vec3 dir = c - vgridClosestPointOnTriangle(c, a, b, cc);
   float len2 = dot(dir, dir);
   if (!(len2 > 0.0)) {
     return vec4(0.0);
@@ -227,7 +227,7 @@ uint bucketAt(uint pos) {
 
 // Voxel v of a round. An 8^3 block goes in 4x4x2 bricks, one per culling
 // group, so a group's voxels are near one another; any other size in row
-// order (vrLocalBase).
+// order (vgridLocalBase).
 ivec3 voxelOf(uint v, int bs) {
   if (bs == 8) {
     uint w = v & 31u;
@@ -236,13 +236,13 @@ ivec3 voxelOf(uint v, int bs) {
                  int(((b >> 1u) & 1u) * 4u + ((w >> 2u) & 3u)),
                  int((b >> 2u) * 2u + (w >> 4u)));
   }
-  return vrLocalBase(v, bs);
+  return vgridLocalBase(v, bs);
 }
 
 // Measure triangle t, vertices (a, b, c), from p: the minimum over (d^2, t).
 void measure(vec3 p, uint t, vec3 a, vec3 b, vec3 c, inout float best_d2,
              inout uint best_t, inout vec3 best_closest) {
-  vec3 q = vrClosestPointOnTriangle(p, a, b, c);
+  vec3 q = vgridClosestPointOnTriangle(p, a, b, c);
   vec3 d = p - q;
   float d2 = dot(d, d);
   if (d2 < best_d2 || (d2 == best_d2 && t < best_t)) {
@@ -333,7 +333,7 @@ void main() {
     // Node-centred voxels (voxel * voxel_size), matching
     // volume/voxel_coords.hpp::voxel_to_world and tsdf_integrate.comp.
     ivec3 lc = voxelOf(live ? v : 0u, bs);
-    uint local = uint(vrLocalIndex(lc, bs));
+    uint local = uint(vgridLocalIndex(lc, bs));
     vec3 p = vec3(coord * bs + lc) * pc.grid.voxel_size;
 
     // The group's box, over its live voxels.
