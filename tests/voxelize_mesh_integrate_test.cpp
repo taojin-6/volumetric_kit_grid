@@ -38,29 +38,29 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "test_meshes.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_coords.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
-#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_coords.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace vx = volumetric_kit::recon::voxelize;
+namespace vol = volumetric_kit::grid::volume;
+namespace vx = volumetric_kit::grid::voxelize;
 
 namespace {
 
@@ -81,19 +81,19 @@ constexpr float kEdge = 1e-5f;
 
 // ---- The independent reference --------------------------------------------
 
-float nearest(vr::Vec3f p, const Mesh& m) {
+float nearest(vgrid::Vec3f p, const Mesh& m) {
   float best = 1e30f;
   for (std::size_t t = 0; t < m.triangle_count(); ++t) {
-    const vr::Vec3f q =
+    const vgrid::Vec3f q =
         closest_point(p, corner(m, t, 0), corner(m, t, 1), corner(m, t, 2));
-    best = std::fmin(best, vr::length(p - q));
+    best = std::fmin(best, vgrid::length(p - q));
   }
   return best;
 }
 
 // The generalized winding number: 1 inside a closed outward-wound mesh, 0
 // outside (van Oosterom & Strackee's solid angle per triangle, in double).
-double winding(vr::Vec3f p, const Mesh& m) {
+double winding(vgrid::Vec3f p, const Mesh& m) {
   double total = 0.0;
   for (std::size_t t = 0; t < m.triangle_count(); ++t) {
     double A[3], B[3], C[3];
@@ -127,10 +127,10 @@ float clampf(float x, float lo, float hi) {
 // ----------------------------------------------------------------
 
 // A regular tetrahedron, edge 2*sqrt(2)*s, centred at c.
-Mesh tetrahedron(vr::Vec3f c, float s) {
+Mesh tetrahedron(vgrid::Vec3f c, float s) {
   Mesh m;
-  m.v = {c + s * vr::Vec3f(1, 1, 1), c + s * vr::Vec3f(1, -1, -1),
-         c + s * vr::Vec3f(-1, 1, -1), c + s * vr::Vec3f(-1, -1, 1)};
+  m.v = {c + s * vgrid::Vec3f(1, 1, 1), c + s * vgrid::Vec3f(1, -1, -1),
+         c + s * vgrid::Vec3f(-1, 1, -1), c + s * vgrid::Vec3f(-1, -1, 1)};
   m.i = {0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3};
   orient_outward(m, c);
   return m;
@@ -178,7 +178,8 @@ std::vector<vol::BlockIndex> active_blocks(vol::VoxelBlockGrid& grid) {
 // A host copy of one attribute.
 std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                         std::string_view name) {
-  return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
+  return vgrid_test::read_attribute<float>(ctx.device, ctx.allocator, grid,
+                                           name)
       .value();
 }
 
@@ -198,7 +199,7 @@ std::vector<float> snapshot(const vkc::test::Gpu& ctx,
 std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                         std::string_view name,
                         const std::vector<vol::BlockIndex>& blocks) {
-  return vr_test::read_blocks<float>(ctx, grid, name, blocks).value();
+  return vgrid_test::read_blocks<float>(ctx, grid, name, blocks).value();
 }
 
 // Each written block's voxels, keyed by coordinate: the heap hands a block a
@@ -241,12 +242,12 @@ int verify(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
       attr(ctx, grid, vol::kWeightAttribute, blocks);
   int observed = 0;
   for (std::size_t i = 0; i < blocks.size(); ++i) {
-    const vr::Vec3i base = vol::block_to_voxel(blocks[i].coord, g);
+    const vgrid::Vec3i base = vol::block_to_voxel(blocks[i].coord, g);
     for (int local = 0; local < g.voxels_per_block; ++local) {
-      const vr::Vec3i lc(local % g.block_size,
-                         (local / g.block_size) % g.block_size,
-                         local / (g.block_size * g.block_size));
-      const vr::Vec3f p = vol::voxel_to_world(base + lc, g);
+      const vgrid::Vec3i lc(local % g.block_size,
+                            (local / g.block_size) % g.block_size,
+                            local / (g.block_size * g.block_size));
+      const vgrid::Vec3f p = vol::voxel_to_world(base + lc, g);
       const Expect e = expect(p);
       if (e.skip) continue;
       const std::size_t at = i * static_cast<std::size_t>(g.voxels_per_block) +
@@ -277,15 +278,15 @@ int verify(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
 // face tied for nearest -- every face meeting at the closest edge or vertex --
 // puts the voxel on the wrong side of its own plane, since which of the tied
 // faces decides is the lowest index, not the right side.
-bool face_rule_can_fail(vr::Vec3f p, const Mesh& m, bool inside) {
+bool face_rule_can_fail(vgrid::Vec3f p, const Mesh& m, bool inside) {
   const float d = nearest(p, m);
   for (std::size_t t = 0; t < m.triangle_count(); ++t) {
-    const vr::Vec3f a = corner(m, t, 0), b = corner(m, t, 1),
-                    c = corner(m, t, 2);
-    const vr::Vec3f q = closest_point(p, a, b, c);
-    if (vr::length(p - q) > d + 1e-6f) continue;
+    const vgrid::Vec3f a = corner(m, t, 0), b = corner(m, t, 1),
+                       c = corner(m, t, 2);
+    const vgrid::Vec3f q = closest_point(p, a, b, c);
+    if (vgrid::length(p - q) > d + 1e-6f) continue;
     const bool face_says_inside =
-        vr::dot(p - q, vr::cross(b - a, c - a)) < 0.0f;
+        vgrid::dot(p - q, vgrid::cross(b - a, c - a)) < 0.0f;
     if (face_says_inside != inside) return true;
   }
   return false;
@@ -295,7 +296,7 @@ bool face_rule_can_fail(vr::Vec3f p, const Mesh& m, bool inside) {
 // from the winding number wherever the faces tied for nearest agree about it.
 // Where they do not, the sign is the lowest-indexed face's -- the documented
 // cost of signing without topology -- so only the distance is checked.
-Expect signed_closed(vr::Vec3f p, const Mesh& m, float trunc) {
+Expect signed_closed(vgrid::Vec3f p, const Mesh& m, float trunc) {
   Expect e;
   const float d = nearest(p, m);
   if (d < kEdge || std::fabs(d - trunc) < kEdge) {
@@ -318,7 +319,7 @@ Expect signed_closed(vr::Vec3f p, const Mesh& m, float trunc) {
 struct Rect {
   float x0, x1, y0, y1;
 };
-Expect signed_sheets(vr::Vec3f p, const std::vector<Rect>& sheets, float z0,
+Expect signed_sheets(vgrid::Vec3f p, const std::vector<Rect>& sheets, float z0,
                      float trunc) {
   Expect e;
   const float h = p.z - z0;
@@ -383,7 +384,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   const float shell = 1.5f * gp.voxel_size;
 
   // ---- 1. Signed tetrahedron: the sharp-edge case -------------------------
-  const Mesh tet = tetrahedron(vr::Vec3f(0.203f, 0.117f, -0.089f), 0.1f);
+  const Mesh tet = tetrahedron(vgrid::Vec3f(0.203f, 0.117f, -0.089f), 0.1f);
   vkc::Result<vx::MeshIntegrateStats> tet_stats = convert(tet, kSigned);
   if (!tet_stats.ok()) {
     std::fprintf(stderr, "tetrahedron: %s\n",
@@ -399,7 +400,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   int tet_sign_checked = 0;
   if (verify(
           gpu, grid, "signed tetrahedron",
-          [&](vr::Vec3f p) {
+          [&](vgrid::Vec3f p) {
             const Expect e = signed_closed(p, tet, trunc);
             if (!e.skip && e.observed && !e.magnitude_only) ++tet_sign_checked;
             return e;
@@ -444,7 +445,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // and another as 0 * -1 writes: -0.0 is the same position as +0.0. A
   // tetrahedron with vertices on the coordinate planes, whose soup has one
   // triangle's zeros negated.
-  const Mesh zeros = tetrahedron(vr::Vec3f(0.1f, 0.1f, 0.1f), 0.1f);
+  const Mesh zeros = tetrahedron(vgrid::Vec3f(0.1f, 0.1f, 0.1f), 0.1f);
   CHECK(convert(zeros, kSigned).ok());
   const std::map<Coord, std::vector<float>> zeros_bytes = by_coord(gpu, grid);
   Mesh zeros_soup = soup(zeros);
@@ -462,12 +463,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(by_coord(gpu, grid) == zeros_bytes);
 
   // ---- 4. Signed dented cube: concave edges and a concave vertex ---------
-  const Mesh cube = dented_cube(vr::Vec3f(0.013f, -0.021f, 0.017f), 0.3f);
+  const Mesh cube = dented_cube(vgrid::Vec3f(0.013f, -0.021f, 0.017f), 0.3f);
   vkc::Result<vx::MeshIntegrateStats> cube_stats = convert(cube, kSigned);
   CHECK(cube_stats.ok());
   CHECK(cube_stats.value().triangles == 12);
-  if (verify(gpu, grid, "signed dented cube",
-             [&](vr::Vec3f p) { return signed_closed(p, cube, trunc); }) != 0) {
+  if (verify(gpu, grid, "signed dented cube", [&](vgrid::Vec3f p) {
+        return signed_closed(p, cube, trunc);
+      }) != 0) {
     return 1;
   }
   // Its ~600 candidates binned at one group a dispatch, three dispatches a
@@ -475,9 +477,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // on a device with Vulkan's 65,535-group floor.
   {
     const std::map<Coord, std::vector<float>> cube_bytes = by_coord(gpu, grid);
-    vr::detail::set_test_groups_per_dispatch(1);
+    vgrid::detail::set_test_groups_per_dispatch(1);
     const bool split = convert(cube, kSigned).ok();
-    vr::detail::set_test_groups_per_dispatch(0);
+    vgrid::detail::set_test_groups_per_dispatch(0);
     CHECK(split);
     CHECK(by_coord(gpu, grid) == cube_bytes);
   }
@@ -495,7 +497,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   int quad_observed = 0;
   if (verify(
           gpu, grid, "signed open quad",
-          [&](vr::Vec3f p) {
+          [&](vgrid::Vec3f p) {
             return signed_sheets(p, {{x0, x1, y0, y1}}, z0, trunc);
           },
           &quad_observed) != 0) {
@@ -507,7 +509,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // The same open quad, now observed past its rim too.
   CHECK(convert(quad, kShell).ok());
   auto shell_expect = [&](const Mesh& m) {
-    return [&m, trunc, shell](vr::Vec3f p) {
+    return [&m, trunc, shell](vgrid::Vec3f p) {
       Expect e;
       const float d = nearest(p, m);
       if (std::fabs(d - trunc) < kEdge) {
@@ -545,7 +547,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   if (verify(gpu, grid, "shell tetrahedron", shell_expect(tet)) != 0) return 1;
   {
     int deep_inside_positive = 0;
-    if (verify(gpu, grid, "shell inner wall", [&](vr::Vec3f p) {
+    if (verify(gpu, grid, "shell inner wall", [&](vgrid::Vec3f p) {
           Expect e = shell_expect(tet)(p);
           if (!e.skip && e.observed && e.value > 0.0f &&
               winding(p, tet) > 0.5) {
@@ -578,7 +580,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
           sheet_stats.value().bin_entries);
     CHECK(sheet_stats.value().dispatches > 1);
     CHECK(sheet_stats.value().blocks == active_blocks(grid).size());
-    if (verify(gpu, grid, "signed divided sheet", [&](vr::Vec3f p) {
+    if (verify(gpu, grid, "signed divided sheet", [&](vgrid::Vec3f p) {
           return signed_sheets(p, {{sx0, sx1, sy0, sy1}}, z0, trunc);
         }) != 0) {
       return 1;
@@ -587,8 +589,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // ---- 8. Blocks the band does not reach keep what they held ------------
   CHECK(grid.clear().ok());
-  const vol::BlockIndex far_block{vr::Vec3i(40, 40, 40), 0};
-  CHECK(vr_test::allocate_blocks(gpu, grid.map(), &far_block, 1).ok());
+  const vol::BlockIndex far_block{vgrid::Vec3i(40, 40, 40), 0};
+  CHECK(vgrid_test::allocate_blocks(gpu, grid.map(), &far_block, 1).ok());
   std::int32_t far_ptr = -1;
   for (const vol::BlockIndex& b : active_blocks(grid)) far_ptr = b.ptr;
   CHECK(far_ptr >= 0);
@@ -599,11 +601,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       tsdf[far_ptr + k] = 7.0f;
       weight[far_ptr + k] = 7.0f;
     }
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kTsdfAttribute, tsdf)
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kTsdfAttribute, tsdf)
               .ok());
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vol::kWeightAttribute, weight)
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kWeightAttribute, weight)
               .ok());
   }
   CHECK(grid.map()
@@ -654,7 +656,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   {
     const std::vector<vol::BlockIndex> band = active_blocks(grid);
     CHECK(!band.empty());
-    CHECK(vr_test::remove_blocks(gpu, grid, &band[band.size() / 2], 1).ok());
+    CHECK(vgrid_test::remove_blocks(gpu, grid, &band[band.size() / 2], 1).ok());
   }
   CHECK(refused(tet, kSigned, "not allocated"));
 
@@ -797,14 +799,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     const auto first_bytes = by_coord(gpu, wide);
     CHECK(write().ok());
     CHECK(by_coord(gpu, wide) == first_bytes);
-    for (vr::Vec3f& v : moving.v) v.z += 0.137f;
+    for (vgrid::Vec3f& v : moving.v) v.z += 0.137f;
     for (std::size_t t = 0; t < moving.i.size(); t += 3) {
       std::swap(moving.i[t + 1], moving.i[t + 2]);
     }
     CHECK(write().ok());
     CHECK(by_coord(gpu, wide) != first_bytes);
     if (verify(gpu, wide, "reused scratch, moved/reversed sheet",
-               [&](vr::Vec3f p) {
+               [&](vgrid::Vec3f p) {
                  Expect e =
                      signed_sheets(p, {{-0.487f, 0.513f, -0.493f, 0.507f}},
                                    z0 + 0.137f, wide_gp.trunc_dist);
@@ -849,5 +851,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

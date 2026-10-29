@@ -38,11 +38,11 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/eval/export.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/eval/export.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
 
-namespace volumetric_kit::recon::eval {
+namespace volumetric_kit::grid::eval {
 
 /// @brief The point of triangle `abc` nearest to @p p: its projection onto
 ///        the face when that lands inside, and otherwise the nearest point of
@@ -61,7 +61,8 @@ namespace volumetric_kit::recon::eval {
 ///         1e-4 -- two corners coinciding, whichever two, or all three on one
 ///         line -- is measured by its edges, which lie within its height of
 ///         its face.
-VR_EVAL_API Vec3f closest_point_on_triangle(Vec3f p, Vec3f a, Vec3f b, Vec3f c);
+VGRID_EVAL_API Vec3f closest_point_on_triangle(Vec3f p, Vec3f a, Vec3f b,
+                                               Vec3f c);
 
 /// @brief Distance from points to one triangle mesh's surface, up to a reach.
 ///
@@ -71,7 +72,7 @@ VR_EVAL_API Vec3f closest_point_on_triangle(Vec3f p, Vec3f a, Vec3f b, Vec3f c);
 /// within two cells whose box is nearer than the best found so far -- on a
 /// surface, few of them. The triangles are **copied** at @ref create, so the
 /// source mesh need not outlive this.
-class VR_EVAL_API MeshDistance {
+class VGRID_EVAL_API MeshDistance {
  public:
   /// The most cells a triangle may be filed under, on average over the mesh.
   /// A triangle no larger than half the reach touches at most 8 cells, and
@@ -127,7 +128,8 @@ struct DistanceStats {
 ///                   counted in @ref DistanceStats::beyond_reach.
 /// @return The distribution. Every field but the two counts is 0 when no
 ///         distance is within reach.
-VR_EVAL_API DistanceStats summarize(std::vector<float> distances, float reach);
+VGRID_EVAL_API DistanceStats summarize(std::vector<float> distances,
+                                       float reach);
 
 /// @brief Precision, recall and their harmonic mean at one threshold.
 struct FScore {
@@ -167,7 +169,7 @@ struct MeshComparison {
 /// so the reference mesh need not outlive this. @ref compare then builds only
 /// the index of the mesh under test, and measures both ways: accuracy (test
 /// to reference) and coverage (reference to test).
-class VR_EVAL_API ReferenceMesh {
+class VGRID_EVAL_API ReferenceMesh {
  public:
   /// @brief Index @p reference for comparisons measured as @p options says.
   /// @param reference  The mesh taken as the truth.
@@ -201,4 +203,4 @@ class VR_EVAL_API ReferenceMesh {
   std::vector<Vec3f> points_;  // the reference's vertices, as measured
 };
 
-}  // namespace volumetric_kit::recon::eval
+}  // namespace volumetric_kit::grid::eval

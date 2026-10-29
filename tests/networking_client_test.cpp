@@ -38,16 +38,16 @@
 #include <thread>
 #include <vector>
 
-#include "networking_loopback.hpp"
-#include "stream_files.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
+#include "volumetric_kit/grid/testing/networking_loopback.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace networking = volumetric_kit::recon::networking;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
-namespace net = vr_test::net;
+namespace networking = volumetric_kit::grid::networking;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
+namespace net = vgrid_test::net;
 
 namespace {
 

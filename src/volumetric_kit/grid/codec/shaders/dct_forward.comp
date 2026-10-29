@@ -22,23 +22,23 @@
 
 layout(local_size_x = kLanes) in;
 
-layout(set = 0, binding = VR_DCT_BINDING_TSDF, scalar) readonly buffer Tsdf {
+layout(set = 0, binding = VGRID_DCT_BINDING_TSDF, scalar) readonly buffer Tsdf {
   float tsdf[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_WEIGHT, scalar) readonly buffer
     Weight {
   float weight[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_COEFFICIENTS, scalar) writeonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_COEFFICIENTS, scalar) writeonly buffer
     Coefficients {
   uint coefficients[];
 };
-layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) writeonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_MASKS, scalar) writeonly buffer
     Masks {
   uint masks[];
 };
 // Read only with pc.true_sdf (see dct_common.glsl).
-layout(set = 0, binding = VR_DCT_BINDING_CUT, scalar) readonly buffer Cut {
+layout(set = 0, binding = VGRID_DCT_BINDING_CUT, scalar) readonly buffer Cut {
   uint cut[];
 };
 
@@ -132,7 +132,7 @@ void main() {
     uint v = x_line_base(lane) + x;
     uint slot = voxel_base + v;
     bool obs = weight[slot] >= pc.observed_weight &&
-               (pc.true_sdf == 0u || !VR_SLOT_BIT(cut, slot));
+               (pc.true_sdf == 0u || !VGRID_SLOT_BIT(cut, slot));
     s_work[v] = obs ? tsdf[slot] * inv_trunc : 0.0;
     s_known[v] = obs ? 1u : 0u;
     if (obs) {

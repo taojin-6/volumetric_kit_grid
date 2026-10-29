@@ -26,32 +26,32 @@
 #include <utility>
 #include <vector>
 
-#include "codec_fixture.hpp"
 #include "codec_oracle_device.hpp"
 #include "codec_oracle_encode.hpp"
 #include "dct_tables.hpp"
 #include "dct_transform.hpp"
-#include "device_blocks.hpp"
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace codec = volumetric_kit::recon::codec;
+namespace vol = volumetric_kit::grid::volume;
+namespace codec = volumetric_kit::grid::codec;
 namespace oracle = codec_oracle;
 using codec::detail::DctTransform;
 using codec_oracle::DctBlocks;
@@ -99,10 +99,10 @@ vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
     const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) {
-    coords[static_cast<std::size_t>(i)].coord = vr::Vec3i(i, 0, 0);
+    coords[static_cast<std::size_t>(i)].coord = vgrid::Vec3i(i, 0, 0);
   }
   VKC_ASSIGN(std::uint32_t failed,
-             vr_test::allocate_blocks(ctx, grid.map(), coords));
+             vgrid_test::allocate_blocks(ctx, grid.map(), coords));
   if (failed != 0) {
     return vkc::Status::invalid_argument("allocate_row: allocation failed");
   }
@@ -120,13 +120,14 @@ vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
 std::vector<float> attr(const vkc::test::Gpu& ctx,
                         const vol::VoxelBlockGrid& grid,
                         std::string_view name) {
-  return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
+  return vgrid_test::read_attribute<float>(ctx.device, ctx.allocator, grid,
+                                           name)
       .value();
 }
 
 void put(const vkc::test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
          std::string_view name, const std::vector<float>& data) {
-  if (!vr_test::write_attribute(ctx.device, ctx.allocator, grid, name, data)
+  if (!vgrid_test::write_attribute(ctx.device, ctx.allocator, grid, name, data)
            .ok()) {
     std::abort();
   }
@@ -902,9 +903,9 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   // the single run: a freed buffer VMA hands straight back still holds the
   // previous run's output, so equality alone passes a batch that wrote
   // nothing past its first entries.
-  vr::detail::set_test_groups_per_dispatch(3);
+  vgrid::detail::set_test_groups_per_dispatch(3);
   CHECK(oracle::forward(ctx, t, grid, blocks, params, many).ok());
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
   int exact = 0;
   int near_half = 0;
   CHECK(check_against_reference(many, content.data(), content.size(), exact,
@@ -929,9 +930,9 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
     }
   }
   put(ctx, grid, vol::kTsdfAttribute, tsdf);
-  vr::detail::set_test_groups_per_dispatch(3);
+  vgrid::detail::set_test_groups_per_dispatch(3);
   CHECK(oracle::inverse(ctx, t, grid, blocks, many).ok());
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     CHECK(read_block(ctx, grid, blocks[i]) == single[i]);
   }
@@ -1068,7 +1069,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   }
   // A coord the grid does not hold is refused, and leaves the outputs empty.
   std::vector<vol::BlockIndex> absent = blocks;
-  absent[1].coord = vr::Vec3i(99, 99, 99);
+  absent[1].coord = vgrid::Vec3i(99, 99, 99);
   out.coefficients = {1};
   CHECK(!oracle::forward(ctx, t, grid, absent, params, out).ok());
   CHECK(out.coefficients.empty());
@@ -1080,7 +1081,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   {
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = unused;
-    forged[2].coord = vr::Vec3i(99, 99, 99);
+    forged[2].coord = vgrid::Vec3i(99, 99, 99);
     std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
     for (const vol::BlockIndex& b : blocks) {
       for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -1117,7 +1118,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     const auto inverse = [&](const codec::detail::ResidentBlocks& in) {
       vkc::CommandBatch batch(device, allocator);
       return t.record_inverse(batch, grid, in, params,
-                              volumetric_kit::recon::detail::IndirectSlices{});
+                              volumetric_kit::grid::detail::IndirectSlices{});
     };
     codec::detail::ResidentBlocks resident;
     resident.count = std::uint32_t(blocks.size());
@@ -1140,7 +1141,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   vol::BlockIndex gone{};
   gone.coord = blocks[0].coord;
   vkc::Result<std::uint32_t> removed =
-      vr_test::remove_blocks(ctx, grid, &gone, 1);
+      vgrid_test::remove_blocks(ctx, grid, &gone, 1);
   CHECK(removed.ok());
   CHECK(!oracle::forward(ctx, t, grid, blocks, params, out).ok());
   CHECK(!oracle::inverse(ctx, t, grid, blocks, out).ok());
@@ -1150,8 +1151,8 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   CHECK(g4.ok());
   vol::VoxelBlockGrid grid4 = std::move(g4).value();
   std::vector<vol::BlockIndex> one(1);
-  one[0].coord = vr::Vec3i(0, 0, 0);
-  CHECK(vr_test::allocate_blocks(ctx, grid4.map(), one).ok());
+  one[0].coord = vgrid::Vec3i(0, 0, 0);
+  CHECK(vgrid_test::allocate_blocks(ctx, grid4.map(), one).ok());
   vkc::Result<std::vector<vol::BlockIndex>> active4 =
       grid4.map().compact_active_blocks();
   CHECK(active4.ok());
@@ -1163,7 +1164,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
       make_grid(device, allocator, codec::kBlockSize, false);
   CHECK(gw.ok());
   vol::VoxelBlockGrid no_weight = std::move(gw).value();
-  CHECK(vr_test::allocate_blocks(ctx, no_weight.map(), one).ok());
+  CHECK(vgrid_test::allocate_blocks(ctx, no_weight.map(), one).ok());
   vkc::Result<std::vector<vol::BlockIndex>> active_w =
       no_weight.map().compact_active_blocks();
   CHECK(active_w.ok());
@@ -1339,7 +1340,8 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
 int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
   vkc::test::Gpu ctx{device, allocator};
   const codec_fixture::Curtain curtain{
-      codec_fixture::Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, true};
+      codec_fixture::Sphere{vgrid::Vec3f(0.013f, -0.007f, 0.004f), 0.09f},
+      true};
   vkc::Result<vol::VoxelBlockGrid> g =
       codec_fixture::curtain_grid(ctx, curtain);
   CHECK(g.ok());
@@ -1357,10 +1359,10 @@ int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
         DctTransform::create(device, allocator);
     CHECK(made.ok());
     DctTransform& chunked = *made.value();
-    vr::detail::set_test_groups_per_dispatch(chunk);
+    vgrid::detail::set_test_groups_per_dispatch(chunk);
     vkc::Result<std::uint32_t> n =
         observed_count(device, allocator, chunked, grid, list.value(), true);
-    vr::detail::set_test_groups_per_dispatch(0);
+    vgrid::detail::set_test_groups_per_dispatch(0);
     CHECK(n.ok() && n.value() == host.blocks.size());
     vkc::Result<std::vector<vol::BlockIndex>> kept =
         vkc::test::read_back<vol::BlockIndex>(
@@ -1553,10 +1555,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // Again on fresh scratch, two blocks a dispatch.
   auto chunked = DctTransform::create(dev, alloc);
   CHECK(chunked.ok());
-  vr::detail::set_test_groups_per_dispatch(2);
+  vgrid::detail::set_test_groups_per_dispatch(2);
   if (observed_case(dev, alloc, *chunked.value()) != 0) return 1;
   if (scratch_reuse_case(dev, alloc, *chunked.value()) != 0) return 1;
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
   if (surface_chunks_case(dev, alloc) != 0) return 1;
   if (inverse_stamps_case(dev, alloc, t) != 0) return 1;
   std::printf("codec DctTransform: OK\n");
@@ -1566,5 +1568,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

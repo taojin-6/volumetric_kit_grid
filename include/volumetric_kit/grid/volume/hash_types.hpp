@@ -22,9 +22,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// Active-block reference used in compacted block lists.
 struct BlockIndex {
@@ -37,7 +37,7 @@ static_assert(offsetof(BlockIndex, ptr) == 12, "BlockIndex layout drift");
 
 /// @return `true` if block coordinate @p a sorts before @p b: by z, then y,
 ///         then x. The one order every sorted block list here uses, the
-///         codec's frames included; `vrCoordLess` in
+///         codec's frames included; `vgridCoordLess` in
 ///         `volume/shaders/coord_order.glsl` mirrors it for kernels.
 inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
   if (a.z != b.z) return a.z < b.z;
@@ -78,4 +78,4 @@ constexpr bool tick_after(std::uint32_t a, std::uint32_t b) noexcept {
   return static_cast<std::int32_t>(a - b) > 0;
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

@@ -18,9 +18,9 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// @brief A frame's coder steps laid out from each entry's step count, on
 ///        the device (`rans_layout.comp`): where each entry's steps go in the
@@ -51,7 +51,7 @@ namespace volumetric_kit::recon::codec::detail {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time.
-class VR_CODEC_API StepLayout {
+class VGRID_CODEC_API StepLayout {
  public:
   /// @brief Build the kernel.
   /// @return The layout, or a pipeline or pool failure.
@@ -144,4 +144,4 @@ class VR_CODEC_API StepLayout {
   core::Buffer totals_;        // starts_[N] and slot_offsets_[S]
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

@@ -53,7 +53,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 // Cross-tier: the voxel colour attribute's format, from the volume tier.
-#include "volumetric_kit/recon/volume/shaders/voxel_color.glsl"
+#include "volumetric_kit/grid/volume/shaders/voxel_color.glsl"
 
 // One workgroup per block. 256 is fixed rather than sized from
 // voxels_per_block, which is a push constant and so cannot set local_size
@@ -66,8 +66,8 @@ layout(local_size_x = 256) in;
 // block's voxel-array base, which also supplies the shared BlockIndex /
 // HashEntry layouts and hash constants from the volume tier's hash_common.glsl
 // (one definition, not a mirror -- see hash_lookup.glsl).
-#define VR_HASH_ENTRIES_BINDING 2
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
+#define VGRID_HASH_ENTRIES_BINDING 2
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
 
 // One mesh vertex (mirrors mesh::Vertex).
 struct Vertex {
@@ -97,7 +97,7 @@ layout(set = 0, binding = 5, scalar) readonly buffer Color { uint color_attr[]; 
 layout(set = 0, binding = 6, scalar) writeonly buffer Vertices {
   Vertex vertices[];
 };
-// The draw command, plus two words of recon scratch past it.
+// The draw command, plus two words of grid scratch past it.
 //
 // `index_count` IS VkDrawIndexedIndirectCommand::indexCount -- the kernel counts
 // into the command rather than into a number a host would build one from. The
@@ -156,7 +156,7 @@ layout(push_constant, scalar) uniform PushConstants {
 // edge guard, over the Tables / Vertices / DrawCommand bindings declared above.
 #include "marching_cubes_common.glsl"
 
-// vrLocalIndex / vrLocalBase / s_neighbour / vrResolveNeighbourhood /
+// vgridLocalIndex / vgridLocalBase / s_neighbour / vgridResolveNeighbourhood /
 // mcGather.
 #include "marching_cubes_sparse_common.glsl"
 
@@ -274,7 +274,7 @@ int mcClaimVertex(vec3 position, vec3 normal, vec3 color) {
 // Accumulated into the caller's registers across the whole strided loop and
 // pushed to the shared totals once per lane, not once per cell.
 void mcCountCell(int bs, uint local, inout uint verts, inout uint tris) {
-  int cube_index = mcCellSigns(bs, vrLocalBase(local, bs));
+  int cube_index = mcCellSigns(bs, vgridLocalBase(local, bs));
   int n = mcCellTriangleCount(cube_index);
   s_case[local] = uint(cube_index) | (uint(n) << kCaseTriShift);
   if (n == 0) {
@@ -320,7 +320,7 @@ uint mcCountDuplicates(int bs, uint local) {
     return 0u;
   }
   int row = int(c & 0xFFu) * 16;
-  ivec3 base = vrLocalBase(local, bs);
+  ivec3 base = vgridLocalBase(local, bs);
 
   uint dupes = 0u;
   for (uint t = 0u; t < n; ++t) {
@@ -328,7 +328,7 @@ uint mcCountDuplicates(int bs, uint local) {
     for (int k = 0; k < 3; ++k) {
       ivec3 owner = base + s_edge_owner[tri_table[e + k]].xyz;
       if (!all(lessThan(owner, ivec3(bs))) ||
-          (s_case[vrLocalIndex(owner, bs)] >> kCaseTriShift) == 0u) {
+          (s_case[vgridLocalIndex(owner, bs)] >> kCaseTriShift) == 0u) {
         ++dupes;
       }
     }
@@ -361,13 +361,13 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
   }
   int cube_index = int(c & 0xFFu);
 
-  ivec3 base = vrLocalBase(local, bs);
+  ivec3 base = vgridLocalBase(local, bs);
   float sdf[8];
   vec3 corner_color[8];
   int regathered;
   if (!mcGather(bs, base, sdf, corner_color, regathered)) {
     // Cannot happen: mcCellSigns resolved the same eight corners through the
-    // same vrCornerStorage over the same quiescent buffers, and returned
+    // same vgridCornerStorage over the same quiescent buffers, and returned
     // non-zero. If it ever does, this cell emits none of the vertices it was
     // counted for, the cells referencing its edges duplicate instead, and
     // mcClaimVertex's bound is what keeps the surplus inside this block.
@@ -416,7 +416,7 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
   }
   int row = int(c & 0xFFu) * 16;
 
-  ivec3 base = vrLocalBase(local, bs);
+  ivec3 base = vgridLocalBase(local, bs);
   ivec3 base_voxel = block.coord * bs + base;
   // Gathered LAZILY: a cell all of whose edges are shared never touches global
   // memory here, which is most interior cells.
@@ -465,7 +465,7 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
       int axis = owner_info.w;
       int slot = kNoVertex;
       if (all(lessThan(owner, ivec3(bs)))) {
-        slot = s_edge_vtx[uint(vrLocalIndex(owner, bs)) * 3u + uint(axis)];
+        slot = s_edge_vtx[uint(vgridLocalIndex(owner, bs)) * 3u + uint(axis)];
       }
       if (slot == kNoVertex) {
         // Duplicate: this cell's own corners describe the same edge, and
@@ -574,7 +574,7 @@ void main() {
     s_vcursor = 0u;
     s_icursor = 0u;
   }
-  vrResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
+  vgridResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
                          pc.bucket_size, pc.max_chain);
   // Derived once per workgroup by the first 12 lanes, under the same barrier as
   // the neighbourhood: mcEdgeOwner is a pure function of the tables, so having

@@ -16,15 +16,15 @@
 #include "codec_quantization.hpp"
 #include "codec_report.hpp"
 #include "stage_table.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/eval/mesh_distance.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/eval/mesh_distance.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 namespace vkc = volumetric_kit::core;
 
@@ -50,7 +50,7 @@ inline std::vector<SweepConfig> sweep_configs() {
       }
     }
   }
-  c.push_back({"uniform", vr::codec::kVoxelsPerBlock, 0.002f});
+  c.push_back({"uniform", vgrid::codec::kVoxelsPerBlock, 0.002f});
   return c;
 }
 
@@ -59,10 +59,10 @@ inline std::vector<SweepConfig> sweep_configs() {
 ///         of 1, since a row times repeated encodes of one grid, which a
 ///         P-frame would code as skips; or InvalidArgument for an unknown
 ///         table (@ref apply_quantization_table).
-inline vkc::Result<vr::codec::EncoderConfig> sweep_encoder_config(
-    const vr::codec::EncoderConfig& base, const SweepConfig& cfg) {
-  vr::codec::EncoderConfig ec = base;
-  ec.params = vr::codec::CodecParams{};
+inline vkc::Result<vgrid::codec::EncoderConfig> sweep_encoder_config(
+    const vgrid::codec::EncoderConfig& base, const SweepConfig& cfg) {
+  vgrid::codec::EncoderConfig ec = base;
+  ec.params = vgrid::codec::CodecParams{};
   ec.params.coefficient_count = cfg.k;
   ec.params.quantization_scale = cfg.scale;
   VKC_TRY(apply_quantization_table(ec.params, cfg.family));
@@ -90,13 +90,13 @@ inline vkc::Result<vr::codec::EncoderConfig> sweep_encoder_config(
 ///                for this geometry (it grows if a frame needs it).
 inline vkc::Status run_codec_sweep(vkc::Device& device,
                                    vkc::Allocator& allocator,
-                                   vr::volume::VoxelBlockGrid& source,
-                                   const vr::eval::ReferenceMesh& reference,
-                                   vr::mesh::MarchingCubes& extractor,
-                                   const vr::codec::EncoderConfig& base,
-                                   vr::volume::VoxelBlockGrid& player) {
-  VKC_ASSIGN(vr::codec::Decoder dec,
-             vr::codec::Decoder::create(device, allocator));
+                                   vgrid::volume::VoxelBlockGrid& source,
+                                   const vgrid::eval::ReferenceMesh& reference,
+                                   vgrid::mesh::MarchingCubes& extractor,
+                                   const vgrid::codec::EncoderConfig& base,
+                                   vgrid::volume::VoxelBlockGrid& player) {
+  VKC_ASSIGN(vgrid::codec::Decoder dec,
+             vgrid::codec::Decoder::create(device, allocator));
   // The source's slots bound its frames' blocks: the player's ceiling.
   const auto max_blocks = static_cast<std::uint32_t>(source.grid().num_blocks);
   const float tau = reference.options().fscore_threshold;
@@ -117,13 +117,13 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
       "acc max", "acc>r", "cov rms", "cov>r", "F", "enc ms", "dec ms",
       "enc gpu", "dec gpu");
   for (const SweepConfig& cfg : sweep_configs()) {
-    VKC_ASSIGN(const vr::codec::EncoderConfig ec,
+    VKC_ASSIGN(const vgrid::codec::EncoderConfig ec,
                sweep_encoder_config(base, cfg));
-    VKC_ASSIGN(vr::codec::Encoder enc,
-               vr::codec::Encoder::create(device, allocator, ec));
+    VKC_ASSIGN(vgrid::codec::Encoder enc,
+               vgrid::codec::Encoder::create(device, allocator, ec));
     VKC_ASSIGN(const Bytes warm, enc.encode(source));
-    VKC_TRY(vr::codec::decode_growing(dec, warm.data(), warm.size(), player,
-                                      max_blocks));
+    VKC_TRY(vgrid::codec::decode_growing(dec, warm.data(), warm.size(), player,
+                                         max_blocks));
 
     vkc::StageMetrics enc_rows;
     vkc::StageMetrics dec_rows;
@@ -131,13 +131,13 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
     Bytes frame;
     for (int repeat = 0; repeat < kTimedRounds; ++repeat) {
       VKC_ASSIGN(frame, enc.encode(source, &enc_rows));
-      VKC_TRY(vr::codec::decode_growing(dec, frame.data(), frame.size(), player,
-                                        max_blocks, &dec_rows));
+      VKC_TRY(vgrid::codec::decode_growing(dec, frame.data(), frame.size(),
+                                           player, max_blocks, &dec_rows));
     }
-    VKC_ASSIGN(const vr::codec::FrameInfo info,
-               vr::codec::read_frame_info(frame.data(), frame.size()));
-    VKC_ASSIGN(const vr::mesh::Mesh decoded, extractor.extract_host(player));
-    VKC_ASSIGN(const vr::eval::MeshComparison c, reference.compare(decoded));
+    VKC_ASSIGN(const vgrid::codec::FrameInfo info,
+               vgrid::codec::read_frame_info(frame.data(), frame.size()));
+    VKC_ASSIGN(const vgrid::mesh::Mesh decoded, extractor.extract_host(player));
+    VKC_ASSIGN(const vgrid::eval::MeshComparison c, reference.compare(decoded));
     const double per_block =
         info.block_count > 0 ? double(frame.size()) / info.block_count : 0.0;
     char f[16] = "-";  // not measured, which a 0 would misread as
@@ -167,4 +167,4 @@ inline vkc::Status run_codec_sweep(vkc::Device& device,
   return {};
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

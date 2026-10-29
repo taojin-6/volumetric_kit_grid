@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// recon's one count-to-indirect-slices kernel (recon::detail::DispatchArgs):
+// grid's one count-to-indirect-slices kernel (grid::detail::DispatchArgs):
 // a pass's size from a count on the device -- a compaction's, a diff's -- or
 // one the host knows, gated by an optional word, so no count reaches the host
 // between the kernel that wrote it and the passes it sizes. One invocation
@@ -15,8 +15,8 @@ layout(local_size_x = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Counts { uint counts[]; };
 layout(set = 0, binding = 1) readonly buffer Gates { uint gates[]; };
-#define VR_SLICES_BINDING 2
-#include "volumetric_kit/recon/core/shaders/dispatch_slices.glsl"
+#define VGRID_SLICES_BINDING 2
+#include "volumetric_kit/grid/base/shaders/dispatch_slices.glsl"
 
 // A word index that names no word.
 const uint kNoWord = 0xFFFFFFFFu;
@@ -40,10 +40,10 @@ void main() {
   if (pc.gate_word != kNoWord && gates[pc.gate_word] == 0u) count = 0u;
   // bound * multiplier fits 32 bits (the host's check), so this cannot wrap.
   const uint items = count * pc.multiplier;
-  vrWriteSlices(0u, pc.dispatches0, pc.per_dispatch,
-                vrGroups(items, pc.lanes0));
+  vgridWriteSlices(0u, pc.dispatches0, pc.per_dispatch,
+                vgridGroups(items, pc.lanes0));
   if (pc.lanes1 != 0u) {
-    vrWriteSlices(pc.dispatches0, pc.dispatches1, pc.per_dispatch,
-                  vrGroups(items, pc.lanes1));
+    vgridWriteSlices(pc.dispatches0, pc.dispatches1, pc.per_dispatch,
+                  vgridGroups(items, pc.lanes1));
   }
 }

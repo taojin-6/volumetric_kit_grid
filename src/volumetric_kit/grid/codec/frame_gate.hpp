@@ -8,7 +8,7 @@
 ///        grid writes run behind, their slices, and the results the host
 ///        reads once the frame's batch has run.
 ///
-/// Internal (under src/, never installed). It carries `VR_CODEC_API` so the
+/// Internal (under src/, never installed). It carries `VGRID_CODEC_API` so the
 /// tier's tests reach it in a shared-library build.
 
 #include <cstdint>
@@ -21,10 +21,10 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// @brief What a frame's batch leaves in the decoder's results slot, written
 ///        whole by `frame_results.comp`: every count `Decoder::finish` and
@@ -66,8 +66,8 @@ struct ResultSources {
 /// @brief The slices of a frame's apply, inverse and deblock: a workgroup a
 ///        block, and the deblock flags' 64 blocks a workgroup.
 struct FrameSlices {
-  recon::detail::IndirectSlices blocks;
-  recon::detail::IndirectSlices flags;
+  volumetric_kit::grid::detail::IndirectSlices blocks;
+  volumetric_kit::grid::detail::IndirectSlices flags;
 };
 
 /// @brief The decoder's gate, its slices and its results.
@@ -75,14 +75,14 @@ struct FrameSlices {
 /// The gate is one word (@ref gate): `frame_gate.comp` writes it from the
 /// frame's verdict -- rows 11 to 13 for a decode, the grid's blocks against
 /// the frame's for a rebuild -- the map's rounds close it on their own
-/// failures, and recon's count-to-slices kernel sizes the apply, the inverse
+/// failures, and grid's count-to-slices kernel sizes the apply, the inverse
 /// and the deblock from N behind it (@ref record_slices), so a frame refused
 /// on the device writes no voxel and no stamp. `frame_results.comp` gathers
 /// every count into the decoder's results slot (@ref record_results).
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must outlive
 ///          this object. Not thread-safe.
-class VR_CODEC_API FrameGate {
+class VGRID_CODEC_API FrameGate {
  public:
   /// @brief Build the three kernels and the gate word.
   /// @return The gate, or a pipeline, pool or allocation failure.
@@ -133,4 +133,4 @@ class VR_CODEC_API FrameGate {
   core::Buffer slices_;
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

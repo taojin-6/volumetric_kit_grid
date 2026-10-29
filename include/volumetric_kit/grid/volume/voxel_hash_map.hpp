@@ -25,13 +25,13 @@
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/export.hpp"
-#include "volumetric_kit/recon/volume/frustum.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/export.hpp"
+#include "volumetric_kit/grid/volume/frustum.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief Why a dispatch's failures failed -- the per-reason split behind the
 ///        single count @ref VoxelHashMap::allocate and friends return.
@@ -216,7 +216,7 @@ struct RecordedRounds {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
-class VR_VOLUME_API VoxelHashMap {
+class VGRID_VOLUME_API VoxelHashMap {
  public:
   /// @brief Create the hash map on @p device with the given grid, allocating
   /// its
@@ -726,7 +726,7 @@ class VR_VOLUME_API VoxelHashMap {
   core::Status resize(std::int32_t new_num_buckets);
 
   /// @brief The map's internals, for the voxel grid's own tiers: defined in
-  ///        `src/volumetric_kit/recon/volume/hash_map_internal.hpp`, which
+  ///        `src/volumetric_kit/grid/volume/hash_map_internal.hpp`, which
   ///        codec, mesh and voxelize reach on their private `src/` path. It
   ///        hands out the hash-entry array, whose layout is internal.
   class Internal;
@@ -1099,4 +1099,4 @@ class VR_VOLUME_API VoxelHashMap {
   core::KernelSets depth_sets_;
 };
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

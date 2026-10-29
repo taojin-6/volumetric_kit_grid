@@ -13,7 +13,7 @@
 #include "dct_tables.hpp"
 #include "rans.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 // --- The models. -------------------------------------------------------------
 //
@@ -720,4 +720,4 @@ core::Status check_new_block(std::uint32_t q, std::uint32_t e) {
              std::to_string(e));
 }
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

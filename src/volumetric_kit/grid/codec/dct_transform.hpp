@@ -10,7 +10,7 @@
 /// Internal (under src/, never installed): the `Encoder` and `Decoder` share
 /// it, and nothing outside the tier should build a frame from raw coefficients
 /// -- that is the transform-only public API the 2026-09-26 decision declined
-/// to repeat. It carries `VR_CODEC_API` anyway, so the tier's own test links
+/// to repeat. It carries `VGRID_CODEC_API` anyway, so the tier's own test links
 /// against it in a shared-library build too.
 
 #include <cstdint>
@@ -23,13 +23,13 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// The weight the inverse writes on an observed voxel: anything at or above
 /// @ref volume::kObservedWeight meshes the same, and a decoded grid is not
@@ -131,7 +131,7 @@ struct ResidentBlocks {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
-class VR_CODEC_API DctTransform {
+class VGRID_CODEC_API DctTransform {
  public:
   /// @brief Build both kernels and upload the basis and zigzag tables.
   /// @param device     The compute device (must outlive this object).
@@ -241,12 +241,11 @@ class VR_CODEC_API DctTransform {
   ///         missing or smaller than @p in's count needs, or a P-frame's
   ///         entries, which are not yet its blocks. Otherwise a buffer
   ///         failure.
-  core::Status record_inverse(core::CommandBatch& batch,
-                              volume::VoxelBlockGrid& grid,
-                              const ResidentBlocks& in,
-                              const CodecParams& params,
-                              const recon::detail::IndirectSlices& slices,
-                              core::GpuStageScope* stage = nullptr);
+  core::Status record_inverse(
+      core::CommandBatch& batch, volume::VoxelBlockGrid& grid,
+      const ResidentBlocks& in, const CodecParams& params,
+      const volumetric_kit::grid::detail::IndirectSlices& slices,
+      core::GpuStageScope* stage = nullptr);
 
   /// @return The entries the last forward or inverse found no block for --
   ///         which it neither read nor wrote -- a u32, once its batch ran,
@@ -347,14 +346,13 @@ class VR_CODEC_API DctTransform {
   /// @p counts zeroed first; over @p slices when given, which the device
   /// sized. @p coefficients and @p masks may be null for a kernel that reads
   /// none.
-  core::Status record(core::CommandBatch& batch, core::ComputeKernel& kernel,
-                      const volume::VoxelBlockGrid& grid,
-                      const GridViews& views, VkBuffer list,
-                      std::uint32_t count, const CodecParams& params,
-                      VkBuffer coefficients, VkBuffer masks,
-                      VkDeviceSize masks_bytes, const TrueSdf& true_sdf,
-                      const recon::detail::IndirectSlices* slices,
-                      const core::Buffer& counts, core::GpuStageScope* stage);
+  core::Status record(
+      core::CommandBatch& batch, core::ComputeKernel& kernel,
+      const volume::VoxelBlockGrid& grid, const GridViews& views, VkBuffer list,
+      std::uint32_t count, const CodecParams& params, VkBuffer coefficients,
+      VkBuffer masks, VkDeviceSize masks_bytes, const TrueSdf& true_sdf,
+      const volumetric_kit::grid::detail::IndirectSlices* slices,
+      const core::Buffer& counts, core::GpuStageScope* stage);
   /// A count word's checks, and its bound against the grid's heap.
   core::Status check_count(const char* op, const volume::VoxelBlockGrid& grid,
                            const volume::DeviceCount& count) const;
@@ -379,7 +377,7 @@ class VR_CODEC_API DctTransform {
   core::ComputeKernel inverse_kernel_;
   core::ComputeKernel observed_kernel_;
   core::ComputeKernel surface_kernel_;
-  // The count-to-slices kernels (recon::detail::add_dispatch_args) of the
+  // The count-to-slices kernels (vgrid::detail::add_dispatch_args) of the
   // observed pass and the forward, one each, so both size in one batch.
   core::ComputeKernel observed_args_kernel_;
   core::ComputeKernel forward_args_kernel_;
@@ -409,4 +407,4 @@ class VR_CODEC_API DctTransform {
   core::Buffer keep_;
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

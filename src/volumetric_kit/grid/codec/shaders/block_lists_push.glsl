@@ -4,8 +4,8 @@
 // The push constants of the block-list kernels (block_lists.hpp). Mirrors
 // `ListsPush` in block_lists.cpp.
 
-#ifndef VR_BLOCK_LISTS_PUSH_GLSL
-#define VR_BLOCK_LISTS_PUSH_GLSL
+#ifndef VGRID_BLOCK_LISTS_PUSH_GLSL
+#define VGRID_BLOCK_LISTS_PUSH_GLSL
 
 layout(push_constant, std430) uniform Push {
   uint item_base;   // first item this dispatch covers
@@ -22,4 +22,4 @@ layout(push_constant, std430) uniform Push {
 }
 pc;
 
-#endif  // VR_BLOCK_LISTS_PUSH_GLSL
+#endif  // VGRID_BLOCK_LISTS_PUSH_GLSL

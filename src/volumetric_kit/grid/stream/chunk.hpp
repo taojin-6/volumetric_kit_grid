@@ -16,9 +16,9 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
 
-namespace volumetric_kit::recon::stream::detail {
+namespace volumetric_kit::grid::stream::detail {
 
 // --- Little-endian words. ----------------------------------------------------
 
@@ -235,4 +235,4 @@ core::Result<std::uint64_t> read_session(std::string_view api,
                                          const FileView& file,
                                          Session* session);
 
-}  // namespace volumetric_kit::recon::stream::detail
+}  // namespace volumetric_kit::grid::stream::detail

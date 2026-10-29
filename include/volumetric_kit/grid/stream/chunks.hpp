@@ -15,11 +15,11 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/stream/export.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/export.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 
 /// @brief A record's payload as one or two runs of bytes, and their CRC,
 ///        computed once, by @ref of, for every chunk that frames it: a
@@ -35,7 +35,7 @@ namespace volumetric_kit::recon::stream {
 /// VKC_TRY(writer->append(info, payload));   // one writev, no joined copy
 /// VKC_TRY(server->publish(info, payload));  // its one copy, no second CRC
 /// @endcode
-class VR_STREAM_API RecordPayload {
+class VGRID_STREAM_API RecordPayload {
  public:
   /// @brief The payload @p first then @p second, and its CRC.
   /// @param first        Its first run; may be null when @p first_size is 0.
@@ -87,7 +87,7 @@ class VR_STREAM_API RecordPayload {
 /// @endcode
 ///
 /// @warning Not thread-safe: call @ref frame from one thread.
-class VR_STREAM_API ChunkEncoder {
+class VGRID_STREAM_API ChunkEncoder {
  public:
   /// @brief Encode @p session's chunk.
   /// @param session  As @ref StreamWriter::create takes it: at least one
@@ -185,7 +185,7 @@ class VR_STREAM_API ChunkEncoder {
 /// @endcode
 ///
 /// @warning Not thread-safe: one thread uses it.
-class VR_STREAM_API ChunkParser {
+class VGRID_STREAM_API ChunkParser {
  public:
   /// The largest body of a chunk other than the session's: a larger one is
   /// refused once its header is in, whatever of its body has come.
@@ -255,4 +255,4 @@ class VR_STREAM_API ChunkParser {
   core::Status failure_;
 };
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

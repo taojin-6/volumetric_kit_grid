@@ -20,13 +20,13 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
 namespace codec_oracle {
 
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 // @p b's coefficients as the device holds them: two int16 a word,
 // coefficient 2p low, each entry starting a word of its own, an odd K's pad
@@ -51,7 +51,7 @@ struct Resident {
 vkc::Result<Resident> resident(
     const vkc::test::Gpu& gpu, const DctBlocks& entries,
     const std::vector<d::BlockMode>& modes = {},
-    const std::vector<vr::Vec3i>& coords = {}, std::uint16_t pad = 0,
+    const std::vector<vgrid::Vec3i>& coords = {}, std::uint16_t pad = 0,
     std::optional<std::uint32_t> tail = std::nullopt);
 
 // @p t's forward output over @p blocks, uploaded as the device list it takes,

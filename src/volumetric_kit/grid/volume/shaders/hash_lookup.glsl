@@ -17,26 +17,26 @@
 // `pc` block colliding with the includer's push constants) is opt-out now; the
 // table shape still arrives as arguments, which is the only part that had to.
 //
-// The caller must #define VR_HASH_ENTRIES_BINDING to the set-0 binding it has
+// The caller must #define VGRID_HASH_ENTRIES_BINDING to the set-0 binding it has
 // reserved for the hash entries, before including this.
 
-#ifndef VR_HASH_LOOKUP_GLSL
-#define VR_HASH_LOOKUP_GLSL
+#ifndef VGRID_HASH_LOOKUP_GLSL
+#define VGRID_HASH_LOOKUP_GLSL
 
-#ifndef VR_HASH_ENTRIES_BINDING
-#error "define VR_HASH_ENTRIES_BINDING before including hash_lookup.glsl"
+#ifndef VGRID_HASH_ENTRIES_BINDING
+#error "define VGRID_HASH_ENTRIES_BINDING before including hash_lookup.glsl"
 #endif
 
 // The includer has its own push constants, so take the table shape as function
 // arguments rather than reading hash_common's `pc`. Everything else -- HashEntry,
 // kFreeEntry / kNoOffset, computeHashPos, and the scalar-block-layout
 // `#extension` this file's buffer block depends on -- is shared from there.
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
 
-layout(set = 0, binding = VR_HASH_ENTRIES_BINDING, scalar) readonly buffer
-    VrHashEntries {
-  HashEntry vr_hash_entries[];
+layout(set = 0, binding = VGRID_HASH_ENTRIES_BINDING, scalar) readonly buffer
+    VgridHashEntries {
+  HashEntry vgrid_hash_entries[];
 };
 
 /// @return The block's voxel-array base pointer, or -1 when @p coord is not
@@ -64,7 +64,7 @@ layout(set = 0, binding = VR_HASH_ENTRIES_BINDING, scalar) readonly buffer
 /// clears an arbitrary slot in place (hash_delete_coords.comp::delete_primary),
 /// so a bucket may hold a free slot ahead of an occupied one. find_block scans
 /// in full for exactly this reason.
-int vrFindBlockPtr(ivec3 coord, int num_buckets, int bucket_size,
+int vgridFindBlockPtr(ivec3 coord, int num_buckets, int bucket_size,
                    int max_chain) {
   uint bs = uint(bucket_size);
   uint total_entries = uint(num_buckets) * bs;
@@ -73,20 +73,20 @@ int vrFindBlockPtr(ivec3 coord, int num_buckets, int bucket_size,
 
   for (uint i = 0u; i < bs; ++i) {
     uint slot = bucket_start + i;
-    if (vr_hash_entries[slot].ptr != kFreeEntry &&
-        vr_hash_entries[slot].pos == coord) {
-      return vr_hash_entries[slot].ptr;
+    if (vgrid_hash_entries[slot].ptr != kFreeEntry &&
+        vgrid_hash_entries[slot].pos == coord) {
+      return vgrid_hash_entries[slot].ptr;
     }
   }
   // The last entry of each bucket anchors its chain; follow `offset` hops.
   uint idx_last = (bucket + 1u) * bs - 1u;
   uint idx = idx_last;
   for (int it = 0; it < max_chain; ++it) {
-    if (vr_hash_entries[idx].ptr != kFreeEntry &&
-        vr_hash_entries[idx].pos == coord) {
-      return vr_hash_entries[idx].ptr;
+    if (vgrid_hash_entries[idx].ptr != kFreeEntry &&
+        vgrid_hash_entries[idx].pos == coord) {
+      return vgrid_hash_entries[idx].ptr;
     }
-    int off = vr_hash_entries[idx].offset;
+    int off = vgrid_hash_entries[idx].offset;
     if (off == kNoOffset) {
       break;
     }
@@ -95,4 +95,4 @@ int vrFindBlockPtr(ivec3 coord, int num_buckets, int bucket_size,
   return -1;
 }
 
-#endif  // VR_HASH_LOOKUP_GLSL
+#endif  // VGRID_HASH_LOOKUP_GLSL

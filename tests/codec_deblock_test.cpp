@@ -39,24 +39,24 @@
 #include <vector>
 
 #include "codec_deblock_oracle.hpp"
-#include "codec_fixture.hpp"
 #include "deblock.hpp"
 #include "host_slices.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 namespace oracle = codec_deblock_oracle;
 using namespace codec_fixture;
 
@@ -96,10 +96,10 @@ struct Voxel {
 
 // Local voxel (x, y, z) of block @p b; global voxel g = 8 b + local.
 struct Where {
-  vr::Vec3i block;
+  vgrid::Vec3i block;
   int x, y, z;
-  vr::Vec3i global() const {
-    return vr::Vec3i(block.x * 8 + x, block.y * 8 + y, block.z * 8 + z);
+  vgrid::Vec3i global() const {
+    return vgrid::Vec3i(block.x * 8 + x, block.y * 8 + y, block.z * 8 + z);
   }
 };
 
@@ -119,8 +119,8 @@ float hash01(std::uint32_t a, std::uint32_t b = 0, std::uint32_t c = 0) {
 // offset and slope along x (the DC and first-AC errors, a few T at
 // T = 0.01), plus noise, every voxel observed.
 Voxel quantized_ramp(const Where& at) {
-  const vr::Vec3i g = at.global();
-  const vr::Vec3i& b = at.block;
+  const vgrid::Vec3i g = at.global();
+  const vgrid::Vec3i& b = at.block;
   const std::uint32_t bx = std::uint32_t(b.x + 16),
                       by = std::uint32_t(b.y + 16),
                       bz = std::uint32_t(b.z + 16);
@@ -139,14 +139,14 @@ Voxel quantized_ramp(const Where& at) {
 // voxels, the plane x = 13 of the blocks (1, y, 0), and block (3,0,0)'s voxel
 // (0,4,4), on its face to (2,0,0), unobserved; the rest of quantized_ramp.
 Voxel ramp_field(const Where& at) {
-  const vr::Vec3i g = at.global();
-  const vr::Vec3i& b = at.block;
-  const bool partial = b == vr::Vec3i(1, 1, 1) &&
+  const vgrid::Vec3i g = at.global();
+  const vgrid::Vec3i& b = at.block;
+  const bool partial = b == vgrid::Vec3i(1, 1, 1) &&
                        hash01(std::uint32_t(g.x + 64), std::uint32_t(g.y + 64),
                               std::uint32_t(g.z + 64)) < 0.1f;
   const bool plane = g.x == 13 && b.z == 0;
   const bool single =
-      b == vr::Vec3i(3, 0, 0) && at.x == 0 && at.y == 4 && at.z == 4;
+      b == vgrid::Vec3i(3, 0, 0) && at.x == 0 && at.y == 4 && at.z == 4;
   if (partial || plane || single) return Voxel{false, 0.0f};
   return quantized_ramp(at);
 }
@@ -154,14 +154,14 @@ constexpr std::uint32_t kRampMasked = 5;
 
 // The ramp fixture's blocks: 4 x 3 x 3, less a face neighbour, an edge
 // neighbour and a corner neighbour of their blocks.
-std::vector<vr::Vec3i> ramp_blocks() {
-  std::vector<vr::Vec3i> out;
+std::vector<vgrid::Vec3i> ramp_blocks() {
+  std::vector<vgrid::Vec3i> out;
   for (int z = 0; z < 3; ++z) {
     for (int y = 0; y < 3; ++y) {
       for (int x = 0; x < 4; ++x) {
-        const vr::Vec3i c(x, y, z);
-        if (c == vr::Vec3i(2, 1, 2) || c == vr::Vec3i(0, 0, 1) ||
-            c == vr::Vec3i(0, 2, 2)) {
+        const vgrid::Vec3i c(x, y, z);
+        if (c == vgrid::Vec3i(2, 1, 2) || c == vgrid::Vec3i(0, 0, 1) ||
+            c == vgrid::Vec3i(0, 2, 2)) {
           continue;
         }
         out.push_back(c);
@@ -178,7 +178,7 @@ std::vector<vr::Vec3i> ramp_blocks() {
 // by list position.
 struct Fixture {
   vol::VoxelBlockGrid grid;
-  std::vector<vr::Vec3i> coords;  // the list's order
+  std::vector<vgrid::Vec3i> coords;  // the list's order
   vkc::Buffer list;
   vkc::Buffer masks;
   d::ResidentBlocks frame() const {
@@ -192,7 +192,7 @@ struct Fixture {
 };
 
 vkc::Result<Fixture> make_fixture(Gpu& gpu,
-                                  const std::vector<vr::Vec3i>& coords,
+                                  const std::vector<vgrid::Vec3i>& coords,
                                   const Field& field, bool reverse = false) {
   const auto fail = [](const char* why) {
     return vkc::Status::invalid_argument(std::string("fixture: ") + why);
@@ -201,12 +201,12 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
   shape.trunc_dist = kBand;
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
   const std::size_t n = coords.size();
-  std::vector<vr::Vec3i> fillers;
+  std::vector<vgrid::Vec3i> fillers;
   for (std::size_t i = 0; i < 2 * n; ++i) {
-    fillers.push_back(vr::Vec3i(100 + int(i), 100, 100));
+    fillers.push_back(vgrid::Vec3i(100 + int(i), 100, 100));
   }
   VKC_TRY(allocate(gpu, grid, fillers));
-  std::vector<vr::Vec3i> shuffled = coords;
+  std::vector<vgrid::Vec3i> shuffled = coords;
   for (std::size_t i = shuffled.size(); i > 1; --i) {
     std::swap(shuffled[i - 1],
               shuffled[std::size_t(hash01(std::uint32_t(i)) * float(i))]);
@@ -215,21 +215,21 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
   std::vector<vol::BlockIndex> gone(fillers.size());
   for (std::size_t i = 0; i < fillers.size(); ++i) gone[i].coord = fillers[i];
   VKC_ASSIGN(const std::uint32_t failed,
-             vr_test::remove_blocks(gpu, grid, gone));
+             vgrid_test::remove_blocks(gpu, grid, gone));
   if (failed != 0) return fail("fillers stayed");
 
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   if (active.size() != n) return fail("block count");
   VKC_ASSIGN(std::vector<float> tsdf,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vr::volume::kTsdfAttribute));
-  VKC_ASSIGN(std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vr::volume::kWeightAttribute));
+             vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                               vgrid::volume::kTsdfAttribute));
+  VKC_ASSIGN(std::vector<float> weight, vgrid_test::read_attribute<float>(
+                                            gpu.device, gpu.allocator, grid,
+                                            vgrid::volume::kWeightAttribute));
   std::vector<vol::BlockIndex> list = active;
   if (reverse) std::reverse(list.begin(), list.end());
   std::vector<std::uint32_t> masks(n * codec::kMaskWordsPerBlock, 0u);
-  std::vector<vr::Vec3i> order;
+  std::vector<vgrid::Vec3i> order;
   for (std::size_t e = 0; e < n; ++e) {
     const vol::BlockIndex& b = list[e];
     if (std::uint32_t(b.ptr) / kVpb < 2 * n) return fail("a slot below 2n");
@@ -244,10 +244,10 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
     }
     order.push_back(b.coord);
   }
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vr::volume::kTsdfAttribute, tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vr::volume::kWeightAttribute, weight));
+  VKC_TRY(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vgrid::volume::kTsdfAttribute, tsdf));
+  VKC_TRY(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vgrid::volume::kWeightAttribute, weight));
   // Each entry names its block by coordinate alone; the ptr it carries is
   // its mirror's, which a kernel must never read.
   std::vector<vol::BlockIndex> poisoned = list;
@@ -272,14 +272,15 @@ std::uint32_t slots(const Fixture& fx) {
 // The deblock's slices for a frame of @p n blocks, as the decoder's gate
 // writes them for a frame it passed.
 struct Slices {
-  vr_test::HostSlices blocks;
-  vr_test::HostSlices flags;
+  vgrid_test::HostSlices blocks;
+  vgrid_test::HostSlices flags;
 };
 
 vkc::Result<Slices> slices_for(Gpu& gpu, std::uint32_t n) {
   Slices out;
-  VKC_ASSIGN(out.blocks, vr_test::host_slices(gpu, n, 1));
-  VKC_ASSIGN(out.flags, vr_test::host_slices(gpu, n, d::Deblock::kFlagLanes));
+  VKC_ASSIGN(out.blocks, vgrid_test::host_slices(gpu, n, 1));
+  VKC_ASSIGN(out.flags,
+             vgrid_test::host_slices(gpu, n, d::Deblock::kFlagLanes));
   return out;
 }
 
@@ -530,8 +531,9 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
     // 2: a jump of 0.5, clipped.
     lines.push_back(Lines{{0.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}});
 
-    vkc::Result<Fixture> made = make_fixture(
-        gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)}, lines_field(lines));
+    vkc::Result<Fixture> made =
+        make_fixture(gpu, {vgrid::Vec3i(0, 0, 0), vgrid::Vec3i(1, 0, 0)},
+                     lines_field(lines));
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
     vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
@@ -576,13 +578,13 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
   // hole in either block.
   const std::vector<Lines> jump = {
       Lines{{0.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}}};
-  const Where holes[] = {{vr::Vec3i(0, 0, 0), 5, 2, 3},
-                         {vr::Vec3i(1, 0, 0), 2, 2, 3},
-                         {vr::Vec3i(0, 0, 0), 0, 0, 0},
-                         {vr::Vec3i(1, 0, 0), 7, 7, 7}};
+  const Where holes[] = {{vgrid::Vec3i(0, 0, 0), 5, 2, 3},
+                         {vgrid::Vec3i(1, 0, 0), 2, 2, 3},
+                         {vgrid::Vec3i(0, 0, 0), 0, 0, 0},
+                         {vgrid::Vec3i(1, 0, 0), 7, 7, 7}};
   for (const Where& hole : holes) {
     vkc::Result<Fixture> made =
-        make_fixture(gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)},
+        make_fixture(gpu, {vgrid::Vec3i(0, 0, 0), vgrid::Vec3i(1, 0, 0)},
                      lines_field(jump, &hole));
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
@@ -610,7 +612,7 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
   // (0,0,0) alone leaves the grid as it was, where a second fit would move
   // it again.
   vkc::Result<Fixture> made = make_fixture(
-      gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)}, lines_field(jump));
+      gpu, {vgrid::Vec3i(0, 0, 0), vgrid::Vec3i(1, 0, 0)}, lines_field(jump));
   CHECK(made.ok());
   Fixture fx = std::move(made).value();
   const d::DeblockPasses lf = linfit_only(0.05f);
@@ -619,7 +621,7 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
   vkc::Result<std::vector<vol::BlockStamp>> stamps =
       fx.grid.map().read_block_stamps();
   CHECK(fitted.ok() && stamps.ok());
-  CHECK(fx.coords.front() == vr::Vec3i(0, 0, 0));
+  CHECK(fx.coords.front() == vgrid::Vec3i(0, 0, 0));
   d::ResidentBlocks first = fx.frame();
   first.count = 1;
   fx.grid.map().advance_tick();
@@ -640,26 +642,28 @@ int line_rules_case(Gpu& gpu, d::Deblock& deblock) {
 // x alone varies: a ramp along x, the plane x = 7 of block (0,0,0)
 // unobserved for y >= 4, which masks it; or a spike.
 Voxel x_ramp_field(const Where& at) {
-  const vr::Vec3i g = at.global();
+  const vgrid::Vec3i g = at.global();
   if (g.x == 7 && g.y >= 4) return Voxel{false, 0.0f};
   return Voxel{true, 0.02f * float(g.x)};
 }
 // A spike in masked block (0,1,0), at (3,0,3), on its face to (0,0,0).
 Voxel masked_spike_field(const Where& at) {
-  if (at.block == vr::Vec3i(0, 1, 0)) {
+  if (at.block == vgrid::Vec3i(0, 1, 0)) {
     if (at.x == 7 && at.y == 7 && at.z == 7) return Voxel{false, 0.0f};
     if (at.x == 3 && at.y == 0 && at.z == 3) return Voxel{true, 0.5f};
   }
   return Voxel{true, 0.0f};
 }
 Voxel spike_field(const Where& at) {
-  if (at.block == vr::Vec3i(0, 0, 0) && at.x == 3 && at.y == 3 && at.z == 3) {
+  if (at.block == vgrid::Vec3i(0, 0, 0) && at.x == 3 && at.y == 3 &&
+      at.z == 3) {
     return Voxel{true, 0.5f};
   }
   return Voxel{true, 0.0f};
 }
 Voxel corner_field(const Where& at) {
-  if (at.block == vr::Vec3i(0, 0, 0) && at.x == 7 && at.y == 7 && at.z == 7) {
+  if (at.block == vgrid::Vec3i(0, 0, 0) && at.x == 7 && at.y == 7 &&
+      at.z == 7) {
     return Voxel{true, 0.3f};
   }
   return Voxel{true, 0.0f};
@@ -675,7 +679,7 @@ Voxel corner_field(const Where& at) {
 int gauss_rules_case(Gpu& gpu, d::Deblock& deblock) {
   {
     vkc::Result<Fixture> made = make_fixture(
-        gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(1, 0, 0)}, x_ramp_field);
+        gpu, {vgrid::Vec3i(0, 0, 0), vgrid::Vec3i(1, 0, 0)}, x_ramp_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
     vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
@@ -703,8 +707,9 @@ int gauss_rules_case(Gpu& gpu, d::Deblock& deblock) {
                     want_hole) >= 100 * kTolerance);
   }
   {
-    vkc::Result<Fixture> made = make_fixture(
-        gpu, {vr::Vec3i(0, 0, 0), vr::Vec3i(0, 1, 0)}, masked_spike_field);
+    vkc::Result<Fixture> made =
+        make_fixture(gpu, {vgrid::Vec3i(0, 0, 0), vgrid::Vec3i(0, 1, 0)},
+                     masked_spike_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
     vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
@@ -732,7 +737,7 @@ int gauss_rules_case(Gpu& gpu, d::Deblock& deblock) {
   }
   {
     vkc::Result<Fixture> made =
-        make_fixture(gpu, {vr::Vec3i(0, 0, 0)}, spike_field);
+        make_fixture(gpu, {vgrid::Vec3i(0, 0, 0)}, spike_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
     const d::DeblockPasses passes = gauss_only(0.0133f);
@@ -749,9 +754,9 @@ int gauss_rules_case(Gpu& gpu, d::Deblock& deblock) {
           kTolerance);
   }
   {
-    std::vector<vr::Vec3i> cube;
+    std::vector<vgrid::Vec3i> cube;
     for (int i = 0; i < 8; ++i)
-      cube.push_back(vr::Vec3i(i & 1, i >> 1 & 1, i >> 2));
+      cube.push_back(vgrid::Vec3i(i & 1, i >> 1 & 1, i >> 2));
     vkc::Result<Fixture> made = make_fixture(gpu, cube, corner_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
@@ -798,9 +803,9 @@ int order_case(Gpu& gpu) {
       vkc::Result<Snapshot> before = snapshot(gpu, fx.grid);
       CHECK(before.ok());
       // 0: the device's limit.
-      vr::detail::set_test_groups_per_dispatch(r.per_dispatch);
+      vgrid::detail::set_test_groups_per_dispatch(r.per_dispatch);
       const vkc::Status ran = run(gpu, *made_deblock.value(), fx, passes);
-      vr::detail::set_test_groups_per_dispatch(0);
+      vgrid::detail::set_test_groups_per_dispatch(0);
       CHECK(ran.ok());
       vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
       CHECK(after.ok());
@@ -819,10 +824,11 @@ int order_case(Gpu& gpu) {
 
 // Block (0,0,0) at 0.1 among zeros; block (-1,0,0) masked by one voxel.
 Voxel stamps_field(const Where& at) {
-  if (at.block == vr::Vec3i(-1, 0, 0) && at.x == 3 && at.y == 3 && at.z == 3) {
+  if (at.block == vgrid::Vec3i(-1, 0, 0) && at.x == 3 && at.y == 3 &&
+      at.z == 3) {
     return Voxel{false, 0.0f};
   }
-  return Voxel{true, at.block == vr::Vec3i(0, 0, 0) ? 0.1f : 0.0f};
+  return Voxel{true, at.block == vgrid::Vec3i(0, 0, 0) ? 0.1f : 0.0f};
 }
 
 // 9. A block the deblock writes carries the pass's tick, whoever wrote it:
@@ -834,8 +840,8 @@ int stamps_case(Gpu& gpu, d::Deblock& deblock) {
   for (const bool gaussian : {false, true}) {
     vkc::Result<Fixture> made =
         make_fixture(gpu,
-                     {vr::Vec3i(-1, 0, 0), vr::Vec3i(0, 0, 0),
-                      vr::Vec3i(1, 0, 0), vr::Vec3i(5, 5, 5)},
+                     {vgrid::Vec3i(-1, 0, 0), vgrid::Vec3i(0, 0, 0),
+                      vgrid::Vec3i(1, 0, 0), vgrid::Vec3i(5, 5, 5)},
                      stamps_field);
     CHECK(made.ok());
     Fixture fx = std::move(made).value();
@@ -852,14 +858,15 @@ int stamps_case(Gpu& gpu, d::Deblock& deblock) {
     CHECK(after.ok() && stamps.ok() && active.ok());
     CHECK(after.value().coords == before.value().coords);
     for (std::size_t b = 0; b < 4; ++b) {
-      const vr::Vec3i& c = after.value().coords[b];
+      const vgrid::Vec3i& c = after.value().coords[b];
       const bool changed = std::memcmp(&after.value().tsdf[b * kVpb],
                                        &before.value().tsdf[b * kVpb],
                                        kVpb * sizeof(float)) != 0;
       const std::uint32_t slot = std::uint32_t(active.value()[b].ptr) / kVpb;
-      CHECK(changed == (c == vr::Vec3i(0, 0, 0) || c == vr::Vec3i(1, 0, 0)));
+      CHECK(changed ==
+            (c == vgrid::Vec3i(0, 0, 0) || c == vgrid::Vec3i(1, 0, 0)));
       CHECK((stamps.value()[slot].changed == tick) == changed);
-      if (gaussian && c == vr::Vec3i(1, 0, 0)) {
+      if (gaussian && c == vgrid::Vec3i(1, 0, 0)) {
         // Block (1,0,0)'s interior is untouched: its stamp is the store's.
         for (std::uint32_t l = 0; l < kVpb; ++l) {
           const std::uint32_t x = l % 8, y = l / 8 % 8, z = l / 64;
@@ -969,13 +976,13 @@ int record_case(Gpu& gpu, d::Deblock& deblock) {
 // voxel (4,3,5) unobserved -- one masked block among 125, list entry 87, in
 // the flags kernel's second workgroup, or 37 reversed -- or, with @p all,
 // every block's, or none.
-const vr::Vec3i kHole(2, 2, 3);
+const vgrid::Vec3i kHole(2, 2, 3);
 
-std::vector<vr::Vec3i> cube_blocks() {
-  std::vector<vr::Vec3i> out;
+std::vector<vgrid::Vec3i> cube_blocks() {
+  std::vector<vgrid::Vec3i> out;
   for (int z = 0; z < 5; ++z) {
     for (int y = 0; y < 5; ++y) {
-      for (int x = 0; x < 5; ++x) out.push_back(vr::Vec3i(x, y, z));
+      for (int x = 0; x < 5; ++x) out.push_back(vgrid::Vec3i(x, y, z));
     }
   }
   return out;
@@ -995,14 +1002,15 @@ Field cube_field(Holes holes) {
 }
 
 // Voxel i of a snapshot of @p coords, in global voxels.
-vr::Vec3i global_voxel(const std::vector<vr::Vec3i>& coords, std::size_t i) {
+vgrid::Vec3i global_voxel(const std::vector<vgrid::Vec3i>& coords,
+                          std::size_t i) {
   const Where w{coords[i / kVpb], int(i % 8), int(i / 8 % 8),
                 int(i % kVpb / 64)};
   return w.global();
 }
 
 // The Chebyshev distance, in voxels, from global voxel @p g to block @p b.
-int distance_to_block(const vr::Vec3i& g, const vr::Vec3i& b) {
+int distance_to_block(const vgrid::Vec3i& g, const vgrid::Vec3i& b) {
   const auto axis = [](int v, int lo) {
     return v < lo ? lo - v : (v > lo + 7 ? v - lo - 7 : 0);
   };
@@ -1022,7 +1030,7 @@ int distance_to_block(const vr::Vec3i& g, const vr::Vec3i& b) {
 // masked, the oracle's filter with none counted, as without the fallback.
 int fallback_case(Gpu& gpu, d::Deblock& deblock) {
   const float t = 0.01f;
-  const std::vector<vr::Vec3i> coords = cube_blocks();
+  const std::vector<vgrid::Vec3i> coords = cube_blocks();
   for (const char* filter : {"LF", "LG", "R"}) {
     const d::DeblockPasses passes = d::deblock_passes(row(filter), t);
     const bool lf = std::strcmp(filter, "LF") == 0;
@@ -1038,10 +1046,10 @@ int fallback_case(Gpu& gpu, d::Deblock& deblock) {
             stamps_by_coord(fx.grid);
         CHECK(before.ok() && stamps_before.ok());
         CHECK(masked_count(before.value()) == 1);
-        vr::detail::set_test_groups_per_dispatch(per_dispatch);
+        vgrid::detail::set_test_groups_per_dispatch(per_dispatch);
         std::uint32_t exact = 0;
         const vkc::Status ran = run(gpu, deblock, fx, passes, &exact);
-        vr::detail::set_test_groups_per_dispatch(0);
+        vgrid::detail::set_test_groups_per_dispatch(0);
         CHECK(ran.ok() && exact == 1);
         vkc::Result<Snapshot> after = snapshot(gpu, fx.grid);
         vkc::Result<std::vector<std::uint32_t>> stamps_after =
@@ -1078,7 +1086,7 @@ int fallback_case(Gpu& gpu, d::Deblock& deblock) {
           // Each face neighbour's voxels 1 and 2 from the face, 2..5 along
           // the face: on no other line of any pass.
           for (std::size_t b = 0; b < coords.size(); ++b) {
-            const vr::Vec3i o = coords[b] - kHole;
+            const vgrid::Vec3i o = coords[b] - kHole;
             if (std::abs(o.x) + std::abs(o.y) + std::abs(o.z) != 1) continue;
             for (std::uint32_t l = 0; l < kVpb; ++l) {
               const int p[3] = {int(l % 8), int(l / 8 % 8), int(l / 64)};
@@ -1123,10 +1131,10 @@ int fallback_case(Gpu& gpu, d::Deblock& deblock) {
       vkc::Result<std::vector<vol::BlockStamp>> stamps =
           fx.grid.map().read_block_stamps();
       CHECK(before.ok() && stamps.ok());
-      vr::detail::set_test_groups_per_dispatch(1);
+      vgrid::detail::set_test_groups_per_dispatch(1);
       std::uint32_t exact = 0;
       const vkc::Status ran = run(gpu, deblock, fx, passes, &exact);
-      vr::detail::set_test_groups_per_dispatch(0);
+      vgrid::detail::set_test_groups_per_dispatch(0);
       CHECK(ran.ok());
       if (holes == Holes::kAll) {
         CHECK(exact == coords.size());
@@ -1250,7 +1258,7 @@ vkc::Result<vol::VoxelBlockGrid> full_grid(Gpu& gpu,
   VKC_TRY(allocate(gpu, grid, union_blocks(spheres)));
   VKC_TRY(write_field(
       gpu, grid,
-      [&spheres](const vr::Vec3f& p) {
+      [&spheres](const vgrid::Vec3f& p) {
         float d = spheres[0].sdf(p);
         for (const Sphere& s : spheres) d = std::min(d, s.sdf(p));
         return d;
@@ -1340,7 +1348,7 @@ int switch_case(Gpu& gpu) {
         fresh.value().last_deblock().exact_blocks == 0);
   CHECK(on.deblock());
 
-  const Sphere s{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
+  const Sphere s{vgrid::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> source = full_grid(gpu, {s});
   CHECK(source.ok());
   struct Setting {
@@ -1419,9 +1427,9 @@ int switch_case(Gpu& gpu) {
 vkc::Result<vol::VoxelBlockGrid> moving_grid(Gpu& gpu, int t,
                                              bool full = true) {
   const Sphere moving{
-      vr::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
+      vgrid::Vec3f(0.004f * float(t), -0.002f * float(t), 0.003f * float(t)),
       0.07f + 0.002f * float(t)};
-  const Sphere still{vr::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f};
+  const Sphere still{vgrid::Vec3f(-0.5f, 0.1f, 0.0f), 0.05f};
   if (full) return full_grid(gpu, {moving, still});
   return two_sphere_grid(gpu, moving, still);
 }
@@ -1508,7 +1516,7 @@ int mixed_filters_case(Gpu& gpu) {
   std::size_t last_blocks = 0;
   for (const Frame& f : frames) {
     vkc::Result<vol::VoxelBlockGrid> source =
-        full_grid(gpu, {Sphere{vr::Vec3f(0.0f), f.radius}});
+        full_grid(gpu, {Sphere{vgrid::Vec3f(0.0f), f.radius}});
     CHECK(source.ok());
     vkc::Result<Bytes> frame = encode_at(gpu, source.value(), f.k, f.scale);
     vkc::Result<vol::VoxelBlockGrid> exact_grid = player_grid(gpu, 2048);
@@ -1600,9 +1608,9 @@ int rebuild_case(Gpu& gpu) {
 
   // Refused, untouched: a block too many, one too few, other geometry.
   vol::BlockIndex extra{};
-  extra.coord = vr::Vec3i(40, 40, 40);
+  extra.coord = vgrid::Vec3i(40, 40, 40);
   vkc::Result<std::uint32_t> added =
-      vr_test::allocate_blocks(gpu, grid.map(), {extra});
+      vgrid_test::allocate_blocks(gpu, grid.map(), {extra});
   CHECK(added.ok() && added.value() == 0);
   vkc::Result<Snapshot> with_extra = snapshot(gpu, grid);
   CHECK(with_extra.ok());
@@ -1611,11 +1619,11 @@ int rebuild_case(Gpu& gpu) {
   vkc::Result<Snapshot> still = snapshot(gpu, grid);
   CHECK(still.ok() && still.value() == with_extra.value());
   vkc::Result<std::uint32_t> dropped =
-      vr_test::remove_blocks(gpu, grid, {extra});
+      vgrid_test::remove_blocks(gpu, grid, {extra});
   CHECK(dropped.ok() && dropped.value() == 0);
   vol::BlockIndex missing{};
   missing.coord = exact.value().coords[3];
-  dropped = vr_test::remove_blocks(gpu, grid, {missing});
+  dropped = vgrid_test::remove_blocks(gpu, grid, {missing});
   CHECK(dropped.ok() && dropped.value() == 0);
   vkc::Result<Snapshot> short_one = snapshot(gpu, grid);
   CHECK(short_one.ok());
@@ -1645,11 +1653,11 @@ int rebuild_case(Gpu& gpu) {
 // writing B as its +x neighbour -- can stamp it. Off, B keeps frame 1's
 // stamp.
 int decoder_stamps_case(Gpu& gpu) {
-  const vr::Vec3i b(1, 0, 0);
-  const vr::Vec3i left(0, 0, 0);
+  const vgrid::Vec3i b(1, 0, 0);
+  const vgrid::Vec3i left(0, 0, 0);
   // A plane, crossing both blocks, with B - x's half lifted 4 mm.
   const auto plane = [](float lift) {
-    return [lift](const vr::Vec3f& p) {
+    return [lift](const vgrid::Vec3f& p) {
       return 0.6f * p.x + 0.8f * p.y - 0.02f + (p.x < 0.04f ? lift : 0.0f);
     };
   };
@@ -1787,8 +1795,8 @@ int masked_case(Gpu& gpu) {
 
 // The fallback's decoder fixture: a mask-free sphere's band blocks, the last
 // dropped when they are odd, so its frames have 2n.
-std::vector<vr::Vec3i> share_coords(const Sphere& s) {
-  std::vector<vr::Vec3i> coords = union_blocks({s});
+std::vector<vgrid::Vec3i> share_coords(const Sphere& s) {
+  std::vector<vgrid::Vec3i> coords = union_blocks({s});
   if (coords.size() % 2 != 0) coords.pop_back();
   return coords;
 }
@@ -1801,14 +1809,14 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
   VKC_TRY(allocate(gpu, grid, share_coords(s)));
   VKC_TRY(write_field(
-      gpu, grid, [&s](const vr::Vec3f& p) { return s.sdf(p); }, true));
+      gpu, grid, [&s](const vgrid::Vec3f& p) { return s.sdf(p); }, true));
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   VKC_ASSIGN(std::vector<float> tsdf,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vr::volume::kTsdfAttribute));
-  VKC_ASSIGN(std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vr::volume::kWeightAttribute));
+             vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                               vgrid::volume::kTsdfAttribute));
+  VKC_ASSIGN(std::vector<float> weight, vgrid_test::read_attribute<float>(
+                                            gpu.device, gpu.allocator, grid,
+                                            vgrid::volume::kWeightAttribute));
   const std::size_t n = active.size();
   const std::size_t evens = (n + 1) / 2;
   // Local (3, 4, 5), then (5, 1, 2).
@@ -1821,10 +1829,10 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
       weight[base + at_local[h]] = 0.0f;
     }
   }
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vr::volume::kTsdfAttribute, tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                   vr::volume::kWeightAttribute, weight));
+  VKC_TRY(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vgrid::volume::kTsdfAttribute, tsdf));
+  VKC_TRY(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vgrid::volume::kWeightAttribute, weight));
   return grid;
 }
 
@@ -1837,7 +1845,7 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
 // block in two x-lines, so a count by word or line rather than by block
 // would report more.
 int share_case(Gpu& gpu) {
-  const Sphere s{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
+  const Sphere s{vgrid::Vec3f(0.006f, -0.004f, 0.002f), 0.09f};
   const std::size_t blocks = share_coords(s).size();
   const std::size_t n = blocks / 2;
   CHECK(n >= 2);
@@ -1964,9 +1972,10 @@ int true_sdf_case(Gpu& gpu) {
   vkc::Result<codec::Encoder> enc =
       codec::Encoder::create(gpu.device, gpu.allocator, config);
   vkc::Result<vol::VoxelBlockGrid> sphere = sphere_grid(
-      gpu, Sphere{vr::Vec3f(0.006f, -0.004f, 0.002f), 0.07f}, wide_band());
+      gpu, Sphere{vgrid::Vec3f(0.006f, -0.004f, 0.002f), 0.07f}, wide_band());
   vkc::Result<vol::VoxelBlockGrid> curtain = curtain_grid(
-      gpu, Curtain{Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, false});
+      gpu,
+      Curtain{Sphere{vgrid::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, false});
   CHECK(enc.ok() && sphere.ok() && curtain.ok());
   for (const bool cut : {false, true}) {
     vkc::Result<Bytes> frame =
@@ -2014,7 +2023,7 @@ int true_sdf_case(Gpu& gpu) {
 int rows_case(Gpu& gpu) {
   vkc::Result<codec::Decoder> dec = decoder(gpu, true);
   vkc::Result<vol::VoxelBlockGrid> source =
-      full_grid(gpu, {Sphere{vr::Vec3f(0.0f), 0.08f}});
+      full_grid(gpu, {Sphere{vgrid::Vec3f(0.0f), 0.08f}});
   CHECK(dec.ok() && source.ok());
   vkc::Result<Bytes> frame = encode_at(gpu, source.value(), 64, 0.2f);
   vkc::Result<vol::VoxelBlockGrid> grid = player_grid(gpu);
@@ -2079,5 +2088,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

@@ -17,7 +17,7 @@
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief Grid resolution and hash-table shape: metres-per-voxel, block size,
 ///        truncation band, and the hash-table capacity.
@@ -213,4 +213,4 @@ inline core::Status VoxelGridParams::validate() const try {
                                 core::Status::Code::InvalidArgument);
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

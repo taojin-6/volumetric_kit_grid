@@ -24,11 +24,11 @@
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/volume/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/volume/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief Declares one per-voxel attribute array to allocate: a name and the
 ///        byte size of its per-voxel element.
@@ -96,7 +96,7 @@ inline constexpr std::string_view kColorAttribute = "color";
 ///          outlive this object; it stores references to them (through the
 ///          owned
 ///          @ref VoxelHashMap, and the allocator backs every attribute buffer).
-class VR_VOLUME_API VoxelBlockGrid {
+class VGRID_VOLUME_API VoxelBlockGrid {
  public:
   /// @brief Create the grid: build the block index, then allocate and zero each
   ///        declared attribute array.
@@ -413,7 +413,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   // Record the zero kernel over the first entries of `list`, an attribute a
   // dispatch, each block found by its coord: `count` of them, or, with a
   // device `words`, as many as its count says behind its gate, sized by
-  // recon's count-to-slices kernel.
+  // grid's count-to-slices kernel.
   core::Status record_zero(core::CommandBatch& batch, const core::Buffer& list,
                            std::uint32_t count, const DeviceCount* words,
                            const DeviceCount* gate, core::GpuStageScope* stage);
@@ -451,7 +451,7 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::ComputeKernel zero_kernel_;
   core::KernelSets zero_sets_;
   // A recorded removal's zeroing, and the stamp pass, each sized from a
-  // count on the device: recon's count-to-slices kernel, an instance each,
+  // count on the device: grid's count-to-slices kernel, an instance each,
   // and its slices.
   core::ComputeKernel zero_args_kernel_;
   core::Buffer zero_slices_;
@@ -479,4 +479,4 @@ class VR_VOLUME_API VoxelBlockGrid {
   core::Allocator* allocator_ = nullptr;
 };
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

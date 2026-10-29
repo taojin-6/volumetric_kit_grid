@@ -1,0 +1,29 @@
+# Build directories
+/build*/
+/cmake-build-*/
+/out/
+
+# Local git worktrees (one per in-flight change; see AGENTS.md)
+/.worktrees/
+
+# CMake / user state
+CMakeUserPresets.json
+.cache/
+compile_commands.json
+
+# Compiled GPU shader intermediates (built into the build tree)
+*.spv
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# GPU debugging captures (Xcode Metal frame capture / Nsight)
+*.gputrace
+*.nsys-rep
+*.ncu-rep
+
+# Logs
+*.log

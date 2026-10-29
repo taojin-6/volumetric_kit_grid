@@ -32,7 +32,6 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
@@ -40,21 +39,22 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/frustum.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/frustum.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
-#include "sphere_scene.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/sphere_scene.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 using C = vkc::Status::Code;
 
 namespace {
@@ -80,7 +80,7 @@ vol::VoxelGridParams params(std::int32_t bucket_size,
 
 vol::BlockIndex at(int x, int y, int z) {
   vol::BlockIndex b{};
-  b.coord = vr::Vec3i(x, y, z);
+  b.coord = vgrid::Vec3i(x, y, z);
   return b;
 }
 
@@ -193,8 +193,8 @@ vkc::Result<vol::AllocFailures> recorded(
     vkc::test::Gpu& gpu, vol::VoxelHashMap& map, const Blocks& blocks,
     bool removes, const vol::DeviceCount* gate = nullptr) {
   VKC_ASSIGN(const vkc::Buffer list,
-             vr_test::detail::device_coords(gpu, blocks.data(),
-                                            std::uint32_t(blocks.size())));
+             vgrid_test::detail::device_coords(gpu, blocks.data(),
+                                               std::uint32_t(blocks.size())));
   VKC_ASSIGN(const vkc::Buffer count,
              words(gpu, {std::uint32_t(blocks.size())}));
   const vol::DeviceCount n{&count, 0, std::uint32_t(blocks.size())};
@@ -227,8 +227,9 @@ vkc::Result<std::uint32_t> blocking_all(
   std::uint32_t left = 0;
   for (int pass = 0; pass < 8; ++pass) {
     VKC_ASSIGN(left,
-               removes ? vr_test::remove_blocks(gpu, map, blocks, failures)
-                       : vr_test::allocate_blocks(gpu, map, blocks, failures));
+               removes
+                   ? vgrid_test::remove_blocks(gpu, map, blocks, failures)
+                   : vgrid_test::allocate_blocks(gpu, map, blocks, failures));
     if (left == 0) break;
   }
   return left;
@@ -311,7 +312,7 @@ int agrees_case(vkc::test::Gpu& gpu) {
 // of 0 records nothing and settles to zeros.
 int count_case(vkc::test::Gpu& gpu) {
   const Blocks all = cube();
-  vkc::Result<vkc::Buffer> list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> list = vgrid_test::detail::device_coords(
       gpu, all.data(), std::uint32_t(all.size()));
   CHECK(list.ok());
   vkc::Result<vkc::Buffer> counts = words(gpu, {7, 0, 20, 1000});
@@ -371,7 +372,7 @@ int count_case(vkc::test::Gpu& gpu) {
 int word_metadata_case(vkc::test::Gpu& gpu) {
   const Blocks one = {at(0, 0, 0)};
   vkc::Result<vkc::Buffer> list =
-      vr_test::detail::device_coords(gpu, one.data(), 1);
+      vgrid_test::detail::device_coords(gpu, one.data(), 1);
   vkc::Result<vkc::Buffer> counts = words(gpu, {0, 1});
   vkc::Result<vkc::Buffer> short_word =
       vkc::device_storage_buffer(gpu.allocator, 3);
@@ -515,7 +516,7 @@ int contention_case(vkc::test::Gpu& gpu) {
   }
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 1));
   CHECK(map.ok() && blocking_all(gpu, *map, placed, false).value() == 0);
-  vkc::Result<vkc::Buffer> list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> list = vgrid_test::detail::device_coords(
       gpu, coords.data(), std::uint32_t(coords.size()));
   CHECK(list.ok());
   const vkc::DeviceCounters before = gpu.device.counters();
@@ -534,7 +535,7 @@ int contention_case(vkc::test::Gpu& gpu) {
   CHECK(few.ok());
   vol::AllocFailures g;
   vkc::Result<std::uint32_t> missed =
-      vr_test::allocate_blocks(gpu, *few, placed, &g);
+      vgrid_test::allocate_blocks(gpu, *few, placed, &g);
   CHECK(missed.ok() && missed.value() == 0 && g.rounds <= 10);
   CHECK(few->allocated_blocks() == placed.size());
   return 0;
@@ -565,9 +566,9 @@ int one_batch_case(vkc::test::Gpu& gpu) {
   const Blocks gone = corners();
   Blocks fresh;
   for (int i = 0; i < 8; ++i) fresh.push_back(at(10 + i, 0, 0));
-  vkc::Result<vkc::Buffer> gone_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> gone_list = vgrid_test::detail::device_coords(
       gpu, gone.data(), std::uint32_t(gone.size()));
-  vkc::Result<vkc::Buffer> fresh_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> fresh_list = vgrid_test::detail::device_coords(
       gpu, fresh.data(), std::uint32_t(fresh.size()));
   vkc::Result<vkc::Buffer> counts = words(gpu, {8, 8, 1});
   CHECK(gone_list.ok() && fresh_list.ok() && counts.ok());
@@ -610,7 +611,7 @@ int one_batch_case(vkc::test::Gpu& gpu) {
 // Past a dispatch's groups: a round of 1 024 coords split into four slices
 // of one group each places what one dispatch places.
 int slices_case(vkc::test::Gpu& gpu) {
-  vr::detail::set_test_groups_per_dispatch(1);
+  vgrid::detail::set_test_groups_per_dispatch(1);
   const Blocks all = sheet(32, 32);
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 4096));
   CHECK(map.ok());
@@ -619,7 +620,7 @@ int slices_case(vkc::test::Gpu& gpu) {
   CHECK(coords_of(*map).value() == sorted(all));
   vkc::Result<vol::AllocFailures> g = recorded_all(gpu, *map, all, true);
   CHECK(g.ok() && g->total == 0 && map->allocated_blocks() == 0);
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
   return 0;
 }
 
@@ -658,8 +659,8 @@ static_assert(
 // A camera 1 m behind the cube, looking down +Z, its far plane 0.99 m ahead:
 // it keeps the cube's z = -1 slab, which ends 1 m ahead, alone.
 vol::FrustumPlanes front_frustum() {
-  vr::Mat4f pose(1.0f);
-  pose[3] = vr::Vec4f(0.0f, 0.0f, -1.0f, 1.0f);
+  vgrid::Mat4f pose(1.0f);
+  pose[3] = vgrid::Vec4f(0.0f, 0.0f, -1.0f, 1.0f);
   return vol::make_frustum_planes(100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 0.1f,
                                   0.99f, pose);
 }
@@ -780,9 +781,9 @@ int counters_case(vkc::test::Gpu& gpu) {
   CHECK(map.ok());
   const Blocks all = cube();
   const Blocks gone = corners();
-  vkc::Result<vkc::Buffer> all_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> all_list = vgrid_test::detail::device_coords(
       gpu, all.data(), std::uint32_t(all.size()));
-  vkc::Result<vkc::Buffer> gone_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> gone_list = vgrid_test::detail::device_coords(
       gpu, gone.data(), std::uint32_t(gone.size()));
   vkc::Result<vkc::Buffer> counts = words(gpu, {27, 8});
   CHECK(all_list.ok() && gone_list.ok() && counts.ok());
@@ -813,7 +814,7 @@ int slots_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks all = cube();
-  vkc::Result<vkc::Buffer> list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> list = vgrid_test::detail::device_coords(
       gpu, all.data(), std::uint32_t(all.size()));
   vkc::Result<vkc::Buffer> counts = words(gpu, {27});
   CHECK(list.ok() && counts.ok());
@@ -845,7 +846,7 @@ int slots_case(vkc::test::Gpu& gpu) {
 
 // Three cameras round a sphere, their depth on the host and on the device.
 struct Sphere {
-  std::vector<vr_test::SphereView<vol::DepthPinhole>> views;
+  std::vector<vgrid_test::SphereView<vol::DepthPinhole>> views;
   std::vector<vkc::Buffer> device;
 
   std::vector<vol::DepthInput> frames(std::size_t cameras,
@@ -863,7 +864,7 @@ struct Sphere {
 vkc::Result<Sphere> sphere(vkc::test::Gpu& gpu) {
   Sphere s;
   for (int c = 0; c < 3; ++c) {
-    s.views.push_back(vr_test::sphere_view<vol::DepthPinhole>(c));
+    s.views.push_back(vgrid_test::sphere_view<vol::DepthPinhole>(c));
     const std::vector<float>& depth = s.views.back().depth;
     VKC_ASSIGN(vkc::Buffer buffer, vkc::test::upload_device_buffer(
                                        gpu.device, gpu.allocator, depth.data(),
@@ -978,11 +979,11 @@ int settle_order_case(vkc::test::Gpu& gpu) {
   const Blocks first = cube();
   const Blocks second = sheet(4, 4, 5);
   const Blocks third = sheet(4, 4, 9);
-  vkc::Result<vkc::Buffer> first_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> first_list = vgrid_test::detail::device_coords(
       gpu, first.data(), std::uint32_t(first.size()));
-  vkc::Result<vkc::Buffer> second_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> second_list = vgrid_test::detail::device_coords(
       gpu, second.data(), std::uint32_t(second.size()));
-  vkc::Result<vkc::Buffer> third_list = vr_test::detail::device_coords(
+  vkc::Result<vkc::Buffer> third_list = vgrid_test::detail::device_coords(
       gpu, third.data(), std::uint32_t(third.size()));
   vkc::Result<vkc::Buffer> counts = words(gpu, {27, 16});
   CHECK(first_list.ok() && second_list.ok() && third_list.ok() && counts.ok());
@@ -1053,12 +1054,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   if (depth_gate_case(gpu) != 0) return 1;
   if (settle_order_case(gpu) != 0) return 1;
   if (depth_counters_case(gpu) != 0) return 1;
-  std::printf("recon volume recorded test passed\n");
+  std::printf("grid volume recorded test passed\n");
   return 0;
 }
 
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

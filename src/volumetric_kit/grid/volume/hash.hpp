@@ -13,9 +13,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// Hash-table entry -- one per slot in the table. `hash_common.glsl`'s
 /// `HashEntry` is its device half, byte-identical under scalar block layout
@@ -79,4 +79,4 @@ struct RoundsResult {
 static_assert(sizeof(RoundsResult) == 4 * 8,
               "RoundsResult is eight words, as hash_rounds.comp writes it");
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

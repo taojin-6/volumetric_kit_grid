@@ -12,16 +12,16 @@
 #include <new>
 #include <vector>
 
-#include "codec_fixture.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
+namespace codec = volumetric_kit::grid::codec;
 using namespace codec_fixture;
 
 namespace {
@@ -190,8 +190,8 @@ int decoder_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
 }
 
 int gpu_main(vkc::test::GpuContext& gpu) {
-  auto a = sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.04f});
-  auto b = sphere_grid(gpu, Sphere{vr::Vec3f(0.02f, 0.0f, 0.0f), 0.05f});
+  auto a = sphere_grid(gpu, Sphere{vgrid::Vec3f(0.0f), 0.04f});
+  auto b = sphere_grid(gpu, Sphere{vgrid::Vec3f(0.02f, 0.0f, 0.0f), 0.05f});
   CHECK(a.ok() && b.ok());
   codec::EncoderConfig config;
   config.params.coefficient_count = 1;
@@ -220,7 +220,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() try {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 } catch (const std::bad_alloc&) {
   vkc::test::allocation_failure = {};
   std::fputs("FAIL: bad_alloc escaped a decoder API\n", stderr);

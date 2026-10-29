@@ -12,9 +12,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
 
-namespace volumetric_kit::recon::mesh {
+namespace volumetric_kit::grid::mesh {
 
 /// @brief One mesh vertex: world-space position + normal, and the hybrid
 ///        appearance the reconstruction handoff carries -- a per-vertex color
@@ -121,4 +121,4 @@ struct Mesh {
   std::size_t triangle_count() const noexcept { return indices.size() / 3; }
 };
 
-}  // namespace volumetric_kit::recon::mesh
+}  // namespace volumetric_kit::grid::mesh

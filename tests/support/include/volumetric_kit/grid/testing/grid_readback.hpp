@@ -18,10 +18,10 @@
 #include <vector>
 
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace vr_test {
+namespace vgrid_test {
 
 namespace vkc = volumetric_kit::core;
 
@@ -29,7 +29,7 @@ namespace vkc = volumetric_kit::core;
 template <typename T>
 vkc::Result<std::vector<T>> read_attribute(
     const vkc::Device& device, vkc::Allocator& allocator,
-    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const volumetric_kit::grid::volume::VoxelBlockGrid& grid,
     std::string_view name) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
   return vkc::test::read_back<T>(device, allocator, *view.buffer,
@@ -40,7 +40,7 @@ vkc::Result<std::vector<T>> read_attribute(
 template <typename T>
 vkc::Status write_attribute(
     const vkc::Device& device, vkc::Allocator& allocator,
-    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const volumetric_kit::grid::volume::VoxelBlockGrid& grid,
     std::string_view name, const std::vector<T>& data) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
   return vkc::test::write_back(device, allocator, *view.buffer, data);
@@ -61,9 +61,9 @@ struct AttributeSpan {
 template <typename T>
 vkc::Result<AttributeSpan<T>> read_span(
     const vkc::Device& device, vkc::Allocator& allocator,
-    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const volumetric_kit::grid::volume::VoxelBlockGrid& grid,
     std::string_view name,
-    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
+    const std::vector<volumetric_kit::grid::volume::BlockIndex>& blocks) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
   if (view.element_size != sizeof(T)) {
     return vkc::Status::invalid_argument("read_span: another element size");
@@ -86,10 +86,9 @@ vkc::Result<AttributeSpan<T>> read_span(
 
 // Write `span` back where read_span read it.
 template <typename T>
-vkc::Status write_span(
-    const vkc::Device& device, vkc::Allocator& allocator,
-    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
-    std::string_view name, const AttributeSpan<T>& span) {
+vkc::Status write_span(const vkc::Device& device, vkc::Allocator& allocator,
+                       const volumetric_kit::grid::volume::VoxelBlockGrid& grid,
+                       std::string_view name, const AttributeSpan<T>& span) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
   return vkc::test::write_back(device, allocator, *view.buffer, span.values,
                                span.first);
@@ -101,9 +100,9 @@ vkc::Status write_span(
 template <typename T>
 vkc::Result<std::vector<T>> read_blocks(
     const vkc::test::Gpu& gpu,
-    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const volumetric_kit::grid::volume::VoxelBlockGrid& grid,
     std::string_view name,
-    const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
+    const std::vector<volumetric_kit::grid::volume::BlockIndex>& blocks) {
   VKC_ASSIGN(const auto span,
              read_span<T>(gpu.device, gpu.allocator, grid, name, blocks));
   const auto vpb = static_cast<std::size_t>(grid.grid().voxels_per_block);
@@ -119,8 +118,8 @@ using BlockCoord = std::tuple<int, int, int>;
 
 // Every active block's coordinate and first voxel (`ptr` is a voxel offset).
 inline vkc::Result<std::map<BlockCoord, std::int32_t>> blocks_of(
-    volumetric_kit::recon::volume::VoxelBlockGrid& grid) {
-  VKC_ASSIGN(std::vector<volumetric_kit::recon::volume::BlockIndex> active,
+    volumetric_kit::grid::volume::VoxelBlockGrid& grid) {
+  VKC_ASSIGN(std::vector<volumetric_kit::grid::volume::BlockIndex> active,
              grid.map().compact_active_blocks());
   std::map<BlockCoord, std::int32_t> out;
   for (const auto& b : active) {
@@ -134,13 +133,13 @@ namespace detail {
 // The blocks two grids share, in coordinate order: a[i] and b[i] are at the
 // same coordinate, whatever slots the GPU gave them.
 struct MatchedBlocks {
-  std::vector<volumetric_kit::recon::volume::BlockIndex> a, b;
+  std::vector<volumetric_kit::grid::volume::BlockIndex> a, b;
 };
 
 inline vkc::Result<MatchedBlocks> matching_blocks(
-    volumetric_kit::recon::volume::VoxelBlockGrid& a,
-    volumetric_kit::recon::volume::VoxelBlockGrid& b) {
-  namespace vol = volumetric_kit::recon::volume;
+    volumetric_kit::grid::volume::VoxelBlockGrid& a,
+    volumetric_kit::grid::volume::VoxelBlockGrid& b) {
+  namespace vol = volumetric_kit::grid::volume;
   MatchedBlocks m;
   VKC_ASSIGN(m.a, a.map().compact_active_blocks());
   VKC_ASSIGN(m.b, b.map().compact_active_blocks());
@@ -192,8 +191,8 @@ struct VoxelWords {
 // their own nonempty and minimum-observed checks; empty grids are valid here.
 template <typename Compare>
 bool compare_grids(const vkc::test::Gpu& gpu,
-                   volumetric_kit::recon::volume::VoxelBlockGrid& a,
-                   volumetric_kit::recon::volume::VoxelBlockGrid& b,
+                   volumetric_kit::grid::volume::VoxelBlockGrid& a,
+                   volumetric_kit::grid::volume::VoxelBlockGrid& b,
                    Compare&& compare, std::size_t* observed = nullptr,
                    std::size_t* block_count = nullptr) {
   auto blocks = detail::matching_blocks(a, b);
@@ -202,7 +201,7 @@ bool compare_grids(const vkc::test::Gpu& gpu,
                  blocks.status().message().c_str());
     return false;
   }
-  namespace vol = volumetric_kit::recon::volume;
+  namespace vol = volumetric_kit::grid::volume;
   const std::string_view names[] = {vol::kWeightAttribute, vol::kTsdfAttribute,
                                     vol::kColorAttribute};
   std::vector<std::uint32_t> wa[3], wb[3];
@@ -234,8 +233,8 @@ bool compare_grids(const vkc::test::Gpu& gpu,
 // Bit-identical weight, tsdf and colour, including unobserved voxels. Read
 // one attribute pair at a time so large-grid tests need no extra host memory.
 inline bool same_grids(const vkc::test::Gpu& gpu,
-                       volumetric_kit::recon::volume::VoxelBlockGrid& a,
-                       volumetric_kit::recon::volume::VoxelBlockGrid& b,
+                       volumetric_kit::grid::volume::VoxelBlockGrid& a,
+                       volumetric_kit::grid::volume::VoxelBlockGrid& b,
                        std::size_t* observed = nullptr,
                        std::size_t* block_count = nullptr) {
   auto blocks = detail::matching_blocks(a, b);
@@ -243,7 +242,7 @@ inline bool same_grids(const vkc::test::Gpu& gpu,
     std::fprintf(stderr, "same_grids: %s\n", blocks.status().message().c_str());
     return false;
   }
-  namespace vol = volumetric_kit::recon::volume;
+  namespace vol = volumetric_kit::grid::volume;
   const std::string_view names[] = {vol::kWeightAttribute, vol::kTsdfAttribute,
                                     vol::kColorAttribute};
   std::size_t weighted = 0;
@@ -271,4 +270,4 @@ inline bool same_grids(const vkc::test::Gpu& gpu,
   return true;
 }
 
-}  // namespace vr_test
+}  // namespace vgrid_test

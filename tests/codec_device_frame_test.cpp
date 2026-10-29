@@ -38,13 +38,13 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
-namespace vol = volumetric_kit::recon::volume;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
+namespace vol = volumetric_kit::grid::volume;
 namespace oracle = codec_oracle;
 using codec_frames::extreme_frame;
 using codec_frames::inter_frame;
@@ -180,7 +180,7 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   const std::uint32_t m = resident.reference_count;
   std::vector<std::uint32_t> packed(std::size_t(entries) * words);
   std::vector<std::uint32_t> modes(m);
-  std::vector<vr::volume::BlockIndex> list(entries - m);
+  std::vector<vgrid::volume::BlockIndex> list(entries - m);
   frame.blocks.masks.resize(std::size_t(entries) * codec::kMaskWordsPerBlock);
   if (entries != 0) {
     VKC_TRY(batch.readback(*resident.masks, 0,
@@ -196,7 +196,7 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   }
   if (!list.empty()) {
     VKC_TRY(batch.readback(*resident.list, 0,
-                           list.size() * sizeof(vr::volume::BlockIndex),
+                           list.size() * sizeof(vgrid::volume::BlockIndex),
                            list.data()));
   }
   VKC_TRY(batch.submit());
@@ -204,7 +204,7 @@ vkc::Result<oracle::Frame> device_read(d::DeviceFrameReader& reader,
   for (const std::uint32_t mode : modes) {
     frame.modes.push_back(static_cast<d::BlockMode>(mode));
   }
-  for (const vr::volume::BlockIndex& b : list) {
+  for (const vgrid::volume::BlockIndex& b : list) {
     frame.coords.push_back(b.coord);
   }
   frame.blocks.coefficients.resize(std::size_t(entries) * k);
@@ -402,7 +402,7 @@ int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
         writer, codec_frames::golden_frame(g), sizes(g.segment_size, 64));
     CHECK(bytes.ok());
     CHECK(bytes.value().size() == g.size);
-    CHECK(vr_test::fnv1a(bytes.value()) == g.hash);
+    CHECK(vgrid_test::fnv1a(bytes.value()) == g.hash);
     CHECK(same_read(reader, bytes.value()) == 0);
   }
   for (const codec_frames::GoldenInterFrame& g :
@@ -413,14 +413,14 @@ int golden_case(d::DeviceFrameWriter& writer, d::DeviceFrameReader& reader) {
         device_write(writer, p, sizes(g.segment_size, g.update_size));
     CHECK(bytes.ok());
     CHECK(bytes.value().size() == g.size);
-    CHECK(vr_test::fnv1a(bytes.value()) == g.hash);
+    CHECK(vgrid_test::fnv1a(bytes.value()) == g.hash);
     CHECK(same_read(reader, bytes.value(), &p.reference) == 0);
     for (const std::uint32_t tail : tails(p.modes.size())) {
       const vkc::Result<Bytes> bounded =
           device_write(writer, p, sizes(g.segment_size, g.update_size), tail);
       CHECK(bounded.ok());
       CHECK(bounded.value().size() == g.size);
-      CHECK(vr_test::fnv1a(bounded.value()) == g.hash);
+      CHECK(vgrid_test::fnv1a(bounded.value()) == g.hash);
     }
   }
   return 0;
@@ -495,7 +495,7 @@ Bytes extreme_inter(d::FrameReference& id) {
   id = reference_of(oracle::write_frame(reference).value());
   const oracle::Frame kept = successor(reference, 32, 100, 400, 0);
   const oracle::Frame added = extreme_frame();
-  std::map<vr::Vec3i, codec_frames::Payload, codec_frames::ZyxLess> blocks;
+  std::map<vgrid::Vec3i, codec_frames::Payload, codec_frames::ZyxLess> blocks;
   for (std::size_t i = 0; i < kept.coords.size(); ++i) {
     blocks.emplace(kept.coords[i], codec_frames::payload_at(kept.blocks, i));
   }
@@ -721,16 +721,16 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
     held = r.value();
   }
   auto decoded = [&held] {
-    std::vector<vr::Vec3i> coords;
-    for (const vr::volume::BlockIndex& b :
-         vkc::test::read_back<vr::volume::BlockIndex>(*g_device, *g_allocator,
-                                                      *held.list, held.count)
+    std::vector<vgrid::Vec3i> coords;
+    for (const vgrid::volume::BlockIndex& b :
+         vkc::test::read_back<vgrid::volume::BlockIndex>(
+             *g_device, *g_allocator, *held.list, held.count)
              .value()) {
       coords.push_back(b.coord);
     }
     return coords;
   };
-  const std::vector<vr::Vec3i> before = decoded();
+  const std::vector<vgrid::Vec3i> before = decoded();
   CHECK(before == reference.coords);
   // Refused before the payload is bound, so the intra frame's input serves.
   auto refused = [&](const d::ParsedFrame& parsed, C code,
@@ -780,7 +780,7 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
 int verdict_case(d::DeviceFrameReader& reader) {
   oracle::Frame row = make_frame(20, 4, 41);
   row.coords.clear();
-  for (int x = 0; x < 20; ++x) row.coords.push_back(vr::Vec3i(x, 3, -2));
+  for (int x = 0; x < 20; ++x) row.coords.push_back(vgrid::Vec3i(x, 3, -2));
   const Bytes good = oracle::write_frame(row, sizes(4, 64)).value();
   const d::ParsedFrame parsed =
       d::parse_frame(good.data(), good.size(), kMaxBlocks, nullptr).value();
@@ -1020,7 +1020,7 @@ int device_count_case(d::DeviceFrameWriter& writer) {
     oracle::Frame big = f;
     Lcg rng{n + 5};
     for (std::uint32_t i = 0; i < kGarbage; ++i) {
-      big.coords.push_back(vr::Vec3i(-9000 - int(i), 3, int(rng.below(9))));
+      big.coords.push_back(vgrid::Vec3i(-9000 - int(i), 3, int(rng.below(9))));
       for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
         big.blocks.masks.push_back(rng.next());
       }
@@ -1086,5 +1086,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

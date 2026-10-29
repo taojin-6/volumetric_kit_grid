@@ -19,7 +19,7 @@
 // keep and zero alone, which the caller makes and applies (bitstream.hpp
 // says what each carries): the grammar never sees the reference.
 //
-// The includer picks a half with VR_FRAME_WRITER or VR_FRAME_READER, and
+// The includer picks a half with VGRID_FRAME_WRITER or VGRID_FRAME_READER, and
 // defines what it calls: a writer, sink_symbol, sink_bits (a raw field of 1
 // to 32 bits) and coefficient(j); a reader, get, get_bits, coder_failed and
 // store_coefficient. Both work on the block's mask in g_mask, and a reader
@@ -36,12 +36,12 @@
 #include "frame_models.glsl"
 
 uint g_mask[kMaskWords];
-#ifdef VR_FRAME_WRITER
+#ifdef VGRID_FRAME_WRITER
 void sink_symbol(uint model, uint symbol);
 void sink_bits(uint value, uint bits);
 int coefficient(uint j);
 #endif
-#ifdef VR_FRAME_READER
+#ifdef VGRID_FRAME_READER
 ivec3 g_coord;
 uint get(uint model);
 uint get_bits(uint bits);
@@ -66,7 +66,7 @@ uint line_predictor(uint z, uint y) {
   return z > 0u ? mask_line(kLinesPerPlane * (z - 1u)) : 0x00u;
 }
 
-#ifdef VR_FRAME_WRITER
+#ifdef VGRID_FRAME_WRITER
 
 void emit_unsigned(uint model, uint u) {
   const uint c = bit_length(u);
@@ -186,9 +186,9 @@ void emit_entry(uint mode, uint k) {
   if (mode == kModeKeep || mode == kModeZero) emit_payload(k);
 }
 
-#endif  // VR_FRAME_WRITER
+#endif  // VGRID_FRAME_WRITER
 
-#ifdef VR_FRAME_READER
+#ifdef VGRID_FRAME_READER
 
 uint get_unsigned(uint model) {
   const uint c = get(model);
@@ -319,4 +319,4 @@ uint read_entry(uint k) {
   return mode;
 }
 
-#endif  // VR_FRAME_READER
+#endif  // VGRID_FRAME_READER

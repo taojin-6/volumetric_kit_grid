@@ -8,13 +8,13 @@
 #include <utility>
 
 #include "volumetric_kit/core/base/check.hpp"
-#include "volumetric_kit/recon/io/mesh_io.hpp"
-#include "volumetric_kit/recon/volume/grid_growth.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_io.hpp"
+#include "volumetric_kit/grid/volume/grid_growth.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 namespace {
 
-namespace io = vr::io;
+namespace mesh_io = vgrid::mesh_io;
 
 // A pattern split at its number, each `%%` already made `%`.
 struct Pattern {
@@ -78,12 +78,12 @@ std::string range_text(const MeshSequence& sequence) {
                                      ".." + std::to_string(sequence.last());
 }
 
-void print_bounds(const char* label, const io::MeshBounds& b) {
+void print_bounds(const char* label, const mesh_io::MeshBounds& b) {
   std::printf("%s: x [%.9g, %.9g], y [%.9g, %.9g], z [%.9g, %.9g]\n", label,
               b.min[0], b.max[0], b.min[1], b.max[1], b.min[2], b.max[2]);
 }
 
-void print_vector(const char* label, const vr::Vec3d& v) {
+void print_vector(const char* label, const vgrid::Vec3d& v) {
   std::printf("%s (%.17g, %.17g, %.17g)", label, v.x, v.y, v.z);
 }
 
@@ -119,32 +119,33 @@ vkc::Result<MeshSequence> MeshSequence::open(const config::Config& settings) {
   sequence.by_height_ = !(source.metres_per_unit > 0.0);
   for (int i = 0; i < run.frames; ++i) {
     std::string path = expand(pattern, sequence.first_ + std::uint32_t(i));
-    const vkc::Status file = io::check_mesh_file(path);
+    const vkc::Status file = mesh_io::check_mesh_file(path);
     if (!file.ok()) return file.with_context("source.path");
     sequence.paths_.push_back(std::move(path));
   }
 
   const auto& up = *source.up_vector;
-  VKC_ASSIGN(const io::MeshAxes axes, io::up_axes({up[0], up[1], up[2]}));
+  VKC_ASSIGN(const mesh_io::MeshAxes axes,
+             mesh_io::up_axes({up[0], up[1], up[2]}));
   sequence.upright_.axes = axes;
   for (std::uint32_t n = sequence.first(), i = 0; i < sequence.count();
        ++i, ++n) {
     const std::string& path = sequence.path(n);
-    vkc::Result<io::TriangleMesh> mesh = io::load_mesh(path);
+    vkc::Result<mesh_io::TriangleMesh> mesh = mesh_io::load_mesh(path);
     if (!mesh.ok()) return mesh.status().with_context(frame_name(n, path));
-    io::extend_bounds(sequence.input_, *mesh);
-    io::extend_bounds(sequence.upright_, *mesh);
-    const vkc::Result<io::MeshTopology> topology =
-        io::audit_mesh_topology(*mesh);
+    mesh_io::extend_bounds(sequence.input_, *mesh);
+    mesh_io::extend_bounds(sequence.upright_, *mesh);
+    const vkc::Result<mesh_io::MeshTopology> topology =
+        mesh_io::audit_mesh_topology(*mesh);
     if (!topology.ok()) {
       return topology.status().with_context(frame_name(n, path));
     }
     if (!settings.codec.inspect_only) VKC_TRY(sequence.admit(n, *topology));
   }
-  vkc::Result<io::MeshTransform> transform =
+  vkc::Result<mesh_io::MeshTransform> transform =
       sequence.by_height_
-          ? io::fit_transform(sequence.upright_, source.height_m)
-          : io::scale_transform(sequence.upright_, source.metres_per_unit);
+          ? mesh_io::fit_transform(sequence.upright_, source.height_m)
+          : mesh_io::scale_transform(sequence.upright_, source.metres_per_unit);
   if (!transform.ok()) {
     return transform.status().with_context(range_text(sequence));
   }
@@ -163,7 +164,7 @@ void MeshSequence::print() const {
               range_text(*this).c_str(), pattern_.c_str(),
               by_height_ ? "source.height_m" : "source.metres_per_unit");
   print_bounds("input bounds (source units)", input_);
-  const vr::Vec3d& up = transform_.axes.up;
+  const vgrid::Vec3d& up = transform_.axes.up;
   std::printf(
       "head-up (input coordinates): (%.9g, %.9g, %.9g); projected height "
       "%.12g source units\n",
@@ -178,7 +179,7 @@ void MeshSequence::print() const {
   print_vector("; origin", transform_.origin);
   std::printf(" source units; %.17g metres/source-unit\n",
               transform_.metres_per_unit);
-  io::MeshBounds placed;
+  mesh_io::MeshBounds placed;
   for (int a = 0; a < 3; ++a) {
     placed.min[a] =
         (upright_.min[a] - transform_.origin[a]) * transform_.metres_per_unit;
@@ -193,19 +194,20 @@ vkc::Result<MeshFrame> MeshSequence::load(std::uint32_t number) const {
   frame.number = number;
   frame.path = path(number);
   const std::string name = frame_name(number, frame.path);
-  vkc::Result<io::TriangleMesh> mesh = io::load_mesh(frame.path);
+  vkc::Result<mesh_io::TriangleMesh> mesh = mesh_io::load_mesh(frame.path);
   if (!mesh.ok()) return mesh.status().with_context(name);
   frame.mesh = std::move(mesh).value();
-  const vkc::Status placed = io::apply_transform(frame.mesh, transform_);
+  const vkc::Status placed = mesh_io::apply_transform(frame.mesh, transform_);
   if (!placed.ok()) return placed.with_context(name);
-  vkc::Result<io::MeshTopology> topology = io::audit_mesh_topology(frame.mesh);
+  vkc::Result<mesh_io::MeshTopology> topology =
+      mesh_io::audit_mesh_topology(frame.mesh);
   if (!topology.ok()) return topology.status().with_context(name);
   frame.topology = *topology;
   return frame;
 }
 
 vkc::Status MeshSequence::admit(std::uint32_t number,
-                                const io::MeshTopology& topology) const {
+                                const mesh_io::MeshTopology& topology) const {
   if (!signed_ || topology.supports_signed(allow_holes_)) return {};
   const std::string what = frame_name(number, path(number)) + ": " +
                            topology_defects(topology) + "; ";
@@ -221,7 +223,7 @@ vkc::Status MeshSequence::admit(std::uint32_t number,
       "choose source.sdf_mode=shell");
 }
 
-std::string topology_defects(const io::MeshTopology& t) {
+std::string topology_defects(const mesh_io::MeshTopology& t) {
   if (t.components == 0) return "no triangles";
   std::string out;
   const auto add = [&out](std::size_t count, const char* what) {
@@ -238,7 +240,7 @@ std::string topology_defects(const io::MeshTopology& t) {
 }
 
 void print_frame(const MeshFrame& frame) {
-  const io::MeshTopology& t = frame.topology;
+  const mesh_io::MeshTopology& t = frame.topology;
   std::printf("frame %u: %zu vertices, %zu triangles\n", frame.number,
               frame.mesh.positions.size(), frame.mesh.indices.size() / 3);
   std::printf(
@@ -270,10 +272,11 @@ vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence) {
   return result;
 }
 
-vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
-    vr::volume::VoxelBlockGrid& grid, vr::voxelize::MeshIntegrator& integrator,
-    const io::TriangleMesh& mesh, const vr::voxelize::MeshSdfParams& params,
-    vkc::StageMetrics* metrics) {
+vkc::Result<vgrid::voxelize::MeshIntegrateStats> convert_frame(
+    vgrid::volume::VoxelBlockGrid& grid,
+    vgrid::voxelize::MeshIntegrator& integrator,
+    const mesh_io::TriangleMesh& mesh,
+    const vgrid::voxelize::MeshSdfParams& params, vkc::StageMetrics* metrics) {
   VKC_TRY(grid.clear());
   const auto vertices = std::uint32_t(mesh.positions.size());
   const auto triangles = std::uint32_t(mesh.indices.size() / 3);
@@ -281,7 +284,7 @@ vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
   // over a table with room, which a retry places: the mesh integrator refuses
   // a band with a block missing.
   for (int contended = 0;;) {
-    vr::volume::AllocFailures failures;
+    vgrid::volume::AllocFailures failures;
     VKC_ASSIGN(const auto failed,
                grid.map().allocate_from_triangles(
                    mesh.positions.data(), vertices, mesh.indices.data(),
@@ -294,7 +297,7 @@ vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
       }
       continue;
     }
-    VKC_TRY(vr::volume::grow_grid(grid));
+    VKC_TRY(vgrid::volume::grow_grid(grid));
   }
   return integrator.integrate(grid, mesh.positions.data(), vertices,
                               mesh.indices.data(), triangles, params, metrics);
@@ -302,24 +305,24 @@ vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
 
 vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    std::uint32_t number,
-                                   vr::volume::VoxelBlockGrid& grid,
-                                   vr::voxelize::MeshIntegrator& integrator,
-                                   const vr::voxelize::MeshSdfParams& params,
-                                   vr::codec_stream::CodecStream& stream,
+                                   vgrid::volume::VoxelBlockGrid& grid,
+                                   vgrid::voxelize::MeshIntegrator& integrator,
+                                   const vgrid::voxelize::MeshSdfParams& params,
+                                   vgrid::codec_stream::CodecStream& stream,
                                    vkc::StageMetrics* conversion) {
   CodedFrame coded;
   VKC_ASSIGN(coded.frame, sequence.load(number));
   VKC_TRY(sequence.admit(number, coded.frame.topology));
   const std::string name = frame_name(number, coded.frame.path);
-  vkc::Result<vr::voxelize::MeshIntegrateStats> stats =
+  vkc::Result<vgrid::voxelize::MeshIntegrateStats> stats =
       convert_frame(grid, integrator, coded.frame.mesh, params, conversion);
   if (!stats.ok()) return stats.status().with_context(name);
   coded.stats = *stats;
-  vkc::Result<vr::codec_stream::SentFrame> recorded =
+  vkc::Result<vgrid::codec_stream::SentFrame> recorded =
       stream.code(grid, number, frame_pts_ns(number, kNominalFps));
   if (!recorded.ok()) return recorded.status().with_context(name);
   coded.sent = std::move(recorded).value();
   return coded;
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

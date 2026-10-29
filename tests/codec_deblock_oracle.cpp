@@ -15,8 +15,8 @@
 namespace codec_deblock_oracle {
 namespace {
 
-namespace vr = volumetric_kit::recon;
-namespace vol = volumetric_kit::recon::volume;
+namespace vgrid = volumetric_kit::grid;
+namespace vol = volumetric_kit::grid::volume;
 
 constexpr int kB = 8;
 constexpr std::size_t kV = 512;
@@ -38,21 +38,21 @@ std::size_t line_local(int axis, int t, int u, int w) {
 // Blocks by coordinate.
 class Blocks {
  public:
-  explicit Blocks(const std::vector<vr::Vec3i>& coords) {
+  explicit Blocks(const std::vector<vgrid::Vec3i>& coords) {
     for (std::size_t i = 0; i < coords.size(); ++i) {
       at_[key(coords[i])] = std::int64_t(i);
     }
   }
   // The block one step along `axis` (s = -1 or 1) from @p c, or -1.
-  std::int64_t find(const vr::Vec3i& c, int axis, int s) const {
-    vr::Vec3i n = c;
+  std::int64_t find(const vgrid::Vec3i& c, int axis, int s) const {
+    vgrid::Vec3i n = c;
     (axis == 0 ? n.x : axis == 1 ? n.y : n.z) += s;
     const auto it = at_.find(key(n));
     return it == at_.end() ? -1 : it->second;
   }
 
  private:
-  static std::tuple<int, int, int> key(const vr::Vec3i& c) {
+  static std::tuple<int, int, int> key(const vgrid::Vec3i& c) {
     return {c.x, c.y, c.z};
   }
   std::map<std::tuple<int, int, int>, std::int64_t> at_;
@@ -184,8 +184,7 @@ void gauss(codec_fixture::Snapshot& g, const Blocks& blocks,
 
 }  // namespace
 
-float study_step_scale(
-    const volumetric_kit::recon::codec::CodecParams& params) {
+float study_step_scale(const volumetric_kit::grid::codec::CodecParams& params) {
   const double phi0 = std::sqrt(1.0 / 8.0);
   const double phi1 =
       std::sqrt(2.0 / 8.0) * std::cos(3.14159265358979323846 / 16.0);

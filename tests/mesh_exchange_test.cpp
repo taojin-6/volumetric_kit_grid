@@ -33,10 +33,10 @@
 
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/mesh/device_mesh.hpp"
-#include "volumetric_kit/recon/mesh/mesh_exchange.hpp"
+#include "volumetric_kit/grid/mesh/device_mesh.hpp"
+#include "volumetric_kit/grid/mesh/mesh_exchange.hpp"
 
-namespace rmesh = volumetric_kit::recon::mesh;
+namespace rmesh = volumetric_kit::grid::mesh;
 
 namespace {
 

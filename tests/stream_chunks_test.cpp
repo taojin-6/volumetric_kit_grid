@@ -19,15 +19,15 @@
 #include <utility>
 #include <vector>
 
-#include "stream_files.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
 
 namespace {
 
@@ -702,7 +702,7 @@ int parser_read_identity_case() {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_stream_chunks_");
+  vkc::test::Scratch scratch("grid_stream_chunks_");
   const std::string dir = scratch.path.string();
   if (encoder_bytes_case(dir) != 0) return 1;
   if (payload_runs_case() != 0) return 1;

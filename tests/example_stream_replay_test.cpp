@@ -19,22 +19,22 @@
 #include <string>
 #include <vector>
 
-#include "stream_files.hpp"
 #include "stream_replay.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
 
 namespace {
 
 using Code = vkc::Status::Code;
-using Clock = vr_example::ReplayLoop::Clock;
+using Clock = vgrid_example::ReplayLoop::Clock;
 
 constexpr std::uint64_t kStep = 33'333'333;
 
@@ -77,10 +77,10 @@ int loop_case(const std::string& dir) {
   CHECK(write(path, infos));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
-  vkc::Result<vr_example::ReplayLoop> made =
-      vr_example::ReplayLoop::create(*reader);
+  vkc::Result<vgrid_example::ReplayLoop> made =
+      vgrid_example::ReplayLoop::create(*reader);
   CHECK(made.ok());
-  const vr_example::ReplayLoop& loop = *made;
+  const vgrid_example::ReplayLoop& loop = *made;
   CHECK(loop.records().size() == infos.size() - 1);
   CHECK(loop.records().front().info.key &&
         loop.records().front().info.seq == 1);
@@ -140,8 +140,8 @@ int lone_record_case(const std::string& dir) {
   auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
-  vkc::Result<vr_example::ReplayLoop> loop =
-      vr_example::ReplayLoop::create(*reader);
+  vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*reader);
   failure.measure = false;
   CHECK(loop.ok());
   const stream::RecordInfo next = loop->restamp(loop->records()[0].info, 1);
@@ -151,7 +151,7 @@ int lone_record_case(const std::string& dir) {
   failure.site = failure.measured_site;
   failure.armed = true;
   const Code refused =
-      vr_example::ReplayLoop::create(*reader).status().domain();
+      vgrid_example::ReplayLoop::create(*reader).status().domain();
   const bool injected = failure.injected;
   failure = {};
   CHECK(injected && refused == Code::OutOfMemory);
@@ -188,8 +188,8 @@ int damage_case(const std::string& dir) {
   CHECK(vrst::write_bytes(path, file));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
-  vkc::Result<vr_example::ReplayLoop> loop =
-      vr_example::ReplayLoop::create(*reader);
+  vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*reader);
   CHECK(loop.ok() && loop->records().size() == 3);
   CHECK(loop->records()[1].info.seq == 1 && loop->records()[2].info.seq == 3);
 
@@ -207,7 +207,7 @@ int damage_case(const std::string& dir) {
   failure.site = failure.measured_site;
   failure.armed = true;
   const Code refused =
-      vr_example::ReplayLoop::create(*reader).status().domain();
+      vgrid_example::ReplayLoop::create(*reader).status().domain();
   const bool injected = failure.injected;
   failure = {};
   CHECK(injected && refused == Code::OutOfMemory);
@@ -231,8 +231,8 @@ int damaged_key_case(const std::string& dir) {
   CHECK(vrst::write_bytes(first, file));
   const auto later = reader_of(first);
   CHECK(later != nullptr && later->recovery().finished);
-  vkc::Result<vr_example::ReplayLoop> loop =
-      vr_example::ReplayLoop::create(*later);
+  vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*later);
   CHECK(loop.ok() && loop->records().size() == 2 &&
         loop->records()[0].info.seq == 2);
 
@@ -240,7 +240,7 @@ int damaged_key_case(const std::string& dir) {
   CHECK(vrst::write_bytes(both, vrst::flipped(file, chunks[3].offset + 26, 0)));
   const auto none = reader_of(both);
   CHECK(none != nullptr && none->recovery().finished);
-  CHECK(vr_example::ReplayLoop::create(*none).status().domain() ==
+  CHECK(vgrid_example::ReplayLoop::create(*none).status().domain() ==
         Code::NotFound);
   return 0;
 }
@@ -268,8 +268,8 @@ int payload_damage_case(const std::string& dir) {
   CHECK(vrst::write_bytes(path, vrst::flipped(file, payload_at(2), 0)));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
-  vkc::Result<vr_example::ReplayLoop> loop =
-      vr_example::ReplayLoop::create(*reader);
+  vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*reader);
   CHECK(loop.ok() && loop->records().size() == infos.size());
 
   std::vector<stream::RecordInfo> sent;
@@ -304,8 +304,8 @@ int payload_damage_case(const std::string& dir) {
       vrst::flipped(vrst::flipped(file, payload_at(0), 0), payload_at(4), 0)));
   const auto keyless = reader_of(both);
   CHECK(keyless != nullptr);
-  vkc::Result<vr_example::ReplayLoop> none =
-      vr_example::ReplayLoop::create(*keyless);
+  vkc::Result<vgrid_example::ReplayLoop> none =
+      vgrid_example::ReplayLoop::create(*keyless);
   CHECK(none.ok());
   sent.clear();
   CHECK(none->send_pass(*keyless, Clock::now(), 0, collect).domain() ==
@@ -319,9 +319,9 @@ int refusals_case(const std::string& dir) {
   CHECK(write(path, {vrst::info(0, false, 0, 0), vrst::info(0, false, 1, 1)}));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
-  CHECK(vr_example::ReplayLoop::create(*reader).status().domain() ==
+  CHECK(vgrid_example::ReplayLoop::create(*reader).status().domain() ==
         Code::NotFound);
-  CHECK(vr_example::ReplayLoop::create(*reader, 1).status().domain() ==
+  CHECK(vgrid_example::ReplayLoop::create(*reader, 1).status().domain() ==
         Code::InvalidArgument);
   return 0;
 }
@@ -329,7 +329,7 @@ int refusals_case(const std::string& dir) {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_example_stream_replay_");
+  vkc::test::Scratch scratch("grid_example_stream_replay_");
   const std::string dir = scratch.path.string();
   if (loop_case(dir) != 0) return 1;
   if (lone_record_case(dir) != 0) return 1;

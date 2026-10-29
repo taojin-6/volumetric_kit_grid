@@ -34,7 +34,7 @@ void main() {
   for (uint base = 0u; base <= m; base += kScanLanes) {
     const uint e = base + lane;
     const bool survives = e < m && modes[e] <= kModeZero;  // keep, skip, zero
-    const uint rank = vrScanChunk(survives ? 1u : 0u, carry);
+    const uint rank = vgridScanChunk(survives ? 1u : 0u, carry);
     if (e <= m) ranks[e] = rank;
   }
   if (lane == 0u) survivors = carry;

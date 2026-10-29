@@ -34,19 +34,19 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_coords.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_coords.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "grid_truncation_comp.spv.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -55,7 +55,7 @@ using Coord = std::tuple<int, int, int>;
 // Insert the solid (2*tb+1)^3 block cube centred on `center` into `want`, tb =
 // truncation_blocks(grid) -- the band the depth/point kernels dilate a surface
 // block into. Uses the host coordinate math the shader mirrors.
-void insert_cube(const vol::VoxelGridParams& grid, vr::Vec3i center,
+void insert_cube(const vol::VoxelGridParams& grid, vgrid::Vec3i center,
                  std::set<Coord>& want) {
   const int tb = vol::truncation_blocks(grid);
   for (int dz = -tb; dz <= tb; ++dz) {
@@ -88,13 +88,13 @@ int collect_active(vol::VoxelHashMap& map, std::set<Coord>& got) {
 // so the expected block for a pixel is derived INDEPENDENTLY of the shader --
 // a wrong fx/fy/cx/cy or a transposed cam_to_world changes this result and the
 // on-device set no longer matches. (The device path is GLSL; this is glm/C++.)
-vr::Vec3i unproject_to_block(const vol::DepthPinhole& cam,
-                             const vol::VoxelGridParams& grid, std::uint32_t u,
-                             std::uint32_t v, float d) {
+vgrid::Vec3i unproject_to_block(const vol::DepthPinhole& cam,
+                                const vol::VoxelGridParams& grid,
+                                std::uint32_t u, std::uint32_t v, float d) {
   const float x = (static_cast<float>(u) - cam.cx) * d / cam.fx;
   const float y = (static_cast<float>(v) - cam.cy) * d / cam.fy;
-  const vr::Vec3f world =
-      vr::Vec3f(cam.cam_to_world * vr::Vec4f(x, y, d, 1.0f));
+  const vgrid::Vec3f world =
+      vgrid::Vec3f(cam.cam_to_world * vgrid::Vec4f(x, y, d, 1.0f));
   return vol::world_to_block(world, grid);
 }
 
@@ -118,8 +118,8 @@ int truncation_bounds_case(const vkc::test::Gpu& gpu) {
   vkc::ComputeKernel kernel;
   vkc::KernelSetBuilder builder(gpu.device);
   CHECK(builder
-            .add(kernel, "grid_truncation", vr_grid_truncation_comp_spv,
-                 vr_grid_truncation_comp_spv_size, 2)
+            .add(kernel, "grid_truncation", vgrid_grid_truncation_comp_spv,
+                 vgrid_grid_truncation_comp_spv_size, 2)
             .ok());
   auto pool = builder.build();
   auto input = vkc::test::upload_device_buffer(
@@ -165,19 +165,19 @@ vol::VoxelGridParams golden_grid() {
 
 // The rotation of the integer quaternion (a, b, c, d), each entry one rounded
 // division, and translation t: the same bits from every compiler.
-vr::Mat4f golden_pose(const int (&q)[4], vr::Vec3f t) {
+vgrid::Mat4f golden_pose(const int (&q)[4], vgrid::Vec3f t) {
   const int a = q[0], b = q[1], c = q[2], d = q[3];
   const auto e = [n = a * a + b * b + c * c + d * d](int num) {
     return static_cast<float>(num) / static_cast<float>(n);
   };
-  vr::Mat4f m(1.0f);  // column-major: m[column][row]
-  m[0] = vr::Vec4f(e(a * a + b * b - c * c - d * d), e(2 * (b * c + a * d)),
-                   e(2 * (b * d - a * c)), 0.0f);
-  m[1] = vr::Vec4f(e(2 * (b * c - a * d)), e(a * a - b * b + c * c - d * d),
-                   e(2 * (c * d + a * b)), 0.0f);
-  m[2] = vr::Vec4f(e(2 * (b * d + a * c)), e(2 * (c * d - a * b)),
-                   e(a * a - b * b - c * c + d * d), 0.0f);
-  m[3] = vr::Vec4f(t, 1.0f);
+  vgrid::Mat4f m(1.0f);  // column-major: m[column][row]
+  m[0] = vgrid::Vec4f(e(a * a + b * b - c * c - d * d), e(2 * (b * c + a * d)),
+                      e(2 * (b * d - a * c)), 0.0f);
+  m[1] = vgrid::Vec4f(e(2 * (b * c - a * d)), e(a * a - b * b + c * c - d * d),
+                      e(2 * (c * d + a * b)), 0.0f);
+  m[2] = vgrid::Vec4f(e(2 * (b * d + a * c)), e(2 * (c * d - a * b)),
+                      e(a * a - b * b - c * c + d * d), 0.0f);
+  m[3] = vgrid::Vec4f(t, 1.0f);
   return m;
 }
 
@@ -217,13 +217,14 @@ GoldenFrame golden_frame(int index, const vol::VoxelGridParams& g) {
   // (width, height), (fx, fy, cx, cy), the pose's quaternion and translation.
   // 100 x 75 and 161 x 83 are no multiples of the kernel's 16 x 16 groups.
   const std::uint32_t sizes[3][2] = {{128, 96}, {100, 75}, {161, 83}};
-  const vr::Vec4f intrinsics[3] = {vr::Vec4f(211.37f, 209.81f, 63.29f, 47.61f),
-                                   vr::Vec4f(150.5f, 151.25f, 49.75f, 37.125f),
-                                   vr::Vec4f(300.3f, 299.7f, 80.9f, 41.2f)};
+  const vgrid::Vec4f intrinsics[3] = {
+      vgrid::Vec4f(211.37f, 209.81f, 63.29f, 47.61f),
+      vgrid::Vec4f(150.5f, 151.25f, 49.75f, 37.125f),
+      vgrid::Vec4f(300.3f, 299.7f, 80.9f, 41.2f)};
   const int quaternions[3][4] = {{5, 1, 2, 1}, {3, -1, 1, 2}, {4, 2, -1, 3}};
-  const vr::Vec3f translations[3] = {vr::Vec3f(0.13f, -0.27f, 0.41f),
-                                     vr::Vec3f(-0.62f, 0.08f, 0.35f),
-                                     vr::Vec3f(0.21f, 0.33f, -0.57f)};
+  const vgrid::Vec3f translations[3] = {vgrid::Vec3f(0.13f, -0.27f, 0.41f),
+                                        vgrid::Vec3f(-0.62f, 0.08f, 0.35f),
+                                        vgrid::Vec3f(0.21f, 0.33f, -0.57f)};
   GoldenFrame f;
   f.cam.fx = intrinsics[index].x;
   f.cam.fy = intrinsics[index].y;
@@ -305,8 +306,8 @@ vkc::Result<Pinned> pinned(const char* what, vol::VoxelHashMap& map) {
         {std::uint32_t(b.coord.x), std::uint32_t(b.coord.y),
          std::uint32_t(b.coord.z), s.requested, s.weighted, s.changed});
   }
-  const Pinned p{active.size(), map.allocated_blocks(), vr_test::fnv1a(coords),
-                 vr_test::fnv1a(stamped)};
+  const Pinned p{active.size(), map.allocated_blocks(),
+                 vgrid_test::fnv1a(coords), vgrid_test::fnv1a(stamped)};
   std::printf("  pinned %s: %zu blocks, heap %u, coords %08x, stamps %08x\n",
               what, p.blocks, p.allocated, p.coords, p.stamps);
   return p;
@@ -436,10 +437,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // translation. Column-major (glm): col0=(0,1,0,0), col1=(-1,0,0,0),
   // col2=(0,0,1,0), col3=translate. (glm default-init is garbage.)
   cam.cam_to_world =
-      vr::Mat4f(0.0f, 1.0f, 0.0f, 0.0f,    // column 0
-                -1.0f, 0.0f, 0.0f, 0.0f,   // column 1
-                0.0f, 0.0f, 1.0f, 0.0f,    // column 2
-                0.2f, -0.1f, 0.3f, 1.0f);  // column 3 (translate)
+      vgrid::Mat4f(0.0f, 1.0f, 0.0f, 0.0f,    // column 0
+                   -1.0f, 0.0f, 0.0f, 0.0f,   // column 1
+                   0.0f, 0.0f, 1.0f, 0.0f,    // column 2
+                   0.2f, -0.1f, 0.3f, 1.0f);  // column 3 (translate)
 
   const float kDepth = 1.0f;
   std::vector<float> depth(static_cast<std::size_t>(cam.width) * cam.height,
@@ -568,7 +569,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     wide.max_depth = 2.0f;
     wide.width = 37;   // 3 tiles, the last 5 pixels wide
     wide.height = 23;  // 2 tiles, the last 7 pixels tall
-    wide.cam_to_world[3] = vr::Vec4f(0.25f, -0.125f, 0.375f, 1.0f);
+    wide.cam_to_world[3] = vgrid::Vec4f(0.25f, -0.125f, 0.375f, 1.0f);
     std::vector<float> wide_depth(std::size_t{wide.width} * wide.height);
     std::set<Coord> tiled_want;
     for (std::uint32_t v = 0; v < wide.height; ++v) {
@@ -603,7 +604,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(after_clear.ok() && after_clear.value().empty());
 
   std::printf(
-      "recon volume allocate test passed: depth band (%zu blocks) allocated + "
+      "grid volume allocate test passed: depth band (%zu blocks) allocated + "
       "compacted on-device\n",
       depth_want.size());
   return 0;
@@ -612,5 +613,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

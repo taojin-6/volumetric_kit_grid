@@ -11,9 +11,9 @@
 #include <cstdint>
 #include <string>
 
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 /// @brief Set a candidate table, keeping the coefficient count and scale.
 /// @param name "uniform", "band" (linear total frequency), or "radial"
@@ -21,8 +21,7 @@ namespace vr_example {
 /// @return OK, or InvalidArgument for an unknown table; on error @p params
 ///         is unchanged.
 inline volumetric_kit::core::Status apply_quantization_table(
-    volumetric_kit::recon::codec::CodecParams& params,
-    const std::string& name) {
+    volumetric_kit::grid::codec::CodecParams& params, const std::string& name) {
   namespace vkc = volumetric_kit::core;
   if (name != "uniform" && name != "band" && name != "radial") {
     return vkc::Status::invalid_argument(
@@ -45,4 +44,4 @@ inline volumetric_kit::core::Status apply_quantization_table(
   return {};
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

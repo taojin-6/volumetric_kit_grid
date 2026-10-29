@@ -12,7 +12,7 @@
 #include "file.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 
-namespace volumetric_kit::recon::stream::detail {
+namespace volumetric_kit::grid::stream::detail {
 namespace {
 
 // --- CRC-32, sliced by 8. ----------------------------------------------------
@@ -533,4 +533,4 @@ core::Result<std::uint64_t> read_session(std::string_view api,
   return h + size + padding(size);
 }
 
-}  // namespace volumetric_kit::recon::stream::detail
+}  // namespace volumetric_kit::grid::stream::detail

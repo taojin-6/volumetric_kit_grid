@@ -28,45 +28,45 @@
 #include <vector>
 
 #include "codec_config.hpp"
-#include "codec_fixture.hpp"
 #include "mesh_sequence.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/io/mesh_io.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_io.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
 namespace cfg = volumetric_kit::core::config;
-namespace io = volumetric_kit::recon::io;
-namespace vol = volumetric_kit::recon::volume;
-namespace codec = volumetric_kit::recon::codec;
-namespace codec_stream = volumetric_kit::recon::codec_stream;
-namespace stream = volumetric_kit::recon::stream;
-namespace vx = volumetric_kit::recon::voxelize;
+namespace mesh_io = volumetric_kit::grid::mesh_io;
+namespace vol = volumetric_kit::grid::volume;
+namespace codec = volumetric_kit::grid::codec;
+namespace codec_stream = volumetric_kit::grid::codec_stream;
+namespace stream = volumetric_kit::grid::stream;
+namespace vx = volumetric_kit::grid::voxelize;
 namespace fs = std::filesystem;
 using codec_fixture::Snapshot;
 using Code = vkc::Status::Code;
-using volumetric_kit::recon::Vec3d;
-using volumetric_kit::recon::Vec3f;
+using volumetric_kit::grid::Vec3d;
+using volumetric_kit::grid::Vec3f;
 
 namespace {
 
 // A codec_mesh stream's session, its transform left out.
 stream::Session geometry_session() {
-  return vr_example::codec_session("example_mesh_sequence",
-                                   {vr_example::kNominalFps, 1});
+  return vgrid_example::codec_session("example_mesh_sequence",
+                                      {vgrid_example::kNominalFps, 1});
 }
 
 // An axis-aligned cube, wound outward: vertex i at centre + half * (bit 0, bit
 // 1, bit 2 of i, each as -1 or +1).
-io::TriangleMesh cube(const Vec3f& centre, float half) {
-  io::TriangleMesh mesh;
+mesh_io::TriangleMesh cube(const Vec3f& centre, float half) {
+  mesh_io::TriangleMesh mesh;
   for (int i = 0; i < 8; ++i) {
     mesh.positions.push_back({centre.x + ((i & 1) ? half : -half),
                               centre.y + ((i & 2) ? half : -half),
@@ -78,12 +78,12 @@ io::TriangleMesh cube(const Vec3f& centre, float half) {
 }
 
 // A tetrahedron wound outward with apex 3 at `apex`; the base stays put.
-io::TriangleMesh tetrahedron(const Vec3f& apex) {
+mesh_io::TriangleMesh tetrahedron(const Vec3f& apex) {
   return {{{0, 0, 0}, {1, 0, 0}, {0, 0, 1}, apex},
           {0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2}};
 }
 
-bool write_obj(const fs::path& path, const io::TriangleMesh& mesh) {
+bool write_obj(const fs::path& path, const mesh_io::TriangleMesh& mesh) {
   std::ofstream out(path);
   out << std::setprecision(9);  // every float back as written
   for (const Vec3f& p : mesh.positions) {
@@ -118,13 +118,13 @@ bool refused(const vkc::Status& status, Code code, const std::string& named) {
   return false;
 }
 
-bool same_bits(const io::TriangleMesh& a, const io::TriangleMesh& b) {
+bool same_bits(const mesh_io::TriangleMesh& a, const mesh_io::TriangleMesh& b) {
   return a.positions.size() == b.positions.size() && a.indices == b.indices &&
          std::memcmp(a.positions.data(), b.positions.data(),
                      a.positions.size() * sizeof(Vec3f)) == 0;
 }
 
-bool same(const io::MeshTransform& a, const io::MeshTransform& b) {
+bool same(const mesh_io::MeshTransform& a, const mesh_io::MeshTransform& b) {
   return a.axes.x == b.axes.x && a.axes.up == b.axes.up &&
          a.axes.z == b.axes.z && a.origin == b.origin &&
          a.metres_per_unit == b.metres_per_unit;
@@ -152,13 +152,13 @@ int patterns() {
   };
   for (const auto& e : expanded) {
     const vkc::Result<std::string> path =
-        vr_example::numbered_path(e.pattern, e.number);
+        vgrid_example::numbered_path(e.pattern, e.number);
     CHECK(path.ok() && *path == e.path);
   }
   for (const char* bad :
        {"a_%d_%d.obj", "%02d_%d", "%s", "%5d", "%-5d", "%0d", "%00d", "%010d",
         "%05", "%", "x%", "%%%", "%ld", "%u", "pct/50%off/cube.obj"}) {
-    CHECK(refused(vr_example::numbered_path(bad, 1).status(),
+    CHECK(refused(vgrid_example::numbered_path(bad, 1).status(),
                   Code::InvalidArgument, "source.path"));
   }
   return 0;
@@ -177,7 +177,7 @@ int refusals(const vkc::test::Scratch& scratch) {
     const vkc::Result<cfg::Config> settings =
         scenario(dir, path, R"(, "height_m": 1.7)", run);
     if (!settings.ok()) return settings.status();
-    return vr_example::MeshSequence::open(*settings).status();
+    return vgrid_example::MeshSequence::open(*settings).status();
   };
   // Frame 2 is missing, and frame 1 is not a mesh: NotFound for frame 2
   // shows no frame was loaded first.
@@ -219,34 +219,37 @@ int one_transform(const vkc::test::Scratch& scratch) {
       scenario(dir, "frame_%03d.obj", R"(, "height_m": 1.5)",
                R"(, "run": {"first": 4, "frames": 3})");
   CHECK(settings.ok());
-  vkc::Result<vr_example::MeshSequence> opened =
-      vr_example::MeshSequence::open(*settings);
+  vkc::Result<vgrid_example::MeshSequence> opened =
+      vgrid_example::MeshSequence::open(*settings);
   CHECK(opened.ok());
-  const vr_example::MeshSequence& sequence = *opened;
+  const vgrid_example::MeshSequence& sequence = *opened;
   CHECK(sequence.first() == 4 && sequence.count() == 3 && sequence.last() == 6);
   CHECK(sequence.path(5) == (dir / "frame_005.obj").string());
   sequence.print();
 
   // The transform is the fit to the union of every frame's bounds.
-  io::MeshBounds all = io::mesh_bounds({}, io::up_axes({0, 1, 0}).value());
-  for (int i = 0; i < 3; ++i) io::extend_bounds(all, tetrahedron(apexes[i]));
-  const vkc::Result<io::MeshTransform> fit = io::fit_transform(all, 1.5);
+  mesh_io::MeshBounds all =
+      mesh_io::mesh_bounds({}, mesh_io::up_axes({0, 1, 0}).value());
+  for (int i = 0; i < 3; ++i)
+    mesh_io::extend_bounds(all, tetrahedron(apexes[i]));
+  const vkc::Result<mesh_io::MeshTransform> fit =
+      mesh_io::fit_transform(all, 1.5);
   CHECK(fit.ok() && same(sequence.transform(), *fit));
-  const vkc::Result<io::MeshTransform> alone =
-      io::fit_transform(io::mesh_bounds(tetrahedron(apexes[0]), all.axes), 1.5);
+  const vkc::Result<mesh_io::MeshTransform> alone = mesh_io::fit_transform(
+      mesh_io::mesh_bounds(tetrahedron(apexes[0]), all.axes), 1.5);
   CHECK(alone.ok() && !same(sequence.transform(), *alone));
 
-  std::vector<io::TriangleMesh> placed;
+  std::vector<mesh_io::TriangleMesh> placed;
   float top = 0.0f;
   for (std::uint32_t n = 4; n <= 6; ++n) {
-    vkc::Result<vr_example::MeshFrame> frame = sequence.load(n);
+    vkc::Result<vgrid_example::MeshFrame> frame = sequence.load(n);
     CHECK(frame.ok() && frame->number == n);
     CHECK(frame->topology.supports_signed());
     for (const Vec3f& p : frame->mesh.positions) top = std::max(top, p.y);
     placed.push_back(std::move(frame->mesh));
   }
   // The base, vertices 0-2, keeps its place; the apex moves.
-  for (const io::TriangleMesh& mesh : placed) {
+  for (const mesh_io::TriangleMesh& mesh : placed) {
     CHECK(std::memcmp(mesh.positions.data(), placed[0].positions.data(),
                       3 * sizeof(Vec3f)) == 0);
   }
@@ -255,7 +258,7 @@ int one_transform(const vkc::test::Scratch& scratch) {
   CHECK(std::abs(top - 1.5f) < 1e-6f);
   CHECK(std::abs(placed[0].positions[3].y - 0.5f) < 1e-6f);
   // The same frame loads to the same bits again.
-  vkc::Result<vr_example::MeshFrame> again = sequence.load(4);
+  vkc::Result<vgrid_example::MeshFrame> again = sequence.load(4);
   CHECK(again.ok() && same_bits(again->mesh, placed[0]));
 
   // A unit instead of a height: the scale as given, placed the same way.
@@ -263,15 +266,16 @@ int one_transform(const vkc::test::Scratch& scratch) {
       scenario(dir, "frame_%03d.obj", R"(, "metres_per_unit": 0.25)",
                R"(, "run": {"first": 4, "frames": 3})");
   CHECK(unit.ok());
-  vkc::Result<vr_example::MeshSequence> scaled =
-      vr_example::MeshSequence::open(*unit);
+  vkc::Result<vgrid_example::MeshSequence> scaled =
+      vgrid_example::MeshSequence::open(*unit);
   CHECK(scaled.ok());
-  const vkc::Result<io::MeshTransform> by_unit = io::scale_transform(all, 0.25);
+  const vkc::Result<mesh_io::MeshTransform> by_unit =
+      mesh_io::scale_transform(all, 0.25);
   CHECK(by_unit.ok() && same(scaled->transform(), *by_unit));
 
   // Inspection makes the second pass on the host and returns the last frame.
-  vkc::Result<vr_example::Inspection> inspected =
-      vr_example::inspect_frames(sequence);
+  vkc::Result<vgrid_example::Inspection> inspected =
+      vgrid_example::inspect_frames(sequence);
   CHECK(inspected.ok() && inspected->last.number == 6 &&
         same_bits(inspected->last.mesh, placed[2]));
   CHECK(inspected->open == 0 && inspected->refused == 0);
@@ -283,7 +287,7 @@ int one_transform(const vkc::test::Scratch& scratch) {
 int single_mesh(const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "single";
   CHECK(fs::create_directory(dir));
-  const io::TriangleMesh mesh = tetrahedron({0.3f, 1.25f, 0.2f});
+  const mesh_io::TriangleMesh mesh = tetrahedron({0.3f, 1.25f, 0.2f});
   CHECK(write_obj(dir / "person.obj", mesh));
   vkc::Result<cfg::Config> settings = cfg::parse(
       R"({"version": 1, "operation": "codec",
@@ -292,22 +296,24 @@ int single_mesh(const vkc::test::Scratch& scratch) {
                                    -0.4046920474]}})",
       cfg::Application::CodecMesh, dir.string());
   CHECK(settings.ok());
-  vkc::Result<vr_example::MeshSequence> sequence =
-      vr_example::MeshSequence::open(*settings);
+  vkc::Result<vgrid_example::MeshSequence> sequence =
+      vgrid_example::MeshSequence::open(*settings);
   CHECK(sequence.ok());
   CHECK(sequence->first() == 0 && sequence->count() == 1);
 
   // What codec_mesh did with one mesh before it took a range.
-  vkc::Result<io::TriangleMesh> loaded = io::load_mesh(sequence->path(0));
+  vkc::Result<mesh_io::TriangleMesh> loaded =
+      mesh_io::load_mesh(sequence->path(0));
   CHECK(loaded.ok());
   const auto& up = *settings->source.up_vector;
-  const vkc::Result<io::MeshAxes> axes = io::up_axes({up[0], up[1], up[2]});
+  const vkc::Result<mesh_io::MeshAxes> axes =
+      mesh_io::up_axes({up[0], up[1], up[2]});
   CHECK(axes.ok());
-  const vkc::Result<io::MeshTransform> fit =
-      io::fit_transform(io::mesh_bounds(*loaded, *axes), 1.7);
+  const vkc::Result<mesh_io::MeshTransform> fit =
+      mesh_io::fit_transform(mesh_io::mesh_bounds(*loaded, *axes), 1.7);
   CHECK(fit.ok() && same(sequence->transform(), *fit));
-  CHECK(io::apply_transform(*loaded, *fit).ok());
-  vkc::Result<vr_example::MeshFrame> frame = sequence->load(0);
+  CHECK(mesh_io::apply_transform(*loaded, *fit).ok());
+  vkc::Result<vgrid_example::MeshFrame> frame = sequence->load(0);
   CHECK(frame.ok() && frame->number == 0 && same_bits(frame->mesh, *loaded));
   return 0;
 }
@@ -318,9 +324,9 @@ int single_mesh(const vkc::test::Scratch& scratch) {
 int signed_rule(const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "signed";
   CHECK(fs::create_directory(dir));
-  io::TriangleMesh open = cube({0, 0, 0}, 0.5f);
+  mesh_io::TriangleMesh open = cube({0, 0, 0}, 0.5f);
   open.indices.resize(open.indices.size() - 6);  // the +x face
-  io::TriangleMesh book = cube({0, 0, 0}, 0.5f);
+  mesh_io::TriangleMesh book = cube({0, 0, 0}, 0.5f);
   book.positions.push_back({0.0f, 2.0f, 0.0f});
   book.indices.insert(book.indices.end(), {0, 2, 8});  // a third on edge 0-2
   CHECK(write_obj(dir / "m_1.obj", cube({0, 0, 0}, 0.5f)));
@@ -334,7 +340,7 @@ int signed_rule(const vkc::test::Scratch& scratch) {
                  R"(, "run": {"first": )" + std::to_string(first) +
                      R"(, "frames": )" + std::to_string(frames) + "}" + codec);
     if (!settings.ok()) return settings.status();
-    return vr_example::MeshSequence::open(*settings).status();
+    return vgrid_example::MeshSequence::open(*settings).status();
   };
   CHECK(open_range(1, 1, "").ok());
   const vkc::Status holes = open_range(1, 2, "");
@@ -358,19 +364,19 @@ int signed_rule(const vkc::test::Scratch& scratch) {
                R"(, "run": {"first": 1, "frames": 3},
                   "codec": {"inspect_only": true})");
   CHECK(settings.ok());
-  vkc::Result<vr_example::MeshSequence> sequence =
-      vr_example::MeshSequence::open(*settings);
+  vkc::Result<vgrid_example::MeshSequence> sequence =
+      vgrid_example::MeshSequence::open(*settings);
   CHECK(sequence.ok());
   for (std::uint32_t n = 1; n <= 3; ++n) {
-    vkc::Result<vr_example::MeshFrame> frame = sequence->load(n);
+    vkc::Result<vgrid_example::MeshFrame> frame = sequence->load(n);
     CHECK(frame.ok());
     CHECK(sequence->admit(n, frame->topology).ok() == (n == 1));
   }
-  CHECK(vr_example::topology_defects(sequence->load(2)->topology) ==
+  CHECK(vgrid_example::topology_defects(sequence->load(2)->topology) ==
         "4 boundary edges");
   // One open frame signed mode takes with allow_holes, one it refuses.
-  vkc::Result<vr_example::Inspection> inspected =
-      vr_example::inspect_frames(*sequence);
+  vkc::Result<vgrid_example::Inspection> inspected =
+      vgrid_example::inspect_frames(*sequence);
   CHECK(inspected.ok() && inspected->last.number == 3);
   CHECK(inspected->open == 1 && inspected->refused == 1);
   return 0;
@@ -407,8 +413,8 @@ int escaped_directory(const vkc::test::Scratch& scratch) {
       const vkc::Result<cfg::Config> settings =
           cfg::load(config_path.string(), cfg::Application::CodecMesh);
       CHECK(settings.ok());
-      const vkc::Result<vr_example::MeshSequence> sequence =
-          vr_example::MeshSequence::open(*settings);
+      const vkc::Result<vgrid_example::MeshSequence> sequence =
+          vgrid_example::MeshSequence::open(*settings);
       if (!sequence.ok())
         std::fprintf(stderr, "%s: %s\n", config_path.string().c_str(),
                      sequence.status().message().c_str());
@@ -419,7 +425,7 @@ int escaped_directory(const vkc::test::Scratch& scratch) {
         const char* file =
             numbered ? (n == 1 ? "m_01.obj" : "m_02.obj") : "shape.obj";
         CHECK(sequence->path(n) == (dir / file).string());
-        const vkc::Result<vr_example::MeshFrame> frame = sequence->load(n);
+        const vkc::Result<vgrid_example::MeshFrame> frame = sequence->load(n);
         CHECK(frame.ok() && frame->number == n);
         float top = 0.0f;
         for (const Vec3f& p : frame->mesh.positions) top = std::max(top, p.y);
@@ -435,12 +441,12 @@ int escaped_directory(const vkc::test::Scratch& scratch) {
 // small one's corners round to one float, so its triangles are degenerate
 // only once placed: the first pass, on source coordinates, takes the frame,
 // and the second pass's audit, which decides, refuses it.
-vkc::Result<vr_example::MeshSequence> collapsing(const fs::path& dir,
-                                                 const std::string& codec) {
+vkc::Result<vgrid_example::MeshSequence> collapsing(const fs::path& dir,
+                                                    const std::string& codec) {
   std::error_code ignored;
   fs::create_directory(dir, ignored);
-  io::TriangleMesh mesh = tetrahedron({0.25f, 1.0f, 0.25f});
-  const io::TriangleMesh unit = tetrahedron({0.2f, 1.0f, 0.2f});
+  mesh_io::TriangleMesh mesh = tetrahedron({0.25f, 1.0f, 0.25f});
+  const mesh_io::TriangleMesh unit = tetrahedron({0.2f, 1.0f, 0.2f});
   const auto base = std::uint32_t(mesh.positions.size());
   for (const Vec3f& p : unit.positions) {
     mesh.positions.push_back(Vec3f(1e-12f) + 1e-15f * p);
@@ -452,14 +458,14 @@ vkc::Result<vr_example::MeshSequence> collapsing(const fs::path& dir,
   VKC_ASSIGN(const cfg::Config settings,
              scenario(dir, "f_%d.obj", R"(, "metres_per_unit": 1e-31)",
                       R"(, "run": {"first": 7})" + codec));
-  return vr_example::MeshSequence::open(settings);
+  return vgrid_example::MeshSequence::open(settings);
 }
 
 int placed_audit_decides(const vkc::test::Scratch& scratch) {
-  vkc::Result<vr_example::MeshSequence> sequence =
+  vkc::Result<vgrid_example::MeshSequence> sequence =
       collapsing(scratch.path / "collapsing", "");
   CHECK(sequence.ok());
-  vkc::Result<vr_example::MeshFrame> frame = sequence->load(7);
+  vkc::Result<vgrid_example::MeshFrame> frame = sequence->load(7);
   CHECK(frame.ok() && frame->topology.degenerate_triangles == 4);
   CHECK(refused(sequence->admit(7, frame->topology), Code::InvalidArgument,
                 "4 degenerate triangles"));
@@ -469,9 +475,9 @@ int placed_audit_decides(const vkc::test::Scratch& scratch) {
 // The scenario over `count` cubes on disk, each `half` across, frame n's
 // centre at `centre(n)`, numbered from `first`, in metres as given.
 template <typename Centre>
-vkc::Result<vr_example::MeshSequence> cubes(const fs::path& dir,
-                                            std::uint32_t first, int count,
-                                            float half, Centre centre) {
+vkc::Result<vgrid_example::MeshSequence> cubes(const fs::path& dir,
+                                               std::uint32_t first, int count,
+                                               float half, Centre centre) {
   std::error_code ignored;
   fs::create_directory(dir, ignored);
   for (int i = 0; i < count; ++i) {
@@ -486,7 +492,7 @@ vkc::Result<vr_example::MeshSequence> cubes(const fs::path& dir,
              scenario(dir, "cube_%02d.obj", R"(, "metres_per_unit": 1)",
                       R"(, "run": {"first": )" + std::to_string(first) +
                           R"(, "frames": )" + std::to_string(count) + "}"));
-  return vr_example::MeshSequence::open(settings);
+  return vgrid_example::MeshSequence::open(settings);
 }
 
 // A small grid in the examples' layout: too small for the cubes, so the
@@ -503,20 +509,20 @@ vkc::Result<vol::VoxelBlockGrid> small_grid(vkc::test::GpuContext& gpu) {
 // Each frame is converted into a cleared grid: no block of the frame before
 // stays, and the grid holds what a fresh one would.
 int clean_grids(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
-  vkc::Result<vr_example::MeshSequence> sequence =
+  vkc::Result<vgrid_example::MeshSequence> sequence =
       cubes(scratch.path / "clean", 1, 2, 0.06f,
             [](std::uint32_t n) { return Vec3f(0.5f * float(n), 0.0f, 0.0f); });
   CHECK(sequence.ok());
-  vkc::Result<vr_example::MeshFrame> a = sequence->load(1);
-  vkc::Result<vr_example::MeshFrame> b = sequence->load(2);
+  vkc::Result<vgrid_example::MeshFrame> a = sequence->load(1);
+  vkc::Result<vgrid_example::MeshFrame> b = sequence->load(2);
   CHECK(a.ok() && b.ok());
   vkc::Result<vx::MeshIntegrator> integrator =
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   CHECK(integrator.ok());
-  const auto alone = [&](const io::TriangleMesh& mesh) -> Snapshot {
+  const auto alone = [&](const mesh_io::TriangleMesh& mesh) -> Snapshot {
     vkc::Result<vol::VoxelBlockGrid> fresh = small_grid(gpu);
     if (!fresh.ok() ||
-        !vr_example::convert_frame(*fresh, *integrator, mesh, {}, nullptr)
+        !vgrid_example::convert_frame(*fresh, *integrator, mesh, {}, nullptr)
              .ok()) {
       return {};
     }
@@ -531,9 +537,9 @@ int clean_grids(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
   CHECK(grid.ok());
   const std::int32_t slots = grid->grid().num_blocks;
-  for (const io::TriangleMesh* mesh : {&a->mesh, &b->mesh, &a->mesh}) {
+  for (const mesh_io::TriangleMesh* mesh : {&a->mesh, &b->mesh, &a->mesh}) {
     vkc::Result<vx::MeshIntegrateStats> stats =
-        vr_example::convert_frame(*grid, *integrator, *mesh, {}, nullptr);
+        vgrid_example::convert_frame(*grid, *integrator, *mesh, {}, nullptr);
     CHECK(stats.ok() && stats->blocks > 0);
     vkc::Result<Snapshot> shot = codec_fixture::snapshot(gpu, *grid);
     CHECK(shot.ok() && *shot == (mesh == &a->mesh ? only_a : only_b));
@@ -548,19 +554,21 @@ int clean_grids(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
 // params the sequence's transform. The player ends holding frame 7's blocks.
 int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   const float block = 8.0f * codec_fixture::kVoxel;
-  vkc::Result<vr_example::MeshSequence> sequence = cubes(
+  vkc::Result<vgrid_example::MeshSequence> sequence = cubes(
       scratch.path / "moving", 5, 3, 0.06f,
       [block](std::uint32_t n) { return Vec3f(block * float(n), 0.0f, 0.0f); });
   CHECK(sequence.ok());
-  vkc::Result<std::string> params = io::encode_transform(sequence->transform());
+  vkc::Result<std::string> params =
+      mesh_io::encode_transform(sequence->transform());
   CHECK(params.ok());
   codec_stream::CodecOutputs outputs;
   outputs.stream = (scratch.path / "moving" / "frames.vrst").string();
   vkc::Result<codec_stream::CodecStream> made =
       codec_stream::CodecStream::create(
           gpu.device, gpu.allocator, {},
-          vr_example::codec_session("example_mesh_sequence",
-                                    {vr_example::kNominalFps, 1}, *params),
+          vgrid_example::codec_session("example_mesh_sequence",
+                                       {vgrid_example::kNominalFps, 1},
+                                       *params),
           outputs);
   CHECK(made.ok());
   codec_stream::CodecStream coder = std::move(made).value();
@@ -573,7 +581,7 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   std::vector<std::vector<vol::BlockIndex>> blocks;
   std::vector<codec_stream::SentFrame> sent;
   for (std::uint32_t n = 5; n <= 7; ++n) {
-    vkc::Result<vr_example::CodedFrame> coded = vr_example::code_frame(
+    vkc::Result<vgrid_example::CodedFrame> coded = vgrid_example::code_frame(
         *sequence, n, *grid, *integrator, {}, coder, &conversion);
     CHECK(coded.ok() && coded->frame.number == n && coded->stats.blocks > 0);
     CHECK(coded->sent.bytes > 0 && coded->sent.blocks > 0);
@@ -602,7 +610,8 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   const stream::Track& track = reader.session().tracks[0];
   CHECK(track.kind == stream::TrackKind::Geometry && track.params == *params);
   CHECK(track.rate.num == 30 && track.rate.den == 1);
-  vkc::Result<io::MeshTransform> stored = io::decode_transform(track.params);
+  vkc::Result<mesh_io::MeshTransform> stored =
+      mesh_io::decode_transform(track.params);
   CHECK(stored.ok() && same(*stored, sequence->transform()));
   vkc::Result<codec::Encoder> enc =
       codec::Encoder::create(gpu.device, gpu.allocator, {});
@@ -621,12 +630,12 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
     CHECK(record.info.pts_ns == pts[i]);
     CHECK(reader.read(record, &payload).ok());
     // The frame alone, in a fresh grid, through a fresh encoder.
-    vkc::Result<vr_example::MeshFrame> frame = sequence->load(n);
+    vkc::Result<vgrid_example::MeshFrame> frame = sequence->load(n);
     vkc::Result<vol::VoxelBlockGrid> fresh = small_grid(gpu);
     CHECK(frame.ok() && fresh.ok());
-    CHECK(
-        vr_example::convert_frame(*fresh, *integrator, frame->mesh, {}, nullptr)
-            .ok());
+    CHECK(vgrid_example::convert_frame(*fresh, *integrator, frame->mesh, {},
+                                       nullptr)
+              .ok());
     vkc::Result<codec::Encoder> once =
         codec::Encoder::create(gpu.device, gpu.allocator, {});
     CHECK(once.ok());
@@ -663,7 +672,7 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
 // coordinates make degenerate is refused before anything is coded.
 int refused_once_placed(vkc::test::GpuContext& gpu,
                         const vkc::test::Scratch& scratch) {
-  vkc::Result<vr_example::MeshSequence> sequence =
+  vkc::Result<vgrid_example::MeshSequence> sequence =
       collapsing(scratch.path / "collapsing_gpu", "");
   CHECK(sequence.ok());
   vkc::Result<codec_stream::CodecStream> coder =
@@ -673,8 +682,8 @@ int refused_once_placed(vkc::test::GpuContext& gpu,
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
   CHECK(coder.ok() && integrator.ok() && grid.ok());
-  CHECK(refused(vr_example::code_frame(*sequence, 7, *grid, *integrator, {},
-                                       *coder, nullptr)
+  CHECK(refused(vgrid_example::code_frame(*sequence, 7, *grid, *integrator, {},
+                                          *coder, nullptr)
                     .status(),
                 Code::InvalidArgument, "frame 7"));
   CHECK(coder->coded() == 0);
@@ -688,7 +697,7 @@ int holes_in_code_frame(vkc::test::GpuContext& gpu,
                         const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "holes_gpu";
   CHECK(fs::create_directory(dir));
-  io::TriangleMesh open = cube({0.05f, 0.0f, 0.0f}, 0.06f);
+  mesh_io::TriangleMesh open = cube({0.05f, 0.0f, 0.0f}, 0.06f);
   open.indices.resize(open.indices.size() - 6);  // the +x face
   CHECK(write_obj(dir / "h_1.obj", open));
   vkc::Status coded[2];
@@ -701,8 +710,8 @@ int holes_in_code_frame(vkc::test::GpuContext& gpu,
                  std::string(R"(, "run": {"first": 1})") +
                      (allowed ? "" : R"(, "codec": {"inspect_only": true})"));
     CHECK(settings.ok());
-    vkc::Result<vr_example::MeshSequence> sequence =
-        vr_example::MeshSequence::open(*settings);
+    vkc::Result<vgrid_example::MeshSequence> sequence =
+        vgrid_example::MeshSequence::open(*settings);
     vkc::Result<codec_stream::CodecStream> coder =
         codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                           geometry_session());
@@ -710,8 +719,8 @@ int holes_in_code_frame(vkc::test::GpuContext& gpu,
         vx::MeshIntegrator::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
     CHECK(sequence.ok() && coder.ok() && integrator.ok() && grid.ok());
-    coded[allowed] = vr_example::code_frame(*sequence, 1, *grid, *integrator,
-                                            {}, *coder, nullptr)
+    coded[allowed] = vgrid_example::code_frame(*sequence, 1, *grid, *integrator,
+                                               {}, *coder, nullptr)
                          .status();
     rows[allowed] = coder->coded();
   }
@@ -730,8 +739,8 @@ int single_record(vkc::test::GpuContext& gpu,
   vkc::Result<cfg::Config> settings =
       scenario(dir, "cube.obj", R"(, "metres_per_unit": 1)");
   CHECK(settings.ok());
-  vkc::Result<vr_example::MeshSequence> sequence =
-      vr_example::MeshSequence::open(*settings);
+  vkc::Result<vgrid_example::MeshSequence> sequence =
+      vgrid_example::MeshSequence::open(*settings);
   CHECK(sequence.ok());
   codec_stream::CodecOutputs outputs;
   outputs.stream = (dir / "one.vrst").string();
@@ -742,8 +751,8 @@ int single_record(vkc::test::GpuContext& gpu,
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
   CHECK(coder.ok() && integrator.ok() && grid.ok());
-  CHECK(vr_example::code_frame(*sequence, 0, *grid, *integrator, {}, *coder,
-                               nullptr)
+  CHECK(vgrid_example::code_frame(*sequence, 0, *grid, *integrator, {}, *coder,
+                                  nullptr)
             .ok());
   CHECK(coder->finish().ok());
   vkc::Result<std::unique_ptr<stream::StreamReader>> opened =
@@ -759,7 +768,7 @@ int single_record(vkc::test::GpuContext& gpu,
 }
 
 int gpu_main(vkc::test::GpuContext& gpu) {
-  vkc::test::Scratch scratch("recon_example_mesh_sequence_gpu_");
+  vkc::test::Scratch scratch("grid_example_mesh_sequence_gpu_");
   CHECK(clean_grids(gpu, scratch) == 0);
   CHECK(records(gpu, scratch) == 0);
   CHECK(single_record(gpu, scratch) == 0);
@@ -772,7 +781,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_example_mesh_sequence_");
+  vkc::test::Scratch scratch("grid_example_mesh_sequence_");
   CHECK(patterns() == 0);
   CHECK(refusals(scratch) == 0);
   CHECK(one_transform(scratch) == 0);
@@ -780,5 +789,5 @@ int main() {
   CHECK(signed_rule(scratch) == 0);
   CHECK(placed_audit_decides(scratch) == 0);
   CHECK(escaped_directory(scratch) == 0);
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

@@ -27,8 +27,8 @@ layout(set = 0, binding = 2, scalar) writeonly buffer DrawCommand {
   uint vertex_count;
   uint sharing_applied;
 };
-#define VR_SLICES_BINDING 3
-#include "volumetric_kit/recon/core/shaders/dispatch_slices.glsl"
+#define VGRID_SLICES_BINDING 3
+#include "volumetric_kit/grid/base/shaders/dispatch_slices.glsl"
 // The blocks the extract meshes, and whether its gate was open.
 layout(set = 0, binding = 4) writeonly buffer State {
   uint meshed;
@@ -52,7 +52,7 @@ void main() {
   uint count = pc.count_word == kNoWord ? pc.bound
                                         : min(counts[pc.count_word], pc.bound);
   if (!gate_open) count = 0u;
-  vrWriteSlices(0u, pc.dispatches, pc.per_dispatch, count);
+  vgridWriteSlices(0u, pc.dispatches, pc.per_dispatch, count);
   // Drawable as it stands: no index yet, one instance, the run from 0.
   index_count = 0u;
   instance_count = 1u;

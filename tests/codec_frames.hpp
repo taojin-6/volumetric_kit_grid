@@ -24,14 +24,14 @@
 #include "fnv1a.hpp"
 #include "frame_hash.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
 namespace codec_frames {
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 namespace oracle = codec_oracle;
 
 inline constexpr std::int32_t kMax32 = std::numeric_limits<std::int32_t>::max();
@@ -76,10 +76,10 @@ inline void slab_mask(Lcg& rng, std::uint32_t* mask) {
 inline oracle::Frame make_frame(std::size_t n, std::uint32_t k,
                                 std::uint64_t seed) {
   Lcg rng{seed};
-  auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
+  auto less = [](const vgrid::Vec3i& a, const vgrid::Vec3i& b) {
     return d::coord_less(a, b);
   };
-  std::set<vr::Vec3i, decltype(less)> coords(less);
+  std::set<vgrid::Vec3i, decltype(less)> coords(less);
   while (coords.size() < n) {
     // One draw per statement: the order a function's arguments are evaluated
     // in is unspecified (GCC and Clang disagree), and a fixture must be the
@@ -87,10 +87,10 @@ inline oracle::Frame make_frame(std::size_t n, std::uint32_t k,
     const int sx = int(rng.below(200)) - 100;
     const int sy = int(rng.below(60)) - 30;
     const int sz = int(rng.below(60)) - 30;
-    const vr::Vec3i start(sx, sy, sz);
+    const vgrid::Vec3i start(sx, sy, sz);
     const std::uint32_t run = 1 + rng.below(12);
     for (std::uint32_t i = 0; i < run && coords.size() < n; ++i) {
-      coords.insert(vr::Vec3i(start.x + int(i), start.y, start.z));
+      coords.insert(vgrid::Vec3i(start.x + int(i), start.y, start.z));
     }
   }
   oracle::Frame f;
@@ -144,7 +144,7 @@ inline oracle::Frame extreme_frame() {
 // P-frame's modes (none for an intra frame).
 inline std::uint32_t content_hash(const oracle::Frame& f) {
   std::vector<std::uint32_t> words;
-  for (const vr::Vec3i& c : f.coords) {
+  for (const vgrid::Vec3i& c : f.coords) {
     words.insert(words.end(), {static_cast<std::uint32_t>(c.x),
                                static_cast<std::uint32_t>(c.y),
                                static_cast<std::uint32_t>(c.z)});
@@ -154,7 +154,7 @@ inline std::uint32_t content_hash(const oracle::Frame& f) {
     words.push_back(static_cast<std::uint16_t>(c));
   }
   for (d::BlockMode m : f.modes) words.push_back(std::uint32_t(m));
-  return vr_test::fnv1a(words);
+  return vgrid_test::fnv1a(words);
 }
 
 // --- Golden frames. ---------------------------------------------------------
@@ -177,7 +177,7 @@ struct GoldenFrame {
   std::uint32_t segment_size;
   std::uint32_t content;  // content_hash of the frame
   std::size_t size;       // its bytes
-  std::uint32_t hash;     // vr_test::fnv1a of them
+  std::uint32_t hash;     // vgrid_test::fnv1a of them
 };
 
 // The default K and segment size over many segments, every K with segments
@@ -308,7 +308,7 @@ inline d::CodedFrame coded_frame(const d::ParsedFrame& p) {
 
 // The frame order, (z, y, x), written out rather than taken from the library.
 struct ZyxLess {
-  bool operator()(const vr::Vec3i& a, const vr::Vec3i& b) const {
+  bool operator()(const vgrid::Vec3i& a, const vgrid::Vec3i& b) const {
     return std::tie(a.z, a.y, a.x) < std::tie(b.z, b.y, b.x);
   }
 };
@@ -365,7 +365,7 @@ inline oracle::Frame successor(const oracle::Frame& reference,
                                std::uint32_t changed, std::size_t added) {
   Lcg rng{seed};
   const std::uint32_t k = reference.blocks.params.coefficient_count;
-  std::map<vr::Vec3i, Payload, ZyxLess> blocks;
+  std::map<vgrid::Vec3i, Payload, ZyxLess> blocks;
   for (std::size_t e = 0; e < reference.coords.size(); ++e) {
     const std::uint32_t roll = rng.below(1000);
     if (roll < removed) continue;
@@ -394,10 +394,10 @@ inline oracle::Frame successor(const oracle::Frame& reference,
     blocks.emplace(reference.coords[e], std::move(p));
   }
   const oracle::Frame fresh = make_frame(added, k, seed ^ 0x5eedu);
-  std::set<vr::Vec3i, ZyxLess> taken(reference.coords.begin(),
-                                     reference.coords.end());
+  std::set<vgrid::Vec3i, ZyxLess> taken(reference.coords.begin(),
+                                        reference.coords.end());
   for (std::size_t i = 0; i < fresh.coords.size(); ++i) {
-    vr::Vec3i c = fresh.coords[i];
+    vgrid::Vec3i c = fresh.coords[i];
     while (taken.count(c) != 0) c.z += 1000;  // away from the reference
     taken.insert(c);
     blocks.emplace(c, payload_at(fresh.blocks, i));
@@ -424,12 +424,12 @@ inline oracle::Frame inter_frame(
     const oracle::Frame& target,
     const std::map<std::size_t, d::BlockMode>& overrides = {}) {
   const std::uint32_t k = reference.blocks.params.coefficient_count;
-  std::map<vr::Vec3i, std::size_t, ZyxLess> in_target;
+  std::map<vgrid::Vec3i, std::size_t, ZyxLess> in_target;
   for (std::size_t i = 0; i < target.coords.size(); ++i) {
     in_target.emplace(target.coords[i], i);
   }
-  const std::set<vr::Vec3i, ZyxLess> in_reference(reference.coords.begin(),
-                                                  reference.coords.end());
+  const std::set<vgrid::Vec3i, ZyxLess> in_reference(reference.coords.begin(),
+                                                     reference.coords.end());
   oracle::Frame p;
   p.type = d::FrameType::kInter;
   p.voxel_size = target.voxel_size;
@@ -481,7 +481,7 @@ inline oracle::Frame encoder_frame(const d::FrameReference& id,
                                    const oracle::Frame& target) {
   const oracle::Frame keep = inter_frame(id, reference, target);
   const std::uint32_t k = reference.blocks.params.coefficient_count;
-  std::map<vr::Vec3i, std::size_t, ZyxLess> in_target;
+  std::map<vgrid::Vec3i, std::size_t, ZyxLess> in_target;
   for (std::size_t i = 0; i < target.coords.size(); ++i) {
     in_target.emplace(target.coords[i], i);
   }
@@ -504,7 +504,7 @@ inline oracle::Frame encoder_frame(const d::FrameReference& id,
 inline oracle::Frame resolve(const oracle::Frame& reference,
                              const oracle::Frame& p) {
   const std::size_t m = reference.coords.size();
-  std::map<vr::Vec3i, Payload, ZyxLess> blocks;
+  std::map<vgrid::Vec3i, Payload, ZyxLess> blocks;
   for (std::size_t e = 0; e < m; ++e) {
     const Payload r = payload_at(reference.blocks, e);
     const Payload x = payload_at(p.blocks, e);
@@ -544,17 +544,17 @@ inline oracle::Frame resolve(const oracle::Frame& reference,
 
 // A decoded frame's blocks in frame order, and each one's sources.
 struct Merged {
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   std::vector<d::ApplySource> sources;
 };
 
 // A P-frame's blocks in frame order with their sources, by the oracle's own
 // map: what the decoder's merge must give. An intra frame's are new blocks on
 // an empty reference.
-inline Merged merge_oracle(const std::vector<vr::Vec3i>& reference,
+inline Merged merge_oracle(const std::vector<vgrid::Vec3i>& reference,
                            const std::vector<d::BlockMode>& modes,
-                           const std::vector<vr::Vec3i>& added) {
-  std::map<vr::Vec3i, d::ApplySource, ZyxLess> blocks;
+                           const std::vector<vgrid::Vec3i>& added) {
+  std::map<vgrid::Vec3i, d::ApplySource, ZyxLess> blocks;
   for (std::size_t e = 0; e < reference.size(); ++e) {
     const auto i = static_cast<std::uint32_t>(e);
     if (modes[e] == d::BlockMode::kKeep) blocks[reference[e]] = {i, i};
@@ -650,7 +650,7 @@ inline std::vector<std::uint8_t> example_bytes(std::uint64_t hash) {
 // ones -- each a second spelling of the same block.
 inline std::map<std::size_t, d::BlockMode> spellings(
     const oracle::Frame& reference, const oracle::Frame& target) {
-  std::map<vr::Vec3i, std::size_t, ZyxLess> at;
+  std::map<vgrid::Vec3i, std::size_t, ZyxLess> at;
   for (std::size_t i = 0; i < target.coords.size(); ++i) {
     at.emplace(target.coords[i], i);
   }
@@ -761,7 +761,7 @@ struct GoldenInterFrame {
   std::uint32_t update_size;   // U
   std::uint32_t content;       // content_hash of the P-frame
   std::size_t size;            // its bytes
-  std::uint32_t hash;          // vr_test::fnv1a of them
+  std::uint32_t hash;          // vgrid_test::fnv1a of them
 };
 
 // The default K and sizes, every mode, over many update segments and new
@@ -776,7 +776,7 @@ inline constexpr GoldenInterFrame kGoldenInterFrames[] = {
 
 // New blocks at int32's extremes, none of extreme_frame()'s: just after its
 // first block, past the ends of y and z, and just before its last.
-inline std::vector<vr::Vec3i> extreme_additions() {
+inline std::vector<vgrid::Vec3i> extreme_additions() {
   return {{kMin32 + 1, kMin32, kMin32},
           {kMax32, kMax32, kMin32},
           {kMin32, kMin32, kMax32},
@@ -798,7 +798,7 @@ inline InterCode golden_inter_code(const GoldenInterFrame& g) {
   const std::uint32_t k = reference.blocks.params.coefficient_count;
   const std::size_t length = std::strlen(g.modes);
   Lcg rng{0x601du};
-  std::map<vr::Vec3i, Payload, ZyxLess> blocks;
+  std::map<vgrid::Vec3i, Payload, ZyxLess> blocks;
   std::map<std::size_t, d::BlockMode> modes;
   for (std::size_t e = 0; e < reference.coords.size(); ++e) {
     const char mode = g.modes[e % length];
@@ -831,15 +831,15 @@ inline InterCode golden_inter_code(const GoldenInterFrame& g) {
     blocks.emplace(reference.coords[e], std::move(p));
   }
   const oracle::Frame fresh = make_frame(g.added, k, row.seed ^ 0x5eedu);
-  std::vector<vr::Vec3i> added = fresh.coords;
+  std::vector<vgrid::Vec3i> added = fresh.coords;
   if (row.extreme) {
-    const std::vector<vr::Vec3i> extremes = extreme_additions();
+    const std::vector<vgrid::Vec3i> extremes = extreme_additions();
     added.assign(extremes.begin(), extremes.begin() + std::ptrdiff_t(g.added));
   }
-  std::set<vr::Vec3i, ZyxLess> taken(reference.coords.begin(),
-                                     reference.coords.end());
+  std::set<vgrid::Vec3i, ZyxLess> taken(reference.coords.begin(),
+                                        reference.coords.end());
   for (std::size_t i = 0; i < added.size(); ++i) {
-    vr::Vec3i c = added[i];
+    vgrid::Vec3i c = added[i];
     while (taken.count(c) != 0) c.z += 1000;  // away from the reference
     taken.insert(c);
     blocks.emplace(c, payload_at(fresh.blocks, i));
@@ -889,19 +889,19 @@ inline RefusalBase refusal_base() {
   const std::vector<std::uint8_t> reference_bytes =
       oracle::write_frame(base.reference).value();
   oracle::Frame target = successor(base.reference, 78, 100, 400, 0);
-  std::map<vr::Vec3i, Payload, ZyxLess> blocks;
+  std::map<vgrid::Vec3i, Payload, ZyxLess> blocks;
   for (std::size_t i = 0; i < target.coords.size(); ++i) {
     blocks.emplace(target.coords[i], payload_at(target.blocks, i));
   }
   const oracle::Frame extra = make_frame(8, 8, 79);
-  const vr::Vec3i added[] = {{500, 0, 0},
-                             {501, 0, 0},
-                             {502, 0, 0},
-                             {503, 0, 0},
-                             {504, 0, 0},
-                             {505, 0, 0},
-                             {0x7FFFF000, 0, kMax32},
-                             {0x7FFFF001, 0, kMax32}};
+  const vgrid::Vec3i added[] = {{500, 0, 0},
+                                {501, 0, 0},
+                                {502, 0, 0},
+                                {503, 0, 0},
+                                {504, 0, 0},
+                                {505, 0, 0},
+                                {0x7FFFF000, 0, kMax32},
+                                {0x7FFFF001, 0, kMax32}};
   for (std::size_t i = 0; i < 8; ++i) {
     blocks.emplace(added[i], payload_at(extra.blocks, i));
   }

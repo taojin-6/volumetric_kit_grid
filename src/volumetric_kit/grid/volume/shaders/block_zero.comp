@@ -8,7 +8,7 @@
 // hash_lookup.glsl says, which it is between the map's calls.
 
 #extension GL_GOOGLE_include_directive : require
-#define VR_HASH_ENTRIES_BINDING 2
+#define VGRID_HASH_ENTRIES_BINDING 2
 #include "hash_lookup.glsl"
 
 layout(local_size_x = 256) in;
@@ -32,7 +32,7 @@ shared int s_ptr;
 
 void main() {
   if (gl_LocalInvocationID.x == 0u) {
-    s_ptr = vrFindBlockPtr(blocks[pc.item_base + gl_WorkGroupID.x].coord,
+    s_ptr = vgridFindBlockPtr(blocks[pc.item_base + gl_WorkGroupID.x].coord,
                            pc.num_buckets, pc.bucket_size, pc.max_chain);
   }
   barrier();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
 
 #include <cstring>
 #include <filesystem>
@@ -11,10 +11,10 @@
 
 #include "stream_coder.hpp"
 #include "volumetric_kit/core/base/log.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/core/log.hpp"
+#include "volumetric_kit/grid/base/log.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
 
-namespace volumetric_kit::recon::codec_stream {
+namespace volumetric_kit::grid::codec_stream {
 
 namespace detail {
 namespace {
@@ -384,4 +384,4 @@ std::uint64_t CodecStream::coded() const noexcept {
   return coder_ ? coder_->coded() : 0;
 }
 
-}  // namespace volumetric_kit::recon::codec_stream
+}  // namespace volumetric_kit::grid::codec_stream

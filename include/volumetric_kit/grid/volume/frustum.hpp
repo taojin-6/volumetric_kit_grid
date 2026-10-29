@@ -13,9 +13,9 @@
 
 #include <glm/gtc/matrix_inverse.hpp>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief The six planes of a camera view frustum, in world space.
 ///
@@ -27,8 +27,8 @@ namespace volumetric_kit::recon::volume {
 /// the array uploads verbatim.
 using FrustumPlanes = std::array<Vec4f, 6>;
 // Pin the upload size the way every other shader-fed POD does (2026-07-05 ABI):
-// the `vr::` backing type is swappable, so a Vec4f layout change is a compile
-// error here, not a silent frustum misprojection.
+// the `vgrid::` backing type is swappable, so a Vec4f layout change is a
+// compile error here, not a silent frustum misprojection.
 static_assert(sizeof(FrustumPlanes) == 96,
               "FrustumPlanes must be 96 bytes (6 x vec4) to match the shader's "
               "scalar-layout planes, six a frustum");
@@ -216,4 +216,4 @@ inline FrustumPlanes make_frustum_planes(const Mat4f& view_proj,
 template <typename T>
 FrustumPlanes make_frustum_planes(T, float = 0.0f) = delete;
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

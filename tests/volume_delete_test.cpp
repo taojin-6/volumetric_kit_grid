@@ -14,23 +14,23 @@
 #include <utility>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -103,7 +103,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     for (int y = -1; y <= 1; ++y) {
       for (int z = -1; z <= 1; ++z) {
         vol::BlockIndex block{};
-        block.coord = vr::Vec3i(x, y, z);
+        block.coord = vgrid::Vec3i(x, y, z);
         all.push_back(block);
         want_all.insert({x, y, z});
         if (x != 0 && y != 0 && z != 0) {
@@ -117,7 +117,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // Allocate the full cube.
   vkc::Result<std::uint32_t> alloc_fail =
-      vr_test::allocate_blocks(gpu, map, all);
+      vgrid_test::allocate_blocks(gpu, map, all);
   CHECK(alloc_fail.ok() && alloc_fail.value() == 0);
 
   // Snapshot the block pointers in use, to prove heap reuse after the
@@ -127,7 +127,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // Remove the 8 corners.
   vkc::Result<std::uint32_t> remove_fail =
-      vr_test::remove_blocks(gpu, map, corners);
+      vgrid_test::remove_blocks(gpu, map, corners);
   CHECK(remove_fail.ok() && remove_fail.value() == 0);
 
   // The survivors are exactly the non-corners.
@@ -144,9 +144,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // Removing an absent coord is a no-op (0 failures, set unchanged).
   vol::BlockIndex absent{};
-  absent.coord = vr::Vec3i(100, 100, 100);
+  absent.coord = vgrid::Vec3i(100, 100, 100);
   vkc::Result<std::uint32_t> noop =
-      vr_test::remove_blocks(gpu, map, &absent, 1);
+      vgrid_test::remove_blocks(gpu, map, &absent, 1);
   CHECK(noop.ok() && noop.value() == 0);
   vkc::Result<std::set<Coord>> unchanged = active_set(map);
   CHECK(unchanged.ok() && unchanged.value() == after_remove.value());
@@ -155,7 +155,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // absent under the lock, so no block is double-freed back onto the heap (a
   // double-free would later surface as a duplicate in the pointer set).
   vkc::Result<std::uint32_t> double_remove =
-      vr_test::remove_blocks(gpu, map, corners);
+      vgrid_test::remove_blocks(gpu, map, corners);
   CHECK(double_remove.ok() && double_remove.value() == 0);
   vkc::Result<std::set<Coord>> still_gone = active_set(map);
   CHECK(still_gone.ok() && still_gone.value() == after_remove.value());
@@ -165,7 +165,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // had leaked, the re-allocate would hand out fresh pointers and the set would
   // differ (or fail outright once the heap ran dry).
   vkc::Result<std::uint32_t> realloc_fail =
-      vr_test::allocate_blocks(gpu, map, corners);
+      vgrid_test::allocate_blocks(gpu, map, corners);
   CHECK(realloc_fail.ok() && realloc_fail.value() == 0);
   vkc::Result<std::set<Coord>> restored = active_set(map);
   CHECK(restored.ok());
@@ -197,7 +197,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         device_survivors.value() == after_remove.value());
   device_removed = map.remove(device_list.value(), device_count);
   CHECK(device_removed.ok() && device_removed.value() == 0);
-  realloc_fail = vr_test::allocate_blocks(gpu, map, corners);
+  realloc_fail = vgrid_test::allocate_blocks(gpu, map, corners);
   CHECK(realloc_fail.ok() && realloc_fail.value() == 0);
   auto device_ptrs = active_ptrs(map);
   CHECK(device_ptrs.ok() && device_ptrs.value() == ptrs_before.value());
@@ -267,7 +267,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     std::vector<vol::BlockIndex> half;
     for (int i = 0; i < 16384; ++i) {
       vol::BlockIndex block{};
-      block.coord = vr::Vec3i(i % 32, (i / 32) % 32, i / 1024);
+      block.coord = vgrid::Vec3i(i % 32, (i / 32) % 32, i / 1024);
       slab.push_back(block);
       if (i % 2 == 0) half.push_back(block);
     }
@@ -277,7 +277,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       std::uint32_t left = 1;
       for (int pass = 0; pass < 8 && left != 0; ++pass) {
         vol::AllocFailures failures{};
-        vkc::Result<std::uint32_t> r = vr_test::allocate_blocks(
+        vkc::Result<std::uint32_t> r = vgrid_test::allocate_blocks(
             gpu, big, blocks.data(), std::uint32_t(blocks.size()), &failures);
         if (!r || failures.capacity_limited()) return false;
         left = r.value();
@@ -331,15 +331,15 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vol::VoxelHashMap tight = std::move(made).value();
     std::vector<vol::BlockIndex> coords(1024);
     for (std::size_t i = 0; i < coords.size(); ++i) {
-      coords[i].coord = vr::Vec3i(static_cast<int>(i), 0, 0);
+      coords[i].coord = vgrid::Vec3i(static_cast<int>(i), 0, 0);
     }
     // Re-drives until nothing is left, as a caller does.
     const auto settle = [&](bool remove) {
       std::uint32_t left = 1;
       for (int pass = 0; pass < 8 && left != 0; ++pass) {
         vkc::Result<std::uint32_t> r =
-            remove ? vr_test::remove_blocks(gpu, tight, coords.data(), 8)
-                   : vr_test::allocate_blocks(gpu, tight, coords.data(), 8);
+            remove ? vgrid_test::remove_blocks(gpu, tight, coords.data(), 8)
+                   : vgrid_test::allocate_blocks(gpu, tight, coords.data(), 8);
         if (!r) return false;
         left = r.value();
       }
@@ -369,7 +369,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
 
   std::printf(
-      "recon volume delete test passed: removed %zu of %zu blocks, survivors "
+      "grid volume delete test passed: removed %zu of %zu blocks, survivors "
       "verified, heap reuse restored the set\n",
       want_corners.size(), want_all.size());
   return 0;
@@ -378,5 +378,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

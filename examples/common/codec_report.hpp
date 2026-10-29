@@ -28,13 +28,13 @@
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/eval/mesh_distance.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/eval/mesh_distance.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
 
 using Bytes = std::vector<std::uint8_t>;
@@ -58,8 +58,9 @@ inline double row_device_ms(const vkc::StageMetrics& m, const char* name) {
 }
 
 /// @brief Print an accuracy / coverage / F-score comparison, in mm.
-inline void print_comparison(const vr::eval::MeshComparison& c, float voxel) {
-  auto line = [voxel](const char* name, const vr::eval::DistanceStats& s) {
+inline void print_comparison(const vgrid::eval::MeshComparison& c,
+                             float voxel) {
+  auto line = [voxel](const char* name, const vgrid::eval::DistanceStats& s) {
     std::printf(
         "    %-9s mean %6.3f  rms %6.3f  p95 %6.3f  max %6.3f mm "
         "(%.3f voxels rms), %zu of %zu beyond reach\n",
@@ -80,9 +81,9 @@ inline void print_comparison(const vr::eval::MeshComparison& c, float voxel) {
 ///         with the codec: a band's width of reach (@p trunc, at least 2 cm),
 ///         about 1 vertex in 4 both ways, and an F-score at half a voxel
 ///         (@p voxel).
-inline vr::eval::CompareOptions codec_compare_options(float voxel,
-                                                      float trunc) {
-  vr::eval::CompareOptions compare;
+inline vgrid::eval::CompareOptions codec_compare_options(float voxel,
+                                                         float trunc) {
+  vgrid::eval::CompareOptions compare;
   compare.reach = std::max(trunc, 0.02f);
   compare.stride = 4;
   compare.fscore_threshold = 0.5f * voxel;
@@ -90,8 +91,8 @@ inline vr::eval::CompareOptions codec_compare_options(float voxel,
 }
 
 /// @return @p type's name in a stream's rows: "I" or "P".
-inline const char* frame_type_name(vr::codec::FrameType type) {
-  return type == vr::codec::FrameType::kIntra ? "I" : "P";
+inline const char* frame_type_name(vgrid::codec::FrameType type) {
+  return type == vgrid::codec::FrameType::kIntra ? "I" : "P";
 }
 
 /// @brief One coded frame: its type and size, and what encoding and decoding
@@ -100,7 +101,7 @@ inline const char* frame_type_name(vr::codec::FrameType type) {
 struct CodecRow {
   std::size_t frame = 0;  ///< The source's index of the frame coded.
   /// An I-frame, or a P-frame on the frame coded before.
-  vr::codec::FrameType type = vr::codec::FrameType::kIntra;
+  vgrid::codec::FrameType type = vgrid::codec::FrameType::kIntra;
   std::size_t bytes = 0;     ///< The compressed frame's size.
   std::uint32_t blocks = 0;  ///< The blocks it carries.
   /// Encode, host busy: its waits on the device left out, wherever they ran.
@@ -136,7 +137,7 @@ inline std::optional<double> device_ms(const vkc::StageMetrics& m) {
 ///        its rows, as `Encoder::encode` does, or a sender waits outside
 ///        them) and its @ref device_ms.
 /// @param decode  The decode's rows, or null for a frame not decoded.
-inline CodecRow make_codec_row(std::size_t frame, vr::codec::FrameType type,
+inline CodecRow make_codec_row(std::size_t frame, vgrid::codec::FrameType type,
                                std::size_t bytes, std::uint32_t blocks,
                                const vkc::StageMetrics& encode,
                                const vkc::StageMetrics* decode) {
@@ -187,7 +188,7 @@ struct FrameSizes {
 /// @return The sizes of @p rows' frames of @p type; every field 0 when there
 ///         is none.
 inline FrameSizes frame_sizes(const std::vector<CodecRow>& rows,
-                              vr::codec::FrameType type) {
+                              vgrid::codec::FrameType type) {
   std::vector<std::size_t> sizes;
   double total = 0.0;
   for (const CodecRow& row : rows) {
@@ -303,7 +304,7 @@ class CodecReport {
   /// @return OK; or IoError naming the CSV, the row kept, and for every row
   ///         after.
   vkc::Status add(std::uint64_t frame,
-                  const vr::codec_stream::SentFrame& sent) {
+                  const vgrid::codec_stream::SentFrame& sent) {
     const auto t = static_cast<std::size_t>(sent.type);
     encode_rows_[t].merge(sent.encode);
     if (decode_) decode_rows_[t].merge(sent.decode);
@@ -323,13 +324,13 @@ class CodecReport {
 
   /// @return The encode stage rows of every frame of @p type, summed: what
   ///         @ref print prints, a frame of that type each.
-  const vkc::StageMetrics& encode_stages(vr::codec::FrameType type) const {
+  const vkc::StageMetrics& encode_stages(vgrid::codec::FrameType type) const {
     return encode_rows_[static_cast<std::size_t>(type)];
   }
 
   /// @return As @ref encode_stages, the decode's: none when the stream does
   ///         not decode.
-  const vkc::StageMetrics& decode_stages(vr::codec::FrameType type) const {
+  const vkc::StageMetrics& decode_stages(vgrid::codec::FrameType type) const {
     return decode_rows_[static_cast<std::size_t>(type)];
   }
 
@@ -364,8 +365,8 @@ class CodecReport {
                   mbit_per_s(per_frame, coded_fps), coded_fps, every, fps);
     }
     std::printf("\n");
-    const vr::codec::FrameType types[] = {vr::codec::FrameType::kIntra,
-                                          vr::codec::FrameType::kInter};
+    const vgrid::codec::FrameType types[] = {vgrid::codec::FrameType::kIntra,
+                                             vgrid::codec::FrameType::kInter};
     const FrameSizes sizes[] = {frame_sizes(rows_, types[0]),
                                 frame_sizes(rows_, types[1])};
     if (every > 0 && intra_period_ > 1 && sizes[0].count > 0 &&
@@ -432,4 +433,4 @@ class CodecReport {
   bool grew_ = false;  // a decode grew the player grid
 };
 
-}  // namespace vr_example
+}  // namespace vgrid_example

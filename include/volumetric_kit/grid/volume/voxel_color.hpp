@@ -13,15 +13,15 @@
 /// exact piecewise sRGB curve, full range -- alpha `0xFF` once observed, and
 /// @ref kVoxelColorUnobserved for a voxel no colour was fused into. The curve
 /// is the published one, held to it and to the GLSL by
-/// `recon_volume_voxel_color`, and to the sensor boundary's copy by recon's
+/// `grid_volume_voxel_color`, and to the sensor boundary's copy by recon's
 /// `recon_tsdf_voxel_color_space`.
 
 #include <cmath>
 #include <cstdint>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief A voxel no colour has been fused into: the zeroed attribute, and
 ///        what a clear writes. A fused colour carries alpha `0xFF`, so it is
@@ -81,4 +81,4 @@ inline std::uint32_t voxel_color_from_linear(const Vec3f& linear) noexcept {
          0xFF000000u;
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

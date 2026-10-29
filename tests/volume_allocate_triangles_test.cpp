@@ -32,20 +32,20 @@
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/triangle_candidates.hpp"
-#include "volumetric_kit/recon/volume/voxel_coords.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/triangle_candidates.hpp"
+#include "volumetric_kit/grid/volume/voxel_coords.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -53,39 +53,40 @@ using test_meshes::closest_point;
 
 using Coord = std::tuple<int, int, int>;
 
-float distance_to_triangle(vr::Vec3f p, vr::Vec3f a, vr::Vec3f b, vr::Vec3f c) {
-  const vr::Vec3f q = closest_point(p, a, b, c);
-  return vr::length(p - q);
+float distance_to_triangle(vgrid::Vec3f p, vgrid::Vec3f a, vgrid::Vec3f b,
+                           vgrid::Vec3f c) {
+  const vgrid::Vec3f q = closest_point(p, a, b, c);
+  return vgrid::length(p - q);
 }
 
 // Every block holding at least one voxel within trunc_dist of some triangle --
 // the set the kernel promises to cover. Brute force over each triangle's
 // bounding box in blocks, and over all 512 voxels of each candidate.
 std::set<Coord> blocks_within_band(const vol::VoxelGridParams& grid,
-                                   const std::vector<vr::Vec3f>& verts,
+                                   const std::vector<vgrid::Vec3f>& verts,
                                    const std::vector<std::uint32_t>& idx) {
   std::set<Coord> want;
   for (std::size_t t = 0; t + 2 < idx.size(); t += 3) {
-    const vr::Vec3f a = verts[idx[t]];
-    const vr::Vec3f b = verts[idx[t + 1]];
-    const vr::Vec3f c = verts[idx[t + 2]];
-    const vr::Vec3f lo =
-        glm::min(a, glm::min(b, c)) - vr::Vec3f(grid.trunc_dist);
-    const vr::Vec3f hi =
-        glm::max(a, glm::max(b, c)) + vr::Vec3f(grid.trunc_dist);
-    const vr::Vec3i bmin = vol::world_to_block(lo, grid);
-    const vr::Vec3i bmax = vol::world_to_block(hi, grid);
+    const vgrid::Vec3f a = verts[idx[t]];
+    const vgrid::Vec3f b = verts[idx[t + 1]];
+    const vgrid::Vec3f c = verts[idx[t + 2]];
+    const vgrid::Vec3f lo =
+        glm::min(a, glm::min(b, c)) - vgrid::Vec3f(grid.trunc_dist);
+    const vgrid::Vec3f hi =
+        glm::max(a, glm::max(b, c)) + vgrid::Vec3f(grid.trunc_dist);
+    const vgrid::Vec3i bmin = vol::world_to_block(lo, grid);
+    const vgrid::Vec3i bmax = vol::world_to_block(hi, grid);
     for (int bz = bmin.z; bz <= bmax.z; ++bz) {
       for (int by = bmin.y; by <= bmax.y; ++by) {
         for (int bx = bmin.x; bx <= bmax.x; ++bx) {
-          const vr::Vec3i base =
-              vol::block_to_voxel(vr::Vec3i(bx, by, bz), grid);
+          const vgrid::Vec3i base =
+              vol::block_to_voxel(vgrid::Vec3i(bx, by, bz), grid);
           bool hit = false;
           for (int vz = 0; vz < grid.block_size && !hit; ++vz) {
             for (int vy = 0; vy < grid.block_size && !hit; ++vy) {
               for (int vx = 0; vx < grid.block_size && !hit; ++vx) {
-                const vr::Vec3f p =
-                    vol::voxel_to_world(base + vr::Vec3i(vx, vy, vz), grid);
+                const vgrid::Vec3f p =
+                    vol::voxel_to_world(base + vgrid::Vec3i(vx, vy, vz), grid);
                 hit = distance_to_triangle(p, a, b, c) <= grid.trunc_dist;
               }
             }
@@ -134,7 +135,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // A tilted quad (two triangles) about 0.12 m across, deliberately not axis-
   // aligned and not on a block boundary, so the band is not a shape the block
   // grid could reproduce by accident.
-  const std::vector<vr::Vec3f> quad_verts = {
+  const std::vector<vgrid::Vec3f> quad_verts = {
       {0.013f, 0.007f, 0.011f},
       {0.131f, 0.019f, 0.023f},
       {0.127f, 0.113f, 0.077f},
@@ -180,12 +181,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // than the (2*tb+1)^3 = 3-block cube a vertex dilates into, so a block near
   // its centroid is reachable only by a triangle-aware pass.
   CHECK(map.clear().ok());
-  const std::vector<vr::Vec3f> big_verts = {
+  const std::vector<vgrid::Vec3f> big_verts = {
       {0.0f, 0.0f, 0.0f}, {0.6f, 0.0f, 0.0f}, {0.0f, 0.6f, 0.0f}};
   const std::vector<std::uint32_t> big_idx = {0, 1, 2};
-  const vr::Vec3f centroid =
+  const vgrid::Vec3f centroid =
       (big_verts[0] + big_verts[1] + big_verts[2]) / 3.0f;
-  const vr::Vec3i centre_block = vol::world_to_block(centroid, grid);
+  const vgrid::Vec3i centre_block = vol::world_to_block(centroid, grid);
   const Coord centre_coord = {centre_block.x, centre_block.y, centre_block.z};
 
   vkc::Result<std::uint32_t> big =
@@ -200,8 +201,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // three vertices, each dilated into the (2*tb+1)^3 cube as a point is, would
   // leave the centroid's block out.
   const int tb = vol::truncation_blocks(grid);
-  for (const vr::Vec3f& v : big_verts) {
-    const vr::Vec3i d = vol::world_to_block(v, grid) - centre_block;
+  for (const vgrid::Vec3f& v : big_verts) {
+    const vgrid::Vec3i d = vol::world_to_block(v, grid) - centre_block;
     CHECK(std::max({std::abs(d.x), std::abs(d.y), std::abs(d.z)}) > tb);
   }
 
@@ -209,10 +210,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // dispatches, allocate the same blocks: the path a mesh with more
   // candidates than the device's 65535 groups hold takes.
   CHECK(map.clear().ok());
-  vr::detail::set_test_groups_per_dispatch(1);
+  vgrid::detail::set_test_groups_per_dispatch(1);
   vkc::Result<std::uint32_t> split =
       map.allocate_from_triangles(big_verts.data(), 3, big_idx.data(), 1);
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
   CHECK(split.ok() && split.value() == 0);
   std::set<Coord> split_got;
   if (collect_active(map, split_got) != 0) return 1;
@@ -223,7 +224,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // from the surface, so a kernel that allocated the box rather than the band
   // would allocate them.
   CHECK(map.clear().ok());
-  const std::vector<vr::Vec3f> diag_verts = {
+  const std::vector<vgrid::Vec3f> diag_verts = {
       {0.0f, 0.0f, 0.0f}, {0.6f, 0.6f, 0.0f}, {0.0f, 0.0f, 0.3f}};
   const std::vector<std::uint32_t> diag_idx = {0, 1, 2};
   vkc::Result<std::uint32_t> diag =
@@ -233,12 +234,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   std::set<Coord> diag_got;
   if (collect_active(map, diag_got) != 0) return 1;
   // A corner of the box, maximally far from the x=y plane the triangle lies in.
-  const vr::Vec3i far_block =
-      vol::world_to_block(vr::Vec3f(0.58f, 0.02f, 0.15f), grid);
+  const vgrid::Vec3i far_block =
+      vol::world_to_block(vgrid::Vec3f(0.58f, 0.02f, 0.15f), grid);
   CHECK(diag_got.count({far_block.x, far_block.y, far_block.z}) == 0);
   // ...while the surface itself is still covered.
-  const vr::Vec3i on_block =
-      vol::world_to_block(vr::Vec3f(0.30f, 0.30f, 0.10f), grid);
+  const vgrid::Vec3i on_block =
+      vol::world_to_block(vgrid::Vec3f(0.30f, 0.30f, 0.10f), grid);
   CHECK(diag_got.count({on_block.x, on_block.y, on_block.z}) == 1);
 
   // ---- 5. Guards -----------------------------------------------------------
@@ -261,7 +262,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // refused: a mesh file routinely carries a few, and one bad face should not
   // fail the whole allocation.
   const float inf = std::numeric_limits<float>::infinity();
-  const std::vector<vr::Vec3f> odd_verts = {
+  const std::vector<vgrid::Vec3f> odd_verts = {
       {0.1f, 0.1f, 0.1f},  // 0: degenerate triangle uses 0,0,1
       {0.2f, 0.1f, 0.1f},  // 1
       {inf, 0.0f, 0.0f},   // 2: non-finite
@@ -282,7 +283,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // those calls is every block that passes the band test with nothing
   // de-duplicated: exactly what the whole sheet in one call must allocate.
   constexpr int kSide = 10;
-  std::vector<vr::Vec3f> sheet_verts;
+  std::vector<vgrid::Vec3f> sheet_verts;
   for (int j = 0; j <= kSide; ++j) {
     for (int i = 0; i <= kSide; ++i) {
       const float x = 0.01f * float(i) + 0.003f;
@@ -323,9 +324,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // among them their column's neighbours. None may be taken for the lane's
   // own block.
   CHECK(map.clear().ok());
-  const std::vector<vr::Vec3f> sliver_verts = {{0.011f, 0.013f, 0.007f},
-                                               {0.063f, 0.017f, 0.009f},
-                                               {0.019f, 0.021f, 0.611f}};
+  const std::vector<vgrid::Vec3f> sliver_verts = {{0.011f, 0.013f, 0.007f},
+                                                  {0.063f, 0.017f, 0.009f},
+                                                  {0.019f, 0.021f, 0.611f}};
   const std::vector<std::uint32_t> sliver_idx = {0, 1, 2};
   vkc::Result<std::uint32_t> sliver =
       map.allocate_from_triangles(sliver_verts.data(), 3, sliver_idx.data(), 1);
@@ -346,5 +347,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

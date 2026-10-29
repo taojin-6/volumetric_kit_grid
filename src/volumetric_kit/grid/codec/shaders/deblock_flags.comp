@@ -27,8 +27,8 @@ void main() {
   }
   barrier();
   if (entry < pc.num_blocks) {
-    if (vrEntryFull(entry)) {
-      int ptr = vrFindBlockPtr(blocks[entry].coord, pc.num_buckets,
+    if (vgridEntryFull(entry)) {
+      int ptr = vgridFindBlockPtr(blocks[entry].coord, pc.num_buckets,
                                pc.bucket_size, pc.max_chain);
       if (ptr >= 0) {
         full[uint(ptr) / kBlockVoxels] = 1u;

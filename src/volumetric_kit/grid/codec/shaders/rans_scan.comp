@@ -44,7 +44,7 @@ void main() {
   for (uint base = 0u; base < pc.segment_count; base += kScanLanes) {
     const uint i = base + lane;
     const uint length = i < pc.segment_count ? lengths[i] : 0u;
-    const uint offset = vrScanChunk(length, carry);
+    const uint offset = vgridScanChunk(length, carry);
     if (i < pc.segment_count) {
       payload_offsets[i] = offset;
       result_lengths[i] = length;

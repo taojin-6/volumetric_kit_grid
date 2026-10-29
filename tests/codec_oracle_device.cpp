@@ -13,11 +13,11 @@
 
 #include "codec_frames.hpp"
 #include "codec_oracle_encode.hpp"
-#include "grid_readback.hpp"
 #include "host_slices.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
 
 namespace codec_oracle {
 
@@ -39,7 +39,7 @@ std::vector<std::uint32_t> pack(const DctBlocks& b, std::uint16_t pad) {
 vkc::Result<Resident> resident(const vkc::test::Gpu& gpu,
                                const DctBlocks& entries,
                                const std::vector<d::BlockMode>& modes,
-                               const std::vector<vr::Vec3i>& coords,
+                               const std::vector<vgrid::Vec3i>& coords,
                                std::uint16_t pad,
                                std::optional<std::uint32_t> tail) {
   const auto upload =
@@ -52,7 +52,7 @@ vkc::Result<Resident> resident(const vkc::test::Gpu& gpu,
   // The bound's garbage past the frame's entries, which no count may read.
   const auto m = static_cast<std::uint32_t>(modes.size());
   DctBlocks bound;
-  std::vector<vr::Vec3i> bound_coords;
+  std::vector<vgrid::Vec3i> bound_coords;
   std::vector<std::uint32_t> ranks;
   if (tail) {
     codec_frames::Lcg rng{0x7a11u + *tail};
@@ -76,7 +76,7 @@ vkc::Result<Resident> resident(const vkc::test::Gpu& gpu,
     ranks[m] = *tail;
   }
   const DctBlocks& all = tail ? bound : entries;
-  const std::vector<vr::Vec3i>& all_coords = tail ? bound_coords : coords;
+  const std::vector<vgrid::Vec3i>& all_coords = tail ? bound_coords : coords;
   Resident r;
   r.blocks.count =
       static_cast<std::uint32_t>(all.masks.size() / codec::kMaskWordsPerBlock);
@@ -211,8 +211,8 @@ vkc::Status inverse(const vkc::test::Gpu& gpu, d::DctTransform& t,
     r.list = std::make_unique<vkc::Buffer>(std::move(list));
     r.blocks.list = r.list.get();
   }
-  VKC_ASSIGN(const vr_test::HostSlices slices,
-             vr_test::host_slices(gpu, r.blocks.count, 1));
+  VKC_ASSIGN(const vgrid_test::HostSlices slices,
+             vgrid_test::host_slices(gpu, r.blocks.count, 1));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   VKC_TRY(t.record_steps(batch, in.params));
   VKC_TRY(t.record_inverse(batch, grid, r.blocks, in.params, slices.slices()));
@@ -242,13 +242,13 @@ Corner corner(int x, int y, int z, int c) {
 
 // The coordinate @p o steps past @p c, wrapping as the device's int addition
 // does at int32's extremes.
-vr::Vec3i step(const vr::Vec3i& c, int o) {
+vgrid::Vec3i step(const vgrid::Vec3i& c, int o) {
   const auto wrap = [](std::int32_t v, int d) {
     return static_cast<std::int32_t>(static_cast<std::uint32_t>(v) +
                                      static_cast<std::uint32_t>(d));
   };
-  return vr::Vec3i(wrap(c.x, o & 1), wrap(c.y, (o >> 1) & 1),
-                   wrap(c.z, (o >> 2) & 1));
+  return vgrid::Vec3i(wrap(c.x, o & 1), wrap(c.y, (o >> 1) & 1),
+                      wrap(c.z, (o >> 2) & 1));
 }
 
 }  // namespace
@@ -258,15 +258,15 @@ vkc::Result<SurfaceSet> surface_set(const vkc::test::Gpu& gpu,
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
   VKC_ASSIGN(const std::vector<float> tsdf,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vol::kTsdfAttribute));
+             vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                               vol::kTsdfAttribute));
   VKC_ASSIGN(const std::vector<float> weight,
-             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            vol::kWeightAttribute));
-  const auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
+             vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                               vol::kWeightAttribute));
+  const auto less = [](const vgrid::Vec3i& a, const vgrid::Vec3i& b) {
     return d::coord_less(a, b);
   };
-  std::map<vr::Vec3i, std::int64_t, decltype(less)> slot_of(less);
+  std::map<vgrid::Vec3i, std::int64_t, decltype(less)> slot_of(less);
   for (const vol::BlockIndex& b : active) slot_of[b.coord] = b.ptr;
   // The rule's distances, metres: past sqrt(3) voxels a corner of a crossing
   // cannot lie, and within one voxel a corner keeps its cell.
@@ -385,9 +385,9 @@ vkc::Result<std::vector<std::uint8_t>> encode(
     const codec::EncoderConfig& config) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
-  VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vol::kWeightAttribute, active));
+  VKC_ASSIGN(const vgrid_test::AttributeSpan<float> weight,
+             vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                          vol::kWeightAttribute, active));
   std::vector<vol::BlockIndex> observed;
   std::optional<vkc::Buffer> cut;
   if (config.true_sdf) {

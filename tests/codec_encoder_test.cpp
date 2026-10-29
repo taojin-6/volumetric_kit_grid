@@ -36,23 +36,23 @@
 #include <utility>
 #include <vector>
 
-#include "codec_fixture.hpp"
 #include "codec_oracle_encode.hpp"
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/volume/grid_growth.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/volume/grid_growth.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
 
-namespace codec = volumetric_kit::recon::codec;
+namespace codec = volumetric_kit::grid::codec;
 using namespace codec_fixture;
 
 namespace {
@@ -90,8 +90,8 @@ int empty_grid_case(Gpu& gpu, codec::Encoder& enc) {
 // blocks allocated in opposite orders into tables of different sizes, so
 // every ptr and the compaction order differ -- encodes to the same bytes.
 int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
-  const Sphere s{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
-  std::vector<vr::Vec3i> coords = band_blocks(s);
+  const Sphere s{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  std::vector<vgrid::Vec3i> coords = band_blocks(s);
   CHECK(coords.size() > 100);
 
   vkc::Result<vol::VoxelBlockGrid> ga = make_grid(gpu);
@@ -105,7 +105,7 @@ int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> gb = make_grid(gpu, bigger);
   CHECK(gb.ok());
   vol::VoxelBlockGrid b = std::move(gb).value();
-  std::vector<vr::Vec3i> reversed(coords.rbegin(), coords.rend());
+  std::vector<vgrid::Vec3i> reversed(coords.rbegin(), coords.rend());
   CHECK(allocate(gpu, b, reversed).ok());
   CHECK(write_sphere(gpu, b, s).ok());
 
@@ -135,8 +135,9 @@ int order_independent_case(Gpu& gpu, codec::Encoder& enc) {
 
 // A block with no observed voxel is left out of the frame.
 int unobserved_dropped_case(Gpu& gpu, codec::Encoder& enc) {
-  const Sphere s{vr::Vec3f(0.0f, 0.0f, 0.0f), 0.06f};
-  const std::vector<vr::Vec3i> far = {{40, 40, 40}, {41, 40, 40}, {-40, 3, 9}};
+  const Sphere s{vgrid::Vec3f(0.0f, 0.0f, 0.0f), 0.06f};
+  const std::vector<vgrid::Vec3i> far = {
+      {40, 40, 40}, {41, 40, 40}, {-40, 3, 9}};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s, {}, far);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -168,7 +169,7 @@ int unobserved_dropped_case(Gpu& gpu, codec::Encoder& enc) {
 // The rows the header promises, and the device half on the parent row where
 // the device can time at all.
 int metrics_case(Gpu& gpu, codec::Encoder& enc) {
-  const Sphere s{vr::Vec3f(0.0f), 0.08f};
+  const Sphere s{vgrid::Vec3f(0.0f), 0.08f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -219,7 +220,7 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc) {
 // after compacts its own. Both encodes are handed the grid read-only.
 int device_list_case(Gpu& gpu, codec::Encoder& enc) {
   vkc::Result<vol::VoxelBlockGrid> g =
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.07f});
+      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.0f), 0.07f});
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
   const vol::VoxelBlockGrid& view = grid;
@@ -255,7 +256,7 @@ int device_list_case(Gpu& gpu, codec::Encoder& enc) {
 // The Encoder writes the CPU oracle's bytes for a fused-looking grid, at an
 // odd K, for the default and a finer segmentation and the longest segments.
 int oracle_case(Gpu& gpu) {
-  const Sphere s{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  const Sphere s{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -282,13 +283,13 @@ int oracle_case(Gpu& gpu) {
 // the whole range, so the bytes are still the oracle's -- with true_sdf too,
 // whose neighbours there wrap around int32 on the device and in the oracle.
 int extremes_case(Gpu& gpu, codec::Encoder& enc) {
-  const Sphere s{vr::Vec3f(0.0f), 0.05f};
+  const Sphere s{vgrid::Vec3f(0.0f), 0.05f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
   constexpr std::int32_t lo = std::numeric_limits<std::int32_t>::min();
   constexpr std::int32_t hi = std::numeric_limits<std::int32_t>::max();
-  const std::vector<vr::Vec3i> far = {
+  const std::vector<vgrid::Vec3i> far = {
       {lo, 0, 0},   {hi, 0, 0},   {0, lo, 0},   {0, hi, 0},
       {0, 0, lo},   {0, 0, hi},   {lo, lo, lo}, {hi, hi, hi},
       {hi, lo, hi}, {lo, hi, lo}, {-1, hi, lo}, {lo + 1, -1, hi - 1}};
@@ -296,10 +297,10 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
   // Observed by hand, as write_sphere's block positions overflow here.
   vkc::Result<std::vector<vol::BlockIndex>> active =
       grid.map().compact_active_blocks();
-  vkc::Result<std::vector<float>> tsdf = vr_test::read_attribute<float>(
-      gpu.device, gpu.allocator, grid, vr::volume::kTsdfAttribute);
-  vkc::Result<std::vector<float>> weight = vr_test::read_attribute<float>(
-      gpu.device, gpu.allocator, grid, vr::volume::kWeightAttribute);
+  vkc::Result<std::vector<float>> tsdf = vgrid_test::read_attribute<float>(
+      gpu.device, gpu.allocator, grid, vgrid::volume::kTsdfAttribute);
+  vkc::Result<std::vector<float>> weight = vgrid_test::read_attribute<float>(
+      gpu.device, gpu.allocator, grid, vgrid::volume::kWeightAttribute);
   CHECK(active.ok() && tsdf.ok() && weight.ok());
   std::size_t marked = 0;
   for (const vol::BlockIndex& b : active.value()) {
@@ -313,11 +314,12 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
     ++marked;
   }
   CHECK(marked == far.size());
-  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                 vr::volume::kTsdfAttribute, tsdf.value())
+  CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                    vgrid::volume::kTsdfAttribute, tsdf.value())
             .ok());
-  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                 vr::volume::kWeightAttribute, weight.value())
+  CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                    vgrid::volume::kWeightAttribute,
+                                    weight.value())
             .ok());
   vkc::Result<std::vector<std::uint8_t>> frame = enc.encode(grid);
   vkc::Result<std::vector<std::uint8_t>> oracle =
@@ -446,7 +448,7 @@ codec::FrameType type_of(const Bytes& frame) {
 
 // A sphere at step @p t of a chain: moving and growing.
 Sphere chain_sphere(int t) {
-  return Sphere{vr::Vec3f(0.008f * float(t), -0.004f * float(t), 0.0f),
+  return Sphere{vgrid::Vec3f(0.008f * float(t), -0.004f * float(t), 0.0f),
                 0.08f + 0.005f * float(t)};
 }
 
@@ -611,7 +613,8 @@ int repeat_case(Gpu& gpu) {
 
 // Off the grid, so the curtain's slab faces lie inside blocks.
 Curtain test_curtain(bool with_speck = true) {
-  return Curtain{Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, with_speck};
+  return Curtain{Sphere{vgrid::Vec3f(0.013f, -0.007f, 0.004f), 0.09f},
+                 with_speck};
 }
 
 codec::EncoderConfig true_sdf_config() {
@@ -641,8 +644,9 @@ std::size_t unobserved(const Snapshot& s) {
   return std::size_t(std::count(s.weight.begin(), s.weight.end(), 0.0f));
 }
 
-std::vector<vr::Vec3i> coords_of(const std::vector<vol::BlockIndex>& blocks) {
-  std::vector<vr::Vec3i> out;
+std::vector<vgrid::Vec3i> coords_of(
+    const std::vector<vol::BlockIndex>& blocks) {
+  std::vector<vgrid::Vec3i> out;
   for (const vol::BlockIndex& b : blocks) out.push_back(b.coord);
   return out;
 }
@@ -697,14 +701,14 @@ int true_sdf_oracle_case(Gpu& gpu) {
 // rule alone, and cuts nothing: every voxel of a coded block decodes
 // observed.
 int surface_blocks_case(Gpu& gpu) {
-  const Sphere a{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
-  const Sphere b{vr::Vec3f(0.31f, 0.0f, 0.0f), 0.05f};
+  const Sphere a{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
+  const Sphere b{vgrid::Vec3f(0.31f, 0.0f, 0.0f), 0.05f};
   const GridShape shape = wide_band();
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(gpu, shape);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
   CHECK(allocate(gpu, grid, union_blocks({a, b, speck(10)}, shape)).ok());
-  CHECK(write_field(gpu, grid, [&](const vr::Vec3f& p) {
+  CHECK(write_field(gpu, grid, [&](const vgrid::Vec3f& p) {
           return std::min({a.sdf(p), b.sdf(p), speck(10).sdf(p)});
         }).ok());
   vkc::Result<codec_oracle::SurfaceSet> set =
@@ -806,7 +810,8 @@ int stale_cut_case(Gpu& gpu) {
   bool holds_one = false;
   while (!holds_one) {
     CHECK(far.size() < std::size_t(grid.grid().num_blocks));
-    far.push_back(vol::BlockIndex{vr::Vec3i(1000 + int(far.size()), 0, 0), 0});
+    far.push_back(
+        vol::BlockIndex{vgrid::Vec3i(1000 + int(far.size()), 0, 0), 0});
     CHECK(allocate(gpu, grid, {far.back().coord}).ok());
     vkc::Result<std::vector<vol::BlockIndex>> drawn = active_sorted(grid);
     CHECK(drawn.ok());
@@ -817,7 +822,7 @@ int stale_cut_case(Gpu& gpu) {
     }
   }
   CHECK(allocate(gpu, grid, union_blocks({curtain.sphere}, wide_band())).ok());
-  vkc::Result<std::uint32_t> failed = vr_test::remove_blocks(gpu, grid, far);
+  vkc::Result<std::uint32_t> failed = vgrid_test::remove_blocks(gpu, grid, far);
   CHECK(failed.ok() && failed.value() == 0);
   CHECK(write_sphere(gpu, grid, curtain.sphere).ok());
   vkc::Result<std::vector<vol::BlockIndex>> after = active_sorted(grid);
@@ -912,7 +917,7 @@ int halves_case(Gpu& gpu) {
     }
   }
 
-  const Sphere s{vr::Vec3f(0.003f, 0.001f, -0.002f), 0.08f};
+  const Sphere s{vgrid::Vec3f(0.003f, 0.001f, -0.002f), 0.08f};
   const std::size_t blocks = band_blocks(s).size();
   GridShape slots;
   slots.num_buckets = static_cast<std::int32_t>(8 * blocks);  // 64x
@@ -1057,17 +1062,17 @@ int tail_case(Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> smooth = make_grid(gpu);
   vkc::Result<vol::VoxelBlockGrid> noise = make_grid(gpu);
   CHECK(enc.ok() && fresh.ok() && smooth.ok() && noise.ok());
-  std::vector<vr::Vec3i> coords;
-  for (int i = 0; i < 64; ++i) coords.push_back(vr::Vec3i(i % 8, i / 8, 49));
+  std::vector<vgrid::Vec3i> coords;
+  for (int i = 0; i < 64; ++i) coords.push_back(vgrid::Vec3i(i % 8, i / 8, 49));
   CHECK(allocate(gpu, smooth.value(), coords).ok());
   CHECK(allocate(gpu, noise.value(), coords).ok());
   CHECK(write_field(
-            gpu, smooth.value(), [](const vr::Vec3f& p) { return p.z - 1.98f; },
-            true)
+            gpu, smooth.value(),
+            [](const vgrid::Vec3f& p) { return p.z - 1.98f; }, true)
             .ok());
   CHECK(write_field(
             gpu, noise.value(),
-            [](const vr::Vec3f& p) {
+            [](const vgrid::Vec3f& p) {
               const auto h = std::uint32_t(p.x * 7919.0f + p.y * 104729.0f +
                                            p.z * 1299709.0f) *
                              2654435761u;
@@ -1150,5 +1155,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

@@ -21,19 +21,19 @@
 #include <vector>
 
 #include "bitstream.hpp"
-#include "codec_fixture.hpp"
-#include "stage_rows.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/codec/decode_grid.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/testing/stage_rows.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 using namespace codec_fixture;
 
 namespace {
@@ -69,12 +69,12 @@ vkc::Result<Frames> make_frames(Gpu& gpu) {
   own.trunc_dist = kSmallTrunc;
   VKC_ASSIGN(
       vol::VoxelBlockGrid small,
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.01f, 0.0f, -0.02f), 0.1f}, own));
+      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.01f, 0.0f, -0.02f), 0.1f}, own));
   VKC_ASSIGN(f.small, encode(gpu, small));
   GridShape roomy;
   roomy.num_buckets = 2048;
   VKC_ASSIGN(vol::VoxelBlockGrid large,
-             sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.6f}, roomy));
+             sphere_grid(gpu, Sphere{vgrid::Vec3f(0.0f), 0.6f}, roomy));
   VKC_ASSIGN(f.large, encode(gpu, large));
   VKC_ASSIGN(const codec::FrameInfo s,
              codec::read_frame_info(f.small.data(), f.small.size()));
@@ -100,7 +100,7 @@ std::int32_t decode_buckets(std::uint32_t blocks) {
 }
 
 bool has_row(const vkc::StageMetrics& m, const char* name) {
-  return vr_test::find_row(m, name) != nullptr;
+  return vgrid_test::find_row(m, name) != nullptr;
 }
 
 // The grid from a frame's header: its geometry exactly, 8^3 blocks, the
@@ -269,7 +269,7 @@ int grows_once_case(Gpu& gpu, const Frames& f) {
             .ok());
   CHECK(grid->grid().num_buckets == decode_buckets(f.small_blocks));
   CHECK(metrics.rows().front().name == std::string("codec decode"));
-  CHECK(has_row(metrics, "  ..grow") && vr_test::breakdowns_nest(metrics));
+  CHECK(has_row(metrics, "  ..grow") && vgrid_test::breakdowns_nest(metrics));
 
   vkc::Result<vol::VoxelBlockGrid> roomy = codec::make_decode_grid(
       gpu.device, gpu.allocator, f.small.data(), f.small.size(), kMaxBlocks);
@@ -355,8 +355,8 @@ int second_out_of_memory_case(Gpu& gpu, const Frames& f) {
 // with no metrics, the default. A P-frame builds a grid as an I-frame does,
 // though only a decoder holding its reference decodes it.
 int fits_case(Gpu& gpu) {
-  const Sphere a{vr::Vec3f(0.0f), 0.08f};
-  const Sphere b{vr::Vec3f(0.02f, 0.0f, 0.0f), 0.08f};
+  const Sphere a{vgrid::Vec3f(0.0f), 0.08f};
+  const Sphere b{vgrid::Vec3f(0.02f, 0.0f, 0.0f), 0.08f};
   vkc::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
   vkc::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
   CHECK(ga.ok() && gb.ok());
@@ -401,7 +401,7 @@ int fits_case(Gpu& gpu) {
 // frame of other geometry and a cut one (InvalidArgument).
 int refusals_case(Gpu& gpu, const Frames& f) {
   vkc::Result<vol::VoxelBlockGrid> ga =
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.08f});
+      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.0f), 0.08f});
   CHECK(ga.ok());
   codec::EncoderConfig config;
   config.intra_period = 30;
@@ -456,5 +456,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

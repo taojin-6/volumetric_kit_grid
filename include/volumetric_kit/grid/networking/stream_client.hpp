@@ -13,12 +13,12 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/networking/export.hpp"
-#include "volumetric_kit/recon/networking/stream_server.hpp"  // kDefaultPort
-#include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/networking/export.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"  // kDefaultPort
+#include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
 
-namespace volumetric_kit::recon::networking {
+namespace volumetric_kit::grid::networking {
 
 /// @brief How a @ref StreamClient reads.
 struct ClientOptions {
@@ -70,7 +70,7 @@ struct ClientOptions {
 /// @endcode
 ///
 /// @warning Not thread-safe: one thread uses it.
-class VR_NETWORKING_API StreamClient {
+class VGRID_NETWORKING_API StreamClient {
  public:
   /// @brief A client of @p host's sender; never blocks. A name is looked up
   ///        at once, on a detached helper thread, which the client abandons
@@ -176,4 +176,4 @@ class VR_NETWORKING_API StreamClient {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace volumetric_kit::recon::networking
+}  // namespace volumetric_kit::grid::networking

@@ -19,11 +19,11 @@
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec {
+namespace volumetric_kit::grid::codec {
 
 namespace detail {
 class BlockLists;
@@ -38,7 +38,7 @@ struct RecordedEncode;
 inline constexpr std::uint32_t kTrueSdfBandVoxels = 15;
 
 /// @brief How an @ref Encoder codes a frame.
-struct VR_CODEC_API EncoderConfig {
+struct VGRID_CODEC_API EncoderConfig {
   /// Coefficients kept per block and their quantization steps.
   CodecParams params;
   /// Blocks per independently coded segment, from 1 to
@@ -204,7 +204,7 @@ struct EncodedFrame {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one call at a time.
-class VR_CODEC_API Encoder {
+class VGRID_CODEC_API Encoder {
  public:
   /// @brief Build the kernels: the forward transform's, the block lists'
   ///        (the sort's among them), the reference store's (the P-frame
@@ -409,4 +409,4 @@ class VR_CODEC_API Encoder {
   std::unique_ptr<detail::RecordedEncode> pending_;
 };
 
-}  // namespace volumetric_kit::recon::codec
+}  // namespace volumetric_kit::grid::codec

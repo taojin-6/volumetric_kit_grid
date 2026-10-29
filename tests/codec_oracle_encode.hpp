@@ -12,8 +12,8 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
 namespace codec_oracle {
 
@@ -22,7 +22,7 @@ namespace codec_oracle {
 // from a snapshot: the kept blocks in (z, y, x) order, the cut set as
 // DctTransform::record_forward takes it, and counts the tests assert on.
 struct SurfaceSet {
-  std::vector<volumetric_kit::recon::volume::BlockIndex> blocks;
+  std::vector<volumetric_kit::grid::volume::BlockIndex> blocks;
   std::vector<std::uint32_t> cut;   // num_blocks * 16 words, by heap slot
   std::size_t observed_blocks = 0;  // active blocks with an observed voxel
   std::size_t cut_voxels = 0;
@@ -35,7 +35,7 @@ struct SurfaceSet {
 
 volumetric_kit::core::Result<SurfaceSet> surface_set(
     const volumetric_kit::core::test::Gpu& gpu,
-    volumetric_kit::recon::volume::VoxelBlockGrid& grid);
+    volumetric_kit::grid::volume::VoxelBlockGrid& grid);
 
 // What an Encoder of @p config must write for @p grid: the grid's active
 // blocks that hold an observed voxel -- with config.true_sdf, surface_set's
@@ -43,7 +43,7 @@ volumetric_kit::core::Result<SurfaceSet> surface_set(
 // device's forward transform, coded by write_frame.
 volumetric_kit::core::Result<std::vector<std::uint8_t>> encode(
     const volumetric_kit::core::test::Gpu& gpu,
-    volumetric_kit::recon::volume::VoxelBlockGrid& grid,
-    const volumetric_kit::recon::codec::EncoderConfig& config);
+    volumetric_kit::grid::volume::VoxelBlockGrid& grid,
+    const volumetric_kit::grid::codec::EncoderConfig& config);
 
 }  // namespace codec_oracle

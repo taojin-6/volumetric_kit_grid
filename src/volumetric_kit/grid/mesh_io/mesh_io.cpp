@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/io/mesh_io.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_io.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,9 +24,9 @@
 
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
-#include "volumetric_kit/recon/io/textured_mesh.hpp"
+#include "volumetric_kit/grid/mesh_io/textured_mesh.hpp"
 
-namespace volumetric_kit::recon::io {
+namespace volumetric_kit::grid::mesh_io {
 namespace {
 
 // A vertex: its position and, in a textured load, its texture coordinates
@@ -368,4 +368,4 @@ core::Result<TexturedMesh> load_textured_mesh(const std::string& path) {
   }
 }
 
-}  // namespace volumetric_kit::recon::io
+}  // namespace volumetric_kit::grid::mesh_io

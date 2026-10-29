@@ -7,7 +7,7 @@
 /// @brief The host side of the rANS kernels, which the device frame writer
 ///        and reader share: their push constants and the table entries they
 ///        read. They and the block lists' kernels dispatch through
-///        `recon::detail::dispatch_items` (core/dispatch.hpp).
+///        `vgrid::detail::dispatch_items` (base/dispatch.hpp).
 ///
 /// Internal (under src/, never installed).
 
@@ -17,11 +17,11 @@
 
 #include "rans.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
-using recon::detail::dispatch_items;
+using volumetric_kit::grid::detail::dispatch_items;
 
 /// Mirrors `Push` in rans_push.glsl.
 struct RansPush {
@@ -62,4 +62,4 @@ inline VkDeviceSize binding_range(VkDeviceSize bytes, VkDeviceSize element) {
   return std::max(bytes, element);
 }
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

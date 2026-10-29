@@ -103,7 +103,7 @@
 #include <string>
 #include <vector>
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 
 /// @brief What a track's payloads are. A kind comes with its first writer;
 ///        a reader passes the values it does not know through as read.
@@ -111,7 +111,7 @@ enum class TrackKind : std::uint16_t {
   /// One codec frame per record, exactly what `codec::Encoder::encode`
   /// returned; a key record is an intra frame. The track has no width,
   /// height or sensor: the frame's own header says what it is. Its params
-  /// are empty, or the bytes of `io::encode_transform`
+  /// are empty, or the bytes of `mesh_io::encode_transform`
   /// (io/mesh_normalization.hpp): the transform that placed a mesh source in
   /// metres.
   Geometry = 1,
@@ -202,4 +202,4 @@ struct TrackStats {
   std::uint64_t max_pts_ns = 0;     ///< Its greatest pts; 0 with no records.
 };
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

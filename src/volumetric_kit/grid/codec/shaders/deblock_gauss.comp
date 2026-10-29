@@ -64,18 +64,18 @@ bool kept(int x, int y, int z) {
 // clipped, then clamped; an unobserved voxel stays unobserved. Summed in the
 // CPU's order, -1, 0, +1.
 float gauss_step(float a, float v, float b) {
-  if (!vrObserved(v)) {
+  if (!vgridObserved(v)) {
     return v;
   }
   float sw = 0.0;
   float sv = 0.0;
-  if (vrObserved(a)) {
+  if (vgridObserved(a)) {
     sw += pc.gauss_g1;
     sv += pc.gauss_g1 * a;
   }
   sw += 1.0;
   sv += v;
-  if (vrObserved(b)) {
+  if (vgridObserved(b)) {
     sw += pc.gauss_g1;
     sv += pc.gauss_g1 * b;
   }
@@ -87,17 +87,17 @@ void main() {
   uint lane = gl_LocalInvocationIndex;
   uint entry = pc.item_base + gl_WorkGroupID.x;
   // Uniform across the workgroup: a masked B keeps its exact decode.
-  if (entry >= pc.num_blocks || !vrEntryFull(entry)) {
+  if (entry >= pc.num_blocks || !vgridEntryFull(entry)) {
     return;
   }
   ivec3 coord = blocks[entry].coord;
   if (lane < 27u) {
     ivec3 o = ivec3(int(lane % 3u), int((lane / 3u) % 3u), int(lane / 9u)) -
               ivec3(1);
-    int ptr = vrFindBlockPtr(coord + o, pc.num_buckets, pc.bucket_size,
+    int ptr = vgridFindBlockPtr(coord + o, pc.num_buckets, pc.bucket_size,
                              pc.max_chain);
     s_blocks[lane] = ptr;
-    s_full[lane] = ptr >= 0 && vrFull(ptr) ? 1u : 0u;
+    s_full[lane] = ptr >= 0 && vgridFull(ptr) ? 1u : 0u;
   }
   if (lane == 0u) {
     s_wrote = 0u;
@@ -125,7 +125,7 @@ void main() {
       float t = tsdf[s];
       bool observed = o == ivec3(0) || weight[s] >= pc.observed_weight;
       if (observed) {
-        v = vrNormalized(t);
+        v = vgridNormalized(t);
       }
     }
     s_field[i] = v;
@@ -192,11 +192,11 @@ void main() {
     float out_value = gauss_step(s_field[c - kField * kField], s_field[c],
                              s_field[c + kField * kField]);
     float in_value = input_value[z];
-    bool changed = vrObserved(in_value) &&
+    bool changed = vgridObserved(in_value) &&
                    floatBitsToUint(out_value) != floatBitsToUint(in_value);
     float metres = out_value * pc.trunc_dist;
     uint l = uint(cx + int(kEdge) * (cy + int(kEdge) * z));
-    uint si = vrShellIndex(uvec3(cx, cy, z));
+    uint si = vgridShellIndex(uvec3(cx, cy, z));
     if (si == kShellVoxels) {
       if (changed) {
         tsdf[uint(self_ptr) + l] = metres;
@@ -211,6 +211,6 @@ void main() {
   }
   barrier();
   if (lane == 0u && s_wrote != 0u) {
-    vrStampChanged(self_ptr);
+    vgridStampChanged(self_ptr);
   }
 }

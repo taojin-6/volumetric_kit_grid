@@ -18,16 +18,16 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/networking/stream_server.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec_stream::detail {
+namespace volumetric_kit::grid::codec_stream::detail {
 
 class StreamCoder {
  public:
@@ -122,4 +122,4 @@ class StreamCoder {
   std::uint32_t max_blocks_ = 0;
 };
 
-}  // namespace volumetric_kit::recon::codec_stream::detail
+}  // namespace volumetric_kit::grid::codec_stream::detail

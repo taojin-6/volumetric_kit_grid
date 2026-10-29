@@ -9,16 +9,16 @@
 #include <new>
 #include <optional>
 
-#include "codec_fixture.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
+namespace codec = volumetric_kit::grid::codec;
 using namespace codec_fixture;
 
 namespace {
@@ -169,12 +169,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   auto a = make_grid(gpu);
   auto b = make_grid(gpu);
   CHECK(a.ok() && b.ok());
-  CHECK(allocate(gpu, *a, {vr::Vec3i(0)}).ok());
-  CHECK(allocate(gpu, *b, {vr::Vec3i(0)}).ok());
-  CHECK(
-      write_field(gpu, *a, [](const vr::Vec3f&) { return 0.01f; }, true).ok());
-  CHECK(
-      write_field(gpu, *b, [](const vr::Vec3f&) { return -0.01f; }, true).ok());
+  CHECK(allocate(gpu, *a, {vgrid::Vec3i(0)}).ok());
+  CHECK(allocate(gpu, *b, {vgrid::Vec3i(0)}).ok());
+  CHECK(write_field(
+            gpu, *a, [](const vgrid::Vec3f&) { return 0.01f; }, true)
+            .ok());
+  CHECK(write_field(
+            gpu, *b, [](const vgrid::Vec3f&) { return -0.01f; }, true)
+            .ok());
   int failed = returned_bytes_case(gpu, *a, *b, false);
   failed |= returned_bytes_case(gpu, *a, *b, true);
   failed |= back_retry_case(gpu, *a, false);
@@ -186,7 +188,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() try {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 } catch (const std::bad_alloc&) {
   vkc::test::allocation_failure = {};
   std::fputs("FAIL: bad_alloc escaped the encoder\n", stderr);

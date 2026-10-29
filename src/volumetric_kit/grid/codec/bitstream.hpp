@@ -118,12 +118,12 @@
 
 #include "rans.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// The four bytes every frame starts with.
 inline constexpr std::uint8_t kFrameMagic[4] = {'V', 'R', 'T', 'C'};
@@ -167,15 +167,16 @@ using codec::FrameType;
 /// @param who  The caller, which a refusal names.
 /// @return OK for an intra frame or a P-frame; otherwise
 ///         `Status::Code::Unsupported`.
-VR_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
+VGRID_CODEC_API core::Status check_frame_type(FrameType type, const char* who);
 
 /// @brief The segment-size rule every writer and reader holds a frame to: R,
 ///        and a P-frame's U, from 1 to @ref kMaxDeviceDecodeSegmentSize.
 /// @param who   The caller, which a refusal names.
 /// @param name  The size's name, which a refusal names too.
 /// @return OK, or `Status::Code::InvalidArgument`.
-VR_CODEC_API core::Status check_segment_size(const char* who, const char* name,
-                                             std::uint32_t size);
+VGRID_CODEC_API core::Status check_segment_size(const char* who,
+                                                const char* name,
+                                                std::uint32_t size);
 
 /// The sections v3 defines, numbered `1..kSectionCount`.
 enum class SectionId : std::uint16_t {
@@ -230,7 +231,7 @@ struct FrameReference {
 /// @brief Parse and check a frame's fixed header -- the first
 ///        @ref frame_header_bytes -- and nothing after it.
 /// @return The header, or the same header refusals as @ref parse_frame.
-VR_CODEC_API core::Result<FrameHeader> read_frame_header(
+VGRID_CODEC_API core::Result<FrameHeader> read_frame_header(
     const std::uint8_t* data, std::size_t size);
 
 /// @brief The refusals every writer makes after the type's, of the coding
@@ -238,8 +239,8 @@ VR_CODEC_API core::Result<FrameHeader> read_frame_header(
 ///        first: one place for their codes and words.
 /// @return OK, or `Status::Code::InvalidArgument` for a non-positive or
 ///         non-finite @p voxel_size or @p trunc_dist, or invalid @p params.
-VR_CODEC_API core::Status check_coding(float voxel_size, float trunc_dist,
-                                       const CodecParams& params);
+VGRID_CODEC_API core::Status check_coding(float voxel_size, float trunc_dist,
+                                          const CodecParams& params);
 
 /// @brief The rule a P-frame's coding parameters keep: its reference's, bit
 ///        for bit. The one check the reader, the writers and the encoder's
@@ -247,9 +248,10 @@ VR_CODEC_API core::Status check_coding(float voxel_size, float trunc_dist,
 /// @return The first of @p voxel_size, @p trunc_dist and @p params' K,
 ///         scale and kept weights that is not @p reference's, by name; null
 ///         when none is.
-VR_CODEC_API const char* coding_difference(const FrameHeader& reference,
-                                           float voxel_size, float trunc_dist,
-                                           const CodecParams& params);
+VGRID_CODEC_API const char* coding_difference(const FrameHeader& reference,
+                                              float voxel_size,
+                                              float trunc_dist,
+                                              const CodecParams& params);
 
 /// @brief The last refusals a writer makes, of what its entries hold, which
 ///        the device writer's count pass finds: one place for their codes
@@ -262,21 +264,22 @@ VR_CODEC_API const char* coding_difference(const FrameHeader& reference,
 /// @return OK, or in this order: `Status::Code::InvalidArgument` for a mode
 ///         past the alphabet, `Status::Code::Unsupported` for motion, and
 ///         `Status::Code::InvalidArgument` for a value out of range.
-VR_CODEC_API core::Status check_entries(std::uint32_t largest_mode, bool motion,
-                                        bool out_of_range);
+VGRID_CODEC_API core::Status check_entries(std::uint32_t largest_mode,
+                                           bool motion, bool out_of_range);
 
 /// @return How many frequency tables a frame of @p type keeping @p k
 ///         coefficients carries, in TABLES order.
-VR_CODEC_API std::uint32_t frame_model_count(FrameType type, std::uint32_t k);
+VGRID_CODEC_API std::uint32_t frame_model_count(FrameType type,
+                                                std::uint32_t k);
 /// @return The first entry of table @p model at @p k in the kernels'
 ///         per-symbol arrays, every table's symbols back to back in TABLES
 ///         order; for @ref frame_model_count, the arrays' size.
-VR_CODEC_API std::uint32_t frame_model_base(std::uint32_t model,
-                                            std::uint32_t k);
+VGRID_CODEC_API std::uint32_t frame_model_base(std::uint32_t model,
+                                               std::uint32_t k);
 
 /// @brief Normalize a frame's per-model symbol counts into its tables, the
 ///        one way every writer builds them.
-VR_CODEC_API std::vector<FrequencyTable> frame_tables(
+VGRID_CODEC_API std::vector<FrequencyTable> frame_tables(
     const std::vector<std::vector<std::uint64_t>>& counts);
 
 /// @brief A frame whose segments are already coded, which
@@ -316,7 +319,7 @@ struct CodedFrame {
 ///         intra frame, tables or segment lengths whose count the header
 ///         disagrees with, lengths that do not sum to the payload, a payload
 ///         past 4 GiB or more than 2^30 - 1 segments.
-VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
+VGRID_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
     FrameType type, const CodedFrame& frame);
 
 /// @brief @ref assemble_frame's bytes but PAYLOAD's body, which comes last:
@@ -325,7 +328,7 @@ VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_frame(
 ///        read. The head then the payload are @ref assemble_frame's bytes.
 /// @return The head; or @ref assemble_frame's refusals, the segment lengths
 ///         summed against @p payload_size.
-VR_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_head(
+VGRID_CODEC_API core::Result<std::vector<std::uint8_t>> assemble_head(
     FrameType type, const CodedFrame& frame, std::uint64_t payload_size);
 
 /// @brief A frame parsed and checked up to its segment streams: what the
@@ -378,7 +381,7 @@ struct ParsedFrame {
 ///         `Status::Code::OutOfMemory` for a well-formed frame of more than
 ///         @p max_blocks blocks. The order the refusals are made in is this
 ///         file's; a segment's own are @ref check_segment's.
-VR_CODEC_API core::Result<ParsedFrame> parse_frame(
+VGRID_CODEC_API core::Result<ParsedFrame> parse_frame(
     const std::uint8_t* data, std::size_t size, std::uint32_t max_blocks,
     const FrameReference* reference);
 
@@ -405,21 +408,21 @@ enum class SegmentFault : std::uint32_t {
 ///        one place for both readers' codes and words.
 /// @return OK for @ref SegmentFault::kNone; otherwise
 ///         `Status::Code::InvalidArgument`.
-VR_CODEC_API core::Status check_segment(std::uint64_t s, SegmentFault fault);
+VGRID_CODEC_API core::Status check_segment(std::uint64_t s, SegmentFault fault);
 
 /// @brief A P-frame's survivor count, which only a whole decode knows: one
 ///        place for both readers' refusal.
 /// @return OK when @p survivors, its reference entries that keep, skip or
 ///         zero, are @p n - @p a; otherwise `Status::Code::InvalidArgument`.
-VR_CODEC_API core::Status check_survivors(std::uint64_t survivors,
-                                          std::uint32_t n, std::uint32_t a);
+VGRID_CODEC_API core::Status check_survivors(std::uint64_t survivors,
+                                             std::uint32_t n, std::uint32_t a);
 
 /// @brief The refusal of a P-frame whose new block @p q is on reference
 ///        entry @p e -- one spelling per block: a reference block is recoded
 ///        with zero, never removed and added -- whatever that entry's mode.
 ///        The decoder's merge finds the first such pair.
 /// @return `Status::Code::InvalidArgument`.
-VR_CODEC_API core::Status check_new_block(std::uint32_t q, std::uint32_t e);
+VGRID_CODEC_API core::Status check_new_block(std::uint32_t q, std::uint32_t e);
 
 /// @ref ApplySource's value for a field the block does not take.
 inline constexpr std::uint32_t kNoSource = ~0u;
@@ -438,4 +441,4 @@ static_assert(sizeof(ApplySource) == 8 &&
                   offsetof(ApplySource, payload) == 4,
               "ApplySource is two u32, as the apply kernel reads it");
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

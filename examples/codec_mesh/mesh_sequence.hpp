@@ -17,13 +17,13 @@
 #include "config.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/io/mesh_normalization.hpp"
-#include "volumetric_kit/recon/io/triangle_mesh.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_normalization.hpp"
+#include "volumetric_kit/grid/mesh_io/triangle_mesh.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 /// @brief Frame @p number's path in @p pattern.
 ///
@@ -39,10 +39,10 @@ vkc::Result<std::string> numbered_path(const std::string& pattern,
 
 /// @brief One frame, loaded and placed in metres.
 struct MeshFrame {
-  std::uint32_t number = 0;       ///< Its number: its record's set.
-  std::string path;               ///< Its file.
-  vr::io::TriangleMesh mesh;      ///< Its geometry, in metres.
-  vr::io::MeshTopology topology;  ///< The audit of those coordinates.
+  std::uint32_t number = 0;               ///< Its number: its record's set.
+  std::string path;                       ///< Its file.
+  vgrid::mesh_io::TriangleMesh mesh;      ///< Its geometry, in metres.
+  vgrid::mesh_io::MeshTopology topology;  ///< The audit of those coordinates.
 };
 
 /// @brief The frames a run codes -- `run.frames` of them, numbered from
@@ -60,8 +60,9 @@ class MeshSequence {
   /// (@ref admit), before any GPU work; rounding can still make a placed
   /// triangle degenerate or a volume's sign change, which @ref load's audit
   /// decides. One transform is fitted to the union of the frames' bounds:
-  /// `io::fit_transform` to `source.height_m`, or `io::scale_transform` by
-  /// `source.metres_per_unit`, which refuse a placement past float range.
+  /// `mesh_io::fit_transform` to `source.height_m`, or
+  /// `mesh_io::scale_transform` by `source.metres_per_unit`, which refuse a
+  /// placement past float range.
   /// @return The sequence; before any load, InvalidArgument for a malformed
   ///         pattern, for `run.first` above 0 or `run.frames` above 1 with no
   ///         number in `source.path` (naming the key), or for a frame's file
@@ -79,7 +80,9 @@ class MeshSequence {
   /// @return Frame @p number's file. @pre first() <= number <= last().
   const std::string& path(std::uint32_t number) const;
   /// @return The transform that places every frame.
-  const vr::io::MeshTransform& transform() const noexcept { return transform_; }
+  const vgrid::mesh_io::MeshTransform& transform() const noexcept {
+    return transform_;
+  }
 
   /// @brief Print the range, its bounds and the transform.
   void print() const;
@@ -96,7 +99,7 @@ class MeshSequence {
   /// @return OK, or InvalidArgument naming the frame, its file and its
   ///         defects, and `source.allow_holes` when holes are its only one.
   vkc::Status admit(std::uint32_t number,
-                    const vr::io::MeshTopology& topology) const;
+                    const vgrid::mesh_io::MeshTopology& topology) const;
 
  private:
   MeshSequence() = default;
@@ -106,15 +109,15 @@ class MeshSequence {
   std::vector<std::string> paths_;  // frame first_ + i's at i
   bool signed_ = true;
   bool allow_holes_ = false;
-  bool by_height_ = true;       // fitted to source.height_m, else scaled
-  vr::io::MeshBounds input_;    // the union in input coordinates
-  vr::io::MeshBounds upright_;  // the union along the up axes
-  vr::io::MeshTransform transform_;
+  bool by_height_ = true;             // fitted to source.height_m, else scaled
+  vgrid::mesh_io::MeshBounds input_;  // the union in input coordinates
+  vgrid::mesh_io::MeshBounds upright_;  // the union along the up axes
+  vgrid::mesh_io::MeshTransform transform_;
 };
 
 /// @return @p topology's defects, each a count and what it counts, joined
 ///         by ", "; empty when signed mode can take it without holes.
-std::string topology_defects(const vr::io::MeshTopology& topology);
+std::string topology_defects(const vgrid::mesh_io::MeshTopology& topology);
 
 /// @brief Print a frame's size and its full topology audit.
 void print_frame(const MeshFrame& frame);
@@ -137,16 +140,17 @@ vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence);
 ///        an earlier frame stays, allocate the mesh's band, growing the grid
 ///        for capacity and retrying lost bucket-lock races, then integrate.
 /// @return The integrator's stats, or the first error.
-vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
-    vr::volume::VoxelBlockGrid& grid, vr::voxelize::MeshIntegrator& integrator,
-    const vr::io::TriangleMesh& mesh, const vr::voxelize::MeshSdfParams& params,
-    vkc::StageMetrics* metrics);
+vkc::Result<vgrid::voxelize::MeshIntegrateStats> convert_frame(
+    vgrid::volume::VoxelBlockGrid& grid,
+    vgrid::voxelize::MeshIntegrator& integrator,
+    const vgrid::mesh_io::TriangleMesh& mesh,
+    const vgrid::voxelize::MeshSdfParams& params, vkc::StageMetrics* metrics);
 
 /// @brief What @ref code_frame did with one frame.
 struct CodedFrame {
-  MeshFrame frame;                         ///< The frame as converted.
-  vr::voxelize::MeshIntegrateStats stats;  ///< Its conversion.
-  vr::codec_stream::SentFrame sent;        ///< Its record, as it went out.
+  MeshFrame frame;                            ///< The frame as converted.
+  vgrid::voxelize::MeshIntegrateStats stats;  ///< Its conversion.
+  vgrid::codec_stream::SentFrame sent;        ///< Its record, as it went out.
 };
 
 /// @brief One frame of a run: @ref MeshSequence::load, @ref
@@ -156,10 +160,10 @@ struct CodedFrame {
 /// @return The frame, or the first error, naming the frame.
 vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    std::uint32_t number,
-                                   vr::volume::VoxelBlockGrid& grid,
-                                   vr::voxelize::MeshIntegrator& integrator,
-                                   const vr::voxelize::MeshSdfParams& params,
-                                   vr::codec_stream::CodecStream& stream,
+                                   vgrid::volume::VoxelBlockGrid& grid,
+                                   vgrid::voxelize::MeshIntegrator& integrator,
+                                   const vgrid::voxelize::MeshSdfParams& params,
+                                   vgrid::codec_stream::CodecStream& stream,
                                    vkc::StageMetrics* conversion);
 
-}  // namespace vr_example
+}  // namespace vgrid_example

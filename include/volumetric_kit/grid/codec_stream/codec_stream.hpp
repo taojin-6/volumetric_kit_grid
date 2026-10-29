@@ -18,14 +18,14 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/codec_stream/export.hpp"
-#include "volumetric_kit/recon/networking/stream_server.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec_stream/export.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::codec_stream {
+namespace volumetric_kit::grid::codec_stream {
 
 namespace detail {
 class StreamCoder;
@@ -115,7 +115,7 @@ struct SentFrame {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must outlive
 ///          the stream. Not thread-safe: one call at a time.
-class VR_CODEC_STREAM_API CodecStream {
+class VGRID_CODEC_STREAM_API CodecStream {
  public:
   /// @brief Make the outputs, then the encoder and, with
   ///        @ref CodecOutputs::decode, the decoder.
@@ -282,4 +282,4 @@ class VR_CODEC_STREAM_API CodecStream {
   std::unique_ptr<detail::StreamCoder> coder_;
 };
 
-}  // namespace volumetric_kit::recon::codec_stream
+}  // namespace volumetric_kit::grid::codec_stream

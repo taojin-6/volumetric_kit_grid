@@ -1,0 +1,5 @@
+# cmake-format configuration.
+markup:
+  # Emit the first comment block in each file verbatim, so the two-line SPDX
+  # license header is not reflowed into a single line.
+  first_comment_is_literal: true

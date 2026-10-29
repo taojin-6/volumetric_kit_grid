@@ -27,12 +27,12 @@
 #include "dct_tables.hpp"
 #include "frame_hash.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 namespace oracle = codec_oracle;
 
 namespace {
@@ -141,7 +141,7 @@ int golden_case() {
         oracle::write_frame(f, opt);
     CHECK(bytes.ok());
     const std::uint32_t content = codec_frames::content_hash(f);
-    const std::uint32_t hash = vr_test::fnv1a(bytes.value());
+    const std::uint32_t hash = vgrid_test::fnv1a(bytes.value());
     if (content != g.content || bytes.value().size() != g.size ||
         hash != g.hash) {
       std::fprintf(stderr,
@@ -206,7 +206,7 @@ int write_refusals_case() {
   CHECK(!typed.ok());
   CHECK(typed.status().domain() == vkc::Status::Code::Unsupported);
   // An intra frame has no reference and no modes (P-frames are
-  // recon_codec_inter_bitstream's).
+  // grid_codec_inter_bitstream's).
   f = good;
   f.reference.hash = 1;
   CHECK(refused(f));
@@ -613,7 +613,7 @@ int table_rules_case() {
 }
 
 // Blocks all observed with zero coefficients at @p coords, K = 1.
-oracle::Frame plain_frame(const std::vector<vr::Vec3i>& coords) {
+oracle::Frame plain_frame(const std::vector<vgrid::Vec3i>& coords) {
   oracle::Frame f = make_frame(0, 1, 1);
   f.coords = coords;
   f.blocks.masks.assign(coords.size() * codec::kMaskWordsPerBlock, ~0u);
@@ -684,7 +684,7 @@ int segment_order_case() {
   // A step forwards is only a different, valid frame.
   vkc::Result<oracle::Frame> r = with_second_x(9);
   CHECK(r.ok());
-  CHECK(r.value().coords[1] == vr::Vec3i(9, 0, 0));
+  CHECK(r.value().coords[1] == vgrid::Vec3i(9, 0, 0));
   return 0;
 }
 
@@ -730,7 +730,7 @@ int corruption_case() {
 int zero_frame_cost_case() {
   oracle::Frame f = make_frame(0, 32, 1);
   for (int i = 0; i < 640; ++i) {
-    f.coords.push_back(vr::Vec3i(i, 0, 0));
+    f.coords.push_back(vgrid::Vec3i(i, 0, 0));
   }
   f.blocks.masks.assign(640 * codec::kMaskWordsPerBlock, ~0u);
   f.blocks.coefficients.assign(640 * 32, 0);

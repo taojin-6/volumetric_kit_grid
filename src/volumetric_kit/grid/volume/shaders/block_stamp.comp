@@ -6,7 +6,7 @@
 // blocks neither an allocation nor weight has stamped in more ticks than that.
 
 #extension GL_GOOGLE_include_directive : require
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
 #include "hash_common.glsl"
 
 layout(local_size_x = 256) in;

@@ -17,15 +17,15 @@
 
 #include "bitstream.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
 namespace codec_oracle {
 
 namespace vkc = volumetric_kit::core;
-namespace vr = volumetric_kit::recon;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace vgrid = volumetric_kit::grid;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 
 // One block list's transform on the host: what the forward transform leaves
 // on the device, read back K coefficients to an entry, and what its inverse
@@ -53,7 +53,7 @@ struct Frame {
   std::vector<d::BlockMode> modes;
   // Block coordinates, strictly increasing in (z, y, x) order, as the format
   // requires: a P-frame's A new blocks, an intra frame's every block.
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   // The payload by stream position: a P-frame's M reference entries, then its
   // new blocks, entry for entry with coords; an intra frame's blocks. A keep
   // entry holds its XOR mask and residuals. Skip and remove entries are zero

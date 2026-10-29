@@ -17,19 +17,19 @@
 
 layout(local_size_x = kLanes) in;
 
-layout(set = 0, binding = VR_DCT_BINDING_WEIGHT, scalar) readonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_WEIGHT, scalar) readonly buffer
     Weight {
   float weight[];
 };
 // Up to pc.num_blocks entries, on the masks' binding: this writes no mask.
 // Append order is unspecified; the encoder sorts by coordinate on the host.
-layout(set = 0, binding = VR_DCT_BINDING_MASKS, scalar) writeonly buffer
+layout(set = 0, binding = VGRID_DCT_BINDING_MASKS, scalar) writeonly buffer
     Observed {
   BlockIndex observed[];
 };
 
 // One word per block slot (see dct_common.glsl), read only with pc.true_sdf.
-layout(set = 0, binding = VR_DCT_BINDING_KEEP, scalar) readonly buffer Keep {
+layout(set = 0, binding = VGRID_DCT_BINDING_KEEP, scalar) readonly buffer Keep {
   uint keep[];
 };
 

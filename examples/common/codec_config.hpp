@@ -13,12 +13,12 @@
 #include "codec_quantization.hpp"
 #include "config.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
-namespace vr_example {
+namespace vgrid_example {
 
 /// @return The selected table's name, as @ref apply_quantization_table and
 ///         the measurement report take it.
@@ -39,9 +39,9 @@ inline const char* quantization_name(config::QuantizationTable table) {
 ///         InvalidArgument from `EncoderConfig::validate` for what core
 ///         leaves to the codec: a kept coefficient's step outside its
 ///         bounds, or a segment or update size past its longest.
-inline volumetric_kit::core::Result<volumetric_kit::recon::codec::EncoderConfig>
+inline volumetric_kit::core::Result<volumetric_kit::grid::codec::EncoderConfig>
 encoder_config(const config::Codec& settings) {
-  namespace codec = volumetric_kit::recon::codec;
+  namespace codec = volumetric_kit::grid::codec;
   codec::EncoderConfig result;
   result.params.coefficient_count = settings.coefficient_count;
   result.params.quantization_scale = settings.quantization_scale;
@@ -59,7 +59,7 @@ encoder_config(const config::Codec& settings) {
 ///         period, above 1 with the update size its P-frames use, and
 ///         whether it codes a true SDF.
 inline std::string codec_settings(
-    const volumetric_kit::recon::codec::EncoderConfig& config,
+    const volumetric_kit::grid::codec::EncoderConfig& config,
     config::QuantizationTable table) {
   char text[128];
   std::snprintf(text, sizeof text,
@@ -85,9 +85,9 @@ inline std::string codec_settings(
 ///         serving nothing, without `replay_gop`: the stream codes live, so a
 ///         viewer that joins or falls behind gets a key at the next frame.
 ///         `output.csv` is the report's (`CodecReport`).
-inline volumetric_kit::recon::codec_stream::CodecOutputs codec_outputs(
+inline volumetric_kit::grid::codec_stream::CodecOutputs codec_outputs(
     const config::Output& output) {
-  volumetric_kit::recon::codec_stream::CodecOutputs outputs;
+  volumetric_kit::grid::codec_stream::CodecOutputs outputs;
   outputs.stream = output.stream;
   if (output.serve != 0) {
     outputs.serve.emplace();  // every interface
@@ -100,9 +100,9 @@ inline volumetric_kit::recon::codec_stream::CodecOutputs codec_outputs(
 /// @return The outputs of @p opt's sender's stream (@ref codec_outputs),
 ///         decoding each frame only with `output.csv` or `codec.sweep`,
 ///         which read the decode: a recording or a server alone needs none.
-inline volumetric_kit::recon::codec_stream::CodecOutputs set_codec_outputs(
+inline volumetric_kit::grid::codec_stream::CodecOutputs set_codec_outputs(
     const config::Config& opt) {
-  volumetric_kit::recon::codec_stream::CodecOutputs outputs =
+  volumetric_kit::grid::codec_stream::CodecOutputs outputs =
       codec_outputs(opt.output);
   outputs.decode = !opt.output.csv.empty() || opt.codec.sweep;
   return outputs;
@@ -111,12 +111,12 @@ inline volumetric_kit::recon::codec_stream::CodecOutputs set_codec_outputs(
 /// @return The session a codec example's stream writes and serves: its
 ///         writer @p program and one Geometry track at @p rate, the source's,
 ///         whose params are @p geometry_params, empty or a mesh source's
-///         `io::encode_transform` bytes (stream/session.hpp). No session id
-///         or start time, so a rerun writes the same bytes.
-inline volumetric_kit::recon::stream::Session codec_session(
-    const std::string& program, volumetric_kit::recon::stream::Rate rate,
+///         `mesh_io::encode_transform` bytes (stream/session.hpp). No session
+///         id or start time, so a rerun writes the same bytes.
+inline volumetric_kit::grid::stream::Session codec_session(
+    const std::string& program, volumetric_kit::grid::stream::Rate rate,
     std::string geometry_params = {}) {
-  namespace stream = volumetric_kit::recon::stream;
+  namespace stream = volumetric_kit::grid::stream;
   stream::Track geometry;
   geometry.kind = stream::TrackKind::Geometry;
   geometry.rate = rate;
@@ -133,10 +133,10 @@ inline volumetric_kit::recon::stream::Session codec_session(
 ///         out; or InvalidArgument naming the minimum, for a caller that
 ///         refuses before any GPU work.
 inline volumetric_kit::core::Status check_true_sdf_band(
-    const volumetric_kit::recon::voxelize::MeshSdfParams& sdf,
-    const volumetric_kit::recon::volume::VoxelGridParams& grid) {
-  namespace codec = volumetric_kit::recon::codec;
-  namespace voxelize = volumetric_kit::recon::voxelize;
+    const volumetric_kit::grid::voxelize::MeshSdfParams& sdf,
+    const volumetric_kit::grid::volume::VoxelGridParams& grid) {
+  namespace codec = volumetric_kit::grid::codec;
+  namespace voxelize = volumetric_kit::grid::voxelize;
   const bool shell = sdf.mode == voxelize::MeshSdfMode::Shell;
   const double least = double(codec::kTrueSdfBandVoxels) +
                        (shell ? double(sdf.shell_voxels) : 0.0);
@@ -158,10 +158,10 @@ inline volumetric_kit::core::Status check_true_sdf_band(
 ///         InvalidArgument from `MeshSdfParams::validate` against @p grid:
 ///         the shell's bound, which core leaves to the mesh conversion.
 inline volumetric_kit::core::Result<
-    volumetric_kit::recon::voxelize::MeshSdfParams>
+    volumetric_kit::grid::voxelize::MeshSdfParams>
 mesh_sdf_config(const config::Source& source,
-                const volumetric_kit::recon::volume::VoxelGridParams& grid) {
-  namespace voxelize = volumetric_kit::recon::voxelize;
+                const volumetric_kit::grid::volume::VoxelGridParams& grid) {
+  namespace voxelize = volumetric_kit::grid::voxelize;
   voxelize::MeshSdfParams result;
   result.mode = source.sdf_mode == config::SdfMode::Signed
                     ? voxelize::MeshSdfMode::Signed
@@ -171,4 +171,4 @@ mesh_sdf_config(const config::Source& source,
   return result;
 }
 
-}  // namespace vr_example
+}  // namespace vgrid_example

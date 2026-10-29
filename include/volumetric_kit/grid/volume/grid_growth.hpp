@@ -10,10 +10,10 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
-#include "volumetric_kit/recon/volume/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 /// @brief Double @p grid, or grow it to @p at_least buckets if larger.
 ///
@@ -27,8 +27,8 @@ namespace volumetric_kit::recon::volume {
 ///         grid or a negative minimum; `Status::Code::OutOfMemory` at the
 ///         ceiling, for an unreachable minimum or a host allocation failure;
 ///         otherwise @ref VoxelBlockGrid::resize's error.
-VR_VOLUME_API core::Status grow_grid(VoxelBlockGrid& grid,
-                                     std::int32_t at_least = 0,
-                                     core::StageMetrics* metrics = nullptr);
+VGRID_VOLUME_API core::Status grow_grid(VoxelBlockGrid& grid,
+                                        std::int32_t at_least = 0,
+                                        core::StageMetrics* metrics = nullptr);
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

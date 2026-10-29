@@ -1,0 +1,52 @@
+# Formatting + hygiene hooks. Run once after cloning:
+#   pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+
+  - repo: https://github.com/pocc/pre-commit-hooks
+    rev: v1.3.5
+    hooks:
+      - id: clang-format
+        args: [-i, --style=file]
+        types_or: [c, c++, cuda, objective-c++]
+        # Pin the clang-format binary so formatting is identical locally and in
+        # CI; pre-commit installs it, so contributors need not install it too.
+        additional_dependencies: ['clang-format==22.1.8']
+
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+      - id: cmake-format
+        additional_dependencies: [cmakelang, pyyaml]
+
+  # Enforce the Vulkan-include umbrella: first-party code includes
+  # volumetric_kit_core's "volumetric_kit/core/vulkan/vulkan.hpp", never
+  # <vulkan/...> directly, so the loader/dispatch choice (link-time loader today;
+  # volk later) stays a detail of that one header. Fails if any tracked
+  # C / C++ / CUDA / Obj-C++ source includes a <vulkan/...> path. The pattern is
+  # anchored to the start of a line (after optional whitespace) so it matches real
+  # `#include` directives, not the path quoted inside a comment or a Doxygen @code
+  # block. Exemption: examples/ (consumer demo code, not library code, may use
+  # Vulkan directly).
+  - repo: local
+    hooks:
+      - id: vulkan-include-umbrella
+        name: enforce core/vulkan/vulkan.hpp Vulkan-include umbrella
+        entry: '^\s*#\s*include\s*[<"]vulkan/'
+        language: pygrep
+        files: \.(h|hpp|hxx|inl|ipp|c|cc|cpp|cxx|cu|cuh|mm)$
+        exclude: ^examples/
+
+# pre-commit.ci (https://pre-commit.ci) runs these same hooks on every PR and
+# pushes the auto-fixes back to the branch, so formatting lands even when a
+# contributor has not run `pre-commit install` locally. The repo's required
+# `lint` check stays the merge gate; this just removes the manual step.
+ci:
+  autofix_prs: true
+  autofix_commit_msg: "style: auto-fixes from pre-commit.ci hooks"
+  autoupdate_schedule: monthly
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"

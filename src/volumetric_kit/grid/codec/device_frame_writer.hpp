@@ -30,11 +30,11 @@
 #include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// @brief What the front batch's last command gathers into its results slot
 ///        (`encode_results.comp`), before the symbol counts.
@@ -104,7 +104,7 @@ struct TransformWords {
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
-class VR_CODEC_API DeviceFrameWriter {
+class VGRID_CODEC_API DeviceFrameWriter {
  public:
   /// @brief Build the six kernels and the step layout's.
   /// @return The writer, or a pipeline or pool failure.
@@ -278,4 +278,4 @@ class VR_CODEC_API DeviceFrameWriter {
   std::uint32_t payload_per_entry_[2] = {};
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

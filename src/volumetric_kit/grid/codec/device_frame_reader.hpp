@@ -25,10 +25,10 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/fwd.hpp"
-#include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
+#include "volumetric_kit/grid/codec/export.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// The verdict word with no failing segment: a failing one is `s << 2 |
 /// kind`, kind 1 to 3, and s below @ref kMaxFrameSegments, so it is never
@@ -51,7 +51,7 @@ inline constexpr std::uint32_t kNoVerdict = ~0u;
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object. Not thread-safe: one frame at a time.
-class VR_CODEC_API DeviceFrameReader {
+class VGRID_CODEC_API DeviceFrameReader {
  public:
   /// @brief Build the four kernels.
   /// @return The reader, or a pipeline or pool failure.
@@ -126,4 +126,4 @@ class VR_CODEC_API DeviceFrameReader {
   core::Buffer verdict_;        // the first failing segment, the survivors
 };
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

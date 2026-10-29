@@ -1,0 +1,16 @@
+# Plain Google base, 80-column lines, left-aligned pointers, preserved include
+# blocks. Matches volumetric_kit_gfx so the two siblings format identically.
+Language: Cpp
+BasedOnStyle: Google
+ColumnLimit: 80
+IncludeBlocks: Preserve
+DerivePointerAlignment: false
+PointerAlignment: Left
+---
+# The same for Objective-C++ (pixel_buffer_importer.mm).
+Language: ObjC
+BasedOnStyle: Google
+ColumnLimit: 80
+IncludeBlocks: Preserve
+DerivePointerAlignment: false
+PointerAlignment: Left

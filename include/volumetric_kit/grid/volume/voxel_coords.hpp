@@ -12,10 +12,10 @@
 
 #include <cmath>
 
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 
 namespace detail {
 
@@ -140,4 +140,4 @@ inline int truncation_blocks(const VoxelGridParams& grid) {
   return blocks > 1 ? blocks : 1;
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

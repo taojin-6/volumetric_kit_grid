@@ -16,10 +16,10 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
-#include "volumetric_kit/recon/stream/export.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
+#include "volumetric_kit/grid/stream/export.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 
 /// @brief How a @ref StreamReader reads.
 struct ReaderOptions {
@@ -112,7 +112,7 @@ struct Record {
 ///
 /// Every method is `const` and safe to call from several threads at once,
 /// each with its own @ref Position.
-class VR_STREAM_API StreamReader {
+class VGRID_STREAM_API StreamReader {
  public:
   /// @brief Open the file at @p path, from its footer when it is finished,
   ///        otherwise by a scan.
@@ -247,4 +247,4 @@ class VR_STREAM_API StreamReader {
   std::vector<bool> keys_unordered_;         // by track: key pts decrease
 };
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

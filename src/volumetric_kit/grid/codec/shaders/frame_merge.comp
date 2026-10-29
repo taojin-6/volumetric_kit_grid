@@ -19,9 +19,9 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_scalar_block_layout : require
 
-#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
-#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/coord_order.glsl"
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/coord_order.glsl"
 
 #include "block_lists_push.glsl"
 #include "frame_models.glsl"
@@ -58,8 +58,8 @@ layout(set = 0, binding = 6, std430) buffer Collision {
   uint collision_e;  // and that reference entry
 };
 
-VR_COORD_SEARCH(in_reference, reference)
-VR_COORD_SEARCH(in_added, added)
+VGRID_COORD_SEARCH(in_reference, reference)
+VGRID_COORD_SEARCH(in_added, added)
 
 void main() {
   const uint t = pc.item_base + gl_GlobalInvocationID.x;

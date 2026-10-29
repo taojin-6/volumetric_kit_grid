@@ -19,17 +19,17 @@
 
 #include <cstddef>
 
-#include "codec_fixture.hpp"
 #include "deblock.hpp"
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
 namespace codec_deblock_oracle {
 
-namespace d = volumetric_kit::recon::codec::detail;
+namespace d = volumetric_kit::grid::codec::detail;
 
 // The study's T, its arithmetic as it wrote it (deblock.cpp's step_scale),
 // which detail::step_scale must reproduce bit for bit.
-float study_step_scale(const volumetric_kit::recon::codec::CodecParams& params);
+float study_step_scale(const volumetric_kit::grid::codec::CodecParams& params);
 
 // @p grid's tsdf filtered by @p passes in place, in metres, its band
 // @p trunc_dist; a voxel is observed when its weight is at least

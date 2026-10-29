@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/networking/stream_client.hpp"
+#include "volumetric_kit/grid/networking/stream_client.hpp"
 
 #include <poll.h>
 
@@ -15,9 +15,9 @@
 #include "socket.hpp"
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
 
-namespace volumetric_kit::recon::networking {
+namespace volumetric_kit::grid::networking {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -277,4 +277,4 @@ core::Status StreamClient::read(const stream::Record& record, std::uint8_t* dst,
   return s.parser.read(record, dst, capacity);
 }
 
-}  // namespace volumetric_kit::recon::networking
+}  // namespace volumetric_kit::grid::networking

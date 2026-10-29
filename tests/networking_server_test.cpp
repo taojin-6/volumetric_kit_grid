@@ -59,19 +59,19 @@
 #include <utility>
 #include <vector>
 
-#include "networking_loopback.hpp"
-#include "stream_files.hpp"
 #include "volumetric_kit/core/base/log.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/testing/networking_loopback.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace networking = volumetric_kit::recon::networking;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
-namespace net = vr_test::net;
+namespace networking = volumetric_kit::grid::networking;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
+namespace net = vgrid_test::net;
 
 namespace {
 
@@ -1320,7 +1320,7 @@ int main() {
   // core and ignores mallopt from then on.
   CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
 #endif
-  vkc::test::Scratch scratch("recon_networking_server_");
+  vkc::test::Scratch scratch("grid_networking_server_");
   const std::string dir = scratch.path.string();
   if (wire_is_the_file_case(dir) != 0) return 1;
   if (two_runs_case(dir) != 0) return 1;

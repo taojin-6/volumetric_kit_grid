@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -13,7 +13,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
 
 #include "hash_map_internal.hpp"
 #include "table_sizes.hpp"
@@ -21,11 +21,11 @@
 #include "block_stamp_comp.spv.hpp"
 #include "block_zero_comp.spv.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 namespace {
 
 // Both kernels run a workgroup a listed block, item_base the first block a
-// dispatch covers (recon::detail::dispatch_items).
+// dispatch covers (vgrid::detail::dispatch_items).
 struct StampPush {
   std::uint32_t item_base;
   std::uint32_t voxels_per_block;
@@ -418,12 +418,14 @@ core::Status VoxelBlockGrid::build_block_kernels() {
   core::ComputeKernel zero_args;
   core::ComputeKernel stamp_args;
   core::KernelSetBuilder kb(*device_);
-  VKC_TRY(kb.add(stamp, "block_stamp", vr_block_stamp_comp_spv,
-                 vr_block_stamp_comp_spv_size, 5, &stamp_push));
-  VKC_TRY(kb.add(zero, "block_zero", vr_block_zero_comp_spv,
-                 vr_block_zero_comp_spv_size, 3, &zero_push));
-  VKC_TRY(recon::detail::add_dispatch_args(kb, zero_args, "block_zero_args"));
-  VKC_TRY(recon::detail::add_dispatch_args(kb, stamp_args, "block_stamp_args"));
+  VKC_TRY(kb.add(stamp, "block_stamp", vgrid_block_stamp_comp_spv,
+                 vgrid_block_stamp_comp_spv_size, 5, &stamp_push));
+  VKC_TRY(kb.add(zero, "block_zero", vgrid_block_zero_comp_spv,
+                 vgrid_block_zero_comp_spv_size, 3, &zero_push));
+  VKC_TRY(volumetric_kit::grid::detail::add_dispatch_args(kb, zero_args,
+                                                          "block_zero_args"));
+  VKC_TRY(volumetric_kit::grid::detail::add_dispatch_args(kb, stamp_args,
+                                                          "block_stamp_args"));
   VKC_ASSIGN(core::DescriptorPool pool, kb.build());
   core::KernelSets sets;
   VKC_TRY(sets.reserve(*device_, zero,
@@ -491,12 +493,12 @@ core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
   }
   // The stamp pass, a group an active block, sized from the compaction's
   // count; it lists the stale blocks and counts them.
-  recon::detail::IndirectSlices groups;
-  VKC_TRY(recon::detail::record_dispatch_args(
+  volumetric_kit::grid::detail::IndirectSlices groups;
+  VKC_TRY(volumetric_kit::grid::detail::record_dispatch_args(
       batch, *device_, *allocator_, stamp_args_kernel_, stamp_slices_,
       "grid.stamp_slices",
-      recon::detail::SlicedCount{active.count, 0, slots, 1}, 1, &groups, 0,
-      nullptr, max_workgroup_count_x_, &stage));
+      volumetric_kit::grid::detail::SlicedCount{active.count, 0, slots, 1}, 1,
+      &groups, 0, nullptr, max_workgroup_count_x_, &stage));
   const core::DescriptorSet& set = stamp_kernel_.set;
   set.write_storage_buffer(0, weight.buffer->handle(), 0, VK_WHOLE_SIZE);
   set.write_storage_buffer(1, active.buffer->handle(), 0, list_bytes);
@@ -507,8 +509,8 @@ core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
                        static_cast<std::uint32_t>(map_.grid().voxels_per_block),
                        map_.tick(), max_age, kObservedWeight};
   VKC_TRY(batch.fill(stale_count_, 0, sizeof(std::uint32_t), 0u));
-  VKC_TRY(recon::detail::dispatch_slices(batch, stamp_kernel_, push, groups,
-                                         &stage));
+  VKC_TRY(volumetric_kit::grid::detail::dispatch_slices(batch, stamp_kernel_,
+                                                        push, groups, &stage));
   // Each stale block zeroed, then freed, from the list and count the pass
   // left: the removal needs no host coordinate or count.
   VKC_ASSIGN(
@@ -566,14 +568,15 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
                                            entries_bytes,
                                            max_storage_buffer_range_));
   // A workgroup a block, as many as the device's count says behind its gate.
-  recon::detail::IndirectSlices slices;
+  volumetric_kit::grid::detail::IndirectSlices slices;
   if (words != nullptr) {
-    VKC_TRY(recon::detail::record_dispatch_args(
+    VKC_TRY(volumetric_kit::grid::detail::record_dispatch_args(
         batch, *device_, *allocator_, zero_args_kernel_, zero_slices_,
         "grid.zero_slices",
-        recon::detail::SlicedCount{words->buffer, words->offset, count, 1,
-                                   gate != nullptr ? gate->buffer : nullptr,
-                                   gate != nullptr ? gate->offset : 0},
+        volumetric_kit::grid::detail::SlicedCount{
+            words->buffer, words->offset, count, 1,
+            gate != nullptr ? gate->buffer : nullptr,
+            gate != nullptr ? gate->offset : 0},
         1, &slices, 0, nullptr, max_workgroup_count_x_, stage));
   }
   for (std::size_t i = 0; i < attributes_.size(); ++i) {
@@ -593,15 +596,15 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
     if (words != nullptr) {
       // An indirect dispatch binds the kernel's own set.
       zero_kernel_.set = set;
-      VKC_TRY(recon::detail::dispatch_slices(batch, zero_kernel_, push, slices,
-                                             stage));
+      VKC_TRY(volumetric_kit::grid::detail::dispatch_slices(
+          batch, zero_kernel_, push, slices, stage));
     } else {
-      VKC_TRY(recon::detail::dispatch_items(batch, zero_kernel_, push, count, 1,
-                                            max_workgroup_count_x_, stage,
-                                            &set));
+      VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
+          batch, zero_kernel_, push, count, 1, max_workgroup_count_x_, stage,
+          &set));
     }
   }
   return {};
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

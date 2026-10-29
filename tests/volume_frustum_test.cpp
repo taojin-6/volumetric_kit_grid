@@ -26,24 +26,24 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
 
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/frustum.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/frustum.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -111,19 +111,21 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // kEdge is just PAST the true right image edge, kept only by the ~10%
   // side-plane widening (remove/reverse the widening and it culls); kNearFar is
   // just INSIDE the far plane (world z 4.8 < far 5), pinning the far clip.
-  const vr::Vec3i kInside(0, 0, 25);    // world (0,0,1.0): dead centre
-  const vr::Vec3i kEdge(14, 0, 25);     // world (0.56,0,1.0): past true edge
-  const vr::Vec3i kNearFar(0, 0, 120);  // world (0,0,4.8): just inside far
-  const vr::Vec3i kBehind(0, 0, -25);   // world (0,0,-1.0): behind the camera
-  const vr::Vec3i kFar(0, 0, 200);      // world (0,0,8.0): beyond far
-  const vr::Vec3i kSide(100, 0, 25);    // world (4.0,0,1.0): outside the fov
+  const vgrid::Vec3i kInside(0, 0, 25);    // world (0,0,1.0): dead centre
+  const vgrid::Vec3i kEdge(14, 0, 25);     // world (0.56,0,1.0): past true edge
+  const vgrid::Vec3i kNearFar(0, 0, 120);  // world (0,0,4.8): just inside far
+  const vgrid::Vec3i kBehind(0, 0, -25);  // world (0,0,-1.0): behind the camera
+  const vgrid::Vec3i kFar(0, 0, 200);     // world (0,0,8.0): beyond far
+  const vgrid::Vec3i kSide(100, 0, 25);   // world (4.0,0,1.0): outside the fov
   std::vector<vol::BlockIndex> coords;
-  for (const vr::Vec3i& c : {kInside, kEdge, kNearFar, kBehind, kFar, kSide}) {
+  for (const vgrid::Vec3i& c :
+       {kInside, kEdge, kNearFar, kBehind, kFar, kSide}) {
     vol::BlockIndex b{};
     b.coord = c;
     coords.push_back(b);
   }
-  vkc::Result<std::uint32_t> fail = vr_test::allocate_blocks(gpu, map, coords);
+  vkc::Result<std::uint32_t> fail =
+      vgrid_test::allocate_blocks(gpu, map, coords);
   CHECK(fail.ok() && fail.value() == 0);
 
   // Plain compaction: all six blocks are active.
@@ -136,7 +138,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // count + distinct ptrs, so a duplicate append in the frustum kernel fails.
   const std::set<Coord> want = {{0, 0, 25}, {14, 0, 25}, {0, 0, 120}};
   const vol::FrustumPlanes planes = vol::make_frustum_planes(
-      100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 0.1f, 5.0f, vr::Mat4f(1.0f));
+      100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 0.1f, 5.0f, vgrid::Mat4f(1.0f));
   vkc::Device& dev = gpu.device;
   vkc::Allocator& alloc = gpu.allocator;
   vkc::Result<std::vector<vol::BlockIndex>> visible =
@@ -153,7 +155,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       map.compact_active_blocks_on_device();
   CHECK(full.ok() && full.value().count == 6);
   const vol::FrustumPlanes beyond = vol::make_frustum_planes(
-      100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 6.0f, 10.0f, vr::Mat4f(1.0f));
+      100.0f, 100.0f, 50.0f, 50.0f, 100, 100, 6.0f, 10.0f, vgrid::Mat4f(1.0f));
   vkc::Result<vol::DeviceBlockList> both =
       map.compact_active_blocks_in_frusta_on_device({planes, beyond});
   CHECK(both.ok());
@@ -190,24 +192,25 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(map.clear().ok());
   // Column-major: col0 (cam +X -> world -Z), col1 (cam +Y -> world +Y), col2
   // (cam +Z view -> world +X), col3 = camera world position (1,2,3).
-  const vr::Mat4f pose(0.0f, 0.0f, -1.0f, 0.0f,  // column 0
-                       0.0f, 1.0f, 0.0f, 0.0f,   // column 1
-                       1.0f, 0.0f, 0.0f, 0.0f,   // column 2
-                       1.0f, 2.0f, 3.0f, 1.0f);  // column 3 (camera position)
+  const vgrid::Mat4f pose(0.0f, 0.0f, -1.0f, 0.0f,  // column 0
+                          0.0f, 1.0f, 0.0f, 0.0f,   // column 1
+                          1.0f, 0.0f, 0.0f, 0.0f,   // column 2
+                          1.0f, 2.0f, 3.0f,
+                          1.0f);  // column 3 (camera position)
   // Camera at (1,2,3) looking +X. kFront -> world (3,2,3) is 2 m dead ahead
   // (cam-space (0,0,2)); the others are behind / beyond far / far off-axis.
-  const vr::Vec3i kFront(75, 50, 75);     // cam-space (0,0,2): dead centre
-  const vr::Vec3i kPBehind(-25, 50, 75);  // cam-space depth -2: behind
-  const vr::Vec3i kPFar(225, 50, 75);     // cam-space depth 8: beyond far
-  const vr::Vec3i kPSide(75, 50, -175);   // cam-space (10,0,2): u ~ 550
+  const vgrid::Vec3i kFront(75, 50, 75);     // cam-space (0,0,2): dead centre
+  const vgrid::Vec3i kPBehind(-25, 50, 75);  // cam-space depth -2: behind
+  const vgrid::Vec3i kPFar(225, 50, 75);     // cam-space depth 8: beyond far
+  const vgrid::Vec3i kPSide(75, 50, -175);   // cam-space (10,0,2): u ~ 550
   std::vector<vol::BlockIndex> pcoords;
-  for (const vr::Vec3i& c : {kFront, kPBehind, kPFar, kPSide}) {
+  for (const vgrid::Vec3i& c : {kFront, kPBehind, kPFar, kPSide}) {
     vol::BlockIndex b{};
     b.coord = c;
     pcoords.push_back(b);
   }
   vkc::Result<std::uint32_t> pfail =
-      vr_test::allocate_blocks(gpu, map, pcoords);
+      vgrid_test::allocate_blocks(gpu, map, pcoords);
   CHECK(pfail.ok() && pfail.value() == 0);
 
   vkc::Result<std::vector<vol::BlockIndex>> pvisible =
@@ -225,7 +228,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // cx=cy=50, 100x100 pinhole above.
   //
   // RH_ZO explicitly, not glm::perspective: that one follows
-  // GLM_FORCE_DEPTH_ZERO_TO_ONE, which recon does not define (it draws
+  // GLM_FORCE_DEPTH_ZERO_TO_ONE, which grid does not define (it draws
   // nothing), so it would hand this a GL-convention [-1,1] matrix and the test
   // would then assert the very confusion the overload's @warning is about.
   CHECK(map.clear().ok());
@@ -244,16 +247,16 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // the near plane moved behind the camera and the also-widened side planes
   // admitted a cone of geometry behind it. kBehind is too far back (1.0 m) to
   // catch that -- it needs a block within the margin.
-  const vr::Vec3i kNearBand(0, 0, 3);     // world z [0.12, 0.16]
-  const vr::Vec3i kJustBehind(0, 0, -3);  // world z [-0.12, -0.08]
+  const vgrid::Vec3i kNearBand(0, 0, 3);     // world z [0.12, 0.16]
+  const vgrid::Vec3i kJustBehind(0, 0, -3);  // world z [-0.12, -0.08]
   std::vector<vol::BlockIndex> vp_coords = coords;
-  for (const vr::Vec3i& c : {kNearBand, kJustBehind}) {
+  for (const vgrid::Vec3i& c : {kNearBand, kJustBehind}) {
     vol::BlockIndex b{};
     b.coord = c;
     vp_coords.push_back(b);
   }
   vkc::Result<std::uint32_t> vfail =
-      vr_test::allocate_blocks(gpu, map, vp_coords);
+      vgrid_test::allocate_blocks(gpu, map, vp_coords);
   CHECK(vfail.ok() && vfail.value() == 0);
   // lookAtRH from the origin toward world +Z with up = world -Y. Camera right
   // is world +X and camera down world +Y, so the two overloads describe the
@@ -264,10 +267,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // cannot tell the two apart, and nothing here should be read as claiming
   // they do.
   const float kFovY = 2.0f * std::atan(0.5f);
-  const vr::Mat4f view =
-      glm::lookAtRH(vr::Vec3f(0.0f, 0.0f, 0.0f), vr::Vec3f(0.0f, 0.0f, 1.0f),
-                    vr::Vec3f(0.0f, -1.0f, 0.0f));
-  const vr::Mat4f view_proj =
+  const vgrid::Mat4f view = glm::lookAtRH(vgrid::Vec3f(0.0f, 0.0f, 0.0f),
+                                          vgrid::Vec3f(0.0f, 0.0f, 1.0f),
+                                          vgrid::Vec3f(0.0f, -1.0f, 0.0f));
+  const vgrid::Mat4f view_proj =
       glm::perspectiveRH_ZO(kFovY, 1.0f, 0.1f, 5.0f) * view;
 
   // Exact, so kEdge is CULLED here -- it survives the pinhole overload only on
@@ -285,7 +288,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // shell about one near-distance thick -- and kNearBand, which lies in exactly
   // that shell, is the block that goes missing. Everything else answers the
   // same, which is why this needed a block of its own.
-  const vr::Mat4f view_proj_gl =
+  const vgrid::Mat4f view_proj_gl =
       glm::perspectiveRH_NO(kFovY, 1.0f, 0.1f, 5.0f) * view;
   std::set<Coord> gl_want = vp_want;
   gl_want.erase({0, 0, 3});
@@ -344,13 +347,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // everything, which is an empty mesh every frame with Status::ok. The
   // degenerate branch adds no margin, so this keeps every block instead --
   // conservative, and the direction a cull should fail in.
-  vkc::Result<std::vector<vol::BlockIndex>> vp_degenerate =
-      cull(dev, alloc, map, vol::make_frustum_planes(vr::Mat4f(0.0f), -1e-7f));
+  vkc::Result<std::vector<vol::BlockIndex>> vp_degenerate = cull(
+      dev, alloc, map, vol::make_frustum_planes(vgrid::Mat4f(0.0f), -1e-7f));
   CHECK(vp_degenerate.ok());
   CHECK(vp_degenerate.value().size() == vp_coords.size());
 
   std::printf(
-      "recon volume frustum test passed: identity view kept %zu/6 (widening + "
+      "grid volume frustum test passed: identity view kept %zu/6 (widening + "
       "near-far edges), posed view kept %zu/4 (pose transform exercised), "
       "view_proj kept %zu/8 exact, %zu/8 under a GL [-1,1] projection and "
       "%zu/8 at a 0.1 m margin; a 0.5 m margin kept the camera outside the "
@@ -364,5 +367,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

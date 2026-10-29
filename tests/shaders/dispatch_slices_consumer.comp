@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// A consumer's kernel on grid's exported split dispatch
+// (base/shaders/dispatch_slices.glsl), compiled by the subproject consumer
+// through INCLUDE_TARGETS volumetric_kit::grid_base (glsl_consumer.cmake): one
+// thread writes the indirect slices of a pass of `groups` groups. Compiled,
+// never run.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define VGRID_SLICES_BINDING 0
+#include "volumetric_kit/grid/base/shaders/dispatch_slices.glsl"
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform Push {
+  uint items;
+  uint lanes;
+  uint per_dispatch;
+  uint dispatches;
+}
+pc;
+
+void main() {
+  vgridWriteSlices(0u, pc.dispatches, pc.per_dispatch,
+                   vgridGroups(pc.items, pc.lanes));
+}

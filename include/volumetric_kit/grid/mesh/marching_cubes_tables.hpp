@@ -31,7 +31,7 @@
 
 #include <cstdint>
 
-namespace volumetric_kit::recon::mesh {
+namespace volumetric_kit::grid::mesh {
 
 /// @brief Triangle table: `kTriTable[cube_index]` lists crossed-edge indices in
 ///        triples (one triangle each), terminated by the first `-1`.
@@ -309,4 +309,4 @@ inline constexpr std::int32_t kEdgeToVert[12][2] = {
     {0, 4}, {1, 5}, {2, 6}, {3, 7},  // verticals
 };
 
-}  // namespace volumetric_kit::recon::mesh
+}  // namespace volumetric_kit::grid::mesh

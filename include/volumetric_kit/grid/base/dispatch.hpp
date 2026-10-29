@@ -8,11 +8,12 @@
 ///        pass the device's limit, its test seam, and the same split for a
 ///        pass whose size a kernel finds on the device.
 ///
-/// Internal (under src/, never installed). Vulkan guarantees only 65535
-/// groups along x (`maxComputeWorkGroupCount[0]`), which a room's blocks
-/// already pass, so such a dispatch is recorded as several rather than
-/// refused. The seam carries `VR_CORE_API` so a test reaches it in a
-/// shared-library build too.
+/// Public for the tiers of a project that links grid, as recon's tsdf does,
+/// and outside grid's versioned API: its names are in `detail`. Vulkan
+/// guarantees only 65535 groups along x (`maxComputeWorkGroupCount[0]`),
+/// which a room's blocks already pass, so such a dispatch is recorded as
+/// several rather than refused. The seam carries `VGRID_BASE_API` so a test
+/// reaches it in a shared-library build too.
 
 #include <algorithm>
 #include <cstdint>
@@ -24,19 +25,19 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
-#include "volumetric_kit/recon/core/export.hpp"
+#include "volumetric_kit/grid/base/export.hpp"
 
-namespace volumetric_kit::recon::detail {
+namespace volumetric_kit::grid::detail {
 
 /// @return The groups one dispatch of @ref dispatch_items holds:
 ///         @p max_groups, the device's `maxComputeWorkGroupCount[0]`, or the
 ///         cap @ref set_test_groups_per_dispatch set, if lower.
-VR_CORE_API std::uint32_t groups_per_dispatch(std::uint32_t max_groups);
+VGRID_BASE_API std::uint32_t groups_per_dispatch(std::uint32_t max_groups);
 
 /// @brief For tests only: cap @ref groups_per_dispatch at @p groups, so a
 ///        small input takes the split path a device's limit gives a large
 ///        one; 0 lifts the cap. Process-wide.
-VR_CORE_API void set_test_groups_per_dispatch(std::uint32_t groups);
+VGRID_BASE_API void set_test_groups_per_dispatch(std::uint32_t groups);
 
 /// Record @p kernel over @p items invocations of @p lanes a workgroup, in as
 /// many dispatches of @ref groups_per_dispatch groups as it takes; each pushes
@@ -66,7 +67,7 @@ core::Status dispatch_items(core::CommandBatch& batch,
 }
 
 /// The indirect slices of one pass whose size a kernel wrote on the device
-/// (`core/shaders/dispatch_slices.glsl`): @ref dispatches
+/// (`base/shaders/dispatch_slices.glsl`): @ref dispatches
 /// `VkDispatchIndirectCommand`s from @ref offset of @ref buffer, each of up
 /// to @ref per_dispatch groups of @ref lanes items, split as
 /// @ref dispatch_items splits a pass the host knows.
@@ -80,9 +81,9 @@ struct IndirectSlices {
 
 /// @return The slices a pass of at most @p max_items items, @p lanes a group,
 ///         takes at @p per_dispatch groups a slice: at least 1.
-VR_CORE_API std::uint32_t slice_count(std::uint64_t max_items,
-                                      std::uint32_t lanes,
-                                      std::uint32_t per_dispatch);
+VGRID_BASE_API std::uint32_t slice_count(std::uint64_t max_items,
+                                         std::uint32_t lanes,
+                                         std::uint32_t per_dispatch);
 
 /// Record @p kernel over @p slices, each pushing @p push with its first item
 /// as `item_base`, binding the kernel's own set.
@@ -115,13 +116,13 @@ struct SlicedCount {
   VkDeviceSize gate_offset = 0;
 };
 
-/// Add recon's one count-to-indirect-slices kernel
-/// (`core/shaders/dispatch_args.comp`) to @p kb as @p kernel, named @p name.
+/// Add grid's one count-to-indirect-slices kernel
+/// (`base/shaders/dispatch_args.comp`) to @p kb as @p kernel, named @p name.
 /// Each owner builds an instance of its own: a kernel and the buffer of the
 /// slices it writes (@ref record_dispatch_args).
-VR_CORE_API core::Status add_dispatch_args(core::KernelSetBuilder& kb,
-                                           core::ComputeKernel& kernel,
-                                           const char* name);
+VGRID_BASE_API core::Status add_dispatch_args(core::KernelSetBuilder& kb,
+                                              core::ComputeKernel& kernel,
+                                              const char* name);
 
 /// Record into @p batch the sizing of passes of @p count at @p lanes items a
 /// group into @p slices, and at @p second_lanes (0 for none) into @p second,
@@ -131,11 +132,11 @@ VR_CORE_API core::Status add_dispatch_args(core::KernelSetBuilder& kb,
 /// that read @p buffer before must have resolved.
 /// @return OK; `Status::Code::InvalidArgument` for a misaligned word or a
 ///         bound past 32-bit items; or a buffer failure.
-VR_CORE_API core::Status record_dispatch_args(
+VGRID_BASE_API core::Status record_dispatch_args(
     core::CommandBatch& batch, core::Device& device, core::Allocator& allocator,
     core::ComputeKernel& kernel, core::Buffer& buffer, const char* name,
     const SlicedCount& count, std::uint32_t lanes, IndirectSlices* slices,
     std::uint32_t second_lanes, IndirectSlices* second,
     std::uint32_t max_groups, core::GpuStageScope* stage);
 
-}  // namespace volumetric_kit::recon::detail
+}  // namespace volumetric_kit::grid::detail

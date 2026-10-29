@@ -15,14 +15,14 @@
 // A kernel with push constants of its own -- another tier's, or one that
 // reaches this through hash_lookup.glsl -- still wants the struct layouts, the
 // constants and computeHashPos, so the `pc` block below is opt-out via
-// VR_HASH_COMMON_NO_PUSH_CONSTANTS. Everything else is shared unconditionally,
+// VGRID_HASH_COMMON_NO_PUSH_CONSTANTS. Everything else is shared unconditionally,
 // which is the point: a second copy of these constants would compile clean, pass
 // spirv-val, and resolve neighbours from the wrong bucket the moment one of them
 // changed. The include guard is what lets a translation unit reach this both
 // directly and transitively.
 
-#ifndef VR_HASH_COMMON_GLSL
-#define VR_HASH_COMMON_GLSL
+#ifndef VGRID_HASH_COMMON_GLSL
+#define VGRID_HASH_COMMON_GLSL
 
 #extension GL_EXT_scalar_block_layout : require
 
@@ -47,7 +47,7 @@ const int kNoOffset = 0;
 
 // Whether a slot's ptr names a block, neither free nor locked mid-insert: what
 // the compactions list, and the codec's grid diff takes for a grid block.
-bool vrEntryActive(int ptr) { return ptr != kFreeEntry && ptr != kLockEntry; }
+bool vgridEntryActive(int ptr) { return ptr != kFreeEntry && ptr != kLockEntry; }
 
 const uint kHashPrimeX = 73856093u;
 const uint kHashPrimeY = 19349669u;
@@ -89,11 +89,11 @@ const int kFailSlots = 6;
 // --- Push constants: the grid shape + one kernel-specific argument. ---
 //
 // A GLSL translation unit may declare only ONE push-constant block, so a kernel
-// with push constants of its own defines VR_HASH_COMMON_NO_PUSH_CONSTANTS before
+// with push constants of its own defines VGRID_HASH_COMMON_NO_PUSH_CONSTANTS before
 // including this and passes the table shape as function arguments instead (see
 // hash_lookup.glsl). Nothing above this point reads `pc` -- the coord transforms
 // all take their VoxelGridParams as a parameter -- so opting out costs nothing.
-#ifndef VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#ifndef VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
 layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;
   uint arg;  // allocate and delete: their count's word in the rounds' state;
@@ -147,4 +147,4 @@ int truncationBlocks(VoxelGridParams grid) {
   return blocks > 1 ? blocks : 1;
 }
 
-#endif  // VR_HASH_COMMON_GLSL
+#endif  // VGRID_HASH_COMMON_GLSL

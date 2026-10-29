@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/io/mesh_normalization.hpp"
+#include "volumetric_kit/grid/mesh_io/mesh_normalization.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -21,7 +21,7 @@
 // CMake compiles this file with -ffp-contract=off: no multiply-add is fused,
 // so a transform's doubles do not depend on the compiler.
 
-namespace volumetric_kit::recon::io {
+namespace volumetric_kit::grid::mesh_io {
 namespace {
 
 bool finite(const Vec3d& v) {
@@ -419,4 +419,4 @@ core::Result<MeshTopology> audit_mesh_topology(const TriangleMesh& mesh) try {
                                 core::Status::Code::InvalidArgument);
 }
 
-}  // namespace volumetric_kit::recon::io
+}  // namespace volumetric_kit::grid::mesh_io

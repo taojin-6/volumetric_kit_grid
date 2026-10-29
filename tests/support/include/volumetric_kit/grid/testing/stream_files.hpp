@@ -25,11 +25,11 @@
 #include <vector>
 
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
 
-namespace vr_test::vrst {
+namespace vgrid_test::vrst {
 
-namespace stream = volumetric_kit::recon::stream;
+namespace stream = volumetric_kit::grid::stream;
 using Bytes = std::vector<std::uint8_t>;
 
 // zlib's CRC-32, a bit at a time.
@@ -358,4 +358,4 @@ inline ReadBack read_all(const stream::StreamReader& reader) {
   return read_all(reader, reader.begin());
 }
 
-}  // namespace vr_test::vrst
+}  // namespace vgrid_test::vrst

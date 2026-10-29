@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/volume/triangle_candidates.hpp"
+#include "volumetric_kit/grid/volume/triangle_candidates.hpp"
 
 #include <cmath>
 #include <cstddef>
 #include <limits>
 #include <string>
 
-#include "volumetric_kit/recon/volume/voxel_coords.hpp"
+#include "volumetric_kit/grid/volume/voxel_coords.hpp"
 
-namespace volumetric_kit::recon::volume {
+namespace volumetric_kit::grid::volume {
 namespace {
 
 // Every component finite. A mesh vertex is caller data, and one NaN turns a
@@ -66,7 +66,7 @@ core::Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
       continue;
     }
 
-    // Mirrored bit-for-bit by vrCandidateBlock, which recomputes rather than
+    // Mirrored bit-for-bit by vgridCandidateBlock, which recomputes rather than
     // reads this back -- see triangle_candidates.glsl.
     const Vec3f lo = glm::min(v0, glm::min(v1, v2)) - Vec3f(grid.trunc_dist);
     const Vec3f hi = glm::max(v0, glm::max(v1, v2)) + Vec3f(grid.trunc_dist);
@@ -92,4 +92,4 @@ core::Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
   return offsets;
 }
 
-}  // namespace volumetric_kit::recon::volume
+}  // namespace volumetric_kit::grid::volume

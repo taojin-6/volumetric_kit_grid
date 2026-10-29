@@ -9,8 +9,8 @@
 // bitstream.cpp and the tests' CPU oracle as C++ (see frame_grammar.glsl), so
 // it is written in what the two languages share.
 
-#ifndef VR_FRAME_MODELS_GLSL
-#define VR_FRAME_MODELS_GLSL
+#ifndef VGRID_FRAME_MODELS_GLSL
+#define VGRID_FRAME_MODELS_GLSL
 
 // The coordinate models are split by what the sort already guarantees about
 // the delta: after a block in the same (y, z) row the x step is at least 1
@@ -133,4 +133,4 @@ uint segment_of(uint p, uint m, uint u, uint r) {
   return updates + (p - m) / r;
 }
 
-#endif  // VR_FRAME_MODELS_GLSL
+#endif  // VGRID_FRAME_MODELS_GLSL

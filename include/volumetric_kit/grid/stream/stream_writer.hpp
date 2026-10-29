@@ -15,11 +15,11 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
-#include "volumetric_kit/recon/stream/export.hpp"
-#include "volumetric_kit/recon/stream/session.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
+#include "volumetric_kit/grid/stream/export.hpp"
+#include "volumetric_kit/grid/stream/session.hpp"
 
-namespace volumetric_kit::recon::stream {
+namespace volumetric_kit::grid::stream {
 
 /// @brief Writes one `.vrst` file (stream/session.hpp): the session header,
 ///        then each record as it is appended, then on @ref finish the
@@ -56,7 +56,7 @@ namespace volumetric_kit::recon::stream {
 /// @endcode
 ///
 /// @warning Not thread-safe: call it from one thread.
-class VR_STREAM_API StreamWriter {
+class VGRID_STREAM_API StreamWriter {
  public:
   /// @brief Create the file at @p path and write @p session's header to it,
   ///        flushed to storage with its directory entry.
@@ -139,4 +139,4 @@ class VR_STREAM_API StreamWriter {
   bool finished_ = false;
 };
 
-}  // namespace volumetric_kit::recon::stream
+}  // namespace volumetric_kit::grid::stream

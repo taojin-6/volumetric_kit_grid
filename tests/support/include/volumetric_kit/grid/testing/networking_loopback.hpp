@@ -25,16 +25,16 @@
 #include <utility>
 #include <vector>
 
-#include "stream_files.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
-#include "volumetric_kit/recon/networking/stream_client.hpp"
-#include "volumetric_kit/recon/networking/stream_server.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
+#include "volumetric_kit/grid/networking/stream_client.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
-namespace vr_test::net {
+namespace vgrid_test::net {
 
-namespace networking = volumetric_kit::recon::networking;
-namespace stream = volumetric_kit::recon::stream;
+namespace networking = volumetric_kit::grid::networking;
+namespace stream = volumetric_kit::grid::stream;
 namespace vkc = volumetric_kit::core;
 using Bytes = std::vector<std::uint8_t>;
 using Clock = std::chrono::steady_clock;
@@ -273,4 +273,4 @@ inline Bytes record_payload(std::uint64_t seq, std::size_t size) {
   return vrst::pattern(size, seq);
 }
 
-}  // namespace vr_test::net
+}  // namespace vgrid_test::net

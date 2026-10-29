@@ -25,14 +25,14 @@
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
 #include "volumetric_kit/core/vulkan/sync.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/mesh/device_mesh.hpp"
-#include "volumetric_kit/recon/mesh/export.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/mesh/device_mesh.hpp"
+#include "volumetric_kit/grid/mesh/export.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 
-namespace volumetric_kit::recon::mesh {
+namespace volumetric_kit::grid::mesh {
 
 /// @brief Indices one extracted triangle contributes: three.
 ///
@@ -242,12 +242,12 @@ struct MarchingCubesConfig {
   /// Applies to all three -- vertex arena, index run and indirect command --
   /// since a renderer drawing the mesh reads every one of them. Left empty (the
   /// default) they are `VK_SHARING_MODE_EXCLUSIVE`, which is right for a
-  /// recon-only consumer and byte-identical to what this tier always did.
+  /// grid-only consumer and byte-identical to what this tier always did.
   ///
   /// A consumer sharing the mesh with a sibling on another queue family must
   /// name both here. Reading an EXCLUSIVE buffer from a family that does not
   /// own it is undefined, and on Apple -- where the shared-device bootstrap
-  /// hands recon and gfx *different* families, and where Metal has no ownership
+  /// hands grid and gfx *different* families, and where Metal has no ownership
   /// concept to violate -- it is undefined in the way that appears to work.
   /// Pass both indices unconditionally: duplicates collapse, so a device whose
   /// two consumers land on one family gets EXCLUSIVE for free.
@@ -427,7 +427,7 @@ struct MarchingCubesConfig {
 // TODO(mesh): shared-edge vertex dedup, so the index buffer stops being the
 // identity run and the arena shrinks toward the unique-vertex count.
 
-class VR_MESH_API MarchingCubes {
+class VGRID_MESH_API MarchingCubes {
  public:
   /// @brief Create the extractor on @p device, building its pipeline and
   ///        binding it to @p allocator for its input, vertex-arena, and
@@ -436,7 +436,7 @@ class VR_MESH_API MarchingCubes {
   /// @param allocator  The allocator its buffers come from (must outlive this).
   /// @param config     Extra buffer usage and queue families a *consumer* of
   ///                   the mesh needs; see @ref MarchingCubesConfig. Defaults
-  ///                   to none, which is what a recon-only consumer wants.
+  ///                   to none, which is what a grid-only consumer wants.
   /// @return The extractor, or a non-OK `Status` if @p config asks for an
   ///         unsupported usage bit, or a pipeline, layout, or descriptor
   ///         allocation fails.
@@ -1119,4 +1119,4 @@ class VR_MESH_API MarchingCubes {
   void disarm_indirect_command();
 };
 
-}  // namespace volumetric_kit::recon::mesh
+}  // namespace volumetric_kit::grid::mesh

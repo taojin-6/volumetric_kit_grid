@@ -33,7 +33,6 @@
 #include <vector>
 
 #include "bitstream.hpp"
-#include "codec_fixture.hpp"
 #include "codec_frames.hpp"
 #include "codec_oracle.hpp"
 #include "codec_oracle_device.hpp"
@@ -43,17 +42,18 @@
 #include "host_slices.hpp"
 #include "reference_store.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace codec = volumetric_kit::recon::codec;
-namespace d = volumetric_kit::recon::codec::detail;
+namespace codec = volumetric_kit::grid::codec;
+namespace d = volumetric_kit::grid::codec::detail;
 namespace oracle = codec_oracle;
 using namespace codec_fixture;
 using codec_frames::append_payload;
@@ -94,9 +94,9 @@ oracle::DctBlocks random_entries(std::size_t n, std::uint32_t k, Lcg& rng) {
 }
 
 // Strictly increasing coordinates, @p n of them.
-std::vector<vr::Vec3i> row_of(std::size_t n) {
-  std::vector<vr::Vec3i> out;
-  for (std::size_t i = 0; i < n; ++i) out.push_back(vr::Vec3i(int(i), 0, 0));
+std::vector<vgrid::Vec3i> row_of(std::size_t n) {
+  std::vector<vgrid::Vec3i> out;
+  for (std::size_t i = 0; i < n; ++i) out.push_back(vgrid::Vec3i(int(i), 0, 0));
   return out;
 }
 
@@ -104,10 +104,10 @@ std::vector<vr::Vec3i> row_of(std::size_t n) {
 // store's frame buffers, after a reserve.
 vkc::Status stage_frame(Gpu& gpu, const d::ReferenceStore& store,
                         const std::vector<d::ApplySource>& sources,
-                        const std::vector<vr::Vec3i>& coords) {
+                        const std::vector<vgrid::Vec3i>& coords) {
   const d::FrameBuffers frame = store.frame_buffers();
   std::vector<vol::BlockIndex> list;
-  for (const vr::Vec3i& c : coords) list.push_back(vol::BlockIndex{c, 0});
+  for (const vgrid::Vec3i& c : coords) list.push_back(vol::BlockIndex{c, 0});
   if (!sources.empty()) {
     VKC_TRY(vkc::test::write_back(gpu.device, gpu.allocator, *frame.sources,
                                   sources));
@@ -120,8 +120,9 @@ vkc::Status stage_frame(Gpu& gpu, const d::ReferenceStore& store,
 }
 
 // The held reference's coordinates, read back from the store's list.
-std::vector<vr::Vec3i> held_coords(Gpu& gpu, const d::ReferenceStore& store) {
-  std::vector<vr::Vec3i> out;
+std::vector<vgrid::Vec3i> held_coords(Gpu& gpu,
+                                      const d::ReferenceStore& store) {
+  std::vector<vgrid::Vec3i> out;
   if (store.held() == nullptr) return out;
   const std::uint32_t m = store.held()->header.block_count;
   if (m == 0) return out;
@@ -141,8 +142,8 @@ vkc::Result<d::ResidentBlocks> record_apply(Gpu& gpu, d::ReferenceStore& store,
                                             vkc::CommandBatch& batch,
                                             const d::ResidentBlocks& payload,
                                             std::uint32_t n,
-                                            vr_test::HostSlices& held) {
-  VKC_ASSIGN(held, vr_test::host_slices(gpu, std::max(n, 1u), 1));
+                                            vgrid_test::HostSlices& held) {
+  VKC_ASSIGN(held, vgrid_test::host_slices(gpu, std::max(n, 1u), 1));
   return store.record_apply(batch, payload, n, held.slices());
 }
 
@@ -158,7 +159,7 @@ vkc::Status apply_faults(Gpu& gpu, const d::ReferenceStore& store) {
 // whether every odd K's pad half was written 0.
 struct Applied {
   std::vector<Payload> blocks;
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   bool pads_zero = true;
 };
 
@@ -226,7 +227,7 @@ int commit_intra(Gpu& gpu, d::ReferenceStore& store, const oracle::DctBlocks& r,
   vkc::Result<Resident> up = resident(gpu, r);
   CHECK(up.ok());
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  vr_test::HostSlices slices;
+  vgrid_test::HostSlices slices;
   vkc::Result<d::ResidentBlocks> spare = record_apply(
       gpu, store, batch, up.value().blocks, std::uint32_t(m), slices);
   CHECK(spare.ok());
@@ -278,7 +279,7 @@ int apply_case(Gpu& gpu) {
                                                  {d::kNoSource, 6},
                                                  {8, 8},
                                                  {d::kNoSource, 10}};
-    const std::vector<vr::Vec3i> coords = row_of(sources.size());
+    const std::vector<vgrid::Vec3i> coords = row_of(sources.size());
     CHECK(store.reserve(std::uint32_t(sources.size()), k).ok());
     CHECK(stage_frame(gpu, store, sources, coords).ok());
     vkc::Result<Resident> up = resident(gpu, payload, {}, {}, 0xBEEF);
@@ -286,7 +287,7 @@ int apply_case(Gpu& gpu) {
     d::ResidentBlocks entries = up.value().blocks;
     entries.reference_count = std::uint32_t(m);
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    vr_test::HostSlices slices;
+    vgrid_test::HostSlices slices;
     vkc::Result<d::ResidentBlocks> spare = record_apply(
         gpu, store, batch, entries, std::uint32_t(sources.size()), slices);
     CHECK(spare.ok());
@@ -350,7 +351,7 @@ int grow_case(Gpu& gpu) {
     d::ResidentBlocks entries = up.value().blocks;
     entries.reference_count = std::uint32_t(m);
     vkc::CommandBatch batch(gpu.device, gpu.allocator);
-    vr_test::HostSlices slices;
+    vgrid_test::HostSlices slices;
     vkc::Result<d::ResidentBlocks> spare =
         record_apply(gpu, store, batch, entries, std::uint32_t(n), slices);
     CHECK(spare.ok());
@@ -368,7 +369,7 @@ int grow_case(Gpu& gpu) {
     // but never committed: nothing changes.
     const d::FrameReference before = *store.held();
     vkc::CommandBatch refused(gpu.device, gpu.allocator);
-    vr_test::HostSlices unused;
+    vgrid_test::HostSlices unused;
     CHECK(
         record_apply(gpu, store, refused, entries, 2 * std::uint32_t(n), unused)
             .status()
@@ -415,7 +416,7 @@ int apply_refusals_case(Gpu& gpu) {
     d::ResidentBlocks payload = up.value().blocks;
     payload.reference_count = m;
     payload.coefficient_count = k;
-    vr_test::HostSlices slices;
+    vgrid_test::HostSlices slices;
     vkc::Result<d::ResidentBlocks> r =
         record_apply(gpu, store, batch, payload, blocks, slices);
     vkc::Status s = r.status();
@@ -436,7 +437,7 @@ int apply_refusals_case(Gpu& gpu) {
   CHECK(refused(std::vector<d::ApplySource>(4, {0, none}), 4, 8, 100,
                 "more than were reserved"));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
-  vr_test::HostSlices unused;
+  vgrid_test::HostSlices unused;
   CHECK(record_apply(gpu, store, batch, d::ResidentBlocks{}, 1, unused)
             .status()
             .message()
@@ -448,7 +449,7 @@ int apply_refusals_case(Gpu& gpu) {
   d::ResidentBlocks payload = up.value().blocks;
   payload.reference_count = 4;
   vkc::CommandBatch clean(gpu.device, gpu.allocator);
-  vr_test::HostSlices slices;
+  vgrid_test::HostSlices slices;
   CHECK(record_apply(gpu, store, clean, payload, 1, slices).ok());
   CHECK(clean.submit().ok() && apply_faults(gpu, store).ok());
   return 0;
@@ -621,7 +622,7 @@ int extremes_chain_case(Shared& gpu) {
   const oracle::Frame reference = make_frame(60, 4, 31);
   const oracle::Frame kept = successor(reference, 32, 100, 400, 0);
   const oracle::Frame added = codec_frames::extreme_frame();
-  std::map<vr::Vec3i, Payload, codec_frames::ZyxLess> blocks;
+  std::map<vgrid::Vec3i, Payload, codec_frames::ZyxLess> blocks;
   for (std::size_t i = 0; i < kept.coords.size(); ++i) {
     blocks.emplace(kept.coords[i], payload_at(kept.blocks, i));
   }
@@ -645,7 +646,7 @@ int extremes_chain_case(Shared& gpu) {
 // and finer ones, each into a fresh grid: as the oracle decodes them.
 int encoder_case(Shared& gpu) {
   vkc::Result<vol::VoxelBlockGrid> g =
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f});
+      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f});
   CHECK(g.ok());
   for (std::uint32_t segment_size : {64u, 3u}) {
     codec::EncoderConfig config;
@@ -683,7 +684,7 @@ vkc::Result<Spheres> spheres(Gpu& gpu) {
              codec::Encoder::create(gpu.device, gpu.allocator, config));
   std::vector<Bytes> intra;
   for (int t = 0; t < 3; ++t) {
-    const Sphere s{vr::Vec3f(0.006f * float(t), 0.0f, 0.002f * float(t)),
+    const Sphere s{vgrid::Vec3f(0.006f * float(t), 0.0f, 0.002f * float(t)),
                    0.1f + 0.008f * float(t)};
     VKC_ASSIGN(vol::VoxelBlockGrid g, sphere_grid(gpu, s));
     VKC_ASSIGN(Bytes frame, enc.encode(g));
@@ -809,7 +810,7 @@ int invalid_case(Shared& gpu, const Spheres& s) {
     if (p.modes[e] == d::BlockMode::kRemove) gone = e;
   }
   CHECK(gone < m);
-  const vr::Vec3i c = chain[1].content.coords[gone];
+  const vgrid::Vec3i c = chain[1].content.coords[gone];
   const auto at =
       std::upper_bound(p.coords.begin(), p.coords.end(), c, d::coord_less) -
       p.coords.begin();
@@ -1067,10 +1068,10 @@ codec::FrameType type_of(const Bytes& frame) {
 // A sphere that moves and grows beside one that stays, at step @p t.
 vkc::Result<vol::VoxelBlockGrid> moving_spheres(Gpu& gpu, int t) {
   const Sphere moving{
-      vr::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
+      vgrid::Vec3f(0.01f * float(t), 0.003f * float(t), -0.004f * float(t)),
       0.09f + 0.006f * float(t)};
   return two_sphere_grid(gpu, moving,
-                         Sphere{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f});
+                         Sphere{vgrid::Vec3f(0.6f, 0.0f, 0.0f), 0.05f});
 }
 
 // The moving spheres in chains at period 4 and open-ended, at an odd K in
@@ -1124,16 +1125,16 @@ int encoder_chain_case(Shared& gpu) {
 // A curtain that moves and grows with its sphere, its slab sliding across
 // it, beside a sphere that stays, at a 16-voxel band, at step @p t.
 vkc::Result<vol::VoxelBlockGrid> moving_curtain(Gpu& gpu, int t) {
-  const Curtain moving{
-      Sphere{vr::Vec3f(0.013f + 0.01f * float(t), -0.007f + 0.003f * float(t),
-                       0.004f - 0.004f * float(t)),
-             0.09f + 0.006f * float(t)},
-      false, 0.011f * float(t)};
-  const Sphere still{vr::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
+  const Curtain moving{Sphere{vgrid::Vec3f(0.013f + 0.01f * float(t),
+                                           -0.007f + 0.003f * float(t),
+                                           0.004f - 0.004f * float(t)),
+                              0.09f + 0.006f * float(t)},
+                       false, 0.011f * float(t)};
+  const Sphere still{vgrid::Vec3f(0.6f, 0.0f, 0.0f), 0.05f};
   const GridShape shape = wide_band();
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu, shape));
   VKC_TRY(allocate(gpu, grid, union_blocks({moving.sphere, still}, shape)));
-  VKC_TRY(write_field(gpu, grid, [&](const vr::Vec3f& p) {
+  VKC_TRY(write_field(gpu, grid, [&](const vgrid::Vec3f& p) {
     return std::min(moving.sdf(p), still.sdf(p));
   }));
   return grid;
@@ -1261,7 +1262,7 @@ struct Voxels {
   std::vector<bool> observed = std::vector<bool>(kVpb, true);
 };
 
-using Content = std::map<vr::Vec3i, Voxels, codec_frames::ZyxLess>;
+using Content = std::map<vgrid::Vec3i, Voxels, codec_frames::ZyxLess>;
 
 Voxels constant(float sdf) {
   Voxels v;
@@ -1292,16 +1293,18 @@ Voxels slope(int tilt) {
 vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
                                               const Content& content) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(gpu));
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   for (const auto& [c, voxels] : content) coords.push_back(c);
   VKC_TRY(allocate(gpu, grid, coords));
   VKC_ASSIGN(const std::vector<vol::BlockIndex> blocks, active_sorted(grid));
-  VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vr::volume::kTsdfAttribute, blocks));
-  VKC_ASSIGN(vr_test::AttributeSpan<float> weight,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       vr::volume::kWeightAttribute, blocks));
+  VKC_ASSIGN(
+      vgrid_test::AttributeSpan<float> tsdf,
+      vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                   vgrid::volume::kTsdfAttribute, blocks));
+  VKC_ASSIGN(
+      vgrid_test::AttributeSpan<float> weight,
+      vgrid_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                   vgrid::volume::kWeightAttribute, blocks));
   for (const vol::BlockIndex& b : blocks) {
     const Voxels& v = content.at(b.coord);
     const std::size_t at = std::size_t(b.ptr) - tsdf.first;
@@ -1310,10 +1313,10 @@ vkc::Result<vol::VoxelBlockGrid> content_grid(Gpu& gpu,
       weight.values[at + i] = v.observed[i] ? 2.0f : 0.0f;
     }
   }
-  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid,
-                              vr::volume::kTsdfAttribute, tsdf));
-  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid,
-                              vr::volume::kWeightAttribute, weight));
+  VKC_TRY(vgrid_test::write_span(gpu.device, gpu.allocator, grid,
+                                 vgrid::volume::kTsdfAttribute, tsdf));
+  VKC_TRY(vgrid_test::write_span(gpu.device, gpu.allocator, grid,
+                                 vgrid::volume::kWeightAttribute, weight));
   return grid;
 }
 
@@ -1334,12 +1337,12 @@ int diff_case(Shared& gpu) {
   codec::Encoder& enc = made.value();
   Lcg rng{91};
   Content base;
-  base[vr::Vec3i(0, 0, 0)] = constant(0.3f);
-  base[vr::Vec3i(1, 0, 0)] = slope(1);
-  base[vr::Vec3i(3, 0, 0)] = slope(2);
-  base[vr::Vec3i(0, 2, 0)] = noise(rng);
-  base[vr::Vec3i(-4, 1, 7)] = noise(rng);
-  base[vr::Vec3i(5, -3, 2)] = constant(-0.6f);
+  base[vgrid::Vec3i(0, 0, 0)] = constant(0.3f);
+  base[vgrid::Vec3i(1, 0, 0)] = slope(1);
+  base[vgrid::Vec3i(3, 0, 0)] = slope(2);
+  base[vgrid::Vec3i(0, 2, 0)] = noise(rng);
+  base[vgrid::Vec3i(-4, 1, 7)] = noise(rng);
+  base[vgrid::Vec3i(5, -3, 2)] = constant(-0.6f);
   std::vector<Coded> chain;
   // Encode @p content, a P-frame on the chain's last frame: its modes, in
   // reference order, and its new blocks.
@@ -1373,7 +1376,7 @@ int diff_case(Shared& gpu) {
   // A plane of one block lowered: several coefficients change.
   Content changed = base;
   for (std::uint32_t i = 0; i < 64; ++i) {
-    changed.at(vr::Vec3i(1, 0, 0)).sdf[i] -= 0.3f;
+    changed.at(vgrid::Vec3i(1, 0, 0)).sdf[i] -= 0.3f;
   }
   CHECK(next(changed, p));
   CHECK(count(p, d::BlockMode::kSkip) == m - 1 && p.coords.empty());
@@ -1381,7 +1384,7 @@ int diff_case(Shared& gpu) {
   // One voxel of the constant block unobserved: the forward fills it with
   // the same value, so the coefficients stay and the mask alone changes.
   Content masked = changed;
-  masked.at(vr::Vec3i(0, 0, 0)).observed[77] = false;
+  masked.at(vgrid::Vec3i(0, 0, 0)).observed[77] = false;
   CHECK(next(masked, p));
   CHECK(p.modes[0] == d::BlockMode::kKeep);
   CHECK(count(p, d::BlockMode::kSkip) == m - 1);
@@ -1393,29 +1396,29 @@ int diff_case(Shared& gpu) {
   CHECK(bits == 1 && (x.mask[77 / 32] >> (77 % 32) & 1u) == 1u);
 
   Content moved = masked;
-  moved.erase(vr::Vec3i(3, 0, 0));
-  moved[vr::Vec3i(2, 0, 0)] = slope(3);
+  moved.erase(vgrid::Vec3i(3, 0, 0));
+  moved[vgrid::Vec3i(2, 0, 0)] = slope(3);
   CHECK(next(moved, p));
   CHECK(count(p, d::BlockMode::kRemove) == 1 &&
         count(p, d::BlockMode::kSkip) == m - 1);
-  CHECK(p.coords == std::vector<vr::Vec3i>{vr::Vec3i(2, 0, 0)});
+  CHECK(p.coords == std::vector<vgrid::Vec3i>{vgrid::Vec3i(2, 0, 0)});
 
   // A smooth block where noise was is zero, its residuals costing more than
   // its values; noise with one plane lowered is keep, the other way round.
   Content unrelated = moved;
-  unrelated.at(vr::Vec3i(0, 2, 0)) = slope(1);
+  unrelated.at(vgrid::Vec3i(0, 2, 0)) = slope(1);
   for (std::uint32_t i = 448; i < kVpb; ++i) {
-    float& v = unrelated.at(vr::Vec3i(-4, 1, 7)).sdf[i];
+    float& v = unrelated.at(vgrid::Vec3i(-4, 1, 7)).sdf[i];
     v = std::max(v - 0.2f, -1.0f);
   }
   CHECK(next(unrelated, p));
   const oracle::Frame& ref = chain[chain.size() - 2].content;
-  std::map<vr::Vec3i, d::BlockMode, codec_frames::ZyxLess> mode_of;
+  std::map<vgrid::Vec3i, d::BlockMode, codec_frames::ZyxLess> mode_of;
   for (std::size_t e = 0; e < ref.coords.size(); ++e) {
     mode_of[ref.coords[e]] = p.modes[e];
   }
-  CHECK(mode_of.at(vr::Vec3i(0, 2, 0)) == d::BlockMode::kZero);
-  CHECK(mode_of.at(vr::Vec3i(-4, 1, 7)) == d::BlockMode::kKeep);
+  CHECK(mode_of.at(vgrid::Vec3i(0, 2, 0)) == d::BlockMode::kZero);
+  CHECK(mode_of.at(vgrid::Vec3i(-4, 1, 7)) == d::BlockMode::kKeep);
 
   // Every block gone: an I-frame of no blocks, where a P-frame would remove
   // every entry; then, on that empty reference, an I-frame again.
@@ -1476,10 +1479,10 @@ int wrap_case(Shared& gpu, std::uint32_t j) {
     return v;
   };
   Content up;
-  up[vr::Vec3i(0, 0, 0)] = block(1.0f);
-  up[vr::Vec3i(1, 0, 0)] = slope(1);
+  up[vgrid::Vec3i(0, 0, 0)] = block(1.0f);
+  up[vgrid::Vec3i(1, 0, 0)] = slope(1);
   Content down = up;
-  down.at(vr::Vec3i(0, 0, 0)) = block(-1.0f);
+  down.at(vgrid::Vec3i(0, 0, 0)) = block(-1.0f);
   std::vector<Coded> chain;
   vkc::Result<vol::VoxelBlockGrid> a = content_grid(gpu, up);
   vkc::Result<vol::VoxelBlockGrid> b = content_grid(gpu, down);
@@ -1596,11 +1599,11 @@ int gpu_main(vkc::test::GpuContext& context) {
   Shared gpu{
       {context.device, context.allocator}, *transform.value(), dec.value()};
   if (apply_case(gpu) != 0) return 1;
-  vr::detail::set_test_groups_per_dispatch(4);
+  vgrid::detail::set_test_groups_per_dispatch(4);
   if (apply_case(gpu) != 0) return 1;
-  vr::detail::set_test_groups_per_dispatch(7);
+  vgrid::detail::set_test_groups_per_dispatch(7);
   if (grow_case(gpu) != 0) return 1;
-  vr::detail::set_test_groups_per_dispatch(0);
+  vgrid::detail::set_test_groups_per_dispatch(0);
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
   if (extremes_chain_case(gpu) != 0) return 1;
@@ -1626,5 +1629,5 @@ int gpu_main(vkc::test::GpuContext& context) {
 }
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

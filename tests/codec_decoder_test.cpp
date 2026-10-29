@@ -11,7 +11,7 @@
 // recovers after a resize; read_frame_info; the stage rows; the moves; and the
 // Encoder's P-frame chains, at a period of 4 and open-ended, decoding to
 // exactly the grids its I-frames of the same content do, and recovering from a
-// lost frame through force_intra(). Links recon_mesh, which the codec tier
+// lost frame through force_intra(). Links grid_mesh, which the codec tier
 // itself may not. Skips with no device.
 
 #include <algorithm>
@@ -23,22 +23,22 @@
 #include <utility>
 #include <vector>
 
-#include "codec_fixture.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
-#include "volumetric_kit/recon/codec/decoder.hpp"
-#include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
+#include "volumetric_kit/grid/codec/decoder.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/testing/codec_fixture.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
 
-namespace codec = volumetric_kit::recon::codec;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace codec = volumetric_kit::grid::codec;
+namespace mesh = volumetric_kit::grid::mesh;
 using namespace codec_fixture;
 
 namespace {
@@ -86,7 +86,7 @@ codec::EncoderConfig near_lossless() {
 // observed. Reports the largest error it saw.
 int compare_decoded(const Snapshot& src, const Snapshot& dec, float bound,
                     float* max_err_out) {
-  std::vector<vr::Vec3i> observed;
+  std::vector<vgrid::Vec3i> observed;
   std::vector<std::size_t> src_index;
   for (std::size_t i = 0; i < src.coords.size(); ++i) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -123,11 +123,11 @@ int compare_decoded(const Snapshot& src, const Snapshot& dec, float bound,
 // step, so over a block the error's norm is at most sqrt(512) * step / 2 in
 // units of trunc_dist -- a bound on any one voxel, however loose.
 int round_trip_case(Gpu& gpu, codec::Decoder& dec) {
-  const Sphere s{vr::Vec3f(0.01f, 0.0f, -0.01f), 0.1f};
+  const Sphere s{vgrid::Vec3f(0.01f, 0.0f, -0.01f), 0.1f};
   // Never observed, so the encoder drops both: one sorts after every sphere
   // block, the other before them all, so dropping it slides the whole
   // readback down one block.
-  const std::vector<vr::Vec3i> far = {{30, 30, 30}, {-30, 2, -30}};
+  const std::vector<vgrid::Vec3i> far = {{30, 30, 30}, {-30, 2, -30}};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s, {}, far);
   CHECK(g.ok());
   vol::VoxelBlockGrid src = std::move(g).value();
@@ -208,7 +208,7 @@ vkc::Result<MeshFit> fit(Gpu& gpu, vol::VoxelBlockGrid& grid, const Field& s) {
 // source did. Judged against the analytic sphere, so a decoded mesh that
 // matched a wrong source mesh would not pass.
 int mesh_case(Gpu& gpu, codec::Decoder& dec) {
-  const Sphere s{vr::Vec3f(0.0f, 0.02f, 0.0f), 0.12f};
+  const Sphere s{vgrid::Vec3f(0.0f, 0.02f, 0.0f), 0.12f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   vol::VoxelBlockGrid src = std::move(g).value();
@@ -268,8 +268,8 @@ int mesh_case(Gpu& gpu, codec::Decoder& dec) {
 // state, bit for bit, as decoding that frame into a fresh grid. The two
 // spheres overlap, so the grid keeps some blocks, drops some and gains some.
 int sequence_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
-  const Sphere a{vr::Vec3f(0.0f), 0.08f};
-  const Sphere b{vr::Vec3f(0.05f, 0.0f, 0.0f), 0.07f};
+  const Sphere a{vgrid::Vec3f(0.0f), 0.08f};
+  const Sphere b{vgrid::Vec3f(0.05f, 0.0f, 0.0f), 0.07f};
   vkc::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
   vkc::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
   CHECK(ga.ok() && gb.ok());
@@ -326,7 +326,7 @@ int sequence_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
     dropped[i].coord = after_b.value().coords[i * 5];
   }
   vkc::Result<std::uint32_t> removed =
-      vr_test::remove_blocks(gpu, gb.value(), dropped);
+      vgrid_test::remove_blocks(gpu, gb.value(), dropped);
   CHECK(removed.ok() && removed.value() == 0);
   vkc::Result<Bytes> fsub = enc.encode(gb.value());
   CHECK(fsub.ok());
@@ -343,7 +343,7 @@ int sequence_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
 
   // The premise: the grid did keep, drop and gain blocks between the two.
   std::size_t kept = 0;
-  for (const vr::Vec3i& c : after_a.value().coords) {
+  for (const vgrid::Vec3i& c : after_a.value().coords) {
     kept += std::binary_search(after_b.value().coords.begin(),
                                after_b.value().coords.end(), c, coord_less)
                 ? 1
@@ -367,8 +367,8 @@ int sequence_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
 // Every refusal that comes before the grid changes leaves it exactly as it
 // was: a corrupt frame, one of other geometry, one too big for the heap.
 int untouched_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
-  const Sphere a{vr::Vec3f(0.0f), 0.06f};
-  const Sphere b{vr::Vec3f(0.03f, 0.0f, 0.0f), 0.09f};
+  const Sphere a{vgrid::Vec3f(0.0f), 0.06f};
+  const Sphere b{vgrid::Vec3f(0.03f, 0.0f, 0.0f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> ga = sphere_grid(gpu, a);
   vkc::Result<vol::VoxelBlockGrid> gb = sphere_grid(gpu, b);
   CHECK(ga.ok() && gb.ok());
@@ -423,8 +423,9 @@ int untouched_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   CHECK(gt.ok());
   vol::VoxelBlockGrid small = std::move(gt).value();
   CHECK(allocate(gpu, small, {{0, 0, 0}, {1, 0, 0}}).ok());
-  CHECK(write_sphere(gpu, small, Sphere{vr::Vec3f(0.02f, 0.02f, 0.02f), 0.02f})
-            .ok());
+  CHECK(
+      write_sphere(gpu, small, Sphere{vgrid::Vec3f(0.02f, 0.02f, 0.02f), 0.02f})
+          .ok());
   vkc::Result<Snapshot> small_before = snapshot(gpu, small);
   CHECK(small_before.ok());
   vkc::Result<codec::FrameInfo> info =
@@ -470,12 +471,12 @@ int out_of_memory_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   vkc::Result<vol::VoxelBlockGrid> gs = make_grid(gpu);
   CHECK(gs.ok());
   vol::VoxelBlockGrid src = std::move(gs).value();
-  std::vector<vr::Vec3i> coords;
+  std::vector<vgrid::Vec3i> coords;
   for (int i = 0; i < 16; ++i) {
-    coords.push_back(vr::Vec3i(i % 4, i / 4, 0));
+    coords.push_back(vgrid::Vec3i(i % 4, i / 4, 0));
   }
   CHECK(allocate(gpu, src, coords).ok());
-  CHECK(write_sphere(gpu, src, Sphere{vr::Vec3f(0.08f, 0.08f, 0.02f), 0.05f})
+  CHECK(write_sphere(gpu, src, Sphere{vgrid::Vec3f(0.08f, 0.08f, 0.02f), 0.05f})
             .ok());
   vkc::Result<Snapshot> src_snap = snapshot(gpu, src);
   CHECK(src_snap.ok());
@@ -515,7 +516,7 @@ int out_of_memory_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
 // the previous frame's quantizer, even when its block coordinates are equal.
 int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
   vkc::Result<vol::VoxelBlockGrid> source =
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
+      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.0f), 0.05f});
   CHECK(source.ok());
   codec::EncoderConfig a;
   a.params.coefficient_count = 35;
@@ -556,7 +557,7 @@ int quantization_sequence_case(Gpu& gpu, codec::Decoder& dec) {
 }
 
 int frame_info_case(Gpu& gpu) {
-  const Sphere s{vr::Vec3f(0.0f), 0.05f};
+  const Sphere s{vgrid::Vec3f(0.0f), 0.05f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   codec::EncoderConfig config;
@@ -605,7 +606,7 @@ int refusals_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   // A frame with blocks in it, so a refusal that came after the grid started
   // to change would show.
   vkc::Result<vol::VoxelBlockGrid> g =
-      sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.05f});
+      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.0f), 0.05f});
   CHECK(g.ok());
   vkc::Result<Bytes> frame = enc.encode(g.value());
   CHECK(frame.ok());
@@ -658,7 +659,7 @@ int refusals_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
 }
 
 int metrics_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
-  const Sphere s{vr::Vec3f(0.0f), 0.08f};
+  const Sphere s{vgrid::Vec3f(0.0f), 0.08f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
   vkc::Result<Bytes> frame = enc.encode(g.value());
@@ -709,7 +710,7 @@ int metrics_case(Gpu& gpu, codec::Encoder& enc, codec::Decoder& dec) {
   CHECK(tiles(m, false));
   // A second frame on another sphere: the grid removes the blocks the first
   // held alone and allocates the second's, both in "  ..apply".
-  const Sphere moved{vr::Vec3f(0.04f, 0.0f, 0.0f), 0.08f};
+  const Sphere moved{vgrid::Vec3f(0.04f, 0.0f, 0.0f), 0.08f};
   vkc::Result<vol::VoxelBlockGrid> g2 = sphere_grid(gpu, moved);
   CHECK(g2.ok());
   vkc::Result<Bytes> second = enc.encode(g2.value());
@@ -895,7 +896,9 @@ int lost_frame_case(Gpu& gpu, codec::Encoder& all_intra) {
 struct Union {
   Sphere a;
   Sphere b;
-  float sdf(const vr::Vec3f& p) const { return std::min(a.sdf(p), b.sdf(p)); }
+  float sdf(const vgrid::Vec3f& p) const {
+    return std::min(a.sdf(p), b.sdf(p));
+  }
 };
 
 // EncoderConfig::true_sdf at a 16-voxel band with the defaults' step in
@@ -928,8 +931,8 @@ std::vector<TrueSdfSetting> true_sdf_settings() {
 // with about the source's triangle count (surface_blocks_case in
 // codec_encoder_test pins the exact block set).
 int true_sdf_decode_case(Gpu& gpu, codec::Decoder& dec) {
-  const Union truth{Sphere{vr::Vec3f(0.0f, 0.02f, 0.0f), 0.12f},
-                    Sphere{vr::Vec3f(0.33f, 0.0f, 0.0f), 0.05f}};
+  const Union truth{Sphere{vgrid::Vec3f(0.0f, 0.02f, 0.0f), 0.12f},
+                    Sphere{vgrid::Vec3f(0.33f, 0.0f, 0.0f), 0.05f}};
   for (const bool two : {false, true}) {
     vkc::Result<vol::VoxelBlockGrid> g =
         two ? two_sphere_grid(gpu, truth.a, truth.b, wide_band())
@@ -976,7 +979,7 @@ int true_sdf_decode_case(Gpu& gpu, codec::Decoder& dec) {
 // coded blocks unobserved. Near-lossless, so what is judged is the cut; at a
 // coarse step, the jump the cut leaves inside a coded block rings.
 int curtain_case(Gpu& gpu, codec::Decoder& dec) {
-  const Curtain curtain{Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f},
+  const Curtain curtain{Sphere{vgrid::Vec3f(0.013f, -0.007f, 0.004f), 0.09f},
                         false};
   vkc::Result<vol::VoxelBlockGrid> g = curtain_grid(gpu, curtain);
   CHECK(g.ok());
@@ -1046,5 +1049,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

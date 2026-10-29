@@ -16,7 +16,6 @@
 #include <string_view>
 #include <vector>
 
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
@@ -24,21 +23,22 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
+namespace vol = volumetric_kit::grid::volume;
 
 namespace {
 
@@ -90,7 +90,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // would have built them.
   {
     vol::BlockIndex far{};
-    far.coord = vr::Vec3i(100, 100, 100);
+    far.coord = vgrid::Vec3i(100, 100, 100);
     vkc::Result<vkc::Buffer> list = vkc::test::upload_device_buffer(
         gpu.device, gpu.allocator, &far, sizeof(far));
     vkc::Result<vkc::GpuTimer> timer = vkc::GpuTimer::create(gpu.device);
@@ -158,11 +158,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // after the grid changes them, written back before the grid reads them.
   CHECK(tsdf.value().buffer->mapped() == nullptr);
   const auto get = [&](std::string_view name) {
-    return vr_test::read_attribute<float>(gpu.device, gpu.allocator, vbg, name)
+    return vgrid_test::read_attribute<float>(gpu.device, gpu.allocator, vbg,
+                                             name)
         .value();
   };
   const auto put = [&](std::string_view name, const std::vector<float>& data) {
-    return vr_test::write_attribute(gpu.device, gpu.allocator, vbg, name, data)
+    return vgrid_test::write_attribute(gpu.device, gpu.allocator, vbg, name,
+                                       data)
         .ok();
   };
   // load_factor() and allocated_blocks() read a host copy of the heap
@@ -204,13 +206,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     for (int y = -1; y <= 1; ++y) {
       for (int z = -1; z <= 1; ++z) {
         vol::BlockIndex block{};
-        block.coord = vr::Vec3i(x, y, z);
+        block.coord = vgrid::Vec3i(x, y, z);
         cube.push_back(block);
       }
     }
   }
   vkc::Result<std::uint32_t> allocated =
-      vr_test::allocate_blocks(gpu, vbg.map(), cube);
+      vgrid_test::allocate_blocks(gpu, vbg.map(), cube);
   CHECK(allocated.ok() && allocated.value() == 0);
   vkc::Result<std::vector<vol::BlockIndex>> active =
       vbg.map().compact_active_blocks();
@@ -287,11 +289,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // The active set is intact, and the grown table still allocates a fresh block
   // whose attribute range lands in the new pool and reads back zero.
-  const vr::Vec3i fresh_coord(40, 40, 40);
+  const vgrid::Vec3i fresh_coord(40, 40, 40);
   vol::BlockIndex fresh{};
   fresh.coord = fresh_coord;
   vkc::Result<std::uint32_t> fresh_alloc =
-      vr_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
+      vgrid_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
   CHECK(fresh_alloc.ok() && fresh_alloc.value() == 0);
   CHECK(heap_agrees());  // the rebuilt heap's device counter, read back
   vkc::Result<std::vector<vol::BlockIndex>> with_fresh =
@@ -325,7 +327,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
           put(vol::kWeightAttribute, weight_grown_data));
 
     vkc::Result<std::uint32_t> removed =
-        vr_test::remove_blocks(gpu, vbg, &fresh, 1);
+        vgrid_test::remove_blocks(gpu, vbg, &fresh, 1);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
     tsdf_grown_data = get(vol::kTsdfAttribute);
@@ -341,7 +343,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // The reuse this protects against: re-allocating draws the same index back
     // (LIFO) and it reads as a fresh block rather than the removed one.
     vkc::Result<std::uint32_t> realloc =
-        vr_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
+        vgrid_test::allocate_blocks(gpu, vbg.map(), &fresh, 1);
     CHECK(realloc.ok() && realloc.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> after_reuse =
         vbg.map().compact_active_blocks();
@@ -361,14 +363,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // plane, two removed. Each removed range is cleared and each kept one is
   // not, so the lookup from coord to range must match all three components.
   {
-    const vr::Vec3i quad[4] = {
+    const vgrid::Vec3i quad[4] = {
         {50, 50, 50}, {51, 50, 50}, {50, 51, 50}, {51, 51, 50}};
     vol::BlockIndex blocks[4]{};
     for (int i = 0; i < 4; ++i) {
       blocks[i].coord = quad[i];
     }
     vkc::Result<std::uint32_t> placed =
-        vr_test::allocate_blocks(gpu, vbg.map(), blocks, 4);
+        vgrid_test::allocate_blocks(gpu, vbg.map(), blocks, 4);
     CHECK(placed.ok() && placed.value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> live =
         vbg.map().compact_active_blocks();
@@ -387,7 +389,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     }
     CHECK(put(vol::kTsdfAttribute, tsdf_grown_data));
     vkc::Result<std::uint32_t> removed =
-        vr_test::remove_blocks(gpu, vbg, blocks + 1, 2);
+        vgrid_test::remove_blocks(gpu, vbg, blocks + 1, 2);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
     tsdf_grown_data = get(vol::kTsdfAttribute);
@@ -398,9 +400,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // A coord the table does not hold, beside one it does: the kernel finds
     // no block for the first and zeroes nothing for it.
     vol::BlockIndex pair[2]{};
-    pair[0].coord = vr::Vec3i(7000, 7000, 7000);
+    pair[0].coord = vgrid::Vec3i(7000, 7000, 7000);
     pair[1].coord = quad[3];
-    removed = vr_test::remove_blocks(gpu, vbg, pair, 2);
+    removed = vgrid_test::remove_blocks(gpu, vbg, pair, 2);
     CHECK(removed.ok() && removed.value() == 0);
     tsdf_grown_data = get(vol::kTsdfAttribute);
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
@@ -411,13 +413,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // block zeroed and freed once, and never a live entry past the count. A
   // refused list zeroes nothing and keeps the topology epoch.
   {
-    const vr::Vec3i quad[4] = {
+    const vgrid::Vec3i quad[4] = {
         {60, 60, 60}, {61, 60, 60}, {60, 61, 60}, {61, 61, 60}};
     vol::BlockIndex blocks[4]{};
     for (int i = 0; i < 4; ++i) {
       blocks[i].coord = quad[i];
     }
-    CHECK(vr_test::allocate_blocks(gpu, vbg.map(), blocks, 4).value() == 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, vbg.map(), blocks, 4).value() == 0);
     vkc::Result<std::vector<vol::BlockIndex>> live =
         vbg.map().compact_active_blocks();
     CHECK(live.ok());
@@ -435,7 +437,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(put(vol::kTsdfAttribute, tsdf_grown_data) &&
           put(vol::kWeightAttribute, weight_grown_data));
     vol::BlockIndex absent{};
-    absent.coord = vr::Vec3i(7000, 7000, 7000);
+    absent.coord = vgrid::Vec3i(7000, 7000, 7000);
     const std::vector<vol::BlockIndex> list = {blocks[1], absent, blocks[2],
                                                blocks[1], blocks[3]};
     const std::uint32_t count = 4;  // blocks[3] is past it
@@ -601,7 +603,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(!vbg.valid());  // NOLINT(bugprone-use-after-move) -- asserting empty
 
   std::printf(
-      "recon volume block grid test passed: 2 SoA attributes (%llu voxels "
+      "grid volume block grid test passed: 2 SoA attributes (%llu voxels "
       "each), independent storage, composed map allocates, resize grew them to "
       "%llu voxels preserving per-voxel data\n",
       static_cast<unsigned long long>(voxels),
@@ -612,5 +614,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

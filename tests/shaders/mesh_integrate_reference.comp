@@ -5,7 +5,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 // The brute force mesh_integrate.comp must match bit for bit
-// (recon_voxelize_mesh_integrate_exact): one thread per voxel measures every
+// (grid_voxelize_mesh_integrate_exact): one thread per voxel measures every
 // triangle of its block's bin -- the kernel as it was before it ruled
 // triangles out, its voxel, update and write unchanged. Two passes (pc.pass):
 //   bins    -- one item per (triangle, candidate block) work item, decoded,
@@ -14,10 +14,10 @@
 //   measure -- one item per voxel of the blocks, over the bins the host lists
 //              from those bits, in triangle order.
 
-#define VR_HASH_ENTRIES_BINDING 7
-#include "volumetric_kit/recon/volume/shaders/hash_lookup.glsl"
-#define VR_TRI_OFFSETS_BINDING 2
-#include "volumetric_kit/recon/volume/shaders/triangle_candidates.glsl"
+#define VGRID_HASH_ENTRIES_BINDING 7
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
+#define VGRID_TRI_OFFSETS_BINDING 2
+#include "volumetric_kit/grid/volume/shaders/triangle_candidates.glsl"
 
 layout(local_size_x = 256) in;
 
@@ -64,18 +64,18 @@ const uint kModeSigned = 0u;
 void main() {
   uint gid = gl_GlobalInvocationID.x;
   if (pc.pass == kPassBins) {
-    if (gid >= vr_tri_offsets[pc.tri_count]) {
+    if (gid >= vgrid_tri_offsets[pc.tri_count]) {
       return;
     }
-    uint t = vrTriangleOf(gid, pc.tri_count);
+    uint t = vgridTriangleOf(gid, pc.tri_count);
     vec3 v0 = vertices[indices[3u * t]];
     vec3 v1 = vertices[indices[3u * t + 1u]];
     vec3 v2 = vertices[indices[3u * t + 2u]];
     ivec3 coord;
-    if (vrCandidateBlock(gid - vr_tri_offsets[t], v0, v1, v2, pc.grid,
+    if (vgridCandidateBlock(gid - vgrid_tri_offsets[t], v0, v1, v2, pc.grid,
                          coord) &&
-        vrBlockInBand(coord, v0, v1, v2, pc.grid)) {
-      int ptr = vrFindBlockPtr(coord, pc.grid.num_buckets,
+        vgridBlockInBand(coord, v0, v1, v2, pc.grid)) {
+      int ptr = vgridFindBlockPtr(coord, pc.grid.num_buckets,
                                pc.grid.bucket_size, pc.grid.max_chain);
       int b = ptr < 0 ? -1
                       : slot_block[uint(ptr) / uint(pc.grid.voxels_per_block)];
@@ -94,7 +94,7 @@ void main() {
   RefBlock blk = blocks[gid / vpb];
   uint local = gid % vpb;
   int bs = pc.grid.block_size;
-  ivec3 lc = vrLocalBase(local, bs);
+  ivec3 lc = vgridLocalBase(local, bs);
   vec3 p = vec3(blk.coord * bs + lc) * pc.grid.voxel_size;
 
   float best_d2 = 3.4e38;
@@ -105,7 +105,7 @@ void main() {
     vec3 a = vertices[indices[3u * t]];
     vec3 b = vertices[indices[3u * t + 1u]];
     vec3 c = vertices[indices[3u * t + 2u]];
-    vec3 q = vrClosestPointOnTriangle(p, a, b, c);
+    vec3 q = vgridClosestPointOnTriangle(p, a, b, c);
     vec3 d = p - q;
     float d2 = dot(d, d);
     if (d2 < best_d2 || (d2 == best_d2 && t < best_t)) {

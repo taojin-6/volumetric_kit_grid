@@ -21,9 +21,9 @@
 #include <cstdint>
 #include <tuple>
 
-#include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/grid/codec/codec_params.hpp"
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// One block edge, unsigned: the length of every line the separable transform
 /// runs along.
@@ -102,4 +102,4 @@ inline std::array<std::uint32_t, kVoxelsPerBlock> zigzag_order() {
   return order;
 }
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

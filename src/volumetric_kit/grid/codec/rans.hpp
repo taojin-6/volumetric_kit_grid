@@ -37,7 +37,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace volumetric_kit::recon::codec::detail {
+namespace volumetric_kit::grid::codec::detail {
 
 /// Probability precision: every table's frequencies sum to `2^12`.
 inline constexpr std::uint32_t kRansScaleBits = 12;
@@ -119,4 +119,4 @@ inline FrequencyTable normalize_counts(
   return t;
 }
 
-}  // namespace volumetric_kit::recon::codec::detail
+}  // namespace volumetric_kit::grid::codec::detail

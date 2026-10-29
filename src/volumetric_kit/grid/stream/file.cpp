@@ -23,7 +23,7 @@
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 
-namespace volumetric_kit::recon::stream::detail {
+namespace volumetric_kit::grid::stream::detail {
 namespace {
 
 static_assert(sizeof(off_t) == 8, "offsets past 2 GiB need a 64-bit off_t");
@@ -205,4 +205,4 @@ core::Status read_at(std::string_view api, const std::string& path, int fd,
   return {};
 }
 
-}  // namespace volumetric_kit::recon::stream::detail
+}  // namespace volumetric_kit::grid::stream::detail

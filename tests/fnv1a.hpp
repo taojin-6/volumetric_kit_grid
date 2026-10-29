@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace vr_test {
+namespace vgrid_test {
 
 // FNV-1a over @p values, each taken as a 32-bit unsigned value: a byte of a
 // stream, or an entry of a table.
@@ -21,4 +21,4 @@ std::uint32_t fnv1a(const Range& values) {
   return hash;
 }
 
-}  // namespace vr_test
+}  // namespace vgrid_test

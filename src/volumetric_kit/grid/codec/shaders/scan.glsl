@@ -9,8 +9,8 @@
 // end of its values: a frame has tens of thousands of entries, not millions,
 // so one workgroup walks them a chunk at a time.
 
-#ifndef VR_SCAN_GLSL
-#define VR_SCAN_GLSL
+#ifndef VGRID_SCAN_GLSL
+#define VGRID_SCAN_GLSL
 
 const uint kScanLanes = 256u;
 
@@ -18,7 +18,7 @@ shared uint s_scan[kScanLanes];
 
 // @return This lane's @p value's exclusive prefix within the chunk, plus
 //         @p carry, which then advances by the chunk's total.
-uint vrScanChunk(uint value, inout uint carry) {
+uint vgridScanChunk(uint value, inout uint carry) {
   const uint lane = gl_LocalInvocationID.x;
   s_scan[lane] = value;
   barrier();
@@ -34,4 +34,4 @@ uint vrScanChunk(uint value, inout uint carry) {
   return prefix;
 }
 
-#endif  // VR_SCAN_GLSL
+#endif  // VGRID_SCAN_GLSL

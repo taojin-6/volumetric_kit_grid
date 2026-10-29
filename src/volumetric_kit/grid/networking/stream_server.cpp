@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-#include "volumetric_kit/recon/networking/stream_server.hpp"
+#include "volumetric_kit/grid/networking/stream_server.hpp"
 
 #include <poll.h>
 
@@ -18,10 +18,10 @@
 #include "gop_log.hpp"
 #include "socket.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
-#include "volumetric_kit/recon/core/log.hpp"
-#include "volumetric_kit/recon/stream/chunks.hpp"
+#include "volumetric_kit/grid/base/log.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
 
-namespace volumetric_kit::recon::networking {
+namespace volumetric_kit::grid::networking {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -34,7 +34,7 @@ constexpr std::size_t kDrainBytes = 4096;
 // The least time between two refusals logged at Warning; the rest go at Debug.
 constexpr std::chrono::seconds kRefusalWarningEvery{10};
 
-// recon's log_message, from a thread or a catch no exception may leave.
+// grid's log_message, from a thread or a catch no exception may leave.
 // Viewers come and go at Info, which the core's default sink drops and a
 // sender prints, as serve_stream and fuse_orbbec do.
 void log_at(core::LogLevel level, const std::string& message) noexcept {
@@ -467,4 +467,4 @@ std::uint64_t StreamServer::key_wanted() const noexcept {
   return impl_->key_wanted.load();
 }
 
-}  // namespace volumetric_kit::recon::networking
+}  // namespace volumetric_kit::grid::networking

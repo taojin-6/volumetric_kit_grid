@@ -42,31 +42,31 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#include "device_blocks.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/dispatch.hpp"
-#include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/mesh/mesh.hpp"
-#include "volumetric_kit/recon/volume/frustum.hpp"
-#include "volumetric_kit/recon/volume/hash_types.hpp"
-#include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_color.hpp"
-#include "volumetric_kit/recon/volume/voxel_grid.hpp"
-#include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/base/math/vector_types.hpp"
+#include "volumetric_kit/grid/mesh/marching_cubes.hpp"
+#include "volumetric_kit/grid/mesh/mesh.hpp"
+#include "volumetric_kit/grid/testing/device_blocks.hpp"
+#include "volumetric_kit/grid/volume/frustum.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_color.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
 
-#include "grid_readback.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
-#include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/grid/base/device_requirements.hpp"
+#include "volumetric_kit/grid/testing/grid_readback.hpp"
 
-namespace vr = volumetric_kit::recon;
+namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
-namespace vol = volumetric_kit::recon::volume;
-namespace mesh = volumetric_kit::recon::mesh;
+namespace vol = volumetric_kit::grid::volume;
+namespace mesh = volumetric_kit::grid::mesh;
 
 namespace {
 
@@ -79,23 +79,23 @@ constexpr float kSpan = static_cast<float>(kN - 1) * kH;  // grid world extent
 
 // Sphere centre, shared by the dense and sparse fields (node convention: voxel
 // (x,y,z) sits at world (x,y,z)*kH, so both grids sample identical positions).
-vr::Vec3f sphere_center() {
+vgrid::Vec3f sphere_center() {
   const float c = static_cast<float>(kN - 1) * 0.5f * kH;
-  return vr::Vec3f(c, c, c);
+  return vgrid::Vec3f(c, c, c);
 }
 
 // A linear gradient colour: world position normalized to [0,1] per axis. Linear
 // interpolation of a linear field is exact, so a vertex's colour must match the
 // gradient at that vertex's own position to within u8 quantization.
-vr::Vec3f grad_color(vr::Vec3f p) {
+vgrid::Vec3f grad_color(vgrid::Vec3f p) {
   auto clamp01 = [](float v) {
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
   };
-  return vr::Vec3f(clamp01(p.x / kSpan), clamp01(p.y / kSpan),
-                   clamp01(p.z / kSpan));
+  return vgrid::Vec3f(clamp01(p.x / kSpan), clamp01(p.y / kSpan),
+                      clamp01(p.z / kSpan));
 }
 
-std::uint32_t pack_rgb(vr::Vec3f c) {
+std::uint32_t pack_rgb(vgrid::Vec3f c) {
   // RGB in the low three bytes, alpha 0xFF in the high byte -- matching the
   // tsdf integrator's packUnorm4x8(vec4(rgb, 1.0)). An observed colour is then
   // always non-zero, so 0 uniquely means "colour unobserved", the sentinel the
@@ -108,11 +108,13 @@ std::uint32_t pack_rgb(vr::Vec3f c) {
 
 // An axis-aligned box as six inward-normal planes, the form a frustum
 // compaction reads: x in [lo.x, hi.x], and likewise y and z.
-vol::FrustumPlanes box_planes(vr::Vec3f lo, vr::Vec3f hi) {
-  return {
-      vr::Vec4f(1.0f, 0.0f, 0.0f, -lo.x), vr::Vec4f(-1.0f, 0.0f, 0.0f, hi.x),
-      vr::Vec4f(0.0f, 1.0f, 0.0f, -lo.y), vr::Vec4f(0.0f, -1.0f, 0.0f, hi.y),
-      vr::Vec4f(0.0f, 0.0f, 1.0f, -lo.z), vr::Vec4f(0.0f, 0.0f, -1.0f, hi.z)};
+vol::FrustumPlanes box_planes(vgrid::Vec3f lo, vgrid::Vec3f hi) {
+  return {vgrid::Vec4f(1.0f, 0.0f, 0.0f, -lo.x),
+          vgrid::Vec4f(-1.0f, 0.0f, 0.0f, hi.x),
+          vgrid::Vec4f(0.0f, 1.0f, 0.0f, -lo.y),
+          vgrid::Vec4f(0.0f, -1.0f, 0.0f, hi.y),
+          vgrid::Vec4f(0.0f, 0.0f, 1.0f, -lo.z),
+          vgrid::Vec4f(0.0f, 0.0f, -1.0f, hi.z)};
 }
 
 // The device the grids live on, for the helpers that write their attributes.
@@ -133,11 +135,11 @@ vol::VoxelGridParams sphere_grid_params() {
 bool write_attributes(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
                       const std::vector<float>& tsdf,
                       const std::vector<float>& weight) {
-  return vr_test::write_attribute(ctx.device, ctx.allocator, g,
-                                  vol::kTsdfAttribute, tsdf)
+  return vgrid_test::write_attribute(ctx.device, ctx.allocator, g,
+                                     vol::kTsdfAttribute, tsdf)
              .ok() &&
-         vr_test::write_attribute(ctx.device, ctx.allocator, g,
-                                  vol::kWeightAttribute, weight)
+         vgrid_test::write_attribute(ctx.device, ctx.allocator, g,
+                                     vol::kWeightAttribute, weight)
              .ok();
 }
 
@@ -148,7 +150,7 @@ std::vector<vol::BlockIndex> cube_blocks() {
     for (int cy = 0; cy < kBlocks; ++cy) {
       for (int cx = 0; cx < kBlocks; ++cx) {
         vol::BlockIndex b{};
-        b.coord = vr::Vec3i(cx, cy, cz);
+        b.coord = vgrid::Vec3i(cx, cy, cz);
         blocks.push_back(b);
       }
     }
@@ -166,7 +168,7 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
                       bool with_color, float weight_value = 1.0f) {
   const std::vector<vol::BlockIndex> blocks = cube_blocks();
   vkc::Result<std::uint32_t> failed =
-      vr_test::allocate_blocks(ctx, g.map(), blocks);
+      vgrid_test::allocate_blocks(ctx, g.map(), blocks);
   if (!failed || failed.value() != 0) {
     return false;
   }
@@ -176,10 +178,10 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
     return false;
   }
 
-  auto tsdf = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
-                                             vol::kTsdfAttribute);
-  auto weight = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
-                                               vol::kWeightAttribute);
+  auto tsdf = vgrid_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                                vol::kTsdfAttribute);
+  auto weight = vgrid_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                                  vol::kWeightAttribute);
   if (!tsdf || !weight) {
     return false;
   }
@@ -188,8 +190,8 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
   vkc::Result<std::vector<std::uint32_t>> color = std::vector<std::uint32_t>{};
   std::uint32_t* cptr = nullptr;
   if (with_color) {
-    color = vr_test::read_attribute<std::uint32_t>(ctx.device, ctx.allocator, g,
-                                                   vol::kColorAttribute);
+    color = vgrid_test::read_attribute<std::uint32_t>(ctx.device, ctx.allocator,
+                                                      g, vol::kColorAttribute);
     if (!color) {
       return false;
     }
@@ -201,10 +203,11 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
       for (int ly = 0; ly < kBlock; ++ly) {
         for (int lx = 0; lx < kBlock; ++lx) {
           const int local = lx + kBlock * (ly + kBlock * lz);
-          const vr::Vec3i voxel = b.coord * kBlock + vr::Vec3i(lx, ly, lz);
-          const vr::Vec3f world = vr::Vec3f(voxel) * kH;
+          const vgrid::Vec3i voxel =
+              b.coord * kBlock + vgrid::Vec3i(lx, ly, lz);
+          const vgrid::Vec3f world = vgrid::Vec3f(voxel) * kH;
           const auto idx = static_cast<std::size_t>(b.ptr) + local;
-          tptr[idx] = vr::length(world - sphere_center()) - kRadius;
+          tptr[idx] = vgrid::length(world - sphere_center()) - kRadius;
           wptr[idx] = weight_value;
           if (cptr != nullptr) {
             cptr[idx] = pack_rgb(grad_color(world));
@@ -215,8 +218,8 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
   }
   return write_attributes(ctx, g, tsdf.value(), weight.value()) &&
          (!with_color ||
-          vr_test::write_attribute(ctx.device, ctx.allocator, g,
-                                   vol::kColorAttribute, color.value())
+          vgrid_test::write_attribute(ctx.device, ctx.allocator, g,
+                                      vol::kColorAttribute, color.value())
               .ok());
 }
 
@@ -246,13 +249,13 @@ bool fill_dense_blocks(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
     for (int cy = 0; cy < span; ++cy) {
       for (int cx = 0; cx < span; ++cx) {
         vol::BlockIndex b{};
-        b.coord = vr::Vec3i(cx, cy, cz);
+        b.coord = vgrid::Vec3i(cx, cy, cz);
         blocks.push_back(b);
       }
     }
   }
   vkc::Result<std::uint32_t> failed =
-      vr_test::allocate_blocks(ctx, g.map(), blocks);
+      vgrid_test::allocate_blocks(ctx, g.map(), blocks);
   if (!failed || failed.value() != 0) {
     return false;
   }
@@ -261,10 +264,10 @@ bool fill_dense_blocks(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
   if (!active || active.value().size() != blocks.size()) {
     return false;
   }
-  auto tsdf = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
-                                             vol::kTsdfAttribute);
-  auto weight = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
-                                               vol::kWeightAttribute);
+  auto tsdf = vgrid_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                                vol::kTsdfAttribute);
+  auto weight = vgrid_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                                  vol::kWeightAttribute);
   if (!tsdf || !weight) {
     return false;
   }
@@ -275,7 +278,7 @@ bool fill_dense_blocks(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
       for (int ly = 0; ly < bs; ++ly) {
         for (int lx = 0; lx < bs; ++lx) {
           const int local = lx + bs * (ly + bs * lz);
-          const vr::Vec3i voxel = blk.coord * bs + vr::Vec3i(lx, ly, lz);
+          const vgrid::Vec3i voxel = blk.coord * bs + vgrid::Vec3i(lx, ly, lz);
           const auto idx = static_cast<std::size_t>(blk.ptr) + local;
           tptr[idx] =
               ((voxel.x + voxel.y + voxel.z) % 2 == 0) ? -0.5f * h : 0.5f * h;
@@ -321,7 +324,7 @@ BlockLayout block_layout(const mesh::Mesh& m, int block_size,
   std::vector<std::array<long long, 3>> owner;
   owner.reserve(m.indices.size() / 3);
   for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
-    vr::Vec3f c(0.0f, 0.0f, 0.0f);
+    vgrid::Vec3f c(0.0f, 0.0f, 0.0f);
     for (int k = 0; k < 3; ++k) {
       c = c + m.vertices[m.indices[t + k]].position;
     }
@@ -369,7 +372,7 @@ VertexRanges vertex_ranges(const mesh::Mesh& m, int block_size,
   const float block_extent = static_cast<float>(block_size) * voxel_size;
   std::map<std::array<long long, 3>, std::set<std::uint32_t>> used;
   for (std::size_t t = 0; t + 2 < m.indices.size(); t += 3) {
-    vr::Vec3f c(0.0f, 0.0f, 0.0f);
+    vgrid::Vec3f c(0.0f, 0.0f, 0.0f);
     for (int k = 0; k < 3; ++k) {
       c = c + m.vertices[m.indices[t + k]].position;
     }
@@ -460,7 +463,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(sphere.indices.size() % 3 == 0);
   CHECK(sphere.triangle_count() > 500);
 
-  const vr::Vec3f center = sphere_center();
+  const vgrid::Vec3f center = sphere_center();
 
   // Every vertex lies on the sphere; every normal is unit and points outward.
   double radius_sum = 0.0;
@@ -474,13 +477,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // would notice; this is the only guard.
     CHECK(v.tangent.x == 1.0f && v.tangent.y == 0.0f && v.tangent.z == 0.0f &&
           v.tangent.w == 1.0f);
-    const vr::Vec3f d = v.position - center;
-    const float r = vr::length(d);
+    const vgrid::Vec3f d = v.position - center;
+    const float r = vgrid::length(d);
     CHECK(std::fabs(r - kRadius) < 1.5f * kH);  // MC accuracy ~ one voxel
-    CHECK(std::fabs(vr::length(v.normal) - 1.0f) < 1e-3f);
-    CHECK(vr::dot(glm::normalize(d), v.normal) > 0.5f);  // never inward
+    CHECK(std::fabs(vgrid::length(v.normal) - 1.0f) < 1e-3f);
+    CHECK(vgrid::dot(glm::normalize(d), v.normal) > 0.5f);  // never inward
     radius_sum += r;
-    outward_sum += vr::dot(glm::normalize(d), v.normal);
+    outward_sum += vgrid::dot(glm::normalize(d), v.normal);
   }
   const auto nv = static_cast<double>(sphere.vertices.size());
   CHECK(std::fabs(radius_sum / nv - kRadius) < 0.25 * kH);  // no radial bias
@@ -521,10 +524,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     const mesh::Vertex& a = sphere.vertices[sphere.indices[t + 0]];
     const mesh::Vertex& b = sphere.vertices[sphere.indices[t + 1]];
     const mesh::Vertex& c = sphere.vertices[sphere.indices[t + 2]];
-    const vr::Vec3f face =
-        vr::cross(b.position - a.position, c.position - a.position);
-    if (vr::length(face) > 1e-8f) {
-      if (vr::dot(glm::normalize(face), a.normal) > 0.0f) {
+    const vgrid::Vec3f face =
+        vgrid::cross(b.position - a.position, c.position - a.position);
+    if (vgrid::length(face) > 1e-8f) {
+      if (vgrid::dot(glm::normalize(face), a.normal) > 0.0f) {
         ++face_outward;
       }
       ++face_count;
@@ -567,10 +570,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // counter participates in, so it must measure the real surface.
   double area = 0.0;
   for (std::size_t i = 0; i + 2 < sphere.indices.size(); i += 3) {
-    const vr::Vec3f& a = sphere.vertices[sphere.indices[i + 0]].position;
-    const vr::Vec3f& b = sphere.vertices[sphere.indices[i + 1]].position;
-    const vr::Vec3f& c = sphere.vertices[sphere.indices[i + 2]].position;
-    area += 0.5 * static_cast<double>(vr::length(vr::cross(b - a, c - a)));
+    const vgrid::Vec3f& a = sphere.vertices[sphere.indices[i + 0]].position;
+    const vgrid::Vec3f& b = sphere.vertices[sphere.indices[i + 1]].position;
+    const vgrid::Vec3f& c = sphere.vertices[sphere.indices[i + 2]].position;
+    area +=
+        0.5 * static_cast<double>(vgrid::length(vgrid::cross(b - a, c - a)));
   }
   const double analytic_area = 4.0 * 3.14159265358979323846 *
                                static_cast<double>(kRadius) *
@@ -583,7 +587,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // sphere_grid_params(), whose 8-entry buckets over 128 buckets never
   // overflow: the 216 block coords reach a maximum bucket occupancy of 4, so
   // allocate_in_overflow is never entered and NOT ONE entry is reachable only
-  // through a chain. That leaves the chain half of vrFindBlockPtr -- the
+  // through a chain. That leaves the chain half of vgridFindBlockPtr -- the
   // subtlest code in the kernel, and the half that has no host-side counterpart
   // to have been proven against -- executed by nothing. Measured, not assumed:
   // replacing the chain walk with `return -1;` left this whole suite green, and
@@ -613,7 +617,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // table of this shape that may not chain refuses a block only where its
   // bucket's slots are full, which is where this one had to chain it.
   vkc::Result<std::uint32_t> refused =
-      vr_test::chain_refusals(gpu, chained_gp, cube_blocks());
+      vgrid_test::chain_refusals(gpu, chained_gp, cube_blocks());
   CHECK(refused.ok() && refused.value() > 0);
 
   vkc::Result<mesh::Mesh> chained_mesh_result =
@@ -655,10 +659,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // stays discriminating rather than vacuous: a kernel that skipped the
     // decode would leave `v.color` encoded, and `linear_to_srgb` of an
     // already-encoded 0.5 is 0.735, nowhere near it.
-    const vr::Vec3f expected = grad_color(v.position);
-    const vr::Vec3f encoded(vol::linear_to_srgb(v.color.x),
-                            vol::linear_to_srgb(v.color.y),
-                            vol::linear_to_srgb(v.color.z));
+    const vgrid::Vec3f expected = grad_color(v.position);
+    const vgrid::Vec3f encoded(vol::linear_to_srgb(v.color.x),
+                               vol::linear_to_srgb(v.color.y),
+                               vol::linear_to_srgb(v.color.z));
     CHECK(std::fabs(encoded.x - expected.x) < 0.005f);  // ~2.5x the u8 floor
     CHECK(std::fabs(encoded.y - expected.y) < 0.005f);
     CHECK(std::fabs(encoded.z - expected.z) < 0.005f);
@@ -743,9 +747,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(one_result.ok());
   vol::VoxelBlockGrid one_grid = std::move(one_result).value();
   vol::BlockIndex single_block{};
-  single_block.coord = vr::Vec3i(0, 0, 0);
+  single_block.coord = vgrid::Vec3i(0, 0, 0);
   vkc::Result<std::uint32_t> single_failed =
-      vr_test::allocate_blocks(gpu, one_grid.map(), &single_block, 1);
+      vgrid_test::allocate_blocks(gpu, one_grid.map(), &single_block, 1);
   CHECK(single_failed.ok());
   CHECK(single_failed.value() == 0);
 
@@ -938,10 +942,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // Both kernels at three blocks a dispatch mesh the same surface: the path
   // an active set past the device's 65,535-group floor takes.
   {
-    vr::detail::set_test_groups_per_dispatch(3);
+    vgrid::detail::set_test_groups_per_dispatch(3);
     vkc::Result<mesh::Mesh> chunked = extractor.extract_host(grid, 0.0f);
     vkc::Result<mesh::Mesh> chunked_shared = share_mc.extract_host(grid, 0.0f);
-    vr::detail::set_test_groups_per_dispatch(0);
+    vgrid::detail::set_test_groups_per_dispatch(0);
     CHECK(chunked.ok() && chunked_shared.ok());
     CHECK(canonical_triangles(chunked.value()) == canonical_triangles(sphere));
     CHECK(canonical_triangles(chunked_shared.value()) ==
@@ -1295,8 +1299,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // The whole active set as a device list reproduces the internal
     // compaction, and reports no compaction of its own.
     mesh::ExtractTimings whole_t{};
-    vkc::Result<mesh::Mesh> whole =
-        mesh_half(box_planes(vr::Vec3f(-10.0f), vr::Vec3f(10.0f)), &whole_t);
+    vkc::Result<mesh::Mesh> whole = mesh_half(
+        box_planes(vgrid::Vec3f(-10.0f), vgrid::Vec3f(10.0f)), &whole_t);
     CHECK(whole.ok());
     CHECK(canonical_triangles(whole.value()) == full_tris);
     CHECK(whole_t.active_blocks == kAll);
@@ -1308,9 +1312,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // plane sits inside a block: x <= 1.1 keeps blocks 0-2, x >= 1.25 keeps
     // blocks 3-5.
     const vol::FrustumPlanes lo_half =
-        box_planes(vr::Vec3f(-10.0f), vr::Vec3f(1.1f, 10.0f, 10.0f));
+        box_planes(vgrid::Vec3f(-10.0f), vgrid::Vec3f(1.1f, 10.0f, 10.0f));
     const vol::FrustumPlanes hi_half =
-        box_planes(vr::Vec3f(1.25f, -10.0f, -10.0f), vr::Vec3f(10.0f));
+        box_planes(vgrid::Vec3f(1.25f, -10.0f, -10.0f), vgrid::Vec3f(10.0f));
     mesh::ExtractTimings lo_t{};
     mesh::ExtractTimings hi_t{};
     vkc::Result<mesh::Mesh> lo_mesh = mesh_half(lo_half, &lo_t);
@@ -1362,8 +1366,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(other_result.ok());
     vol::VoxelBlockGrid other = std::move(other_result).value();
     vol::BlockIndex inside{};
-    inside.coord = vr::Vec3i(4, 0, 0);
-    CHECK(vr_test::allocate_blocks(gpu, other.map(), &inside, 1).value() == 0);
+    inside.coord = vgrid::Vec3i(4, 0, 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, other.map(), &inside, 1).value() ==
+          0);
     vkc::Result<vol::DeviceBlockList> other_list =
         other.map().compact_active_blocks_in_frusta_on_device({hi_half});
     CHECK(other_list.ok() && other_list.value().count == 1);
@@ -1373,8 +1378,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // block the frustum keeps. One block past the cube, never observed.
     CHECK(cull_mc.extract_device(cull_grid, 0.0f, hi_list.value()).ok());
     vol::BlockIndex extra{};
-    extra.coord = vr::Vec3i(kBlocks, 0, 0);
-    CHECK(vr_test::allocate_blocks(gpu, cull_map, &extra, 1).value() == 0);
+    extra.coord = vgrid::Vec3i(kBlocks, 0, 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, cull_map, &extra, 1).value() == 0);
     CHECK(!cull_mc.extract_device(cull_grid, 0.0f, hi_list.value()).ok());
   }
 
@@ -1397,7 +1402,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // there.
     vkc::Result<vol::DeviceBlockList> one =
         dense.map().compact_active_blocks_in_frusta_on_device(
-            {box_planes(vr::Vec3f(-1.0f), vr::Vec3f(0.3f))});
+            {box_planes(vgrid::Vec3f(-1.0f), vgrid::Vec3f(0.3f))});
     CHECK(one.ok() && one.value().count == 1);
     mesh::ExtractTimings first{};
     CHECK(density_mc.value()
@@ -1429,12 +1434,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       for (int y = 0; y < 2; ++y) {
         for (int x = 0; x < 2; ++x) {
           vol::BlockIndex b{};
-          b.coord = vr::Vec3i(x, y, z);
+          b.coord = vgrid::Vec3i(x, y, z);
           coords.push_back(b);
         }
       }
     }
-    CHECK(vr_test::allocate_blocks(gpu, near_grid.map(), coords).value() == 0);
+    CHECK(vgrid_test::allocate_blocks(gpu, near_grid.map(), coords).value() ==
+          0);
     vkc::Result<std::vector<vol::BlockIndex>> live =
         near_grid.map().compact_active_blocks();
     CHECK(live.ok());
@@ -1458,9 +1464,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     }
     CHECK(write_attributes(gpu, near_grid, tsdf, weights));
     // gfx's convention, depth in [0, 1]; the eye at z = 2.6 cm, near 5 cm.
-    const vr::Mat4f view_proj =
+    const vgrid::Mat4f view_proj =
         glm::perspectiveLH_ZO(glm::radians(90.0f), 1.0f, 0.05f, 2.0f) *
-        glm::translate(vr::Mat4f(1.0f), vr::Vec3f(-0.04f, -0.04f, -0.026f));
+        glm::translate(vgrid::Mat4f(1.0f),
+                       vgrid::Vec3f(-0.04f, -0.04f, -0.026f));
     mesh::MarchingCubesConfig config;
     config.share_vertices = shared;
     vkc::Result<mesh::MarchingCubes> near_mc =
@@ -1517,15 +1524,16 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
     // One block past the cube, never observed, so it adds no surface.
     vol::BlockIndex extra{};
-    extra.coord = vr::Vec3i(kBlocks, 0, 0);
-    CHECK(vr_test::allocate_blocks(gpu, list_grid.map(), &extra, 1).value() ==
-          0);
+    extra.coord = vgrid::Vec3i(kBlocks, 0, 0);
+    CHECK(
+        vgrid_test::allocate_blocks(gpu, list_grid.map(), &extra, 1).value() ==
+        0);
     CHECK(list_mc.value().extract_device(list_grid, 0.0f, &t).ok());
     CHECK(t.active_blocks == last.value().count + 1);
   }
 
   std::printf(
-      "recon mesh sparse marching-cubes test passed: meshed a sphere across "
+      "grid mesh sparse marching-cubes test passed: meshed a sphere across "
       "%d^3 blocks (%zu triangles), matched the same field at block_size 16 "
       "triangle-for-triangle, verified cross-block colour on-device, and "
       "partitioned the active set into two frustum-culled halves that merge "
@@ -1537,5 +1545,5 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+  return vkc::test::run_on_gpu(vgrid::device_requirements(), gpu_main);
 }

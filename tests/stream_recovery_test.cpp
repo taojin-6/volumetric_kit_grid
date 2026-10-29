@@ -21,14 +21,14 @@
 #include <string>
 #include <vector>
 
-#include "stream_files.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/stream/stream_reader.hpp"
-#include "volumetric_kit/recon/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
+#include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vkc = volumetric_kit::core;
-namespace stream = volumetric_kit::recon::stream;
-namespace vrst = vr_test::vrst;
+namespace stream = volumetric_kit::grid::stream;
+namespace vrst = vgrid_test::vrst;
 
 namespace {
 
@@ -304,7 +304,7 @@ int footer_case(const std::string& dir) {
   };
 
   // The footer the writer writes: finished, its counts and key read. The
-  // footers that must not count are recon_stream_footer's.
+  // footers that must not count are grid_stream_footer's.
   const vrst::Index index{
       1, 1, {{1, 1, payload.size(), 5, 5}}, {{record_at, 5, 0, 0}}};
   const Bytes good = vrst::index_chunk(index);
@@ -448,7 +448,7 @@ int file_size_limit_case(const std::string& dir) {
 }  // namespace
 
 int main() {
-  vkc::test::Scratch scratch("recon_stream_recovery_");
+  vkc::test::Scratch scratch("grid_stream_recovery_");
   const std::string dir = scratch.path.string();
   if (crc_mismatch_case(dir) != 0) return 1;
   if (truncation_case(dir) != 0) return 1;
