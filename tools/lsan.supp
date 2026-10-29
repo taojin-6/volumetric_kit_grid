@@ -1,0 +1,24 @@
+# LeakSanitizer suppressions for the sanitizer CI job (.github/workflows/sanitizers.yml).
+#
+# These cover third-party driver/runtime allocations that legitimately persist to
+# process exit (TLS caches, JIT contexts, dlopen'd ICD globals) — not bugs we can
+# fix. Each entry is scoped to a library/symbol substring so FIRST-PARTY leaks are
+# still reported: never add a `vgrid::` / `volumetric_kit::` frame here. If a real
+# first-party leak appears, fix it — do not suppress it.
+
+# Mesa / lavapipe — the software Vulkan ICD the job pins the loader to.
+leak:libvulkan_lvp
+leak:lvp_
+leak:libgallium
+leak:swrast
+leak:util_queue
+leak:libLLVM
+
+# The Vulkan loader's own allocations (ICD and layer discovery), by its
+# `loader_` functions. Neither the loader's module nor the validation layer's is
+# named: they are on the stack of every Vulkan call and of the core's debug
+# messenger callback, so either would hide a first-party leak made there.
+leak:loader_
+
+# dlopen-resident globals from loading the driver / layers.
+leak:__libc_dlopen

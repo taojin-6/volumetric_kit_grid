@@ -1,0 +1,117 @@
+name: ci
+
+# Umbrella CI. Every platform build/test plus lint and sanitizers fan out from
+# here, and the single `required` gate at the bottom succeeds only if all of
+# them did. Branch protection requires just that one check ("ci / required"), so
+# the protected `main` required-checks list stays stable as matrix legs (build
+# types, OSes) are added or renamed — adding an OS never silently leaves an old
+# required context unreported and blocking every PR.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Only the owner triggers this repository's workflows, so no job carries a fork
+# guard.
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # The Ubuntu legs run on the self-hosted GPU boxes (label `vk-linux-gpu`),
+      # each in an OS-matched container with the GPU passed through (`--gpus
+      # all`), so one host covers 24.04 / 26.04 against the real driver.
+      # macOS runs natively on a self-hosted Mac (label `mac`) — macOS can't be
+      # containerised. _build.yml keys its install steps off `runner.os`, so
+      # only the Ubuntu legs use a container; NVIDIA_DRIVER_CAPABILITIES=all
+      # makes the toolkit mount the Vulkan ICD for those. See the core's
+      # tools/runners/README.md.
+      #
+      # The build and test fan-out is set in the container env, too: a runner's
+      # .env reaches jobs run directly on it (the Mac) but not a job container,
+      # where ctest would otherwise run the suite one test at a time. 4 is a
+      # 24-core host over grid's 6 runners.
+      # TODO: recon's and gfx's 6 runners share each host, so 2 would match the
+      # split the core's setup-runners.sh writes for jobs on the host.
+      #
+      # So is the NVIDIA driver's shader cache. By default it lives under
+      # $HOME/.cache, which a bare image lacks, and the driver then caches
+      # nothing, so every test process compiled every pipeline cold. /__w/_tool,
+      # the runner's tool cache, outlives the job, so the cache stays warm
+      # across runs (the driver keys it by driver and GPU); _build.yml's
+      # bootstrap creates it.
+      #
+      # Release runs on every OS; Debug only on macOS, where it is cheap, and
+      # sanitizers builds and tests Debug on Linux (clang + ASan/UBSan).
+      # `assimp` builds the optional mesh loader (and with it codec_mesh) on
+      # 24.04 and macOS; 26.04 builds image / PLY IO without it. Every leg is
+      # top-level, so first-party warnings are errors (VGRID_WARNINGS_AS_ERRORS
+      # defaults on).
+      #
+      # Every leg runs the tests under the Khronos validation layer, and
+      # `sync_validation` adds synchronization validation on the NVIDIA legs,
+      # as the sanitizer job does on lavapipe.
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            runner: vk-linux-gpu
+            container: '{"image":"ubuntu:24.04","options":"--gpus all","env":{"NVIDIA_DRIVER_CAPABILITIES":"all","CMAKE_BUILD_PARALLEL_LEVEL":"4","CTEST_PARALLEL_LEVEL":"4","__GL_SHADER_DISK_CACHE_PATH":"/__w/_tool/nvidia-glcache","__GL_SHADER_DISK_CACHE_SKIP_CLEANUP":"1"}}'
+            build_types: '["Release"]'
+            assimp: true
+            sync_validation: true
+          - os: ubuntu-26.04
+            runner: vk-linux-gpu
+            container: '{"image":"ubuntu:26.04","options":"--gpus all","env":{"NVIDIA_DRIVER_CAPABILITIES":"all","CMAKE_BUILD_PARALLEL_LEVEL":"4","CTEST_PARALLEL_LEVEL":"4","__GL_SHADER_DISK_CACHE_PATH":"/__w/_tool/nvidia-glcache","__GL_SHADER_DISK_CACHE_SKIP_CLEANUP":"1"}}'
+            build_types: '["Release"]'
+            sync_validation: true
+          - os: macos-26
+            runner: mac
+            container: ''
+            build_types: '["Debug","Release"]'
+            assimp: true
+    uses: ./.github/workflows/_build.yml
+    with:
+      os: ${{ matrix.os }}
+      runner: ${{ matrix.runner }}
+      container: ${{ matrix.container }}
+      build_types: ${{ matrix.build_types }}
+      assimp: ${{ matrix.assimp || false }}
+      sync_validation: ${{ matrix.sync_validation || false }}
+
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  sanitizers:
+    uses: ./.github/workflows/sanitizers.yml
+
+  required:
+    # The single status check branch protection requires. It passes only when
+    # every build leg, lint and sanitizers succeeded, and FAILS (never skips)
+    # on any other outcome: a skipped required check never reports its result
+    # and would block every merge forever. Runs on a hosted runner so the gate
+    # can always report.
+    needs: [build, lint, sanitizers]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Assert every required job succeeded
+        run: |
+          echo "build=${{ needs.build.result }}" \
+               "lint=${{ needs.lint.result }}" \
+               "sanitizers=${{ needs.sanitizers.result }}"
+          if [ "${{ needs.build.result }}" = success ] \
+             && [ "${{ needs.lint.result }}" = success ] \
+             && [ "${{ needs.sanitizers.result }}" = success ]; then
+            echo "All required CI jobs passed."
+          else
+            echo "::error::one or more required CI jobs did not succeed (see results above)"
+            exit 1
+          fi

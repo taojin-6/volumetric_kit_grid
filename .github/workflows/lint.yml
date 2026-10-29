@@ -1,0 +1,37 @@
+name: lint
+
+# Styling + docs gate. Runs the same hooks as the local `pre-commit` install.
+# Linux-only, on a GitHub-hosted runner: clang-format and cmake-format output is
+# deterministic across operating systems, so one runner is enough. Invoked by
+# ci.yml, which owns the push / pull_request triggers and the concurrency group.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      # Cache pre-commit's installed hook environments (incl. the pinned
+      # clang-format) keyed on the config so they're only rebuilt when it changes.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          # Reuse the unchanged hook envs across config edits (e.g. a rev bump)
+          # instead of rebuilding every environment from cold.
+          restore-keys: |
+            pre-commit-
+      # Pin the runner so a new upstream pre-commit release can't change the
+      # merge-gate's behavior without a commit here.
+      - run: python -m pip install pre-commit==4.6.2
+      - run: pre-commit run --all-files --show-diff-on-failure

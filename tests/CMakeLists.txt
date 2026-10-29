@@ -798,8 +798,8 @@ add_test(NAME grid_example_stream_replay
          COMMAND grid_example_stream_replay_test)
 # The tests whose code runs threads -- a reader shared by two, the mesh
 # handoff's producer and consumer, the sockets', the senders' log -- which CI
-# builds and runs again under ThreadSanitizer (recon's
-# .github/workflows/_build.yml): one target to build them.
+# builds and runs again under ThreadSanitizer (.github/workflows/_build.yml):
+# one target to build them.
 add_custom_target(grid_tsan_tests)
 add_dependencies(
   grid_tsan_tests

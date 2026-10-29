@@ -1,0 +1,319 @@
+name: build (reusable)
+
+# Reusable build & test for one OS leg. ci.yml calls this once per entry in its
+# build matrix. Every leg runs on a self-hosted runner: the Ubuntu legs in an
+# OS-matched container with the GPU passed through (pass `container`), the
+# macOS leg directly on the Mac. The dependency-install steps key off
+# `runner.os` (Linux/macOS).
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: Leg identity, used in the job name and cache key (e.g. ubuntu-24.04).
+        required: true
+        type: string
+      runner:
+        description: >-
+          The self-hosted runner label this leg runs on (vk-linux-gpu, mac).
+        required: true
+        type: string
+      container:
+        description: >-
+          JSON for the job container, e.g.
+          '{"image":"ubuntu:24.04","options":"--gpus all"}', or '' for none.
+        required: false
+        type: string
+        default: ''
+      assimp:
+        description: >-
+          Install Assimp and build the optional mesh loader with
+          VGRID_WITH_ASSIMP=ON.
+        required: false
+        type: boolean
+        default: false
+      build_types:
+        description: >-
+          JSON array of the CMAKE_BUILD_TYPEs this leg builds and tests, one
+          job each, e.g. '["Release"]'.
+        required: false
+        type: string
+        default: '["Debug","Release"]'
+      sync_validation:
+        description: >-
+          Run the tests under the validation layer's synchronization
+          validation too (VKC_TEST_SYNC_VALIDATION).
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, '${{ inputs.runner }}']
+    # Render the container JSON to a map only when one was requested; the
+    # macOS leg passes '' and runs directly on the runner. `&&` short-circuits,
+    # so fromJSON is never handed the empty string.
+    container: ${{ inputs.container != '' && fromJSON(inputs.container) || null }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Inside a container GitHub runs `run:` steps under `sh` (dash), not
+        # `bash`; force bash everywhere for one consistent shell across legs.
+        shell: bash
+    env:
+      # 'true' when this leg runs in a container (the self-hosted GPU boxes'
+      # Ubuntu legs, where the image is a bare ubuntu:* with the GPU passed
+      # through); drives the toolchain install and the GPU check below.
+      IN_CONTAINER: ${{ inputs.container != '' }}
+    strategy:
+      fail-fast: false
+      # One job per build type the caller asks for: ci.yml runs an optimized
+      # Release/NDEBUG build on every OS, and an unoptimized Debug one on one OS,
+      # so an NDEBUG-only or optimizer-exposed break is still caught.
+      matrix:
+        build_type: ${{ fromJSON(inputs.build_types) }}
+    steps:
+      # Bare ubuntu:* images lack git (actions/checkout and FetchContent need
+      # it) and sudo (the install steps use it); we run as root in the
+      # container, so install them before anything else. The NVIDIA driver's
+      # shader cache directory, which the container env names (ci.yml says
+      # why), is made here: the driver creates nothing above its own GLCache.
+      - name: Bootstrap container
+        if: inputs.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git sudo
+          if [ -n "${__GL_SHADER_DISK_CACHE_PATH:-}" ]; then
+            mkdir -p "${__GL_SHADER_DISK_CACHE_PATH}"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # libglm-dev supplies the GLM headers + CMake config that grid_base's
+          # vector/matrix types alias. vulkan-tools provides vulkaninfo;
+          # glslang-tools/spirv-tools cover the compute-shader toolchain.
+          pkgs="cmake libglm-dev libvulkan-dev vulkan-validationlayers spirv-tools glslang-tools vulkan-tools"
+          if [ "$IN_CONTAINER" = "true" ]; then
+            # A bare container lacks a C/C++ toolchain and make, and the two
+            # client libraries the NVIDIA Vulkan ICD needs before it will hand
+            # the loader a vkCreateInstance: libGLX_nvidia.so.0 links
+            # libXext.so.6 and dlopens libEGL.so.1 while initialising. Without
+            # them the ICD the toolkit mounts is found and then discarded
+            # ("Found no drivers!"), and every GPU test would fail.
+            pkgs="$pkgs build-essential libxext6 libegl1"
+          fi
+          if [ "${{ inputs.assimp }}" = "true" ]; then
+            # Ubuntu's Assimp CMake export references libz.so but does not
+            # pull in the development package that provides that link.
+            pkgs="$pkgs libassimp-dev zlib1g-dev"
+          fi
+          # shellcheck disable=SC2086  # intentional: split $pkgs into separate args
+          sudo apt-get install -y --no-install-recommends $pkgs
+          # The loader is pinned to nothing: the NVIDIA Vulkan ICD injected by
+          # the container toolkit is then the only ICD, so the Vulkan tests run
+          # on the real GPU — and if it is absent, the GPU diagnostic below
+          # fails the leg.
+
+      # The leg's Homebrew formulae, named once for the key below: glm
+      # supplies the GLM math headers grid_base's types alias; molten-vk is
+      # the Vulkan driver; shaderc provides glslc for the compute shaders and
+      # spirv-tools the spirv-val that checks them;
+      # vulkan-loader/-headers/-tools/-validationlayers complete the SDK. A job
+      # on the self-hosted Mac installs nothing: it fails, naming any formula
+      # missing, for the owner to install while CI is idle.
+      - name: Check dependencies (macOS)
+        id: formulae
+        if: runner.os == 'macOS'
+        run: |
+          pkgs="cmake glm molten-vk vulkan-headers vulkan-loader vulkan-tools"
+          pkgs="$pkgs vulkan-validationlayers shaderc spirv-tools"
+          if [ "${{ inputs.assimp }}" = "true" ]; then
+            pkgs="$pkgs assimp"
+          fi
+          echo "formulae=$pkgs" >> "$GITHUB_OUTPUT"
+          # Without brew every formula would look missing.
+          command -v brew >/dev/null || {
+            echo "::error::brew is not on this runner's PATH"
+            exit 1
+          }
+          missing=""
+          for pkg in $pkgs; do
+            brew list --formula "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::install by hand on this self-hosted runner's host, while CI is idle:${missing}"
+            exit 1
+          fi
+          # make ships with the Xcode command-line tools.
+          # The validation layer's manifest names its library without a path;
+          # the Test step alone searches Homebrew's lib for it, as job-wide
+          # its libraries would shadow those of every other tool.
+          echo "VGRID_LAYER_LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+          echo "VK_LAYER_PATH=$(brew --prefix)/share/vulkan/explicit_layer.d" >> "$GITHUB_ENV"
+
+      # The installed versions of those formulae and of all they depend on:
+      # the dependency cache below keys on them, so the first run after a
+      # brew upgrade builds on the new versions (the core's
+      # tools/runners/README.md, "Upgrading Homebrew"). The action is at the
+      # core pin in third_party/CMakeLists.txt.
+      - name: Homebrew key
+        id: brew
+        if: runner.os == 'macOS'
+        uses: taojin-6/volumetric_kit_core/.github/actions/homebrew-key@a4a6fff4af65b26b25df27c8ed8c9eecbfbfcd87
+        with:
+          formulae: ${{ steps.formulae.outputs.formulae }}
+
+      # Report the Vulkan device the runner sees (the real GPU in a container,
+      # MoltenVK on macOS). On macOS a missing device is a notice, and the Test
+      # step's VKC_REQUIRE_VULKAN_DEVICE fails the GPU tests. In a container it
+      # fails the leg here: that leg exists only for the GPU behind `--gpus
+      # all`.
+      - name: GPU diagnostic
+        run: |
+          if vulkaninfo --summary; then
+            exit 0
+          fi
+          if [ "$IN_CONTAINER" = "true" ]; then
+            echo "::error::no Vulkan device visible inside the GPU container — refusing to pass a leg that would skip every GPU test"
+            exit 1
+          fi
+          echo "::notice::no Vulkan device visible"
+
+      # The dependency cache is keyed by the workspace *path*, so compute a short
+      # fingerprint of it. See the cache step below for why the path is the thing
+      # that has to match.
+      - name: Workspace fingerprint
+        id: ws
+        run: |
+          h=$(printf '%s' "${GITHUB_WORKSPACE}" |
+              { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)
+          echo "hash=${h}" >> "${GITHUB_OUTPUT}"
+          echo "workspace ${GITHUB_WORKSPACE} -> ${h}"
+
+      # Cache the FetchContent dependency tree (the core, tinyply, googletest
+      # sources + builds) so they are not re-cloned and recompiled every run.
+      # FetchContent bakes the absolute build path into its sub-build
+      # CMakeCache, so a cache is only reusable where that path is identical --
+      # restore one built elsewhere and Configure dies with "CMakeCache.txt
+      # directory ... is different than the directory ... where CMakeCache.txt
+      # was created". The key therefore carries a hash of GITHUB_WORKSPACE:
+      # relocating a self-hosted runner on disk is then a natural cache miss,
+      # and the containerised legs, which all see the same /__w/… path, share
+      # one key.
+      #
+      # The key also hashes the dep-pin home (third_party/CMakeLists.txt) and
+      # the root list, so a FetchContent version bump busts the cache. And it
+      # carries the Homebrew key (`none` off macOS), in the restore prefix too,
+      # so no tree built on other Homebrew versions is restored.
+      - name: Cache third-party deps
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/_deps
+          key: deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}-ws${{ steps.ws.outputs.hash }}-${{ hashFiles('third_party/CMakeLists.txt', 'CMakeLists.txt') }}
+          restore-keys: |
+            deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}-ws${{ steps.ws.outputs.hash }}-
+
+      # A self-hosted runner keeps its _work tree between jobs, so a build/ left
+      # by a previous checkout survives a runner relocation with the old absolute
+      # paths still baked into every CMakeCache.txt. The key above stops the
+      # *cache* carrying stale paths in, but cannot clean what is already on
+      # disk, and the Configure retry cannot help: the failure is deterministic.
+      # So: if any CMakeCache.txt under build/ records a directory other than
+      # the one it now occupies, drop the tree and let Configure start clean.
+      - name: Discard a build tree left behind at a different path
+        run: |
+          [ -d build ] || exit 0
+          stale=$(find build -name CMakeCache.txt -exec sh -c '
+            recorded=$(sed -n "s/^CMAKE_CACHEFILE_DIR:INTERNAL=//p" "$1" | head -1)
+            actual=$(cd "$(dirname "$1")" && pwd)
+            if [ -n "${recorded}" ] && [ "${recorded}" != "${actual}" ]; then
+              echo "$1 records ${recorded}, now at ${actual}"
+            fi
+          ' _ {} \; | head -3)
+          if [ -n "${stale}" ]; then
+            echo "::warning::discarding a stale build tree:"
+            echo "${stale}"
+            rm -rf build
+          fi
+
+      # Default ("Unix Makefiles") generator + a parallel make build, per project
+      # preference — no Ninja.
+      - name: Configure
+        # Retry to ride out transient FetchContent git-clone DNS blips.
+        run: |
+          ok=0
+          for attempt in 1 2 3; do
+            if cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                -DVGRID_WITH_ASSIMP=${{ inputs.assimp && 'ON' || 'OFF' }}; then
+              ok=1
+              break
+            fi
+            echo "::warning::cmake configure attempt ${attempt} failed; retrying in 15s"
+            sleep 15
+          done
+          [ "${ok}" = 1 ] || {
+            echo "::error::cmake configure failed after 3 attempts"
+            exit 1
+          }
+
+      # Runs CMAKE_BUILD_PARALLEL_LEVEL jobs at once, from the runner's .env or
+      # the container env as for the Test step below, or one per core where
+      # neither sets it. The level is explicit because a bare --parallel
+      # ignores the variable and runs an unlimited make -j.
+      - name: Build
+        run: |
+          cmake --build build \
+            --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-$(getconf _NPROCESSORS_ONLN)}"
+
+      # Runs CTEST_PARALLEL_LEVEL tests at once: from the runner's .env on the
+      # Mac, from the container env ci.yml sets on the Ubuntu legs.
+      - name: Test
+        env:
+          # The core's test policy (core/testing/gpu_test.hpp). Every leg has a
+          # device and the validation layer, so a GPU test fails rather than
+          # skips without either, and fails on any error the layer reports.
+          VKC_REQUIRE_VULKAN_DEVICE: '1'
+          VKC_TEST_VALIDATION: '1'
+          VKC_TEST_SYNC_VALIDATION: ${{ inputs.sync_validation && '1' || '' }}
+          DYLD_LIBRARY_PATH: ${{ env.VGRID_LAYER_LIBRARY_PATH }}
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      # The tests whose code runs threads again under ThreadSanitizer: the
+      # stream reader two threads share, the mesh handoff's producer and
+      # consumer, the server's and the client's threads and the examples' log
+      # handler (examples/common/info_log.hpp), which the sanitizer job, on
+      # address and undefined only, never runs threaded. In a tree of their own
+      # that reuses the sources FetchContent fetched for build/, built for those
+      # tests alone (grid_tsan_tests, tests/CMakeLists.txt). Debug only: the
+      # races do not depend on the build type.
+      - name: Threaded tests under ThreadSanitizer (macOS)
+        if: runner.os == 'macOS' && matrix.build_type == 'Debug'
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          VKC_REQUIRE_VULKAN_DEVICE: '1'
+          VKC_TEST_VALIDATION: '1'
+          DYLD_LIBRARY_PATH: ${{ env.VGRID_LAYER_LIBRARY_PATH }}
+        run: |
+          shopt -s nullglob
+          flags=()
+          for src in build/_deps/*-src; do
+            dep=$(basename "${src}" -src | tr '[:lower:]' '[:upper:]')
+            flags+=("-DFETCHCONTENT_SOURCE_DIR_${dep}=${PWD}/${src}")
+          done
+          rm -rf build-tsan
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+            -DVGRID_SANITIZE=thread -DVGRID_BUILD_EXAMPLES=OFF \
+            -DVGRID_WITH_ASSIMP=OFF "${flags[@]}"
+          cmake --build build-tsan \
+            --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-$(getconf _NPROCESSORS_ONLN)}" \
+            --target grid_tsan_tests
+          ctest --test-dir build-tsan --output-on-failure --no-tests=error \
+            -R '^grid_(networking_|stream_container$|mesh_exchange$|example_info_log$)'
