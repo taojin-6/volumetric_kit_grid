@@ -39,13 +39,11 @@ void take_back(std::unique_ptr<stream::StreamWriter>& writer,
 
 // A frame `set` at `pts_ns` that does not follow the last one coded.
 core::Status out_of_order(std::uint64_t set, std::uint64_t pts_ns,
-                          std::uint64_t last_set, std::uint64_t last_pts_ns,
-                          const char* also) {
+                          std::uint64_t last_set, std::uint64_t last_pts_ns) {
   return core::Status::invalid_argument(
       "CodecStream: frame " + std::to_string(set) + " at " +
       std::to_string(pts_ns) + " ns does not follow frame " +
-      std::to_string(last_set) + " at " + std::to_string(last_pts_ns) + " ns" +
-      also);
+      std::to_string(last_set) + " at " + std::to_string(last_pts_ns) + " ns");
 }
 
 }  // namespace
@@ -115,7 +113,7 @@ core::Result<SentFrame> StreamCoder::code(volume::VoxelBlockGrid& grid,
     return core::Status::invalid_argument("CodecStream: finished");
   }
   if (coded_ > 0 && (set <= last_set_ || pts_ns < last_pts_ns_)) {
-    return out_of_order(set, pts_ns, last_set_, last_pts_ns_, "");
+    return out_of_order(set, pts_ns, last_set_, last_pts_ns_);
   }
   key_on_request();
   core::StageMetrics encoded;
@@ -182,11 +180,13 @@ core::Result<SentFrame> StreamCoder::finish_frame(
     const codec::PendingEncode& pending, std::uint64_t set,
     std::uint64_t pts_ns, core::StageMetrics* rows,
     const std::function<void()>& sent) {
-  if (finished_ ||
-      (coded_ > 0 && (set <= last_set_ || pts_ns < last_pts_ns_))) {
+  if (finished_) {
     encoder_.abandon(pending);
-    return out_of_order(set, pts_ns, last_set_, last_pts_ns_,
-                        ", or the stream is finished");
+    return core::Status::invalid_argument("CodecStream: finished");
+  }
+  if (coded_ > 0 && (set <= last_set_ || pts_ns < last_pts_ns_)) {
+    encoder_.abandon(pending);
+    return out_of_order(set, pts_ns, last_set_, last_pts_ns_);
   }
   core::StageMetrics back_rows;
   core::CommandBatch back(*device_, *allocator_);

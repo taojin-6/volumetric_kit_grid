@@ -186,8 +186,10 @@ class VR_CODEC_STREAM_API CodecStream {
   /// @param grid   The grid to code; nothing but @p front changes it until
   ///               @ref finish_frame, or @ref redo records the half again.
   /// @return The pending frame; `Status::Code::InvalidArgument` for a
-  ///         finished or moved-from stream; or the encoder's refusal, with
-  ///         nothing recorded.
+  ///         finished or moved-from stream; the encoder's refusal, with
+  ///         nothing recorded; or, after the first commands, a buffer
+  ///         failure, so the caller drops @p front
+  ///         (@ref codec::Encoder::record_front).
   /// @pre The batches of the stream's last frame have resolved.
   core::Result<codec::PendingEncode> record_front(core::CommandBatch& front,
                                                   volume::VoxelBlockGrid& grid);
@@ -236,8 +238,8 @@ class VR_CODEC_STREAM_API CodecStream {
   /// @param sent     Optional: runs once the frame is written and served,
   ///                 before the decode.
   /// @return As @ref code; a @p set or @p pts_ns out of order, or a
-  ///         finished or moved-from stream, refused with @p pending
-  ///         dropped.
+  ///         finished stream, refused with @p pending dropped;
+  ///         `Status::Code::InvalidArgument` on a moved-from stream.
   core::Result<SentFrame> finish_frame(const codec::PendingEncode& pending,
                                        std::uint64_t set, std::uint64_t pts_ns,
                                        core::StageMetrics* rows = nullptr,

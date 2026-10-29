@@ -16,9 +16,10 @@
 // finished still read whole, and one dropped before its first frame removed;
 // frames in halves around a caller's batch the file code() writes, byte for
 // byte, the batch's device rows split between the frame and the caller, the
-// front half again on a grid changed after it, and a pending frame since
-// superseded refused; and, served on 127.0.0.1 port 0 (never every
-// interface), every frame the file records reaching a client as it is coded,
+// front half again on a grid changed after it, a pending frame since
+// superseded refused, and a viewer's request for a key read by the front
+// half; and, served on 127.0.0.1 port 0 (never every interface), every
+// frame the file records reaching a client as it is coded,
 // with the file's seq, key, pts, set, bytes and offset, and the end once
 // finished, a frame the file refuses never served, serving alone writing no
 // file, a port in use refused before any file is made, and neither a client
@@ -145,7 +146,8 @@ int refused(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
 
 // With no outputs, the stream codes but writes no file, so nothing lands in
 // the working directory; a frame out of order, and any call once finished, is
-// refused all the same, with no writer to refuse it, a front half included.
+// refused all the same, with no writer to refuse it, a front half included,
+// and a frame whose front half ran before finish, nothing coded.
 // A stream moved from refuses every call,
 // its halves' too, and reports nothing, the one it moved into going on.
 int writes_nothing(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
@@ -178,6 +180,24 @@ int writes_nothing(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     CHECK(made->record_front(front, source).status().domain() ==
           vkc::Status::Code::InvalidArgument);
     CHECK(made->coded() == 2);
+  }
+  {  // A front half run before finish, its frame finished after it.
+    vkc::Result<codec_stream::CodecStream> halted =
+        codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                          session());
+    CHECK(halted.ok());
+    vkc::CommandBatch front(gpu.device, gpu.allocator);
+    const vkc::Result<codec::PendingEncode> pending =
+        halted->record_front(front, source);
+    CHECK(pending.ok());
+    vkc::Result<vkc::PendingBatch> done = front.submit_async({}, {});
+    CHECK(done.ok() && done->wait().ok());
+    halted->front_ran(done->device_rows());
+    CHECK(halted->finish().ok());
+    const vkc::Status late = halted->finish_frame(*pending, 0, pts(0)).status();
+    CHECK(late.domain() == vkc::Status::Code::InvalidArgument &&
+          late.message() == "CodecStream: finished");
+    CHECK(halted->coded() == 0 && halted->player() == nullptr);
   }
 
   vkc::Result<codec_stream::CodecStream> first =
@@ -602,6 +622,44 @@ int halves(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   return 0;
 }
 
+// Served without replay_gop at a period of 3, a viewer joining after frame
+// 0 asks for a key, which frame 1's front half reads: frame 1, coded in
+// halves, is an I-frame where the encoder would code a P-frame, and the
+// viewer's first record, a key; frame 2 a P-frame on it.
+int keyed_halves(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source) {
+  constexpr codec::FrameType I = codec::FrameType::kIntra;
+  constexpr codec::FrameType P = codec::FrameType::kInter;
+  codec_stream::CodecOutputs outputs = served_on_loopback();
+  outputs.serve->replay_gop = false;
+  codec::EncoderConfig config;
+  config.intra_period = 3;
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
+                                        session(), outputs);
+  CHECK(made.ok());
+  codec_stream::CodecStream& coder = made.value();
+  CHECK(coder.code(source, 0, pts(0)).ok());
+  const std::unique_ptr<networking::StreamClient> client = joined(coder);
+  CHECK(client != nullptr && coder.server()->key_wanted() == 1);
+  for (std::size_t frame = 1; frame < 3; ++frame) {
+    vkc::CommandBatch front(gpu.device, gpu.allocator);
+    const vkc::Result<codec::PendingEncode> pending =
+        coder.record_front(front, source);
+    CHECK(pending.ok());
+    vkc::Result<vkc::PendingBatch> done = front.submit_async({}, {});
+    CHECK(done.ok() && done->wait().ok());
+    coder.front_ran(done->device_rows());
+    const vkc::Result<codec_stream::SentFrame> sent =
+        coder.finish_frame(*pending, frame, pts(frame));
+    CHECK(sent.ok() && sent->type == (frame == 1 ? I : P));
+    net::Got got;
+    CHECK(net::next_within(*client, &got));
+    CHECK(got.record.info.seq == frame && got.record.info.key == (frame == 1));
+  }
+  CHECK(coder.finish().ok());
+  return 0;
+}
+
 // Serving alone, the stream codes its frames and serves each, a key at the
 // default period of 1, writing no file.
 int serves_alone(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
@@ -848,6 +906,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(unfinished(gpu, *source, scratch) == 0);
   CHECK(serves(gpu, *source, *other, scratch) == 0);
   CHECK(halves(gpu, *source, *other, scratch) == 0);
+  CHECK(keyed_halves(gpu, *source) == 0);
   CHECK(serves_alone(gpu, *source, scratch) == 0);
   CHECK(port_in_use(gpu, scratch) == 0);
   CHECK(viewer_leaves(gpu, *source, scratch) == 0);
