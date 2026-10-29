@@ -103,8 +103,8 @@ int main() {
             sequence_encoder->segment_size);
 
   // Any port maps to every interface on it, keys on demand (fuse_orbbec codes
-  // live), the server's other options at their defaults; serving alone needs
-  // no file.
+  // live), the scenario's default viewer count the server's own, the server's
+  // other options at their defaults; serving alone needs no file.
   const auto on_port = cfg::parse(R"({
     "version": 1, "operation": "fuse",
     "source": {"kind": "live", "sync_config": "sync.json"},
@@ -119,9 +119,22 @@ int main() {
   CHECK(to_port.serve && to_port.serve->host.empty() &&
         to_port.serve->port == 5000);
   CHECK(!to_port.serve->replay_gop && defaults_served.replay_gop);
-  CHECK(to_port.serve->max_viewers == defaults_served.max_viewers &&
+  CHECK(on_port->output.max_viewers == defaults_served.max_viewers &&
+        to_port.serve->max_viewers == defaults_served.max_viewers &&
         to_port.serve->max_gop_bytes == defaults_served.max_gop_bytes &&
         to_port.serve->stall_limit == defaults_served.stall_limit);
+  // The scenario's viewer count goes to the server.
+  const auto sixteen = cfg::parse(R"({
+    "version": 1, "operation": "fuse",
+    "source": {"kind": "live", "sync_config": "sync.json"},
+    "output": {"path": "rig.ply", "serve": 5000, "max_viewers": 16}
+  })",
+                                  cfg::Application::FuseOrbbec);
+  CHECK(sixteen);
+  const vgrid::codec_stream::CodecOutputs to_sixteen =
+      vgrid_example::codec_outputs(sixteen.value().output);
+  CHECK(to_sixteen.serve && to_sixteen.serve->port == 5000 &&
+        to_sixteen.serve->max_viewers == 16);
 
   const auto encoded =
       cfg::parse(R"({

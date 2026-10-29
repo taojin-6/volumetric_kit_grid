@@ -182,7 +182,8 @@ GPU; a viewer connects to the sender's `host:port`:
 
 Both listen on every interface, with no authentication or encryption: any
 host that reaches the port can watch, and the first four to connect keep
-their slots while they stay (`max_viewers`). Both print each viewer joining
+their slots while they stay (`max_viewers`; `fuse_orbbec` takes another
+count from the scenario's `output.max_viewers`). Both print each viewer joining
 and leaving on stderr; one the sender closes, or whose connection fails,
 ends with `closed: <why>` or `failed: <why>` in place of `left`:
 

@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(
   volumetric_kit_grid
-  VERSION 0.2.0
+  VERSION 0.2.1
   DESCRIPTION
     "Sparse voxel hashing, meshing and the TSDF geometry codec on Vulkan compute (MoltenVK on Apple) for the volumetric_kit family"
   HOMEPAGE_URL "https://github.com/taojin-6/volumetric_kit_grid"
@@ -57,10 +57,11 @@ endif()
 # Pinned dependencies: volumetric_kit_core, linked PUBLIC, and tinyply, private
 # to the mesh files. The oldest core grid's libraries build with is checked in
 # the core that arrives (third_party/, which also checks the config tier the
-# examples and tests need): 0.29.0, whose vulkan/fwd.hpp the public headers
-# include, whose vkc_export_glsl exports grid's GLSL and whose test support the
-# tests run on.
-set(VGRID_CORE_MIN_VERSION 0.29.0)
+# examples and tests need): 0.30.0, whose output.max_viewers the examples' serve
+# reads; 0.29.0 brought the vulkan/fwd.hpp the public headers include, the
+# vkc_export_glsl that exports grid's GLSL and the test support the tests run
+# on.
+set(VGRID_CORE_MIN_VERSION 0.30.0)
 add_subdirectory(third_party)
 
 add_subdirectory(src)
