@@ -268,7 +268,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   an I-frame; the split, the diff and a static price for zero run on the
   device. *Amended 2026-10-16:* a sixth rule, an empty grid; U is
   `EncoderConfig::update_size`. *Amended 2026-10-17:* a P-frame is counted
-  in the forward's submit.
+  in the forward's submit. *Amended 2026-10-29:* a P-frame is held one
+  quantization step against the reference before it is coded.
 - [**2026-10-14**](#2026-10-14--mesh-normalization-and-the-topology-audit-are-opt-in-generic-io-helpers-for-a-mesh-sequence-bounds-measured-along-one-up-and-joined-over-frames-and-one-transform-for-every-frame-amends-the-2026-10-02-normalized-mesh-and-2026-10-03-codec-mesh-entries) —
   Mesh normalization and the topology audit are opt-in, generic `io`
   helpers for a mesh sequence: bounds measured along one up and joined over
@@ -422,6 +423,12 @@ entries relevant to your task; later amendments supersede earlier rules.
   grid is a package of its own: the voxel grid and what reads it, under
   grid's names, on the core alone. It lives in recon's `grid/` until it
   becomes `volumetric_kit_grid`; recon builds on it.
+- [**2026-10-29**](#2026-10-29--the-encoder-holds-each-p-frame-one-quantization-step-against-its-reference-i-frames-are-quantized-afresh-amends-the-2026-10-14-encoder-entry) —
+  The `Encoder` holds each P-frame one quantization step against its
+  reference: a coefficient within one step of the reference's,
+  |q − q_ref| ≤ 1, keeps the reference's value, always, on the device;
+  I-frames are quantized afresh, since holding them too lets the held
+  values drift. Format and decoder unchanged.
 
 ## Decision record
 
@@ -8316,3 +8323,59 @@ tests, examples and `-Werror` follow recon's, and it builds outside the
 cached `_deps`. A project that fetches grid itself declares it first, by URL,
 SHA and `SOURCE_SUBDIR grid` until the repository is its own. grid starts at
 0.1.0, and recon moves to 0.1.0 with it.
+
+### 2026-10-29 — The `Encoder` holds each P-frame one quantization step against its reference; I-frames are quantized afresh (amends the 2026-10-14 encoder entry).
+
+**Why.** The forward quantized every frame from scratch, so sensor noise
+that moves a coefficient to and fro across a rounding boundary flipped it
+between two steps frame after frame: the decoded surface flickered where
+fusion's did not, and every flip cost P-frame bits.
+
+**The rule.** In the front's batch, after the forward and before the diff,
+`inter_hold.comp` (an invocation a reference entry, the frame's block found
+by binary search) gives each coefficient of a block the reference holds the
+reference's value when |q − q_ref| ≤ 1, in the store's spare in place. So
+the frame codes, the decoder holds and the next frame is coded against the
+held values, and a held block costs a skip. A change of more than one step
+passes in its frame, and every coefficient stays within one step of the
+forward's. Integer only, so every device holds alike; masks and the blocks
+the reference lacks are left as they are. Always on, with no switch: the
+format, the golden frames and the `Decoder` are unchanged.
+
+**I-frames are not held.** Held the same way, an I-frame still carries its
+values in full and decodes on its own, and the flicker of the transition
+into it goes. But nothing then re-centres a held value: it moves only when
+the forward is two steps off it, and then to that outlier, so period after
+period the held values drift toward the ends of the noise. On take1 that
+raised the decoded mesh's interior roughness p90 to 15.5° (Dynamic) and
+13.7° (Classic), against 12.2° and 9.9° with P-frames alone and 11.6° and
+9.8° on main (median 4.1° and 3.3°, against 2.9° and 1.9°), and its steady
+flicker and rate were higher than with P-frames alone. An I-frame quantized
+afresh re-centres once a period, at one transition of flicker.
+
+**Measured** (Release; take1: 4 Femtos, 1 cm, K 64, scale 0.2, period 30,
+300 sets of recon's fusion through this encoder, flicker the share of the
+decoded mesh's band triangles unmatched across a transition, sets 150–165;
+Rafa2: frames 1–150 on `codec_mesh`'s path, 5 mm, K 56, scale 0.040877,
+period 30, error the decoded surface's against the uncompressed TSDF's,
+mean over frames):
+
+| | main | held P-frames |
+| --- | --- | --- |
+| take1 Dynamic: Mbit/s; interior / edge flicker | 74.8; 0.155 / 0.355 | 51.3; 0.061 / 0.335 |
+| take1 Dynamic, into the I-frame | 0.156 / 0.365 | 0.210 / 0.462 |
+| take1 Classic: Mbit/s; interior / edge flicker | 17.0; 0.0213 / 0.0247 | 12.8; 0.0002 / 0.0011 |
+| take1 Classic, into the I-frame | 0.022 / 0.024 | 0.092 / 0.119 |
+| Rafa2: Mbit/s; error mm | 1.99; 0.212 | 1.26; 0.316 |
+| Rafa2 at scale 0.09, main's at the same rate | 1.26; 0.368 | — |
+| encode device ms, P median: 4090 take1 D / C / Rafa2 | 1.65 / 0.93 / 0.77 | 1.46 / 0.92 / 0.70 |
+| encode device ms, P median: M5 Max take1 D / C / Rafa2 | 2.24 / 1.52 / 1.20 | 1.98 / 1.42 / 1.15 |
+
+Fusion is untouched: its mesh's flicker and roughness match main's to every
+digit (its vertex order varies run to run). Over a period of 30 the transition
+into the I-frame leaves interior flicker 58% (Dynamic) and 85% (Classic)
+below main's. On Rafa2, a clean mesh sequence, the hold trades error for
+rate: at the same scale 37% fewer bits and a larger error, at the same rate
+14% less error than main's coarser step, and decoded flicker down to the
+source's own. I-frames encode in the same time (take1 medians within
+0.05 ms on both devices).
