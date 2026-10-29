@@ -12,7 +12,7 @@
 // than the format allows refused, every refusal and failure leaving the
 // reference as it was, and the device buffers grown and shrunk frame to
 // frame. Encoding: every frame of the Encoder's chains the CPU oracle's
-// bytes, held against the frame before (oracle::held), its P-frames priced
+// bytes, a P-frame's held against the frame before (oracle::held), priced
 // as the oracle prices them, counted in the diff's batch, and coded in update
 // segments of the segment size, or of an update size set; each of the diff's
 // choices from one edit of a frame; a difference of 32768 coded zero, in
@@ -21,9 +21,9 @@
 // curtain's chain, its partial masks changing frame to frame. The hold: the
 // store's against oracle::held at every K, past its count and in several
 // dispatches, and its refusals; and an Encoder's chain whose dithering
-// coefficient stays put, a jump passes in its frame, a drift follows two
-// steps at a time, every coefficient within one step of the forward's, and
-// its I-frames hold too, decoding on their own to the frame before's grid.
+// coefficient stays put across P-frames, a jump passes in its frame, a drift
+// follows two steps at a time, every coefficient within one step of the
+// forward's, and its I-frames the forward's, decoding on their own.
 // Internal headers by include path; skips with no device.
 
 #include <algorithm>
@@ -1008,8 +1008,9 @@ int segment_rule_case(Shared& gpu) {
 // --- The Encoder's P-frames. -------------------------------------------------
 
 // One frame of an Encoder's chain: what it sent, the oracle's intra frame of
-// the same grid held against the chain's last frame, and the content both
-// code, read off that intra frame; and the forward's content, unheld.
+// the same grid -- a P-frame's held against the chain's last frame -- and the
+// content both code, read off that intra frame; and the forward's content,
+// unheld.
 struct Coded {
   Bytes sent;
   Bytes intra;
@@ -1018,26 +1019,28 @@ struct Coded {
 };
 
 // Encode @p grid with @p enc and hold the bytes to the oracle's: an I-frame
-// to the oracle's intra frame of the grid held against the chain's last
-// frame (oracle::held), a P-frame to the oracle's writer over encoder_frame
-// of that content against the chain's last, at @p config's sizes. Appends
-// the frame to @p chain.
+// to the oracle's intra frame of the grid, a P-frame to the oracle's writer
+// over encoder_frame of the grid's content held against the chain's last
+// frame (oracle::held), at @p config's sizes. Appends the frame to @p chain.
 int encode_checked(Shared& gpu, codec::Encoder& enc,
                    const codec::EncoderConfig& config,
                    vol::VoxelBlockGrid& grid, std::vector<Coded>& chain) {
   vkc::Result<Bytes> sent = enc.encode(grid);
-  vkc::Result<Bytes> intra =
-      oracle::encode(gpu, gpu.transform, grid, config,
-                     chain.empty() ? nullptr : &chain.back().intra);
+  CHECK(sent.ok());
+  vkc::Result<codec::FrameInfo> info =
+      codec::read_frame_info(sent.value().data(), sent.value().size());
+  CHECK(info.ok());
+  const bool p = info.value().type == codec::FrameType::kInter;
+  CHECK(!p || !chain.empty());
+  vkc::Result<Bytes> intra = oracle::encode(gpu, gpu.transform, grid, config,
+                                            p ? &chain.back().intra : nullptr);
   vkc::Result<Bytes> fresh = oracle::encode(gpu, gpu.transform, grid, config);
-  CHECK(sent.ok() && intra.ok() && fresh.ok());
+  CHECK(intra.ok() && fresh.ok());
   vkc::Result<oracle::Frame> content = oracle::read_frame(
       intra.value().data(), intra.value().size(), kMaxBlocks);
   vkc::Result<oracle::Frame> unheld = oracle::read_frame(
       fresh.value().data(), fresh.value().size(), kMaxBlocks);
-  vkc::Result<codec::FrameInfo> info =
-      codec::read_frame_info(sent.value().data(), sent.value().size());
-  CHECK(content.ok() && unheld.ok() && info.ok());
+  CHECK(content.ok() && unheld.ok());
   if (info.value().type == codec::FrameType::kIntra) {
     CHECK(sent.value() == intra.value());
   } else {
@@ -1738,16 +1741,16 @@ int hold_store_case(Gpu& gpu) {
 
 // An Encoder's chain at a period of 4 over blocks of constant SDF, whose DC
 // alone is not 0: q = round(v sqrt(512) / 0.2), the default step. Block a's
-// forward DC dithers between 40 and 41 at random -- 41 at both later
-// I-frames -- and stays at 40 throughout, so the P-frames between skip it;
-// c jumps three steps at frame 5, which passes in that frame; d drifts a
-// step a frame from frame 6, which the hold follows two steps at a time;
-// b, a slope, never changes. Every frame is the held oracle's bytes, each
-// held coefficient within one step of the forward's, and the player's grid
-// the held content's at every frame. The I-frames hold as the P-frames do:
-// the key frame at 4 is frame 3's content, so the player's grid does not
-// change across it, and a decoder that starts there decodes it, and the
-// P-frame after it, to the chain's grid.
+// forward DC dithers between 40 and 41 at random, 41 at both later I-frames;
+// the P-frames hold it -- at 40, then at 41 from the I-frame at 4 -- and skip
+// it; c jumps three steps at frame 5, which passes in that frame; d drifts a
+// step a frame from frame 6, which the P-frames follow two steps at a time;
+// b, a slope, never changes. Every frame is the oracle's bytes, each held
+// coefficient within one step of the forward's, and the player's grid the
+// held content's at every frame. The I-frames are the forward's, so each
+// re-centres what the P-frames held: the one frame of flicker the hold
+// leaves, at 4 (a) and at 8 (d). A decoder that starts at the I-frame at 4
+// decodes it, and the frames after it, to the chain's grid.
 int hold_chain_case(Shared& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 4;
@@ -1760,9 +1763,10 @@ int hold_chain_case(Shared& gpu) {
   };
   const vgrid::Vec3i a(0, 0, 0), b(1, 0, 0), c(0, 2, 0), e(3, 0, 0);
   const int a_dc[10] = {40, 41, 40, 41, 41, 40, 41, 40, 41, 40};
+  const int a_held[10] = {40, 40, 40, 40, 41, 41, 41, 41, 41, 41};
   const int c_dc[10] = {20, 20, 20, 20, 20, 23, 23, 23, 23, 23};
   const int e_dc[10] = {10, 10, 10, 10, 10, 10, 11, 12, 13, 14};
-  const int e_held[10] = {10, 10, 10, 10, 10, 10, 10, 12, 12, 14};
+  const int e_held[10] = {10, 10, 10, 10, 10, 10, 10, 12, 13, 13};
   std::vector<Coded> chain;
   vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
   vkc::Result<vol::VoxelBlockGrid> joiner = make_grid(gpu);
@@ -1792,9 +1796,11 @@ int hold_chain_case(Shared& gpu) {
     CHECK(f.fresh.blocks.coefficients[0] == a_dc[t]);
     CHECK(f.fresh.blocks.coefficients[2 * k] == e_dc[t]);
     CHECK(f.fresh.blocks.coefficients[3 * k] == c_dc[t]);
-    CHECK(f.content.blocks.coefficients[0] == 40);
+    CHECK(f.content.blocks.coefficients[0] == a_held[t]);
     CHECK(f.content.blocks.coefficients[2 * k] == e_held[t]);
     CHECK(f.content.blocks.coefficients[3 * k] == c_dc[t]);
+    CHECK(!intra ||
+          f.content.blocks.coefficients == f.fresh.blocks.coefficients);
     for (std::size_t i = 0; i < f.fresh.blocks.coefficients.size(); ++i) {
       const int gap = std::abs(int(f.content.blocks.coefficients[i]) -
                                int(f.fresh.blocks.coefficients[i]));
@@ -1804,7 +1810,7 @@ int hold_chain_case(Shared& gpu) {
     CHECK(f.content.blocks.masks == f.fresh.blocks.masks);
     if (!intra) {
       const Census n = census_of(chain);
-      const bool still = t != 5 && t != 7 && t != 9;
+      const bool still = t != 5 && t != 7;
       CHECK(n.added == 0);
       CHECK(n.modes[std::size_t(d::BlockMode::kSkip)] == (still ? 4u : 3u));
     }
@@ -1821,15 +1827,10 @@ int hold_chain_case(Shared& gpu) {
       CHECK(j.ok() && j.value() == decoded.back());
     }
   }
-  CHECK(off_by_one == 7);  // a's five 41s and e's two
-  // No key-frame pulse: frames 3 and 4, and 7 and 8, but for c and d.
-  CHECK(chain[4].content.coords == chain[3].content.coords &&
-        chain[4].content.blocks.coefficients ==
-            chain[3].content.blocks.coefficients);
-  CHECK(decoded[4] == decoded[3]);
-  CHECK(chain[8].content.blocks.coefficients ==
-        chain[7].content.blocks.coefficients);
-  CHECK(decoded[8] == decoded[7]);
+  CHECK(off_by_one == 7);  // a's five P-frames off the forward's, and d's two
+  // What the P-frames before each later I-frame held, it re-centres.
+  CHECK(!(decoded[4] == decoded[3]) && !(decoded[8] == decoded[7]));
+  CHECK(decoded[2] == decoded[1] && decoded[6] == decoded[5]);
   return 0;
 }
 

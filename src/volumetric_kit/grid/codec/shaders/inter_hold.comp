@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The encoder's one-step hold (reference_store.hpp), run on every frame
-// coded while a reference is held, intra or P, before it is coded: each
-// coefficient of a target block on a reference coordinate takes the
-// reference block's value when the two lie within one quantization step,
-// |q_t - q_ref| <= 1, written into the target in place -- the frame the
-// forward made, in frame order, in the store's spare, which the frame codes
-// and the next frame is coded against. An invocation a reference entry e: a
-// binary search of the target's list for its coordinate, none holding
-// nothing. Integer only, so every device holds alike; the masks, the blocks
-// the reference lacks and an odd K's pad half are left as they are. Writes
-// stay below the target's count.
+// The encoder's one-step hold (reference_store.hpp), run on a P-frame before
+// inter_diff.comp codes it: each coefficient of a target block on a
+// reference coordinate takes the reference block's value when the two lie
+// within one quantization step, |q_t - q_ref| <= 1, written into the target
+// in place -- the frame the forward made, in frame order, in the store's
+// spare, which the frame codes and the next frame is coded against. An
+// invocation a reference entry e: a binary search of the target's list for
+// its coordinate, none holding nothing. Integer only, so every device holds
+// alike; the masks, the blocks the reference lacks and an odd K's pad half
+// are left as they are. Writes stay below the target's count.
 
 #version 450
 #extension GL_GOOGLE_include_directive : require

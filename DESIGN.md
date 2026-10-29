@@ -546,21 +546,19 @@ reader's rule), when the reference holds no block, and when the grid holds
 none (the 2026-10-16 entry, decided by the device's count, so a P-frame
 planned at record finishes as an I-frame of none); a P-frame otherwise,
 against the frame returned last. Its reference is what the decoder
-will hold of that frame: the forward's q, held, and masks and the sorted list,
-left in `detail::ReferenceStore`'s spare and swapped in when `finish` returns
-the frame, so a refusal or `abandon` keeps the reference and the period's
-count. Every frame, I or P, is held against that frame before it is coded
-(the 2026-10-29 entry), unless its geometry is not the grid's or it holds no
-block: in the front's batch, `inter_hold.comp`, an invocation a reference
+will hold of that frame: the forward's q (a P-frame's held, below) and masks
+and the sorted list, left in `detail::ReferenceStore`'s spare and swapped in
+when `finish` returns the frame, so a refusal or `abandon` keeps the reference
+and the period's count. A P-frame is held against its reference before it is coded (the 2026-10-29
+entry): in the front's batch, `inter_hold.comp`, an invocation a reference
 entry, finds its block in the frame by binary search and gives each
 coefficient within one step of the reference's, |q − q_ref| ≤ 1, the
 reference's value, in the spare in place. Noise that moves a coefficient to
 and fro across a rounding boundary then costs neither flicker nor bits, a
 change of more than one step passes in its frame, and each coefficient stays
-within one step of the forward's. An I-frame carries its held values in full,
-so it decodes on its own, to the grid a P-frame in its place would have:
-what a chain decodes to does not depend on its frame types, and a key costs
-no flicker. Format and decoder are unchanged.
+within one step of the forward's. An I-frame is quantized afresh, which
+re-centres the held values on its grid once a period, at one frame of
+flicker. Format and decoder are unchanged.
 In the front's batch, `inter_diff.comp` splits the frame against the reference
 and codes it, an invocation an entry: each reference entry finds its block
 by binary search (remove, skip when every word is equal, else keep or zero),

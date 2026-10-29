@@ -59,9 +59,9 @@ struct FrameBuffers {
 /// (`inter_apply.comp`); an intra frame takes the same apply, from its
 /// payload alone, so every decoded frame lands in the store by one path. An
 /// encoder's comes from its sort and forward transform, intra or P alike,
-/// held against the reference by @ref record_hold (`inter_hold.comp`), and a
-/// P-frame's entries are coded from it against the reference by
-/// @ref record_diff (`inter_diff.comp`). Every frame either side commits is
+/// and a P-frame is held against the reference by @ref record_hold
+/// (`inter_hold.comp`) and its entries coded from it against the reference
+/// by @ref record_diff (`inter_diff.comp`). Every frame either side commits is
 /// the q and masks the next one is coded or decoded against.
 ///
 /// Each slot takes `80 + 4 * coefficient_words(K)` bytes a block, and the
@@ -169,7 +169,7 @@ class VGRID_CODEC_API ReferenceStore {
   /// @brief Record the one-step hold of the frame the spare holds against
   ///        the held reference, once the commands @p batch already holds
   ///        have run (an encoder's sort, into the spare's list, and its
-  ///        forward): an intra frame's or a P-frame's, before it is coded.
+  ///        forward): a P-frame's, before @ref record_diff codes it.
   ///
   /// `inter_hold.comp` gives each coefficient of a frame block on a
   /// reference coordinate the reference block's value when the two lie

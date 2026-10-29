@@ -282,12 +282,7 @@ int oracle_case(Gpu& gpu) {
 // sort orders them as the oracle's std::sort does, and the frame's deltas span
 // the whole range, so the bytes are still the oracle's -- with true_sdf too,
 // whose neighbours there wrap around int32 on the device and in the oracle.
-// Fresh encoders, whose first frames hold nothing.
-int extremes_case(Gpu& gpu) {
-  vkc::Result<codec::Encoder> made =
-      codec::Encoder::create(gpu.device, gpu.allocator);
-  CHECK(made.ok());
-  codec::Encoder& enc = made.value();
+int extremes_case(Gpu& gpu, codec::Encoder& enc) {
   const Sphere s{vgrid::Vec3f(0.0f), 0.05f};
   vkc::Result<vol::VoxelBlockGrid> g = sphere_grid(gpu, s);
   CHECK(g.ok());
@@ -793,11 +788,10 @@ int true_sdf_heap_case(Gpu& gpu) {
 // One encoder, a frame with cuts, then a frame without any on the same grid
 // cleared and allocated again -- its slots now other blocks': no cut and no
 // kept block of the first frame reaches the second, which is the oracle's
-// held against the first and codes every voxel of its blocks observed. clear()
-// refills the heap as a new grid's, so the same blocks may draw the same slots
-// again: far blocks, drawn one at a time until one holds a slot of the first
-// frame's, keep that slot from its block while the curtain's blocks are drawn,
-// then go.
+// and codes every voxel of its blocks observed. clear() refills the heap as
+// a new grid's, so the same blocks may draw the same slots again: far blocks,
+// drawn one at a time until one holds a slot of the first frame's, keep that
+// slot from its block while the curtain's blocks are drawn, then go.
 int stale_cut_case(Gpu& gpu) {
   const Curtain curtain = test_curtain(false);
   vkc::Result<codec::Encoder> enc =
@@ -840,7 +834,7 @@ int stale_cut_case(Gpu& gpu) {
   CHECK(moved);  // the premise: the blocks sit in other slots
   vkc::Result<Bytes> clean = enc.value().encode(grid);
   vkc::Result<Bytes> oracle =
-      codec_oracle::encode(gpu, grid, true_sdf_config(), &cut.value());
+      codec_oracle::encode(gpu, grid, true_sdf_config());
   CHECK(clean.ok() && oracle.ok() && clean.value() == oracle.value());
   vkc::Result<Snapshot> none = decoded(gpu, clean.value());
   CHECK(none.ok() && unobserved(none.value()) == 0);
@@ -1057,17 +1051,17 @@ int abandon_case(Gpu& gpu) {
 }
 
 // A payload past what the back batch copied is gathered again over the rest
-// ("  ..tail"), to the bytes encode() makes of the same chain: a smooth frame
-// sets the next frame's guess, and a frame of noise outgrows it. In place the
-// batch writes the slot itself, so there is never a tail.
+// ("  ..tail"), to the same bytes: a smooth frame sets the next frame's
+// guess, and a frame of noise outgrows it. In place the batch writes the
+// slot itself, so there is never a tail.
 int tail_case(Gpu& gpu) {
   vkc::Result<codec::Encoder> enc =
       codec::Encoder::create(gpu.device, gpu.allocator);
-  vkc::Result<codec::Encoder> whole =
+  vkc::Result<codec::Encoder> fresh =
       codec::Encoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> smooth = make_grid(gpu);
   vkc::Result<vol::VoxelBlockGrid> noise = make_grid(gpu);
-  CHECK(enc.ok() && whole.ok() && smooth.ok() && noise.ok());
+  CHECK(enc.ok() && fresh.ok() && smooth.ok() && noise.ok());
   std::vector<vgrid::Vec3i> coords;
   for (int i = 0; i < 64; ++i) coords.push_back(vgrid::Vec3i(i % 8, i / 8, 49));
   CHECK(allocate(gpu, smooth.value(), coords).ok());
@@ -1090,8 +1084,7 @@ int tail_case(Gpu& gpu) {
   vkc::StageMetrics m;
   vkc::Result<Halves> noisy = by_halves(gpu, enc.value(), noise.value(), &m);
   CHECK(first.ok() && noisy.ok());
-  CHECK(whole.value().encode(smooth.value()).value() == first.value().bytes);
-  CHECK(noisy.value().bytes == whole.value().encode(noise.value()).value());
+  CHECK(noisy.value().bytes == fresh.value().encode(noise.value()).value());
   const bool in_place = gpu.device.caps().device_mapped_cached();
   std::printf("  smooth %zu bytes, noise %zu bytes, in place %d\n",
               first.value().bytes.size(), noisy.value().bytes.size(),
@@ -1137,7 +1130,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   if (metrics_case(gpu, enc) != 0) return 1;
   if (device_list_case(gpu, enc) != 0) return 1;
   if (oracle_case(gpu) != 0) return 1;
-  if (extremes_case(gpu) != 0) return 1;
+  if (extremes_case(gpu, enc) != 0) return 1;
   if (sizes_case(gpu) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (moves_case(gpu) != 0) return 1;

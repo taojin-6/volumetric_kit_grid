@@ -117,8 +117,8 @@ std::uint64_t payload_price(const std::uint32_t* mask,
 // that block's when the two lie within one step, |q - q_ref| <= 1; its masks,
 // its other blocks and its pad as they are. Both are intra frames' content.
 // A reference of no blocks, or whose coding parameters are not @p target's
-// (d::coding_difference), holds nothing, as in the Encoder. Block identity by
-// a std::map, the values in plain int arithmetic.
+// (d::coding_difference), holds nothing. Block identity by a std::map, the
+// values in plain int arithmetic.
 Frame held(const Frame& reference, const Frame& target);
 
 // The device writer's step layout (step_layout.hpp), on the host, in 64

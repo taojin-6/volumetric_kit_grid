@@ -10,9 +10,11 @@
 // untouched; a grid whose hash table cannot place the frame says so and
 // recovers after a resize; read_frame_info; the stage rows; the moves; and the
 // Encoder's P-frame chains, at a period of 4 and open-ended, decoding to
-// exactly the grids an all-intra chain of the same grids does, and recovering
-// from a lost frame through force_intra(). Links grid_mesh, which the codec
-// tier itself may not. Skips with no device.
+// exactly the grids the CPU oracle's intra frames of the same content do --
+// an I-frame's quantized afresh, a P-frame's held against the frame before
+// (codec_oracle_encode.hpp) -- and recovering from a lost frame through
+// force_intra(). Links grid_mesh, which the codec tier itself may not. Skips
+// with no device.
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "codec_oracle_encode.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/grid/codec/decoder.hpp"
@@ -779,16 +782,27 @@ int moves_case(Gpu& gpu, codec::Encoder& enc) {
   return 0;
 }
 
-// Chains of P-frames at a period of 4 and open-ended, each decoded frame
-// after frame into one grid by a decoder of its own, leave that grid bit for
-// bit as an all-intra chain of the same grids leaves another, at every frame;
-// the period's chain crosses its second I-frame.
+// What the oracle's intra frame @p want decodes to: @p dec's decode of it
+// into @p grid, frame after frame, read back.
+vkc::Result<Snapshot> decoded_by(codec::Decoder& dec, vol::VoxelBlockGrid& grid,
+                                 Gpu& gpu, const Bytes& want) {
+  VKC_TRY(dec.decode(want.data(), want.size(), grid));
+  return snapshot(gpu, grid);
+}
+
+// Chains at a period of 1, of 4 and open-ended, each decoded frame after
+// frame into one grid by a decoder of its own, leave that grid bit for bit as
+// the CPU oracle's intra frame of the same content leaves another, at every
+// frame: an I-frame's quantized afresh, a P-frame's held against the chain's
+// frame before. The period's chain crosses its second I-frame; the
+// all-intra chain holds nothing.
 int p_chain_case(Gpu& gpu) {
   struct Chain {
     std::uint32_t period;
     codec::Encoder enc;
     codec::Decoder dec;
     vol::VoxelBlockGrid grid;
+    Bytes last;  // the oracle's intra frame of what dec holds
   };
   std::vector<Chain> chains;
   for (const std::uint32_t period : {1u, 4u, ~0u}) {
@@ -800,14 +814,20 @@ int p_chain_case(Gpu& gpu) {
         codec::Decoder::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> grid = make_grid(gpu);
     CHECK(enc.ok() && dec.ok() && grid.ok());
-    chains.push_back(Chain{period, std::move(enc).value(),
-                           std::move(dec).value(), std::move(grid).value()});
+    chains.push_back(Chain{period,
+                           std::move(enc).value(),
+                           std::move(dec).value(),
+                           std::move(grid).value(),
+                           {}});
   }
+  vkc::Result<codec::Decoder> oracle_dec =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  vkc::Result<vol::VoxelBlockGrid> oracle_grid = make_grid(gpu);
+  CHECK(oracle_dec.ok() && oracle_grid.ok());
   std::size_t p_frames = 0;
   for (int t = 0; t < 6; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
     CHECK(g.ok());
-    std::vector<Snapshot> decoded;
     for (Chain& c : chains) {
       vkc::Result<Bytes> frame = c.enc.encode(g.value());
       CHECK(frame.ok());
@@ -820,17 +840,23 @@ int p_chain_case(Gpu& gpu) {
       p_frames += intra ? 0 : 1;
       CHECK(c.dec.decode(frame.value().data(), frame.value().size(), c.grid)
                 .ok());
-      vkc::Result<Snapshot> snap = snapshot(gpu, c.grid);
-      CHECK(snap.ok());
-      decoded.push_back(std::move(snap).value());
-    }
-    for (const Snapshot& s : decoded) {
-      if (!(s == decoded[0])) {
-        std::fprintf(stderr, "frame %d: a chain differs from all-intra\n", t);
+      codec::EncoderConfig config;
+      config.intra_period = c.period;
+      vkc::Result<Bytes> want = codec_oracle::encode(gpu, g.value(), config,
+                                                     intra ? nullptr : &c.last);
+      CHECK(want.ok());
+      c.last = std::move(want).value();
+      vkc::Result<Snapshot> got = snapshot(gpu, c.grid);
+      vkc::Result<Snapshot> oracle =
+          decoded_by(oracle_dec.value(), oracle_grid.value(), gpu, c.last);
+      CHECK(got.ok() && oracle.ok() && !got.value().coords.empty());
+      if (!(got.value() == oracle.value())) {
+        std::fprintf(stderr,
+                     "frame %d: the period %u chain is not the oracle's\n", t,
+                     c.period);
         return 1;
       }
     }
-    CHECK(!decoded[0].coords.empty());
   }
   CHECK(p_frames == 4 + 5);
   return 0;
@@ -838,32 +864,30 @@ int p_chain_case(Gpu& gpu) {
 
 // A frame the Encoder returned and the player lost breaks the chain: the
 // P-frame after it is NotFound, the grid untouched; force_intra() makes the
-// next frame an I-frame, which the player decodes on its own though it is
-// held against a frame the player lacks, and the P-frames after it decode as
-// an all-intra chain of the same grids does.
+// next frame an I-frame, which the player decodes to the oracle's intra frame
+// of its grid, and the P-frames after it decode to the oracle's, each held
+// against the frame before.
 int lost_frame_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 30;
   vkc::Result<codec::Encoder> made =
       codec::Encoder::create(gpu.device, gpu.allocator, config);
-  vkc::Result<codec::Encoder> all_intra =
-      codec::Encoder::create(gpu.device, gpu.allocator);
   vkc::Result<codec::Decoder> dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<codec::Decoder> intra_dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
   vkc::Result<vol::VoxelBlockGrid> intra_player = make_grid(gpu);
-  CHECK(made.ok() && all_intra.ok() && dec.ok() && intra_dec.ok() &&
-        player.ok() && intra_player.ok());
+  CHECK(made.ok() && dec.ok() && intra_dec.ok() && player.ok() &&
+        intra_player.ok());
   codec::Encoder& enc = made.value();
+  Bytes last;  // the oracle's intra frame of what the player holds
   for (int t = 0; t < 6; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
     CHECK(g.ok());
     if (t == 3) enc.force_intra();
     vkc::Result<Bytes> frame = enc.encode(g.value());
-    vkc::Result<Bytes> intra = all_intra.value().encode(g.value());
-    CHECK(frame.ok() && intra.ok());
+    CHECK(frame.ok());
     const Bytes& f = frame.value();
     if (t == 1) continue;  // lost
     if (t == 2) {
@@ -877,10 +901,14 @@ int lost_frame_case(Gpu& gpu) {
     }
     vkc::Result<codec::FrameInfo> info =
         codec::read_frame_info(f.data(), f.size());
-    CHECK(info.ok() &&
-          info.value().type == (t == 0 || t == 3 ? codec::FrameType::kIntra
+    const bool key = t == 0 || t == 3;
+    CHECK(info.ok() && info.value().type == (key ? codec::FrameType::kIntra
                                                  : codec::FrameType::kInter));
     CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
+    vkc::Result<Bytes> intra =
+        codec_oracle::encode(gpu, g.value(), config, key ? nullptr : &last);
+    CHECK(intra.ok());
+    last = intra.value();
     CHECK(intra_dec.value()
               .decode(intra.value().data(), intra.value().size(),
                       intra_player.value())
