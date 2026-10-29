@@ -425,8 +425,8 @@ one voxel past the cell, so each workgroup also resolves its block's 3×3×3
 neighbourhood. Against one normal per cell, interleaved on the last frame
 of a decoded live room capture (1 cm, 1.24 M triangles, Release,
 2026-10-29), the extract's dispatch takes
-+0.66 ms unshared and +0.23 ms sharing on an RTX 4090 (0.62 → 1.29 and
-1.56 → 1.80 ms), and +0.66 and +0.91 ms on an M5 Max (1.51 → 2.17 and
++0.42 ms unshared and +0.23 ms sharing on an RTX 4090 (0.62 → 1.04 and
+1.57 → 1.80 ms), and +0.59 and +0.91 ms on an M5 Max (1.51 → 2.10 and
 2.29 → 3.20 ms).
 `MeshExchange<Payload>` (`mesh/mesh_exchange.hpp`) hands `extract_device`'s
 meshes from the extracting thread to a renderer drawing them in place, each
