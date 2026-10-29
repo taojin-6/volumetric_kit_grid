@@ -9,7 +9,8 @@
 // it is pinned rather than trusted.
 //
 // Host, always: volume's curve, decode and running-mean encode are
-// color_space's, bit for bit, over every code and a sweep of linear values.
+// color_space's, bit for bit, over every code and a sweep of linear values;
+// the unobserved word decodes to opaque white.
 //
 // Device (shaders/voxel_color_cases.comp, skipped where no device is
 // present), over every grey code, the colour-unobserved word and words with
@@ -20,8 +21,8 @@
 //     rounding-mode difference between packUnorm4x8 and the host's +0.5;
 //   * a first observation stores the word's R, G, B and alpha 0xFF, exactly
 //     as the host's, never the unobserved word;
-//   * the mesher reads the unobserved word as opaque white, and any other as
-//     its decode.
+//   * the mesher reads every word as the host's voxel_color_to_linear does:
+//     the unobserved word exactly (opaque white), any other within 1e-5.
 
 #include <cmath>
 #include <cstdint>
@@ -70,6 +71,9 @@ int check_host() {
     CHECK(same_bits(vol::voxel_color_to_linear(word),
                     vr::unpack_srgb_to_linear(word)));
   }
+  // Unobserved reads opaque white, so it does not drag an average to black.
+  CHECK(same_bits(vol::voxel_color_to_linear(vol::kVoxelColorUnobserved),
+                  vr::Vec3f(1.0f)));
   const float specials[] = {-0.0f,
                             -1.0f,
                             2.0f,
@@ -164,9 +168,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         vol::srgb_to_linear(static_cast<float>((word >> 8) & 0xFFu) * inv),
         vol::srgb_to_linear(static_cast<float>((word >> 16) & 0xFFu) * inv));
     const vr::Vec4f& r = read.value()[i];
-    const bool read_ok = word == vol::kVoxelColorUnobserved
-                             ? r.x == 1.0f && r.y == 1.0f && r.z == 1.0f
-                             : near(r, vol::voxel_color_to_linear(word));
+    const vr::Vec3f want_read = vol::voxel_color_to_linear(word);
+    const bool read_ok =
+        word == vol::kVoxelColorUnobserved
+            ? r.x == want_read.x && r.y == want_read.y && r.z == want_read.z
+            : near(r, want_read);
     const bool ok =
         near(linear.value()[i], decoded) &&
         round.value()[i] == ((word & 0x00FFFFFFu) | 0xFF000000u) &&

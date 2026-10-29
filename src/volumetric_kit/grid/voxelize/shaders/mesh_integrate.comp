@@ -227,7 +227,7 @@ uint bucketAt(uint pos) {
 
 // Voxel v of a round. An 8^3 block goes in 4x4x2 bricks, one per culling
 // group, so a group's voxels are near one another; any other size in row
-// order.
+// order (vrLocalBase).
 ivec3 voxelOf(uint v, int bs) {
   if (bs == 8) {
     uint w = v & 31u;
@@ -236,8 +236,7 @@ ivec3 voxelOf(uint v, int bs) {
                  int(((b >> 1u) & 1u) * 4u + ((w >> 2u) & 3u)),
                  int((b >> 2u) * 2u + (w >> 4u)));
   }
-  uint ubs = uint(bs);
-  return ivec3(int(v % ubs), int((v / ubs) % ubs), int(v / (ubs * ubs)));
+  return vrLocalBase(v, bs);
 }
 
 // Measure triangle t, vertices (a, b, c), from p: the minimum over (d^2, t).
@@ -334,7 +333,7 @@ void main() {
     // Node-centred voxels (voxel * voxel_size), matching
     // volume/voxel_coords.hpp::voxel_to_world and tsdf_integrate.comp.
     ivec3 lc = voxelOf(live ? v : 0u, bs);
-    uint local = uint(lc.x + bs * (lc.y + bs * lc.z));
+    uint local = uint(vrLocalIndex(lc, bs));
     vec3 p = vec3(coord * bs + lc) * pc.grid.voxel_size;
 
     // The group's box, over its live voxels.
