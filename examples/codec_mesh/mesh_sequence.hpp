@@ -17,9 +17,9 @@
 #include "config.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
 #include "volumetric_kit/recon/io/triangle_mesh.hpp"
-#include "volumetric_kit/recon/sender/codec_stream.hpp"
 #include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
@@ -146,12 +146,12 @@ vkc::Result<vr::tsdf::MeshIntegrateStats> convert_frame(
 struct CodedFrame {
   MeshFrame frame;                     ///< The frame as converted.
   vr::tsdf::MeshIntegrateStats stats;  ///< Its conversion.
-  vr::sender::SentFrame sent;          ///< Its record, as it went out.
+  vr::codec_stream::SentFrame sent;    ///< Its record, as it went out.
 };
 
 /// @brief One frame of a run: @ref MeshSequence::load, @ref
 ///        MeshSequence::admit, @ref convert_frame into @p grid, then one
-///        record of @p stream (`sender::CodecStream::code`), its set the
+///        record of @p stream (`codec_stream::CodecStream::code`), its set the
 ///        frame's number and its pts that number at @ref kNominalFps.
 /// @return The frame, or the first error, naming the frame.
 vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
@@ -159,7 +159,7 @@ vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    vr::volume::VoxelBlockGrid& grid,
                                    vr::tsdf::MeshIntegrator& integrator,
                                    const vr::tsdf::MeshSdfParams& params,
-                                   vr::sender::CodecStream& stream,
+                                   vr::codec_stream::CodecStream& stream,
                                    vkc::StageMetrics* conversion);
 
 }  // namespace vr_example

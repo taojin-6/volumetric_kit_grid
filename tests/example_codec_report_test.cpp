@@ -8,11 +8,11 @@
 // is the stream's or the CSV's file through a link refused, one beside them
 // taken and one that cannot be checked refused, and a sender's set stamped and
 // its frame's row kept from what the set step returned. On a grid holding a
-// sphere, coded through sender::CodecStream: a CSV refused after the stream
-// is made, which takes the stream's file back, or because it is the stream's
-// file under another name; a row per frame, under the source's index, whose
-// type, bytes and blocks are the frame's, and each type's stage rows its own
-// frames'; the CSV replaced on create and written as each row comes; a CSV
+// sphere, coded through codec_stream::CodecStream: a CSV refused after the
+// stream is made, which takes the stream's file back, or because it is the
+// stream's file under another name; a row per frame, under the source's index,
+// whose type, bytes and blocks are the frame's, and each type's stage rows its
+// own frames'; the CSV replaced on create and written as each row comes; a CSV
 // that stops taking rows refused, the row kept and every row after refused;
 // and without the decode, rows with no decode columns and no decode stage
 // rows. The device part skips with no device.
@@ -38,12 +38,13 @@
 #include "scratch_dir.hpp"
 #include "set_log.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
-#include "volumetric_kit/recon/sender/codec_stream.hpp"
+#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/sender/set_sender.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 
 namespace codec = volumetric_kit::recon::codec;
+namespace codec_stream = volumetric_kit::recon::codec_stream;
 namespace eval = volumetric_kit::recon::eval;
 namespace sender = volumetric_kit::recon::sender;
 namespace stream = volumetric_kit::recon::stream;
@@ -275,12 +276,13 @@ stream::Session session() {
 // the CSV, and the stream, dropped unfinished before its first frame, takes
 // its file back.
 int csv_refused(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
-  sender::CodecOutputs outputs;
+  codec_stream::CodecOutputs outputs;
   outputs.stream = (scratch.path / "late.vrst").string();
   const std::string csv = (scratch.path / "missing" / "rows.csv").string();
   {
-    vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
-        gpu.device, gpu.allocator, {}, session(), outputs);
+    vkc::Result<codec_stream::CodecStream> made =
+        codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                          session(), outputs);
     CHECK(made.ok() && fs::exists(outputs.stream));
     const vkc::Result<vr_example::CodecReport> report =
         vr_example::CodecReport::create(csv, outputs.stream, true, 1);
@@ -313,14 +315,15 @@ int aliased_outputs(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   } else {
     std::puts("aliased_outputs: case-sensitive filesystem; case alias skipped");
   }
-  sender::CodecOutputs outputs;
+  codec_stream::CodecOutputs outputs;
   outputs.stream = stream_path.string();
   outputs.decode = false;
   for (const fs::path& csv_path : csv_paths) {
     CHECK(!fs::exists(stream_path));
     {
-      vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
-          gpu.device, gpu.allocator, {}, session(), outputs);
+      vkc::Result<codec_stream::CodecStream> made =
+          codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                            session(), outputs);
       CHECK(made.ok());
       const vkc::Result<vr_example::CodecReport> report =
           vr_example::CodecReport::create(csv_path.string(), outputs.stream,
@@ -338,8 +341,9 @@ int aliased_outputs(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
     CHECK(fs::is_symlink(dir_link));
   }
   const std::string separate = (dir / "separate.csv").string();
-  vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
-      gpu.device, gpu.allocator, {}, session(), outputs);
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                        session(), outputs);
   CHECK(made.ok());
   const vkc::Result<vr_example::CodecReport> report =
       vr_example::CodecReport::create(separate, outputs.stream, false, 1);
@@ -361,14 +365,15 @@ int rows_and_stages(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
                     const vr_test::Scratch& scratch) {
   constexpr codec::FrameType I = codec::FrameType::kIntra;
   constexpr codec::FrameType P = codec::FrameType::kInter;
-  sender::CodecOutputs outputs;
+  codec_stream::CodecOutputs outputs;
   outputs.stream = (scratch.path / "periodic.vrst").string();
   const std::string csv = (scratch.path / "periodic.csv").string();
   CHECK(vkc::write_file(csv, "stale\nstale\n", vkc::WriteMode::CreateNew).ok());
   codec::EncoderConfig config;
   config.intra_period = 4;
-  vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
-      gpu.device, gpu.allocator, config, session(), outputs);
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
+                                        session(), outputs);
   CHECK(made.ok());
   vkc::Result<vr_example::CodecReport> listed =
       vr_example::CodecReport::create(csv, outputs.stream, true, 4);
@@ -378,10 +383,10 @@ int rows_and_stages(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   CHECK(started.size() == 1 &&
         started[0] + "\n" == vr_example::kCodecRowsCsvHeader);
   const codec::FrameType types[] = {I, P, P, I, I, I, P, P, P, I};
-  std::vector<sender::SentFrame> sent;
+  std::vector<codec_stream::SentFrame> sent;
   for (std::size_t frame = 0; frame < std::size(types); ++frame) {
     const bool refused = frame == 3 || frame == 4;
-    vkc::Result<sender::SentFrame> s =
+    vkc::Result<codec_stream::SentFrame> s =
         made->code(refused ? other : source, frame, pts(frame));
     CHECK(s.ok() != refused);
     if (refused) continue;
@@ -430,18 +435,20 @@ int rows_and_stages(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 int csv_fails(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
               const vr_test::Scratch& scratch) {
   const std::string csv = (scratch.path / "limited.csv").string();
-  vkc::Result<sender::CodecStream> made =
-      sender::CodecStream::create(gpu.device, gpu.allocator, {}, session());
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                        session());
   vkc::Result<vr_example::CodecReport> listed =
       vr_example::CodecReport::create(csv, "", true, 1);
   CHECK(made.ok() && listed.ok());
   vr_example::CodecReport& report = listed.value();
-  vkc::Result<sender::SentFrame> first = made->code(source, 0, pts(0));
+  vkc::Result<codec_stream::SentFrame> first = made->code(source, 0, pts(0));
   CHECK(first.ok() && report.add(0, *first).ok());
   const std::uintmax_t size = fs::file_size(csv);
-  std::vector<sender::SentFrame> sent;
+  std::vector<codec_stream::SentFrame> sent;
   for (std::size_t frame = 1; frame < 4; ++frame) {
-    vkc::Result<sender::SentFrame> s = made->code(source, frame, pts(frame));
+    vkc::Result<codec_stream::SentFrame> s =
+        made->code(source, frame, pts(frame));
     CHECK(s.ok());
     sent.push_back(std::move(s).value());
   }
@@ -476,17 +483,19 @@ int decode_off(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   const codec::FrameType types[] = {I, P, P, I, P};
   codec::EncoderConfig config;
   config.intra_period = 3;
-  sender::CodecOutputs outputs;
+  codec_stream::CodecOutputs outputs;
   outputs.decode = false;
   const std::string csv = (scratch.path / "undecoded.csv").string();
-  vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
-      gpu.device, gpu.allocator, config, session(), outputs);
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
+                                        session(), outputs);
   vkc::Result<vr_example::CodecReport> listed =
       vr_example::CodecReport::create(csv, "", false, 3);
   CHECK(made.ok() && listed.ok());
   vr_example::CodecReport& report = listed.value();
   for (std::size_t frame = 0; frame < std::size(types); ++frame) {
-    vkc::Result<sender::SentFrame> s = made->code(source, frame, pts(frame));
+    vkc::Result<codec_stream::SentFrame> s =
+        made->code(source, frame, pts(frame));
     CHECK(s.ok() && report.add(frame, *s).ok());
   }
   CHECK(made->finish().ok());

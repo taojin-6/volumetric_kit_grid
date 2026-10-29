@@ -5,7 +5,7 @@
 
 /// @file examples/common/codec_report.hpp
 /// @brief What the codec examples report of a stream: a row per coded frame,
-///        built from what `sender::CodecStream::code` and
+///        built from what `codec_stream::CodecStream::code` and
 ///        `sender::SetSender::send` return, which the report sums by frame
 ///        type and the CSV lists, and the comparisons of a decoded surface.
 
@@ -31,8 +31,8 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
+#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
-#include "volumetric_kit/recon/sender/codec_stream.hpp"
 #include "volumetric_kit/recon/sender/set_sender.hpp"
 
 namespace vr_example {
@@ -305,7 +305,8 @@ class CodecReport {
   ///        rows in its type's, then write the row to the CSV, flushed.
   /// @return OK; or IoError naming the CSV, the row kept, and for every row
   ///         after.
-  vkc::Status add(std::uint64_t frame, const vr::sender::SentFrame& sent) {
+  vkc::Status add(std::uint64_t frame,
+                  const vr::codec_stream::SentFrame& sent) {
     const auto t = static_cast<std::size_t>(sent.type);
     encode_rows_[t].merge(sent.encode);
     if (decode_) decode_rows_[t].merge(sent.decode);
