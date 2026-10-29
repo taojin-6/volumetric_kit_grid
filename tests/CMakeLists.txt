@@ -484,9 +484,10 @@ add_test(NAME grid_codec_device_frame COMMAND grid_codec_device_frame_test)
 # chains -- leaving the grid as the CPU oracle's decode of the same content
 # does, bit for bit, with NotFound, a segment longer than the format allows, the
 # refusals and failures that keep the reference, and moves; and the Encoder's
-# P-frames, the CPU oracle's bytes, with the diff's every choice and refusal.
-# Internal headers through the oracle (the public decoder test stays
-# public-only). Skips without a device.
+# P-frames, the CPU oracle's bytes, with the diff's every choice and refusal,
+# and its one-step hold of every frame against oracle::held. Internal headers
+# through the oracle (the public decoder test stays public-only). Skips without
+# a device.
 add_executable(grid_codec_inter_test codec_inter_test.cpp)
 target_link_libraries(
   grid_codec_inter_test PRIVATE grid_codec_oracle Vulkan::Vulkan

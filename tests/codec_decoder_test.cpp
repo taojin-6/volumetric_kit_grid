@@ -10,9 +10,9 @@
 // untouched; a grid whose hash table cannot place the frame says so and
 // recovers after a resize; read_frame_info; the stage rows; the moves; and the
 // Encoder's P-frame chains, at a period of 4 and open-ended, decoding to
-// exactly the grids its I-frames of the same content do, and recovering from a
-// lost frame through force_intra(). Links grid_mesh, which the codec tier
-// itself may not. Skips with no device.
+// exactly the grids an all-intra chain of the same grids does, and recovering
+// from a lost frame through force_intra(). Links grid_mesh, which the codec
+// tier itself may not. Skips with no device.
 
 #include <algorithm>
 #include <cmath>
@@ -838,28 +838,32 @@ int p_chain_case(Gpu& gpu) {
 
 // A frame the Encoder returned and the player lost breaks the chain: the
 // P-frame after it is NotFound, the grid untouched; force_intra() makes the
-// next frame an I-frame, which the player decodes, and the P-frames after
-// it decode as the all-intra chain does.
-int lost_frame_case(Gpu& gpu, codec::Encoder& all_intra) {
+// next frame an I-frame, which the player decodes on its own though it is
+// held against a frame the player lacks, and the P-frames after it decode as
+// an all-intra chain of the same grids does.
+int lost_frame_case(Gpu& gpu) {
   codec::EncoderConfig config;
   config.intra_period = 30;
   vkc::Result<codec::Encoder> made =
       codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<codec::Encoder> all_intra =
+      codec::Encoder::create(gpu.device, gpu.allocator);
   vkc::Result<codec::Decoder> dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<codec::Decoder> intra_dec =
       codec::Decoder::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
   vkc::Result<vol::VoxelBlockGrid> intra_player = make_grid(gpu);
-  CHECK(made.ok() && dec.ok() && intra_dec.ok() && player.ok() &&
-        intra_player.ok());
+  CHECK(made.ok() && all_intra.ok() && dec.ok() && intra_dec.ok() &&
+        player.ok() && intra_player.ok());
   codec::Encoder& enc = made.value();
   for (int t = 0; t < 6; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = chain_grid(gpu, t);
     CHECK(g.ok());
     if (t == 3) enc.force_intra();
     vkc::Result<Bytes> frame = enc.encode(g.value());
-    CHECK(frame.ok());
+    vkc::Result<Bytes> intra = all_intra.value().encode(g.value());
+    CHECK(frame.ok() && intra.ok());
     const Bytes& f = frame.value();
     if (t == 1) continue;  // lost
     if (t == 2) {
@@ -877,8 +881,6 @@ int lost_frame_case(Gpu& gpu, codec::Encoder& all_intra) {
           info.value().type == (t == 0 || t == 3 ? codec::FrameType::kIntra
                                                  : codec::FrameType::kInter));
     CHECK(dec.value().decode(f.data(), f.size(), player.value()).ok());
-    vkc::Result<Bytes> intra = all_intra.encode(g.value());
-    CHECK(intra.ok());
     CHECK(intra_dec.value()
               .decode(intra.value().data(), intra.value().size(),
                       intra_player.value())
@@ -1041,7 +1043,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   if (moves_case(gpu, enc) != 0) return 1;
   if (frame_info_case(gpu) != 0) return 1;
   if (p_chain_case(gpu) != 0) return 1;
-  if (lost_frame_case(gpu, enc) != 0) return 1;
+  if (lost_frame_case(gpu) != 0) return 1;
   if (true_sdf_decode_case(gpu, dec) != 0) return 1;
   if (curtain_case(gpu, dec) != 0) return 1;
   std::printf("codec Decoder: OK\n");

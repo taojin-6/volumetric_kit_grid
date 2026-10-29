@@ -195,20 +195,22 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
   VKC_TRY(transform_->check_grid(grid));
   VKC_TRY(detail::check_coding(gp.voxel_size, gp.trunc_dist, params));
 
-  // A P-frame codes against the frame returned last, unless the rules on
-  // encode() make this an I-frame. The encoder's params never change, so of
-  // the coding parameters only the grid's geometry can differ. An empty
-  // reference leaves nothing to predict. Whether the grid has a block to
+  // Every frame is held against the frame returned last, intra or P, when
+  // the two can be compared: the encoder's params never change, so of the
+  // coding parameters only the grid's geometry can differ, and an empty
+  // reference holds nothing. A P-frame codes against it too, unless the
+  // rules on encode() make this an I-frame. Whether the grid has a block to
   // code is the device's to say: a frame of none is an I-frame of none
   // (back), which costs no remove for every reference entry.
-  const detail::FrameReference* reference = store_->held();
-  if (reference != nullptr &&
-      (force_intra_ || gop_position_ == 0 ||
-       reference->header.block_count == 0 ||
-       detail::coding_difference(reference->header, gp.voxel_size,
-                                 gp.trunc_dist, params) != nullptr)) {
-    reference = nullptr;
+  const detail::FrameReference* held = store_->held();
+  if (held != nullptr &&
+      (held->header.block_count == 0 ||
+       detail::coding_difference(held->header, gp.voxel_size, gp.trunc_dist,
+                                 params) != nullptr)) {
+    held = nullptr;
   }
+  const detail::FrameReference* reference =
+      force_intra_ || gop_position_ == 0 ? nullptr : held;
   // Made before an unfinished record is superseded, so a host allocation
   // failure leaves that token finishable.
   auto recorded = std::make_unique<detail::RecordedEncode>();
@@ -270,12 +272,13 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
   // Then into the order the frame requires -- the hash table's order is
   // whatever the allocate atomics left, so sorting is also what makes the
   // same content give the same bytes -- the sort's last level writing the
-  // reference store's spare list, and through the forward into the spare:
-  // the frame the decoder will hold, which this one holds too once it
-  // returns the frame. A P-frame's entries are coded against the reference
-  // there too, bounded at M plus the frame's blocks; the count takes the
-  // survivors off on the device. Either frame's symbols are counted, laid
-  // out and gathered for the host in the same batch.
+  // reference store's spare list, and through the forward into the spare,
+  // held against the reference (the one-step hold, encoder.hpp): the frame
+  // the decoder will hold, which this one holds too once it returns the
+  // frame. A P-frame's entries are coded against the reference there too,
+  // bounded at M plus the frame's blocks; the count takes the survivors off
+  // on the device. Either frame's symbols are counted, laid out and gathered
+  // for the host in the same batch.
   // TODO(codec): trim a P-frame's host overhead at small R, where its encode
   // is still slower than intra's (DECISIONS, the 2026-10-17 freeze).
   {
@@ -291,6 +294,9 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
             batch, grid, *frame.list, observed, params, *frame.masks,
             *frame.coefficients,
             config_.true_sdf ? &transform_->cut_set() : nullptr, &forward));
+    if (held != nullptr) {
+      VKC_TRY(store_->record_hold(batch, observed, k, &forward));
+    }
     if (reference != nullptr) {
       VKC_ASSIGN(recorded->entries,
                  store_->record_diff(batch, observed, k, &forward));

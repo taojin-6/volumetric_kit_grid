@@ -382,7 +382,8 @@ vkc::Result<std::vector<std::uint8_t>> write_counted(
 
 vkc::Result<std::vector<std::uint8_t>> encode(
     const vkc::test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
-    const codec::EncoderConfig& config) {
+    const codec::EncoderConfig& config,
+    const std::vector<std::uint8_t>* previous) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
   VKC_ASSIGN(const vgrid_test::AttributeSpan<float> weight,
@@ -415,6 +416,11 @@ vkc::Result<std::vector<std::uint8_t>> encode(
   VKC_TRY(forward(gpu, t, grid, observed, config.params, frame.blocks,
                   cut ? &*cut : nullptr));
   for (const vol::BlockIndex& b : observed) frame.coords.push_back(b.coord);
+  if (previous != nullptr) {
+    VKC_ASSIGN(const Frame last,
+               read_frame(previous->data(), previous->size(), 1u << 24));
+    frame = held(last, frame);
+  }
   FrameWriteOptions options;
   options.segment_size = config.segment_size;
   return write_frame(frame, options);
@@ -422,10 +428,11 @@ vkc::Result<std::vector<std::uint8_t>> encode(
 
 vkc::Result<std::vector<std::uint8_t>> encode(
     const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& grid,
-    const codec::EncoderConfig& config) {
+    const codec::EncoderConfig& config,
+    const std::vector<std::uint8_t>* previous) {
   VKC_ASSIGN(const std::unique_ptr<d::DctTransform> t,
              d::DctTransform::create(gpu.device, gpu.allocator));
-  return encode(gpu, *t, grid, config);
+  return encode(gpu, *t, grid, config, previous);
 }
 
 }  // namespace codec_oracle

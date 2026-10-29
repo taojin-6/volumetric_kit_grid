@@ -12,19 +12,25 @@
 // than the format allows refused, every refusal and failure leaving the
 // reference as it was, and the device buffers grown and shrunk frame to
 // frame. Encoding: every frame of the Encoder's chains the CPU oracle's
-// bytes, its P-frames priced as the oracle prices them, counted in the
-// diff's batch, and coded in update segments of the segment size, or of an
-// update size set; each of the diff's choices from one edit of a frame; a
-// difference of 32768 coded zero, in either half of a coefficient word; and
-// the diff's refusals and bounded entries, counted in its batch; and with
-// EncoderConfig::true_sdf, a moving curtain's chain, its partial masks
-// changing frame to frame. Internal headers by include path; skips with no
-// device.
+// bytes, held against the frame before (oracle::held), its P-frames priced
+// as the oracle prices them, counted in the diff's batch, and coded in update
+// segments of the segment size, or of an update size set; each of the diff's
+// choices from one edit of a frame; a difference of 32768 coded zero, in
+// either half of a coefficient word; and the diff's refusals and bounded
+// entries, counted in its batch; and with EncoderConfig::true_sdf, a moving
+// curtain's chain, its partial masks changing frame to frame. The hold: the
+// store's against oracle::held at every K, past its count and in several
+// dispatches, and its refusals; and an Encoder's chain whose dithering
+// coefficient stays put, a jump passes in its frame, a drift follows two
+// steps at a time, every coefficient within one step of the forward's, and
+// its I-frames hold too, decoding on their own to the frame before's grid.
+// Internal headers by include path; skips with no device.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1002,28 +1008,36 @@ int segment_rule_case(Shared& gpu) {
 // --- The Encoder's P-frames. -------------------------------------------------
 
 // One frame of an Encoder's chain: what it sent, the oracle's intra frame of
-// the same grid, and the content both code, read off that intra frame.
+// the same grid held against the chain's last frame, and the content both
+// code, read off that intra frame; and the forward's content, unheld.
 struct Coded {
   Bytes sent;
   Bytes intra;
   oracle::Frame content;
+  oracle::Frame fresh;
 };
 
 // Encode @p grid with @p enc and hold the bytes to the oracle's: an I-frame
-// to the oracle's intra frame of the grid, a P-frame to the oracle's writer
-// over encoder_frame against the chain's last frame, at @p config's sizes.
-// Appends the frame to @p chain.
+// to the oracle's intra frame of the grid held against the chain's last
+// frame (oracle::held), a P-frame to the oracle's writer over encoder_frame
+// of that content against the chain's last, at @p config's sizes. Appends
+// the frame to @p chain.
 int encode_checked(Shared& gpu, codec::Encoder& enc,
                    const codec::EncoderConfig& config,
                    vol::VoxelBlockGrid& grid, std::vector<Coded>& chain) {
   vkc::Result<Bytes> sent = enc.encode(grid);
-  vkc::Result<Bytes> intra = oracle::encode(gpu, gpu.transform, grid, config);
-  CHECK(sent.ok() && intra.ok());
+  vkc::Result<Bytes> intra =
+      oracle::encode(gpu, gpu.transform, grid, config,
+                     chain.empty() ? nullptr : &chain.back().intra);
+  vkc::Result<Bytes> fresh = oracle::encode(gpu, gpu.transform, grid, config);
+  CHECK(sent.ok() && intra.ok() && fresh.ok());
   vkc::Result<oracle::Frame> content = oracle::read_frame(
       intra.value().data(), intra.value().size(), kMaxBlocks);
+  vkc::Result<oracle::Frame> unheld = oracle::read_frame(
+      fresh.value().data(), fresh.value().size(), kMaxBlocks);
   vkc::Result<codec::FrameInfo> info =
       codec::read_frame_info(sent.value().data(), sent.value().size());
-  CHECK(content.ok() && info.ok());
+  CHECK(content.ok() && unheld.ok() && info.ok());
   if (info.value().type == codec::FrameType::kIntra) {
     CHECK(sent.value() == intra.value());
   } else {
@@ -1044,7 +1058,7 @@ int encode_checked(Shared& gpu, codec::Encoder& enc,
     }
   }
   chain.push_back(Coded{std::move(sent).value(), std::move(intra).value(),
-                        std::move(content).value()});
+                        std::move(content).value(), std::move(unheld).value()});
   return 0;
 }
 
@@ -1588,6 +1602,237 @@ int diff_refusals_case(Gpu& gpu) {
   return 0;
 }
 
+// --- The hold. ---------------------------------------------------------------
+
+// The store's hold of a target in its spare against a held reference, as
+// oracle::held makes it, at K of 1, 37, 64 and 512: the target's blocks a
+// mix of the reference's coordinates and new ones, its coefficients the
+// reference's moved by -2 to +2 or anywhere in int16, the odd K's pad half
+// garbage, and its count word at an offset, below the bound, with entries
+// past it on reference coordinates and within one step, which the hold must
+// not touch. Then its refusals.
+int hold_store_case(Gpu& gpu) {
+  for (const std::uint32_t k : {1u, 37u, 64u, 512u}) {
+    vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
+        d::ReferenceStore::create(gpu.device, gpu.allocator);
+    CHECK(made.ok());
+    d::ReferenceStore& store = *made.value();
+    Lcg rng{101u + k};
+    const std::size_t m = 300;
+    const oracle::DctBlocks r = random_entries(m, k, rng);
+    CHECK(commit_intra(gpu, store, r, 7) == 0);
+    // The target: every other reference block and a few new ones, in frame
+    // order, then garbage past its count.
+    std::vector<vgrid::Vec3i> coords = {vgrid::Vec3i(-3, 0, 0),
+                                        vgrid::Vec3i(-1, 0, 0)};
+    for (std::size_t e = 0; e < m; e += 2) coords.push_back(row_of(m)[e]);
+    coords.push_back(vgrid::Vec3i(int(m) + 4, 0, 0));
+    const std::size_t n = coords.size();
+    oracle::Frame target;
+    target.voxel_size = kVoxel;
+    target.coords = coords;
+    target.blocks.params = r.params;
+    target.blocks.trunc_dist = r.trunc_dist;
+    std::size_t near = 0;
+    for (const vgrid::Vec3i& c : coords) {
+      const bool shared = c.x >= 0 && c.x < int(m);
+      for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
+        target.blocks.masks.push_back(rng.next());
+      }
+      for (std::uint32_t j = 0; j < k; ++j) {
+        const std::uint32_t roll = rng.below(6);
+        const int ref = shared ? r.coefficients[std::size_t(c.x) * k + j] : 0;
+        const int v = roll < 5 ? ref + int(roll) - 2 : int(rng.next());
+        near += shared && roll >= 1 && roll <= 3 ? 1 : 0;
+        target.blocks.coefficients.push_back(static_cast<std::int16_t>(v));
+      }
+    }
+    CHECK(near > 0);
+    // Past the count: reference blocks within one step, never to be held.
+    const std::size_t past = 4;
+    oracle::DctBlocks all = target.blocks;
+    std::vector<vgrid::Vec3i> all_coords = coords;
+    for (std::size_t i = 0; i < past; ++i) {
+      all_coords.push_back(row_of(m)[2 * i + 1]);
+      for (std::uint32_t w = 0; w < codec::kMaskWordsPerBlock; ++w) {
+        all.masks.push_back(0);
+      }
+      for (std::uint32_t j = 0; j < k; ++j) {
+        all.coefficients.push_back(
+            static_cast<std::int16_t>(r.coefficients[(2 * i + 1) * k + j] + 1));
+      }
+    }
+    const auto bound = static_cast<std::uint32_t>(n + past);
+    CHECK(store.reserve(bound, k).ok());
+    const d::FrameBuffers frame = store.frame_buffers();
+    std::vector<vol::BlockIndex> list;
+    for (const vgrid::Vec3i& c : all_coords) {
+      list.push_back(vol::BlockIndex{c, 0});
+    }
+    const std::uint16_t pad = 0xBEEF;
+    const std::vector<std::uint32_t> packed = oracle::pack(all, pad);
+    CHECK(vkc::test::write_back(gpu.device, gpu.allocator, *frame.list, list)
+              .ok());
+    CHECK(vkc::test::write_back(gpu.device, gpu.allocator, *frame.coefficients,
+                                packed)
+              .ok());
+    const std::uint32_t words[2] = {0xFFFFFFFFu, std::uint32_t(n)};
+    vkc::Result<vkc::Buffer> count = vkc::test::upload_device_buffer(
+        gpu.device, gpu.allocator, words, sizeof(words));
+    CHECK(count.ok());
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    CHECK(
+        store.record_hold(batch, vol::DeviceCount{&count.value(), 4, bound}, k)
+            .ok());
+    CHECK(batch.submit().ok());
+    vkc::Result<std::vector<std::uint32_t>> got =
+        vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                            *frame.coefficients, packed.size());
+    CHECK(got.ok());
+    oracle::Frame reference;
+    reference.voxel_size = kVoxel;
+    reference.coords = row_of(m);
+    reference.blocks = r;
+    oracle::DctBlocks want = oracle::held(reference, target).blocks;
+    want.coefficients.insert(want.coefficients.end(),
+                             all.coefficients.begin() + std::ptrdiff_t(n * k),
+                             all.coefficients.end());
+    want.masks = all.masks;
+    CHECK(got.value() == oracle::pack(want, pad));
+    // The premise: the hold changed some values and left some.
+    CHECK(oracle::pack(want, pad) != packed);
+    std::size_t held = 0;
+    for (std::size_t i = 0; i < n * k; ++i) {
+      held += want.coefficients[i] != target.blocks.coefficients[i] ? 1 : 0;
+    }
+    CHECK(held > 0 && held < near);
+  }
+  // Refusals, before anything is recorded; nothing to hold is no command.
+  vkc::Result<std::unique_ptr<d::ReferenceStore>> made =
+      d::ReferenceStore::create(gpu.device, gpu.allocator);
+  CHECK(made.ok());
+  d::ReferenceStore& store = *made.value();
+  const std::uint32_t zero = 0;
+  vkc::Result<vkc::Buffer> word = vkc::test::upload_device_buffer(
+      gpu.device, gpu.allocator, &zero, sizeof(zero));
+  CHECK(word.ok());
+  auto hold = [&](std::uint32_t n, std::uint32_t k) {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    return store.record_hold(batch, vol::DeviceCount{&word.value(), 0, n}, k);
+  };
+  auto refused = [&](std::uint32_t n, std::uint32_t k, const char* says) {
+    const vkc::Status s = hold(n, k);
+    return !s.ok() && s.domain() == C::InvalidArgument &&
+           s.message().find("record_hold") != std::string::npos &&
+           s.message().find(says) != std::string::npos;
+  };
+  CHECK(refused(0, 8, "no reference is held"));
+  Lcg rng{41};
+  CHECK(commit_intra(gpu, store, random_entries(5, 8, rng), 3) == 0);
+  CHECK(store.reserve(4, 8).ok());
+  CHECK(refused(4, 9, "a frame at K 9 on a reference at K 8"));
+  CHECK(refused(1000, 8, "1000 blocks, more than were reserved"));
+  CHECK(hold(0, 8).ok() && hold(4, 8).ok());
+  return 0;
+}
+
+// An Encoder's chain at a period of 4 over blocks of constant SDF, whose DC
+// alone is not 0: q = round(v sqrt(512) / 0.2), the default step. Block a's
+// forward DC dithers between 40 and 41 at random -- 41 at both later
+// I-frames -- and stays at 40 throughout, so the P-frames between skip it;
+// c jumps three steps at frame 5, which passes in that frame; d drifts a
+// step a frame from frame 6, which the hold follows two steps at a time;
+// b, a slope, never changes. Every frame is the held oracle's bytes, each
+// held coefficient within one step of the forward's, and the player's grid
+// the held content's at every frame. The I-frames hold as the P-frames do:
+// the key frame at 4 is frame 3's content, so the player's grid does not
+// change across it, and a decoder that starts there decodes it, and the
+// P-frame after it, to the chain's grid.
+int hold_chain_case(Shared& gpu) {
+  codec::EncoderConfig config;
+  config.intra_period = 4;
+  vkc::Result<codec::Encoder> made =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  CHECK(made.ok());
+  codec::Encoder& enc = made.value();
+  const auto dc = [](double q) {
+    return constant(float(q * 0.2 / 22.627416997969522));
+  };
+  const vgrid::Vec3i a(0, 0, 0), b(1, 0, 0), c(0, 2, 0), e(3, 0, 0);
+  const int a_dc[10] = {40, 41, 40, 41, 41, 40, 41, 40, 41, 40};
+  const int c_dc[10] = {20, 20, 20, 20, 20, 23, 23, 23, 23, 23};
+  const int e_dc[10] = {10, 10, 10, 10, 10, 10, 11, 12, 13, 14};
+  const int e_held[10] = {10, 10, 10, 10, 10, 10, 10, 12, 12, 14};
+  std::vector<Coded> chain;
+  vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
+  vkc::Result<vol::VoxelBlockGrid> joiner = make_grid(gpu);
+  vkc::Result<codec::Decoder> joined =
+      codec::Decoder::create(gpu.device, gpu.allocator);
+  CHECK(player.ok() && joiner.ok() && joined.ok());
+  std::vector<Snapshot> decoded;
+  std::size_t off_by_one = 0;
+  for (int t = 0; t < 10; ++t) {
+    Content content;
+    // The dither sits 0.15 of a step off the boundary between 40 and 41.
+    content[a] = dc(40.5 + (a_dc[t] == 40 ? -0.15 : 0.15));
+    content[b] = slope(1);
+    content[c] = dc(c_dc[t]);
+    content[e] = dc(e_dc[t]);
+    vkc::Result<vol::VoxelBlockGrid> g = content_grid(gpu, content);
+    CHECK(g.ok());
+    CHECK(encode_checked(gpu, enc, config, g.value(), chain) == 0);
+    const Coded& f = chain.back();
+    const bool intra = t % 4 == 0;
+    CHECK(type_of(f.sent) ==
+          (intra ? codec::FrameType::kIntra : codec::FrameType::kInter));
+    // The forward's DCs, then the held ones; blocks in frame order: a, b,
+    // e, c.
+    const std::uint32_t k = f.content.blocks.params.coefficient_count;
+    CHECK(f.content.coords == f.fresh.coords && f.content.coords.size() == 4);
+    CHECK(f.fresh.blocks.coefficients[0] == a_dc[t]);
+    CHECK(f.fresh.blocks.coefficients[2 * k] == e_dc[t]);
+    CHECK(f.fresh.blocks.coefficients[3 * k] == c_dc[t]);
+    CHECK(f.content.blocks.coefficients[0] == 40);
+    CHECK(f.content.blocks.coefficients[2 * k] == e_held[t]);
+    CHECK(f.content.blocks.coefficients[3 * k] == c_dc[t]);
+    for (std::size_t i = 0; i < f.fresh.blocks.coefficients.size(); ++i) {
+      const int gap = std::abs(int(f.content.blocks.coefficients[i]) -
+                               int(f.fresh.blocks.coefficients[i]));
+      CHECK(gap <= 1);
+      off_by_one += gap == 1 ? 1 : 0;
+    }
+    CHECK(f.content.blocks.masks == f.fresh.blocks.masks);
+    if (!intra) {
+      const Census n = census_of(chain);
+      const bool still = t != 5 && t != 7 && t != 9;
+      CHECK(n.added == 0);
+      CHECK(n.modes[std::size_t(d::BlockMode::kSkip)] == (still ? 4u : 3u));
+    }
+    CHECK(gpu.dec.decode(f.sent.data(), f.sent.size(), player.value()).ok());
+    CHECK(holds(gpu, player.value(), f.intra));
+    vkc::Result<Snapshot> snap = snapshot(gpu, player.value());
+    CHECK(snap.ok());
+    decoded.push_back(std::move(snap).value());
+    if (t >= 4) {
+      CHECK(joined.value()
+                .decode(f.sent.data(), f.sent.size(), joiner.value())
+                .ok());
+      vkc::Result<Snapshot> j = snapshot(gpu, joiner.value());
+      CHECK(j.ok() && j.value() == decoded.back());
+    }
+  }
+  CHECK(off_by_one == 7);  // a's five 41s and e's two
+  // No key-frame pulse: frames 3 and 4, and 7 and 8, but for c and d.
+  CHECK(chain[4].content.coords == chain[3].content.coords &&
+        chain[4].content.blocks.coefficients ==
+            chain[3].content.blocks.coefficients);
+  CHECK(decoded[4] == decoded[3]);
+  CHECK(chain[8].content.blocks.coefficients ==
+        chain[7].content.blocks.coefficients);
+  CHECK(decoded[8] == decoded[7]);
+  return 0;
+}
+
 }  // namespace
 
 int gpu_main(vkc::test::GpuContext& context) {
@@ -1624,6 +1869,11 @@ int gpu_main(vkc::test::GpuContext& context) {
   if (wrap_case(gpu, 0) != 0) return 1;
   if (wrap_case(gpu, 3) != 0) return 1;
   if (diff_refusals_case(gpu) != 0) return 1;
+  if (hold_store_case(gpu) != 0) return 1;
+  vgrid::detail::set_test_groups_per_dispatch(2);
+  if (hold_store_case(gpu) != 0) return 1;
+  vgrid::detail::set_test_groups_per_dispatch(0);
+  if (hold_chain_case(gpu) != 0) return 1;
   std::printf("codec P-frames: OK\n");
   return 0;
 }

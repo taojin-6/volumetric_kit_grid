@@ -4,8 +4,11 @@
 #include "codec_oracle.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
+#include <map>
 #include <string>
+#include <tuple>
 
 #include "codec_oracle_rans.hpp"
 
@@ -225,6 +228,36 @@ std::uint64_t payload_price(const std::uint32_t* mask,
   walk.coefficients = coefficients;
   walk.emit_payload(k);
   return sink.total;
+}
+
+Frame held(const Frame& reference, const Frame& target) {
+  Frame out = target;
+  d::FrameHeader header;
+  header.voxel_size = reference.voxel_size;
+  header.trunc_dist = reference.blocks.trunc_dist;
+  header.params = reference.blocks.params;
+  if (reference.coords.empty() ||
+      d::coding_difference(header, target.voxel_size, target.blocks.trunc_dist,
+                           target.blocks.params) != nullptr) {
+    return out;
+  }
+  std::map<std::tuple<int, int, int>, std::size_t> at;
+  for (std::size_t e = 0; e < reference.coords.size(); ++e) {
+    const vgrid::Vec3i& c = reference.coords[e];
+    at.emplace(std::make_tuple(c.x, c.y, c.z), e);
+  }
+  const std::size_t k = target.blocks.params.coefficient_count;
+  for (std::size_t i = 0; i < target.coords.size(); ++i) {
+    const vgrid::Vec3i& c = target.coords[i];
+    const auto it = at.find(std::make_tuple(c.x, c.y, c.z));
+    if (it == at.end()) continue;
+    for (std::size_t j = 0; j < k; ++j) {
+      const int r = reference.blocks.coefficients[it->second * k + j];
+      std::int16_t& q = out.blocks.coefficients[i * k + j];
+      if (std::abs(int(q) - r) <= 1) q = static_cast<std::int16_t>(r);
+    }
+  }
+  return out;
 }
 
 StepLayout step_layout(const std::vector<std::uint32_t>& steps, std::uint32_t m,

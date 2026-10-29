@@ -155,10 +155,23 @@ struct EncodedFrame {
 /// @ref EncoderConfig::true_sdf, the surface less its cuts).
 ///
 /// The blocks are coded in (z, y, x) order, whatever order the hash table
-/// holds them in, so the same content always makes the same bytes on the same
-/// device (a frame is reproducible per device, decodable on any): at an
-/// @ref EncoderConfig::intra_period of 1 any frame, and above it the same
-/// chain of grids, from a fresh encoder or after the same I-frame.
+/// holds them in, so the same chain of grids always makes the same bytes on
+/// the same device (a frame is reproducible per device, decodable on any),
+/// from a fresh encoder or from the same reference at the same place in the
+/// period.
+///
+/// Every frame, intra or P, is held against the last frame @ref encode
+/// returned before it is coded (the 2026-10-29 decision): a coefficient of a
+/// block that frame holds keeps that frame's value when the transform's lies
+/// within one quantization step of it, |q - q_ref| <= 1. A coefficient that
+/// noise moves to and fro across a rounding boundary then stays put, so the
+/// decoded surface does not flicker and a P-frame skips the block; a change
+/// of more than one step passes in the same frame; and a held coefficient
+/// lies within one step of the transform's. Nothing is held across a
+/// geometry change or against a frame of no blocks. An I-frame carries its
+/// held values in full and decodes on its own, so a key frame decodes to the
+/// grid a P-frame in its place would have, and a stream's keys cost no
+/// flicker. The format and the @ref Decoder are unchanged.
 ///
 /// A P-frame (@ref FrameType::kInter) codes a frame against the last one
 /// @ref encode returned, its reference, which the encoder keeps on the
@@ -207,8 +220,8 @@ struct EncodedFrame {
 class VGRID_CODEC_API Encoder {
  public:
   /// @brief Build the kernels: the forward transform's, the block lists'
-  ///        (the sort's among them), the reference store's (the P-frame
-  ///        diff's among them) and the rANS coder's.
+  ///        (the sort's among them), the reference store's (the hold's and
+  ///        the P-frame diff's among them) and the rANS coder's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -257,9 +270,9 @@ class VGRID_CODEC_API Encoder {
   ///                 no list that is still its active set), `"  ..observed"`
   ///                 (finding the blocks to code, with
   ///                 @ref EncoderConfig::true_sdf's passes),
-  ///                 `"  ..forward"` (sorting them, the transform, a
-  ///                 P-frame's diff against the reference, and the symbol
-  ///                 count: the front's batch)
+  ///                 `"  ..forward"` (sorting them, the transform, the
+  ///                 hold and a P-frame's diff against the reference, and
+  ///                 the symbol count: the front's batch)
   ///                 and `"  ..rans encode"` (coding and laying out the
   ///                 frame); and `"  ..tables"`, the host's normalization of
   ///                 the counts, with its host half alone.
@@ -282,8 +295,9 @@ class VGRID_CODEC_API Encoder {
   /// @brief Record the front half of coding @p grid into @p batch, after what
   ///        it holds -- the set's fusion -- with every count on the device:
   ///        the active set, the blocks to code and their sort, the transform,
-  ///        a P-frame's diff against the reference, the symbol count and the
-  ///        coder steps' layout, then the results @ref record_back reads.
+  ///        the hold and a P-frame's diff against the reference, the symbol
+  ///        count and the coder steps' layout, then the results
+  ///        @ref record_back reads.
   ///
   /// Decides I or P now by @ref encode's rules, all but "no block to code",
   /// which the device answers. Every step is sized for the grid's block slots
@@ -362,7 +376,8 @@ class VGRID_CODEC_API Encoder {
   /// @brief Make the next frame @ref encode returns an I-frame: what a
   ///        caller does when a frame it was returned did not reach the
   ///        decoder, so the P-frames after it would be refused there
-  ///        (`Status::Code::NotFound`).
+  ///        (`Status::Code::NotFound`). The I-frame is still held against
+  ///        that frame, and decodes on its own.
   void force_intra() noexcept;
 
   /// @return `true` if this owns a live transform (`false` when moved-from).
@@ -391,7 +406,8 @@ class VGRID_CODEC_API Encoder {
   std::unique_ptr<detail::DctTransform> transform_;
   std::unique_ptr<detail::BlockLists> lists_;
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
-  // The reference a P-frame is coded against, and the diff against it.
+  // The reference every frame is held and a P-frame coded against, and the
+  // hold and the diff.
   std::unique_ptr<detail::ReferenceStore> store_;
   // A held active list's count, set in the front's batch, for the passes
   // the device sizes from it.

@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-29
+
+### Changed
+
+- **The `Encoder` holds every frame one quantization step against the last**:
+  a coefficient within one step of the reference's keeps the reference's
+  value, in I-frames and P-frames alike, so noise near a rounding boundary
+  no longer flickers the decoded surface or costs P-frame bits, and a key
+  frame decodes to what a P-frame in its place would. Each coefficient stays
+  within one step of the transform's. The format and the `Decoder` are
+  unchanged; a frame's bytes now depend on the frames its encoder returned
+  before (DESIGN.md, codec; the 2026-10-29 entry in DECISIONS.md).
+
 ## [0.2.0] - 2026-10-29
 
 ### Added

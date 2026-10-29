@@ -112,6 +112,15 @@ std::vector<std::uint32_t> entry_steps(const Frame& frame,
 std::uint64_t payload_price(const std::uint32_t* mask,
                             const std::int16_t* coefficients, std::uint32_t k);
 
+// The Encoder's one-step hold (inter_hold.comp) on the host: @p target with
+// each coefficient of a block on one of @p reference's coordinates set to
+// that block's when the two lie within one step, |q - q_ref| <= 1; its masks,
+// its other blocks and its pad as they are. Both are intra frames' content.
+// A reference of no blocks, or whose coding parameters are not @p target's
+// (d::coding_difference), holds nothing, as in the Encoder. Block identity by
+// a std::map, the values in plain int arithmetic.
+Frame held(const Frame& reference, const Frame& target);
+
 // The device writer's step layout (step_layout.hpp), on the host, in 64
 // bits: E, the steps before each entry, then their total; and each
 // segment's slot's first 16-bit word -- a word a step and the state's two,
