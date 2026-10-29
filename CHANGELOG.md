@@ -9,9 +9,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **`StreamServer::viewers()`**: the viewers a server is serving now, safe
-  from any thread, as `key_wanted()` is: each counted from its accepted
-  connection, waiting for a key too, until it leaves, fails or stalls; never
-  a connection refused at `max_viewers` (DESIGN.md, networking).
+  from any thread (DESIGN.md, networking).
 
 ## [0.1.0] - 2026-10-28
 

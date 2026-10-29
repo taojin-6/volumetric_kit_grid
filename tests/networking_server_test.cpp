@@ -25,7 +25,8 @@
 // with no Warning while a viewer joins; a viewer that leaves never fails
 // publish; viewers() counts a viewer from before its session, one waiting for
 // a key too, until it leaves, fails or stalls, and never a refused
-// connection; a viewer's join and leave are logged at Info; the writer's
+// connection; a viewer's join and leave are logged at Info, the leave once it
+// no longer counts; the writer's
 // refusals send nothing, and so does a payload over the parser's cap; start
 // refuses (a stall_limit of 0 or less among them); the destructor returns
 // within 1 s with no viewers, idle ones and a stalled one; the threads of
@@ -81,6 +82,7 @@ using Code = vkc::Status::Code;
 using net::Bytes;
 using net::Clock;
 using net::Got;
+using net::serves_within;
 using namespace std::chrono_literals;
 
 struct Published {
@@ -176,17 +178,6 @@ int drain(int fd, const Bytes& wire, std::uint64_t last,
     CHECK(parser.feed(more.data(), more.size()).ok());
   }
   return 0;
-}
-
-// Whether `server` serves `n` viewers within 5 s: it sees a viewer's end
-// within a poll slice.
-bool serves_within(const networking::StreamServer& server, std::size_t n) {
-  const Clock::time_point end = Clock::now() + 5s;
-  while (server.viewers() != n) {
-    if (Clock::now() >= end) return false;
-    std::this_thread::sleep_for(5ms);
-  }
-  return true;
 }
 
 // --- The wire.
@@ -1025,7 +1016,8 @@ int viewer_count_case() {
 }
 
 // A viewer that reads its session and closes is logged joining, then leaving,
-// each at Info, which the senders print: the only lines that name it.
+// each at Info, which the senders print: the only lines that name it; it is
+// no longer counted by the time it is logged leaving.
 int join_leave_log_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -1040,6 +1032,7 @@ int join_leave_log_case() {
   CHECK(header.size() == net::session_chunk(session).size());
   viewer.reset();  // nothing unread, so a clean end
   CHECK(log.wait_for(name, " left", 2s));
+  CHECK(server->viewers() == 0);  // logged once it is no longer counted
   const std::string line = "StreamServer: viewer " + name;
   CHECK(log.count(line + " joined, 1 of 4", "", vkc::LogLevel::Info) == 1);
   CHECK(log.count(line + " left", "", vkc::LogLevel::Info) == 1);

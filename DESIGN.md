@@ -930,9 +930,9 @@ atomic any thread reads, counts each viewer from its accepted connection,
 before its first byte and while it waits for a key, until the server closes
 it; a refused connection never counts. Viewers that join, leave or fail are
 logged at Info; a refusal at Warning, the first and then one in 10 s at
-most, the rest at Debug. The destructor stops every
-thread within a poll slice (20 ms) and the write under way. One track is
-served (`Unsupported` otherwise), and `publish` is called from one thread.
+most, the rest at Debug. The destructor stops every thread within a poll
+slice (20 ms) and the write under way. One track is served (`Unsupported`
+otherwise), and `publish` is called from one thread.
 
 **Reading** (`StreamClient`). `connect` never blocks: a numeric IPv4 address
 is parsed at once, and a name is looked up on a detached thread, which the
