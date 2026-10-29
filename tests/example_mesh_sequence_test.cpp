@@ -46,7 +46,7 @@ namespace cfg = volumetric_kit::core::config;
 namespace io = volumetric_kit::recon::io;
 namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
-namespace sender = volumetric_kit::recon::sender;
+namespace codec_stream = volumetric_kit::recon::codec_stream;
 namespace stream = volumetric_kit::recon::stream;
 namespace vx = volumetric_kit::recon::voxelize;
 namespace fs = std::filesystem;
@@ -554,15 +554,16 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   CHECK(sequence.ok());
   vkc::Result<std::string> params = io::encode_transform(sequence->transform());
   CHECK(params.ok());
-  sender::CodecOutputs outputs;
+  codec_stream::CodecOutputs outputs;
   outputs.stream = (scratch.path / "moving" / "frames.vrst").string();
-  vkc::Result<sender::CodecStream> made = sender::CodecStream::create(
-      gpu.device, gpu.allocator, {},
-      vr_example::codec_session("example_mesh_sequence",
-                                {vr_example::kNominalFps, 1}, *params),
-      outputs);
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(
+          gpu.device, gpu.allocator, {},
+          vr_example::codec_session("example_mesh_sequence",
+                                    {vr_example::kNominalFps, 1}, *params),
+          outputs);
   CHECK(made.ok());
-  sender::CodecStream coder = std::move(made).value();
+  codec_stream::CodecStream coder = std::move(made).value();
   vkc::Result<vx::MeshIntegrator> integrator =
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   CHECK(integrator.ok());
@@ -570,7 +571,7 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   CHECK(grid.ok());
   vkc::StageMetrics conversion;
   std::vector<std::vector<vol::BlockIndex>> blocks;
-  std::vector<sender::SentFrame> sent;
+  std::vector<codec_stream::SentFrame> sent;
   for (std::uint32_t n = 5; n <= 7; ++n) {
     vkc::Result<vr_example::CodedFrame> coded = vr_example::code_frame(
         *sequence, n, *grid, *integrator, {}, coder, &conversion);
@@ -665,8 +666,9 @@ int refused_once_placed(vkc::test::GpuContext& gpu,
   vkc::Result<vr_example::MeshSequence> sequence =
       collapsing(scratch.path / "collapsing_gpu", "");
   CHECK(sequence.ok());
-  vkc::Result<sender::CodecStream> coder = sender::CodecStream::create(
-      gpu.device, gpu.allocator, {}, geometry_session());
+  vkc::Result<codec_stream::CodecStream> coder =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                        geometry_session());
   vkc::Result<vx::MeshIntegrator> integrator =
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
@@ -701,8 +703,9 @@ int holes_in_code_frame(vkc::test::GpuContext& gpu,
     CHECK(settings.ok());
     vkc::Result<vr_example::MeshSequence> sequence =
         vr_example::MeshSequence::open(*settings);
-    vkc::Result<sender::CodecStream> coder = sender::CodecStream::create(
-        gpu.device, gpu.allocator, {}, geometry_session());
+    vkc::Result<codec_stream::CodecStream> coder =
+        codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                          geometry_session());
     vkc::Result<vx::MeshIntegrator> integrator =
         vx::MeshIntegrator::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
@@ -730,10 +733,11 @@ int single_record(vkc::test::GpuContext& gpu,
   vkc::Result<vr_example::MeshSequence> sequence =
       vr_example::MeshSequence::open(*settings);
   CHECK(sequence.ok());
-  sender::CodecOutputs outputs;
+  codec_stream::CodecOutputs outputs;
   outputs.stream = (dir / "one.vrst").string();
-  vkc::Result<sender::CodecStream> coder = sender::CodecStream::create(
-      gpu.device, gpu.allocator, {}, geometry_session(), outputs);
+  vkc::Result<codec_stream::CodecStream> coder =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                        geometry_session(), outputs);
   vkc::Result<vx::MeshIntegrator> integrator =
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);

@@ -22,12 +22,12 @@
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
+#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
-#include "volumetric_kit/recon/sender/codec_stream.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
@@ -35,7 +35,7 @@ namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace mesh = volumetric_kit::recon::mesh;
 namespace eval = volumetric_kit::recon::eval;
-namespace sender = volumetric_kit::recon::sender;
+namespace codec_stream = volumetric_kit::recon::codec_stream;
 namespace {
 
 using Options = vr_example::config::Config;
@@ -91,9 +91,10 @@ vkc::Status run(const Options& opt) {
              mesh::MarchingCubes::create(device, allocator));
   // Made before any frame is converted or written, so a rerun onto an
   // existing stream is refused before any conversion or output.
-  const sender::CodecOutputs outputs = vr_example::codec_outputs(opt.output);
-  VKC_ASSIGN(sender::CodecStream stream,
-             sender::CodecStream::create(
+  const codec_stream::CodecOutputs outputs =
+      vr_example::codec_outputs(opt.output);
+  VKC_ASSIGN(codec_stream::CodecStream stream,
+             codec_stream::CodecStream::create(
                  device, allocator, config,
                  vr_example::codec_session(
                      "codec_mesh", {vr_example::kNominalFps, 1}, placement),

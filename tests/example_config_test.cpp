@@ -73,7 +73,7 @@ int main() {
     CHECK(loaded->output.csv.empty() != coded);
     CHECK(loaded->output.stream.empty() != (coded || served));
     CHECK(loaded->output.serve == (served ? 47801 : 0));
-    const vr::sender::CodecOutputs outputs =
+    const vr::codec_stream::CodecOutputs outputs =
         vr_example::codec_outputs(loaded.value().output);
     CHECK(outputs.serve.has_value() == served);
     CHECK(!served || (outputs.serve->host.empty() &&
@@ -138,7 +138,7 @@ int main() {
   })",
                                   cfg::Application::FuseOrbbec);
   CHECK(on_port);
-  const vr::sender::CodecOutputs to_port =
+  const vr::codec_stream::CodecOutputs to_port =
       vr_example::codec_outputs(on_port.value().output);
   const vr::networking::ServerOptions defaults_served;
   CHECK(on_port->output.csv.empty() && to_port.stream.empty());
@@ -187,7 +187,7 @@ int main() {
   CHECK(!vr_example::sweep_encoder_config(*encoder, {"none", 84, 0.4F}).ok());
   // The outputs, relative to the scenario's directory; the CSV is the
   // report's.
-  const vr::sender::CodecOutputs outputs =
+  const vr::codec_stream::CodecOutputs outputs =
       vr_example::codec_outputs(encoded.value().output);
   CHECK(encoded->output.csv == "/tmp/scenarios/results/rows.csv");
   CHECK(outputs.stream == "/tmp/streams/room0.vrst");
@@ -199,7 +199,7 @@ int main() {
   cfg::Config live_out;
   live_out.output.stream = "rig.vrst";
   live_out.output.serve = 47801;
-  const vr::sender::CodecOutputs live_sent =
+  const vr::codec_stream::CodecOutputs live_sent =
       vr_example::set_codec_outputs(live_out);
   CHECK(!live_sent.decode && live_sent.stream == "rig.vrst");
   CHECK(live_sent.serve && live_sent.serve->port == 47801 &&
