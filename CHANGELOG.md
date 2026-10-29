@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-29
+
+### Changed
+
+- **Marching-cubes vertex normals**: each vertex carries the field's
+  gradient at its own position, the same from every cell and both kernels,
+  where it carried its cell's; positions and triangles are unchanged
+  (DESIGN.md, mesh).
+
 ## [0.2.0] - 2026-10-29
 
 ### Added
