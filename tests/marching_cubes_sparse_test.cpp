@@ -48,7 +48,6 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
@@ -56,6 +55,7 @@
 #include "volumetric_kit/recon/volume/frustum.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/recon/volume/voxel_color.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
@@ -133,10 +133,11 @@ vol::VoxelGridParams sphere_grid_params() {
 bool write_attributes(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
                       const std::vector<float>& tsdf,
                       const std::vector<float>& weight) {
-  return vr_test::write_attribute(ctx.device, ctx.allocator, g, "tsdf", tsdf)
+  return vr_test::write_attribute(ctx.device, ctx.allocator, g,
+                                  vol::kTsdfAttribute, tsdf)
              .ok() &&
-         vr_test::write_attribute(ctx.device, ctx.allocator, g, "weight",
-                                  weight)
+         vr_test::write_attribute(ctx.device, ctx.allocator, g,
+                                  vol::kWeightAttribute, weight)
              .ok();
 }
 
@@ -175,10 +176,10 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
     return false;
   }
 
-  auto tsdf =
-      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "tsdf");
-  auto weight =
-      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "weight");
+  auto tsdf = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                             vol::kTsdfAttribute);
+  auto weight = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                               vol::kWeightAttribute);
   if (!tsdf || !weight) {
     return false;
   }
@@ -188,7 +189,7 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
   std::uint32_t* cptr = nullptr;
   if (with_color) {
     color = vr_test::read_attribute<std::uint32_t>(ctx.device, ctx.allocator, g,
-                                                   "color");
+                                                   vol::kColorAttribute);
     if (!color) {
       return false;
     }
@@ -213,9 +214,10 @@ bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
     }
   }
   return write_attributes(ctx, g, tsdf.value(), weight.value()) &&
-         (!with_color || vr_test::write_attribute(ctx.device, ctx.allocator, g,
-                                                  "color", color.value())
-                             .ok());
+         (!with_color ||
+          vr_test::write_attribute(ctx.device, ctx.allocator, g,
+                                   vol::kColorAttribute, color.value())
+              .ok());
 }
 
 // Allocate a @p span cubed run of blocks and fill every voxel with a
@@ -259,10 +261,10 @@ bool fill_dense_blocks(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
   if (!active || active.value().size() != blocks.size()) {
     return false;
   }
-  auto tsdf =
-      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "tsdf");
-  auto weight =
-      vr_test::read_attribute<float>(ctx.device, ctx.allocator, g, "weight");
+  auto tsdf = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                             vol::kTsdfAttribute);
+  auto weight = vr_test::read_attribute<float>(ctx.device, ctx.allocator, g,
+                                               vol::kWeightAttribute);
   if (!tsdf || !weight) {
     return false;
   }
@@ -440,8 +442,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   mesh::MarchingCubes extractor = std::move(mc_result).value();
 
   const vol::VoxelGridParams gp = sphere_grid_params();
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
 
   // --- Sparse extraction of a multi-block sphere -----------------------------
   vkc::Result<vol::VoxelBlockGrid> grid_result =
@@ -627,9 +629,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // (linear interp of a linear field is exact), to within u8 quantization --
   // including vertices on triangles whose corners came from neighbouring
   // blocks.
-  const vol::AttributeSpec cattrs[] = {{"tsdf", sizeof(float)},
-                                       {"weight", sizeof(float)},
-                                       {"color", sizeof(std::uint32_t)}};
+  const vol::AttributeSpec cattrs[] = {
+      {vol::kTsdfAttribute, sizeof(float)},
+      {vol::kWeightAttribute, sizeof(float)},
+      {vol::kColorAttribute, sizeof(std::uint32_t)}};
   vkc::Result<vol::VoxelBlockGrid> cgrid_result =
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, cattrs, 3);
   CHECK(cgrid_result.ok());
@@ -653,7 +656,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // decode would leave `v.color` encoded, and `linear_to_srgb` of an
     // already-encoded 0.5 is 0.735, nowhere near it.
     const vr::Vec3f expected = grad_color(v.position);
-    const vr::Vec3f encoded = vr::linear_to_srgb(vr::Vec3f(v.color));
+    const vr::Vec3f encoded(vol::linear_to_srgb(v.color.x),
+                            vol::linear_to_srgb(v.color.y),
+                            vol::linear_to_srgb(v.color.z));
     CHECK(std::fabs(encoded.x - expected.x) < 0.005f);  // ~2.5x the u8 floor
     CHECK(std::fabs(encoded.y - expected.y) < 0.005f);
     CHECK(std::fabs(encoded.z - expected.z) < 0.005f);

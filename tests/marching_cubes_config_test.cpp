@@ -102,10 +102,10 @@ bool fill_sphere(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& g,
     return false;
   }
 
-  vkc::Result<std::vector<float>> tsdf =
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, g, "tsdf");
-  vkc::Result<std::vector<float>> weight =
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, g, "weight");
+  vkc::Result<std::vector<float>> tsdf = vr_test::read_attribute<float>(
+      gpu.device, gpu.allocator, g, vol::kTsdfAttribute);
+  vkc::Result<std::vector<float>> weight = vr_test::read_attribute<float>(
+      gpu.device, gpu.allocator, g, vol::kWeightAttribute);
   if (!tsdf || !weight) {
     return false;
   }
@@ -130,11 +130,11 @@ bool fill_sphere(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& g,
       }
     }
   }
-  return vr_test::write_attribute(gpu.device, gpu.allocator, g, "tsdf",
-                                  tsdf.value())
+  return vr_test::write_attribute(gpu.device, gpu.allocator, g,
+                                  vol::kTsdfAttribute, tsdf.value())
              .ok() &&
-         vr_test::write_attribute(gpu.device, gpu.allocator, g, "weight",
-                                  weight.value())
+         vr_test::write_attribute(gpu.device, gpu.allocator, g,
+                                  vol::kWeightAttribute, weight.value())
              .ok();
 }
 
@@ -163,8 +163,8 @@ std::vector<T> copy_out(const vkc::Device& dev, vkc::Allocator& alloc,
 
 int gpu_main(vkc::test::GpuContext& gpu) {
   const vol::VoxelGridParams gp = grid_params();
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
 
   // --- A configured extractor carries the consumer's bits --------------------
   mesh::MarchingCubesConfig config;

@@ -257,12 +257,12 @@ vkc::Result<SurfaceSet> surface_set(const vkc::test::Gpu& gpu,
                                     vol::VoxelBlockGrid& grid) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
-  VKC_ASSIGN(
-      const std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VKC_ASSIGN(const std::vector<float> tsdf,
+             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                            vol::kTsdfAttribute));
   VKC_ASSIGN(const std::vector<float> weight,
              vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+                                            vol::kWeightAttribute));
   const auto less = [](const vr::Vec3i& a, const vr::Vec3i& b) {
     return d::coord_less(a, b);
   };
@@ -387,7 +387,7 @@ vkc::Result<std::vector<std::uint8_t>> encode(
              grid.map().compact_active_blocks());
   VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
              vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       "weight", active));
+                                       vol::kWeightAttribute, active));
   std::vector<vol::BlockIndex> observed;
   std::optional<vkc::Buffer> cut;
   if (config.true_sdf) {

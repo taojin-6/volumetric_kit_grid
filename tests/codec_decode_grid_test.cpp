@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bitstream.hpp"
@@ -134,7 +135,8 @@ int make_grid_case(Gpu& gpu, const Frames& f) {
     CHECK(gp.num_blocks == vol::kDefaultBucketSize * want.buckets &&
           gp.max_chain == vol::kDefaultMaxChain);
     CHECK(grid->attribute_count() == 2);
-    for (const char* name : {"tsdf", "weight"}) {
+    for (const std::string_view name :
+         {vol::kTsdfAttribute, vol::kWeightAttribute}) {
       vkc::Result<vol::AttributeView> view = grid->attribute(name);
       CHECK(view.ok() && view->element_size == sizeof(float));
     }

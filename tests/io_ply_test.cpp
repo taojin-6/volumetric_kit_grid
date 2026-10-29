@@ -2,17 +2,23 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only PLY export checks. Read bytes directly to pin the public layout
-// and color encoding independently of the writer's backend.
+// and color encoding independently of the writer's backend. The writer's
+// sRGB encode is a copy of its own, held here to core/color_space.hpp's
+// linear_to_srgb, code for code.
 
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
+#include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 
 namespace vkc = volumetric_kit::core;
@@ -52,6 +58,71 @@ vr::mesh::Mesh triangle() {
   // A nontrivial order makes indexing vs. consecutive vertex triples visible.
   mesh.indices = {2, 0, 1};
   return mesh;
+}
+
+// The code a linear channel writes, by core/color_space.hpp's curve: 0 for
+// NaN and below, 255 from 1 up, else the encoded value rounded.
+std::uint8_t srgb_code(float linear) {
+  if (!(linear > 0.0f)) return 0;
+  if (linear >= 1.0f) return 255;
+  return static_cast<std::uint8_t>(vr::linear_to_srgb(linear) * 255.0f + 0.5f);
+}
+
+// Linear channels where a code changes: each code's rounding threshold and
+// the floats beside it, the curve's linear toe, a sweep of [0, 1], and the
+// values outside it.
+std::vector<float> code_edges() {
+  std::vector<float> values;
+  for (int c = 0; c < 255; ++c) {
+    float t = vr::srgb_to_linear((static_cast<float>(c) + 0.5f) / 255.0f);
+    for (int i = 0; i < 3; ++i) t = std::nextafter(t, 0.0f);
+    for (int i = 0; i < 7; ++i) {
+      values.push_back(t);
+      t = std::nextafter(t, 1.0f);
+    }
+  }
+  for (int i = 0; i <= 4096; ++i) {
+    values.push_back(static_cast<float>(i) / 4096.0f);
+  }
+  const float toe = 0.0031308f;
+  values.insert(values.end(), {std::nextafter(toe, 0.0f), toe,
+                               std::nextafter(toe, 1.0f), -0.0f, -1.0f, 1.0f,
+                               2.0f, std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::infinity(),
+                               -std::numeric_limits<float>::infinity()});
+  while (values.size() % 3 != 0) values.push_back(0.5f);
+  return values;
+}
+
+// Every channel of code_edges(), written as vertex colours, reads back as
+// srgb_code's.
+int check_srgb_parity(const std::string& path) {
+  const std::vector<float> values = code_edges();
+  vr::mesh::Mesh mesh;
+  mesh.vertices.resize(values.size() / 3);
+  for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
+    mesh.vertices[i].color = {values[3 * i], values[3 * i + 1],
+                              values[3 * i + 2], 1.0f};
+  }
+  CHECK(vr::io::write_ply(path, mesh));
+  const auto bytes = read_bytes(path);
+  const std::string text(bytes.begin(), bytes.end());
+  const auto end = text.find("end_header\n");
+  CHECK(end != std::string::npos);
+  const std::size_t payload = end + std::strlen("end_header\n");
+  CHECK(bytes.size() == payload + mesh.vertices.size() * 27);
+  int mismatches = 0;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    const std::uint8_t got = bytes[payload + (i / 3) * 27 + 24 + i % 3];
+    const std::uint8_t want = srgb_code(values[i]);
+    if (got != want && ++mismatches <= 10) {
+      std::fprintf(stderr, "linear %.9g: PLY code %u, color_space %u\n",
+                   static_cast<double>(values[i]), got, want);
+    }
+  }
+  CHECK(mismatches == 0);
+  std::printf("PLY sRGB matched color_space on %zu channels\n", values.size());
+  return 0;
 }
 
 }  // namespace
@@ -100,6 +171,8 @@ int main() {
   invalid.indices.back() = 3;
   CHECK(!vr::io::write_ply(path, invalid));
   CHECK(read_bytes(path) == bytes);
+
+  CHECK(check_srgb_parity((scratch.path / "codes.ply").string()) == 0);
   std::puts("io PLY tests passed");
   return 0;
 }

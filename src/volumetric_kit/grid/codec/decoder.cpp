@@ -7,6 +7,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "bitstream.hpp"
@@ -72,10 +73,11 @@ core::Status check_grid(const volume::VoxelBlockGrid& grid, const char* op) {
             std::to_string(gp.block_size),
         op);
   }
-  for (const char* name : {"tsdf", "weight"}) {
+  for (const std::string_view name :
+       {volume::kTsdfAttribute, volume::kWeightAttribute}) {
     VKC_ASSIGN(const volume::AttributeView view, grid.attribute(name));
     if (view.element_size != sizeof(float)) {
-      return fail(std::string("the grid's ") + name + " is not a 4-byte float",
+      return fail("the grid's " + std::string(name) + " is not a 4-byte float",
                   op);
     }
   }

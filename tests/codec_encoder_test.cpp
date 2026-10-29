@@ -296,10 +296,10 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
   // Observed by hand, as write_sphere's block positions overflow here.
   vkc::Result<std::vector<vol::BlockIndex>> active =
       grid.map().compact_active_blocks();
-  vkc::Result<std::vector<float>> tsdf =
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf");
-  vkc::Result<std::vector<float>> weight =
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "weight");
+  vkc::Result<std::vector<float>> tsdf = vr_test::read_attribute<float>(
+      gpu.device, gpu.allocator, grid, vr::volume::kTsdfAttribute);
+  vkc::Result<std::vector<float>> weight = vr_test::read_attribute<float>(
+      gpu.device, gpu.allocator, grid, vr::volume::kWeightAttribute);
   CHECK(active.ok() && tsdf.ok() && weight.ok());
   std::size_t marked = 0;
   for (const vol::BlockIndex& b : active.value()) {
@@ -313,11 +313,11 @@ int extremes_case(Gpu& gpu, codec::Encoder& enc) {
     ++marked;
   }
   CHECK(marked == far.size());
-  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf",
-                                 tsdf.value())
+  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                 vr::volume::kTsdfAttribute, tsdf.value())
             .ok());
-  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                 weight.value())
+  CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                 vr::volume::kWeightAttribute, weight.value())
             .ok());
   vkc::Result<std::vector<std::uint8_t>> frame = enc.encode(grid);
   vkc::Result<std::vector<std::uint8_t>> oracle =

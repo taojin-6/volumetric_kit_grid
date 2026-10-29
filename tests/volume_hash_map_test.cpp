@@ -20,6 +20,7 @@
 
 #include "device_blocks.hpp"
 #include "hash.hpp"
+#include "hash_map_internal.hpp"
 #include "volume_hash_oracle.hpp"
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
@@ -416,12 +417,13 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(cactive2.value().size() == cwant.size());
   }
 
-  // --- The entries accessors, which a consumer is told to use as a pair
-  // ------- A live map reports a real handle and the table's byte size; the two
-  // are written into one VkDescriptorBufferInfo by an out-of-tier kernel that
+  // --- The entries accessors, which a caller is told to use as a pair -------
+  // A live map reports a real handle and the table's byte size; the two are
+  // written into one VkDescriptorBufferInfo by an out-of-tier kernel that
   // probes the table itself (mesh's sparse marching cubes).
-  CHECK(map.entries_buffer() != VK_NULL_HANDLE);
-  CHECK(map.entries_buffer_size() ==
+  using Internal = vol::VoxelHashMap::Internal;
+  CHECK(Internal::entries_buffer(map) != VK_NULL_HANDLE);
+  CHECK(Internal::entries_buffer_size(map) ==
         static_cast<VkDeviceSize>(grid.num_buckets) *
             static_cast<VkDeviceSize>(grid.bucket_size) *
             sizeof(vol::HashEntry));
@@ -640,10 +642,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // then feed {VK_NULL_HANDLE, 0, size} to vkUpdateDescriptorSets, invalid
   // usage this repo enables neither nullDescriptor nor robustBufferAccess to
   // survive. Reverting the size accessor's valid() gate fails here.
-  CHECK(map.entries_buffer() == VK_NULL_HANDLE);
-  CHECK(map.entries_buffer_size() == 0);
-  CHECK(moved.entries_buffer() != VK_NULL_HANDLE);
-  CHECK(moved.entries_buffer_size() > 0);
+  CHECK(Internal::entries_buffer(map) == VK_NULL_HANDLE);
+  CHECK(Internal::entries_buffer_size(map) == 0);
+  CHECK(Internal::entries_buffer(moved) != VK_NULL_HANDLE);
+  CHECK(Internal::entries_buffer_size(moved) > 0);
 
   // Move-assign over a live object: build a second map and move it over
   // `moved`; the source empties and the destination stays live (its prior

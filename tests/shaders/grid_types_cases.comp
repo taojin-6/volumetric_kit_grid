@@ -1,0 +1,70 @@
+#version 450
+
+// Runs volume/shaders/grid_types.glsl, the voxel grid's device contract, over
+// what the host writes, so the host test compares it with volume's host
+// types. Invocation i handles tick case i, after[i] = vrTickAfter(a, b), and
+// in-block case i, bases[i] = (vrLocalBase(local, bs), vrLocalIndex of that);
+// invocation 0 also copies every field of the host's VoxelGridParams,
+// BlockIndex and BlockStamp, read through scalar block layout, to fields[].
+//
+// Built through the include root recon_volume exports, as a consumer's kernel
+// is.
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "volumetric_kit/recon/volume/shaders/grid_types.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Ticks {
+  uvec2 ticks[];  // a, b
+};
+layout(set = 0, binding = 1, std430) writeonly buffer After {
+  uint after[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer Locals {
+  uvec2 locals[];  // local, block size
+};
+layout(set = 0, binding = 3, std430) writeonly buffer Bases {
+  ivec4 bases[];
+};
+layout(set = 0, binding = 4, scalar) readonly buffer Structs {
+  VoxelGridParams grid;
+  BlockIndex blocks[2];
+  BlockStamp stamps[2];
+};
+layout(set = 0, binding = 5, std430) writeonly buffer Fields {
+  uint fields[];
+};
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i < uint(ticks.length())) {
+    after[i] = vrTickAfter(ticks[i].x, ticks[i].y) ? 1u : 0u;
+  }
+  if (i < uint(locals.length())) {
+    int bs = int(locals[i].y);
+    ivec3 base = vrLocalBase(locals[i].x, bs);
+    bases[i] = ivec4(base, vrLocalIndex(base, bs));
+  }
+  if (i == 0u) {
+    fields[0] = floatBitsToUint(grid.voxel_size);
+    fields[1] = uint(grid.block_size);
+    fields[2] = uint(grid.voxels_per_block);
+    fields[3] = floatBitsToUint(grid.trunc_dist);
+    fields[4] = uint(grid.bucket_size);
+    fields[5] = uint(grid.num_buckets);
+    fields[6] = uint(grid.num_blocks);
+    fields[7] = uint(grid.max_chain);
+    for (uint b = 0u; b < 2u; ++b) {
+      fields[8u + 4u * b] = uint(blocks[b].coord.x);
+      fields[9u + 4u * b] = uint(blocks[b].coord.y);
+      fields[10u + 4u * b] = uint(blocks[b].coord.z);
+      fields[11u + 4u * b] = uint(blocks[b].ptr);
+      fields[16u + 3u * b] = stamps[b].requested;
+      fields[17u + 3u * b] = stamps[b].weighted;
+      fields[18u + 3u * b] = stamps[b].changed;
+    }
+  }
+}

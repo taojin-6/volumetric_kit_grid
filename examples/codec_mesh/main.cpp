@@ -80,8 +80,9 @@ vkc::Status run(const Options& opt) {
              vkc::Device::create(instance, gpu, vr::device_requirements()));
   VKC_ASSIGN(vkc::Allocator allocator,
              vkc::Allocator::create(instance.handle(), device));
-  const vr::volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                             {"weight", sizeof(float)}};
+  const vr::volume::AttributeSpec attrs[] = {
+      {vr::volume::kTsdfAttribute, sizeof(float)},
+      {vr::volume::kWeightAttribute, sizeof(float)}};
   VKC_ASSIGN(
       vr::volume::VoxelBlockGrid volume,
       vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2));

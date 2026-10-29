@@ -13,12 +13,20 @@
 #include "tinyply_backend.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
-#include "volumetric_kit/recon/core/color_space.hpp"
 
 namespace volumetric_kit::recon::io {
 namespace {
 
 namespace tinyply = detail::tinyply;
+
+// The exact piecewise sRGB encode, one channel: the published formula, the
+// mesh files' own copy so they need no camera or colour vocabulary.
+// recon_io_ply holds it to core/color_space.hpp's linear_to_srgb, code for
+// code.
+float linear_to_srgb(float l) {
+  return l <= 0.0031308f ? l * 12.92f
+                         : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+}
 
 // Encode a LINEAR vertex-color channel to an 8-bit canonical-encoded code.
 //

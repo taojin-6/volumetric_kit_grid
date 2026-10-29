@@ -49,8 +49,8 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 
-// Cross-tier: the one transfer curve, from core.
-#include "volumetric_kit/recon/core/shaders/color_common.glsl"
+// Cross-tier: the voxel colour attribute's format, from the volume tier.
+#include "volumetric_kit/recon/volume/shaders/voxel_color.glsl"
 
 // One workgroup per block. 256 is fixed rather than sized from
 // voxels_per_block, which is a push constant and so cannot set local_size

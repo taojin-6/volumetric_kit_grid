@@ -48,7 +48,7 @@ layout(set = 0, binding = VR_HASH_ENTRIES_BINDING, scalar) readonly buffer
 /// memoryBarrierBuffer() that guards find_block's ptr/pos pair.
 ///
 /// Dropping BOTH is sound for the same single reason, and only for that reason:
-/// the caller's dispatch is **quiescent** -- see VoxelHashMap::entries_buffer's
+/// the caller's dispatch is **quiescent** -- see VoxelHashMap::Internal's
 /// @warning and the precondition on MarchingCubes::extract_device. find_block
 /// needs its acquire because it runs *inside* an allocating dispatch, where a
 /// concurrent invocation's just-published ptr could be observed beside that

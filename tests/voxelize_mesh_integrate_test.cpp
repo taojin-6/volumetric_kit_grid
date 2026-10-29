@@ -33,6 +33,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -176,7 +177,7 @@ std::vector<vol::BlockIndex> active_blocks(vol::VoxelBlockGrid& grid) {
 
 // A host copy of one attribute.
 std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
-                        const char* name) {
+                        std::string_view name) {
   return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
       .value();
 }
@@ -185,7 +186,8 @@ std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
 std::vector<float> snapshot(const vkc::test::Gpu& ctx,
                             vol::VoxelBlockGrid& grid) {
   std::vector<float> out;
-  for (const char* name : {"tsdf", "weight"}) {
+  for (const std::string_view name :
+       {vol::kTsdfAttribute, vol::kWeightAttribute}) {
     const std::vector<float> p = attr(ctx, grid, name);
     out.insert(out.end(), p.begin(), p.end());
   }
@@ -194,7 +196,7 @@ std::vector<float> snapshot(const vkc::test::Gpu& ctx,
 
 // The active blocks' voxels of one attribute, block i's from i * vpb.
 std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
-                        const char* name,
+                        std::string_view name,
                         const std::vector<vol::BlockIndex>& blocks) {
   return vr_test::read_blocks<float>(ctx, grid, name, blocks).value();
 }
@@ -205,8 +207,9 @@ std::map<Coord, std::vector<float>> by_coord(const vkc::test::Gpu& ctx,
                                              vol::VoxelBlockGrid& grid) {
   std::map<Coord, std::vector<float>> out;
   const std::vector<vol::BlockIndex> blocks = active_blocks(grid);
-  const std::vector<float> tsdf = attr(ctx, grid, "tsdf", blocks);
-  const std::vector<float> weight = attr(ctx, grid, "weight", blocks);
+  const std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute, blocks);
+  const std::vector<float> weight =
+      attr(ctx, grid, vol::kWeightAttribute, blocks);
   const auto vpb = static_cast<std::size_t>(grid.grid().voxels_per_block);
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     const vol::BlockIndex& b = blocks[i];
@@ -233,8 +236,9 @@ int verify(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
            const char* what, F expect, int* observed_count = nullptr) {
   const vol::VoxelGridParams& g = grid.grid();
   const std::vector<vol::BlockIndex> blocks = active_blocks(grid);
-  const std::vector<float> tsdf = attr(ctx, grid, "tsdf", blocks);
-  const std::vector<float> weight = attr(ctx, grid, "weight", blocks);
+  const std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute, blocks);
+  const std::vector<float> weight =
+      attr(ctx, grid, vol::kWeightAttribute, blocks);
   int observed = 0;
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     const vr::Vec3i base = vol::block_to_voxel(blocks[i].coord, g);
@@ -348,8 +352,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   gp.max_chain = 128;
   const float trunc = gp.trunc_dist;
 
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
   vkc::Result<vol::VoxelBlockGrid> grid_r =
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
   CHECK(grid_r.ok());
@@ -589,17 +593,17 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   for (const vol::BlockIndex& b : active_blocks(grid)) far_ptr = b.ptr;
   CHECK(far_ptr >= 0);
   {
-    std::vector<float> tsdf = attr(gpu, grid, "tsdf");
-    std::vector<float> weight = attr(gpu, grid, "weight");
+    std::vector<float> tsdf = attr(gpu, grid, vol::kTsdfAttribute);
+    std::vector<float> weight = attr(gpu, grid, vol::kWeightAttribute);
     for (int k = 0; k < gp.voxels_per_block; ++k) {
       tsdf[far_ptr + k] = 7.0f;
       weight[far_ptr + k] = 7.0f;
     }
-    CHECK(
-        vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf)
-            .ok());
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight)
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kTsdfAttribute, tsdf)
+              .ok());
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kWeightAttribute, weight)
               .ok());
   }
   CHECK(grid.map()
@@ -612,8 +616,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(beside.ok());
   CHECK(beside.value().blocks == active_blocks(grid).size() - 1);
   {
-    const std::vector<float> tsdf = attr(gpu, grid, "tsdf");
-    const std::vector<float> weight = attr(gpu, grid, "weight");
+    const std::vector<float> tsdf = attr(gpu, grid, vol::kTsdfAttribute);
+    const std::vector<float> weight = attr(gpu, grid, vol::kWeightAttribute);
     for (int k = 0; k < gp.voxels_per_block; ++k) {
       CHECK(tsdf[far_ptr + k] == 7.0f);
       CHECK(weight[far_ptr + k] == 7.0f);
@@ -733,7 +737,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
   // A grid without a weight attribute.
   {
-    const vol::AttributeSpec tsdf_only[] = {{"tsdf", sizeof(float)}};
+    const vol::AttributeSpec tsdf_only[] = {
+        {vol::kTsdfAttribute, sizeof(float)}};
     vkc::Result<vol::VoxelBlockGrid> bare = vol::VoxelBlockGrid::create(
         gpu.device, gpu.allocator, gp, tsdf_only, 1);
     CHECK(bare.ok());

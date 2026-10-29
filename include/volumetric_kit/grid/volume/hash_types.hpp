@@ -52,7 +52,8 @@ inline bool coord_less(const Vec3i& a, const Vec3i& b) noexcept {
 ///
 /// Indexed by block slot, `BlockIndex::ptr / voxels_per_block`. A slot's
 /// record is zeroed when its block is freed, and 0 is no tick. Mirrored by
-/// `volume/shaders/block_stamp.glsl`.
+/// `volume/shaders/grid_types.glsl`, with @ref BlockIndex and
+/// @ref tick_after.
 struct BlockStamp {
   /// The last tick an allocation asked for the block, whether it inserted the
   /// block or found it there.

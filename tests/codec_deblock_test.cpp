@@ -220,12 +220,12 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
 
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   if (active.size() != n) return fail("block count");
-  VKC_ASSIGN(
-      std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VKC_ASSIGN(std::vector<float> tsdf,
+             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                            vr::volume::kTsdfAttribute));
   VKC_ASSIGN(std::vector<float> weight,
              vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+                                            vr::volume::kWeightAttribute));
   std::vector<vol::BlockIndex> list = active;
   if (reverse) std::reverse(list.begin(), list.end());
   std::vector<std::uint32_t> masks(n * codec::kMaskWordsPerBlock, 0u);
@@ -244,10 +244,10 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
     }
     order.push_back(b.coord);
   }
-  VKC_TRY(
-      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vr::volume::kTsdfAttribute, tsdf));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vr::volume::kWeightAttribute, weight));
   // Each entry names its block by coordinate alone; the ptr it carries is
   // its mirror's, which a kernel must never read.
   std::vector<vol::BlockIndex> poisoned = list;
@@ -1803,12 +1803,12 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
   VKC_TRY(write_field(
       gpu, grid, [&s](const vr::Vec3f& p) { return s.sdf(p); }, true));
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
-  VKC_ASSIGN(
-      std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VKC_ASSIGN(std::vector<float> tsdf,
+             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                            vr::volume::kTsdfAttribute));
   VKC_ASSIGN(std::vector<float> weight,
              vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
-                                            "weight"));
+                                            vr::volume::kWeightAttribute));
   const std::size_t n = active.size();
   const std::size_t evens = (n + 1) / 2;
   // Local (3, 4, 5), then (5, 1, 2).
@@ -1821,10 +1821,10 @@ vkc::Result<vol::VoxelBlockGrid> share_grid(Gpu& gpu, const Sphere& s,
       weight[base + at_local[h]] = 0.0f;
     }
   }
-  VKC_TRY(
-      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vr::volume::kTsdfAttribute, tsdf));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vr::volume::kWeightAttribute, weight));
   return grid;
 }
 

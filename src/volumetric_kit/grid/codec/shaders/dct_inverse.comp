@@ -21,7 +21,7 @@
 
 #extension GL_GOOGLE_include_directive : require
 #include "dct_common.glsl"
-#include "volumetric_kit/recon/volume/shaders/block_stamp.glsl"
+#include "volumetric_kit/recon/volume/shaders/grid_types.glsl"
 
 layout(local_size_x = kLanes) in;
 

@@ -66,6 +66,20 @@ struct AttributeView {
 /// have skipped.
 inline constexpr float kObservedWeight = 1e-6f;
 
+/// @name The attributes the grid's tiers share
+/// Fusion writes them, the mesher and the codec read them, and each looks one
+/// up by its name (@ref VoxelBlockGrid::attribute).
+/// @{
+/// The truncated signed distance, a `float` (4 bytes) a voxel, in metres.
+inline constexpr std::string_view kTsdfAttribute = "tsdf";
+/// The fusion weight, a `float` (4 bytes) a voxel; observed from
+/// @ref kObservedWeight up.
+inline constexpr std::string_view kWeightAttribute = "weight";
+/// The colour, a `uint32_t` (4 bytes) a voxel, in the format
+/// `volume/voxel_color.hpp` gives.
+inline constexpr std::string_view kColorAttribute = "color";
+/// @}
+
 /// @brief A sparse voxel block grid: the @ref VoxelHashMap block index plus a
 ///        set of named, independently-allocated per-voxel attribute arrays.
 ///

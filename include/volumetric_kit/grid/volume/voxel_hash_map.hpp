@@ -725,47 +725,11 @@ class VR_VOLUME_API VoxelHashMap {
   ///         `Status::Code::OutOfMemory` if the re-insert overflows.
   core::Status resize(std::int32_t new_num_buckets);
 
-  /// @brief The device hash-entry array, for a kernel that resolves blocks by
-  ///        coordinate itself instead of being handed a host-built table.
-  ///
-  /// Published because the alternative is worse. A consumer that needs the
-  /// neighbourhood of N blocks otherwise pays an O(N) serial host pass of
-  /// coordinate lookups plus an upload -- 102 ms of a 133 ms mesh extract at
-  /// 107k blocks, measured on an M5 iPad Pro -- to hand the GPU a table it
-  /// could have built itself in parallel. It is for recon's own kernels: the
-  /// entry layout and the GLSL that reads it are internal
-  /// (`volume/shaders/hash_lookup.glsl` is the read-only traversal, mirroring
-  /// `find_block` and taking the table shape as arguments).
-  ///
-  /// @warning Read-only, and only safe while **nothing is mutating the table**
-  /// --
-  ///          no allocate / remove / clear / resize dispatch in flight. Probing
-  ///          concurrently with an insert would race the bucket locks this
-  ///          accessor deliberately does not expose. A meshing pass qualifies
-  ///          because it is quiescent by construction; a pass that also
-  ///          allocates does not.
-  /// @warning **Do not cache the handle.** A completed @ref resize replaces the
-  ///          entry buffer outright -- the old allocation is destroyed, so a
-  ///          handle held in a persistent descriptor set then names freed
-  ///          memory, which is a validation-layer-only diagnostic and undefined
-  ///          with layers off. Both shipped examples resize mid-scan on
-  ///          block-heap overflow. Re-fetch on every use, exactly as @ref
-  ///          AttributeView requires across a @ref VoxelBlockGrid::resize; a
-  ///          move of the map has the same effect.
-  /// @return The entry buffer, or `VK_NULL_HANDLE` on a moved-from map.
-  VkBuffer entries_buffer() const noexcept;
-
-  /// @brief Bytes in @ref entries_buffer, for a `VK_WHOLE_SIZE`-free binding.
-  ///
-  /// Pair it with @ref entries_buffer: bind the range rather than
-  /// `VK_WHOLE_SIZE` so the consumer can check it against the device's
-  /// `maxStorageBufferRange` first. That limit matters here -- the table holds
-  /// an entry a slot and @ref resize doubles `num_buckets`, while Vulkan
-  /// guarantees only 2^27 (128 MiB), which is what Android-class drivers
-  /// report and no driver this repo tests on does.
-  /// @return The size in bytes, or 0 on a moved-from map (so the pair stays
-  ///         consistent: a null handle never carries a non-zero range).
-  VkDeviceSize entries_buffer_size() const noexcept;
+  /// @brief The map's internals, for the voxel grid's own tiers: defined in
+  ///        `src/volumetric_kit/recon/volume/hash_map_internal.hpp`, which
+  ///        codec, mesh and voxelize reach on their private `src/` path. It
+  ///        hands out the hash-entry array, whose layout is internal.
+  class Internal;
 
   /// @brief The map's occupancy as a fraction of its block capacity -- a
   ///        constant-time read, safe to call every frame.

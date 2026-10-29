@@ -10,6 +10,7 @@
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
+#include "volumetric_kit/recon/volume/hash_map_internal.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
@@ -255,7 +256,8 @@ core::Status BlockLists::record_diff(core::CommandBatch& batch,
   // Another tier sized the table (and every resize doubles it), so it is
   // bound at its real size and range-checked, and fetched for this call: a
   // resize replaces it.
-  const VkDeviceSize entries_bytes = grid.map().entries_buffer_size();
+  const VkDeviceSize entries_bytes =
+      volume::VoxelHashMap::Internal::entries_buffer_size(grid.map());
   VKC_TRY(core::check_storage_buffer_range("BlockLists: the hash entries",
                                            entries_bytes,
                                            max_storage_buffer_range_));
@@ -269,7 +271,9 @@ core::Status BlockLists::record_diff(core::CommandBatch& batch,
                                    " slots, more than were reserved");
   }
   const core::DescriptorSet& set = grid_diff_kernel_.set;
-  set.write_storage_buffer(0, grid.map().entries_buffer(), 0, entries_bytes);
+  set.write_storage_buffer(
+      0, volume::VoxelHashMap::Internal::entries_buffer(grid.map()), 0,
+      entries_bytes);
   set.write_storage_buffer(1, frame_list.handle(), 0, frame_bytes);
   set.write_storage_buffer(2, gone_.handle(), 0, gone_bytes);
   set.write_storage_buffer(3, missing_.handle(), 0, frame_bytes);
