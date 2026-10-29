@@ -15,6 +15,7 @@
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 
+#include "hash_map_internal.hpp"
 #include "table_sizes.hpp"
 
 #include "block_stamp_comp.spv.hpp"
@@ -396,7 +397,7 @@ core::Status VoxelBlockGrid::prepare_block_pass() {
   if (!valid()) {
     return core::Status::invalid_argument("VoxelBlockGrid: moved-from grid");
   }
-  VKC_ASSIGN(const AttributeView weight, attribute("weight"));
+  VKC_ASSIGN(const AttributeView weight, attribute(kWeightAttribute));
   if (weight.element_size != sizeof(float)) {
     return core::Status::invalid_argument(
         "VoxelBlockGrid: the block pass needs a float weight attribute");
@@ -471,7 +472,7 @@ void VoxelBlockGrid::place_free_pass_rows(core::StageMetrics* metrics) {
 core::Result<RecordedRounds> VoxelBlockGrid::record_stale(
     core::CommandBatch& batch, std::uint32_t max_age,
     core::GpuStageScope& stage, std::uint32_t* initial_count) {
-  VKC_ASSIGN(const AttributeView weight, attribute("weight"));
+  VKC_ASSIGN(const AttributeView weight, attribute(kWeightAttribute));
   // Every block slot's room, since only the device knows how many are stale;
   // every batch this grid recorded into before has resolved (the @pre).
   const auto slots = static_cast<std::uint32_t>(map_.grid().num_blocks);
@@ -559,7 +560,8 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
   const VoxelGridParams& gp = map_.grid();
   const auto voxels_per_block = static_cast<std::uint32_t>(gp.voxels_per_block);
   const VkDeviceSize list_bytes = VkDeviceSize(count) * sizeof(BlockIndex);
-  const VkDeviceSize entries_bytes = map_.entries_buffer_size();
+  const VkDeviceSize entries_bytes =
+      VoxelHashMap::Internal::entries_buffer_size(map_);
   VKC_TRY(core::check_storage_buffer_range("VoxelBlockGrid: the hash entries",
                                            entries_bytes,
                                            max_storage_buffer_range_));
@@ -579,7 +581,8 @@ core::Status VoxelBlockGrid::record_zero(core::CommandBatch& batch,
     const core::DescriptorSet& set = zero_sets_[i];
     set.write_storage_buffer(0, attr.buffer.handle(), 0, VK_WHOLE_SIZE);
     set.write_storage_buffer(1, list.handle(), 0, list_bytes);
-    set.write_storage_buffer(2, map_.entries_buffer(), 0, entries_bytes);
+    set.write_storage_buffer(2, VoxelHashMap::Internal::entries_buffer(map_), 0,
+                             entries_bytes);
     const ZeroPush push{0,
                         voxels_per_block,
                         voxels_per_block * attr.element_size / 4,

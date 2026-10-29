@@ -62,9 +62,10 @@ inline vkc::Result<vol::VoxelBlockGrid> make_grid(Gpu& gpu,
   gp.num_buckets = s.num_buckets;
   gp.num_blocks = s.bucket_size * s.num_buckets;
   gp.max_chain = s.max_chain;
-  std::vector<vol::AttributeSpec> attrs = {{"tsdf", sizeof(float)}};
-  if (s.weight) attrs.push_back({"weight", sizeof(float)});
-  if (s.color) attrs.push_back({"color", 3});
+  std::vector<vol::AttributeSpec> attrs = {
+      {vol::kTsdfAttribute, sizeof(float)}};
+  if (s.weight) attrs.push_back({vol::kWeightAttribute, sizeof(float)});
+  if (s.color) attrs.push_back({vol::kColorAttribute, 3});
   return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp,
                                      attrs.data(), attrs.size());
 }
@@ -149,11 +150,11 @@ vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf,
                         bool observe_all = false) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   VKC_ASSIGN(vr_test::AttributeSpan<float> tsdf,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
-                                       active));
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       vol::kTsdfAttribute, active));
   VKC_ASSIGN(vr_test::AttributeSpan<float> weight,
              vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       "weight", active));
+                                       vol::kWeightAttribute, active));
   const float voxel = grid.grid().voxel_size;
   const float trunc = grid.grid().trunc_dist;
   for (const vol::BlockIndex& b : active) {
@@ -168,8 +169,10 @@ vkc::Status write_field(Gpu& gpu, vol::VoxelBlockGrid& grid, const Sdf& sdf,
       weight.values[at + v] = obs ? 2.0f : 0.0f;
     }
   }
-  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  return vr_test::write_span(gpu.device, gpu.allocator, grid, "weight", weight);
+  VKC_TRY(vr_test::write_span(gpu.device, gpu.allocator, grid,
+                              vol::kTsdfAttribute, tsdf));
+  return vr_test::write_span(gpu.device, gpu.allocator, grid,
+                             vol::kWeightAttribute, weight);
 }
 
 // write_field of one sphere.
@@ -298,11 +301,11 @@ struct Snapshot {
 inline vkc::Result<Snapshot> snapshot(Gpu& gpu, vol::VoxelBlockGrid& grid) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active, active_sorted(grid));
   VKC_ASSIGN(const vr_test::AttributeSpan<float> tsdf,
-             vr_test::read_span<float>(gpu.device, gpu.allocator, grid, "tsdf",
-                                       active));
+             vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
+                                       vol::kTsdfAttribute, active));
   VKC_ASSIGN(const vr_test::AttributeSpan<float> weight,
              vr_test::read_span<float>(gpu.device, gpu.allocator, grid,
-                                       "weight", active));
+                                       vol::kWeightAttribute, active));
   Snapshot out;
   for (const vol::BlockIndex& b : active) {
     const auto at = [&](const vr_test::AttributeSpan<float>& a) {

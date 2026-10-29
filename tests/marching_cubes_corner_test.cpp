@@ -229,9 +229,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   gp.num_buckets = 128;
   gp.num_blocks = 1024;
   gp.max_chain = 128;
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)},
-                                      {"color", sizeof(std::uint32_t)}};
+  const vol::AttributeSpec attrs[] = {
+      {vol::kTsdfAttribute, sizeof(float)},
+      {vol::kWeightAttribute, sizeof(float)},
+      {vol::kColorAttribute, sizeof(std::uint32_t)}};
   vkc::Result<vol::VoxelBlockGrid> grid_result =
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 3);
   CHECK(grid_result.ok());
@@ -255,12 +256,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<std::vector<vol::BlockIndex>> active =
       grid.map().compact_active_blocks();
   CHECK(active.ok() && active.value().size() == blocks.size());
-  auto tsdf =
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf");
-  auto weight =
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "weight");
-  auto color = vr_test::read_attribute<std::uint32_t>(gpu.device, gpu.allocator,
-                                                      grid, "color");
+  auto tsdf = vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                             vol::kTsdfAttribute);
+  auto weight = vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                               vol::kWeightAttribute);
+  auto color = vr_test::read_attribute<std::uint32_t>(
+      gpu.device, gpu.allocator, grid, vol::kColorAttribute);
   CHECK(tsdf.ok() && weight.ok() && color.ok());
 
   for (const float iso : {0.0f, 0.0025f}) {
@@ -284,14 +285,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         }
       }
     }
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf",
-                                   tsdf.value())
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kTsdfAttribute, tsdf.value())
               .ok());
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight.value())
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kWeightAttribute, weight.value())
               .ok());
-    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "color",
-                                   color.value())
+    CHECK(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kColorAttribute, color.value())
               .ok());
 
     for (const bool share : {false, true}) {

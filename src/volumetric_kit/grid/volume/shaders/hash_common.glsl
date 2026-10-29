@@ -28,31 +28,17 @@
 
 // --- Device struct layouts. Under scalar block layout these are byte-identical
 // to the host POD structs (HashEntry: ptr@0, ivec3 pos@4, offset@16, 20 B),
-// which is what lets one definition serve CPU / GLSL / CUDA (2026-07-05 ABI). ---
+// which is what lets one definition serve CPU / GLSL / CUDA (2026-07-05 ABI).
+// VoxelGridParams, BlockIndex and BlockStamp are the grid's exported contract,
+// grid_types.glsl; the slot is internal. ---
 
-struct VoxelGridParams {
-  float voxel_size;
-  int block_size;
-  int voxels_per_block;
-  float trunc_dist;
-  int bucket_size;
-  int num_buckets;
-  int num_blocks;
-  int max_chain;
-};
+#include "grid_types.glsl"
 
 struct HashEntry {
   int ptr;
   ivec3 pos;
   int offset;
 };
-
-struct BlockIndex {
-  ivec3 coord;
-  int ptr;
-};
-
-#include "block_stamp.glsl"
 
 // --- Slot sentinels: their one definition; no host code reads a slot. ---
 const int kFreeEntry = -1;

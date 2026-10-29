@@ -72,7 +72,8 @@ vol::VoxelGridParams grid_params(int block_size = 8) {
 // centre mid-grid: a surface crossing many block faces.
 vkc::Result<vol::VoxelBlockGrid> sphere_grid(vkc::test::Gpu& gpu,
                                              int blocks = kBlocks) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, 4},
+                                      {vol::kWeightAttribute, 4}};
   VKC_ASSIGN(vol::VoxelBlockGrid grid,
              vol::VoxelBlockGrid::create(gpu.device, gpu.allocator,
                                          grid_params(), attrs, 2));
@@ -89,9 +90,9 @@ vkc::Result<vol::VoxelBlockGrid> sphere_grid(vkc::test::Gpu& gpu,
   if (failed != 0) return vkc::Status::io_error("blocks left unallocated");
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
-  VKC_ASSIGN(
-      std::vector<float> tsdf,
-      vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid, "tsdf"));
+  VKC_ASSIGN(std::vector<float> tsdf,
+             vr_test::read_attribute<float>(gpu.device, gpu.allocator, grid,
+                                            vol::kTsdfAttribute));
   std::vector<float> weight(tsdf.size(), 0.0f);
   const float c = 0.5f * float(blocks * 8 - 1) * kH;
   for (const vol::BlockIndex& b : active) {
@@ -103,10 +104,10 @@ vkc::Result<vol::VoxelBlockGrid> sphere_grid(vkc::test::Gpu& gpu,
       weight[std::size_t(b.ptr) + v] = 1.0f;
     }
   }
-  VKC_TRY(
-      vr_test::write_attribute(gpu.device, gpu.allocator, grid, "tsdf", tsdf));
-  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid, "weight",
-                                   weight));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kTsdfAttribute, tsdf));
+  VKC_TRY(vr_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                   vol::kWeightAttribute, weight));
   return grid;
 }
 
@@ -527,7 +528,8 @@ int counters_case(vkc::test::Gpu& gpu) {
 // A grid whose blocks the sharing kernel's table cannot hold (16^3 voxels) is
 // refused before anything is recorded or claimed.
 int refusal_case(vkc::test::Gpu& gpu) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, 4},
+                                      {vol::kWeightAttribute, 4}};
   vkc::Result<vol::VoxelBlockGrid> big = vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator, grid_params(16), attrs, 2);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu, true);

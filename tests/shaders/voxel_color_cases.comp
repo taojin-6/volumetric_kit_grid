@@ -1,0 +1,48 @@
+#version 450
+
+// Runs volume/shaders/voxel_color.glsl, the voxel colour attribute's format,
+// over the words the host writes, so the host test compares each function
+// with volume/voxel_color.hpp's. Invocation i handles word i:
+//   * linear[i] is vrUnpackSrgbToLinear(word) and round[i] the running mean's
+//     encode of it, vrPackLinearToSrgb;
+//   * observed[i] is vrVoxelColorFromObserved(word), what a first observation
+//     stores;
+//   * read[i] is vrVoxelColorToLinear(word), what the mesher reads.
+//
+// Plain std430, built through the include root recon_volume exports, as a
+// consumer's kernel is.
+
+#extension GL_GOOGLE_include_directive : require
+
+#include "volumetric_kit/recon/volume/shaders/voxel_color.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Words {
+  uint words[];
+};
+layout(set = 0, binding = 1, std430) writeonly buffer Linear {
+  vec4 linear[];
+};
+layout(set = 0, binding = 2, std430) writeonly buffer Round {
+  uint round_trip[];
+};
+layout(set = 0, binding = 3, std430) writeonly buffer Observed {
+  uint observed[];
+};
+layout(set = 0, binding = 4, std430) writeonly buffer Read {
+  vec4 read_back[];
+};
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= uint(words.length())) {
+    return;
+  }
+  uint word = words[i];
+  vec3 l = vrUnpackSrgbToLinear(word);
+  linear[i] = vec4(l, 0.0);
+  round_trip[i] = vrPackLinearToSrgb(l);
+  observed[i] = vrVoxelColorFromObserved(word);
+  read_back[i] = vec4(vrVoxelColorToLinear(word), 0.0);
+}

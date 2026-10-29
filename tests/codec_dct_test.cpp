@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -86,8 +87,8 @@ vol::VoxelGridParams small_grid(std::int32_t block_size = codec::kBlockSize) {
 vkc::Result<vol::VoxelBlockGrid> make_grid(
     vkc::Device& device, vkc::Allocator& allocator,
     std::int32_t block_size = codec::kBlockSize, bool with_weight = true) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
   return vol::VoxelBlockGrid::create(device, allocator, small_grid(block_size),
                                      attrs, with_weight ? 2 : 1);
 }
@@ -117,13 +118,14 @@ vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
 // A copy of an attribute, and back; the arrays are device-local, and both
 // abort on a device error.
 std::vector<float> attr(const vkc::test::Gpu& ctx,
-                        const vol::VoxelBlockGrid& grid, const char* name) {
+                        const vol::VoxelBlockGrid& grid,
+                        std::string_view name) {
   return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
       .value();
 }
 
 void put(const vkc::test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
-         const char* name, const std::vector<float>& data) {
+         std::string_view name, const std::vector<float>& data) {
   if (!vr_test::write_attribute(ctx.device, ctx.allocator, grid, name, data)
            .ok()) {
     std::abort();
@@ -134,14 +136,14 @@ void put(const vkc::test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
 void write_block(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                  const vol::BlockIndex& b, const Cube& s,
                  const std::function<float(std::uint32_t)>& w) {
-  std::vector<float> tsdf = attr(ctx, grid, "tsdf");
-  std::vector<float> weight = attr(ctx, grid, "weight");
+  std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
+  std::vector<float> weight = attr(ctx, grid, vol::kWeightAttribute);
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     tsdf[std::uint32_t(b.ptr) + v] = static_cast<float>(s[v]) * kTrunc;
     weight[std::uint32_t(b.ptr) + v] = w(v);
   }
-  put(ctx, grid, "tsdf", tsdf);
-  put(ctx, grid, "weight", weight);
+  put(ctx, grid, vol::kTsdfAttribute, tsdf);
+  put(ctx, grid, vol::kWeightAttribute, weight);
 }
 
 float observed(std::uint32_t) { return 2.0f; }
@@ -149,7 +151,7 @@ float observed(std::uint32_t) { return 2.0f; }
 // Read a block back in normalized units.
 Cube read_block(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                 const vol::BlockIndex& b) {
-  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  const std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
   Cube s{};
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     s[v] = double(tsdf[std::uint32_t(b.ptr) + v]) / double(kTrunc);
@@ -485,7 +487,7 @@ int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
     squared_steps += step * step;
   }
   const double bound = std::sqrt(squared_steps / (4.0 * kVpb)) + 1e-5;
-  const std::vector<float> weight = attr(ctx, grid, "weight");
+  const std::vector<float> weight = attr(ctx, grid, vol::kWeightAttribute);
   for (int i = 0; i < 4; ++i) {
     const double err =
         rms_diff(read_block(ctx, grid, blocks[std::size_t(i)]), content[i]);
@@ -591,19 +593,19 @@ int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   }
 
   // Poison both attributes so the inverse must write every voxel.
-  std::vector<float> tsdf = attr(ctx, grid, "tsdf");
-  std::vector<float> weight = attr(ctx, grid, "weight");
+  std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
+  std::vector<float> weight = attr(ctx, grid, vol::kWeightAttribute);
   for (const vol::BlockIndex& b : blocks) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       tsdf[std::uint32_t(b.ptr) + v] = 123.0f;
       weight[std::uint32_t(b.ptr) + v] = 123.0f;
     }
   }
-  put(ctx, grid, "tsdf", tsdf);
-  put(ctx, grid, "weight", weight);
+  put(ctx, grid, vol::kTsdfAttribute, tsdf);
+  put(ctx, grid, vol::kWeightAttribute, weight);
   CHECK(oracle::inverse(ctx, t, grid, blocks, out).ok());
-  tsdf = attr(ctx, grid, "tsdf");
-  weight = attr(ctx, grid, "weight");
+  tsdf = attr(ctx, grid, vol::kTsdfAttribute);
+  weight = attr(ctx, grid, vol::kWeightAttribute);
   for (std::size_t i = 0; i < 2; ++i) {
     const std::uint32_t base = std::uint32_t(blocks[i].ptr);
     for (std::uint32_t v = 0; v < kVpb; ++v) {
@@ -700,7 +702,7 @@ int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
   CHECK(*std::max_element(unclamped.begin(), unclamped.end()) > 1.2);
 
   CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
-  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  const std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
   bool saturated = false;
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     const float sdf = tsdf[std::uint32_t(block.ptr) + v];
@@ -828,9 +830,9 @@ int cut_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   CHECK(uncut.masks == plain.masks && uncut.coefficients == plain.coefficients);
   CHECK(with_cut.masks != plain.masks);
 
-  std::vector<float> weights = attr(ctx, grid, "weight");
+  std::vector<float> weights = attr(ctx, grid, vol::kWeightAttribute);
   for (const std::size_t slot : slots) weights[slot] = 0.0f;
-  put(ctx, grid, "weight", weights);
+  put(ctx, grid, vol::kWeightAttribute, weights);
   DctBlocks zeroed;
   CHECK(oracle::forward(ctx, t, grid, blocks, params, zeroed).ok());
   CHECK(with_cut.masks == zeroed.masks &&
@@ -920,13 +922,13 @@ int batching_case(vkc::Device& device, vkc::Allocator& allocator,
   for (const vol::BlockIndex& b : blocks) {
     single.push_back(read_block(ctx, grid, b));
   }
-  std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+  std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
   for (const vol::BlockIndex& b : blocks) {
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
     }
   }
-  put(ctx, grid, "tsdf", tsdf);
+  put(ctx, grid, vol::kTsdfAttribute, tsdf);
   vr::detail::set_test_groups_per_dispatch(3);
   CHECK(oracle::inverse(ctx, t, grid, blocks, many).ok());
   vr::detail::set_test_groups_per_dispatch(0);
@@ -1079,16 +1081,16 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     std::vector<vol::BlockIndex> forged = blocks;
     forged[1].ptr = unused;
     forged[2].coord = vr::Vec3i(99, 99, 99);
-    std::vector<float> tsdf = attr(ctx, grid, "tsdf");
+    std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
     for (const vol::BlockIndex& b : blocks) {
       for (std::uint32_t v = 0; v < kVpb; ++v) {
         tsdf[std::uint32_t(b.ptr) + v] = 9.0f;
       }
     }
-    put(ctx, grid, "tsdf", tsdf);
+    put(ctx, grid, vol::kTsdfAttribute, tsdf);
     CHECK(!oracle::inverse(ctx, t, grid, forged, honest).ok());
-    tsdf = attr(ctx, grid, "tsdf");
-    const std::vector<float> weight = attr(ctx, grid, "weight");
+    tsdf = attr(ctx, grid, vol::kTsdfAttribute);
+    const std::vector<float> weight = attr(ctx, grid, vol::kWeightAttribute);
     for (std::uint32_t v = 0; v < kVpb; ++v) {
       CHECK(weight[std::uint32_t(unused) + v] == 0.0f);
       CHECK(tsdf[std::uint32_t(unused) + v] == 0.0f);
@@ -1255,14 +1257,14 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   // duplicate append and every ptr, across dispatches in the chunked variant
   // below.
   for (bool all : {true, false, true}) {
-    std::vector<float> weights = attr(ctx, grid, "weight");
+    std::vector<float> weights = attr(ctx, grid, vol::kWeightAttribute);
     std::fill(weights.begin(), weights.end(), 0.0f);
     if (all) {
       for (const vol::BlockIndex& block : blocks) {
         weights[std::size_t(block.ptr) + 511] = vol::kObservedWeight;
       }
     }
-    put(ctx, grid, "weight", weights);
+    put(ctx, grid, vol::kWeightAttribute, weights);
     kept = observed_of(grid, list.value());
     CHECK(kept.ok());
     CHECK(kept.value().size() == (all ? blocks.size() : 0u));
@@ -1308,13 +1310,14 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(resized.ok());
     auto row = allocate_row(ctx, resized.value(), size);
     CHECK(row.ok());
-    std::vector<float> weights = attr(ctx, resized.value(), "weight");
+    std::vector<float> weights =
+        attr(ctx, resized.value(), vol::kWeightAttribute);
     for (const vol::BlockIndex& block : row.value()) {
       if (block.coord.x % 2 == 0) {
         weights[std::size_t(block.ptr) + 300] = vol::kObservedWeight;
       }
     }
-    put(ctx, resized.value(), "weight", weights);
+    put(ctx, resized.value(), vol::kWeightAttribute, weights);
     auto device_list = resized.value().map().compact_active_blocks_on_device();
     CHECK(device_list.ok());
     auto result = observed_of(resized.value(), device_list.value());
@@ -1391,8 +1394,8 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
   CHECK(active.ok());
   const auto& blocks = active.value();
   std::vector<Cube> content;
-  std::vector<float> original = attr(ctx, grid, "tsdf");
-  std::vector<float> weights = attr(ctx, grid, "weight");
+  std::vector<float> original = attr(ctx, grid, vol::kTsdfAttribute);
+  std::vector<float> weights = attr(ctx, grid, vol::kWeightAttribute);
   for (const vol::BlockIndex& block : blocks) {
     content.push_back(random_cube(std::uint32_t(block.coord.x) + 713));
     for (std::size_t v = 0; v < kVpb; ++v) {
@@ -1400,11 +1403,11 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
       weights[std::size_t(block.ptr) + v] = codec::detail::kDecodedWeight;
     }
   }
-  put(ctx, grid, "weight", weights);
+  put(ctx, grid, vol::kWeightAttribute, weights);
   const std::array<std::pair<std::size_t, std::uint32_t>, 7> calls = {
       {{1, 1}, {17, 512}, {3, 35}, {0, 64}, {17, 64}, {1, 512}, {17, 512}}};
   for (const auto& [count, k] : calls) {
-    put(ctx, grid, "tsdf", original);
+    put(ctx, grid, vol::kTsdfAttribute, original);
     const std::vector<vol::BlockIndex> prefix(
         blocks.begin(), blocks.begin() + std::ptrdiff_t(count));
     codec::CodecParams params;
@@ -1423,7 +1426,7 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
     CHECK(check_against_reference(out, content.data(), count, exact,
                                   near_half) == 0);
     CHECK(oracle::inverse(ctx, t, grid, list, out).ok());
-    const auto decoded = attr(ctx, grid, "tsdf");
+    const auto decoded = attr(ctx, grid, vol::kTsdfAttribute);
     for (std::size_t i = 0; i < blocks.size(); ++i) {
       Cube actual;
       for (std::size_t v = 0; v < kVpb; ++v) {
@@ -1490,22 +1493,23 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
 
   // Every 0.0 of the grid made -0.0: equal as values, so nothing is stamped,
   // but rewritten, so the arrays end bit for bit as the decode left them.
-  const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
-  const std::vector<float> weight = attr(ctx, grid, "weight");
+  const std::vector<float> tsdf = attr(ctx, grid, vol::kTsdfAttribute);
+  const std::vector<float> weight = attr(ctx, grid, vol::kWeightAttribute);
   auto negate_zeros = [](std::vector<float> a) {
     for (float& x : a) {
       if (x == 0.0f) x = -0.0f;
     }
     return a;
   };
-  put(ctx, grid, "tsdf", negate_zeros(tsdf));
-  put(ctx, grid, "weight", negate_zeros(weight));
+  put(ctx, grid, vol::kTsdfAttribute, negate_zeros(tsdf));
+  put(ctx, grid, vol::kWeightAttribute, negate_zeros(weight));
   CHECK(oracle::inverse(ctx, t, grid, blocks, moved).ok());
   CHECK(changed(0) == first);
   CHECK(changed(1) == second);
   CHECK(changed(2) == first);
-  const std::vector<float> tsdf_after = attr(ctx, grid, "tsdf");
-  const std::vector<float> weight_after = attr(ctx, grid, "weight");
+  const std::vector<float> tsdf_after = attr(ctx, grid, vol::kTsdfAttribute);
+  const std::vector<float> weight_after =
+      attr(ctx, grid, vol::kWeightAttribute);
   for (std::uint32_t v = 0; v < kVpb; ++v) {
     // Block 2 held -0.0 in every voxel.
     const std::size_t i = std::size_t(blocks[2].ptr) + v;

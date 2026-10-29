@@ -202,13 +202,16 @@ bool compare_grids(const vkc::test::Gpu& gpu,
                  blocks.status().message().c_str());
     return false;
   }
-  const char* names[] = {"weight", "tsdf", "color"};
+  namespace vol = volumetric_kit::recon::volume;
+  const std::string_view names[] = {vol::kWeightAttribute, vol::kTsdfAttribute,
+                                    vol::kColorAttribute};
   std::vector<std::uint32_t> wa[3], wb[3];
   for (int n = 0; n < 3; ++n) {
     auto ra = read_blocks<std::uint32_t>(gpu, a, names[n], blocks->a);
     auto rb = read_blocks<std::uint32_t>(gpu, b, names[n], blocks->b);
     if (!ra.ok() || !rb.ok()) {
-      std::fprintf(stderr, "compare_grids: no %s attribute\n", names[n]);
+      std::fprintf(stderr, "compare_grids: no %.*s attribute\n",
+                   static_cast<int>(names[n].size()), names[n].data());
       return false;
     }
     wa[n] = std::move(ra).value();
@@ -240,13 +243,17 @@ inline bool same_grids(const vkc::test::Gpu& gpu,
     std::fprintf(stderr, "same_grids: %s\n", blocks.status().message().c_str());
     return false;
   }
-  const char* names[] = {"weight", "tsdf", "color"};
+  namespace vol = volumetric_kit::recon::volume;
+  const std::string_view names[] = {vol::kWeightAttribute, vol::kTsdfAttribute,
+                                    vol::kColorAttribute};
   std::size_t weighted = 0;
   for (int n = 0; n < 3; ++n) {
+    const int len = static_cast<int>(names[n].size());
     auto ra = read_blocks<std::uint32_t>(gpu, a, names[n], blocks->a);
     auto rb = read_blocks<std::uint32_t>(gpu, b, names[n], blocks->b);
     if (!ra.ok() || !rb.ok()) {
-      std::fprintf(stderr, "same_grids: no %s attribute\n", names[n]);
+      std::fprintf(stderr, "same_grids: no %.*s attribute\n", len,
+                   names[n].data());
       return false;
     }
     if (!detail::compare_voxels(blocks.value(), a.grid().voxels_per_block,
@@ -255,7 +262,7 @@ inline bool same_grids(const vkc::test::Gpu& gpu,
                                     weighted += ra.value()[i] != 0 ? 1 : 0;
                                   return ra.value()[i] == rb.value()[i];
                                 })) {
-      std::fprintf(stderr, "same_grids: %s differs\n", names[n]);
+      std::fprintf(stderr, "same_grids: %.*s differs\n", len, names[n].data());
       return false;
     }
   }

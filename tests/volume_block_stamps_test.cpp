@@ -97,8 +97,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Device& dev = gpu.device;
   vkc::Allocator& alloc = gpu.allocator;
 
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
   auto made = vol::VoxelBlockGrid::create(dev, alloc, params(), attrs, 2);
   CHECK(made.ok());
   vol::VoxelBlockGrid& grid = made.value();
@@ -129,8 +129,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // the pass. At tick 3 the pass stamps the first, and asking for the third
   // again restamps that one.
   {
-    auto w = vr_test::read_attribute<float>(dev, alloc, grid, "weight");
-    auto t = vr_test::read_attribute<float>(dev, alloc, grid, "tsdf");
+    auto w =
+        vr_test::read_attribute<float>(dev, alloc, grid, vol::kWeightAttribute);
+    auto t =
+        vr_test::read_attribute<float>(dev, alloc, grid, vol::kTsdfAttribute);
     CHECK(w.ok() && t.ok());
     w.value()[std::size_t{a} * 512 + 7] = 1.0f;
     w.value()[std::size_t{b} * 512 + 7] = 0.5f * vol::kObservedWeight;
@@ -138,8 +140,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     for (std::size_t k = 0; k < 512; ++k) {
       t.value()[std::size_t{b} * 512 + k] = 0.5f;
     }
-    CHECK(vr_test::write_attribute(dev, alloc, grid, "weight", w.value()).ok());
-    CHECK(vr_test::write_attribute(dev, alloc, grid, "tsdf", t.value()).ok());
+    CHECK(vr_test::write_attribute(dev, alloc, grid, vol::kWeightAttribute,
+                                   w.value())
+              .ok());
+    CHECK(vr_test::write_attribute(dev, alloc, grid, vol::kTsdfAttribute,
+                                   t.value())
+              .ok());
   }
   map.advance_tick();
   map.advance_tick();
@@ -211,8 +217,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(st.value()[a].weighted == 4);
   // Its voxels are zeroed, every attribute, and the kept block's stay.
   {
-    auto w = vr_test::read_attribute<float>(dev, alloc, grid, "weight");
-    auto t = vr_test::read_attribute<float>(dev, alloc, grid, "tsdf");
+    auto w =
+        vr_test::read_attribute<float>(dev, alloc, grid, vol::kWeightAttribute);
+    auto t =
+        vr_test::read_attribute<float>(dev, alloc, grid, vol::kTsdfAttribute);
     CHECK(w.ok() && t.ok());
     for (std::size_t k = 0; k < 512; ++k) {
       CHECK(w.value()[std::size_t{b} * 512 + k] == 0.0f &&
@@ -353,16 +361,22 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       CHECK(
           vr_test::allocate_blocks(gpu, g->map(), coords.data(), 40).value() ==
           0);
-      auto t = vr_test::read_attribute<float>(dev, alloc, *g, "tsdf");
-      auto w = vr_test::read_attribute<float>(dev, alloc, *g, "weight");
+      auto t =
+          vr_test::read_attribute<float>(dev, alloc, *g, vol::kTsdfAttribute);
+      auto w =
+          vr_test::read_attribute<float>(dev, alloc, *g, vol::kWeightAttribute);
       auto at_slot = slots(*g);
       CHECK(t.ok() && w.ok() && at_slot.ok());
       for (float& v : t.value()) v = 1.0f;
       for (const auto& [coord, s] : at_slot.value()) {
         if (std::get<0>(coord) < 2010) w.value()[std::size_t{s} * 512] = 1.0f;
       }
-      CHECK(vr_test::write_attribute(dev, alloc, *g, "tsdf", t.value()).ok());
-      CHECK(vr_test::write_attribute(dev, alloc, *g, "weight", w.value()).ok());
+      CHECK(vr_test::write_attribute(dev, alloc, *g, vol::kTsdfAttribute,
+                                     t.value())
+                .ok());
+      CHECK(vr_test::write_attribute(dev, alloc, *g, vol::kWeightAttribute,
+                                     w.value())
+                .ok());
       g->map().advance_tick();
       g->map().advance_tick();
     }
@@ -390,7 +404,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     auto kept_a = slots(*a);
     auto kept_b = slots(*b);
     CHECK(kept_a.ok() && kept_b.ok() && kept_a->size() == 10);
-    auto t = vr_test::read_attribute<float>(dev, alloc, *b, "tsdf");
+    auto t =
+        vr_test::read_attribute<float>(dev, alloc, *b, vol::kTsdfAttribute);
     CHECK(t.ok());
     for (const auto& [coord, s] : kept_a.value()) {
       CHECK(kept_b->count(coord) == 1);
@@ -445,7 +460,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // Refusals: a max_age of 0, and a grid with no weight.
   CHECK(grid.free_stale_blocks(0).status().domain() ==
         vkc::Status::Code::InvalidArgument);
-  const vol::AttributeSpec no_weight[] = {{"tsdf", sizeof(float)}};
+  const vol::AttributeSpec no_weight[] = {{vol::kTsdfAttribute, sizeof(float)}};
   auto bare = vol::VoxelBlockGrid::create(dev, alloc, params(), no_weight, 1);
   CHECK(bare.ok());
   CHECK(vr_test::allocate_blocks(gpu, bare->map(), three, 1).ok());

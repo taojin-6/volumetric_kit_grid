@@ -76,4 +76,12 @@ vr_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rehash.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rounds.comp")
 
+# The grid's device contract and its colour attribute's format, for any kernel's
+# #include ("volumetric_kit/recon/volume/shaders/grid_types.glsl") through the
+# core's INCLUDE_TARGETS volumetric_kit::recon_volume, as recon's tsdf does. The
+# hash table's GLSL (hash_common.glsl, hash_lookup.glsl, ...) stays internal:
+# the codec, mesh and voxelize kernels read it through src/.
+vkc_export_glsl(recon_volume PREFIX volumetric_kit/recon/volume/shaders FILES
+                shaders/grid_types.glsl shaders/voxel_color.glsl)
+
 vr_target_warnings(recon_volume)

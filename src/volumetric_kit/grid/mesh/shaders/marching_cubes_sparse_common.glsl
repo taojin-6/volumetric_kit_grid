@@ -33,7 +33,7 @@
 // `num_buckets`, `bucket_size`, `max_chain`), the `active_blocks` / `tsdf` /
 // `weight` / `color_attr` buffers, and have included hash_lookup.glsl (for
 // `BlockIndex` + `vrFindBlockPtr`, which block_neighbourhood.glsl needs),
-// color_common.glsl and marching_cubes_common.glsl (for `mcCornerShift`).
+// voxel_color.glsl and marching_cubes_common.glsl (for `mcCornerShift`).
 
 // vrLocalIndex / vrLocalBase / s_neighbour / vrResolveNeighbourhood /
 // vrCornerStorage: the block's +neighbourhood and the one cross-block corner
@@ -61,16 +61,12 @@ bool mcGather(int bs, ivec3 base, out float sdf[8], out vec3 corner_color[8],
     }
     sdf[i] = tsdf[si];
     if (pc.has_color != 0u) {
-      // color_attr == 0 is the tsdf integrator's "colour never observed"
-      // sentinel: a fused colour is packed with alpha 0xFF, so any observed
-      // colour is non-zero. A depth-integrated but colour-unobserved corner
-      // falls back to opaque white rather than dragging the interpolated vertex
-      // toward black, mirroring the integrator's first-observation-assigns
-      // anti-darkening rule. Decoded to LINEAR working values here, because the
-      // edge interpolation is an average (the 2026-08-02 decision); white is
-      // 1.0 in either space, so the sentinel branch is unaffected.
-      uint packed = color_attr[si];
-      corner_color[i] = packed != 0u ? vrUnpackSrgbToLinear(packed) : vec3(1.0);
+      // A depth-integrated but colour-unobserved corner reads opaque white
+      // rather than dragging the interpolated vertex toward black, mirroring
+      // the integrator's first-observation-assigns anti-darkening rule.
+      // Decoded to LINEAR working values, because the edge interpolation is
+      // an average (the 2026-08-02 decision).
+      corner_color[i] = vrVoxelColorToLinear(color_attr[si]);
     }
     if (sdf[i] < pc.iso) {
       cube_index |= (1 << i);

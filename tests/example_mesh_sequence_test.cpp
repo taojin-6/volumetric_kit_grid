@@ -492,8 +492,8 @@ vkc::Result<vr_example::MeshSequence> cubes(const fs::path& dir,
 // A small grid in the examples' layout: too small for the cubes, so the
 // first conversion grows it.
 vkc::Result<vol::VoxelBlockGrid> small_grid(vkc::test::GpuContext& gpu) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
   return vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator,
       vol::block_grid_params(codec_fixture::kVoxel, codec_fixture::kTrunc, 2),

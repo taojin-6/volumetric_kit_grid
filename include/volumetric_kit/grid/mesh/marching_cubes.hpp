@@ -525,8 +525,8 @@ class VR_MESH_API MarchingCubes {
   ///          this thread or any other. Within one thread that holds by
   ///          construction (every `volume` dispatch blocks on its fence), so it
   ///          binds only a caller that fuses and meshes concurrently -- which
-  ///          must serialise the two itself. The same precondition as
-  ///          @ref volume::VoxelHashMap::entries_buffer, stated here because
+  ///          must serialise the two itself. The same precondition as every
+  ///          kernel that reads the hash table, stated here because
   ///          this is where a caller meets it; the host-built neighbour table
   ///          this replaced needed it too, having read the same table through a
   ///          compacted snapshot.

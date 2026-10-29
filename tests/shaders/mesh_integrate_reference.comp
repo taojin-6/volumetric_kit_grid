@@ -94,8 +94,7 @@ void main() {
   RefBlock blk = blocks[gid / vpb];
   uint local = gid % vpb;
   int bs = pc.grid.block_size;
-  ivec3 lc = ivec3(int(local % uint(bs)), int((local / uint(bs)) % uint(bs)),
-                   int(local / uint(bs * bs)));
+  ivec3 lc = vrLocalBase(local, bs);
   vec3 p = vec3(blk.coord * bs + lc) * pc.grid.voxel_size;
 
   float best_d2 = 3.4e38;

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <string_view>
 #include <vector>
 
 #include "device_blocks.hpp"
@@ -71,8 +72,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       static_cast<std::uint64_t>(grid.num_blocks) * grid.voxels_per_block;
 
   // Declare two independent float attributes (SoA): tsdf + weight.
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
   const std::size_t cache_before = pipeline_cache_bytes(gpu.device);
   vkc::Result<vol::VoxelBlockGrid> grid_result =
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, attrs, 2);
@@ -135,14 +136,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // Attribute presence + lookup.
   CHECK(vbg.valid());
-  CHECK(vbg.has_attribute("tsdf"));
-  CHECK(vbg.has_attribute("weight"));
-  CHECK(!vbg.has_attribute("color"));
+  CHECK(vbg.has_attribute(vol::kTsdfAttribute));
+  CHECK(vbg.has_attribute(vol::kWeightAttribute));
+  CHECK(!vbg.has_attribute(vol::kColorAttribute));
 
-  vkc::Result<vol::AttributeView> tsdf = vbg.attribute("tsdf");
-  vkc::Result<vol::AttributeView> weight = vbg.attribute("weight");
+  vkc::Result<vol::AttributeView> tsdf = vbg.attribute(vol::kTsdfAttribute);
+  vkc::Result<vol::AttributeView> weight = vbg.attribute(vol::kWeightAttribute);
   CHECK(tsdf.ok() && weight.ok());
-  CHECK(vbg.attribute("color").status().domain() ==
+  CHECK(vbg.attribute(vol::kColorAttribute).status().domain() ==
         vkc::Status::Code::InvalidArgument);
 
   // Each attribute is its own buffer, sized to the whole voxel pool.
@@ -156,11 +157,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // The arrays are device-local, so the test works on host copies: read
   // after the grid changes them, written back before the grid reads them.
   CHECK(tsdf.value().buffer->mapped() == nullptr);
-  const auto get = [&](const char* name) {
+  const auto get = [&](std::string_view name) {
     return vr_test::read_attribute<float>(gpu.device, gpu.allocator, vbg, name)
         .value();
   };
-  const auto put = [&](const char* name, const std::vector<float>& data) {
+  const auto put = [&](std::string_view name, const std::vector<float>& data) {
     return vr_test::write_attribute(gpu.device, gpu.allocator, vbg, name, data)
         .ok();
   };
@@ -179,8 +180,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
                    (total - static_cast<float>(live.value().size())) / total &&
            vbg.map().allocated_blocks() == live.value().size();
   };
-  std::vector<float> tsdf_data = get("tsdf");
-  std::vector<float> weight_data = get("weight");
+  std::vector<float> tsdf_data = get(vol::kTsdfAttribute);
+  std::vector<float> weight_data = get(vol::kWeightAttribute);
   for (std::uint64_t i = 0; i < voxels; ++i) {  // zeroed on the device
     CHECK(tsdf_data[i] == 0.0f && weight_data[i] == 0.0f);
   }
@@ -190,9 +191,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   tsdf_data[last] = 2.5f;
   weight_data[0] = 10.0f;
   weight_data[last] = 20.0f;
-  CHECK(put("tsdf", tsdf_data) && put("weight", weight_data));
-  tsdf_data = get("tsdf");
-  weight_data = get("weight");
+  CHECK(put(vol::kTsdfAttribute, tsdf_data) &&
+        put(vol::kWeightAttribute, weight_data));
+  tsdf_data = get(vol::kTsdfAttribute);
+  weight_data = get(vol::kWeightAttribute);
   CHECK(tsdf_data[0] == 1.5f && tsdf_data[last] == 2.5f);
   CHECK(weight_data[0] == 10.0f && weight_data[last] == 20.0f);
 
@@ -237,9 +239,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
   tsdf_data[ptr_b] = 0.75f;
   weight_data[ptr_a] = 30.0f;
-  CHECK(put("tsdf", tsdf_data) && put("weight", weight_data));
-  tsdf_data = get("tsdf");
-  weight_data = get("weight");
+  CHECK(put(vol::kTsdfAttribute, tsdf_data) &&
+        put(vol::kWeightAttribute, weight_data));
+  tsdf_data = get(vol::kTsdfAttribute);
+  weight_data = get(vol::kWeightAttribute);
   CHECK(tsdf_data[ptr_a + vpb - 1] == -0.02f);  // B did not overwrite A
   CHECK(tsdf_data[ptr_b] == 0.75f);             // A did not overwrite B
   CHECK(weight_data[ptr_a] == 30.0f && tsdf_data[ptr_a] == -0.02f);
@@ -264,8 +267,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // The attribute buffers grew to the new pool (a resize swaps them), so
   // re-fetch the views: element_count now tracks the grown grid, buffer-derived
   // as ever.
-  vkc::Result<vol::AttributeView> tsdf_grown = vbg.attribute("tsdf");
-  vkc::Result<vol::AttributeView> weight_grown = vbg.attribute("weight");
+  vkc::Result<vol::AttributeView> tsdf_grown =
+      vbg.attribute(vol::kTsdfAttribute);
+  vkc::Result<vol::AttributeView> weight_grown =
+      vbg.attribute(vol::kWeightAttribute);
   CHECK(tsdf_grown.ok() && weight_grown.ok());
   CHECK(tsdf_grown.value().element_count == new_voxels);  // grew, not frozen
   CHECK(weight_grown.value().element_count == new_voxels);
@@ -273,8 +278,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
 
   // The data written before the grow survives at the same pointers (indices
   // preserved): block A's filled tsdf range, block B's base, block A's weight.
-  std::vector<float> tsdf_grown_data = get("tsdf");
-  std::vector<float> weight_grown_data = get("weight");
+  std::vector<float> tsdf_grown_data = get(vol::kTsdfAttribute);
+  std::vector<float> weight_grown_data = get(vol::kWeightAttribute);
   CHECK(tsdf_grown_data[ptr_a] == -0.02f);
   CHECK(tsdf_grown_data[ptr_a + vpb - 1] == -0.02f);  // whole range survived
   CHECK(tsdf_grown_data[ptr_b] == 0.75f);
@@ -300,7 +305,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
   CHECK(fresh_ptr >= 0);
   CHECK(static_cast<std::uint64_t>(fresh_ptr) + vpb <= new_voxels);  // in pool
-  tsdf_grown_data = get("tsdf");
+  tsdf_grown_data = get(vol::kTsdfAttribute);
   CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);  // fresh block: zeroed attribute
 
   // --- remove() clears the per-voxel data before the index goes back.
@@ -316,14 +321,15 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     tsdf_grown_data[fresh_ptr] = -0.5f;
     tsdf_grown_data[fresh_ptr + vpb - 1] = -0.5f;
     weight_grown_data[fresh_ptr] = 5.0f;
-    CHECK(put("tsdf", tsdf_grown_data) && put("weight", weight_grown_data));
+    CHECK(put(vol::kTsdfAttribute, tsdf_grown_data) &&
+          put(vol::kWeightAttribute, weight_grown_data));
 
     vkc::Result<std::uint32_t> removed =
         vr_test::remove_blocks(gpu, vbg, &fresh, 1);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
-    tsdf_grown_data = get("tsdf");
-    weight_grown_data = get("weight");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
+    weight_grown_data = get(vol::kWeightAttribute);
     // Cleared at the removed block's own range, both attributes, whole block.
     CHECK(tsdf_grown_data[fresh_ptr] == 0.0f);
     CHECK(tsdf_grown_data[fresh_ptr + vpb - 1] == 0.0f);
@@ -347,7 +353,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       }
     }
     CHECK(reused_ptr == fresh_ptr);  // LIFO: the same index back
-    tsdf_grown_data = get("tsdf");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
     CHECK(tsdf_grown_data[reused_ptr] == 0.0f);  // and it is clean
   }
 
@@ -379,12 +385,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       CHECK(ptrs[i] >= 0);
       tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
     }
-    CHECK(put("tsdf", tsdf_grown_data));
+    CHECK(put(vol::kTsdfAttribute, tsdf_grown_data));
     vkc::Result<std::uint32_t> removed =
         vr_test::remove_blocks(gpu, vbg, blocks + 1, 2);
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(heap_agrees());
-    tsdf_grown_data = get("tsdf");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
     CHECK(tsdf_grown_data[ptrs[1]] == 0.0f);
     CHECK(tsdf_grown_data[ptrs[2]] == 0.0f);
@@ -396,7 +402,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     pair[1].coord = quad[3];
     removed = vr_test::remove_blocks(gpu, vbg, pair, 2);
     CHECK(removed.ok() && removed.value() == 0);
-    tsdf_grown_data = get("tsdf");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
     CHECK(tsdf_grown_data[ptrs[0]] == 0.25f);
     CHECK(tsdf_grown_data[ptrs[3]] == 0.0f);
   }
@@ -426,7 +432,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       tsdf_grown_data[ptrs[i]] = 0.25f * float(i + 1);
       weight_grown_data[ptrs[i] + vpb - 1] = 3.0f;
     }
-    CHECK(put("tsdf", tsdf_grown_data) && put("weight", weight_grown_data));
+    CHECK(put(vol::kTsdfAttribute, tsdf_grown_data) &&
+          put(vol::kWeightAttribute, weight_grown_data));
     vol::BlockIndex absent{};
     absent.coord = vr::Vec3i(7000, 7000, 7000);
     const std::vector<vol::BlockIndex> list = {blocks[1], absent, blocks[2],
@@ -456,7 +463,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
           vkc::Status::Code::InvalidArgument);
     CHECK(vbg.remove(device_list.value(), 0).ok());
     CHECK(vbg.topology_epoch() == epoch);
-    tsdf_grown_data = get("tsdf");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
     for (int i = 0; i < 4; ++i) {
       CHECK(tsdf_grown_data[ptrs[i]] == 0.25f * float(i + 1));
     }
@@ -465,8 +472,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(removed.ok() && removed.value() == 0);
     CHECK(vbg.topology_epoch() != epoch);
     CHECK(heap_agrees());
-    tsdf_grown_data = get("tsdf");
-    weight_grown_data = get("weight");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
+    weight_grown_data = get(vol::kWeightAttribute);
     for (int i = 0; i < 4; ++i) {
       const bool gone = i == 1 || i == 2;
       CHECK(tsdf_grown_data[ptrs[i]] == (gone ? 0.0f : 0.25f * float(i + 1)));
@@ -484,8 +491,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vol::VoxelGridParams odd = small_grid();
     odd.block_size = 5;
     odd.voxels_per_block = 125;
-    const vol::AttributeSpec odd_attrs[] = {{"tsdf", sizeof(float)},
-                                            {"label", 1}};
+    const vol::AttributeSpec odd_attrs[] = {
+        {vol::kTsdfAttribute, sizeof(float)}, {"label", 1}};
     CHECK(vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, odd, odd_attrs,
                                       2)
               .status()
@@ -496,11 +503,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // block to the heap, so every range is about to be re-drawn.
   {
     tsdf_grown_data[ptr_a] = -0.02f;
-    CHECK(put("tsdf", tsdf_grown_data));
+    CHECK(put(vol::kTsdfAttribute, tsdf_grown_data));
     CHECK(vbg.clear().ok());
     CHECK(heap_agrees() && vbg.map().load_factor().value() == 0.0f);
-    tsdf_grown_data = get("tsdf");
-    weight_grown_data = get("weight");
+    tsdf_grown_data = get(vol::kTsdfAttribute);
+    weight_grown_data = get(vol::kWeightAttribute);
     CHECK(tsdf_grown_data[ptr_a] == 0.0f);
     CHECK(weight_grown_data[ptr_a] == 0.0f);
     vkc::Result<std::vector<vol::BlockIndex>> empty =
@@ -528,7 +535,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // matters -- rejected, before allocating, with the grid untouched.
   {
     const std::int32_t before_buckets = vbg.map().grid().num_buckets;
-    vkc::Result<vol::AttributeView> before_tsdf = vbg.attribute("tsdf");
+    vkc::Result<vol::AttributeView> before_tsdf =
+        vbg.attribute(vol::kTsdfAttribute);
     CHECK(before_tsdf.ok());
     const std::uint64_t before_size = before_tsdf.value().buffer->size();
 
@@ -537,7 +545,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(huge.domain() == vkc::Status::Code::InvalidArgument);
     // All-or-nothing: the live grid is exactly as it was.
     CHECK(vbg.map().grid().num_buckets == before_buckets);
-    vkc::Result<vol::AttributeView> after_tsdf = vbg.attribute("tsdf");
+    vkc::Result<vol::AttributeView> after_tsdf =
+        vbg.attribute(vol::kTsdfAttribute);
     CHECK(after_tsdf.ok());
     CHECK(after_tsdf.value().buffer->size() == before_size);
   }
@@ -553,7 +562,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     const std::int32_t bigger = vbg.map().grid().num_buckets * 2;
     CHECK(vbg.map().resize(bigger).ok());  // the raw path, not vbg.resize
     CHECK(vbg.map().grid().num_buckets == bigger);
-    vkc::Result<vol::AttributeView> stale = vbg.attribute("tsdf");
+    vkc::Result<vol::AttributeView> stale = vbg.attribute(vol::kTsdfAttribute);
     CHECK(!stale.ok());
     CHECK(stale.status().domain() == vkc::Status::Code::InvalidArgument);
   }
@@ -573,7 +582,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, zero_size, 1)
           .status()
           .domain() == vkc::Status::Code::InvalidArgument);
-  const vol::AttributeSpec dup[] = {{"tsdf", 4}, {"tsdf", 4}};
+  const vol::AttributeSpec dup[] = {{vol::kTsdfAttribute, 4},
+                                    {vol::kTsdfAttribute, 4}};
   CHECK(vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, dup, 2)
             .status()
             .domain() == vkc::Status::Code::InvalidArgument);
@@ -582,11 +592,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<vol::VoxelBlockGrid> bare =
       vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, nullptr, 0);
   CHECK(bare.ok());
-  CHECK(bare.value().valid() && !bare.value().has_attribute("tsdf"));
+  CHECK(bare.value().valid() &&
+        !bare.value().has_attribute(vol::kTsdfAttribute));
 
   // Move construction leaves the source empty and the new grid live.
   vol::VoxelBlockGrid moved = std::move(vbg);
-  CHECK(moved.valid() && moved.has_attribute("tsdf"));
+  CHECK(moved.valid() && moved.has_attribute(vol::kTsdfAttribute));
   CHECK(!vbg.valid());  // NOLINT(bugprone-use-after-move) -- asserting empty
 
   std::printf(

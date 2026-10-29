@@ -548,13 +548,14 @@ int contention_case(vkc::test::Gpu& gpu) {
 // every removed block before its index is freed, so a new block that draws a
 // freed pointer reads zeros although the batch allocates after the removal.
 int one_batch_case(vkc::test::Gpu& gpu) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, 4},
+                                      {vol::kWeightAttribute, 4}};
   vkc::Result<vol::VoxelBlockGrid> grid = vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator, params(2, 1024), attrs, 2);
   CHECK(grid.ok());
   const Blocks all = cube();
   CHECK(blocking_all(gpu, grid->map(), all, false).value() == 0);
-  vkc::Result<vol::AttributeView> tsdf = grid->attribute("tsdf");
+  vkc::Result<vol::AttributeView> tsdf = grid->attribute(vol::kTsdfAttribute);
   CHECK(tsdf.ok());
   {
     vkc::CommandBatch fill(gpu.device, gpu.allocator);
@@ -736,7 +737,8 @@ int const_case(vkc::test::Gpu& gpu) {
 // batch at its wait, its count unwritten; and the reader's next batch,
 // recorded after the resize, counts the blocks again.
 int resize_pending_case(vkc::test::Gpu& gpu) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, 4},
+                                      {vol::kWeightAttribute, 4}};
   vkc::Result<vol::VoxelBlockGrid> grid = vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator, params(2, 1024), attrs, 2);
   CHECK(grid.ok());

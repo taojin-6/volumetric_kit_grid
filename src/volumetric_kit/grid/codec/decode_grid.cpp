@@ -64,8 +64,9 @@ core::Result<volume::VoxelBlockGrid> make_decode_grid(
       return parsed.status();
     }
   }
-  const volume::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                         {"weight", sizeof(float)}};
+  const volume::AttributeSpec attrs[] = {
+      {volume::kTsdfAttribute, sizeof(float)},
+      {volume::kWeightAttribute, sizeof(float)}};
   return volume::VoxelBlockGrid::create(
       device, allocator,
       volume::block_grid_params(info.voxel_size, info.trunc_dist,

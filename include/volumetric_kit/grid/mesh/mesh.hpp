@@ -68,7 +68,7 @@ struct Vertex {
   Vec4f color;     ///< Per-vertex RGBA in **linear** working values (linear
                    ///< BT.709/D65), opaque (alpha 1) -- the vertex-color
                    ///< fallback used where @ref uv0 is the sentinel. Linear
-                   ///< because a float color is linear (`core/color_space.hpp`)
+                   ///< because a float color is linear (the colour-space rule)
                    ///< and because that is what glTF specifies for `COLOR_0`
                    ///< and what the renderer's shading multiply needs, so the
                    ///< seam converts nothing. Marching cubes decodes the

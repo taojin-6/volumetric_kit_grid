@@ -50,9 +50,10 @@ vol::VoxelGridParams params(std::int32_t num_buckets) {
 vkc::Result<vol::VoxelBlockGrid> make_grid(vkc::Device& device,
                                            vkc::Allocator& allocator,
                                            const vol::VoxelGridParams& grid) {
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)},
-                                      {"color", sizeof(std::uint32_t)}};
+  const vol::AttributeSpec attrs[] = {
+      {vol::kTsdfAttribute, sizeof(float)},
+      {vol::kWeightAttribute, sizeof(float)},
+      {vol::kColorAttribute, sizeof(std::uint32_t)}};
   return vol::VoxelBlockGrid::create(device, allocator, grid, attrs, 3);
 }
 

@@ -7,8 +7,9 @@
 // (dct_surface.comp) and its deblock's line passes (deblock_line.comp) walk,
 // so each reaches the same voxels.
 //
-// The includer must have included hash_lookup.glsl (for `BlockIndex` and
-// `vrFindBlockPtr`) first, and runs one workgroup per block. The hash table's
+// The includer must have included hash_lookup.glsl (for `BlockIndex`,
+// `vrFindBlockPtr` and grid_types.glsl's in-block index, vrLocalIndex and
+// vrLocalBase) first, and runs one workgroup per block. The hash table's
 // shape arrives as arguments, since each includer has its own push constants.
 
 #ifndef VR_BLOCK_NEIGHBOURHOOD_GLSL
@@ -17,19 +18,6 @@
 #ifndef VR_HASH_LOOKUP_GLSL
 #error "include hash_lookup.glsl before block_neighbourhood.glsl"
 #endif
-
-// Local voxel index within a block (x-fastest), matching the attribute layout
-// BlockIndex::ptr + local the tsdf integrator writes.
-int vrLocalIndex(ivec3 lc, int bs) {
-  return lc.x + bs * (lc.y + bs * lc.z);
-}
-
-// The cell base voxel for a local index, in this block's frame (x-fastest, as
-// tsdf wrote).
-ivec3 vrLocalBase(uint local, int bs) {
-  return ivec3(int(local % uint(bs)), int((local / uint(bs)) % uint(bs)),
-               int(local / uint(bs * bs)));
-}
 
 // This block's 2x2x2 +neighbourhood: s_neighbour[ox + 2*oy + 4*oz] is the voxel-
 // array base of the neighbour that owns corners spilling in that direction, or -1

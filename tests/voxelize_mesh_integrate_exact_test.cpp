@@ -39,6 +39,7 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
+#include "volumetric_kit/recon/volume/hash_map_internal.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/triangle_candidates.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -162,8 +163,9 @@ vkc::Result<RefResult> run_reference(const vkc::test::Gpu& gpu, Reference& ref,
   bind(4, bits);
   bind(5, tsdf);
   bind(6, weight);
-  ref.kernel.set.write_storage_buffer(7, grid.map().entries_buffer(), 0,
-                                      grid.map().entries_buffer_size());
+  ref.kernel.set.write_storage_buffer(
+      7, vol::VoxelHashMap::Internal::entries_buffer(grid.map()), 0,
+      vol::VoxelHashMap::Internal::entries_buffer_size(grid.map()));
   bind(8, slots);
   const float shell = params.mode == vx::MeshSdfMode::Shell
                           ? params.shell_voxels * g.voxel_size
@@ -558,8 +560,8 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(const vkc::test::Gpu& gpu,
   gp.num_buckets = std::min(1024, (1 << 22) / gp.voxels_per_block / 8);
   gp.num_blocks = gp.bucket_size * gp.num_buckets;
   gp.max_chain = 128;
-  const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
-                                      {"weight", sizeof(float)}};
+  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                      {vol::kWeightAttribute, sizeof(float)}};
   return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
 }
 
@@ -607,9 +609,11 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
 
   // Both block by block, in `active`'s order.
   const std::vector<float> tsdf =
-      vr_test::read_blocks<float>(gpu, grid, "tsdf", active).value();
+      vr_test::read_blocks<float>(gpu, grid, vol::kTsdfAttribute, active)
+          .value();
   const std::vector<float> weight =
-      vr_test::read_blocks<float>(gpu, grid, "weight", active).value();
+      vr_test::read_blocks<float>(gpu, grid, vol::kWeightAttribute, active)
+          .value();
   const auto vpb = static_cast<std::size_t>(gp.voxels_per_block);
   std::size_t differ = 0;
   std::size_t observed = 0;
