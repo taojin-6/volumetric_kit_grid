@@ -13,11 +13,14 @@
 #include <vector>
 
 #include "codec_fixture.hpp"
-#include "gpu_test.hpp"
-#include "test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 using namespace codec_fixture;
 
@@ -56,7 +59,7 @@ int decoder_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
   // pending frame, so its allocation is the largest in this host-only call.
   // Measure its actual size and site instead of copying its private layout;
   // replaying both prevents a driver/layer allocation consuming the failure.
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   std::size_t bytes = 0;
   const void* site = nullptr;
   {
@@ -186,7 +189,7 @@ int decoder_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   auto a = sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.04f});
   auto b = sphere_grid(gpu, Sphere{vr::Vec3f(0.02f, 0.0f, 0.0f), 0.05f});
   CHECK(a.ok() && b.ok());
@@ -217,9 +220,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
 }  // namespace
 
 int main() try {
-  return vr_test::run_on_gpu(gpu_main);
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
 } catch (const std::bad_alloc&) {
-  vr_test::allocation_failure = {};
+  vkc::test::allocation_failure = {};
   std::fputs("FAIL: bad_alloc escaped a decoder API\n", stderr);
   return 1;
 }

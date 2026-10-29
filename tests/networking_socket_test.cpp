@@ -33,7 +33,7 @@
 #include <vector>
 
 #include "socket.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace detail = volumetric_kit::recon::networking::detail;

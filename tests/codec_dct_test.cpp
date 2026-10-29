@@ -32,8 +32,8 @@
 #include "dct_transform.hpp"
 #include "device_blocks.hpp"
 #include "grid_readback.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
@@ -44,7 +44,8 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -94,7 +95,7 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(
 // Allocate blocks (i, 0, 0) for i in [0, count) and return the compacted set
 // sorted by x, so entry i is block i whatever order the compaction produced.
 vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
-    const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid, int count) {
+    const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) {
     coords[static_cast<std::size_t>(i)].coord = vr::Vec3i(i, 0, 0);
@@ -115,13 +116,13 @@ vkc::Result<std::vector<vol::BlockIndex>> allocate_row(
 
 // A copy of an attribute, and back; the arrays are device-local, and both
 // abort on a device error.
-std::vector<float> attr(const vr_test::Gpu& ctx,
+std::vector<float> attr(const vkc::test::Gpu& ctx,
                         const vol::VoxelBlockGrid& grid, const char* name) {
   return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
       .value();
 }
 
-void put(const vr_test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
+void put(const vkc::test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
          const char* name, const std::vector<float>& data) {
   if (!vr_test::write_attribute(ctx.device, ctx.allocator, grid, name, data)
            .ok()) {
@@ -130,7 +131,7 @@ void put(const vr_test::Gpu& ctx, const vol::VoxelBlockGrid& grid,
 }
 
 // Write a block's content: tsdf = s * trunc, weight = w (per voxel).
-void write_block(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+void write_block(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                  const vol::BlockIndex& b, const Cube& s,
                  const std::function<float(std::uint32_t)>& w) {
   std::vector<float> tsdf = attr(ctx, grid, "tsdf");
@@ -146,7 +147,7 @@ void write_block(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
 float observed(std::uint32_t) { return 2.0f; }
 
 // Read a block back in normalized units.
-Cube read_block(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+Cube read_block(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                 const vol::BlockIndex& b) {
   const std::vector<float> tsdf = attr(ctx, grid, "tsdf");
   Cube s{};
@@ -333,7 +334,7 @@ int check_against_reference(const DctBlocks& out, const Cube* content,
 // check_against_reference), over content from white noise to a constant.
 int forward_matches_reference_case(vkc::Device& device,
                                    vkc::Allocator& allocator, DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -393,7 +394,7 @@ int forward_matches_reference_case(vkc::Device& device,
 // transform with A, B, then A again to catch a stale per-call table upload.
 int per_basis_sequence_case(vkc::Device& device, vkc::Allocator& allocator,
                             DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -455,7 +456,7 @@ int per_basis_sequence_case(vkc::Device& device, vkc::Allocator& allocator,
 // a block's RMS error is at most sqrt(sum_j (step[j]/2)^2 / 512).
 int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
                           DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -505,7 +506,7 @@ int round_trip_bound_case(vkc::Device& device, vkc::Allocator& allocator,
 int truncation_matches_reference_case(vkc::Device& device,
                                       vkc::Allocator& allocator,
                                       DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -549,7 +550,7 @@ int truncation_matches_reference_case(vkc::Device& device,
 // voxel -- and the inverse writes an observed voxel as decoded and an
 // unobserved one as a fresh block holds it.
 int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -623,7 +624,7 @@ int mask_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
 // lands on the clamp's edge without being clamped from further out.
 int constant_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -669,7 +670,7 @@ int constant_case(vkc::Device& device, vkc::Allocator& allocator,
 // a consumer SDF outside the band.
 int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
                DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -720,7 +721,7 @@ int clamp_case(vkc::Device& device, vkc::Allocator& allocator,
 // for, rather than to the defaults, which room0 moved.
 int partial_block_case(vkc::Device& device, vkc::Allocator& allocator,
                        DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -782,7 +783,7 @@ int partial_block_case(vkc::Device& device, vkc::Allocator& allocator,
 // two blocks and in every mask word of one. An empty cut set, or none, codes
 // the grid as it is, and a cut set short of the grid's heap is refused.
 int cut_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -806,11 +807,11 @@ int cut_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
   }
   for (const std::size_t slot : slots) cuts[slot / 32] |= 1u << (slot % 32);
   const std::vector<std::uint32_t> empty(words, 0u);
-  vkc::Result<vkc::Buffer> cut = vr_test::upload_device_buffer(
+  vkc::Result<vkc::Buffer> cut = vkc::test::upload_device_buffer(
       device, allocator, cuts.data(), words * sizeof(std::uint32_t));
-  vkc::Result<vkc::Buffer> none = vr_test::upload_device_buffer(
+  vkc::Result<vkc::Buffer> none = vkc::test::upload_device_buffer(
       device, allocator, empty.data(), words * sizeof(std::uint32_t));
-  vkc::Result<vkc::Buffer> short_one = vr_test::upload_device_buffer(
+  vkc::Result<vkc::Buffer> short_one = vkc::test::upload_device_buffer(
       device, allocator, empty.data(), (words - 1) * sizeof(std::uint32_t));
   CHECK(cut.ok() && none.ok() && short_one.ok());
 
@@ -846,7 +847,7 @@ int cut_case(vkc::Device& device, vkc::Allocator& allocator, DctTransform& t) {
 // Output follows the list, not the ptrs: permuting the list permutes the rows.
 int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
                             DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -879,7 +880,7 @@ int order_follows_list_case(vkc::Device& device, vkc::Allocator& allocator,
 // blocks a dispatch here.
 int batching_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -953,7 +954,7 @@ std::int32_t free_ptr(const vol::VoxelBlockGrid& grid,
 // each entry's liveness on the device.
 int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -983,7 +984,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   // storage buffer.
   {
     vkc::Buffer none;
-    vkc::Result<vkc::Buffer> two = vr_test::upload_device_buffer(
+    vkc::Result<vkc::Buffer> two = vkc::test::upload_device_buffer(
         device, allocator, blocks.data(), 2 * sizeof(vol::BlockIndex));
     CHECK(two.ok());
     vkc::BufferDesc desc;
@@ -999,7 +1000,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
         3 * codec::detail::coefficient_words(params.coefficient_count) *
             sizeof(std::uint32_t));
     const std::uint32_t three_word = 3;
-    vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+    vkc::Result<vkc::Buffer> word = vkc::test::upload_device_buffer(
         device, allocator, &three_word, sizeof(three_word));
     CHECK(masks.ok() && coefficients.ok() && word.ok());
     const vol::DeviceCount count{&word.value(), 0, 3};
@@ -1015,7 +1016,7 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
     }
     // A list of three, and outputs that hold two: refused before anything
     // is recorded.
-    vkc::Result<vkc::Buffer> three = vr_test::upload_device_buffer(
+    vkc::Result<vkc::Buffer> three = vkc::test::upload_device_buffer(
         device, allocator, blocks.data(), 3 * sizeof(vol::BlockIndex));
     CHECK(three.ok());
     for (const bool short_masks : {true, false}) {
@@ -1183,16 +1184,16 @@ vkc::Result<std::uint32_t> observed_count(vkc::Device& device,
                                           const vol::DeviceBlockList& list,
                                           bool true_sdf) {
   VKC_ASSIGN(const vkc::Buffer word,
-             vr_test::upload_device_buffer(device, allocator, &list.count,
-                                           sizeof(list.count)));
+             vkc::test::upload_device_buffer(device, allocator, &list.count,
+                                             sizeof(list.count)));
   vkc::CommandBatch batch(device, allocator);
   VKC_TRY(t.record_observed(batch, grid,
                             list.buffer != nullptr ? *list.buffer : word,
                             vol::DeviceCount{&word, 0, list.count}, true_sdf));
   VKC_TRY(batch.submit());
   VKC_ASSIGN(const std::vector<std::uint32_t> counts,
-             vr_test::read_back<std::uint32_t>(device, allocator,
-                                               t.observed_counts(), 2));
+             vkc::test::read_back<std::uint32_t>(device, allocator,
+                                                 t.observed_counts(), 2));
   VKC_TRY(DctTransform::check_rejected("observed", counts[0], list.count));
   if (counts[1] > list.count) {
     return vkc::Status::invalid_argument("more observed than listed");
@@ -1205,7 +1206,7 @@ vkc::Result<std::uint32_t> observed_count(vkc::Device& device,
 // on the device, its count left there. Append order is unspecified.
 int observed_case(vkc::Device& device, vkc::Allocator& allocator,
                   DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   // The entries it kept, read back from where it left them.
   const auto observed_of = [&](const vol::VoxelBlockGrid& grid,
                                const vol::DeviceBlockList& list)
@@ -1213,8 +1214,8 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
     VKC_ASSIGN(const std::uint32_t n,
                observed_count(device, allocator, t, grid, list, false));
     if (n == 0) return std::vector<vol::BlockIndex>{};
-    return vr_test::read_back<vol::BlockIndex>(device, allocator,
-                                               t.observed_list(), n);
+    return vkc::test::read_back<vol::BlockIndex>(device, allocator,
+                                                 t.observed_list(), n);
   };
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
@@ -1277,7 +1278,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
   {
     const std::uint32_t four = 4;
     vkc::Result<vkc::Buffer> word =
-        vr_test::upload_device_buffer(device, allocator, &four, sizeof(four));
+        vkc::test::upload_device_buffer(device, allocator, &four, sizeof(four));
     CHECK(word.ok());
     vkc::CommandBatch batch(device, allocator);
     const auto past = static_cast<std::uint32_t>(grid.grid().num_blocks) + 1;
@@ -1333,7 +1334,7 @@ int observed_case(vkc::Device& device, vkc::Allocator& allocator,
 // blocks: a curtain cut across block faces, and a speck kept by the near
 // rule alone.
 int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
-  vr_test::Gpu ctx{device, allocator};
+  vkc::test::Gpu ctx{device, allocator};
   const codec_fixture::Curtain curtain{
       codec_fixture::Sphere{vr::Vec3f(0.013f, -0.007f, 0.004f), 0.09f}, true};
   vkc::Result<vol::VoxelBlockGrid> g =
@@ -1359,8 +1360,8 @@ int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
     vr::detail::set_test_groups_per_dispatch(0);
     CHECK(n.ok() && n.value() == host.blocks.size());
     vkc::Result<std::vector<vol::BlockIndex>> kept =
-        vr_test::read_back<vol::BlockIndex>(device, allocator,
-                                            chunked.observed_list(), n.value());
+        vkc::test::read_back<vol::BlockIndex>(
+            device, allocator, chunked.observed_list(), n.value());
     CHECK(kept.ok());
     std::sort(kept.value().begin(), kept.value().end(),
               [](const vol::BlockIndex& a, const vol::BlockIndex& b) {
@@ -1370,8 +1371,8 @@ int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
       CHECK(kept.value()[i].coord == host.blocks[i].coord);
     }
     vkc::Result<std::vector<std::uint32_t>> cut =
-        vr_test::read_back<std::uint32_t>(device, allocator, chunked.cut_set(),
-                                          host.cut.size());
+        vkc::test::read_back<std::uint32_t>(device, allocator,
+                                            chunked.cut_set(), host.cut.size());
     CHECK(cut.ok() && cut.value() == host.cut);
   }
   return 0;
@@ -1382,7 +1383,7 @@ int surface_chunks_case(vkc::Device& device, vkc::Allocator& allocator) {
 // CPU reference; inverse must not touch a retained list's obsolete suffix.
 int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
                        DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   auto made = make_grid(device, allocator);
   CHECK(made.ok());
   auto& grid = made.value();
@@ -1445,7 +1446,7 @@ int scratch_reuse_case(vkc::Device& device, vkc::Allocator& allocator,
 // bit for bit as decoded: a -0.0 where it decodes 0.0 is rewritten, unstamped.
 int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
                         DctTransform& t) {
-  const vr_test::Gpu ctx{device, allocator};
+  const vkc::test::Gpu ctx{device, allocator};
   vkc::Result<vol::VoxelBlockGrid> g = make_grid(device, allocator);
   CHECK(g.ok());
   vol::VoxelBlockGrid grid = std::move(g).value();
@@ -1519,7 +1520,7 @@ int inverse_stamps_case(vkc::Device& device, vkc::Allocator& allocator,
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Device& dev = gpu.device;
   vkc::Allocator& alloc = gpu.allocator;
 
@@ -1560,4 +1561,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

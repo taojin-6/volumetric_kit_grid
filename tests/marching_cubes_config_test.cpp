@@ -30,7 +30,7 @@
 #include <utility>
 #include <vector>
 
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
@@ -44,8 +44,9 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
 #include "device_blocks.hpp"
-#include "gpu_test.hpp"
 #include "grid_readback.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -74,7 +75,8 @@ vol::VoxelGridParams grid_params() {
 // surface crosses the volume and marching cubes emits a triangle count that
 // scales with the block count -- which is what lets the second extract outgrow
 // the arena the first one sized.
-bool fill_sphere(const vr_test::Gpu& gpu, vol::VoxelBlockGrid& g, int blocks) {
+bool fill_sphere(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& g,
+                 int blocks) {
   const int n = kBlock * blocks;
   const float centre = static_cast<float>(n - 1) * 0.5f * kH;
   const float radius = static_cast<float>(n - 1) * 0.35f * kH;
@@ -159,7 +161,7 @@ std::vector<T> copy_out(const vkc::Device& dev, vkc::Allocator& alloc,
   return out;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   const vol::VoxelGridParams gp = grid_params();
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
@@ -314,7 +316,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   // EXCLUSIVE is the correct answer, which is asserted instead.
   {
     const std::optional<std::uint32_t> other =
-        vr_test::other_queue_family(gpu.device);
+        vkc::test::other_queue_family(gpu.device);
     mesh::MarchingCubesConfig shared_config;
     shared_config.queue_families[0] = gpu.device.queue_family();
     shared_config.queue_families[1] = other.value_or(gpu.device.queue_family());
@@ -747,4 +749,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

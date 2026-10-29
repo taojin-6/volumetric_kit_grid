@@ -22,9 +22,9 @@
 #include <vector>
 
 #include "device_blocks.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -32,8 +32,9 @@
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
-#include "gpu_test.hpp"
 #include "grid_readback.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -92,7 +93,7 @@ vkc::Result<bool> new_blocks_requested_now(
   return added > 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Device& dev = gpu.device;
   vkc::Allocator& alloc = gpu.allocator;
 
@@ -314,7 +315,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     const vol::BlockIndex block = at(1900);
     auto list = vr_test::detail::device_coords(gpu, &block, 1);
     const std::uint32_t one = 1;
-    auto count = vr_test::upload_device_buffer(dev, alloc, &one, sizeof(one));
+    auto count = vkc::test::upload_device_buffer(dev, alloc, &one, sizeof(one));
     CHECK(list.ok() && count.ok());
     if (removes) {
       CHECK(vr_test::allocate_blocks(gpu, g->map(), &block, 1).value() == 0);
@@ -373,7 +374,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
     auto fresh_list = vr_test::detail::device_coords(gpu, fresh.data(), 30);
     const std::uint32_t thirty = 30;
     auto count =
-        vr_test::upload_device_buffer(dev, alloc, &thirty, sizeof(thirty));
+        vkc::test::upload_device_buffer(dev, alloc, &thirty, sizeof(thirty));
     CHECK(fresh_list.ok() && count.ok());
     vkc::CommandBatch batch(dev, alloc);
     auto removed = b->record_free_stale(batch, 1);
@@ -465,4 +466,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

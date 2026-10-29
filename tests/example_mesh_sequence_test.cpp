@@ -29,16 +29,18 @@
 
 #include "codec_config.hpp"
 #include "codec_fixture.hpp"
-#include "gpu_test.hpp"
 #include "mesh_sequence.hpp"
-#include "scratch_dir.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/io/mesh_io.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace cfg = volumetric_kit::core::config;
 namespace io = volumetric_kit::recon::io;
@@ -164,7 +166,7 @@ int patterns() {
 
 // Files are checked, every one, before the first is loaded; a plain path
 // takes no range.
-int refusals(const vr_test::Scratch& scratch) {
+int refusals(const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "refusals";
   CHECK(fs::create_directory(dir));
   {
@@ -203,7 +205,7 @@ int refusals(const vr_test::Scratch& scratch) {
 // tallest. One transform fits all three, so the base keeps its place, bit
 // for bit, and the range is height_m tall; frame 1's own fit would scale it
 // to height_m alone and frame 3 past it.
-int one_transform(const vr_test::Scratch& scratch) {
+int one_transform(const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "growing";
   CHECK(fs::create_directory(dir));
   const Vec3f apexes[] = {
@@ -278,7 +280,7 @@ int one_transform(const vr_test::Scratch& scratch) {
 
 // A plain path is one frame, number 0, placed exactly as one mesh: the fit to
 // its own bounds, applied to it.
-int single_mesh(const vr_test::Scratch& scratch) {
+int single_mesh(const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "single";
   CHECK(fs::create_directory(dir));
   const io::TriangleMesh mesh = tetrahedron({0.3f, 1.25f, 0.2f});
@@ -313,7 +315,7 @@ int single_mesh(const vr_test::Scratch& scratch) {
 // Signed mode needs a closed, consistently wound mesh; source.allow_holes
 // admits boundary edges alone. Refused before any GPU work, by the first
 // pass, unless inspecting; shell mode takes anything.
-int signed_rule(const vr_test::Scratch& scratch) {
+int signed_rule(const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "signed";
   CHECK(fs::create_directory(dir));
   io::TriangleMesh open = cube({0, 0, 0}, 0.5f);
@@ -376,7 +378,7 @@ int signed_rule(const vr_test::Scratch& scratch) {
 
 // Load real scenarios beneath literal % directories. Plain and numbered
 // paths must select their own meshes, including when take0 holds a decoy.
-int escaped_directory(const vr_test::Scratch& scratch) {
+int escaped_directory(const vkc::test::Scratch& scratch) {
   const fs::path base = scratch.path / "pct";
   CHECK(fs::create_directories(base / "take0"));
   for (const char* file : {"shape.obj", "m_01.obj", "m_02.obj"}) {
@@ -453,7 +455,7 @@ vkc::Result<vr_example::MeshSequence> collapsing(const fs::path& dir,
   return vr_example::MeshSequence::open(settings);
 }
 
-int placed_audit_decides(const vr_test::Scratch& scratch) {
+int placed_audit_decides(const vkc::test::Scratch& scratch) {
   vkc::Result<vr_example::MeshSequence> sequence =
       collapsing(scratch.path / "collapsing", "");
   CHECK(sequence.ok());
@@ -489,7 +491,7 @@ vkc::Result<vr_example::MeshSequence> cubes(const fs::path& dir,
 
 // A small grid in the examples' layout: too small for the cubes, so the
 // first conversion grows it.
-vkc::Result<vol::VoxelBlockGrid> small_grid(vr_test::GpuContext& gpu) {
+vkc::Result<vol::VoxelBlockGrid> small_grid(vkc::test::GpuContext& gpu) {
   const vol::AttributeSpec attrs[] = {{"tsdf", sizeof(float)},
                                       {"weight", sizeof(float)}};
   return vol::VoxelBlockGrid::create(
@@ -500,7 +502,7 @@ vkc::Result<vol::VoxelBlockGrid> small_grid(vr_test::GpuContext& gpu) {
 
 // Each frame is converted into a cleared grid: no block of the frame before
 // stays, and the grid holds what a fresh one would.
-int clean_grids(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
+int clean_grids(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   vkc::Result<vr_example::MeshSequence> sequence =
       cubes(scratch.path / "clean", 1, 2, 0.06f,
             [](std::uint32_t n) { return Vec3f(0.5f * float(n), 0.0f, 0.0f); });
@@ -544,7 +546,7 @@ int clean_grids(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
 // frame, set its number, pts that number at 30 fps, seq from 0, each payload
 // what a fresh encoder makes of the frame converted alone, and the track's
 // params the sequence's transform. The player ends holding frame 7's blocks.
-int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
+int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   const float block = 8.0f * codec_fixture::kVoxel;
   vkc::Result<vr_example::MeshSequence> sequence = cubes(
       scratch.path / "moving", 5, 3, 0.06f,
@@ -659,8 +661,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
 
 // code_frame applies the second pass's audit: a frame that only its placed
 // coordinates make degenerate is refused before anything is coded.
-int refused_once_placed(vr_test::GpuContext& gpu,
-                        const vr_test::Scratch& scratch) {
+int refused_once_placed(vkc::test::GpuContext& gpu,
+                        const vkc::test::Scratch& scratch) {
   vkc::Result<vr_example::MeshSequence> sequence =
       collapsing(scratch.path / "collapsing_gpu", "");
   CHECK(sequence.ok());
@@ -682,8 +684,8 @@ int refused_once_placed(vr_test::GpuContext& gpu,
 // The second pass applies allow_holes too: code_frame codes an open cube when
 // the scenario allows holes, and refuses it, coding nothing, when it does not
 // (opened for inspection, so the first pass let it through).
-int holes_in_code_frame(vr_test::GpuContext& gpu,
-                        const vr_test::Scratch& scratch) {
+int holes_in_code_frame(vkc::test::GpuContext& gpu,
+                        const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "holes_gpu";
   CHECK(fs::create_directory(dir));
   io::TriangleMesh open = cube({0.05f, 0.0f, 0.0f}, 0.06f);
@@ -720,7 +722,8 @@ int holes_in_code_frame(vr_test::GpuContext& gpu,
 }
 
 // A plain path codes as one frame: set 0 at pts 0, seq 0.
-int single_record(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
+int single_record(vkc::test::GpuContext& gpu,
+                  const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "one";
   CHECK(fs::create_directory(dir));
   CHECK(write_obj(dir / "cube.obj", cube({0.1f, 0.0f, 0.0f}, 0.06f)));
@@ -755,8 +758,8 @@ int single_record(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
-  vr_test::Scratch scratch("recon_example_mesh_sequence_gpu_");
+int gpu_main(vkc::test::GpuContext& gpu) {
+  vkc::test::Scratch scratch("recon_example_mesh_sequence_gpu_");
   CHECK(clean_grids(gpu, scratch) == 0);
   CHECK(records(gpu, scratch) == 0);
   CHECK(single_record(gpu, scratch) == 0);
@@ -769,7 +772,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_example_mesh_sequence_");
+  vkc::test::Scratch scratch("recon_example_mesh_sequence_");
   CHECK(patterns() == 0);
   CHECK(refusals(scratch) == 0);
   CHECK(one_transform(scratch) == 0);
@@ -777,5 +780,5 @@ int main() {
   CHECK(signed_rule(scratch) == 0);
   CHECK(placed_audit_decides(scratch) == 0);
   CHECK(escaped_directory(scratch) == 0);
-  return vr_test::run_on_gpu(gpu_main);
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
 }

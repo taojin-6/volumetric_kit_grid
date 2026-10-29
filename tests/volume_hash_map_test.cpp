@@ -18,11 +18,11 @@
 #include <utility>
 #include <vector>
 
-#include "buffer_readback.hpp"
 #include "device_blocks.hpp"
 #include "hash.hpp"
-#include "test_check.hpp"
 #include "volume_hash_oracle.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
@@ -31,7 +31,8 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -93,7 +94,7 @@ std::set<int> active_ptrs(vol::VoxelHashMap& map) {
 // allocate() from a device list: duplicate, present and new entries, never an
 // entry past the count, the heap's blocks back, a cached list stale only when
 // a block is taken, the refusals, and rounds under contention.
-int device_allocate_case(vr_test::GpuContext& gpu,
+int device_allocate_case(vkc::test::GpuContext& gpu,
                          const vol::VoxelGridParams& grid) {
   vkc::Result<vol::VoxelHashMap> made =
       vol::VoxelHashMap::create(gpu.device, gpu.allocator, grid);
@@ -106,8 +107,9 @@ int device_allocate_case(vr_test::GpuContext& gpu,
     return b;
   };
   const auto upload = [&](const std::vector<vol::BlockIndex>& list) {
-    return vr_test::upload_device_buffer(gpu.device, gpu.allocator, list.data(),
-                                         list.size() * sizeof(vol::BlockIndex));
+    return vkc::test::upload_device_buffer(
+        gpu.device, gpu.allocator, list.data(),
+        list.size() * sizeof(vol::BlockIndex));
   };
   // Two present, three new, one new twice, and a live entry past the count.
   const std::vector<vol::BlockIndex> present = {at(1, 1, 1), at(2, 1, 1)};
@@ -197,7 +199,7 @@ int device_allocate_case(vr_test::GpuContext& gpu,
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   // A small grid: 1024 buckets x 8, 8192-block heap -- plenty for the test set,
   // and cheap to init.
   vol::VoxelGridParams grid{};
@@ -271,9 +273,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
   CHECK(map.check_device_block_list(on_device.value(), "test").ok());
   {
     vkc::Result<std::vector<vol::BlockIndex>> listed =
-        vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
-                                            *on_device.value().buffer,
-                                            on_device.value().count);
+        vkc::test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
+                                              *on_device.value().buffer,
+                                              on_device.value().count);
     CHECK(listed.ok());
     std::set<std::pair<Coord, int>> host_set;
     std::set<std::pair<Coord, int>> device_set;
@@ -670,4 +672,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

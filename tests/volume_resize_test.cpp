@@ -18,9 +18,9 @@
 #include <vector>
 
 #include "device_blocks.hpp"
-#include "test_check.hpp"
 #include "volume_hash_oracle.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
@@ -29,7 +29,8 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -114,7 +115,7 @@ vkc::Result<std::map<Coord, std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
   return out;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   // Start small so the resize is a real growth.
   vol::VoxelGridParams grid{};
   grid.voxel_size = 0.005f;
@@ -265,8 +266,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     if (unsettled) {
       auto list = vr_test::detail::device_coords(gpu, clash.data(), 5);
       const std::uint32_t five = 5;
-      auto count = vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                                 &five, sizeof(five));
+      auto count = vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                                   &five, sizeof(five));
       CHECK(list.ok() && count.ok());
       vkc::CommandBatch batch(gpu.device, gpu.allocator);
       auto placed = small.record_allocate(batch, *list, {&*count, 0, five});
@@ -318,4 +319,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

@@ -10,11 +10,14 @@
 #include <optional>
 
 #include "codec_fixture.hpp"
-#include "gpu_test.hpp"
-#include "test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 using namespace codec_fixture;
 
@@ -43,7 +46,7 @@ int returned_bytes_case(Gpu& gpu, vol::VoxelBlockGrid& a,
   // The last allocation joins the head and payload into the returned vector.
   // Capture its call site as well as its size: the driver and validation
   // layer may allocate that same size earlier in the encode.
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const auto expected = measured->encode(b);
@@ -121,7 +124,7 @@ int back_retry_case(Gpu& gpu, vol::VoxelBlockGrid& grid, bool hold_previous) {
   const auto a = measured->record_front(measured_front, grid);
   CHECK(a.ok() && measured_front.submit().ok());
   vkc::CommandBatch measured_back(gpu.device, gpu.allocator);
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const auto recorded = measured->record_back(measured_back, *a);
@@ -162,7 +165,7 @@ int back_retry_case(Gpu& gpu, vol::VoxelBlockGrid& grid, bool hold_previous) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   auto a = make_grid(gpu);
   auto b = make_grid(gpu);
   CHECK(a.ok() && b.ok());
@@ -183,9 +186,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
 }  // namespace
 
 int main() try {
-  return vr_test::run_on_gpu(gpu_main);
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
 } catch (const std::bad_alloc&) {
-  vr_test::allocation_failure = {};
+  vkc::test::allocation_failure = {};
   std::fputs("FAIL: bad_alloc escaped the encoder\n", stderr);
   return 1;
 }

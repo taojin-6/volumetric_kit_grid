@@ -14,9 +14,9 @@
 #include <utility>
 #include <vector>
 
-#include "buffer_readback.hpp"
 #include "device_blocks.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
@@ -25,7 +25,8 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -64,7 +65,7 @@ vkc::Result<std::set<std::int32_t>> active_ptrs(vol::VoxelHashMap& map) {
   return out;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vol::VoxelGridParams grid{};
   grid.voxel_size = 0.005f;
   grid.block_size = 8;
@@ -181,7 +182,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   device_coords.push_back(absent);
   const auto device_count = static_cast<std::uint32_t>(device_coords.size());
   device_coords.push_back(vol::BlockIndex{});  // centre (0,0,0): must survive
-  auto device_list = vr_test::upload_device_buffer(
+  auto device_list = vkc::test::upload_device_buffer(
       gpu.device, gpu.allocator, device_coords.data(),
       device_coords.size() * sizeof(vol::BlockIndex));
   CHECK(device_list.ok() && device_list->mapped() == nullptr);
@@ -289,8 +290,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
     };
     CHECK(place(slab));
     auto half_on_device =
-        vr_test::upload_device_buffer(gpu.device, gpu.allocator, half.data(),
-                                      half.size() * sizeof(vol::BlockIndex));
+        vkc::test::upload_device_buffer(gpu.device, gpu.allocator, half.data(),
+                                        half.size() * sizeof(vol::BlockIndex));
     CHECK(half_on_device.ok());
     vkc::Result<std::set<std::int32_t>> slab_ptrs = active_ptrs(big);
     CHECK(slab_ptrs.ok() && slab_ptrs.value().size() == slab.size());
@@ -345,9 +346,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
       return left == 0;
     };
     CHECK(settle(false));
-    auto listed =
-        vr_test::upload_device_buffer(gpu.device, gpu.allocator, coords.data(),
-                                      coords.size() * sizeof(vol::BlockIndex));
+    auto listed = vkc::test::upload_device_buffer(
+        gpu.device, gpu.allocator, coords.data(),
+        coords.size() * sizeof(vol::BlockIndex));
     CHECK(listed.ok());
     vol::AllocFailures failures{};
     int first_rounds = 0;
@@ -376,4 +377,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

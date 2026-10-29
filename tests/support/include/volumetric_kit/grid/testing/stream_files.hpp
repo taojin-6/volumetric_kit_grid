@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-#include "scratch_dir.hpp"
+#include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 
 namespace vr_test::vrst {

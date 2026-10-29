@@ -47,8 +47,10 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
@@ -107,11 +109,12 @@ vkc::Status stage_frame(Gpu& gpu, const d::ReferenceStore& store,
   std::vector<vol::BlockIndex> list;
   for (const vr::Vec3i& c : coords) list.push_back(vol::BlockIndex{c, 0});
   if (!sources.empty()) {
-    VKC_TRY(vr_test::write_back(gpu.device, gpu.allocator, *frame.sources,
-                                sources));
+    VKC_TRY(vkc::test::write_back(gpu.device, gpu.allocator, *frame.sources,
+                                  sources));
   }
   if (!list.empty()) {
-    VKC_TRY(vr_test::write_back(gpu.device, gpu.allocator, *frame.list, list));
+    VKC_TRY(
+        vkc::test::write_back(gpu.device, gpu.allocator, *frame.list, list));
   }
   return {};
 }
@@ -123,8 +126,8 @@ std::vector<vr::Vec3i> held_coords(Gpu& gpu, const d::ReferenceStore& store) {
   const std::uint32_t m = store.held()->header.block_count;
   if (m == 0) return out;
   for (const vol::BlockIndex& b :
-       vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
-                                           store.reference_list(), m)
+       vkc::test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
+                                             store.reference_list(), m)
            .value()) {
     out.push_back(b.coord);
   }
@@ -146,8 +149,8 @@ vkc::Result<d::ResidentBlocks> record_apply(Gpu& gpu, d::ReferenceStore& store,
 // The last apply's faults once its batch ran, as the decoder judges them.
 vkc::Status apply_faults(Gpu& gpu, const d::ReferenceStore& store) {
   VKC_ASSIGN(const std::vector<std::uint32_t> faults,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               store.faults(), 1));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 store.faults(), 1));
   return d::ReferenceStore::check_faults(faults[0]);
 }
 
@@ -165,16 +168,16 @@ vkc::Result<Applied> read_spare(Gpu& gpu, const d::ResidentBlocks& spare) {
   Applied out;
   if (spare.count == 0) return out;
   VKC_ASSIGN(const std::vector<std::uint32_t> masks,
-             vr_test::read_back<std::uint32_t>(
+             vkc::test::read_back<std::uint32_t>(
                  gpu.device, gpu.allocator, *spare.masks,
                  std::size_t(spare.count) * codec::kMaskWordsPerBlock));
   VKC_ASSIGN(const std::vector<std::uint32_t> packed,
-             vr_test::read_back<std::uint32_t>(
+             vkc::test::read_back<std::uint32_t>(
                  gpu.device, gpu.allocator, *spare.coefficients,
                  std::size_t(spare.count) * words));
   VKC_ASSIGN(const std::vector<vol::BlockIndex> list,
-             vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
-                                                 *spare.list, spare.count));
+             vkc::test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
+                                                   *spare.list, spare.count));
   for (std::size_t i = 0; i < spare.count; ++i) {
     Payload p;
     p.mask.assign(masks.begin() + std::ptrdiff_t(i * 16),
@@ -1522,7 +1525,7 @@ int diff_refusals_case(Gpu& gpu) {
   // The frame's blocks, a device word as the encoder's forward leaves them:
   // none.
   const std::uint32_t zero = 0;
-  vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+  vkc::Result<vkc::Buffer> word = vkc::test::upload_device_buffer(
       gpu.device, gpu.allocator, &zero, sizeof(zero));
   CHECK(word.ok());
   auto refused = [&](std::uint32_t n, std::uint32_t k, const char* says) {
@@ -1558,8 +1561,8 @@ int diff_refusals_case(Gpu& gpu) {
             .ok());
   CHECK(batch.submit().ok());
   vkc::Result<std::vector<std::uint32_t>> modes =
-      vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                        *entries.value().modes, 5);
+      vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                          *entries.value().modes, 5);
   CHECK(modes.ok() &&
         modes.value() == std::vector<std::uint32_t>(
                              5, std::uint32_t(d::BlockMode::kRemove)));
@@ -1583,7 +1586,7 @@ int diff_refusals_case(Gpu& gpu) {
 
 }  // namespace
 
-int gpu_main(vr_test::GpuContext& context) {
+int gpu_main(vkc::test::GpuContext& context) {
   vkc::Result<std::unique_ptr<d::DctTransform>> transform =
       d::DctTransform::create(context.device, context.allocator);
   vkc::Result<codec::Decoder> dec =
@@ -1621,4 +1624,6 @@ int gpu_main(vr_test::GpuContext& context) {
   return 0;
 }
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}
