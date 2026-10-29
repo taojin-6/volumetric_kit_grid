@@ -123,18 +123,21 @@ int main() {
         to_port.serve->max_viewers == defaults_served.max_viewers &&
         to_port.serve->max_gop_bytes == defaults_served.max_gop_bytes &&
         to_port.serve->stall_limit == defaults_served.stall_limit);
-  // The scenario's viewer count goes to the server.
-  const auto sixteen = cfg::parse(R"({
-    "version": 1, "operation": "fuse",
-    "source": {"kind": "live", "sync_config": "sync.json"},
-    "output": {"path": "rig.ply", "serve": 5000, "max_viewers": 16}
-  })",
-                                  cfg::Application::FuseOrbbec);
-  CHECK(sixteen);
-  const vgrid::codec_stream::CodecOutputs to_sixteen =
-      vgrid_example::codec_outputs(sixteen.value().output);
-  CHECK(to_sixteen.serve && to_sixteen.serve->port == 5000 &&
-        to_sixteen.serve->max_viewers == 16);
+  // The scenario's viewer count goes to the server as it is, below the
+  // default or above it.
+  for (const unsigned viewers : {1U, 16U}) {
+    const auto counted = cfg::parse(
+        R"({"version": 1, "operation": "fuse",
+            "source": {"kind": "live", "sync_config": "sync.json"},
+            "output": {"path": "rig.ply", "serve": 5000, "max_viewers": )" +
+            std::to_string(viewers) + "}}",
+        cfg::Application::FuseOrbbec);
+    CHECK(counted);
+    const vgrid::codec_stream::CodecOutputs to_counted =
+        vgrid_example::codec_outputs(counted.value().output);
+    CHECK(to_counted.serve && to_counted.serve->port == 5000 &&
+          to_counted.serve->max_viewers == viewers);
+  }
 
   const auto encoded =
       cfg::parse(R"({
