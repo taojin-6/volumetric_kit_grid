@@ -819,9 +819,8 @@ core::Result<MarchingCubes> MarchingCubes::create(
   // per dispatch. Sharing needs ~8 KiB of `shared` arrays, and a `shared` array
   // is reserved when the pipeline is created whatever a push constant later
   // says: folding both into one kernel made the default path pay sharing's
-  // threadgroup budget (44 B -> 8452 B, which bounds residency to 3 workgroups
-  // on Apple's ~32 KiB and to 1 at Vulkan's guaranteed 16 KiB floor) and its
-  // per-corner vertex atomic, for a feature it does not use.
+  // threadgroup budget (the figures are in marching_cubes_sparse_common.glsl's
+  // note) and its per-corner vertex atomic, for a feature it does not use.
   VkPushConstantRange push_sparse{};
   push_sparse.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   push_sparse.offset = 0;

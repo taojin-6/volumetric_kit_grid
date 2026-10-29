@@ -402,8 +402,8 @@ struct MarchingCubesConfig {
 ///
 /// A vertex's normal is the SDF gradient at the vertex -- central differences
 /// at its edge's two end voxels, mixed by where the vertex sits on the edge --
-/// so it points outward (increasing distance) and is the same from every cell
-/// and kernel that emits the vertex. Each vertex also
+/// so it points outward (increasing distance) and, at block_size >= 2, is the
+/// same from every cell and kernel that emits the vertex. Each vertex also
 /// carries the hybrid appearance the renderer consumes: a @ref Vertex::color
 /// interpolated from the optional per-sample color input (opaque white when
 /// absent), and a @ref Vertex::uv0 left at the `(-1, -1)` sentinel -- the
@@ -515,7 +515,8 @@ class VGRID_MESH_API MarchingCubes {
   /// `+face` reaches its far corners into neighbouring blocks; the kernel
   /// resolves that 2x2x2 neighbourhood (this block plus its seven `+x/+y/+z`
   /// neighbours) **itself**, probing @p grid's hash table on-device, eight
-  /// probes amortised over the block's cells. The per-cell body is identical to
+  /// probes amortised over the block's cells (and 27 more for the 3x3x3
+  /// neighbourhood the vertex normals reach). The per-cell body is identical to
   /// every other emitter here -- independent triangles, the gradient normal at
   /// each vertex, reversed winding, and the same hybrid @ref Vertex::color /
   /// @ref Vertex::uv0 appearance.

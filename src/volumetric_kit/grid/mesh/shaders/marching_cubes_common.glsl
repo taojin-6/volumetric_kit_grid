@@ -104,7 +104,8 @@ float mcEdgeRatio(float sa, float sb, float iso) {
 // the cell emits a vertex; mcEdgeVertex reads two of them per vertex. Eight
 // named registers rather than an array, because mcEdgeVertex picks them by a
 // corner index known only at run time, and a private array indexed that way
-// spills to memory.
+// spills to memory. Computing a vertex's two on demand instead, rather than
+// all eight per cell, was slower on an RTX 4090 and an M5 Max.
 vec3 g_corner_grad0, g_corner_grad1, g_corner_grad2, g_corner_grad3,
     g_corner_grad4, g_corner_grad5, g_corner_grad6, g_corner_grad7;
 
@@ -148,7 +149,8 @@ vec3 mcVertexNormal(vec3 grad, ivec3 shift_a, ivec3 shift_b, float sa,
 // gradient is a function of its voxel alone (see mcCornerGradients), so the
 // normal is a function of the edge alone: every cell that emits the vertex,
 // in either kernel and on either side of a block boundary, gives it the same
-// normal, and shading has no seam between cells.
+// normal, and shading has no seam between cells. At block_size 1 alone it does
+// not (mcGradientSample).
 //
 // Bit-identical needs the endpoints in a CANONICAL ORDER, not merely resolved
 // to the same global voxels, and that is what the swap below is for. kEdgeToVert

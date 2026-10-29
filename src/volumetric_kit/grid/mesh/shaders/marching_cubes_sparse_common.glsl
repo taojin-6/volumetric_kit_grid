@@ -149,7 +149,8 @@ void mcResolveGradientBlocks(ivec3 coord, int self_ptr, uint tid) {
 //
 // Branch-free: a voxel with no block reads index 0 and is discarded, so a
 // cell's 24 samples can all be in flight at once. Branching on the block and
-// the weight cost 8 to 10% more of the extract on an RTX 4090 and an M5 Max.
+// the weight made the extract 5 to 11% slower on a decoded live room capture
+// (RTX 4090, M5 Max).
 bool mcGradientSample(ivec3 c, out float s) {
   int bs = pc.block_size;
   ivec3 o = ivec3(greaterThanEqual(c, ivec3(bs))) - ivec3(lessThan(c, ivec3(0)));

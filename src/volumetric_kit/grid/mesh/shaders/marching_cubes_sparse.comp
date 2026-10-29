@@ -27,8 +27,9 @@
 //
 // It is resolved *here* rather than handed over by the host, which is what the
 // workgroup-per-block shape exists for. The meshing dispatch is quiescent -- no
-// concurrent allocation -- so a probe needs no bucket lock, and 8 probes amortise
-// over voxels_per_block cells. The host-built table this replaced was an
+// concurrent allocation -- so a probe needs no bucket lock, and 8 probes (35
+// with the vertex normals' 3x3x3 neighbourhood) amortise over voxels_per_block
+// cells. The host-built table this replaced was an
 // O(active_blocks * 8) serial pass of unordered_map lookups: measured at 102 ms
 // of a 133 ms extract at 107k blocks on an M5 iPad Pro, against 26 ms for this
 // kernel's own dispatch. Both prior CUDA and Metal implementations of this
