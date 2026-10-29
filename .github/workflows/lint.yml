@@ -26,7 +26,7 @@ jobs:
       - uses: taojin-6/volumetric_kit_core/.github/actions/check-workflow-triggers@fcbbe0c99a2fcec8d2e5cc3ddaf77add1f5679af
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.12'
+          python-version: '3.14'
       # Cache pre-commit's installed hook environments (incl. the pinned
       # clang-format) keyed on the config so they're only rebuilt when it changes.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
