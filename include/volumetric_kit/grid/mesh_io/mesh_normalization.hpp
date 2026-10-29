@@ -22,7 +22,7 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
-#include "volumetric_kit/recon/io/export.hpp"
+#include "volumetric_kit/recon/io/mesh_io_export.hpp"
 #include "volumetric_kit/recon/io/triangle_mesh.hpp"
 
 namespace volumetric_kit::recon::io {
@@ -47,7 +47,7 @@ struct MeshAxes {
 /// triangle winding and the sign of volumes.
 /// @param up Head-up direction in input coordinates.
 /// @return The axes, or InvalidArgument for a zero or non-finite @p up.
-VR_IO_API core::Result<MeshAxes> up_axes(const Vec3d& up);
+VR_MESH_IO_API core::Result<MeshAxes> up_axes(const Vec3d& up);
 
 /// @brief Position bounds measured along a frame's axes, in source units.
 ///
@@ -65,15 +65,15 @@ struct MeshBounds {
 /// @param mesh Positions in source units; indices are not read.
 /// @param axes The frame; the default measures input coordinates as given.
 /// @return The bounds, empty for a mesh with no positions.
-VR_IO_API MeshBounds mesh_bounds(const TriangleMesh& mesh,
-                                 const MeshAxes& axes = {});
+VR_MESH_IO_API MeshBounds mesh_bounds(const TriangleMesh& mesh,
+                                      const MeshAxes& axes = {});
 
 /// @brief Grow @p bounds by every position of @p mesh, measured along
 ///        `bounds.axes`: the union over a sequence's frames.
 ///
 /// The union is exact and independent of order, so a caller can load, measure
 /// and drop one frame at a time.
-VR_IO_API void extend_bounds(MeshBounds& bounds, const TriangleMesh& mesh);
+VR_MESH_IO_API void extend_bounds(MeshBounds& bounds, const TriangleMesh& mesh);
 
 /// @brief A similarity that places a mesh in metres.
 ///
@@ -99,8 +99,8 @@ struct MeshTransform {
 ///         @p height_m that is not finite and positive, a scale that is not,
 ///         or bounds it would place past float range, which
 ///         @ref apply_transform would refuse.
-VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
-                                                    double height_m);
+VR_MESH_IO_API core::Result<MeshTransform> fit_transform(
+    const MeshBounds& bounds, double height_m);
 
 /// @brief The same placement as @ref fit_transform, with the scale given: for
 ///        data whose unit is known.
@@ -111,8 +111,8 @@ VR_IO_API core::Result<MeshTransform> fit_transform(const MeshBounds& bounds,
 ///         axes that are not a proper rotation, a @p metres_per_unit that
 ///         is not finite and positive, or bounds it would place past float
 ///         range.
-VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
-                                                      double metres_per_unit);
+VR_MESH_IO_API core::Result<MeshTransform> scale_transform(
+    const MeshBounds& bounds, double metres_per_unit);
 
 /// @brief Map every position of @p mesh through @p transform, in place.
 ///
@@ -124,8 +124,8 @@ VR_IO_API core::Result<MeshTransform> scale_transform(const MeshBounds& bounds,
 ///         and positive, a non-finite position, an output past float range,
 ///         or a height collapse: a mesh with extent along up whose outputs
 ///         round to one Y; OutOfMemory for allocation failure.
-VR_IO_API core::Status apply_transform(TriangleMesh& mesh,
-                                       const MeshTransform& transform);
+VR_MESH_IO_API core::Status apply_transform(TriangleMesh& mesh,
+                                            const MeshTransform& transform);
 
 /// @brief The length of @ref encode_transform's bytes.
 inline constexpr std::size_t kTransformBytes = 112;
@@ -147,7 +147,7 @@ inline constexpr std::size_t kTransformBytes = 112;
 /// @endcode
 /// @return The bytes; InvalidArgument for a transform @ref apply_transform
 ///         refuses; OutOfMemory for allocation failure.
-VR_IO_API core::Result<std::string> encode_transform(
+VR_MESH_IO_API core::Result<std::string> encode_transform(
     const MeshTransform& transform);
 
 /// @brief Read @ref encode_transform's bytes back, bit for bit.
@@ -155,7 +155,7 @@ VR_IO_API core::Result<std::string> encode_transform(
 ///         @ref kTransformBytes long or do not start with "VRMT", or a
 ///         transform @ref apply_transform refuses; Unsupported for a version
 ///         other than 1.
-VR_IO_API core::Result<MeshTransform> decode_transform(
+VR_MESH_IO_API core::Result<MeshTransform> decode_transform(
     const std::string& bytes);
 
 /// @brief Indexed edge and connected-component audit; not a self-intersection
@@ -204,7 +204,7 @@ struct MeshTopology {
 /// @return The audit; InvalidArgument for indices that are not whole
 ///         triangles or name a missing position; OutOfMemory for allocation
 ///         failure.
-VR_IO_API core::Result<MeshTopology> audit_mesh_topology(
+VR_MESH_IO_API core::Result<MeshTopology> audit_mesh_topology(
     const TriangleMesh& mesh);
 
 }  // namespace volumetric_kit::recon::io
