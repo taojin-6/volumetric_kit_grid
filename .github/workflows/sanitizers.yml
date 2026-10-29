@@ -46,12 +46,13 @@ jobs:
     steps:
       # The bare image lacks git, which the checkout needs, and the
       # toolchain. Ubuntu packages clang's sanitizer runtimes apart from it
-      # (libclang-rt-dev), and lavapipe in mesa-vulkan-drivers.
+      # (libclang-rt-dev), its llvm-symbolizer too (llvm), and lavapipe in
+      # mesa-vulkan-drivers.
       - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git \
-            clang libclang-rt-dev cmake make libglm-dev libvulkan-dev \
+            clang libclang-rt-dev llvm cmake make libglm-dev libvulkan-dev \
             vulkan-validationlayers spirv-tools glslang-tools vulkan-tools \
             mesa-vulkan-drivers
 
@@ -77,6 +78,12 @@ jobs:
           supp="${GITHUB_WORKSPACE}/tools/lsan.supp"
           if [ ! -r "$supp" ]; then
             echo "::error::no LSan suppressions at ${supp}"
+            exit 1
+          fi
+          # Without it reports show bare addresses, and the suppressions that
+          # name a function (leak:lvp_) match nothing.
+          if ! command -v llvm-symbolizer >/dev/null; then
+            echo "::error::no llvm-symbolizer on PATH"
             exit 1
           fi
           echo "LSAN_OPTIONS=suppressions=${supp}:print_suppressions=0" >> "$GITHUB_ENV"
