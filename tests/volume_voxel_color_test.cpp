@@ -8,7 +8,7 @@
 // implementations of one curve is the silent drift the 2026-08-02 colour-space
 // decision exists to prevent, so it is pinned rather than trusted. The grid
 // takes no colour vocabulary from elsewhere: recon_tsdf_voxel_color_space
-// holds this curve to core/color_space.hpp's, in recon, which links both.
+// holds this curve to the sensor boundary's copy, in recon, which links both.
 //
 // Host, always: volume's curve, decode and running-mean encode are the
 // reference's, bit for bit, over every code and a sweep of linear values, and

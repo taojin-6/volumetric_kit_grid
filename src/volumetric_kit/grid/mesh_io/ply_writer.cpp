@@ -21,8 +21,8 @@ namespace tinyply = detail::tinyply;
 
 // The exact piecewise sRGB encode, one channel: the published formula, the
 // mesh files' own copy so they need no camera or colour vocabulary.
-// recon_io_ply holds it to core/color_space.hpp's linear_to_srgb, code for
-// code.
+// recon_io_ply holds it to the voxel colour format's curve
+// (volume/voxel_color.hpp), code for code.
 float linear_to_srgb(float l) {
   return l <= 0.0031308f ? l * 12.92f
                          : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
