@@ -20,8 +20,8 @@
 #include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
 #include "volumetric_kit/recon/io/triangle_mesh.hpp"
-#include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
 namespace vr_example {
 
@@ -137,16 +137,16 @@ vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence);
 ///        an earlier frame stays, allocate the mesh's band, growing the grid
 ///        for capacity and retrying lost bucket-lock races, then integrate.
 /// @return The integrator's stats, or the first error.
-vkc::Result<vr::tsdf::MeshIntegrateStats> convert_frame(
-    vr::volume::VoxelBlockGrid& grid, vr::tsdf::MeshIntegrator& integrator,
-    const vr::io::TriangleMesh& mesh, const vr::tsdf::MeshSdfParams& params,
+vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
+    vr::volume::VoxelBlockGrid& grid, vr::voxelize::MeshIntegrator& integrator,
+    const vr::io::TriangleMesh& mesh, const vr::voxelize::MeshSdfParams& params,
     vkc::StageMetrics* metrics);
 
 /// @brief What @ref code_frame did with one frame.
 struct CodedFrame {
-  MeshFrame frame;                     ///< The frame as converted.
-  vr::tsdf::MeshIntegrateStats stats;  ///< Its conversion.
-  vr::codec_stream::SentFrame sent;    ///< Its record, as it went out.
+  MeshFrame frame;                         ///< The frame as converted.
+  vr::voxelize::MeshIntegrateStats stats;  ///< Its conversion.
+  vr::codec_stream::SentFrame sent;        ///< Its record, as it went out.
 };
 
 /// @brief One frame of a run: @ref MeshSequence::load, @ref
@@ -157,8 +157,8 @@ struct CodedFrame {
 vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    std::uint32_t number,
                                    vr::volume::VoxelBlockGrid& grid,
-                                   vr::tsdf::MeshIntegrator& integrator,
-                                   const vr::tsdf::MeshSdfParams& params,
+                                   vr::voxelize::MeshIntegrator& integrator,
+                                   const vr::voxelize::MeshSdfParams& params,
                                    vr::codec_stream::CodecStream& stream,
                                    vkc::StageMetrics* conversion);
 

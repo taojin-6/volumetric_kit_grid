@@ -841,7 +841,7 @@ int slots_case(vr_test::Gpu& gpu) {
 
 // Three cameras round a sphere, their depth on the host and on the device.
 struct Sphere {
-  std::vector<vr_test::SphereView> views;
+  std::vector<vr_test::SphereView<vol::DepthPinhole>> views;
   std::vector<vkc::Buffer> device;
 
   std::vector<vol::DepthInput> frames(std::size_t cameras,
@@ -859,7 +859,7 @@ struct Sphere {
 vkc::Result<Sphere> sphere(vr_test::Gpu& gpu) {
   Sphere s;
   for (int c = 0; c < 3; ++c) {
-    s.views.push_back(vr_test::sphere_view(c));
+    s.views.push_back(vr_test::sphere_view<vol::DepthPinhole>(c));
     const std::vector<float>& depth = s.views.back().depth;
     VKC_ASSIGN(vkc::Buffer buffer, vr_test::upload_device_buffer(
                                        gpu.device, gpu.allocator, depth.data(),

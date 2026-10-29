@@ -22,7 +22,7 @@
 #include "hash_common.glsl"
 #define VR_STAMPS_BINDING 7
 #include "hash_allocate_common.glsl"
-#include "volumetric_kit/recon/core/shaders/pinhole.glsl"
+#include "depth_pinhole.glsl"
 
 // The tile's side; mirrors the host's kDepthTile, which sizes the dispatch.
 // pc.arg is the frame's tile count along x, computed with the dispatch's, so
@@ -37,25 +37,12 @@ layout(set = 0, binding = 4, scalar) readonly buffer Depth {
   float depth_data[];
 };
 
-// binding 6: pinhole intrinsics + pose. Mirrors the host DepthCameraParams;
-// under scalar block layout the struct is byte-identical (floats/uints pack at
-// 4-byte, the mat4 lands at offset 32). It rides a storage buffer, NOT the push
-// block: grid (36 B) + camera (96 B) = 132 B exceeds the 128 B guaranteed
-// maxPushConstantsSize, so folding it into the push constants would fail on
-// min-spec (mobile) drivers.
-struct CameraParams {
-  float fx;
-  float fy;
-  float cx;
-  float cy;
-  float min_depth;
-  float max_depth;
-  uint width;
-  uint height;
-  mat4 cam_to_world;  // column-major camera -> world rigid transform
-};
+// binding 6: the frame's DepthPinhole (depth_pinhole.glsl). It rides a storage
+// buffer, NOT the push block: grid (36 B) + camera (96 B) = 132 B exceeds the
+// 128 B guaranteed maxPushConstantsSize, so moving it into the push constants
+// would fail on min-spec (mobile) drivers.
 layout(set = 0, binding = 6, scalar) readonly buffer Camera {
-  CameraParams cam;
+  DepthPinhole cam;
 };
 
 // Each lane's centre block, and whether it has one; then the tile's distinct
@@ -80,8 +67,8 @@ void main() {
     valid = depth > 0.0 && depth >= cam.min_depth && depth <= cam.max_depth;
     if (valid) {
       // Unproject to camera space, then to world via the rigid pose.
-      vec3 p = vr_unproject_pinhole(vec2(float(u), float(v)), depth,
-                                    vec4(cam.fx, cam.fy, cam.cx, cam.cy));
+      vec3 p = vrUnprojectDepth(vec2(float(u), float(v)), depth,
+                                vec4(cam.fx, cam.fy, cam.cx, cam.cy));
       vec3 world = (cam.cam_to_world * vec4(p, 1.0)).xyz;
       valid = !(any(isinf(world)) || any(isnan(world)));
       block = worldToBlock(world, pc.grid);

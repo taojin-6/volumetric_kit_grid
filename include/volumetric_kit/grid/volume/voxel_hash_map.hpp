@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -23,7 +24,6 @@
 #include "volumetric_kit/core/vulkan/descriptor.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/host_ring.hpp"
-#include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/export.hpp"
@@ -84,6 +84,34 @@ struct AllocFailures {
   }
 };
 
+/// @brief The posed pinhole depth camera @ref VoxelHashMap::allocate_from_depth
+///        unprojects a frame through: intrinsics, valid depth range, image
+///        size and pose.
+///
+/// The voxel layer's own, so it needs no camera vocabulary: a caller holding
+/// another posed pinhole copies its fields in. Uploaded verbatim to the depth
+/// kernel, which reads it under scalar block layout, so the asserts below pin
+/// its packing against the GLSL mirror in `volume/shaders/depth_pinhole.glsl`.
+struct DepthPinhole {
+  float fx;              ///< Focal length x (pixels).
+  float fy;              ///< Focal length y (pixels).
+  float cx;              ///< Principal point x (pixels).
+  float cy;              ///< Principal point y (pixels).
+  float min_depth;       ///< Reject samples nearer than this (metres).
+  float max_depth;       ///< Reject samples farther than this (metres).
+  std::uint32_t width;   ///< Depth image width (pixels).
+  std::uint32_t height;  ///< Depth image height (pixels).
+  Mat4f cam_to_world;    ///< Camera -> world rigid transform (column-major).
+};
+static_assert(sizeof(DepthPinhole) == 96, "DepthPinhole must be 96 bytes");
+static_assert(offsetof(DepthPinhole, min_depth) == 16, "layout drift");
+static_assert(offsetof(DepthPinhole, width) == 24, "layout drift");
+static_assert(offsetof(DepthPinhole, cam_to_world) == 32, "layout drift");
+static_assert(std::is_trivially_copyable_v<DepthPinhole>,
+              "DepthPinhole must be trivially copyable");
+static_assert(std::is_standard_layout_v<DepthPinhole>,
+              "DepthPinhole must be standard-layout");
+
 /// @brief One camera's depth frame, for @ref VoxelHashMap::allocate_from_depth
 ///        over several cameras at once.
 struct DepthInput {
@@ -91,7 +119,7 @@ struct DepthInput {
   /// a host array, staged in the call's first round, or a storage buffer,
   /// bound in place.
   core::StorageInput depth;
-  DepthCameraParams camera;  ///< Intrinsics, depth range, size and pose.
+  DepthPinhole camera;  ///< Intrinsics, depth range, size and pose.
 };
 
 /// @brief A compacted active set on the device, or a frustum-culled subset of
@@ -373,7 +401,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///         or a non-OK `Status` if a buffer or the dispatch fails, or the
   ///         map is moved-from / @p depth is null.
   core::Result<std::uint32_t> allocate_from_depth(
-      const float* depth, const DepthCameraParams& camera,
+      const float* depth, const DepthPinhole& camera,
       AllocFailures* out_failures = nullptr,
       core::StageMetrics* metrics = nullptr);
 
@@ -390,7 +418,7 @@ class VR_VOLUME_API VoxelHashMap {
   ///         non-device-local memory, or is smaller than
   ///         the image.
   core::Result<std::uint32_t> allocate_from_depth(
-      const core::Buffer& depth, const DepthCameraParams& camera,
+      const core::Buffer& depth, const DepthPinhole& camera,
       AllocFailures* out_failures = nullptr,
       core::StageMetrics* metrics = nullptr);
 
@@ -447,7 +475,8 @@ class VR_VOLUME_API VoxelHashMap {
       const DeviceCount* gate = nullptr, core::GpuStageScope* stage = nullptr);
 
   // TODO(volume): the candidate count is a host pass over the triangles, as
-  // in tsdf's MeshIntegrator (the 2026-10-13 volume block-list entry's Next).
+  // in voxelize's MeshIntegrator (the 2026-10-13 volume block-list entry's
+  // Next).
   /// @brief Allocate the voxel blocks a triangle mesh's truncation band covers.
   ///
   /// A block is allocated when its centre lies within `trunc_dist` plus the
@@ -816,9 +845,9 @@ class VR_VOLUME_API VoxelHashMap {
   ///        Starts at 1; 0 is no tick.
   ///
   /// It counts the passes that write voxels -- each `tsdf::TsdfIntegrator`
-  /// integrate call (one per set, for a rig), `tsdf::MeshIntegrator` call and
-  /// codec decode -- since each advances it before it stamps `changed`. So a
-  /// reader that records the tick it read at sees every later change as
+  /// integrate call (one per set, for a rig), `voxelize::MeshIntegrator` call
+  /// and codec decode -- since each advances it before it stamps `changed`. So
+  /// a reader that records the tick it read at sees every later change as
   /// newer, however its calls interleave with the writers'. Ticks compare
   /// modulo 2^32, so an age is right up to 2^31 of them.
   std::uint32_t tick() const noexcept { return tick_; }

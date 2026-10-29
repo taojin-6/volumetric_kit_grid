@@ -46,7 +46,7 @@ namespace vol = volumetric_kit::recon::volume;
 namespace codec = volumetric_kit::recon::codec;
 namespace codec_stream = volumetric_kit::recon::codec_stream;
 namespace stream = volumetric_kit::recon::stream;
-namespace ts = volumetric_kit::recon::tsdf;
+namespace vx = volumetric_kit::recon::voxelize;
 namespace fs = std::filesystem;
 using codec_fixture::Snapshot;
 using Code = vkc::Status::Code;
@@ -508,8 +508,8 @@ int clean_grids(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   vkc::Result<vr_example::MeshFrame> a = sequence->load(1);
   vkc::Result<vr_example::MeshFrame> b = sequence->load(2);
   CHECK(a.ok() && b.ok());
-  vkc::Result<ts::MeshIntegrator> integrator =
-      ts::MeshIntegrator::create(gpu.device, gpu.allocator);
+  vkc::Result<vx::MeshIntegrator> integrator =
+      vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   CHECK(integrator.ok());
   const auto alone = [&](const io::TriangleMesh& mesh) -> Snapshot {
     vkc::Result<vol::VoxelBlockGrid> fresh = small_grid(gpu);
@@ -530,7 +530,7 @@ int clean_grids(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   CHECK(grid.ok());
   const std::int32_t slots = grid->grid().num_blocks;
   for (const io::TriangleMesh* mesh : {&a->mesh, &b->mesh, &a->mesh}) {
-    vkc::Result<ts::MeshIntegrateStats> stats =
+    vkc::Result<vx::MeshIntegrateStats> stats =
         vr_example::convert_frame(*grid, *integrator, *mesh, {}, nullptr);
     CHECK(stats.ok() && stats->blocks > 0);
     vkc::Result<Snapshot> shot = codec_fixture::snapshot(gpu, *grid);
@@ -562,8 +562,8 @@ int records(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
           outputs);
   CHECK(made.ok());
   codec_stream::CodecStream coder = std::move(made).value();
-  vkc::Result<ts::MeshIntegrator> integrator =
-      ts::MeshIntegrator::create(gpu.device, gpu.allocator);
+  vkc::Result<vx::MeshIntegrator> integrator =
+      vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   CHECK(integrator.ok());
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
   CHECK(grid.ok());
@@ -667,8 +667,8 @@ int refused_once_placed(vr_test::GpuContext& gpu,
   vkc::Result<codec_stream::CodecStream> coder =
       codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                         geometry_session());
-  vkc::Result<ts::MeshIntegrator> integrator =
-      ts::MeshIntegrator::create(gpu.device, gpu.allocator);
+  vkc::Result<vx::MeshIntegrator> integrator =
+      vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
   CHECK(coder.ok() && integrator.ok() && grid.ok());
   CHECK(refused(vr_example::code_frame(*sequence, 7, *grid, *integrator, {},
@@ -704,8 +704,8 @@ int holes_in_code_frame(vr_test::GpuContext& gpu,
     vkc::Result<codec_stream::CodecStream> coder =
         codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                           geometry_session());
-    vkc::Result<ts::MeshIntegrator> integrator =
-        ts::MeshIntegrator::create(gpu.device, gpu.allocator);
+    vkc::Result<vx::MeshIntegrator> integrator =
+        vx::MeshIntegrator::create(gpu.device, gpu.allocator);
     vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
     CHECK(sequence.ok() && coder.ok() && integrator.ok() && grid.ok());
     coded[allowed] = vr_example::code_frame(*sequence, 1, *grid, *integrator,
@@ -735,8 +735,8 @@ int single_record(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
   vkc::Result<codec_stream::CodecStream> coder =
       codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
                                         geometry_session(), outputs);
-  vkc::Result<ts::MeshIntegrator> integrator =
-      ts::MeshIntegrator::create(gpu.device, gpu.allocator);
+  vkc::Result<vx::MeshIntegrator> integrator =
+      vx::MeshIntegrator::create(gpu.device, gpu.allocator);
   vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
   CHECK(coder.ok() && integrator.ok() && grid.ok());
   CHECK(vr_example::code_frame(*sequence, 0, *grid, *integrator, {}, *coder,

@@ -10,7 +10,7 @@
 #include <string>
 
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/io/assimp_export.hpp"
+#include "volumetric_kit/recon/io/mesh_io_assimp_export.hpp"
 #include "volumetric_kit/recon/io/triangle_mesh.hpp"
 
 namespace volumetric_kit::recon::io {
@@ -22,7 +22,7 @@ namespace volumetric_kit::recon::io {
 /// @return OK; InvalidArgument for an empty path, one with an embedded NUL,
 ///         or one that is not a regular file; NotFound for a missing file;
 ///         IoError when its status cannot be read.
-VR_IO_ASSIMP_API core::Status check_mesh_file(const std::string& path);
+VR_MESH_IO_ASSIMP_API core::Status check_mesh_file(const std::string& path);
 
 /// @brief Load a static asset as one owned triangle mesh.
 ///
@@ -39,7 +39,7 @@ VR_IO_ASSIMP_API core::Status check_mesh_file(const std::string& path);
 /// where the installed Assimp allows it: Assimp before 5.3 still scales
 /// Collada by its `<unit>`, and Assimp 5.4.x converts FBX axes and units. The
 /// supported formats are those in the installed Assimp library. Link @c
-/// volumetric_kit::recon_io_assimp, enabled with
+/// volumetric_kit::recon_mesh_io_assimp, enabled with
 /// @c VR_WITH_ASSIMP=ON; Assimp types and ownership stay private.
 ///
 /// @param path Asset path without embedded NUL; sidecar files resolve relative
@@ -50,6 +50,7 @@ VR_IO_ASSIMP_API core::Status check_mesh_file(const std::string& path);
 ///         Unsupported for animation, skinning, morphs or non-triangle
 ///         primitives; IoError for import/read failures; OutOfMemory for
 ///         allocation failure or geometry exceeding 32-bit indexing.
-VR_IO_ASSIMP_API core::Result<TriangleMesh> load_mesh(const std::string& path);
+VR_MESH_IO_ASSIMP_API core::Result<TriangleMesh> load_mesh(
+    const std::string& path);
 
 }  // namespace volumetric_kit::recon::io

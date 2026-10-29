@@ -1,0 +1,503 @@
+#version 450
+
+// Write a mesh's truncated distance field into a grid's tsdf/weight, one
+// workgroup per block the band reaches. Each voxel takes the minimum over the
+// triangles mesh_bin.comp filed under its block -- every triangle within
+// trunc_dist of any of the block's voxels, since a bin holds each triangle
+// within trunc_dist + half-diagonal of the block's centre -- so the minimum
+// over the bin is the true minimum wherever the result is observed.
+//
+// Observed means within trunc_dist of the mesh, in both modes: that is the set
+// the band test guarantees complete, and it is the set the allocation covers.
+// An observed voxel gets weight 1 and its distance clamped to +-trunc_dist;
+// every other voxel of the block gets tsdf 0, weight 0 -- a fresh block's
+// zeros, which the mesher and the codec read as unobserved.
+//
+//   Signed -- +-distance, the sign from the closest triangle's face normal:
+//             the rule the research codec shipped. No topology, so it trusts
+//             the mesh to be closed and outward-wound, and a voxel off a sharp
+//             edge can take the wrong side (see MeshSdfMode::Signed).
+//   Shell  -- distance - pc.shell: a thin solid around every triangle.
+//
+// The minimum breaks ties on the triangle index. The fill pass wrote each bin
+// in atomic-arrival order, and two triangles tie along every shared edge and at
+// every shared vertex; taking "the first minimum" would sign those voxels by
+// whichever face the atomics happened to file first.
+//
+// THE EARLY EXIT IS EXACT. Most of a bin cannot be a voxel's nearest triangle,
+// so a voxel measures only the triangles no lower bound rules out, and still
+// writes, bit for bit, what measuring its whole bin writes.
+//
+// The bounds, from a point x to every point of a triangle T:
+//   support plane -- u.(x - c) + min over T's vertices v of u.(c - v), for a
+//                    unit u and a point c: T lies behind that plane. Here c is
+//                    the block's centre and u points to it from the closest
+//                    point vrClosestPointOnTriangle finds.
+//   ball          -- |x - m| - R: T lies within R of m, R being its farthest
+//                    vertex from m (the centroid here).
+//   cylinder      -- the distance from x to the cylinder around m with axis a
+//                    unit n (the face normal here), radius R, and half-height
+//                    T's farthest vertex off the plane through m: T lies in it.
+// Each holds for any c and m and any unit u and n, so it does not matter where
+// rounding put them; what rounds is evaluating a bound (u and n come within a
+// few ulps of unit length), and measuring.
+//
+// The margin. Let s be the largest |coordinate| of c and T's vertices, and
+// band = trunc_dist + the block's half-diagonal, which bounds |x - c| for a
+// voxel x and every distance the field records. The closest point lies within
+// about 35 s*2^-24 of T (a vertex; a parameter in [0, 1] along an edge; or
+// clamped barycentrics), so a measured distance falls short of the true one by
+// at most that and a few band*2^-24; each bound evaluates within about
+// 75 s*2^-24 + 30 band*2^-24 of its value (the cylinder's is the worst, as
+// x - m reaches about 4 s). Every bound of T is taken less
+// m_T = 2^-14 (s + band), about ten times both together, so a bound of T that
+// is positive with its square above L puts T's measured d^2 above L,
+// strictly, and its distance above sqrt(L) by more than the rounding of sqrt.
+// The margin grows with s, so a triangle whose corners lie far beyond the
+// block gets a margin to match the rounding they bring.
+//
+// The rule. A voxel's limit L is its best d^2 so far, or trunc_dist^2 if that
+// is smaller, and a triangle is ruled out only by a bound as above: then it
+// can neither beat nor tie the best (whose d^2 is at least L), and where L is
+// trunc_dist^2 it is not observed. The best only falls, so a bound taken
+// against an earlier limit, or the largest of several voxels' limits, rules
+// out no more. Each triangle measured is measured by the same routine on the
+// same floats, and the minimum over (d^2, index) does not depend on the order
+// -- so the voxel's minimum, and what it writes, are its whole bin's.
+//
+// The order. The workgroup sorts its bin into VR_BUCKETS buckets of the
+// support-plane bound at c, less m_T (a counting sort in shared memory). A
+// bucket's floor, bucket * step, is at most every entry's bound from its first
+// position on, so from a voxel x each of them has a support-plane bound of at
+// least that floor less |x - c|; less the block's own margin for rounding the
+// floor and |x - c|, that is the stop: the voxel stops scanning at the first
+// chunk it rules out. Each chunk of VR_CHUNK entries is staged in shared memory
+// with its bounds. Each culling group -- 32 invocations, a 4x4x2 brick of an
+// 8^3 block -- keeps the chunk's triangles that the support plane and the ball
+// do not rule out anywhere in its voxels' box at the largest limit among them;
+// each voxel then measures those the support plane and the cylinder do not
+// rule out at its own. A bin past VR_MAX_SORTED sorts its first VR_MAX_SORTED
+// entries; the rest follow in bin order, scanned by every voxel to the end.
+
+#extension GL_GOOGLE_include_directive : require
+#define VR_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/recon/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/triangle_common.glsl"
+
+// Sizes, as macros so the preprocessor can check the shared memory they take.
+#define VR_THREADS 256      // a round of a block's voxels
+#define VR_GROUP 32         // a culling group: consecutive invocations
+#define VR_GROUPS 8         // VR_THREADS / VR_GROUP
+#define VR_CHUNK 64         // bin entries staged at a time
+#define VR_BUCKETS 256      // of the sort key: 8 bits, 4 to a word
+#define VR_MAX_SORTED 2048  // bin entries sorted: 16-bit indices, 2 to a word
+// The shared arrays below, in 4-byte words: the sort's keys, order, starts and
+// cursors; a chunk's triangles, 9 coordinates and 3 vec4s; each group's box,
+// limit, count and list; and s_any. 4,033 words, 16,132 bytes: inside the
+// 16,384 every Vulkan device offers (maxComputeSharedMemorySize).
+#define VR_SHARED_WORDS                                      \
+  (VR_MAX_SORTED / 4 + VR_MAX_SORTED / 2 + 2 * VR_BUCKETS +  \
+   VR_CHUNK * (1 + 9 + 3 * 4) + VR_GROUPS * (6 + 2 + VR_CHUNK) + 1)
+#if VR_SHARED_WORDS * 4 > 16384 || VR_GROUPS * VR_GROUP != VR_THREADS
+#error "mesh_integrate.comp: shared memory past 16,384 bytes"
+#endif
+
+layout(local_size_x = VR_THREADS) in;
+
+// One block to write: where its voxels live, and its bin.
+// Scalar layout, 12 bytes, byte-identical to MeshBin in mesh_integrator.cpp.
+struct MeshBin {
+  int ptr;
+  uint begin;
+  uint count;
+};
+
+layout(set = 0, binding = 0, scalar) buffer Tsdf { float tsdf[]; };
+layout(set = 0, binding = 1, scalar) buffer Weight { float weight[]; };
+layout(set = 0, binding = 2, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+layout(set = 0, binding = 3, scalar) readonly buffer Indices { uint indices[]; };
+layout(set = 0, binding = 4, scalar) readonly buffer Bins { MeshBin bins[]; };
+layout(set = 0, binding = 5, scalar) readonly buffer BinTris {
+  uint bin_tris[];
+};
+// Each binned slot's block coordinate, as mesh_bin.comp's count pass stored
+// it, so the host reads back only the counts.
+layout(set = 0, binding = 6, scalar) readonly buffer SlotCoords {
+  ivec3 slot_coord[];
+};
+// The map's block stamps: every block written is stamped changed, since the
+// write overwrites it whole.
+layout(set = 0, binding = 7, scalar) buffer Stamps { BlockStamp stamps[]; };
+
+// The write is split across dispatches so that none measures more than
+// MeshIntegrator::kMaxDispatchBinEntries bin entries; this one writes bins
+// [first_bin, first_bin + num_bins), one workgroup each.
+layout(push_constant, scalar) uniform PushConstants {
+  VoxelGridParams grid;
+  uint first_bin;
+  uint num_bins;
+  uint mode;    // kModeSigned or kModeShell (voxelize::MeshSdfMode)
+  float shell;  // shell half-thickness, metres
+  uint tick;    // the map's tick, which each block written is stamped with
+} pc;
+
+const uint kModeSigned = 0u;
+const uint kModeShell = 1u;
+const uint kNoTriangle = 0xFFFFFFFFu;
+
+const uint kThreads = uint(VR_THREADS);
+const uint kGroup = uint(VR_GROUP);
+const uint kChunk = uint(VR_CHUNK);
+const uint kBuckets = uint(VR_BUCKETS);
+const uint kMaxSorted = uint(VR_MAX_SORTED);
+// 2^-14: the margin per metre of coordinate magnitude and of band (see the
+// top), about 1,000 times float's unit roundoff.
+const float kMargin = 1.0 / 16384.0;
+
+// The sort: each entry's bucket (4 to a word), then the bin's indices in
+// bucket order (2 to a word), and each bucket's first sorted position.
+shared uint s_bucket[VR_MAX_SORTED / 4];
+shared uint s_order[VR_MAX_SORTED / 2];
+shared uint s_start[VR_BUCKETS];
+shared uint s_cursor[VR_BUCKETS];
+// One staged chunk: triangle, vertices, support plane (u, its bound at c less
+// m_T), ball (centroid, radius plus m_T), cylinder axis (normal, half-height
+// plus m_T).
+shared uint s_tri[VR_CHUNK];
+shared float s_vtx[9 * VR_CHUNK];
+shared vec4 s_plane[VR_CHUNK];
+shared vec4 s_ball[VR_CHUNK];
+shared vec4 s_axis[VR_CHUNK];
+// Per culling group: its voxels' box, the largest limit among its scanning
+// voxels (as float bits + 1; 0 for none), and the chunk entries it keeps.
+shared int s_gbox[6 * VR_GROUPS];
+shared uint s_glimit[VR_GROUPS];
+shared uint s_kept[VR_GROUPS];
+shared uint s_list[VR_GROUPS * VR_CHUNK];
+shared uint s_any;
+
+vec3 vertexOf(uint t, uint k) { return vertices[indices[3u * t + k]]; }
+
+float sizeOf(vec3 v) { return max(abs(v.x), max(abs(v.y), abs(v.z))); }
+
+// m_T for triangle (a, b, c) at a block whose centre has size centre_size.
+float triangleMargin(float centre_size, float band, vec3 a, vec3 b, vec3 c) {
+  float s = max(centre_size, max(sizeOf(a), max(sizeOf(b), sizeOf(c))));
+  return kMargin * (s + band);
+}
+
+// The support plane of triangle (a, b, cc) facing c: u, and its bound at c.
+vec4 supportPlane(vec3 c, vec3 a, vec3 b, vec3 cc) {
+  vec3 dir = c - vrClosestPointOnTriangle(c, a, b, cc);
+  float len2 = dot(dir, dir);
+  if (!(len2 > 0.0)) {
+    return vec4(0.0);
+  }
+  vec3 u = dir * inversesqrt(len2);
+  return vec4(u, min(dot(u, c - a), min(dot(u, c - b), dot(u, c - cc))));
+}
+
+// The bucket of a bound lb: its floor, bucket * step, is at most lb (to the
+// rounding the margin covers). Bucket 0, whose floor no voxel's stop can pass,
+// takes every bound under one step, and NaN.
+uint bucketOf(float lb, float step) {
+  float k = floor(lb / step);
+  return k >= 1.0 ? uint(min(k, float(kBuckets - 1u))) : 0u;
+}
+
+// The sorted bin's entry at position pos, and the bucket holding it.
+uint sortedIndex(uint pos) {
+  return (s_order[pos >> 1u] >> ((pos & 1u) << 4u)) & 0xFFFFu;
+}
+uint bucketAt(uint pos) {
+  uint lo = 0u;  // s_start[0] == 0 <= pos
+  uint hi = kBuckets;
+  while (hi - lo > 1u) {
+    uint mid = (lo + hi) >> 1u;
+    if (s_start[mid] <= pos) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// Voxel v of a round. An 8^3 block goes in 4x4x2 bricks, one per culling
+// group, so a group's voxels are near one another; any other size in row
+// order.
+ivec3 voxelOf(uint v, int bs) {
+  if (bs == 8) {
+    uint w = v & 31u;
+    uint b = v >> 5u;
+    return ivec3(int((b & 1u) * 4u + (w & 3u)),
+                 int(((b >> 1u) & 1u) * 4u + ((w >> 2u) & 3u)),
+                 int((b >> 2u) * 2u + (w >> 4u)));
+  }
+  uint ubs = uint(bs);
+  return ivec3(int(v % ubs), int((v / ubs) % ubs), int(v / (ubs * ubs)));
+}
+
+// Measure triangle t, vertices (a, b, c), from p: the minimum over (d^2, t).
+void measure(vec3 p, uint t, vec3 a, vec3 b, vec3 c, inout float best_d2,
+             inout uint best_t, inout vec3 best_closest) {
+  vec3 q = vrClosestPointOnTriangle(p, a, b, c);
+  vec3 d = p - q;
+  float d2 = dot(d, d);
+  if (d2 < best_d2 || (d2 == best_d2 && t < best_t)) {
+    best_d2 = d2;
+    best_t = t;
+    best_closest = q;
+  }
+}
+
+// Whether a bound rules a triangle out against a squared limit (strictly).
+bool ruledOut(float lb, float limit) { return lb > 0.0 && lb * lb > limit; }
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  MeshBin bin = bins[pc.first_bin + gl_WorkGroupID.x];
+  uint vpb = uint(pc.grid.voxels_per_block);
+  uint slot = uint(bin.ptr) / vpb;
+  if (lid == 0u) {
+    stamps[slot].changed = pc.tick;
+  }
+
+  int bs = pc.grid.block_size;
+  ivec3 coord = slot_coord[slot];
+  float span = float(bs - 1) * pc.grid.voxel_size;
+  vec3 centre = vec3(coord * bs) * pc.grid.voxel_size + vec3(0.5 * span);
+  // Every binned triangle comes within band of the centre, as does every
+  // voxel of the block; the sort's buckets divide it.
+  float band = pc.grid.trunc_dist + 0.8660254 * span;
+  float step = band / float(kBuckets);
+  float centre_size = sizeOf(centre);
+  float trunc_dist = pc.grid.trunc_dist;
+  float trunc2 = trunc_dist * trunc_dist;
+
+  // Sort the first kMaxSorted entries; any past them, a tail, are measured in
+  // bin order after them, without the stop.
+  uint nsorted = min(bin.count, kMaxSorted);
+  for (uint i = lid; i < kMaxSorted / 2u; i += kThreads) {
+    s_order[i] = 0u;
+    if (i < kMaxSorted / 4u) {
+      s_bucket[i] = 0u;
+    }
+    if (i < kBuckets) {
+      s_start[i] = 0u;
+    }
+  }
+  barrier();
+  for (uint i = lid; i < nsorted; i += kThreads) {
+    uint t = bin_tris[bin.begin + i];
+    vec3 a = vertexOf(t, 0u);
+    vec3 b = vertexOf(t, 1u);
+    vec3 c = vertexOf(t, 2u);
+    uint key = bucketOf(supportPlane(centre, a, b, c).w -
+                            triangleMargin(centre_size, band, a, b, c),
+                        step);
+    atomicAdd(s_start[key], 1u);
+    atomicOr(s_bucket[i >> 2u], key << ((i & 3u) << 3u));
+  }
+  barrier();
+  // Exclusive prefix sum of the bucket counts (Hillis-Steele).
+  uint own = lid < kBuckets ? s_start[lid] : 0u;
+  uint sum = own;
+  for (uint off = 1u; off < kBuckets; off <<= 1u) {
+    uint add = lid < kBuckets && lid >= off ? s_start[lid - off] : 0u;
+    barrier();
+    if (lid < kBuckets) {
+      sum += add;
+      s_start[lid] = sum;
+    }
+    barrier();
+  }
+  if (lid < kBuckets) {
+    s_start[lid] = sum - own;
+    s_cursor[lid] = sum - own;
+  }
+  barrier();
+  for (uint i = lid; i < nsorted; i += kThreads) {
+    uint key = (s_bucket[i >> 2u] >> ((i & 3u) << 3u)) & 0xFFu;
+    uint pos = atomicAdd(s_cursor[key], 1u);
+    atomicOr(s_order[pos >> 1u], i << ((pos & 1u) << 4u));
+  }
+  barrier();
+
+  uint g = lid / kGroup;
+  uint lane = lid % kGroup;
+  for (uint v0 = 0u; v0 < vpb; v0 += kThreads) {
+    uint v = v0 + lid;
+    bool live = v < vpb;
+    // Node-centred voxels (voxel * voxel_size), matching
+    // volume/voxel_coords.hpp::voxel_to_world and tsdf_integrate.comp.
+    ivec3 lc = voxelOf(live ? v : 0u, bs);
+    uint local = uint(lc.x + bs * (lc.y + bs * lc.z));
+    vec3 p = vec3(coord * bs + lc) * pc.grid.voxel_size;
+
+    // The group's box, over its live voxels.
+    if (lane < 3u) {
+      s_gbox[6u * g + lane] = 0x7FFFFFFF;
+      s_gbox[6u * g + 3u + lane] = -0x7FFFFFFF;
+    }
+    barrier();
+    if (live) {
+      atomicMin(s_gbox[6u * g], lc.x);
+      atomicMin(s_gbox[6u * g + 1u], lc.y);
+      atomicMin(s_gbox[6u * g + 2u], lc.z);
+      atomicMax(s_gbox[6u * g + 3u], lc.x);
+      atomicMax(s_gbox[6u * g + 4u], lc.y);
+      atomicMax(s_gbox[6u * g + 5u], lc.z);
+    }
+    barrier();
+
+    float best_d2 = 3.4e38;
+    uint best_t = kNoTriangle;
+    vec3 best_closest = p;
+    float reach = length(p - centre) + kMargin * (centre_size + band);
+    bool scanning = live;
+    for (uint base = 0u; base < bin.count; base += kChunk) {
+      if (lane == 0u) {
+        s_glimit[g] = 0u;
+        s_kept[g] = 0u;
+      }
+      if (lid == 0u) {
+        s_any = 0u;
+      }
+      barrier();
+      float limit = min(best_d2, trunc2);
+      bool tail = base >= nsorted;
+      if (tail) {
+        scanning = live;
+      } else if (scanning &&
+                 ruledOut(float(bucketAt(base)) * step - reach, limit)) {
+        scanning = false;
+      }
+      if (scanning) {
+        atomicOr(s_any, 1u);
+        atomicMax(s_glimit[g], floatBitsToUint(limit) + 1u);
+      }
+      barrier();
+      if (s_any == 0u) {
+        if (tail || nsorted == bin.count) {
+          break;
+        }
+        // Every voxel is done with the sorted part: on to the tail.
+        barrier();
+        base = nsorted - kChunk;
+        continue;
+      }
+
+      uint n = min(kChunk, bin.count - base);
+      for (uint j = lid; j < n; j += kThreads) {
+        uint pos = base + j;
+        uint t = bin_tris[bin.begin + (pos < nsorted ? sortedIndex(pos) : pos)];
+        vec3 a = vertexOf(t, 0u);
+        vec3 b = vertexOf(t, 1u);
+        vec3 c = vertexOf(t, 2u);
+        s_tri[j] = t;
+        s_vtx[9u * j] = a.x;
+        s_vtx[9u * j + 1u] = a.y;
+        s_vtx[9u * j + 2u] = a.z;
+        s_vtx[9u * j + 3u] = b.x;
+        s_vtx[9u * j + 4u] = b.y;
+        s_vtx[9u * j + 5u] = b.z;
+        s_vtx[9u * j + 6u] = c.x;
+        s_vtx[9u * j + 7u] = c.y;
+        s_vtx[9u * j + 8u] = c.z;
+        float m = triangleMargin(centre_size, band, a, b, c);
+        vec4 plane = supportPlane(centre, a, b, c);
+        s_plane[j] = vec4(plane.xyz, plane.w - m);
+        vec3 mid = (a + b + c) * (1.0 / 3.0);
+        s_ball[j] = vec4(mid, sqrt(max(dot(a - mid, a - mid),
+                                       max(dot(b - mid, b - mid),
+                                           dot(c - mid, c - mid)))) +
+                                  m);
+        vec3 nrm = cross(b - a, c - a);
+        float nl2 = dot(nrm, nrm);
+        nrm = nl2 > 1e-30 ? nrm * inversesqrt(nl2) : vec3(0.0, 0.0, 1.0);
+        s_axis[j] = vec4(nrm, max(abs(dot(a - mid, nrm)),
+                                  max(abs(dot(b - mid, nrm)),
+                                      abs(dot(c - mid, nrm)))) +
+                                  m);
+      }
+      barrier();
+      // The group keeps what some voxel of its box may need: the support
+      // plane at the box's nearest corner along u, and the ball.
+      uint glimit = s_glimit[g];
+      if (glimit != 0u) {
+        float gl = uintBitsToFloat(glimit - 1u);
+        ivec3 glo = ivec3(s_gbox[6u * g], s_gbox[6u * g + 1u],
+                          s_gbox[6u * g + 2u]);
+        ivec3 ghi = ivec3(s_gbox[6u * g + 3u], s_gbox[6u * g + 4u],
+                          s_gbox[6u * g + 5u]);
+        vec3 gcentre =
+            (vec3(coord * bs) + 0.5 * vec3(glo + ghi)) * pc.grid.voxel_size;
+        vec3 ghalf = 0.5 * vec3(ghi - glo) * pc.grid.voxel_size;
+        vec3 goff = gcentre - centre;
+        for (uint j = lane; j < n; j += kGroup) {
+          vec4 plane = s_plane[j];
+          vec4 ball = s_ball[j];
+          float lb = plane.w + dot(plane.xyz, goff) -
+                     dot(abs(plane.xyz), ghalf);
+          lb = max(lb, length(max(abs(ball.xyz - gcentre) - ghalf,
+                                  vec3(0.0))) -
+                           ball.w);
+          if (!ruledOut(lb, gl)) {
+            s_list[g * kChunk + atomicAdd(s_kept[g], 1u)] = j;
+          }
+        }
+      }
+      barrier();
+      if (scanning) {
+        uint kept = s_kept[g];
+        for (uint i = 0u; i < kept; ++i) {
+          uint j = s_list[g * kChunk + i];
+          vec4 plane = s_plane[j];
+          vec4 ball = s_ball[j];
+          vec4 axis = s_axis[j];
+          vec3 off = p - ball.xyz;
+          float h = dot(off, axis.xyz);
+          float dr = max(length(off - h * axis.xyz) - ball.w, 0.0);
+          float dz = max(abs(h) - axis.w, 0.0);
+          float lb = max(plane.w + dot(plane.xyz, p - centre),
+                         sqrt(dr * dr + dz * dz));
+          if (ruledOut(lb, min(best_d2, trunc2))) {
+            continue;
+          }
+          measure(p, s_tri[j],
+                  vec3(s_vtx[9u * j], s_vtx[9u * j + 1u], s_vtx[9u * j + 2u]),
+                  vec3(s_vtx[9u * j + 3u], s_vtx[9u * j + 4u],
+                       s_vtx[9u * j + 5u]),
+                  vec3(s_vtx[9u * j + 6u], s_vtx[9u * j + 7u],
+                       s_vtx[9u * j + 8u]),
+                  best_d2, best_t, best_closest);
+        }
+      }
+      barrier();
+    }
+    if (!live) {
+      continue;
+    }
+
+    float dist = sqrt(best_d2);
+    bool observed = best_t != kNoTriangle && dist <= trunc_dist;
+    float sdf = 0.0;
+    if (observed) {
+      if (pc.mode == kModeSigned) {
+        vec3 a = vertexOf(best_t, 0u);
+        vec3 b = vertexOf(best_t, 1u);
+        vec3 c = vertexOf(best_t, 2u);
+        sdf = dot(p - best_closest, cross(b - a, c - a)) >= 0.0 ? dist : -dist;
+      } else {
+        sdf = dist - pc.shell;
+      }
+    }
+
+    uint idx = uint(bin.ptr) + local;
+    tsdf[idx] = observed ? clamp(sdf, -trunc_dist, trunc_dist) : 0.0;
+    weight[idx] = observed ? 1.0 : 0.0;
+  }
+}
