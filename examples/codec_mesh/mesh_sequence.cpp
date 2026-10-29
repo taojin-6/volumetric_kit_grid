@@ -270,9 +270,9 @@ vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence) {
   return result;
 }
 
-vkc::Result<vr::tsdf::MeshIntegrateStats> convert_frame(
-    vr::volume::VoxelBlockGrid& grid, vr::tsdf::MeshIntegrator& integrator,
-    const io::TriangleMesh& mesh, const vr::tsdf::MeshSdfParams& params,
+vkc::Result<vr::voxelize::MeshIntegrateStats> convert_frame(
+    vr::volume::VoxelBlockGrid& grid, vr::voxelize::MeshIntegrator& integrator,
+    const io::TriangleMesh& mesh, const vr::voxelize::MeshSdfParams& params,
     vkc::StageMetrics* metrics) {
   VKC_TRY(grid.clear());
   const auto vertices = std::uint32_t(mesh.positions.size());
@@ -303,15 +303,15 @@ vkc::Result<vr::tsdf::MeshIntegrateStats> convert_frame(
 vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    std::uint32_t number,
                                    vr::volume::VoxelBlockGrid& grid,
-                                   vr::tsdf::MeshIntegrator& integrator,
-                                   const vr::tsdf::MeshSdfParams& params,
+                                   vr::voxelize::MeshIntegrator& integrator,
+                                   const vr::voxelize::MeshSdfParams& params,
                                    vr::sender::CodecStream& stream,
                                    vkc::StageMetrics* conversion) {
   CodedFrame coded;
   VKC_ASSIGN(coded.frame, sequence.load(number));
   VKC_TRY(sequence.admit(number, coded.frame.topology));
   const std::string name = frame_name(number, coded.frame.path);
-  vkc::Result<vr::tsdf::MeshIntegrateStats> stats =
+  vkc::Result<vr::voxelize::MeshIntegrateStats> stats =
       convert_frame(grid, integrator, coded.frame.mesh, params, conversion);
   if (!stats.ok()) return stats.status().with_context(name);
   coded.stats = *stats;

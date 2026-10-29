@@ -9,9 +9,9 @@
 //
 // Shared rather than restated by every triangle-driven kernel.
 // hash_allocate_triangles.comp allocates the blocks that pass vrBlockInBand,
-// and tsdf's mesh_bin.comp bins triangles into exactly the blocks that pass it.
-// A second copy of the test would compile clean and let the integrator look
-// for a block the allocator never made -- or skip one it did.
+// and voxelize's mesh_bin.comp bins triangles into exactly the blocks that
+// pass it. A second copy of the test would compile clean and let the
+// integrator look for a block the allocator never made -- or skip one it did.
 //
 // The includer must include hash_common.glsl first (directly, or through
 // hash_lookup.glsl), for VoxelGridParams and worldToBlock, and must #define
@@ -27,7 +27,7 @@
 #error "define VR_TRI_OFFSETS_BINDING before including triangle_candidates.glsl"
 #endif
 
-#include "volumetric_kit/recon/core/shaders/triangle_common.glsl"
+#include "volumetric_kit/recon/volume/shaders/triangle_common.glsl"
 
 // Exclusive prefix sum of per-triangle candidate-block counts, tri_count + 1
 // entries. vr_tri_offsets[tri_count] is the total work-item count, which is

@@ -26,7 +26,7 @@ namespace volumetric_kit::recon::volume {
 /// vertices bit-for-bit. That shader also holds the band test that prunes a
 /// candidate to the blocks the band actually reaches.
 /// @ref VoxelHashMap::allocate_from_triangles allocates over this
-/// decomposition and `tsdf::MeshIntegrator` bins triangles over it. Sharing
+/// decomposition and `voxelize::MeshIntegrator` bins triangles over it. Sharing
 /// one definition is what guarantees the integrator finds every block the
 /// allocation made.
 ///

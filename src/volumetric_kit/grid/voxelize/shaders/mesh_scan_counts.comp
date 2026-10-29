@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(scalar, binding = 0) buffer Counts { uint counts[]; };
+layout(scalar, binding = 1) writeonly buffer Groups { uvec4 groups[]; };
+layout(push_constant, scalar) uniform Push { uint size; uint first_group; } pc;
+#include "mesh_scan.glsl"
+void main() {
+  uint group = pc.first_group + gl_WorkGroupID.x;
+  uint slot = group * 256u + gl_LocalInvocationID.x;
+  uint count = slot < pc.size ? counts[slot] : 0u;
+  uvec4 prefix = meshScan(uvec4(count, uint(count != 0u), count, 0u));
+  if (slot < pc.size) counts[slot] = prefix.x;
+  if (gl_LocalInvocationID.x == 0u) groups[group] = meshScanTotal;
+}

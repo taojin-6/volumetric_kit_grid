@@ -62,7 +62,8 @@ struct BlockStamp {
   std::uint32_t weighted = 0;
   /// The last tick a pass that writes voxels changed any of the block's:
   /// `tsdf::TsdfIntegrator` and the codec's decoder, its deblock included,
-  /// where a value changed, `tsdf::MeshIntegrator` on every block it writes.
+  /// where a value changed, `voxelize::MeshIntegrator` on every block it
+  /// writes.
   /// 0 until one does.
   std::uint32_t changed = 0;
 };

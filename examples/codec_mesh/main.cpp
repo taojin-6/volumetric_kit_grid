@@ -28,8 +28,8 @@
 #include "volumetric_kit/recon/io/ply_writer.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 #include "volumetric_kit/recon/sender/codec_stream.hpp"
-#include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
+#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -50,7 +50,7 @@ vkc::Status run(const Options& opt) {
   // Before any GPU work, and before the first pass loads every frame: a
   // step the codec or the conversion refuses costs neither.
   vr::codec::EncoderConfig config;
-  vr::tsdf::MeshSdfParams sdf;
+  vr::voxelize::MeshSdfParams sdf;
   if (!inspect) {
     VKC_ASSIGN(config, vr_example::encoder_config(opt.codec));
     VKC_ASSIGN(sdf, vr_example::mesh_sdf_config(opt.source, grid));
@@ -85,8 +85,8 @@ vkc::Status run(const Options& opt) {
   VKC_ASSIGN(
       vr::volume::VoxelBlockGrid volume,
       vr::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2));
-  VKC_ASSIGN(vr::tsdf::MeshIntegrator integrator,
-             vr::tsdf::MeshIntegrator::create(device, allocator));
+  VKC_ASSIGN(vr::voxelize::MeshIntegrator integrator,
+             vr::voxelize::MeshIntegrator::create(device, allocator));
   VKC_ASSIGN(mesh::MarchingCubes extractor,
              mesh::MarchingCubes::create(device, allocator));
   // Made before any frame is converted or written, so a rerun onto an
