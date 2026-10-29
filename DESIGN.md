@@ -925,9 +925,12 @@ is logged at Info, and a record past `max_gop_bytes` on its own, which no
 viewer can take, at Warning. A viewer whose end acknowledges no
 byte for `stall_limit` (10 s) with bytes waiting is closed: a slow reader
 stays while its end acknowledges a byte within the limit (one behind a large
-receive buffer may not), as does one with nothing waiting. Viewers that
-join, leave or fail are logged at Info; a refusal at Warning, the first and
-then one in 10 s at most, the rest at Debug. The destructor stops every
+receive buffer may not), as does one with nothing waiting. `viewers()`, an
+atomic any thread reads, counts each viewer from its accepted connection,
+before its first byte and while it waits for a key, until the server closes
+it; a refused connection never counts. Viewers that join, leave or fail are
+logged at Info; a refusal at Warning, the first and then one in 10 s at
+most, the rest at Debug. The destructor stops every
 thread within a poll slice (20 ms) and the write under way. One track is
 served (`Unsupported` otherwise), and `publish` is called from one thread.
 

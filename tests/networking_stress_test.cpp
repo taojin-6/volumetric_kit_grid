@@ -9,10 +9,12 @@
 // are mid-chunk, within 1 s. Replaying the GOP, and again with keys on
 // demand at a 1 MiB max_gop_bytes, the publisher reading key_wanted from its
 // own thread and keying each record after it rises: there the joins are
-// counted, and replaying none is.
+// counted, and replaying none is. Either way a thread of its own reads
+// viewers() throughout, which never passes max_viewers and sees a viewer.
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -118,6 +120,16 @@ int stress_case(bool replay) {
     viewers.emplace_back(viewer, server->port(), 100 + v, replay,
                          std::cref(stop_viewers), std::ref(tally));
   }
+  // Read from a thread of its own until the publishing ends.
+  std::atomic<bool> stop_watching{false};
+  std::atomic<std::size_t> most{0};  // the most viewers() read
+  std::thread watcher([&] {
+    while (!stop_watching) {
+      const std::size_t n = server->viewers();
+      if (n > most) most = n;
+      std::this_thread::sleep_for(100us);
+    }
+  });
   // Checked once the viewers are joined.
   std::uint64_t seq = 0;
   std::uint64_t wanted = 0;  // key_wanted() at the last record
@@ -139,6 +151,8 @@ int stress_case(bool replay) {
     ++seq;
   }
   wanted = server->key_wanted();
+  stop_watching = true;
+  watcher.join();
   // Destroy it under the viewers, with records still to send.
   const Clock::time_point start = Clock::now();
   server.reset();
@@ -149,18 +163,19 @@ int stress_case(bool replay) {
   CHECK(took < 1s);
   std::printf(
       "stress, %s: %llu published, %llu keys forced; %llu connections, %llu "
-      "records, %llu jumps; %llu wanted a key\n",
+      "records, %llu jumps; %llu wanted a key; at most %zu viewers\n",
       replay ? "replaying" : "keys on demand",
       static_cast<unsigned long long>(seq),
       static_cast<unsigned long long>(forced),
       static_cast<unsigned long long>(tally.connections.load()),
       static_cast<unsigned long long>(tally.records.load()),
       static_cast<unsigned long long>(tally.jumps.load()),
-      static_cast<unsigned long long>(wanted));
+      static_cast<unsigned long long>(wanted), most.load());
   CHECK(!tally.broken);
   CHECK(tally.connections > 4);
   CHECK(tally.records > 0);
   CHECK(replay ? wanted == 0 : wanted > 0);
+  CHECK(most >= 1 && most <= options.max_viewers);
   return 0;
 }
 

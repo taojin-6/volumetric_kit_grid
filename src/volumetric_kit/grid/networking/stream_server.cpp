@@ -95,10 +95,11 @@ struct StreamServer::Impl {
   std::mutex mutex;
   std::condition_variable wake;   // a record published, or the stop
   detail::GopLog log;             // under the mutex
-  std::size_t live = 0;           // under the mutex: viewers being served
   std::atomic<bool> stop{false};  // set under the mutex
   // The log's key_wanted(), set under the mutex and read from any thread.
   std::atomic<std::uint64_t> key_wanted{0};
+  // The viewers being served: changed under the mutex, read from any thread.
+  std::atomic<std::size_t> live{0};
 
   std::list<Viewer> viewers;  // the accept thread's, then the destructor's
   // The accept thread's: when a refusal was last logged at Warning.
@@ -465,6 +466,10 @@ std::uint16_t StreamServer::port() const noexcept { return impl_->port; }
 
 std::uint64_t StreamServer::key_wanted() const noexcept {
   return impl_->key_wanted.load();
+}
+
+std::size_t StreamServer::viewers() const noexcept {
+  return impl_->live.load();
 }
 
 }  // namespace volumetric_kit::grid::networking

@@ -168,6 +168,14 @@ class VGRID_NETWORKING_API StreamServer {
   ///         `replay_gop`, whose joiners start at the GOP's key.
   std::uint64_t key_wanted() const noexcept;
 
+  /// @brief The viewers being served now: each counted from its accepted
+  ///        connection, before its first byte, until the server closes it as
+  ///        it leaves, fails or stalls past @ref ServerOptions::stall_limit.
+  ///        A viewer waiting for a key counts; a connection refused at
+  ///        @ref ServerOptions::max_viewers never does. Safe from any thread.
+  /// @return The count, at most `max_viewers`.
+  std::size_t viewers() const noexcept;
+
  private:
   struct Impl;
   explicit StreamServer(std::unique_ptr<Impl> impl) noexcept;
