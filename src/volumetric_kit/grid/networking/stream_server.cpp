@@ -98,8 +98,8 @@ struct StreamServer::Impl {
   std::atomic<bool> stop{false};  // set under the mutex
   // The log's key_wanted(), set under the mutex and read from any thread.
   std::atomic<std::uint64_t> key_wanted{0};
-  // The viewers being served: added by the accept thread, read from any
-  // thread.
+  // The viewers being served: added by the accept thread, taken off by each
+  // viewer's thread as it ends, read from any thread.
   std::atomic<std::size_t> live{0};
 
   std::list<Viewer> viewers;  // the accept thread's, then the destructor's

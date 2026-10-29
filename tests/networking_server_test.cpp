@@ -26,8 +26,8 @@
 // publish; viewers() counts a viewer from before its session, one waiting for
 // a key too, until it leaves, fails or stalls, and never a refused
 // connection; a viewer's join and leave are logged at Info, the leave once it
-// no longer counts; the writer's
-// refusals send nothing, and so does a payload over the parser's cap; start
+// no longer counts; the writer's refusals send nothing, and so does a payload
+// over the parser's cap; start
 // refuses (a stall_limit of 0 or less among them); the destructor returns
 // within 1 s with no viewers, idle ones and a stalled one; the threads of
 // viewers that ended are joined as they go, the address space (on macOS, its
