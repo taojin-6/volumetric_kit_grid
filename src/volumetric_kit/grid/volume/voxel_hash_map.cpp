@@ -108,7 +108,7 @@ struct DepthTiles {
   std::uint32_t x;
   std::uint32_t total;
 };
-DepthTiles depth_tiles(const DepthCameraParams& camera) {
+DepthTiles depth_tiles(const DepthPinhole& camera) {
   const std::uint64_t x =
       (std::uint64_t{camera.width} + kDepthTile - 1) / kDepthTile;
   const std::uint64_t y =
@@ -234,7 +234,7 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   const VkDeviceSize alignment =
       std::max<VkDeviceSize>(limits.limits.minStorageBufferOffsetAlignment, 4);
   map.camera_stride_ =
-      (sizeof(DepthCameraParams) + alignment - 1) / alignment * alignment;
+      (sizeof(DepthPinhole) + alignment - 1) / alignment * alignment;
   VKC_ASSIGN(map.camera_params_,
              core::device_storage_buffer(allocator, map.camera_stride_));
   // Frusta for the frustum compactions: likewise small -- one frustum's count
@@ -760,14 +760,14 @@ core::Result<std::uint32_t> VoxelHashMap::allocate(const core::Buffer& coords,
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
-    const float* depth, const DepthCameraParams& camera,
-    AllocFailures* out_failures, core::StageMetrics* metrics) {
+    const float* depth, const DepthPinhole& camera, AllocFailures* out_failures,
+    core::StageMetrics* metrics) {
   return allocate_from_depth({DepthInput{core::StorageInput(depth), camera}},
                              out_failures, metrics);
 }
 
 core::Result<std::uint32_t> VoxelHashMap::allocate_from_depth(
-    const core::Buffer& depth, const DepthCameraParams& camera,
+    const core::Buffer& depth, const DepthPinhole& camera,
     AllocFailures* out_failures, core::StageMetrics* metrics) {
   return allocate_from_depth({DepthInput{core::StorageInput(depth), camera}},
                              out_failures, metrics);
@@ -828,7 +828,7 @@ core::Result<RecordedRounds> VoxelHashMap::record_depth(
   std::vector<std::size_t> live;  // the frames that dispatch, in order
   std::vector<std::uint32_t> pixels(frames.size(), 0);
   for (std::size_t i = 0; i < frames.size(); ++i) {
-    const DepthCameraParams& camera = frames[i].camera;
+    const DepthPinhole& camera = frames[i].camera;
     const std::uint64_t count =
         static_cast<std::uint64_t>(camera.width) * camera.height;
     if (count > std::numeric_limits<std::uint32_t>::max()) {
@@ -876,7 +876,7 @@ core::Result<RecordedRounds> VoxelHashMap::record_depth(
   std::vector<std::uint8_t> cameras(static_cast<std::size_t>(camera_bytes), 0);
   for (std::size_t k = 0; k < live.size(); ++k) {
     std::memcpy(cameras.data() + k * camera_stride_, &frames[live[k]].camera,
-                sizeof(DepthCameraParams));
+                sizeof(DepthPinhole));
   }
   VKC_TRY(batch.upload(camera_params_, 0, cameras.data(), camera_bytes));
   // Every binding of every set, so a set another call wrote, or one a resize
@@ -899,7 +899,7 @@ core::Result<RecordedRounds> VoxelHashMap::record_depth(
     set.write_storage_buffer(4, depth, 0, bytes);
     set.write_storage_buffer(5, fail_counts_.handle(), 0, VK_WHOLE_SIZE);
     set.write_storage_buffer(6, camera_params_.handle(), k * camera_stride_,
-                             sizeof(DepthCameraParams));
+                             sizeof(DepthPinhole));
     set.write_storage_buffer(7, stamps_.handle(), 0, VK_WHOLE_SIZE);
   }
   // The round between the judge's two passes: the first clears the tally,
