@@ -44,13 +44,3 @@ repos:
         language: pygrep
         files: \.(h|hpp|hxx|inl|ipp|c|cc|cpp|cxx|cu|cuh|mm)$
         exclude: ^examples/
-
-# pre-commit.ci (https://pre-commit.ci) runs these same hooks on every PR and
-# pushes the auto-fixes back to the branch, so formatting lands even when a
-# contributor has not run `pre-commit install` locally. The repo's required
-# `lint` check stays the merge gate; this just removes the manual step.
-ci:
-  autofix_prs: true
-  autofix_commit_msg: "style: auto-fixes from pre-commit.ci hooks"
-  autoupdate_schedule: monthly
-  autoupdate_commit_msg: "chore: pre-commit autoupdate"
