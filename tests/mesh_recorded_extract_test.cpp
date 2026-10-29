@@ -464,9 +464,9 @@ int move_case(vkc::test::Gpu& gpu) {
 }
 
 // Once warm, an extract costs one submit and no staging buffer: recorded;
-// blocking after a grid change, its compaction in that submit; and blocking
-// while the map's last list holds, which it binds, compacting nothing and
-// leaving the list holding.
+// blocking after a grid change, its compaction in that submit, waiting at
+// most once; and blocking while the map's last list holds, which it binds,
+// compacting nothing and leaving the list holding.
 int counters_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu);
@@ -503,7 +503,9 @@ int counters_case(vkc::test::Gpu& gpu) {
     if (frame == 0) continue;
     CHECK(after.submits - before.submits == 1);
     CHECK(after.staging_buffers - before.staging_buffers == 0);
-    CHECK(after.host_waits - before.host_waits == 1);
+    // A wait that finds its batch done blocks nothing and counts none, as on
+    // a loaded host, where the batch can finish before its fence is checked.
+    CHECK(after.host_waits - before.host_waits <= 1);
   }
   vkc::Result<vol::DeviceBlockList> held =
       grid->map().compact_active_blocks_on_device();
