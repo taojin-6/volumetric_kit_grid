@@ -18,9 +18,8 @@ served live over TCP, and the codec stream that joins them.
   there.
 - [`volumetric_kit_recon`](https://github.com/taojin-6/volumetric_kit_recon)
   builds on grid (depth fusion, texturing, the live sender); grid includes
-  nothing of recon's or sensor's (`tests/package_boundary.cmake`). Until it is
-  a repository of its own, grid lives in recon's `grid/`, and a change that
-  needs both lands as one recon PR.
+  nothing of recon's or sensor's (`tests/package_boundary.cmake`). A change
+  that needs both lands as a grid PR, then a recon PR that re-pins grid.
 - Vulkan compute (GLSL → SPIR-V) on every platform, with MoltenVK on Apple.
 - Production only: no neural or research code. The `eval` tier is
   production infrastructure.
@@ -87,7 +86,7 @@ core's `vkc_require_sibling(volumetric_kit::grid <min>)`.
 ## Build and validation
 
 ```sh
-# grid_root: grid's checkout, or grid/ in recon's
+# grid_root: grid's checkout
 cmake -S "$grid_root" -B "$grid_root/build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$grid_root/build" --parallel
 ctest --test-dir "$grid_root/build" --output-on-failure

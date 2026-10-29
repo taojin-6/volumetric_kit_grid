@@ -93,9 +93,8 @@ stream → networking → codec_stream
 
 ## Packaging
 
-A consumer fetches grid by commit (`FetchContent`, `SOURCE_SUBDIR grid`
-while it lives in recon's repository) and links its targets; grid has no
-install rules. Its version, `project(VERSION)`, is the umbrella's
+A consumer fetches grid by commit (`FetchContent`) and links its targets;
+grid has no install rules. Its version, `project(VERSION)`, is the umbrella's
 `VKC_PACKAGE_VERSION`, which a consumer checks with the core's
 `vkc_require_sibling(volumetric_kit::grid <min>)`. The exported GLSL is the
 grid's GPU contract: `grid_base`'s `base/shaders/dispatch_slices.glsl` and

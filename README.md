@@ -1,5 +1,7 @@
 # volumetric_kit_grid
 
+[![ci](https://github.com/taojin-6/volumetric_kit_grid/actions/workflows/ci.yml/badge.svg)](https://github.com/taojin-6/volumetric_kit_grid/actions/workflows/ci.yml)
+
 The **sparse voxel grid** of the `volumetric_kit` family and what reads it:
 voxel hashing on the GPU, a triangle mesh's distance field, marching cubes and
 the mesh containers, mesh files, mesh-to-mesh quality measurement, the
@@ -10,8 +12,8 @@ It builds on [`volumetric_kit_core`](https://github.com/taojin-6/volumetric_kit_
 alone. [`volumetric_kit_recon`](https://github.com/taojin-6/volumetric_kit_recon)
 fuses depth into its grid and sends what it codes;
 [`volumetric_kit_gfx`](https://github.com/taojin-6/volumetric_kit_gfx) draws
-the meshes it extracts. Until it is a repository of its own, grid lives in
-recon's `grid/`.
+the meshes it extracts. grid was extracted from recon's `grid/`, with its
+history (see [CHANGELOG.md](CHANGELOG.md)).
 
 > Start with [AGENTS.md](AGENTS.md) for working conventions and commands.
 > [DESIGN.md](DESIGN.md) describes the architecture and implementation;
@@ -34,8 +36,7 @@ The GPU tests follow the core's test policy (its README, "Build and test"):
 `VKC_TEST_SYNC_VALIDATION`.
 
 Consume it from another CMake project with `FetchContent`, pinned by commit
-(grid has no install rules; while it lives in recon's repository, with
-`SOURCE_SUBDIR grid`), then link a tier (e.g. `volumetric_kit::grid_codec`) or
+(grid has no install rules), then link a tier (e.g. `volumetric_kit::grid_codec`) or
 the umbrella `volumetric_kit::grid`. Fetched, grid builds its library tiers
 alone: its tests, examples and `-Werror` (`VGRID_WARNINGS_AS_ERRORS`) default
 on only when it is the top-level project. `VGRID_BUILD_TEST_SUPPORT` builds
