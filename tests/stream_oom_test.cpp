@@ -19,8 +19,8 @@
 #include <utility>
 
 #include "stream_files.hpp"
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
@@ -54,7 +54,7 @@ std::unique_ptr<stream::StreamWriter> create(const std::string& path) {
 template <class Measure, class Call>
 int expect_oom(const char* name, const Measure& measure, const Call& call,
                Code normal) {
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const Code measured = measure();
@@ -255,7 +255,7 @@ int sticky_errors_child(const std::string& dir) {
   // A non-key append allocates only when diagnosing this failed write.
   // Measure the initial diagnostic's string growth without relying on a
   // particular standard library's small-string capacity or errno wording.
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   std::string diagnostic("StreamWriter::append");
@@ -268,7 +268,7 @@ int sticky_errors_child(const std::string& dir) {
   failure = {};
   CHECK(::setrlimit(RLIMIT_FSIZE, &previous) == 0);
   CHECK(injected && refused.domain() == Code::OutOfMemory);
-  const auto partial = vr_test::read_bytes(oom_path);
+  const auto partial = vkc::test::read_bytes(oom_path);
   // Some hosts reject the whole writev; others write up to the limit.
   CHECK(partial.size() == size || partial.size() == size + 8);
   // Once allocation and I/O can succeed again, the failed write must still
@@ -278,7 +278,7 @@ int sticky_errors_child(const std::string& dir) {
   CHECK(writer->sync().domain() == Code::OutOfMemory);
   CHECK(writer->finish().domain() == Code::OutOfMemory);
   CHECK(writer->size() == size);
-  CHECK(vr_test::read_bytes(oom_path) == partial);
+  CHECK(vkc::test::read_bytes(oom_path) == partial);
   const auto reader = vrst::open(oom_path);
   CHECK(reader != nullptr && !reader->recovery().finished);
   CHECK(reader->stats()[0].records == 0);
@@ -358,7 +358,7 @@ int parser_failures(const std::string& dir) {
     CHECK(writer->append(info(0, true, 10, 1), payload.data(), payload.size())
               .ok());
   }
-  const vrst::Bytes bytes = vr_test::read_bytes(path);
+  const vrst::Bytes bytes = vkc::test::read_bytes(path);
   stream::Record record;
   vrst::Bytes payload;
   const auto stuck = [&](stream::ChunkParser& parser) {
@@ -403,7 +403,7 @@ int parser_failures(const std::string& dir) {
   const vrst::Bytes bad = vrst::flipped(bytes, bytes.size() - 8, 0);
   CHECK(damaged.feed(bad.data(), bad.size()).domain() == Code::InvalidArgument);
   const vrst::Bytes more(std::size_t{1} << 20, 0);
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const Code again = damaged.feed(more.data(), more.size()).domain();
@@ -426,7 +426,7 @@ int caller_memory(const std::string& dir) {
               .ok());
     CHECK(writer->finish().ok());
   }
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   const auto allocates = [&](const auto& call) {
     failure = {};
     failure.measure = true;
@@ -446,7 +446,7 @@ int caller_memory(const std::string& dir) {
       [&] { return reader->read(record, slot.data(), slot.size()).ok(); }));
   CHECK(vrst::Bytes(slot.begin(), slot.begin() + 5000) == payload);
 
-  const vrst::Bytes bytes = vr_test::read_bytes(path);
+  const vrst::Bytes bytes = vkc::test::read_bytes(path);
   stream::ChunkParser parser;
   CHECK(parser.feed(bytes.data(), bytes.size()).ok());
   CHECK(!allocates([&] { return parser.next(&record, nullptr).value(); }));
@@ -460,7 +460,7 @@ int caller_memory(const std::string& dir) {
 }  // namespace
 
 int main() try {
-  const vr_test::Scratch scratch("recon-stream-oom-");
+  const vkc::test::Scratch scratch("recon-stream-oom-");
   const auto dir = scratch.path.string();
   int failed = 0;
   failed |= writer_diagnostics(dir);
@@ -472,7 +472,7 @@ int main() try {
   failed |= caller_memory(dir);
   return failed;
 } catch (const std::bad_alloc&) {
-  vr_test::allocation_failure = {};
+  vkc::test::allocation_failure = {};
   std::fprintf(stderr, "FAIL: std::bad_alloc escaped a public stream call\n");
   return 1;
 }

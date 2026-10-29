@@ -20,7 +20,7 @@
 
 #include "codec_oracle_rans.hpp"
 #include "rans.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace d = volumetric_kit::recon::codec::detail;
 namespace oracle = codec_oracle;

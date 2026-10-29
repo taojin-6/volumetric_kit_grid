@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "stream_files.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
@@ -137,13 +137,13 @@ int encoder_bytes_case(const std::string& dir) {
       CHECK(framing->padding == vrst::padding(a.payload.size()));
       append_chunk(bytes, *framing, a.payload);
     }
-    const Bytes finished = vr_test::read_bytes(base + "_finished.vrst");
+    const Bytes finished = vkc::test::read_bytes(base + "_finished.vrst");
     const std::uint64_t footer = vrst::index_offset(finished);
     CHECK(footer == bytes.size());
     CHECK(Bytes(finished.begin(),
                 finished.begin() + static_cast<std::ptrdiff_t>(footer)) ==
           bytes);
-    CHECK(vr_test::read_bytes(base + "_unfinished.vrst") == bytes);
+    CHECK(vkc::test::read_bytes(base + "_unfinished.vrst") == bytes);
   }
   return 0;
 }
@@ -186,7 +186,7 @@ int encoder_refusals_case(const std::string& dir) {
            writer.domain() == Code::InvalidArgument &&
            writer.message() ==
                "StreamWriter::create: " + fresh + ": " + encoder.message() &&
-           vr_test::read_bytes(fresh).empty();
+           vkc::test::read_bytes(fresh).empty();
   };
   const stream::Session good = session_of(1);
   stream::Session s = good;
@@ -249,7 +249,7 @@ int encoder_refusals_case(const std::string& dir) {
     CHECK(framed(info(1, true, 0, 0), p, p.data()));
     CHECK(framed(info(1, false, 0, 1), Bytes{}, nullptr));
   }
-  CHECK(vr_test::read_bytes(path) == expected);
+  CHECK(vkc::test::read_bytes(path) == expected);
   return 0;
 }
 
@@ -383,11 +383,11 @@ int parser_round_trip_case(const std::string& dir) {
     // A finished file: its footer, INDX and TAIL, skipped.
     const std::string finished = base + "_finished.vrst";
     CHECK(write_file(finished, session, records, true));
-    CHECK(parses_as_read(finished, vr_test::read_bytes(finished)) == 0);
+    CHECK(parses_as_read(finished, vkc::test::read_bytes(finished)) == 0);
     // A killed writer's, cut inside the last record's padding: it is whole.
     const std::string cut = base + "_cut.vrst";
     CHECK(write_file(cut, session, records, false));
-    Bytes bytes = vr_test::read_bytes(cut);
+    Bytes bytes = vkc::test::read_bytes(cut);
     bytes.resize(bytes.size() - 2);
     CHECK(vrst::write_bytes(cut, bytes));
     CHECK(parses_as_read(cut, bytes) == 0);
@@ -403,7 +403,7 @@ int parser_skips_case(const std::string& dir) {
   const std::string path = dir + "/skips.vrst";
   CHECK(write_file(path, session_of(1), {{info(0, true, 1, 0), pattern(20, 1)}},
                    false));
-  Bytes bytes = vr_test::read_bytes(path);
+  Bytes bytes = vkc::test::read_bytes(path);
   for (const Bytes& c :
        {vrst::chunk("ZZZZ", Bytes(16, 0x5A), pattern(13, 2)),
         vrst::record(0, 1, 2, 1, 9, pattern(77, 3), 8),  // H 64
@@ -584,7 +584,7 @@ int parser_latch_case(const std::string&) {
 int parser_read_case(const std::string& dir) {
   const std::string path = dir + "/read_into.vrst";
   CHECK(write_file(path, session_of(2), records_on(2), true));
-  const Bytes bytes = vr_test::read_bytes(path);
+  const Bytes bytes = vkc::test::read_bytes(path);
   const Parsed want = parse_whole(bytes);
   CHECK(want.failure.ok() && want.records.size() > 2);
   const auto untouched = [](const Bytes& b, std::size_t from) {
@@ -702,7 +702,7 @@ int parser_read_identity_case() {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_stream_chunks_");
+  vkc::test::Scratch scratch("recon_stream_chunks_");
   const std::string dir = scratch.path.string();
   if (encoder_bytes_case(dir) != 0) return 1;
   if (payload_runs_case() != 0) return 1;

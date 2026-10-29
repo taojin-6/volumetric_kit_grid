@@ -24,7 +24,7 @@
 
 #include <glm/glm.hpp>
 
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
 #include "volumetric_kit/recon/mesh/mesh.hpp"
 
@@ -194,7 +194,7 @@ int closest_point_case() {
 // sanitizers, which look for memory errors, not rare misses. The answer must
 // be the double-precision one to within float rounding at 3 m (0.24 um).
 int thin_triangle_case() {
-#ifdef VR_TEST_SANITIZED
+#ifdef VKC_TEST_SANITIZED
   constexpr int kDraws = 5000;
 #else
   constexpr int kDraws = 50000;

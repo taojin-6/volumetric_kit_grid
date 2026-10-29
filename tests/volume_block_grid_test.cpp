@@ -16,9 +16,9 @@
 #include <vector>
 
 #include "device_blocks.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
@@ -28,11 +28,12 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
-#include "buffer_readback.hpp"
 #include "grid_readback.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -64,7 +65,7 @@ std::size_t pipeline_cache_bytes(const vkc::Device& device) {
   return bytes;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   const vol::VoxelGridParams grid = small_grid();
   const std::uint64_t voxels =
       static_cast<std::uint64_t>(grid.num_blocks) * grid.voxels_per_block;
@@ -89,7 +90,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   {
     vol::BlockIndex far{};
     far.coord = vr::Vec3i(100, 100, 100);
-    vkc::Result<vkc::Buffer> list = vr_test::upload_device_buffer(
+    vkc::Result<vkc::Buffer> list = vkc::test::upload_device_buffer(
         gpu.device, gpu.allocator, &far, sizeof(far));
     vkc::Result<vkc::GpuTimer> timer = vkc::GpuTimer::create(gpu.device);
     CHECK(list.ok() && timer.ok());
@@ -432,8 +433,8 @@ int gpu_main(vr_test::GpuContext& gpu) {
                                                blocks[1], blocks[3]};
     const std::uint32_t count = 4;  // blocks[3] is past it
     vkc::Result<vkc::Buffer> device_list =
-        vr_test::upload_device_buffer(gpu.device, gpu.allocator, list.data(),
-                                      list.size() * sizeof(vol::BlockIndex));
+        vkc::test::upload_device_buffer(gpu.device, gpu.allocator, list.data(),
+                                        list.size() * sizeof(vol::BlockIndex));
     CHECK(device_list.ok());
 
     // Refused: no buffer, one shorter than the count, one that is not a
@@ -599,4 +600,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

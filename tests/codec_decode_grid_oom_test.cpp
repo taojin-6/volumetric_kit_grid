@@ -12,11 +12,14 @@
 #include <vector>
 
 #include "codec_fixture.hpp"
-#include "gpu_test.hpp"
-#include "test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 using namespace codec_fixture;
 
@@ -31,7 +34,7 @@ constexpr std::uint32_t kMaxBlocks = 1u << 20;
 // Capture the diagnostic's allocation by size and call site, so allocations
 // in the driver or validation layer cannot consume the failure.
 int factory_refusal(Gpu& gpu, const std::uint8_t* frame, std::size_t size) {
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const auto normal = codec::make_decode_grid(gpu.device, gpu.allocator, frame,
@@ -117,7 +120,7 @@ int metrics_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
   }
   CHECK(before.rows().size() == before.rows().capacity());
   vkc::StageMetrics measured = before;
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const auto normal = codec::decode_growing(*dec, inter.data(), inter.size(),
@@ -176,7 +179,7 @@ int metrics_case(Gpu& gpu, const Bytes& intra, const Bytes& inter,
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   auto a = sphere_grid(gpu, Sphere{vr::Vec3f(0.0f), 0.08f});
   auto b = sphere_grid(gpu, Sphere{vr::Vec3f(0.02f, 0.0f, 0.0f), 0.10f});
   CHECK(a.ok() && b.ok());
@@ -201,9 +204,9 @@ int gpu_main(vr_test::GpuContext& gpu) {
 }  // namespace
 
 int main() try {
-  return vr_test::run_on_gpu(gpu_main);
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
 } catch (const std::bad_alloc&) {
-  vr_test::allocation_failure = {};
+  vkc::test::allocation_failure = {};
   std::fputs("FAIL: bad_alloc escaped a decode grid helper\n", stderr);
   return 1;
 }

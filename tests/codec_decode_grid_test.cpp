@@ -21,13 +21,16 @@
 
 #include "bitstream.hpp"
 #include "codec_fixture.hpp"
-#include "gpu_test.hpp"
 #include "stage_rows.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/recon/codec/decode_grid.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
 using namespace codec_fixture;
@@ -436,7 +439,7 @@ int refusals_case(Gpu& gpu, const Frames& f) {
 
 }  // namespace
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<Frames> frames = make_frames(gpu);
   CHECK(frames.ok());
   if (make_grid_case(gpu, *frames) != 0) return 1;
@@ -450,4 +453,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
   return 0;
 }
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

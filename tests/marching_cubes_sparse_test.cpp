@@ -43,7 +43,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "device_blocks.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -59,8 +59,9 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
 #include "grid_readback.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -129,7 +130,7 @@ vol::VoxelGridParams sphere_grid_params() {
 }
 
 // Write the tsdf and weight a helper filled back to the grid.
-bool write_attributes(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+bool write_attributes(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
                       const std::vector<float>& tsdf,
                       const std::vector<float>& weight) {
   return vr_test::write_attribute(ctx.device, ctx.allocator, g, "tsdf", tsdf)
@@ -160,7 +161,7 @@ std::vector<vol::BlockIndex> cube_blocks() {
 // colour attribute left unwritten (with_color = false on a grid that carries
 // one) stays zero -- the integrator's "colour unobserved" sentinel. Returns
 // false on any device error.
-bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+bool fill_sphere_grid(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
                       bool with_color, float weight_value = 1.0f) {
   const std::vector<vol::BlockIndex> blocks = cube_blocks();
   vkc::Result<std::uint32_t> failed =
@@ -234,7 +235,7 @@ bool fill_sphere_grid(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
 //
 // Reads the block size from the grid rather than assuming kBlock, for that
 // second use.
-bool fill_dense_blocks(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& g,
+bool fill_dense_blocks(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& g,
                        int span) {
   const int bs = g.grid().block_size;
   const float h = g.grid().voxel_size;
@@ -428,7 +429,7 @@ std::vector<std::array<float, 9>> canonical_triangles(const mesh::Mesh& m) {
   return tris;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<mesh::MarchingCubes> mc_result =
       mesh::MarchingCubes::create(gpu.device, gpu.allocator);
   if (!mc_result) {
@@ -1530,4 +1531,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

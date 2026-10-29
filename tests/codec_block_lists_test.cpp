@@ -27,17 +27,18 @@
 
 #include "bitstream.hpp"
 #include "block_lists.hpp"
-#include "buffer_readback.hpp"
 #include "codec_fixture.hpp"
 #include "codec_frames.hpp"
 #include "device_blocks.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -77,7 +78,7 @@ Blocks entries(const std::vector<vr::Vec3i>& coords) {
 // The device's sort of @p in, its count a device word, recorded for a bound
 // of @p bound entries (@p in's when 0), the list's entries past @p in
 // garbage, read back, with @p in read back too.
-vkc::Result<Blocks> device_sort(vr_test::Gpu& gpu, d::BlockLists& lists,
+vkc::Result<Blocks> device_sort(vkc::test::Gpu& gpu, d::BlockLists& lists,
                                 const Blocks& in, Blocks* input_after,
                                 std::uint32_t bound = 0) {
   const auto n = static_cast<std::uint32_t>(in.size());
@@ -89,32 +90,33 @@ vkc::Result<Blocks> device_sort(vr_test::Gpu& gpu, d::BlockLists& lists,
     for (std::uint32_t i = n; i < bound; ++i) {
       padded.push_back(vol::BlockIndex{vr::Vec3i(-7, int(i), 5), -1});
     }
-    VKC_ASSIGN(list, vr_test::upload_device_buffer(
+    VKC_ASSIGN(list, vkc::test::upload_device_buffer(
                          gpu.device, gpu.allocator, padded.data(),
                          padded.size() * sizeof(vol::BlockIndex)));
     VKC_ASSIGN(
         out, vkc::device_storage_buffer(
                  gpu.allocator, VkDeviceSize(bound) * sizeof(vol::BlockIndex)));
   }
-  VKC_ASSIGN(
-      const vkc::Buffer word,
-      vr_test::upload_device_buffer(gpu.device, gpu.allocator, &n, sizeof(n)));
+  VKC_ASSIGN(const vkc::Buffer word,
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator, &n,
+                                             sizeof(n)));
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   VKC_TRY(
       lists.record_sort(batch, list, vol::DeviceCount{&word, 0, bound}, out));
   VKC_TRY(batch.submit());
   if (n == 0) return Blocks{};
   if (input_after != nullptr) {
-    VKC_ASSIGN(*input_after, vr_test::read_back<vol::BlockIndex>(
+    VKC_ASSIGN(*input_after, vkc::test::read_back<vol::BlockIndex>(
                                  gpu.device, gpu.allocator, list, n));
   }
-  return vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator, out, n);
+  return vkc::test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator, out,
+                                               n);
 }
 
 // @p coords sorted on the device as std::stable_sort sorts them, the input
 // left as it was; and, for a few, recorded for 64 times their entries, whose
 // levels past them copy their entries through.
-int sorts_as_std(vr_test::Gpu& gpu, d::BlockLists& lists,
+int sorts_as_std(vkc::test::Gpu& gpu, d::BlockLists& lists,
                  const std::vector<vr::Vec3i>& coords, const char* what) {
   const Blocks in = entries(coords);
   Blocks expected = in;
@@ -141,7 +143,7 @@ int sorts_as_std(vr_test::Gpu& gpu, d::BlockLists& lists,
   return 0;
 }
 
-int sort_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int sort_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   Lcg rng{11};
   const std::int32_t picks[] = {kMin32, kMin32 + 1, -1,    0,
                                 1,      kMax32 - 1, kMax32};
@@ -189,9 +191,9 @@ int sort_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
 
 // A list it cannot read is refused before anything is recorded; none to
 // sort records nothing.
-int sort_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int sort_refusals_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   const Blocks two = entries({{1, 0, 0}, {0, 0, 0}});
-  vkc::Result<vkc::Buffer> list = vr_test::upload_device_buffer(
+  vkc::Result<vkc::Buffer> list = vkc::test::upload_device_buffer(
       gpu.device, gpu.allocator, two.data(), 2 * sizeof(vol::BlockIndex));
   CHECK(list.ok());
   vkc::BufferDesc desc;
@@ -202,7 +204,7 @@ int sort_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
   CHECK(transfer_only.ok());
   const vkc::Buffer empty;
   const std::uint32_t two_word = 2;
-  vkc::Result<vkc::Buffer> word = vr_test::upload_device_buffer(
+  vkc::Result<vkc::Buffer> word = vkc::test::upload_device_buffer(
       gpu.device, gpu.allocator, &two_word, sizeof(two_word));
   vkc::Result<vkc::Buffer> out =
       vkc::device_storage_buffer(gpu.allocator, 3 * sizeof(vol::BlockIndex));
@@ -254,10 +256,10 @@ int sort_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
 // @p v uploaded, one default element when it is empty, so a side a case
 // lacks still binds a buffer.
 template <typename T>
-vkc::Result<vkc::Buffer> upload(vr_test::Gpu& gpu, std::vector<T> v) {
+vkc::Result<vkc::Buffer> upload(vkc::test::Gpu& gpu, std::vector<T> v) {
   if (v.empty()) v.resize(1);
-  return vr_test::upload_device_buffer(gpu.device, gpu.allocator, v.data(),
-                                       v.size() * sizeof(T));
+  return vkc::test::upload_device_buffer(gpu.device, gpu.allocator, v.data(),
+                                         v.size() * sizeof(T));
 }
 
 Blocks listed(const std::vector<vr::Vec3i>& coords) {
@@ -280,13 +282,13 @@ struct Found {
   std::uint32_t missing = 0;
 };
 
-vkc::Result<Found> found(vr_test::Gpu& gpu, const d::BlockLists& lists) {
+vkc::Result<Found> found(vkc::test::Gpu& gpu, const d::BlockLists& lists) {
   VKC_ASSIGN(const std::vector<std::uint32_t> collision,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               lists.collision(), 2));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 lists.collision(), 2));
   VKC_ASSIGN(const std::vector<std::uint32_t> counts,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               lists.diff_counts(), 2));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 lists.diff_counts(), 2));
   return Found{collision[0], collision[1], counts[0], counts[1]};
 }
 
@@ -308,7 +310,7 @@ std::vector<std::uint32_t> ranks_of(const std::vector<Mode>& modes) {
   return ranks;
 }
 
-vkc::Result<Merged> device_merge(vr_test::Gpu& gpu, d::BlockLists& lists,
+vkc::Result<Merged> device_merge(vkc::test::Gpu& gpu, d::BlockLists& lists,
                                  const std::vector<vr::Vec3i>& reference,
                                  const std::vector<Mode>& modes,
                                  const std::vector<vr::Vec3i>& added,
@@ -335,11 +337,11 @@ vkc::Result<Merged> device_merge(vr_test::Gpu& gpu, d::BlockLists& lists,
                              d::FrameBuffers{&frame_buf, &source_buf}, n));
   VKC_TRY(batch.submit());
   VKC_ASSIGN(const Blocks frame,
-             vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
-                                                 frame_buf, n + kGuard));
+             vkc::test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
+                                                   frame_buf, n + kGuard));
   VKC_ASSIGN(const std::vector<d::ApplySource> sources,
-             vr_test::read_back<d::ApplySource>(gpu.device, gpu.allocator,
-                                                source_buf, n + kGuard));
+             vkc::test::read_back<d::ApplySource>(gpu.device, gpu.allocator,
+                                                  source_buf, n + kGuard));
   Merged out;
   VKC_ASSIGN(out.verdict, found(gpu, lists));
   for (std::size_t i = 0; i < n + kGuard; ++i) {
@@ -369,7 +371,7 @@ bool same_sources(const std::vector<d::ApplySource>& a,
 
 // The device's merge of a sound frame is the oracle's, with no collision and
 // nothing written past N.
-int merges_as_oracle(vr_test::Gpu& gpu, d::BlockLists& lists,
+int merges_as_oracle(vkc::test::Gpu& gpu, d::BlockLists& lists,
                      const std::vector<vr::Vec3i>& reference,
                      const std::vector<Mode>& modes,
                      const std::vector<vr::Vec3i>& added, const char* what) {
@@ -418,7 +420,7 @@ std::vector<Mode> modes_of(Lcg& rng, std::size_t m, const Mode* pool,
   return modes;
 }
 
-int merge_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int merge_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   // The worked example: a <- (0, 0), c <- (none, 2), b <- (1, none).
   {
     const std::vector<vr::Vec3i> reference = {{0, 0, 0}, {4, 0, 0}};
@@ -510,7 +512,7 @@ std::pair<std::uint32_t, std::uint32_t> first_collision(
 
 // Row 13: new blocks on reference blocks -- one removed, one skipped, and
 // several at once -- name the first in frame order, whatever their modes.
-int collision_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int collision_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   Lcg rng{43};
   const Mode every[] = {Mode::kKeep, Mode::kSkip, Mode::kZero, Mode::kRemove};
   for (int trial = 0; trial < 60; ++trial) {
@@ -553,7 +555,7 @@ int collision_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
 
 // @p coords into @p grid, in the order given, a few at a time and again
 // while lock races leave any out.
-vkc::Status place(vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid,
+vkc::Status place(vkc::test::Gpu& gpu, vol::VoxelBlockGrid& grid,
                   const std::vector<vr::Vec3i>& coords) {
   const Blocks blocks = listed(coords);
   for (std::size_t first = 0; first < blocks.size(); first += 16) {
@@ -583,7 +585,7 @@ struct Diffed {
   Blocks missing;
 };
 
-vkc::Result<Diffed> device_diff(vr_test::Gpu& gpu, d::BlockLists& lists,
+vkc::Result<Diffed> device_diff(vkc::test::Gpu& gpu, d::BlockLists& lists,
                                 const vol::VoxelBlockGrid& grid,
                                 const std::vector<vr::Vec3i>& frame) {
   const auto n = static_cast<std::uint32_t>(frame.size());
@@ -598,12 +600,12 @@ vkc::Result<Diffed> device_diff(vr_test::Gpu& gpu, d::BlockLists& lists,
   Diffed out;
   if (counts.gone != 0) {
     VKC_ASSIGN(out.gone,
-               vr_test::read_back<vol::BlockIndex>(gpu.device, gpu.allocator,
-                                                   lists.gone(), counts.gone));
+               vkc::test::read_back<vol::BlockIndex>(
+                   gpu.device, gpu.allocator, lists.gone(), counts.gone));
   }
   if (counts.missing != 0) {
     VKC_ASSIGN(out.missing,
-               vr_test::read_back<vol::BlockIndex>(
+               vkc::test::read_back<vol::BlockIndex>(
                    gpu.device, gpu.allocator, lists.missing(), counts.missing));
   }
   return out;
@@ -611,7 +613,7 @@ vkc::Result<Diffed> device_diff(vr_test::Gpu& gpu, d::BlockLists& lists,
 
 // The diff is std::set_difference both ways, in any order, each gone block
 // with the grid's ptr and each missing one with 0.
-int diffs_as_std(vr_test::Gpu& gpu, d::BlockLists& lists,
+int diffs_as_std(vkc::test::Gpu& gpu, d::BlockLists& lists,
                  vol::VoxelBlockGrid& grid, const std::vector<vr::Vec3i>& frame,
                  const char* what) {
   vkc::Result<Blocks> active = grid.map().compact_active_blocks();
@@ -645,7 +647,7 @@ int diffs_as_std(vr_test::Gpu& gpu, d::BlockLists& lists,
   return 0;
 }
 
-int diff_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int diff_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   codec_fixture::GridShape tiny;  // overflow chains
   tiny.bucket_size = 2;
   tiny.num_buckets = 64;
@@ -694,7 +696,7 @@ int diff_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
 // that disagrees with the survivors, ranks of anything -- still merges
 // within its outputs, and its searches end; an unsorted frame list diffs
 // within the lists' bounds and leaves the list as it was.
-int garbage_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int garbage_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   Lcg rng{53};
   const Mode every[] = {Mode::kKeep, Mode::kSkip, Mode::kZero, Mode::kRemove};
   for (int trial = 0; trial < 40; ++trial) {
@@ -738,7 +740,7 @@ int garbage_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
   CHECK(batch.submit().ok());
   const vkc::Result<Found> counts = found(gpu, lists);
   CHECK(counts.ok() && counts->gone <= held.size() && counts->missing <= n);
-  vkc::Result<Blocks> after = vr_test::read_back<vol::BlockIndex>(
+  vkc::Result<Blocks> after = vkc::test::read_back<vol::BlockIndex>(
       gpu.device, gpu.allocator, frame_buf.value(), n);
   CHECK(after.ok() &&
         sorted_coords(after.value()) == sorted_coords(listed(frame)));
@@ -746,7 +748,7 @@ int garbage_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
 }
 
 // The merge's and the diff's refusals, before anything is recorded.
-int lists_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
+int lists_refusals_case(vkc::test::Gpu& gpu, d::BlockLists& lists) {
   vkc::Result<vkc::Buffer> one = upload(gpu, Blocks(1));
   CHECK(one.ok());
   d::ResidentBlocks decoded;
@@ -774,7 +776,7 @@ int lists_refusals_case(vr_test::Gpu& gpu, d::BlockLists& lists) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<std::unique_ptr<d::BlockLists>> made =
       d::BlockLists::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
@@ -792,4 +794,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

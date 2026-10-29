@@ -34,15 +34,18 @@
 #include "codec_config.hpp"
 #include "codec_fixture.hpp"
 #include "codec_report.hpp"
-#include "gpu_test.hpp"
-#include "scratch_dir.hpp"
 #include "set_log.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/core/testing/scratch_dir.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 #include "volumetric_kit/recon/sender/codec_stream.hpp"
 #include "volumetric_kit/recon/sender/set_sender.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 
+namespace vr = volumetric_kit::recon;
+namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace eval = volumetric_kit::recon::eval;
 namespace sender = volumetric_kit::recon::sender;
@@ -193,7 +196,7 @@ int compare_options() {
 // output that does not exist, is taken; a link to the stream or the CSV is
 // refused, naming both; and a path that cannot be looked up is refused.
 int apart() {
-  vr_test::Scratch scratch("recon_example_codec_report_apart_");
+  vkc::test::Scratch scratch("recon_example_codec_report_apart_");
   const std::string stream_path = (scratch.path / "frames.vrst").string();
   const std::string csv_path = (scratch.path / "rows.csv").string();
   const std::vector<std::string> outputs = {stream_path, csv_path};
@@ -274,7 +277,7 @@ stream::Session session() {
 // A CSV refused once the stream is made fails the report's create, naming
 // the CSV, and the stream, dropped unfinished before its first frame, takes
 // its file back.
-int csv_refused(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
+int csv_refused(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   sender::CodecOutputs outputs;
   outputs.stream = (scratch.path / "late.vrst").string();
   const std::string csv = (scratch.path / "missing" / "rows.csv").string();
@@ -296,7 +299,8 @@ int csv_refused(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
 // naming both, the stream's new file taken back and any symlink kept. A
 // corrected configuration can retry at the same stream path, with a CSV that
 // does not exist yet; both files are readable after finish.
-int aliased_outputs(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
+int aliased_outputs(vkc::test::GpuContext& gpu,
+                    const vkc::test::Scratch& scratch) {
   const fs::path dir = scratch.path / "aliases";
   CHECK(fs::create_directory(dir));
   const fs::path stream_path = dir / "frames.vrst";
@@ -356,9 +360,9 @@ int aliased_outputs(vr_test::GpuContext& gpu, const vr_test::Scratch& scratch) {
 // each row as it is added; a row per frame added, its type, bytes and blocks
 // the frame's; and each type's host busy spans, summed by stage, its rows'
 // milliseconds.
-int rows_and_stages(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
+int rows_and_stages(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
                     vol::VoxelBlockGrid& other,
-                    const vr_test::Scratch& scratch) {
+                    const vkc::test::Scratch& scratch) {
   constexpr codec::FrameType I = codec::FrameType::kIntra;
   constexpr codec::FrameType P = codec::FrameType::kInter;
   sender::CodecOutputs outputs;
@@ -427,8 +431,8 @@ int rows_and_stages(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 // reached, SIGXFSZ ignored -- refuses frame 1's row once it is added, IoError
 // naming the CSV, the row kept; the failure sticks, so every row after is
 // refused too.
-int csv_fails(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
-              const vr_test::Scratch& scratch) {
+int csv_fails(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
+              const vkc::test::Scratch& scratch) {
   const std::string csv = (scratch.path / "limited.csv").string();
   vkc::Result<sender::CodecStream> made =
       sender::CodecStream::create(gpu.device, gpu.allocator, {}, session());
@@ -469,8 +473,8 @@ int csv_fails(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 
 // Without the decode, each row has its frame's type and encode and no
 // decode, as its CSV line has, and no type has decode stage rows.
-int decode_off(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
-               const vr_test::Scratch& scratch) {
+int decode_off(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
+               const vkc::test::Scratch& scratch) {
   constexpr codec::FrameType I = codec::FrameType::kIntra;
   constexpr codec::FrameType P = codec::FrameType::kInter;
   const codec::FrameType types[] = {I, P, P, I, P};
@@ -507,7 +511,7 @@ int decode_off(vr_test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   const Sphere sphere{vr::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> source = sphere_grid(gpu, sphere);
   CHECK(source.ok());
@@ -516,7 +520,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   vkc::Result<vol::VoxelBlockGrid> other = sphere_grid(gpu, sphere, coarser);
   CHECK(other.ok());
 
-  vr_test::Scratch scratch("recon_example_codec_report_");
+  vkc::test::Scratch scratch("recon_example_codec_report_");
   CHECK(csv_refused(gpu, scratch) == 0);
   CHECK(aliased_outputs(gpu, scratch) == 0);
   CHECK(rows_and_stages(gpu, *source, *other, scratch) == 0);
@@ -537,5 +541,5 @@ int main() {
   CHECK(compare_options() == 0);
   CHECK(apart() == 0);
   CHECK(sent_sets() == 0);
-  return vr_test::run_on_gpu(gpu_main);
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
 }

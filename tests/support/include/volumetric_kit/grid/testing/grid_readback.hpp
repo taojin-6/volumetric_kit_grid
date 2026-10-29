@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include "buffer_readback.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
@@ -32,8 +32,8 @@ vkc::Result<std::vector<T>> read_attribute(
     const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
-  return read_back<T>(device, allocator, *view.buffer,
-                      view.buffer->size() / sizeof(T));
+  return vkc::test::read_back<T>(device, allocator, *view.buffer,
+                                 view.buffer->size() / sizeof(T));
 }
 
 // Write `data` over the start of attribute `name`.
@@ -43,7 +43,7 @@ vkc::Status write_attribute(
     const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name, const std::vector<T>& data) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
-  return write_back(device, allocator, *view.buffer, data);
+  return vkc::test::write_back(device, allocator, *view.buffer, data);
 }
 
 // The voxels of an attribute from the block at the lowest ptr of some blocks
@@ -79,7 +79,8 @@ vkc::Result<AttributeSpan<T>> read_span(
   const std::size_t count =
       std::size_t(hi->ptr) + grid.grid().voxels_per_block - out.first;
   VKC_ASSIGN(out.values,
-             read_back<T>(device, allocator, *view.buffer, count, out.first));
+             vkc::test::read_back<T>(device, allocator, *view.buffer, count,
+                                     out.first));
   return out;
 }
 
@@ -90,7 +91,8 @@ vkc::Status write_span(
     const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name, const AttributeSpan<T>& span) {
   VKC_ASSIGN(const auto view, grid.attribute(name));
-  return write_back(device, allocator, *view.buffer, span.values, span.first);
+  return vkc::test::write_back(device, allocator, *view.buffer, span.values,
+                               span.first);
 }
 
 // The voxels of `blocks` in attribute `name`, as elements of T: block i's
@@ -98,7 +100,8 @@ vkc::Status write_span(
 // their read_span. A test reads the blocks it compares, not the whole heap.
 template <typename T>
 vkc::Result<std::vector<T>> read_blocks(
-    const Gpu& gpu, const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const vkc::test::Gpu& gpu,
+    const volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     std::string_view name,
     const std::vector<volumetric_kit::recon::volume::BlockIndex>& blocks) {
   VKC_ASSIGN(const auto span,
@@ -188,7 +191,7 @@ struct VoxelWords {
 // Read all three attributes for a comparison that relates them. Callers keep
 // their own nonempty and minimum-observed checks; empty grids are valid here.
 template <typename Compare>
-bool compare_grids(const Gpu& gpu,
+bool compare_grids(const vkc::test::Gpu& gpu,
                    volumetric_kit::recon::volume::VoxelBlockGrid& a,
                    volumetric_kit::recon::volume::VoxelBlockGrid& b,
                    Compare&& compare, std::size_t* observed = nullptr,
@@ -227,7 +230,7 @@ bool compare_grids(const Gpu& gpu,
 
 // Bit-identical weight, tsdf and colour, including unobserved voxels. Read
 // one attribute pair at a time so large-grid tests need no extra host memory.
-inline bool same_grids(const Gpu& gpu,
+inline bool same_grids(const vkc::test::Gpu& gpu,
                        volumetric_kit::recon::volume::VoxelBlockGrid& a,
                        volumetric_kit::recon::volume::VoxelBlockGrid& b,
                        std::size_t* observed = nullptr,

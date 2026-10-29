@@ -38,8 +38,8 @@
 #include <vector>
 
 #include "device_blocks.hpp"
-#include "test_check.hpp"
 #include "test_meshes.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
@@ -52,8 +52,9 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 #include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
-#include "gpu_test.hpp"
 #include "grid_readback.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -174,14 +175,14 @@ std::vector<vol::BlockIndex> active_blocks(vol::VoxelBlockGrid& grid) {
 }
 
 // A host copy of one attribute.
-std::vector<float> attr(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                         const char* name) {
   return vr_test::read_attribute<float>(ctx.device, ctx.allocator, grid, name)
       .value();
 }
 
 // Every tsdf + weight value, so a refusal can be shown to have written none.
-std::vector<float> snapshot(const vr_test::Gpu& ctx,
+std::vector<float> snapshot(const vkc::test::Gpu& ctx,
                             vol::VoxelBlockGrid& grid) {
   std::vector<float> out;
   for (const char* name : {"tsdf", "weight"}) {
@@ -192,7 +193,7 @@ std::vector<float> snapshot(const vr_test::Gpu& ctx,
 }
 
 // The active blocks' voxels of one attribute, block i's from i * vpb.
-std::vector<float> attr(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+std::vector<float> attr(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
                         const char* name,
                         const std::vector<vol::BlockIndex>& blocks) {
   return vr_test::read_blocks<float>(ctx, grid, name, blocks).value();
@@ -200,7 +201,7 @@ std::vector<float> attr(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid,
 
 // Each written block's voxels, keyed by coordinate: the heap hands a block a
 // different slot in each grid, so bytes are compared block by block.
-std::map<Coord, std::vector<float>> by_coord(const vr_test::Gpu& ctx,
+std::map<Coord, std::vector<float>> by_coord(const vkc::test::Gpu& ctx,
                                              vol::VoxelBlockGrid& grid) {
   std::map<Coord, std::vector<float>> out;
   const std::vector<vol::BlockIndex> blocks = active_blocks(grid);
@@ -228,8 +229,8 @@ struct Expect {
 
 // Compare every voxel of every allocated block with `expect(p)`.
 template <class F>
-int verify(const vr_test::Gpu& ctx, vol::VoxelBlockGrid& grid, const char* what,
-           F expect, int* observed_count = nullptr) {
+int verify(const vkc::test::Gpu& ctx, vol::VoxelBlockGrid& grid,
+           const char* what, F expect, int* observed_count = nullptr) {
   const vol::VoxelGridParams& g = grid.grid();
   const std::vector<vol::BlockIndex> blocks = active_blocks(grid);
   const std::vector<float> tsdf = attr(ctx, grid, "tsdf", blocks);
@@ -332,7 +333,7 @@ Expect signed_sheets(vr::Vec3f p, const std::vector<Rect>& sheets, float z0,
   return e;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   // 10 mm voxels in 8-voxel blocks, a 40 mm (4-voxel) band: coarse enough that
   // the brute-force reference stays quick, with a band several voxels deep.
   // 1,024 blocks hold the largest band here, the metre sheet's 392.
@@ -842,4 +843,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}
