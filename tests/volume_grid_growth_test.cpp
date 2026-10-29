@@ -14,8 +14,8 @@
 
 #include "device_blocks.hpp"
 #include "hash.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -26,7 +26,7 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -57,7 +57,7 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(vkc::Device& device,
 }
 
 // `count` distinct blocks along x, allocated into `grid`.
-int fill(const vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid, int count) {
+int fill(const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& grid, int count) {
   std::vector<vol::BlockIndex> coords(static_cast<std::size_t>(count));
   for (int i = 0; i < count; ++i) coords[std::size_t(i)].coord = {i, 0, 0};
   auto failed = vr_test::allocate_blocks(gpu, grid.map(), coords);
@@ -69,7 +69,7 @@ int fill(const vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid, int count) {
 vkc::Result<vol::VoxelBlockGrid> filled(vkc::Device& device,
                                         vkc::Allocator& allocator, int blocks) {
   VKC_ASSIGN(vol::VoxelBlockGrid grid, make_grid(device, allocator, params(4)));
-  if (fill(vr_test::Gpu{device, allocator}, grid, blocks) != 0) {
+  if (fill(vkc::test::Gpu{device, allocator}, grid, blocks) != 0) {
     return vkc::Status::io_error("allocation failed");
   }
   return grid;
@@ -77,7 +77,7 @@ vkc::Result<vol::VoxelBlockGrid> filled(vkc::Device& device,
 
 }  // namespace
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Device& dev = gpu.device;
   vkc::Allocator& alloc = gpu.allocator;
 
@@ -135,4 +135,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
   return 0;
 }
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

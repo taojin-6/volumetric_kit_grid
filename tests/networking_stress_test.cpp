@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "networking_loopback.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace networking = volumetric_kit::recon::networking;

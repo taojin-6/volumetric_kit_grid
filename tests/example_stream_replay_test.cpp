@@ -19,11 +19,11 @@
 #include <string>
 #include <vector>
 
-#include "scratch_dir.hpp"
 #include "stream_files.hpp"
 #include "stream_replay.hpp"
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/scratch_dir.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/chunks.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
@@ -137,7 +137,7 @@ int lone_record_case(const std::string& dir) {
   CHECK(write(path, {vrst::info(0, true, 500, 4)}));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   vkc::Result<vr_example::ReplayLoop> loop =
@@ -168,7 +168,7 @@ int damage_case(const std::string& dir) {
     infos.push_back(vrst::info(0, seq % 3 == 0, seq * kStep, seq));
   }
   CHECK(write(path, infos));
-  vrst::Bytes file = vr_test::read_bytes(path);
+  vrst::Bytes file = vkc::test::read_bytes(path);
   std::vector<vrst::ChunkAt> records;
   for (const vrst::ChunkAt& c : vrst::chunks(file)) {
     if (c.tag == "RECD") records.push_back(c);
@@ -195,7 +195,7 @@ int damage_case(const std::string& dir) {
 
   // As stream_oom_test does: measure the read at the damage, then fail its
   // last allocation at the same site.
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   stream::Position pos{damaged};
@@ -224,7 +224,7 @@ int damaged_key_case(const std::string& dir) {
   }
   const std::string first = dir + "/first_key.vrst";
   CHECK(write(first, infos));
-  vrst::Bytes file = vr_test::read_bytes(first);
+  vrst::Bytes file = vkc::test::read_bytes(first);
   const std::vector<vrst::ChunkAt> chunks = vrst::chunks(file);  // VRST first
   CHECK(chunks[1].tag == "RECD" && chunks[3].tag == "RECD");
   file = vrst::flipped(file, chunks[1].offset + 26, 0);
@@ -256,7 +256,7 @@ int payload_damage_case(const std::string& dir) {
     infos.push_back(vrst::info(0, seq % 4 == 0, seq * 1000, seq));
   }
   CHECK(write(path, infos));
-  vrst::Bytes file = vr_test::read_bytes(path);
+  vrst::Bytes file = vkc::test::read_bytes(path);
   std::vector<vrst::ChunkAt> records;
   for (const vrst::ChunkAt& c : vrst::chunks(file)) {
     if (c.tag == "RECD") records.push_back(c);
@@ -329,7 +329,7 @@ int refusals_case(const std::string& dir) {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_example_stream_replay_");
+  vkc::test::Scratch scratch("recon_example_stream_replay_");
   const std::string dir = scratch.path.string();
   if (loop_case(dir) != 0) return 1;
   if (lone_record_case(dir) != 0) return 1;

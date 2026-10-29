@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "stream_files.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
@@ -116,7 +116,7 @@ int crc_case(const std::string& dir) {
     }
   }
   CHECK(w->finish().ok());
-  const Bytes file = vr_test::read_bytes(path);
+  const Bytes file = vkc::test::read_bytes(path);
   std::size_t i = 0;
   for (const vrst::ChunkAt& c : vrst::chunks(file)) {
     if (c.tag != "RECD") continue;
@@ -196,7 +196,7 @@ int golden_case(const std::string& dir) {
     CHECK(append(*w, info(0, true, 33333333, 1, 1), {0, 1, 2, 3, 4, 5, 6, 7}));
     CHECK(w->finish().ok());
     CHECK(w->size() == 552);
-    const Bytes file = vr_test::read_bytes(path);
+    const Bytes file = vkc::test::read_bytes(path);
     const Bytes expected = unhex(kGoldenSmall);
     for (std::size_t i = 0; i < file.size() && i < expected.size(); ++i) {
       if (file[i] != expected[i]) {
@@ -216,7 +216,7 @@ int golden_case(const std::string& dir) {
     }
     CHECK(append(*w, info(0, true, 5, 0), payload));
     CHECK(w->finish().ok());
-    const Bytes file = vr_test::read_bytes(path);
+    const Bytes file = vkc::test::read_bytes(path);
     CHECK(file.size() == 65856);
     const Bytes session = unhex(kGoldenBigSession);
     const Bytes record = unhex(kGoldenBigRecord);
@@ -448,7 +448,7 @@ int unknown_case(const std::string& dir) {
     CHECK(w != nullptr);
     CHECK(append(*w, info(1, true, 1, 0), pattern(20, 1)));
   }  // no footer: chunks follow
-  Bytes file = vr_test::read_bytes(path);
+  Bytes file = vkc::test::read_bytes(path);
   const Bytes zzzz = vrst::chunk("ZZZZ", Bytes(16, 0x5A), pattern(13, 2));
   const Bytes wide = vrst::record(0, 1, 2, 0, 9, pattern(77, 3), 8);  // H 64
   file.insert(file.end(), zzzz.begin(), zzzz.end());
@@ -494,7 +494,7 @@ int limits_case(const std::string& dir) {
 
   // A header claiming 2^64 - 8 body bytes: the scan stops there rather than
   // wrapping to a chunk before it.
-  Bytes file = vr_test::read_bytes(path);
+  Bytes file = vkc::test::read_bytes(path);
   const std::uint64_t at = file.size();
   const Bytes huge = vrst::header("RECD", vrst::record_fields(0, 0, 3, 3, 3),
                                   ~std::uint64_t{0} - 7, 0);
@@ -550,7 +550,7 @@ int writer_refusals_case(const std::string& dir) {
   const std::string existing = dir + "/existing.vrst";
   CHECK(vrst::write_bytes(existing, {'k', 'e', 'e', 'p'}));
   CHECK(create_code(existing, good) == Code::InvalidArgument);
-  CHECK(vr_test::read_bytes(existing) == Bytes({'k', 'e', 'e', 'p'}));
+  CHECK(vkc::test::read_bytes(existing) == Bytes({'k', 'e', 'e', 'p'}));
   const std::string directory = dir + "/directory";
   CHECK(::mkdir(directory.c_str(), 0755) == 0);
   CHECK(create_code(directory, good) == Code::InvalidArgument);
@@ -800,7 +800,7 @@ int caller_memory_case(const std::string& dir) {
 
   // The first payload's fifth byte flipped.
   const std::string flip = dir + "/caller_flip.vrst";
-  CHECK(vrst::write_bytes(flip, vrst::flipped(vr_test::read_bytes(path),
+  CHECK(vrst::write_bytes(flip, vrst::flipped(vkc::test::read_bytes(path),
                                               records[0].offset + 60, 2)));
   auto rf = open(flip);
   CHECK(rf != nullptr);
@@ -844,7 +844,7 @@ int two_runs_case(const std::string& dir) {
     }
     CHECK(a->finish().ok() && b->finish().ok());
   }
-  CHECK(vr_test::read_bytes(joined) == vr_test::read_bytes(split));
+  CHECK(vkc::test::read_bytes(joined) == vkc::test::read_bytes(split));
   auto r = open(split);
   CHECK(r != nullptr);
   stream::Position pos = r->begin();
@@ -927,7 +927,7 @@ int nominal_period_case(const std::string&) {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_stream_container_");
+  vkc::test::Scratch scratch("recon_stream_container_");
   const std::string dir = scratch.path.string();
   if (crc_case(dir) != 0) return 1;
   if (golden_case(dir) != 0) return 1;

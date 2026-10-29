@@ -20,9 +20,9 @@
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/vulkan/fwd.hpp"
 #include "volumetric_kit/recon/codec/decoder.hpp"
 #include "volumetric_kit/recon/codec/export.hpp"
-#include "volumetric_kit/recon/core/fwd.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
 namespace volumetric_kit::recon::codec {

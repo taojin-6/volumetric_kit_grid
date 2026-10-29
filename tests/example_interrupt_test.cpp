@@ -12,7 +12,7 @@
 #include <cstdio>
 
 #include "interrupt.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace {
 

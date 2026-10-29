@@ -36,7 +36,7 @@ std::vector<std::uint32_t> pack(const DctBlocks& b, std::uint16_t pad) {
   return out;
 }
 
-vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
+vkc::Result<Resident> resident(const vkc::test::Gpu& gpu,
                                const DctBlocks& entries,
                                const std::vector<d::BlockMode>& modes,
                                const std::vector<vr::Vec3i>& coords,
@@ -45,7 +45,7 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
   const auto upload =
       [&gpu](const void* bytes,
              VkDeviceSize size) -> vkc::Result<std::unique_ptr<vkc::Buffer>> {
-    VKC_ASSIGN(vkc::Buffer buffer, vr_test::upload_device_buffer(
+    VKC_ASSIGN(vkc::Buffer buffer, vkc::test::upload_device_buffer(
                                        gpu.device, gpu.allocator, bytes, size));
     return std::make_unique<vkc::Buffer>(std::move(buffer));
   };
@@ -118,7 +118,7 @@ vkc::Result<Resident> resident(const vr_test::Gpu& gpu,
   return r;
 }
 
-vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
+vkc::Status forward(const vkc::test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
                     const codec::CodecParams& params, DctBlocks& out,
@@ -131,7 +131,7 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
   // empty one, which the transform takes as it is.
   vkc::Buffer list;
   if (count != 0) {
-    VKC_ASSIGN(list, vr_test::upload_device_buffer(
+    VKC_ASSIGN(list, vkc::test::upload_device_buffer(
                          gpu.device, gpu.allocator, blocks.data(),
                          count * sizeof(vol::BlockIndex)));
   }
@@ -150,8 +150,8 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
   }
   // The count as the encoder's observed pass leaves it, a device word.
   VKC_ASSIGN(const vkc::Buffer word,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator, &count,
-                                           sizeof(count)));
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator, &count,
+                                             sizeof(count)));
   std::uint32_t rejected = 0;
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
   if (params.validate().ok()) VKC_TRY(t.record_steps(batch, params));
@@ -186,7 +186,7 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
   return {};
 }
 
-vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
+vkc::Status inverse(const vkc::test::Gpu& gpu, d::DctTransform& t,
                     vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
                     const DctBlocks& in) {
@@ -205,7 +205,7 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
   VKC_ASSIGN(Resident r, resident(gpu, in));
   // The list as given, ptrs included, which the inverse must never read.
   if (n != 0) {
-    VKC_ASSIGN(vkc::Buffer list, vr_test::upload_device_buffer(
+    VKC_ASSIGN(vkc::Buffer list, vkc::test::upload_device_buffer(
                                      gpu.device, gpu.allocator, blocks.data(),
                                      n * sizeof(vol::BlockIndex)));
     r.list = std::make_unique<vkc::Buffer>(std::move(list));
@@ -218,8 +218,8 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
   VKC_TRY(t.record_inverse(batch, grid, r.blocks, in.params, slices.slices()));
   VKC_TRY(batch.submit());
   VKC_ASSIGN(const std::vector<std::uint32_t> rejected,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               t.rejected(), 1));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 t.rejected(), 1));
   return d::DctTransform::check_rejected("inverse", rejected[0],
                                          r.blocks.count);
 }
@@ -253,7 +253,7 @@ vr::Vec3i step(const vr::Vec3i& c, int o) {
 
 }  // namespace
 
-vkc::Result<SurfaceSet> surface_set(const vr_test::Gpu& gpu,
+vkc::Result<SurfaceSet> surface_set(const vkc::test::Gpu& gpu,
                                     vol::VoxelBlockGrid& grid) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
@@ -366,7 +366,7 @@ vkc::Result<SurfaceSet> surface_set(const vr_test::Gpu& gpu,
 }
 
 vkc::Result<std::vector<std::uint8_t>> write_counted(
-    const vr_test::Gpu& gpu, d::DeviceFrameWriter& writer,
+    const vkc::test::Gpu& gpu, d::DeviceFrameWriter& writer,
     const d::ResidentBlocks& counted, float voxel_size, float trunc_dist,
     const codec::CodecParams& params, const d::FrameReference* reference) {
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
@@ -381,7 +381,7 @@ vkc::Result<std::vector<std::uint8_t>> write_counted(
 }
 
 vkc::Result<std::vector<std::uint8_t>> encode(
-    const vr_test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
+    const vkc::test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
     const codec::EncoderConfig& config) {
   VKC_ASSIGN(const std::vector<vol::BlockIndex> active,
              grid.map().compact_active_blocks());
@@ -393,7 +393,7 @@ vkc::Result<std::vector<std::uint8_t>> encode(
   if (config.true_sdf) {
     VKC_ASSIGN(SurfaceSet set, surface_set(gpu, grid));
     observed = std::move(set.blocks);
-    VKC_ASSIGN(cut, vr_test::upload_device_buffer(
+    VKC_ASSIGN(cut, vkc::test::upload_device_buffer(
                         gpu.device, gpu.allocator, set.cut.data(),
                         set.cut.size() * sizeof(std::uint32_t)));
   } else {
@@ -421,7 +421,7 @@ vkc::Result<std::vector<std::uint8_t>> encode(
 }
 
 vkc::Result<std::vector<std::uint8_t>> encode(
-    const vr_test::Gpu& gpu, vol::VoxelBlockGrid& grid,
+    const vkc::test::Gpu& gpu, vol::VoxelBlockGrid& grid,
     const codec::EncoderConfig& config) {
   VKC_ASSIGN(const std::unique_ptr<d::DctTransform> t,
              d::DctTransform::create(gpu.device, gpu.allocator));

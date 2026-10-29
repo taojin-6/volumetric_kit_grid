@@ -60,10 +60,10 @@
 #include <vector>
 
 #include "networking_loopback.hpp"
-#include "scratch_dir.hpp"
 #include "stream_files.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/log.hpp"
+#include "volumetric_kit/core/testing/scratch_dir.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
@@ -210,11 +210,11 @@ int wire_is_the_file_case(const std::string& dir) {
   }
   CHECK((*writer)->finish().ok());
   killed->reset();
-  const Bytes file = vr_test::read_bytes(finished);
+  const Bytes file = vkc::test::read_bytes(finished);
   CHECK(vrst::index_offset(file) == wire.size());
   CHECK(Bytes(file.begin(),
               file.begin() + static_cast<std::ptrdiff_t>(wire.size())) == wire);
-  CHECK(vr_test::read_bytes(unfinished) == wire);
+  CHECK(vkc::test::read_bytes(unfinished) == wire);
   return 0;
 }
 
@@ -252,7 +252,7 @@ int two_runs_case(const std::string& dir) {
     CHECK(wire.size() == want);
   }
   writer->reset();
-  CHECK(vr_test::read_bytes(path) == wire);
+  CHECK(vkc::test::read_bytes(path) == wire);
 
   const Bytes head = vrst::pattern(32, 1);
   Bytes tail = vrst::pattern(64, 2);
@@ -1133,7 +1133,7 @@ int teardown_case() {
   return 0;
 }
 
-#ifndef VR_TEST_SANITIZED
+#ifndef VKC_TEST_SANITIZED
 // The address space a thread never joined would grow, in bytes, or 0 when it
 // cannot be read: on macOS the regions tagged as stacks, as malloc maps a
 // 4 MiB region whenever a thread finds none of its own; elsewhere all of it.
@@ -1177,7 +1177,7 @@ std::uint64_t address_space() {
 // one is made meanwhile. Not under ASan or TSan, which keep freed memory a
 // while.
 int reaping_case() {
-#ifndef VR_TEST_SANITIZED
+#ifndef VKC_TEST_SANITIZED
 #ifdef __GLIBC__
   CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
 #endif
@@ -1312,7 +1312,7 @@ int signals_case() {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_networking_server_");
+  vkc::test::Scratch scratch("recon_networking_server_");
   const std::string dir = scratch.path.string();
   if (wire_is_the_file_case(dir) != 0) return 1;
   if (two_runs_case(dir) != 0) return 1;

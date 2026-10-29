@@ -26,8 +26,8 @@
 #include "device_blocks.hpp"
 #include "grid_readback.hpp"
 #include "stage_rows.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -40,7 +40,8 @@
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -69,7 +70,7 @@ vol::VoxelGridParams grid_params(int block_size = 8) {
 
 // A grid of kBlocks^3 blocks holding a sphere's distance at weight 1, its
 // centre mid-grid: a surface crossing many block faces.
-vkc::Result<vol::VoxelBlockGrid> sphere_grid(vr_test::Gpu& gpu,
+vkc::Result<vol::VoxelBlockGrid> sphere_grid(vkc::test::Gpu& gpu,
                                              int blocks = kBlocks) {
   const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
   VKC_ASSIGN(vol::VoxelBlockGrid grid,
@@ -129,7 +130,8 @@ std::vector<std::array<float, 9>> triangles(const mesh::Mesh& m) {
 
 using vr_test::find_row;
 
-vkc::Result<mesh::MarchingCubes> make_mc(vr_test::Gpu& gpu, bool share = false,
+vkc::Result<mesh::MarchingCubes> make_mc(vkc::test::Gpu& gpu,
+                                         bool share = false,
                                          std::uint32_t slots = 1) {
   mesh::MarchingCubesConfig config;
   config.share_vertices = share;
@@ -140,7 +142,7 @@ vkc::Result<mesh::MarchingCubes> make_mc(vr_test::Gpu& gpu, bool share = false,
 // One recorded extract in a batch of its own, which sets the signal (or, with
 // @p skip_signal, does not), finished.
 vkc::Result<std::optional<mesh::DeviceMesh>> recorded(
-    vr_test::Gpu& gpu, mesh::MarchingCubes& mc, vol::VoxelBlockGrid& grid,
+    vkc::test::Gpu& gpu, mesh::MarchingCubes& mc, vol::VoxelBlockGrid& grid,
     std::uint32_t expected, const vol::DeviceCount* gate = nullptr,
     mesh::ExtractTimings* timings = nullptr, bool skip_signal = false) {
   vkc::CommandBatch batch(gpu.device, gpu.allocator);
@@ -158,7 +160,7 @@ vkc::Result<std::optional<mesh::DeviceMesh>> recorded(
 
 // The recorded extract meshes what extract_device meshes, sharing on and off,
 // and hands it over stamped with the batch's signal, reached.
-int same_mesh_case(vr_test::Gpu& gpu) {
+int same_mesh_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   CHECK(grid.ok());
   const std::uint32_t n = grid->map().allocated_blocks();
@@ -200,7 +202,7 @@ int same_mesh_case(vr_test::Gpu& gpu) {
 // A plan for one block on a fresh extractor cannot hold the sphere: finish
 // grows the slot and meshes again in a batch of its own, whose later value
 // the mesh is ready at; the surface is the same.
-int refit_case(vr_test::Gpu& gpu) {
+int refit_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> a = make_mc(gpu);
   vkc::Result<mesh::MarchingCubes> b = make_mc(gpu);
@@ -242,13 +244,13 @@ int refit_case(vr_test::Gpu& gpu) {
 
 // A closed gate meshes nothing and finishes with no mesh, the slot back for
 // the next extract; an empty grid meshes an empty mesh.
-int gate_case(vr_test::Gpu& gpu) {
+int gate_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu);
   CHECK(grid.ok() && mc.ok());
   const std::uint32_t zero = 0;
   vkc::Result<vkc::Buffer> gate =
-      vr_test::upload_device_buffer(gpu.device, gpu.allocator, &zero, 4);
+      vkc::test::upload_device_buffer(gpu.device, gpu.allocator, &zero, 4);
   CHECK(gate.ok());
   const vol::DeviceCount closed{&*gate, 0, 1};
   const std::uint32_t n = grid->map().allocated_blocks();
@@ -272,7 +274,7 @@ int gate_case(vr_test::Gpu& gpu) {
 // Empty subsets need no list buffer, both before the first extract and after
 // a populated slot. The draw command must also be empty when that slot is
 // reused.
-int empty_subset_case(vr_test::Gpu& gpu) {
+int empty_subset_case(vkc::test::Gpu& gpu) {
   auto grid = sphere_grid(gpu);
   CHECK(grid.ok());
   for (const bool share : {false, true}) {
@@ -305,13 +307,13 @@ int empty_subset_case(vr_test::Gpu& gpu) {
 
 // Refusing a gate must neither invalidate a published mesh nor record work.
 // An offset word in a valid storage buffer remains usable after each refusal.
-int gate_metadata_case(vr_test::Gpu& gpu) {
+int gate_metadata_case(vkc::test::Gpu& gpu) {
   auto grid = sphere_grid(gpu);
   auto mc = make_mc(gpu);
   CHECK(grid.ok() && mc.ok());
   const std::uint32_t words[] = {0, 1};
-  auto storage = vr_test::upload_device_buffer(gpu.device, gpu.allocator, words,
-                                               sizeof(words));
+  auto storage = vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                                 words, sizeof(words));
   vkc::BufferDesc desc;
   desc.size = sizeof(words);
   desc.usage =
@@ -370,7 +372,7 @@ int gate_metadata_case(vr_test::Gpu& gpu) {
 // many more than slot_count, with nothing released, all record. A pending
 // superseded by the next record, or whose batch skipped the signal, is
 // refused.
-int slots_case(vr_test::Gpu& gpu) {
+int slots_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu, false, 2);
   CHECK(grid.ok() && mc.ok());
@@ -445,7 +447,7 @@ int slots_case(vr_test::Gpu& gpu) {
 
 // The timeline lives with the extractor's state, so a mesh's ready point
 // stays good when the extractor moves.
-int move_case(vr_test::Gpu& gpu) {
+int move_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu);
   CHECK(grid.ok() && mc.ok());
@@ -464,7 +466,7 @@ int move_case(vr_test::Gpu& gpu) {
 // blocking after a grid change, its compaction in that submit; and blocking
 // while the map's last list holds, which it binds, compacting nothing and
 // leaving the list holding.
-int counters_case(vr_test::Gpu& gpu) {
+int counters_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelBlockGrid> grid = sphere_grid(gpu);
   vkc::Result<mesh::MarchingCubes> mc = make_mc(gpu);
   CHECK(grid.ok() && mc.ok());
@@ -524,7 +526,7 @@ int counters_case(vr_test::Gpu& gpu) {
 
 // A grid whose blocks the sharing kernel's table cannot hold (16^3 voxels) is
 // refused before anything is recorded or claimed.
-int refusal_case(vr_test::Gpu& gpu) {
+int refusal_case(vkc::test::Gpu& gpu) {
   const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
   vkc::Result<vol::VoxelBlockGrid> big = vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator, grid_params(16), attrs, 2);
@@ -542,7 +544,7 @@ int refusal_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   if (same_mesh_case(gpu) != 0) return 1;
   if (refit_case(gpu) != 0) return 1;
   if (gate_case(gpu) != 0) return 1;
@@ -558,4 +560,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

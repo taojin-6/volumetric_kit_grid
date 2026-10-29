@@ -27,8 +27,8 @@
 #include <vector>
 
 #include "stream_files.hpp"
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
@@ -181,7 +181,7 @@ int footer_equals_scan_case(const std::string& dir) {
     ::unlink(path.c_str());
     CHECK(write_finished(path, shape.tracks, shape.used, shape.records,
                          shape.key_every, shape.sizes));
-    const Bytes file = vr_test::read_bytes(path);
+    const Bytes file = vkc::test::read_bytes(path);
     CHECK(vrst::write_bytes(cut, Bytes(file.begin(), file.end() - 40)));
     auto footer = open(path);
     auto scan = open(cut);
@@ -220,7 +220,7 @@ bool make_sample(const std::string& dir, Sample* out) {
   const std::string path = dir + "/sample.vrst";
   ::unlink(path.c_str());
   if (!write_finished(path, 3, 2, 40, 4)) return false;
-  out->file = vr_test::read_bytes(path);
+  out->file = vkc::test::read_bytes(path);
   out->begin = vrst::chunks(out->file).at(1).offset;
   out->index_at = vrst::index_offset(out->file);
   out->tail_at = out->file.size() - 40;
@@ -571,14 +571,14 @@ int huge_index_case(const std::string& dir) {
     return kSkip;
   }
   CHECK(kKeys > (tail_at + 40) / 56);
-  vr_test::allocation_failure.largest = 0;
-  vr_test::allocation_failure.measure = true;
+  vkc::test::allocation_failure.largest = 0;
+  vkc::test::allocation_failure.measure = true;
   auto r = open(path);
-  vr_test::allocation_failure.measure = false;
+  vkc::test::allocation_failure.measure = false;
   CHECK(r != nullptr);
-  if (vr_test::allocation_failure.largest >= (std::size_t{64} << 10)) {
+  if (vkc::test::allocation_failure.largest >= (std::size_t{64} << 10)) {
     std::fprintf(stderr, "the open allocated %zu bytes at once\n",
-                 vr_test::allocation_failure.largest);
+                 vkc::test::allocation_failure.largest);
     return 1;
   }
   CHECK(!r->recovery().finished && r->recovery().footer_damaged);
@@ -589,7 +589,7 @@ int huge_index_case(const std::string& dir) {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_stream_footer_");
+  vkc::test::Scratch scratch("recon_stream_footer_");
   const std::string dir = scratch.path.string();
   if (footer_equals_scan_case(dir) != 0) return 1;
   if (forged_footer_case(dir) != 0) return 1;

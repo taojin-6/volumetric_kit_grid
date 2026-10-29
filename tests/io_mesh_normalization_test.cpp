@@ -18,8 +18,8 @@
 
 #include <glm/glm.hpp>
 
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/io/mesh_normalization.hpp"
 
 namespace vkc = volumetric_kit::core;
@@ -701,7 +701,7 @@ int out_of_memory() {
   const auto before = mesh;
   const auto transform =
       io::fit_transform(io::mesh_bounds(mesh, oblique()), 1.7).value();
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   const auto fail = [&failure](std::size_t bytes, const auto& call) {
     failure = {};
     failure.bytes = bytes;

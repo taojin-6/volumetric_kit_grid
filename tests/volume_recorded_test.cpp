@@ -32,9 +32,9 @@
 #include <utility>
 #include <vector>
 
-#include "buffer_readback.hpp"
 #include "device_blocks.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
@@ -48,8 +48,9 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
 #include "sphere_scene.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -171,24 +172,25 @@ vkc::Result<State> state_of(vol::VoxelHashMap& map) {
 }
 
 // Words on the device, each a count or a gate a kernel could have written.
-vkc::Result<vkc::Buffer> words(vr_test::Gpu& gpu,
+vkc::Result<vkc::Buffer> words(vkc::test::Gpu& gpu,
                                const std::vector<std::uint32_t>& values) {
-  return vr_test::upload_device_buffer(gpu.device, gpu.allocator, values.data(),
-                                       values.size() * sizeof(std::uint32_t));
+  return vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                         values.data(),
+                                         values.size() * sizeof(std::uint32_t));
 }
 
-vkc::Result<std::uint32_t> word_at(vr_test::Gpu& gpu, const vkc::Buffer& b,
+vkc::Result<std::uint32_t> word_at(vkc::test::Gpu& gpu, const vkc::Buffer& b,
                                    std::size_t index) {
   VKC_ASSIGN(const std::vector<std::uint32_t> w,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator, b, 1,
-                                               index));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator, b,
+                                                 1, index));
   return w[0];
 }
 
 // One recording of @p blocks in a batch of its own, the count a device word,
 // settled: what a caller that records a frame's removal or allocation does.
 vkc::Result<vol::AllocFailures> recorded(
-    vr_test::Gpu& gpu, vol::VoxelHashMap& map, const Blocks& blocks,
+    vkc::test::Gpu& gpu, vol::VoxelHashMap& map, const Blocks& blocks,
     bool removes, const vol::DeviceCount* gate = nullptr) {
   VKC_ASSIGN(const vkc::Buffer list,
              vr_test::detail::device_coords(gpu, blocks.data(),
@@ -205,7 +207,7 @@ vkc::Result<vol::AllocFailures> recorded(
 }
 
 // Recorded until no lost race is left, as the blocking call repeats.
-vkc::Result<vol::AllocFailures> recorded_all(vr_test::Gpu& gpu,
+vkc::Result<vol::AllocFailures> recorded_all(vkc::test::Gpu& gpu,
                                              vol::VoxelHashMap& map,
                                              const Blocks& blocks,
                                              bool removes) {
@@ -220,7 +222,7 @@ vkc::Result<vol::AllocFailures> recorded_all(vr_test::Gpu& gpu,
 // The blocking call, every lost race re-driven as a caller does; the last
 // call's failures land in @p failures.
 vkc::Result<std::uint32_t> blocking_all(
-    vr_test::Gpu& gpu, vol::VoxelHashMap& map, const Blocks& blocks,
+    vkc::test::Gpu& gpu, vol::VoxelHashMap& map, const Blocks& blocks,
     bool removes, vol::AllocFailures* failures = nullptr) {
   std::uint32_t left = 0;
   for (int pass = 0; pass < 8; ++pass) {
@@ -254,7 +256,7 @@ bool same_failures(const vol::AllocFailures& a, const vol::AllocFailures& b) {
          a.table == b.table && a.terminal == b.terminal;
 }
 
-vkc::Result<vol::VoxelHashMap> make_map(vr_test::Gpu& gpu,
+vkc::Result<vol::VoxelHashMap> make_map(vkc::test::Gpu& gpu,
                                         const vol::VoxelGridParams& g) {
   return vol::VoxelHashMap::create(gpu.device, gpu.allocator, g);
 }
@@ -265,7 +267,7 @@ vkc::Result<vol::VoxelHashMap> make_map(vr_test::Gpu& gpu,
 // the cube's allocation, the corners' delete (chains of 2-slot buckets) and
 // a 1 024-block sheet in a wide table: the same blocks, heap count, slot
 // stamps and failures.
-int agrees_case(vr_test::Gpu& gpu) {
+int agrees_case(vkc::test::Gpu& gpu) {
   for (const auto& [g, all, gone] :
        {std::make_tuple(params(2, 1024), cube(), corners()),
         std::make_tuple(params(8, 4096), sheet(32, 32), sheet(16, 32))}) {
@@ -307,7 +309,7 @@ int agrees_case(vr_test::Gpu& gpu) {
 
 // The count is the device's word, at its offset, at most the bound; a bound
 // of 0 records nothing and settles to zeros.
-int count_case(vr_test::Gpu& gpu) {
+int count_case(vkc::test::Gpu& gpu) {
   const Blocks all = cube();
   vkc::Result<vkc::Buffer> list = vr_test::detail::device_coords(
       gpu, all.data(), std::uint32_t(all.size()));
@@ -366,7 +368,7 @@ int count_case(vr_test::Gpu& gpu) {
 // Count and gate words must be complete storage words with known local
 // memory. Refusal preserves the map and its lists, runs no first-round
 // callback, and leaves the same batch available for a valid retry.
-int word_metadata_case(vr_test::Gpu& gpu) {
+int word_metadata_case(vkc::test::Gpu& gpu) {
   const Blocks one = {at(0, 0, 0)};
   vkc::Result<vkc::Buffer> list =
       vr_test::detail::device_coords(gpu, one.data(), 1);
@@ -446,7 +448,7 @@ int word_metadata_case(vr_test::Gpu& gpu) {
 // A closed gate runs no round of either kind: the map, its heap and its
 // stamps are bit-identical, the settle is zeros and the gate stays 0. An
 // open gate that meets no failure stays open.
-int gate_case(vr_test::Gpu& gpu) {
+int gate_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks all = cube();
@@ -473,7 +475,7 @@ int gate_case(vr_test::Gpu& gpu) {
 
 // A capacity limit ends the rounds after the one that met it and closes the
 // gate: 16 coords for an 8-slot table.
-int capacity_case(vr_test::Gpu& gpu) {
+int capacity_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 1));
   CHECK(map.ok());
   vkc::Result<vkc::Buffer> gate = words(gpu, {1});
@@ -494,7 +496,7 @@ int capacity_case(vr_test::Gpu& gpu) {
 // and closes the gate on the races it leaves; the blocking call runs at most
 // 10 rounds, one submit for every K, and loses nothing. lavapipe settles
 // them all and the checks hold trivially there.
-int contention_case(vr_test::Gpu& gpu) {
+int contention_case(vkc::test::Gpu& gpu) {
   Blocks coords;
   for (int i = 0; i < 1024; ++i) coords.push_back(at(i, 0, 0));
   const Blocks placed(coords.begin(), coords.begin() + 8);
@@ -545,7 +547,7 @@ int contention_case(vr_test::Gpu& gpu) {
 // run asks for it: the corners go, eight new blocks come, and the grid zeroes
 // every removed block before its index is freed, so a new block that draws a
 // freed pointer reads zeros although the batch allocates after the removal.
-int one_batch_case(vr_test::Gpu& gpu) {
+int one_batch_case(vkc::test::Gpu& gpu) {
   const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
   vkc::Result<vol::VoxelBlockGrid> grid = vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator, params(2, 1024), attrs, 2);
@@ -595,7 +597,7 @@ int one_batch_case(vr_test::Gpu& gpu) {
   vkc::Result<Blocks> active = grid->map().compact_active_blocks();
   CHECK(active.ok());
   for (const vol::BlockIndex& b : *active) {  // ptr: the first voxel
-    vkc::Result<std::vector<float>> voxels = vr_test::read_back<float>(
+    vkc::Result<std::vector<float>> voxels = vkc::test::read_back<float>(
         gpu.device, gpu.allocator, *tsdf->buffer, 512, std::size_t(b.ptr));
     CHECK(voxels.ok());
     const float want_value = b.coord.x >= 10 ? 0.0f : 1.0f;
@@ -606,7 +608,7 @@ int one_batch_case(vr_test::Gpu& gpu) {
 
 // Past a dispatch's groups: a round of 1 024 coords split into four slices
 // of one group each places what one dispatch places.
-int slices_case(vr_test::Gpu& gpu) {
+int slices_case(vkc::test::Gpu& gpu) {
   vr::detail::set_test_groups_per_dispatch(1);
   const Blocks all = sheet(32, 32);
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 4096));
@@ -622,7 +624,7 @@ int slices_case(vr_test::Gpu& gpu) {
 
 // A recording of either kind makes every list compacted before it stale,
 // even one that changes nothing.
-int stale_case(vr_test::Gpu& gpu) {
+int stale_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks all = cube();
@@ -668,7 +670,7 @@ vol::FrustumPlanes front_frustum() {
 // included, in that list's buffer. A held list of the kind recorded goes
 // stale and the other kind's still holds; the blocks, pointers, stamps, heap
 // count, epoch and tick are as they were.
-int const_case(vr_test::Gpu& gpu) {
+int const_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks all = cube();
@@ -691,7 +693,7 @@ int const_case(vr_test::Gpu& gpu) {
     vkc::Result<vol::DeviceBlockList> kept =
         map->compact_active_blocks_in_frusta_on_device(frustum);
     CHECK(whole.ok() && kept.ok() && whole->count == all.size());
-    vkc::Result<Blocks> kept_blocks = vr_test::read_back<vol::BlockIndex>(
+    vkc::Result<Blocks> kept_blocks = vkc::test::read_back<vol::BlockIndex>(
         gpu.device, gpu.allocator, *kept->buffer, kept->count);
     CHECK(kept_blocks.ok() && sorted(*kept_blocks) == sorted(front));
 
@@ -711,7 +713,7 @@ int const_case(vr_test::Gpu& gpu) {
     vkc::Result<std::uint32_t> n = word_at(gpu, *list->count, 0);
     CHECK(n.ok() && n.value() == mine.count);
     CHECK(culled || n.value() == reader.allocated_blocks());
-    vkc::Result<Blocks> got = vr_test::read_back<vol::BlockIndex>(
+    vkc::Result<Blocks> got = vkc::test::read_back<vol::BlockIndex>(
         gpu.device, gpu.allocator, *list->buffer, n.value());
     CHECK(got.ok() && with_ptrs(*got) ==
                           (culled ? with_ptrs(*kept_blocks) : before->blocks));
@@ -733,7 +735,7 @@ int const_case(vr_test::Gpu& gpu) {
 // buffer or set in use freed or rewritten; the core refuses the reader's
 // batch at its wait, its count unwritten; and the reader's next batch,
 // recorded after the resize, counts the blocks again.
-int resize_pending_case(vr_test::Gpu& gpu) {
+int resize_pending_case(vkc::test::Gpu& gpu) {
   const vol::AttributeSpec attrs[] = {{"tsdf", 4}, {"weight", 4}};
   vkc::Result<vol::VoxelBlockGrid> grid = vol::VoxelBlockGrid::create(
       gpu.device, gpu.allocator, params(2, 1024), attrs, 2);
@@ -771,7 +773,7 @@ int resize_pending_case(vr_test::Gpu& gpu) {
 // Once warm, a batch holding a removal and an allocation costs one submit,
 // no staging buffer, and the rounds' dispatches: K rounds and K + 1 one-thread
 // kernels a kind.
-int counters_case(vr_test::Gpu& gpu) {
+int counters_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks all = cube();
@@ -805,7 +807,7 @@ int counters_case(vr_test::Gpu& gpu) {
 
 // kResultSlots recordings may hold their outcome at once; the next is
 // refused, with nothing recorded, until one is dropped.
-int slots_case(vr_test::Gpu& gpu) {
+int slots_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks all = cube();
@@ -856,12 +858,12 @@ struct Sphere {
   }
 };
 
-vkc::Result<Sphere> sphere(vr_test::Gpu& gpu) {
+vkc::Result<Sphere> sphere(vkc::test::Gpu& gpu) {
   Sphere s;
   for (int c = 0; c < 3; ++c) {
     s.views.push_back(vr_test::sphere_view<vol::DepthPinhole>(c));
     const std::vector<float>& depth = s.views.back().depth;
-    VKC_ASSIGN(vkc::Buffer buffer, vr_test::upload_device_buffer(
+    VKC_ASSIGN(vkc::Buffer buffer, vkc::test::upload_device_buffer(
                                        gpu.device, gpu.allocator, depth.data(),
                                        depth.size() * sizeof(float)));
     s.device.push_back(std::move(buffer));
@@ -872,7 +874,7 @@ vkc::Result<Sphere> sphere(vr_test::Gpu& gpu) {
 // One round of a set's bands recorded, as the blocking call rounds them: the
 // same blocks, heap count and stamps, on one camera and on three, from host
 // arrays and from device buffers; each recording is one round.
-int depth_case(vr_test::Gpu& gpu) {
+int depth_case(vkc::test::Gpu& gpu) {
   vkc::Result<Sphere> s = sphere(gpu);
   CHECK(s.ok());
   for (const bool on_device : {false, true}) {
@@ -920,7 +922,7 @@ int depth_case(vr_test::Gpu& gpu) {
 // open. The gate is the round's output alone: a closed one still has the
 // round run and judged. A gate word past its buffer is refused with nothing
 // recorded.
-int depth_gate_case(vr_test::Gpu& gpu) {
+int depth_gate_case(vkc::test::Gpu& gpu) {
   vkc::Result<Sphere> s = sphere(gpu);
   vkc::Result<vkc::Buffer> gates = words(gpu, {1, 1, 0});
   CHECK(s.ok() && gates.ok());
@@ -968,7 +970,7 @@ int depth_gate_case(vr_test::Gpu& gpu) {
 // Recordings settle in any order, and a blocking call since overtakes one:
 // the heap's host copy is the latest's. A set fused again, blocking, before
 // its round settles, or a free pass, cannot be undone by that settle.
-int settle_order_case(vr_test::Gpu& gpu) {
+int settle_order_case(vkc::test::Gpu& gpu) {
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(2, 1024));
   CHECK(map.ok());
   const Blocks first = cube();
@@ -1011,7 +1013,7 @@ int settle_order_case(vr_test::Gpu& gpu) {
 
 // The blocking call over a set is one submit a round and, warm, no staging
 // buffer: each round its recording, the count word staying on the device.
-int depth_counters_case(vr_test::Gpu& gpu) {
+int depth_counters_case(vkc::test::Gpu& gpu) {
   vkc::Result<Sphere> s = sphere(gpu);
   vkc::Result<vol::VoxelHashMap> map = make_map(gpu, params(8, 4096));
   CHECK(s.ok() && map.ok());
@@ -1031,7 +1033,7 @@ int depth_counters_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   if (agrees_case(gpu) != 0) return 1;
   if (count_case(gpu) != 0) return 1;
   if (word_metadata_case(gpu) != 0) return 1;
@@ -1055,4 +1057,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

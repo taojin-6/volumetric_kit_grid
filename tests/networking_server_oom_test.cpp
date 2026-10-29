@@ -15,8 +15,8 @@
 #include <cstdio>
 
 #include "networking_loopback.hpp"
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace networking = volumetric_kit::recon::networking;
@@ -48,7 +48,7 @@ int lost_copy_case() {
   CHECK(net::next_within(*client, &got) && got.record.info.seq == 0);
   // A publish's largest allocation is its chunk's copy, the same at every
   // record of this size.
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const Code measured = publish(1, false);

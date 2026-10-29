@@ -10,8 +10,8 @@
 #include <fstream>
 #include <string>
 
-#include "scratch_dir.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/scratch_dir.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/io/mesh_io.hpp"
 
 namespace vkc = volumetric_kit::core;
@@ -28,7 +28,7 @@ bool refused(const vkc::Status& status, Code code, const std::string& named) {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_io_mesh_file_");
+  vkc::test::Scratch scratch("recon_io_mesh_file_");
   const std::string tetra = (scratch.path / "tetra.obj").string();
   {
     std::ofstream(tetra) << "v 0 0 0\nv 1 0 0\nv 0 0 1\nv 0 1 0\n"
