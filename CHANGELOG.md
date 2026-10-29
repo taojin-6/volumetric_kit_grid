@@ -21,6 +21,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A consumer that declares the core first pins core 0.30.0 or newer with
   this grid; one at 0.29.0 fails grid's configure (`vkc_require_core`).
 
+## [0.2.1] - 2026-10-29
+
+### Changed
+
+- **Marching-cubes vertex normals**: each vertex carries the field's
+  gradient at its own position, the same from every cell and both kernels,
+  where it carried its cell's; positions and triangles are unchanged
+  (DESIGN.md, mesh).
+
 ## [0.2.0] - 2026-10-29
 
 ### Added

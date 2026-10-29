@@ -65,7 +65,11 @@ void vgridResolveOctants(ivec3 coord, int self_ptr, uint tid, uint octants,
 // group count changed (2 per block -> 1). So the levers are the probe --
 // spreading the 8 across subgroups, or one lane per bucket slot with a
 // reduction -- not the cell or block count. Left unmeasured rather than guessed
-// at; the repo's own lesson is to profile the phase before optimising it. Note
+// at; the repo's own lesson is to profile the phase before optimising it. The
+// mesh kernels then resolve the vertex normals' 3x3x3 neighbourhood in a second
+// round (27 lanes, so lanes 1-7 walk two buckets); a single round in place of
+// both, skipping the 7 blocks no sample reaches, saved at most 2% of the
+// extract on an M5 Max (2026-10-29), so the two stay. Note
 // that an early exit on the first free slot is NOT one of the levers: see the
 // primary-scan note on vgridFindBlockPtr.
 void vgridResolveNeighbourhood(ivec3 coord, int self_ptr, uint tid,

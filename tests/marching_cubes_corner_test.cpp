@@ -3,8 +3,8 @@
 
 // GPU test: a marching-cubes vertex on a corner whose distance is exactly the
 // iso-value is that corner, fl(k * voxel_size) on each axis, bit for bit, with
-// that corner's attributes, from both kernels on every device; and a vertex
-// whose crossing is only near a corner is not moved onto it.
+// that corner's attributes and normal, from both kernels on every device; and a
+// vertex whose crossing is only near a corner is not moved onto it.
 //
 // The field is a set of lattice planes at 1 cm, each in a region of its own:
 // normal to x, y and z, with the distance growing along the normal (the zero
@@ -16,7 +16,10 @@
 // for the corner at 0. One more region has slopes below the near-tangent
 // guard's 1e-6, where the ratio came out at slope / 1e-6, 0.1 to 0.9, on
 // every device. The "color" attribute is one value on each plane's voxels and
-// another everywhere else, so a vertex must carry its own corner's.
+// another everywhere else, so a vertex must carry its own corner's. So must
+// its normal: every distance on the plane is the iso-value, so a plane
+// corner's gradient lies along the plane's normal, while the corners beside it
+// tilt with their columns' slopes.
 //
 // Four more regions, at k = 0, put the plane's voxels 1e-8 above or below the
 // iso-value: their crossings are near the corner but not on it, so along the
@@ -155,8 +158,9 @@ int region_of(const std::vector<Region>& rs, const std::array<int, 3>& k) {
   return -1;
 }
 
-// Every triangle corner of @p m: in an exact region, its lattice point and
-// that point's attribute; in a near region, off the lattice along the normal.
+// Every triangle corner of @p m: in an exact region, its lattice point, that
+// point's attribute and the plane's normal; in a near region, off the lattice
+// along the normal.
 // The count checked and the count wrong, the first few printed.
 std::pair<std::size_t, std::size_t> check_corners(const char* kernel,
                                                   const mesh::Mesh& m,
@@ -191,14 +195,21 @@ std::pair<std::size_t, std::size_t> check_corners(const char* kernel,
       }
       ok = ok && v.color.x > 0.5f && bits(v.color.x) == red &&
            v.color.y == 0.0f && v.color.z == 0.0f;
+      const float n[3] = {v.normal.x, v.normal.y, v.normal.z};
+      const int a = rs[r].axis;
+      ok = ok && std::fabs(n[a] - static_cast<float>(rs[r].s)) < 1e-6f &&
+           std::fabs(n[(a + 1) % 3]) < 1e-6f &&
+           std::fabs(n[(a + 2) % 3]) < 1e-6f;
     }
     if (!ok && ++wrong <= 8) {
       std::fprintf(stderr,
                    "%s, iso %g: corner (%d, %d, %d) at (%08x, %08x, %08x), "
-                   "color (%g, %g, %g); lattice (%08x, %08x, %08x)\n",
+                   "color (%g, %g, %g), normal (%g, %g, %g); lattice (%08x, "
+                   "%08x, %08x)\n",
                    kernel, double(iso), k[0], k[1], k[2], bits(c[0]),
                    bits(c[1]), bits(c[2]), double(v.color.x), double(v.color.y),
-                   double(v.color.z), bits(static_cast<float>(k[0]) * kVoxel),
+                   double(v.color.z), double(v.normal.x), double(v.normal.y),
+                   double(v.normal.z), bits(static_cast<float>(k[0]) * kVoxel),
                    bits(static_cast<float>(k[1]) * kVoxel),
                    bits(static_cast<float>(k[2]) * kVoxel));
     }
