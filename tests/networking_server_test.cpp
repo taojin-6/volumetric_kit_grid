@@ -10,7 +10,7 @@
 // before any key nothing, and none is counted wanting a key; a viewer that
 // stops reading in the first key while
 // 3 GOPs of 1 MiB records are published gets that key whole, then the newest
-// GOP whole, with every publish back at once, with keys on demand too;
+// GOP whole, every publish back while it reads nothing, keys on demand too;
 // without replay_gop, a joiner is counted and gets nothing until the next
 // key, then every record, and one that stops reading falls back, counted,
 // past max_gop_bytes, then gets the next key, while one reading gets every
@@ -440,12 +440,12 @@ int join_case() {
 
 // A viewer that stops reading while 3 GOPs of 1 MiB records are published,
 // then drains, gets the first key whole, then the newest GOP whole, each
-// chunk passing its CRCs; every publish returned at once. The raw viewer
-// reads the first key's header before the rest is published, so the server
-// is sending it then, and under the low-water mark the kernel holds well
-// under 1 MiB of a viewer that does not read: the key is under way, however
-// late its thread ran, until the viewer drains. Replaying the GOP and with
-// keys on demand alike, the viewer counted only as it joined there.
+// chunk passing its CRCs; every publish returned while it read nothing. The
+// raw viewer reads the first key's header before the rest is published, so
+// the server is sending it then, and under the low-water mark the kernel holds
+// well under 1 MiB of a viewer that does not read: the key is under way,
+// however late its thread ran, until the viewer drains. Replaying the GOP and
+// with keys on demand alike, the viewer counted only as it joined there.
 int newest_key_wins_case(bool replay) {
   constexpr std::uint64_t kGop = 4;
   constexpr std::uint64_t kRecords = 3 * kGop;
@@ -453,6 +453,13 @@ int newest_key_wins_case(bool replay) {
   const stream::Session session = net::geometry_session();
   networking::ServerOptions options;
   options.replay_gop = replay;
+  // Never closed: a publish that waited on the viewer, which takes nothing
+  // until the last publish is back, would never return (ctest's TIMEOUT).
+  // That is the check, with no clock. A stall_limit would end such a wait
+  // after a time a starved host may also take to publish, as would a bound
+  // on a publish's time: its CRC and copy of 1 MiB take 50 ms under
+  // ThreadSanitizer, and seconds on a starved host.
+  options.stall_limit = std::chrono::milliseconds::max();
   auto server = net::serve(session, options);
   CHECK(server != nullptr);
   const vkc::UniqueFd viewer = net::connect_loopback(server->port(), 4096);
@@ -463,12 +470,10 @@ int newest_key_wins_case(bool replay) {
   CHECK(wire.size() == header);
   const auto publish = [&](std::uint64_t seq) {
     const Bytes payload = net::record_payload(seq, kSize);
-    const Clock::time_point start = Clock::now();
     return server
-               ->publish(net::record_info(seq, seq % kGop == 0), payload.data(),
-                         payload.size())
-               .ok() &&
-           Clock::now() - start < 1s;
+        ->publish(net::record_info(seq, seq % kGop == 0), payload.data(),
+                  payload.size())
+        .ok();
   };
   CHECK(publish(0));
   net::read_upto(viewer.get(), header + 56, 5s, &wire);  // the key's header
@@ -545,11 +550,11 @@ int on_demand_join_case() {
 // Without replay_gop, at a max_gop_bytes of 512 KiB: a raw viewer that reads
 // its session, then nothing, while one GOP of 64 KiB records is published,
 // falls back, counted, once a record would leave it more than that behind
-// what its socket took, each publish back at once; a client reading each
-// record as it comes gets every one and is not counted. Then a key and two
-// P-frames: the raw viewer, draining, gets each chunk whole, a run from the
-// first key, then the new key and the P-frames after it, so no P-frame
-// without the records it is predicted from; the client gets them all.
+// what its socket took, each publish back while it reads nothing; a client
+// reading each record as it comes gets every one and is not counted. Then a
+// key and two P-frames: the raw viewer, draining, gets each chunk whole, a
+// run from the first key, then the new key and the P-frames after it, so no
+// P-frame without the records it is predicted from; the client gets them all.
 int on_demand_fall_back_case() {
   constexpr std::size_t kSize = 64 << 10;
   const stream::Session session = net::geometry_session();
@@ -568,14 +573,13 @@ int on_demand_fall_back_case() {
   net::read_upto(slow.get(), header, 5s, &wire);
   CHECK(wire.size() == header);
   CHECK(server->key_wanted() == 2);  // counted before their sessions
+  // Never closed, a raw viewer that reads nothing until the end: a publish
+  // that waited on it would never return, as in newest_key_wins_case.
   const auto publish = [&](std::uint64_t seq, bool key) {
     const Bytes payload = net::record_payload(seq, kSize);
-    const Clock::time_point start = Clock::now();
     return server
-               ->publish(net::record_info(seq, key), payload.data(),
-                         payload.size())
-               .ok() &&
-           Clock::now() - start < 1s;
+        ->publish(net::record_info(seq, key), payload.data(), payload.size())
+        .ok();
   };
   std::uint64_t seq = 0;
   Got got;

@@ -421,8 +421,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   Bit-identical to main.
 - [**2026-10-28**](#2026-10-28--grid-is-a-package-of-its-own-the-voxel-grid-and-what-reads-it-under-grids-names-on-the-core-alone) —
   grid is a package of its own: the voxel grid and what reads it, under
-  grid's names, on the core alone. It lives in recon's `grid/` until it
-  becomes `volumetric_kit_grid`; recon builds on it.
+  grid's names, on the core alone. It is now `volumetric_kit_grid`; recon
+  builds on it.
 - [**2026-10-29**](#2026-10-29--the-encoder-holds-each-p-frame-one-quantization-step-against-its-reference-i-frames-are-quantized-afresh-amends-the-2026-10-14-encoder-entry) —
   The `Encoder` holds each P-frame one quantization step against its
   reference: a coefficient within one step of the reference's,
