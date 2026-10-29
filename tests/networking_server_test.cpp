@@ -1170,17 +1170,18 @@ std::uint64_t address_space() {
 // on macOS, 32 KiB of it, and neither shows in a thread count. A viewer's
 // thread sees its end within a poll slice, so 64 slots, and one refused
 // tries again. Each reading waits, however long a loaded machine takes, for
-// every viewer the log says joined to have ended, then for two more to join
+// every viewer the log says joined to have ended, then for kHeld more to join
 // in turn and stay: the accept loop joins every ended viewer's thread before
-// each accept, so before it took the second. glibc gives a thread that finds
-// malloc busy an arena of its own, 64 MiB of address space kept, so no new
-// one is made meanwhile. Not under ASan or TSan, which keep freed memory a
-// while.
+// each accept, so before it took the second. glibc keeps joined threads'
+// stacks for its next threads, up to 40 MiB (4 of 8 MiB), how many hanging
+// on whether ended viewers were still to join as the first came; the other
+// five take every one kept, so a reading holds kHeld viewers' stacks alone.
+// glibc gives a thread that finds no arena free one of its own, 64 MiB of
+// address space kept, so main allows one. Not under ASan or TSan, which keep
+// freed memory a while.
 int reaping_case() {
 #ifndef VKC_TEST_SANITIZED
-#ifdef __GLIBC__
-  CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
-#endif
+  constexpr int kHeld = 6;
   Captured log;
   LogCapture capture(&log);
   const stream::Session session = net::geometry_session();
@@ -1200,7 +1201,7 @@ int reaping_case() {
     }
     return true;
   };
-  // The address space once every ended viewer's thread is joined, with two
+  // The address space once every ended viewer's thread is joined, with kHeld
   // viewers held. A viewer's lines: one as it joins, one as it ends.
   const auto all_ended = [&] {
     return log.count(": viewer ") == 2 * log.count(": viewer ", " joined, ");
@@ -1211,7 +1212,7 @@ int reaping_case() {
       if (Clock::now() >= end) return false;
       std::this_thread::sleep_for(5ms);
     }
-    vkc::UniqueFd held[2];
+    vkc::UniqueFd held[kHeld];
     for (vkc::UniqueFd& viewer : held) {
       viewer = net::connect_loopback(server->port());
       Bytes got;
@@ -1312,6 +1313,13 @@ int signals_case() {
 }  // namespace
 
 int main() {
+#if defined(__GLIBC__) && !defined(VKC_TEST_SANITIZED)
+  // One malloc arena, for reaping_case's readings, set before any thread
+  // starts: once a thread finds no arena free with more than 8 made, as the
+  // cases before it can on a loaded machine, glibc fixes the limit at 8 per
+  // core and ignores mallopt from then on.
+  CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
+#endif
   vkc::test::Scratch scratch("recon_networking_server_");
   const std::string dir = scratch.path.string();
   if (wire_is_the_file_case(dir) != 0) return 1;
