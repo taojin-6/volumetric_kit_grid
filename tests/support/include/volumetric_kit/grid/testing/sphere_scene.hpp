@@ -3,7 +3,9 @@
 
 #pragma once
 
-// Cameras round a sphere at the world origin and what each sees.
+// Cameras round a sphere at the world origin and what each sees. Camera-free:
+// `Camera` is any posed pinhole with DepthCameraParams' fields -- the voxel
+// layer's volume::DepthPinhole for its tests, DepthCameraParams for fusion's.
 
 #include <cmath>
 #include <cstddef>
@@ -12,7 +14,6 @@
 
 #include "grid_readback.hpp"
 #include "volumetric_kit/core/base/result.hpp"
-#include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -25,13 +26,15 @@ inline constexpr float kSphereRadius = 0.25f;
 
 // One camera on a circle round the sphere, looking at it, and what it sees:
 // depth in metres (0 where the ray misses) and a colour per pixel.
+template <typename Camera>
 struct SphereView {
-  volumetric_kit::recon::DepthCameraParams cam{};
+  Camera cam{};
   std::vector<float> depth;
   std::vector<std::uint32_t> color;
 };
 
-inline SphereView sphere_view(int index) {
+template <typename Camera>
+SphereView<Camera> sphere_view(int index) {
   namespace vr = volumetric_kit::recon;
   const float angle = 2.1f * static_cast<float>(index);
   const vr::Vec3f eye(0.9f * std::sin(angle), 0.1f * static_cast<float>(index),
@@ -40,7 +43,7 @@ inline SphereView sphere_view(int index) {
   const vr::Vec3f z = glm::normalize(-eye);
   const vr::Vec3f x = glm::normalize(glm::cross(vr::Vec3f(0, 1, 0), z));
   const vr::Vec3f y = glm::cross(z, x);
-  SphereView v;
+  SphereView<Camera> v;
   v.cam.fx = 140.0f;
   v.cam.fy = 140.0f;
   v.cam.cx = 79.5f;

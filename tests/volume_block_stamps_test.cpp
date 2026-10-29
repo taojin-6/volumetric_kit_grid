@@ -29,7 +29,6 @@
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
-#include "volumetric_kit/recon/core/camera_params.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
 
@@ -248,7 +247,7 @@ int gpu_main(vr_test::GpuContext& gpu) {
   map.advance_tick();  // 7
   before = slots(grid);
   CHECK(before.ok());
-  vr::DepthCameraParams cam{};
+  vol::DepthPinhole cam{};
   cam.fx = cam.fy = 16.0f;
   cam.cx = cam.cy = 8.0f;
   cam.min_depth = 0.1f;
