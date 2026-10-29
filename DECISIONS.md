@@ -8350,8 +8350,9 @@ period the held values drift toward the ends of the noise. On take1 that
 raised the decoded mesh's interior roughness p90 to 15.5° (Dynamic) and
 13.7° (Classic), against 12.2° and 9.9° with P-frames alone and 11.6° and
 9.8° on main (median 4.1° and 3.3°, against 2.9° and 1.9°), and its steady
-flicker and rate were higher than with P-frames alone. An I-frame quantized
-afresh re-centres once a period, at one transition of flicker.
+flicker and rate were higher than with P-frames alone; only Classic's
+interior flicker over a period was lower, 0.0009 against 0.0033. An I-frame
+quantized afresh re-centres once a period, at one transition of flicker.
 
 **Measured** (Release; take1: 4 Femtos, 1 cm, K 64, scale 0.2, period 30,
 300 sets of recon's fusion through this encoder, flicker the share of the
@@ -8371,9 +8372,9 @@ mean over frames):
 | encode device ms, P median: 4090 take1 D / C / Rafa2 | 1.65 / 0.93 / 0.77 | 1.46 / 0.92 / 0.70 |
 | encode device ms, P median: M5 Max take1 D / C / Rafa2 | 2.24 / 1.52 / 1.20 | 1.98 / 1.42 / 1.15 |
 
-Fusion is untouched: its mesh's flicker and roughness match main's to every
-digit (its vertex order varies run to run). Over a period of 30 the transition
-into the I-frame leaves interior flicker 58% (Dynamic) and 85% (Classic)
+Fusion is untouched: its mesh's flicker matches main's to every digit (its
+vertex order varies run to run). Over a period of 30 the transition
+into the I-frame leaves interior flicker 58% (Dynamic) and 84% (Classic)
 below main's. On Rafa2, a clean mesh sequence, the hold trades error for
 rate: at the same scale 37% fewer bits and a larger error, at the same rate
 14% less error than main's coarser step, and decoded flicker down to the
