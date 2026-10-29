@@ -5,8 +5,8 @@
 
 // What the networking tests share: raw sockets on 127.0.0.1 port 0 (never
 // 0.0.0.0, which could raise a firewall prompt) to play a sender or a viewer
-// with any bytes, a server and a client on loopback, and the records a client
-// reads.
+// with any bytes, a server and a client on loopback, the records a client
+// reads and the viewers a server serves.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -263,6 +264,18 @@ inline bool wait_end(networking::StreamClient& client, std::uint16_t port,
     }
     if (*got || Clock::now() >= end) return false;
   }
+}
+
+// Whether `server` serves `n` viewers within 5 s: it sees a viewer's end
+// within a poll slice.
+inline bool serves_within(const networking::StreamServer& server,
+                          std::size_t n) {
+  const Clock::time_point end = Clock::now() + 5s;
+  while (server.viewers() != n) {
+    if (Clock::now() >= end) return false;
+    std::this_thread::sleep_for(5ms);
+  }
+  return true;
 }
 
 // A record's seq and key, with a payload made from its seq.

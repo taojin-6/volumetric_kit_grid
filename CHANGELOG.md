@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-29
+
+### Added
+
+- **`StreamServer::viewers()`**: the viewers a server is serving now, safe
+  from any thread (DESIGN.md, networking).
+
 ## [0.1.0] - 2026-10-28
 
 Extracted from `volumetric_kit_recon` at `5eeec098`; earlier history in that

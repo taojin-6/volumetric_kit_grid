@@ -95,10 +95,12 @@ struct StreamServer::Impl {
   std::mutex mutex;
   std::condition_variable wake;   // a record published, or the stop
   detail::GopLog log;             // under the mutex
-  std::size_t live = 0;           // under the mutex: viewers being served
   std::atomic<bool> stop{false};  // set under the mutex
   // The log's key_wanted(), set under the mutex and read from any thread.
   std::atomic<std::uint64_t> key_wanted{0};
+  // The viewers being served: added by the accept thread, taken off by each
+  // viewer's thread as it ends, read from any thread.
+  std::atomic<std::size_t> live{0};
 
   std::list<Viewer> viewers;  // the accept thread's, then the destructor's
   // The accept thread's: when a refusal was last logged at Warning.
@@ -137,13 +139,9 @@ void StreamServer::Impl::accept_loop() noexcept {
 }
 
 void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
-  std::size_t serving = 0;
-  {
-    // Only this thread adds viewers, so one admitted after this check still
-    // fits.
-    const std::lock_guard<std::mutex> lock(mutex);
-    serving = live;
-  }
+  // Only this thread adds viewers, so one admitted after this check still
+  // fits.
+  std::size_t serving = live;
   if (serving >= options.max_viewers) {
     fd.reset();  // closed at accept: the viewer sees its end before any byte
     // At Warning, which the default sink prints, so the owner sees why a
@@ -164,11 +162,7 @@ void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
   Viewer& viewer = viewers.emplace_back();
   viewer.fd = std::move(fd);
   viewer.name = std::move(name);
-  {
-    const std::lock_guard<std::mutex> lock(mutex);
-    ++live;
-    serving = live;
-  }
+  serving = ++live;
   try {
     log_at(core::LogLevel::Info, std::string(kServer) + ": viewer " +
                                      viewer.name + " joined, " +
@@ -179,10 +173,7 @@ void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
   try {
     viewer.thread = std::thread([this, &viewer] { serve(viewer); });
   } catch (...) {
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-      --live;
-    }
+    --live;
     viewers.pop_back();
     throw;
   }
@@ -465,6 +456,10 @@ std::uint16_t StreamServer::port() const noexcept { return impl_->port; }
 
 std::uint64_t StreamServer::key_wanted() const noexcept {
   return impl_->key_wanted.load();
+}
+
+std::size_t StreamServer::viewers() const noexcept {
+  return impl_->live.load();
 }
 
 }  // namespace volumetric_kit::grid::networking

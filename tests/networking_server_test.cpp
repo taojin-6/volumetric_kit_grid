@@ -23,8 +23,11 @@
 // refusal logged at Warning and the next at Debug, and a client refused there
 // is told it may have been; peers reset before they are accepted are dropped
 // with no Warning while a viewer joins; a viewer that leaves never fails
-// publish; a viewer's join and leave are logged at Info; the writer's
-// refusals send nothing, and so does a payload over the parser's cap; start
+// publish; viewers() counts a viewer from before its session, one waiting for
+// a key too, until it leaves, fails or stalls, and never a refused
+// connection; a viewer's join and leave are logged at Info, the leave once it
+// no longer counts; the writer's refusals send nothing, and so does a payload
+// over the parser's cap; start
 // refuses (a stall_limit of 0 or less among them); the destructor returns
 // within 1 s with no viewers, idle ones and a stalled one; the threads of
 // viewers that ended are joined as they go, the address space (on macOS, its
@@ -79,6 +82,7 @@ using Code = vkc::Status::Code;
 using net::Bytes;
 using net::Clock;
 using net::Got;
+using net::serves_within;
 using namespace std::chrono_literals;
 
 struct Published {
@@ -356,7 +360,8 @@ int viewer_sends_case() {
 // -----------------------------------------------------------------
 
 // A viewer joining after K P P gets K P P, then live; after a second key it
-// starts there; before any key it gets nothing until one.
+// starts there; before any key it gets nothing until one, counted as a viewer
+// while it waits.
 int join_case() {
   const stream::Session session = net::geometry_session();
   auto server = net::serve(session);
@@ -403,12 +408,13 @@ int join_case() {
     CHECK(got.record.info.seq == seq);
   }
 
-  // Before any key: nothing, then the key.
+  // Before any key: nothing, then the key; counted while it waits.
   auto fresh = net::serve(session);
   CHECK(fresh != nullptr);
   auto early = net::connect(fresh->port());
   CHECK(early != nullptr);
   CHECK(net::wait_session(*early));
+  CHECK(fresh->viewers() == 1);
   CHECK(fresh
             ->publish(net::record_info(0, false), payloads[0].data(),
                       payloads[0].size())
@@ -484,10 +490,11 @@ int newest_key_wins_case(bool replay) {
 // --- Keys on demand.
 // ---------------------------------------------------------
 
-// Without replay_gop: a viewer that joins after K P is counted at once and
-// gets its session, then nothing until the next key, then every record; a
-// second joiner waits for the next key while the first gets every record;
-// one leaving is not counted.
+// Without replay_gop: a viewer that joins after K P is counted at once, wanting
+// a key and as a viewer, and gets its session, then nothing until the next
+// key, then every record; a second joiner waits for the next key while the
+// first gets every record; one leaving is not counted wanting a key, and is
+// no longer a viewer.
 int on_demand_join_case() {
   networking::ServerOptions options;
   options.replay_gop = false;
@@ -503,10 +510,11 @@ int on_demand_join_case() {
   CHECK(publish(1, false));
   CHECK(server->key_wanted() == 0);
   // A client connects as it reads, so its session comes first; it was
-  // counted before the session was sent.
+  // counted before the session was sent, wanting a key and as a viewer while
+  // it waits for one.
   auto first = net::connect(server->port());
   CHECK(first != nullptr && net::wait_session(*first));
-  CHECK(server->key_wanted() == 1);
+  CHECK(server->key_wanted() == 1 && server->viewers() == 1);
   Got got;
   CHECK(publish(2, false));
   CHECK(!net::next_within(*first, &got, 200ms));
@@ -518,7 +526,7 @@ int on_demand_join_case() {
   CHECK(net::next_within(*first, &got) && got.record.info.seq == 4);
   auto second = net::connect(server->port());
   CHECK(second != nullptr && net::wait_session(*second));
-  CHECK(server->key_wanted() == 2);
+  CHECK(server->key_wanted() == 2 && server->viewers() == 2);
   CHECK(publish(5, false));
   CHECK(net::next_within(*first, &got) && got.record.info.seq == 5);
   CHECK(!net::next_within(*second, &got, 200ms));
@@ -530,6 +538,7 @@ int on_demand_join_case() {
   CHECK(publish(7, false));
   CHECK(net::next_within(*first, &got) && got.record.info.seq == 7);
   CHECK(server->key_wanted() == 2);
+  CHECK(serves_within(*server, 1));
   return 0;
 }
 
@@ -694,8 +703,8 @@ int gop_limit_case() {
 }
 
 // A viewer that takes no byte while its socket is full is closed after
-// stall_limit (200 ms), logged at Info, and its bytes then end; a reading
-// viewer meanwhile gets every record.
+// stall_limit (200 ms), logged at Info, and no longer counted, and its bytes
+// then end; a reading viewer meanwhile gets every record, still counted.
 int stall_limit_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -715,6 +724,7 @@ int stall_limit_case() {
   CHECK(header.size() == net::session_chunk(session).size());
   const std::string name = peer_name(stalled.get());
   CHECK(log.wait_for(name, "joined", 2s));
+  CHECK(server->viewers() == 2);
 
   const Clock::time_point start = Clock::now();
   std::uint64_t seq = 0;
@@ -734,6 +744,8 @@ int stall_limit_case() {
   const auto closed_after = Clock::now() - start;
   CHECK(log.has(name, "took no byte for 200 ms"));
   CHECK(closed_after >= 200ms);
+  // Logged once it is no longer counted.
+  CHECK(server->viewers() == 1);
   // What it was sent ends: the server closed it.
   Bytes rest;
   bool eof = false;
@@ -814,8 +826,8 @@ int slow_viewer_case() {
   return 0;
 }
 
-// Connection max_viewers + 1 is closed before any byte; once a viewer leaves,
-// a new one is served.
+// Connection max_viewers + 1 is closed before any byte, and never counted;
+// once a viewer leaves, a new one is served.
 int max_viewers_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -837,6 +849,7 @@ int max_viewers_case() {
   CHECK(eof && bytes.empty());
   CHECK(log.wait_for("refused viewer " + peer_name(third.get()), "2 viewers",
                      2s));
+  CHECK(server->viewers() == 2);
   // A client refused there is told it may have been.
   auto refused = net::connect(server->port());
   CHECK(refused != nullptr);
@@ -859,8 +872,10 @@ int max_viewers_case() {
                   vkc::LogLevel::Warning) == 1);
   CHECK(log.count("refused viewer ", "", vkc::LogLevel::Warning) == 1);
   CHECK(log.count("refused viewer ", "", vkc::LogLevel::Debug) == 1);
+  CHECK(server->viewers() == 2);
 
   first.reset();
+  CHECK(serves_within(*server, 1));
   const std::size_t header = net::session_chunk(session).size();
   bool served = false;
   for (int attempt = 0; attempt < 100 && !served; ++attempt) {
@@ -869,6 +884,7 @@ int max_viewers_case() {
     Bytes got;
     net::read_upto(next.get(), header, 1s, &got);
     served = got.size() == header;
+    CHECK(!served || server->viewers() == 2);
     if (!served) std::this_thread::sleep_for(10ms);
   }
   CHECK(served);
@@ -933,7 +949,7 @@ int reset_before_accept_case() {
 }
 
 // Viewers that leave mid-stream, by a close or a reset, never fail publish,
-// and the one that stays gets every record.
+// and are no longer counted; the one that stays gets every record.
 int leaving_viewer_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -976,11 +992,32 @@ int leaving_viewer_case() {
     std::this_thread::sleep_for(5ms);
   }
   CHECK(log.has(resets_name, " failed: ") || log.has(resets_name, " left"));
+  CHECK(serves_within(*server, 1));
+  return 0;
+}
+
+// The count rises at each join, before the viewer's session, and falls as
+// each leaves, the others still counted.
+int viewer_count_case() {
+  auto server = net::serve(net::geometry_session());
+  CHECK(server != nullptr);
+  CHECK(server->viewers() == 0);
+  std::vector<std::unique_ptr<networking::StreamClient>> clients;
+  for (std::size_t n = 1; n <= 3; ++n) {
+    clients.push_back(net::connect(server->port()));
+    CHECK(clients.back() != nullptr && net::wait_session(*clients.back()));
+    CHECK(server->viewers() == n);
+  }
+  while (!clients.empty()) {
+    clients.erase(clients.begin());
+    CHECK(serves_within(*server, clients.size()));
+  }
   return 0;
 }
 
 // A viewer that reads its session and closes is logged joining, then leaving,
-// each at Info, which the senders print: the only lines that name it.
+// each at Info, which the senders print: the only lines that name it; it is
+// no longer counted by the time it is logged leaving.
 int join_leave_log_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -995,6 +1032,7 @@ int join_leave_log_case() {
   CHECK(header.size() == net::session_chunk(session).size());
   viewer.reset();  // nothing unread, so a clean end
   CHECK(log.wait_for(name, " left", 2s));
+  CHECK(server->viewers() == 0);  // logged once it is no longer counted
   const std::string line = "StreamServer: viewer " + name;
   CHECK(log.count(line + " joined, 1 of 4", "", vkc::LogLevel::Info) == 1);
   CHECK(log.count(line + " left", "", vkc::LogLevel::Info) == 1);
@@ -1339,6 +1377,7 @@ int main() {
   if (max_viewers_case() != 0) return 1;
   if (reset_before_accept_case() != 0) return 1;
   if (leaving_viewer_case() != 0) return 1;
+  if (viewer_count_case() != 0) return 1;
   if (join_leave_log_case() != 0) return 1;
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;
