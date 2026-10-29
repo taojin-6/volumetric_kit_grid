@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.2] - 2026-10-29
+## [0.3.1] - 2026-10-29
 
 ### Changed
 
@@ -16,6 +16,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are unchanged; a P-frame decodes to within one step a coefficient of an
   I-frame of its grid (DESIGN.md, codec; the 2026-10-29 entry in
   DECISIONS.md).
+
+## [0.3.0] - 2026-10-29
+
+### Changed
+
+- **`vgrid_example::codec_outputs` serves `output.max_viewers` viewers**
+  (core 0.30.0, default 4, the server's own) in place of the server's
+  default alone, so recon's `fuse_orbbec` takes its viewer count from the
+  scenario.
+- **The core floor is 0.30.0** (`VGRID_CORE_MIN_VERSION`), whose config
+  reads `output.max_viewers`; a minor, as every consumer moves its core pin
+  with it.
+
+### Migration
+
+- A consumer that declares the core first pins core 0.30.0 or newer with
+  this grid; one at 0.29.0 fails grid's configure (`vkc_require_core`).
+
+## [0.2.1] - 2026-10-29
+
+### Changed
+
+- **Marching-cubes vertex normals**: each vertex carries the field's
+  gradient at its own position, the same from every cell and both kernels,
+  where it carried its cell's; positions and triangles are unchanged
+  (DESIGN.md, mesh).
 
 ## [0.2.0] - 2026-10-29
 
