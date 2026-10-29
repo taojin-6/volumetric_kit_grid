@@ -1050,10 +1050,11 @@ type, bytes, blocks, and encode and decode host and device ms), sums each
 type's stage rows, and writes `output.csv` as each row comes; the core cannot
 append, so the file is the report's own. A stream that does not decode
 (`CodecOutputs::decode` off) has rows with empty decode columns.
-`codec_outputs` maps `output.stream` and `output.serve` to `CodecOutputs`,
-and `codec_session` gives the `.vrst` one Geometry track at the source's
-nominal rate (the rig's `source.fps`, else 30 a second), with no session id
-or start time, so a rerun writes the same bytes; a record's set is the
+`codec_outputs` maps `output.stream`, `output.serve` and
+`output.max_viewers` to `CodecOutputs`, and `codec_session` gives the
+`.vrst` one Geometry track at the source's nominal rate (the rig's
+`source.fps`, else 30 a second), with no session id or start time, so a
+rerun writes the same bytes; a record's set is the
 source index and its pts that index at 30 fps, as Replica frames carry no
 time. `codec_outputs` serves without `replay_gop`, so the viewers of recon's `fuse_orbbec`
 that join or fall behind get a key at the next set; `serve_stream`, which
