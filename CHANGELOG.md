@@ -11,11 +11,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The `Encoder` holds each P-frame one quantization step against its
   reference**: a coefficient within one step of the reference's keeps the
   reference's value, so noise near a rounding boundary no longer flickers
-  the decoded surface or costs P-frame bits; a larger change passes in the
-  same frame. I-frames are quantized afresh. The format and the `Decoder`
-  are unchanged; a P-frame decodes to within one step a coefficient of an
-  I-frame of its grid (DESIGN.md, codec; the 2026-10-29 entry in
-  DECISIONS.md).
+  the decoded surface and P-frames take fewer bits; a larger change passes
+  in the same frame. I-frames are quantized afresh and re-centre the held
+  values, which drift in between, so a longer `intra_period` decodes
+  rougher. The format and the `Decoder` are unchanged; a P-frame decodes to
+  within one step a coefficient of an I-frame of its grid (DESIGN.md,
+  codec; the 2026-10-29 entry in DECISIONS.md).
 
 ## [0.3.0] - 2026-10-29
 

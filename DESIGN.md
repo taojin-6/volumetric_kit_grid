@@ -567,14 +567,16 @@ and the period's count. A P-frame is held against its reference before it
 is coded (the 2026-10-29 entry): in the front's batch, `inter_hold.comp`, an
 invocation a reference entry, finds its block in the frame by binary search
 and gives each coefficient within one step of the reference's,
-|q − q_ref| ≤ 1, the reference's value, in the spare in place. Noise that
-moves a coefficient to and fro across a rounding boundary then costs neither
-flicker nor bits, a change of more than one step passes in its frame, and
-each coefficient stays within one step of the forward's. An I-frame is
-quantized afresh, which re-centres the held values on its grid once a
-period, at one transition of flicker; held too, the values would drift
-toward the ends of the noise (the entry's measurements). Format and decoder
-are unchanged.
+|q − q_ref| ≤ 1, the reference's value, in the spare in place. A
+coefficient that noise moves to and fro across a rounding boundary then
+stops flickering, and a block held whole, its masks unchanged, is skipped;
+a change of more than one step passes in its frame, and each coefficient
+stays within one step of the forward's. An I-frame is quantized afresh,
+which re-centres the held values on its grid once a period, at one
+transition of flicker. In between they drift toward the ends of the noise,
+so the intra period bounds the drift: the longer it is, the rougher the
+decoded surface, and an open-ended period decodes as held I-frames would
+(the entry's measurements). Format and decoder are unchanged.
 In the front's batch, `inter_diff.comp` splits the frame against the reference
 and codes it, an invocation an entry: each reference entry finds its block
 by binary search (remove, skip when every word is equal, else keep or zero),

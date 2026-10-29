@@ -62,7 +62,11 @@ struct VGRID_CODEC_API EncoderConfig {
   /// every frame is an I-frame; at N, an I-frame and N - 1 P-frames
   /// (@ref FrameType::kInter) take turns; a period past the stream's length
   /// codes P-frames after the first frame for as long as the rules on
-  /// @ref Encoder::encode allow.
+  /// @ref Encoder::encode allow. Only an I-frame re-centres the values the
+  /// P-frames hold (@ref Encoder): between I-frames they drift toward the
+  /// ends of the noise, so the longer the period, the rougher the decoded
+  /// surface toward its end, and an open-ended period decodes as the held
+  /// I-frames the 2026-10-29 decision measured.
   std::uint32_t intra_period = 1;
   /// Whether the grid holds a true (Euclidean) signed distance, as
   /// @ref voxelize::MeshIntegrator converts a mesh to. `false`, the default,
@@ -171,11 +175,13 @@ struct EncodedFrame {
 /// a block the reference holds keeps the reference's value when the
 /// transform's lies within one quantization step of it, |q - q_ref| <= 1. A
 /// coefficient that noise moves to and fro across a rounding boundary then
-/// stays put, so the decoded surface does not flicker and the block is
-/// skipped; a change of more than one step passes in the same frame. So a
-/// P-frame decodes to within one step a coefficient of the I-frame of the
-/// same grid, which is quantized afresh: each I-frame re-centres the held
-/// values on its grid, at the cost of one frame of flicker. The format and
+/// stays put, so it stops flickering, and a block whose every coefficient
+/// holds and whose masks are unchanged is skipped; a change of more than one
+/// step passes in the same frame. So a P-frame decodes to within one step a
+/// coefficient of the I-frame of the same grid, which is quantized afresh:
+/// each I-frame re-centres the held values on its grid, at the cost of one
+/// frame of flicker, and between I-frames they drift
+/// (@ref EncoderConfig::intra_period). The format and
 /// the @ref Decoder are unchanged. Only a frame @ref encode returns becomes
 /// the reference, so a refusal keeps the chain, and a frame returned and then
 /// lost -- never decoded, or decoded out of order -- breaks it until the
