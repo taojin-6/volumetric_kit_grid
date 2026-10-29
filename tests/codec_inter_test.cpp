@@ -1093,9 +1093,9 @@ vkc::Result<vol::VoxelBlockGrid> moving_spheres(Gpu& gpu, int t) {
 
 // The moving spheres in chains at period 4 and open-ended, at an odd K in
 // segments of 3 and update segments of 5 and at the defaults: every frame
-// the oracle's bytes, every P-frame decoding to its I-frame's grid; and
-// among the P-frames every mode the encoder chooses but motion, and new
-// blocks.
+// the oracle's bytes, every P-frame decoding to the oracle's intra frame of
+// its held content; and among the P-frames every mode the encoder chooses
+// but motion, and new blocks.
 int encoder_chain_case(Shared& gpu) {
   for (const std::uint32_t period : {4u, ~0u}) {
     for (const bool odd : {true, false}) {
@@ -1165,9 +1165,10 @@ bool full_mask(const std::uint32_t* mask) {
 
 // With true_sdf, the moving curtain's open-ended chain: every frame the
 // oracle's bytes, its blocks and cuts by the host rule, every P-frame
-// decoding to its I-frame's grid; among the P-frames keep, skip, remove and
-// new blocks, keep entries whose cut voxels changed (a non-empty XOR mask),
-// and blocks whose mask went from full to partial and back.
+// decoding to the oracle's intra frame of its held content; among the
+// P-frames keep, skip, remove and new blocks, keep entries whose cut voxels
+// changed (a non-empty XOR mask), and blocks whose mask went from full to
+// partial and back.
 int true_sdf_chain_case(Shared& gpu) {
   codec::EncoderConfig config;
   config.intra_period = ~0u;
@@ -1743,13 +1744,13 @@ int hold_store_case(Gpu& gpu) {
 // alone is not 0: q = round(v sqrt(512) / 0.2), the default step. Block a's
 // forward DC dithers between 40 and 41 at random, 41 at both later I-frames;
 // the P-frames hold it -- at 40, then at 41 from the I-frame at 4 -- and skip
-// it; c jumps three steps at frame 5, which passes in that frame; d drifts a
+// it; c jumps three steps at frame 5, which passes in that frame; e drifts a
 // step a frame from frame 6, which the P-frames follow two steps at a time;
 // b, a slope, never changes. Every frame is the oracle's bytes, each held
 // coefficient within one step of the forward's, and the player's grid the
 // held content's at every frame. The I-frames are the forward's, so each
 // re-centres what the P-frames held: the one frame of flicker the hold
-// leaves, at 4 (a) and at 8 (d). A decoder that starts at the I-frame at 4
+// leaves, at 4 (a) and at 8 (e). A decoder that starts at the I-frame at 4
 // decodes it, and the frames after it, to the chain's grid.
 int hold_chain_case(Shared& gpu) {
   codec::EncoderConfig config;
@@ -1827,7 +1828,7 @@ int hold_chain_case(Shared& gpu) {
       CHECK(j.ok() && j.value() == decoded.back());
     }
   }
-  CHECK(off_by_one == 7);  // a's five P-frames off the forward's, and d's two
+  CHECK(off_by_one == 7);  // a's five P-frames off the forward's, and e's two
   // What the P-frames before each later I-frame held, it re-centres.
   CHECK(!(decoded[4] == decoded[3]) && !(decoded[8] == decoded[7]));
   CHECK(decoded[2] == decoded[1] && decoded[6] == decoded[5]);
