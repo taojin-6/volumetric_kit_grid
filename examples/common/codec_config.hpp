@@ -16,7 +16,7 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/sender/codec_stream.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
-#include "volumetric_kit/recon/tsdf/mesh_integrator.hpp"
+#include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
 namespace vr_example {
 
@@ -132,11 +132,11 @@ inline volumetric_kit::recon::stream::Session codec_session(
 ///         out; or InvalidArgument naming the minimum, for a caller that
 ///         refuses before any GPU work.
 inline volumetric_kit::core::Status check_true_sdf_band(
-    const volumetric_kit::recon::tsdf::MeshSdfParams& sdf,
+    const volumetric_kit::recon::voxelize::MeshSdfParams& sdf,
     const volumetric_kit::recon::volume::VoxelGridParams& grid) {
   namespace codec = volumetric_kit::recon::codec;
-  namespace tsdf = volumetric_kit::recon::tsdf;
-  const bool shell = sdf.mode == tsdf::MeshSdfMode::Shell;
+  namespace voxelize = volumetric_kit::recon::voxelize;
+  const bool shell = sdf.mode == voxelize::MeshSdfMode::Shell;
   const double least = double(codec::kTrueSdfBandVoxels) +
                        (shell ? double(sdf.shell_voxels) : 0.0);
   // A relative margin: two floats' ratio can fall just short of a whole band
@@ -156,14 +156,15 @@ inline volumetric_kit::core::Status check_true_sdf_band(
 /// @return Runtime SDF parameters from core's validated mesh source, or
 ///         InvalidArgument from `MeshSdfParams::validate` against @p grid:
 ///         the shell's bound, which core leaves to the mesh conversion.
-inline volumetric_kit::core::Result<volumetric_kit::recon::tsdf::MeshSdfParams>
+inline volumetric_kit::core::Result<
+    volumetric_kit::recon::voxelize::MeshSdfParams>
 mesh_sdf_config(const config::Source& source,
                 const volumetric_kit::recon::volume::VoxelGridParams& grid) {
-  namespace tsdf = volumetric_kit::recon::tsdf;
-  tsdf::MeshSdfParams result;
+  namespace voxelize = volumetric_kit::recon::voxelize;
+  voxelize::MeshSdfParams result;
   result.mode = source.sdf_mode == config::SdfMode::Signed
-                    ? tsdf::MeshSdfMode::Signed
-                    : tsdf::MeshSdfMode::Shell;
+                    ? voxelize::MeshSdfMode::Signed
+                    : voxelize::MeshSdfMode::Shell;
   result.shell_voxels = source.shell_voxels;
   VKC_TRY(result.validate(grid));
   return result;

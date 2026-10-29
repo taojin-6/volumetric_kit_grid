@@ -5,7 +5,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 // The brute force mesh_integrate.comp must match bit for bit
-// (recon_tsdf_mesh_integrate_exact): one thread per voxel measures every
+// (recon_voxelize_mesh_integrate_exact): one thread per voxel measures every
 // triangle of its block's bin -- the kernel as it was before it ruled
 // triangles out, its voxel, update and write unchanged. Two passes (pc.pass):
 //   bins    -- one item per (triangle, candidate block) work item, decoded,
@@ -53,7 +53,7 @@ layout(push_constant, scalar) uniform PushConstants {
   uint tri_count;
   uint block_count;
   uint pass;    // kPassBins or kPassMeasure
-  uint mode;    // tsdf::MeshSdfMode
+  uint mode;    // voxelize::MeshSdfMode
   float shell;  // shell half-thickness, metres
 } pc;
 

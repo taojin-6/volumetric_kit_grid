@@ -322,7 +322,8 @@ int main() {
   const auto sdf =
       vr_example::mesh_sdf_config(mesh.value().source, grid(mesh->fusion));
   CHECK(sdf.ok());
-  CHECK(sdf->mode == vr::tsdf::MeshSdfMode::Shell && sdf->shell_voxels == 2.F);
+  CHECK(sdf->mode == vr::voxelize::MeshSdfMode::Shell &&
+        sdf->shell_voxels == 2.F);
   CHECK(mesh.value().source.up_vector.has_value());
   CHECK((*mesh.value().source.up_vector)[0] < -0.9);
   // Core loads any positive shell; the conversion's bound is recon's, with
@@ -351,9 +352,9 @@ int main() {
   // to 50 mm, though two floats' ratio can fall short of it (0.06 m of 4 mm
   // voxels), and 14 refused; shell mode adds the half-thickness. Both mesh
   // templates pass.
-  vr::tsdf::MeshSdfParams solid;
-  vr::tsdf::MeshSdfParams shelled;
-  shelled.mode = vr::tsdf::MeshSdfMode::Shell;
+  vr::voxelize::MeshSdfParams solid;
+  vr::voxelize::MeshSdfParams shelled;
+  shelled.mode = vr::voxelize::MeshSdfMode::Shell;
   shelled.shell_voxels = 2.F;
   for (int mm = 1; mm <= 50; ++mm) {
     const auto band = [mm](int voxels) {
