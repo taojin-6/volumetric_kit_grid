@@ -8,8 +8,8 @@
 // that stays in each kernel's main(); everything downstream of the gathered
 // `sdf[8]` / `corner_color[8]` is identical and lives here as one source, so a
 // fix to the numerically load-bearing math (the near-tangent edge guard, the
-// 8-corner gradient, the reversed winding) can never be applied to only one
-// path. Mirrors the volume tier's hash_common.glsl / the tsdf tier's
+// vertex normal, the reversed winding) can never be applied to only one path.
+// Mirrors the volume tier's hash_common.glsl / the tsdf tier's
 // tsdf_common.glsl shared-include discipline.
 //
 // The includer must, *before* the include, declare the binding-0 `Tables`
@@ -98,27 +98,59 @@ float mcEdgeRatio(float sa, float sb, float iso) {
   return clamp((iso - sa) / denom, 0.0, 1.0);
 }
 
-// One normal per cell from the 8-corner central-difference gradient (points
-// toward increasing distance, i.e. outward); shared by the cell's vertices. The
-// 1/(4*voxel_size) scale is dropped -- it cancels under normalization. Falls
-// back to +z when the gradient vanishes (a degenerate flat cell).
-vec3 mcCellNormal(float sdf[8]) {
-  vec3 grad =
-      vec3((sdf[1] + sdf[2] + sdf[5] + sdf[6]) - (sdf[0] + sdf[3] + sdf[4] + sdf[7]),
-           (sdf[2] + sdf[3] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[4] + sdf[5]),
-           (sdf[4] + sdf[5] + sdf[6] + sdf[7]) - (sdf[0] + sdf[1] + sdf[2] + sdf[3]));
-  float glen = length(grad);
-  return glen > 1e-6 ? grad / glen : vec3(0.0, 0.0, 1.0);
+// The current cell's field gradient at each of its eight corners, in distance
+// per voxel, toward increasing distance. mcCornerGradients
+// (marching_cubes_sparse_common.glsl) fills them after the gather and before
+// the cell emits a vertex; mcEdgeVertex reads two of them per vertex. Eight
+// named registers rather than an array, because mcEdgeVertex picks them by a
+// corner index known only at run time, and a private array indexed that way
+// spills to memory. Computing a vertex's two on demand instead, rather than
+// all eight per cell, was slower on an RTX 4090 and an M5 Max.
+vec3 g_corner_grad0, g_corner_grad1, g_corner_grad2, g_corner_grad3,
+    g_corner_grad4, g_corner_grad5, g_corner_grad6, g_corner_grad7;
+
+vec3 mcCornerGradient(int corner) {
+  return corner == 0   ? g_corner_grad0
+         : corner == 1 ? g_corner_grad1
+         : corner == 2 ? g_corner_grad2
+         : corner == 3 ? g_corner_grad3
+         : corner == 4 ? g_corner_grad4
+         : corner == 5 ? g_corner_grad5
+         : corner == 6 ? g_corner_grad6
+                       : g_corner_grad7;
 }
 
-// The position + colour of the iso-crossing on edge `edge` of the cell whose
-// eight corner samples are `sdf` / `corner_color` and whose base voxel is
-// `base_voxel` (in GLOBAL voxel coordinates -- see mcWriteTriangle's
+// A vertex's unit normal from the gradient mixed at it, on the edge from
+// corner shift `shift_a` (distance sa) to `shift_b` (sb). Where the gradient
+// vanishes, the edge's axis toward increasing distance: a crossing edge has
+// sa != sb, so that is never the zero vector.
+vec3 mcVertexNormal(vec3 grad, ivec3 shift_a, ivec3 shift_b, float sa,
+                    float sb) {
+  float len = length(grad);
+  if (len > 1e-12) {
+    return grad / len;
+  }
+  vec3 axis = vec3(shift_b - shift_a);
+  return sb > sa ? axis : -axis;
+}
+
+// The position, normal and colour of the iso-crossing on edge `edge` of the
+// cell whose eight corner samples are `sdf` / `corner_color` and whose base
+// voxel is `base_voxel` (in GLOBAL voxel coordinates -- see mcWriteTriangle's
 // preconditions). The ONE interpolator: mcWriteTriangle calls it, and so do
 // both halves of the sharing kernel's vertex claim (the owned-edge pass and
 // the +face duplicate path), so a shared vertex and a duplicated one land on
 // bit-identical coordinates -- which is what makes sharing a pure vertex-count
 // change and leaves every triangle exactly where it was.
+//
+// The normal is the field's gradient at the vertex: the gradients at the
+// edge's two corners (mcCornerGradient, which the caller has filled for this
+// cell) mixed by the same ratio as the position, then normalized. A corner's
+// gradient is a function of its voxel alone (see mcCornerGradients), so the
+// normal is a function of the edge alone: every cell that emits the vertex,
+// in either kernel and on either side of a block boundary, gives it the same
+// normal, and shading has no seam between cells. At block_size 1 alone it does
+// not (mcGradientSample).
 //
 // Bit-identical needs the endpoints in a CANONICAL ORDER, not merely resolved
 // to the same global voxels, and that is what the swap below is for. kEdgeToVert
@@ -152,7 +184,7 @@ vec3 mcCellNormal(float sdf[8]) {
 // reach Metal unguarded.
 void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8],
                   ivec3 base_voxel, float voxel_size, float iso, uint has_color,
-                  out vec3 position, out vec3 color) {
+                  out vec3 position, out vec3 normal, out vec3 color) {
   int a = edge_to_vert[edge * 2 + 0];
   int b = edge_to_vert[edge * 2 + 1];
   ivec3 shift_a = mcCornerShift(a);
@@ -172,11 +204,15 @@ void mcEdgeVertex(int edge, float sdf[8], vec3 corner_color[8],
   if (sdf[a] == iso || sdf[b] == iso) {
     bool at_b = sdf[b] == iso;
     position = at_b ? pb : pa;
+    normal = mcVertexNormal(mcCornerGradient(at_b ? b : a), shift_a, shift_b,
+                            sdf[a], sdf[b]);
     color = has_color != 0u ? corner_color[at_b ? b : a] : vec3(1.0);
     return;
   }
   float ratio = mcEdgeRatio(sdf[a], sdf[b], iso);
   position = mix(pa, pb, ratio);
+  normal = mcVertexNormal(mix(mcCornerGradient(a), mcCornerGradient(b), ratio),
+                          shift_a, shift_b, sdf[a], sdf[b]);
   // LINEAR working values (each kernel decodes at the gather), because this is
   // an average -- the 2026-08-02 colour decision. White is 1.0 either way.
   color = has_color != 0u ? mix(corner_color[a], corner_color[b], ratio)
@@ -238,7 +274,7 @@ int mcCellTriangleCount(int cube_index) {
 // The caller reserves the run and passes the slot; this never claims one.
 //
 // THE PRECONDITIONS, stated here because this is the entry point a third
-// caller would reach for and neither is checkable from inside:
+// caller would reach for and none is checkable from inside:
 //
 //   * Corner c's world position is `(base_voxel + cornerShift(c)) *
 //     voxel_size`, so the caller passes the cell's base voxel in GLOBAL voxel
@@ -251,26 +287,32 @@ int mcCellTriangleCount(int cube_index) {
 //     because the edge interpolation below is an average. Passing encoded sRGB
 //     compiles and darkens every interpolated vertex. It is ignored entirely
 //     when has_color == 0, where vertices get opaque white.
+//   * mcCornerGradients has run for this cell, or every normal is the
+//     previous cell's.
 //
-// Neither shows up as a wrong triangle count, which is what the tests key on.
+// None shows up as a wrong triangle count, which is what the tests key on.
 //
 // Winding is reversed (0, 2, 1) so the CCW front face points along the outward
-// gradient `normal` -- the orientation gfx expects; colour follows the same
-// reversal so each vertex keeps its own edge's colour, and uv0 stays the "use
-// vertex colour" sentinel until projective texturing runs.
+// gradient -- the orientation gfx expects: table entry k is vertex 0, 2, 1.
+// Normal and colour go with their position, so each vertex keeps its own
+// edge's, and uv0 stays the "use vertex colour" sentinel until projective
+// texturing runs.
+//
+// Each vertex is written as soon as it is computed. Holding all three until
+// the end keeps 27 more floats live beside the eight corner gradients (the
+// compiler cannot move the writes up, as the vertex buffer may alias what it
+// reads): on an RTX 4090 that took the kernel from 80 to 116 registers and
+// its extract from 1.04 to 1.29 ms on a decoded live room capture.
 void mcWriteTriangle(int cube_index, int t, float sdf[8], vec3 corner_color[8],
-                     ivec3 base_voxel, float voxel_size, vec3 normal, float iso,
+                     ivec3 base_voxel, float voxel_size, float iso,
                      uint has_color, uint tri) {
-  vec3 p[3];
-  vec3 col[3];
-  for (int k = 0; k < 3; ++k) {
-    mcEdgeVertex(tri_table[cube_index * 16 + t * 3 + k], sdf, corner_color,
-                 base_voxel, voxel_size, iso, has_color, p[k], col[k]);
-  }
   uint vbase = tri * 3u;
-  mcWriteVertex(vbase + 0u, p[0], normal, col[0]);
-  mcWriteVertex(vbase + 1u, p[2], normal, col[2]);
-  mcWriteVertex(vbase + 2u, p[1], normal, col[1]);
+  for (int k = 0; k < 3; ++k) {
+    vec3 p, nrm, col;
+    mcEdgeVertex(tri_table[cube_index * 16 + t * 3 + k], sdf, corner_color,
+                 base_voxel, voxel_size, iso, has_color, p, nrm, col);
+    mcWriteVertex(vbase + uint(k == 0 ? 0 : 3 - k), p, nrm, col);
+  }
 }
 
 #endif  // VGRID_MARCHING_CUBES_COMMON_GLSL

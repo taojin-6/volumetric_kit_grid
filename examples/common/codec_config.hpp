@@ -82,9 +82,10 @@ inline std::string codec_settings(
 ///         (`codec_stream::CodecOutputs`): core's `output.stream`, already
 ///         relative to the scenario's directory, an empty path writing
 ///         nothing; and `output.serve`, every interface on that port, 0
-///         serving nothing, without `replay_gop`: the stream codes live, so a
-///         viewer that joins or falls behind gets a key at the next frame.
-///         `output.csv` is the report's (`CodecReport`).
+///         serving nothing, to `output.max_viewers` viewers at once, without
+///         `replay_gop`: the stream codes live, so a viewer that joins or
+///         falls behind gets a key at the next frame. `output.csv` is the
+///         report's (`CodecReport`).
 inline volumetric_kit::grid::codec_stream::CodecOutputs codec_outputs(
     const config::Output& output) {
   volumetric_kit::grid::codec_stream::CodecOutputs outputs;
@@ -92,6 +93,7 @@ inline volumetric_kit::grid::codec_stream::CodecOutputs codec_outputs(
   if (output.serve != 0) {
     outputs.serve.emplace();  // every interface
     outputs.serve->port = output.serve;
+    outputs.serve->max_viewers = output.max_viewers;
     outputs.serve->replay_gop = false;
   }
   return outputs;

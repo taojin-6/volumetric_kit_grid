@@ -58,7 +58,7 @@ vkc_compile_shaders(my_kernels INCLUDE_TARGETS volumetric_kit::grid_volume
                     SPIRV_VAL_ARGS --scalar-block-layout SHADERS my.comp)
 ```
 
-grid needs the core at `VGRID_CORE_MIN_VERSION` (0.29.0) or newer, with its
+grid needs the core at `VGRID_CORE_MIN_VERSION` (0.30.0) or newer, with its
 vulkan tier, and checks it with the core's `vkc_require_core`. A project that
 also fetches another sibling declares `volumetric_kit_core` first and sets
 `VKC_WITH_VULKAN ON` before its first `FetchContent_MakeAvailable`; pass
@@ -182,9 +182,11 @@ GPU; a viewer connects to the sender's `host:port`:
 
 Both listen on every interface, with no authentication or encryption: any
 host that reaches the port can watch, and the first four to connect keep
-their slots while they stay (`max_viewers`). Both print each viewer joining
-and leaving on stderr; one the sender closes, or whose connection fails,
-ends with `closed: <why>` or `failed: <why>` in place of `left`:
+their slots while they stay (`max_viewers`; `fuse_orbbec` takes its count
+from the scenario's `output.max_viewers`, 4 by default). Both print each
+viewer joining and leaving on stderr; one the sender closes, or whose
+connection fails, ends with `closed: <why>` or `failed: <why>` in place of
+`left`:
 
 ```text
 [vgrid info] StreamServer: viewer 192.168.1.20:52311 joined, 1 of 4

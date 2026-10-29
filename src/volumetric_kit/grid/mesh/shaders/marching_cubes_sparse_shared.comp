@@ -152,12 +152,12 @@ layout(push_constant, scalar) uniform PushConstants {
   uint item_base;  // the first active block this dispatch covers
 } pc;
 
-// mcCornerShift / mcCellNormal / mcEdgeOwner / mcEdgeVertex + the near-tangent
-// edge guard, over the Tables / Vertices / DrawCommand bindings declared above.
+// mcCornerShift / mcEdgeOwner / mcEdgeVertex + the near-tangent edge guard,
+// over the Tables / Vertices / DrawCommand bindings declared above.
 #include "marching_cubes_common.glsl"
 
 // vgridLocalIndex / vgridLocalBase / s_neighbour / vgridResolveNeighbourhood /
-// mcGather.
+// mcGather / mcCornerGradients.
 #include "marching_cubes_sparse_common.glsl"
 
 // The vertex this block emitted for each cell's three OWNED edges (+x, +y, +z
@@ -374,14 +374,11 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
     return;
   }
   ivec3 base_voxel = block.coord * bs + base;
-  // One normal per cell, as before. A shared vertex therefore carries the
-  // gradient of the cell that OWNS its edge rather than of each cell that draws
-  // it -- the prior engine's behaviour, and the reason sharing changes vertex
-  // normals even though it leaves every triangle where it was. A genuine
-  // per-vertex normal (the gradient at the crossing) is a further change and is
-  // deliberately not folded in here; it deserves its own measurement.
-  // TODO(mesh): per-vertex normals now that vertices are shared.
-  vec3 normal = mcCellNormal(sdf);
+  // Corners 0, 1, 3 and 4 alone: the owned edges' ends. A vertex's normal is
+  // a function of its edge (mcEdgeVertex), so a shared vertex carries the
+  // normal every cell drawing it would have given it, and the duplicate path
+  // below gives the same one.
+  mcCornerGradients(sdf, base, true);
   for (int axis = 0; axis < 3; ++axis) {
     int edge = s_owned_edge[axis];
     int a = edge_to_vert[edge * 2 + 0];
@@ -393,9 +390,10 @@ void mcOwnedEdgePass(BlockIndex block, int bs, uint local) {
       continue;
     }
     vec3 position;
+    vec3 normal;
     vec3 color;
     mcEdgeVertex(edge, sdf, corner_color, base_voxel, pc.voxel_size,
-                 pc.iso, pc.has_color, position, color);
+                 pc.iso, pc.has_color, position, normal, color);
     // Always a real slot now, in range or not -- see mcClaimVertex.
     s_edge_vtx[local * 3u + uint(axis)] = mcClaimVertex(position, normal, color);
   }
@@ -422,7 +420,6 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
   // memory here, which is most interior cells.
   float sdf[8];
   vec3 corner_color[8];
-  vec3 normal = vec3(0.0, 0.0, 1.0);
   bool have_corners = false;
 
   // Triangles come from the block's reserved range, not from a per-triangle
@@ -478,12 +475,13 @@ void mcTrianglePass(BlockIndex block, int bs, uint local) {
             break;
           }
           have_corners = true;
-          normal = mcCellNormal(sdf);
+          mcCornerGradients(sdf, base, false);
         }
         vec3 position;
+        vec3 normal;
         vec3 color;
-        mcEdgeVertex(edge, sdf, corner_color, base_voxel,
-                     pc.voxel_size, pc.iso, pc.has_color, position, color);
+        mcEdgeVertex(edge, sdf, corner_color, base_voxel, pc.voxel_size,
+                     pc.iso, pc.has_color, position, normal, color);
         slot = mcClaimVertex(position, normal, color);
       }
       // The vertex was never written, so a triangle referencing it cannot be
@@ -576,6 +574,7 @@ void main() {
   }
   vgridResolveNeighbourhood(block.coord, block.ptr, tid, pc.num_buckets,
                          pc.bucket_size, pc.max_chain);
+  mcResolveGradientBlocks(block.coord, block.ptr, tid);
   // Derived once per workgroup by the first 12 lanes, under the same barrier as
   // the neighbourhood: mcEdgeOwner is a pure function of the tables, so having
   // all 256 lanes run its 12-iteration, 96-load loop -- and then call it again

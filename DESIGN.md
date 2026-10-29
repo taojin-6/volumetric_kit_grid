@@ -413,6 +413,20 @@ interpolated vertex may differ across devices: on NVIDIA and Apple by an ulp
 of the ratio times the voxel along its edge (an ulp of a coordinate, unless
 the coordinate is small against the voxel), and in every coordinate on a
 device whose `mix()` rounds all three, as lavapipe's does.
+A vertex's normal is the field's gradient at the vertex: central
+differences at its edge's two end voxels, mixed by its ratio along the edge
+(a selected corner takes its own), normalized; where that vanishes, the
+edge's axis toward increasing distance. A neighbour that is unallocated or
+below the weight threshold is never used, and that axis takes the one-sided
+difference toward the cell, whose voxels the gather read. So a normal is a
+function of its edge: at block_size ≥ 2, every cell and both kernels give a
+vertex the same one, and shading has no seam between cells or blocks. The
+differences reach one voxel past the cell, so each workgroup also resolves
+its block's 3×3×3 neighbourhood. Against one normal per cell, interleaved on
+the last frame of a decoded live room capture (1 cm, 1.24 M triangles,
+Release, 2026-10-29), the extract's dispatch takes 0.42 ms more unshared and
+0.23 ms more sharing on an RTX 4090 (0.62 → 1.04 and 1.57 → 1.80 ms), and
+0.59 and 0.91 ms more on an M5 Max (1.51 → 2.10 and 2.29 → 3.20 ms).
 `MeshExchange<Payload>` (`mesh/mesh_exchange.hpp`) hands `extract_device`'s
 meshes from the extracting thread to a renderer drawing them in place, each
 with a payload that stays with it (its atlas), and owns the ring's release
@@ -1036,10 +1050,11 @@ type, bytes, blocks, and encode and decode host and device ms), sums each
 type's stage rows, and writes `output.csv` as each row comes; the core cannot
 append, so the file is the report's own. A stream that does not decode
 (`CodecOutputs::decode` off) has rows with empty decode columns.
-`codec_outputs` maps `output.stream` and `output.serve` to `CodecOutputs`,
-and `codec_session` gives the `.vrst` one Geometry track at the source's
-nominal rate (the rig's `source.fps`, else 30 a second), with no session id
-or start time, so a rerun writes the same bytes; a record's set is the
+`codec_outputs` maps `output.stream`, `output.serve` and
+`output.max_viewers` to `CodecOutputs`, and `codec_session` gives the
+`.vrst` one Geometry track at the source's nominal rate (the rig's
+`source.fps`, else 30 a second), with no session id or start time, so a
+rerun writes the same bytes; a record's set is the
 source index and its pts that index at 30 fps, as Replica frames carry no
 time. `codec_outputs` serves without `replay_gop`, so the viewers of recon's `fuse_orbbec`
 that join or fall behind get a key at the next set; `serve_stream`, which
@@ -1115,7 +1130,7 @@ measurement on a large scan, against a full extract with view culling.
 View-culled meshing has landed (2026-10-06); its win is correct and
 unmeasured, so quote nothing until a run on a large scan says so. On
 `mesh_io`, first-class glTF/GLB export. On `mesh`, the greppable
-`TODO(mesh)`s: cross-block vertex sharing, per-vertex normals, measuring a
+`TODO(mesh)`s: cross-block vertex sharing, measuring a
 return of the default kernel to the per-triangle append (the per-block
 reservation cost ~10% of the dispatch and was taken for incremental
 extraction).
