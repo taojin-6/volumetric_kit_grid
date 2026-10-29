@@ -305,7 +305,7 @@ vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    vr::volume::VoxelBlockGrid& grid,
                                    vr::voxelize::MeshIntegrator& integrator,
                                    const vr::voxelize::MeshSdfParams& params,
-                                   vr::sender::CodecStream& stream,
+                                   vr::codec_stream::CodecStream& stream,
                                    vkc::StageMetrics* conversion) {
   CodedFrame coded;
   VKC_ASSIGN(coded.frame, sequence.load(number));
@@ -315,7 +315,7 @@ vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
       convert_frame(grid, integrator, coded.frame.mesh, params, conversion);
   if (!stats.ok()) return stats.status().with_context(name);
   coded.stats = *stats;
-  vkc::Result<vr::sender::SentFrame> recorded =
+  vkc::Result<vr::codec_stream::SentFrame> recorded =
       stream.code(grid, number, frame_pts_ns(number, kNominalFps));
   if (!recorded.ok()) return recorded.status().with_context(name);
   coded.sent = std::move(recorded).value();

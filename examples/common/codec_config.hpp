@@ -12,11 +12,9 @@
 
 #include "codec_quantization.hpp"
 #include "config.hpp"
-#include "fuse_frame.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
-#include "volumetric_kit/recon/sender/codec_stream.hpp"
-#include "volumetric_kit/recon/sender/set_sender.hpp"
+#include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 #include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
@@ -80,15 +78,16 @@ inline std::string codec_settings(
   return config.true_sdf ? settings + "; true SDF" : settings;
 }
 
-/// @return Where a codec stream's frames go (`sender::CodecOutputs`): core's
-///         `output.stream`, already relative to the scenario's directory, an
-///         empty path writing nothing; and `output.serve`, every interface on
-///         that port, 0 serving nothing, without `replay_gop`: the stream
-///         codes live, so a viewer that joins or falls behind gets a key at
-///         the next frame. `output.csv` is the report's (`CodecReport`).
-inline volumetric_kit::recon::sender::CodecOutputs codec_outputs(
+/// @return Where a codec stream's frames go
+///         (`codec_stream::CodecOutputs`): core's `output.stream`, already
+///         relative to the scenario's directory, an empty path writing
+///         nothing; and `output.serve`, every interface on that port, 0
+///         serving nothing, without `replay_gop`: the stream codes live, so a
+///         viewer that joins or falls behind gets a key at the next frame.
+///         `output.csv` is the report's (`CodecReport`).
+inline volumetric_kit::recon::codec_stream::CodecOutputs codec_outputs(
     const config::Output& output) {
-  volumetric_kit::recon::sender::CodecOutputs outputs;
+  volumetric_kit::recon::codec_stream::CodecOutputs outputs;
   outputs.stream = output.stream;
   if (output.serve != 0) {
     outputs.serve.emplace();  // every interface
@@ -101,9 +100,9 @@ inline volumetric_kit::recon::sender::CodecOutputs codec_outputs(
 /// @return The outputs of @p opt's sender's stream (@ref codec_outputs),
 ///         decoding each frame only with `output.csv` or `codec.sweep`,
 ///         which read the decode: a recording or a server alone needs none.
-inline volumetric_kit::recon::sender::CodecOutputs set_codec_outputs(
+inline volumetric_kit::recon::codec_stream::CodecOutputs set_codec_outputs(
     const config::Config& opt) {
-  volumetric_kit::recon::sender::CodecOutputs outputs =
+  volumetric_kit::recon::codec_stream::CodecOutputs outputs =
       codec_outputs(opt.output);
   outputs.decode = !opt.output.csv.empty() || opt.codec.sweep;
   return outputs;
@@ -126,18 +125,6 @@ inline volumetric_kit::recon::stream::Session codec_session(
   session.writer = program;
   session.tracks.push_back(std::move(geometry));
   return session;
-}
-
-/// @return @p opt's sender config (`sender::SetSender::Config`): fusion as
-///         `fusion` says, and every @p code_every-th set coded.
-inline volumetric_kit::recon::sender::SetSender::Config sender_config(
-    const config::Config& opt, int code_every) {
-  volumetric_kit::recon::sender::SetSender::Config c;
-  c.max_weight = opt.fusion.max_weight;
-  c.mode = integration_mode(opt.fusion.dynamic);
-  c.free_after = opt.fusion.free_after;
-  c.code_every = code_every;
-  return c;
 }
 
 /// @return OK when @p grid's band observes every voxel a true-SDF frame of a
