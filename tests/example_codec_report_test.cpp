@@ -6,8 +6,7 @@
 // stage rows, its CSV line, a frame type's sizes, a GOP's bytes and bitrate, a
 // frame's pts, the comparison options the codec examples share, a path that
 // is the stream's or the CSV's file through a link refused, one beside them
-// taken and one that cannot be checked refused, and a sender's set stamped and
-// its frame's row kept from what the set step returned. On a grid holding a
+// taken and one that cannot be checked refused. On a grid holding a
 // sphere, coded through codec_stream::CodecStream: a CSV refused after the
 // stream is made, which takes the stream's file back, or because it is the
 // stream's file under another name; a row per frame, under the source's index,
@@ -15,7 +14,8 @@
 // own frames'; the CSV replaced on create and written as each row comes; a CSV
 // that stops taking rows refused, the row kept and every row after refused;
 // and without the decode, rows with no decode columns and no decode stage
-// rows. The device part skips with no device.
+// rows. The device part skips with no device. A sender's set into the report
+// is example_fuse_sender_test.cpp's.
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -34,13 +34,11 @@
 #include "codec_config.hpp"
 #include "codec_fixture.hpp"
 #include "codec_report.hpp"
-#include "set_log.hpp"
 #include "volumetric_kit/core/base/file_io.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/core/device_requirements.hpp"
-#include "volumetric_kit/recon/sender/set_sender.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 
@@ -49,7 +47,6 @@ namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace codec_stream = volumetric_kit::recon::codec_stream;
 namespace eval = volumetric_kit::recon::eval;
-namespace sender = volumetric_kit::recon::sender;
 namespace stream = volumetric_kit::recon::stream;
 namespace fs = std::filesystem;
 using namespace codec_fixture;
@@ -227,40 +224,6 @@ int apart() {
   const fs::path unknowable = scratch.path / std::string(300, 'x');
   CHECK(vr_example::check_apart(unknowable.string(), outputs).domain() ==
         vkc::Status::Code::IoError);
-  return 0;
-}
-
-// A sender's set into the run's figures: a set fused again whose frame, a
-// P-frame, took a tail, stamped so, its frame's row kept under the set's
-// index; a set not coded stamped with no type, and no row.
-int sent_sets() {
-  vkc::Result<vr_example::CodecReport> made =
-      vr_example::CodecReport::create("", "", false, 30);
-  CHECK(made.ok());
-  vr_example::CodecReport& report = made.value();
-  vr_example::SetLog log(nullptr);
-  sender::SetSender::Sent coded;
-  coded.fused.redone = true;
-  coded.coded.emplace();
-  coded.coded->type = codec::FrameType::kInter;
-  coded.coded->bytes = 1234;
-  coded.coded->blocks = 56;
-  coded.coded->tail = true;
-  vr_example::SetLog::Set& first = log.begin();
-  CHECK(
-      vr_example::report_sent(coded, 4, "example_codec_report", first, &report)
-          .ok());
-  CHECK(first.redone && first.tail && first.type == codec::FrameType::kInter);
-  CHECK(report.rows().size() == 1 && report.rows()[0].frame == 4);
-  CHECK(report.rows()[0].bytes == 1234 && report.rows()[0].blocks == 56);
-  CHECK(!report.rows()[0].decode_ms);
-  const sender::SetSender::Sent fused;
-  vr_example::SetLog::Set& second = log.begin();
-  CHECK(
-      vr_example::report_sent(fused, 5, "example_codec_report", second, &report)
-          .ok());
-  CHECK(!second.redone && !second.tail && !second.type);
-  CHECK(report.rows().size() == 1);
   return 0;
 }
 
@@ -549,6 +512,5 @@ int main() {
   CHECK(frame_times() == 0);
   CHECK(compare_options() == 0);
   CHECK(apart() == 0);
-  CHECK(sent_sets() == 0);
   return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
 }

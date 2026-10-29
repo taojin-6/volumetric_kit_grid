@@ -24,8 +24,6 @@
 #include <utility>
 #include <vector>
 
-#include "fuse_frame.hpp"
-#include "set_log.hpp"
 #include "stage_table.hpp"
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
@@ -33,7 +31,6 @@
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/recon/eval/mesh_distance.hpp"
-#include "volumetric_kit/recon/sender/set_sender.hpp"
 
 namespace vr_example {
 
@@ -434,26 +431,5 @@ class CodecReport {
   std::vector<CodecRow> rows_;
   bool grew_ = false;  // a decode grew the player grid
 };
-
-/// @brief What a sender's set did, into the run's figures: a free pass's
-///        refusal on stderr as "<program>: free blocks: <why>", what the
-///        fusion did to the grid (@ref print_fuse_report), the set's row
-///        stamped -- fused again, its frame's type and tail -- and its
-///        frame's row added to @p report, when given.
-/// @return OK, or @ref CodecReport::add's error.
-inline vkc::Status report_sent(const vr::sender::SetSender::Sent& sent,
-                               std::uint64_t index, const char* program,
-                               SetLog::Set& set, CodecReport* report) {
-  if (!sent.freed.ok()) {
-    std::fprintf(stderr, "%s: free blocks: %s\n", program,
-                 sent.freed.message().c_str());
-  }
-  print_fuse_report(sent.fused);
-  set.redone = sent.fused.redone;
-  if (!sent.coded) return {};
-  set.type = sent.coded->type;
-  set.tail = sent.coded->tail;
-  return report != nullptr ? report->add(index, *sent.coded) : vkc::Status{};
-}
 
 }  // namespace vr_example

@@ -12,11 +12,9 @@
 
 #include "codec_quantization.hpp"
 #include "config.hpp"
-#include "fuse_frame.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/codec_stream/codec_stream.hpp"
-#include "volumetric_kit/recon/sender/set_sender.hpp"
 #include "volumetric_kit/recon/stream/session.hpp"
 #include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
@@ -127,18 +125,6 @@ inline volumetric_kit::recon::stream::Session codec_session(
   session.writer = program;
   session.tracks.push_back(std::move(geometry));
   return session;
-}
-
-/// @return @p opt's sender config (`sender::SetSender::Config`): fusion as
-///         `fusion` says, and every @p code_every-th set coded.
-inline volumetric_kit::recon::sender::SetSender::Config sender_config(
-    const config::Config& opt, int code_every) {
-  volumetric_kit::recon::sender::SetSender::Config c;
-  c.max_weight = opt.fusion.max_weight;
-  c.mode = integration_mode(opt.fusion.dynamic);
-  c.free_after = opt.fusion.free_after;
-  c.code_every = code_every;
-  return c;
 }
 
 /// @return OK when @p grid's band observes every voxel a true-SDF frame of a
