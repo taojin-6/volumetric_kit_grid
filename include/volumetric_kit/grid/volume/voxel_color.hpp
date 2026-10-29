@@ -12,8 +12,9 @@
 /// encoded form -- the linear working space (BT.709 primaries, D65) through the
 /// exact piecewise sRGB curve, full range -- alpha `0xFF` once observed, and
 /// @ref kVoxelColorUnobserved for a voxel no colour was fused into. The curve
-/// is the published one, held to `core/color_space.hpp`'s and to the GLSL by
-/// `recon_volume_voxel_color`.
+/// is the published one, held to it and to the GLSL by
+/// `recon_volume_voxel_color`, and to the sensor boundary's copy by recon's
+/// `recon_tsdf_voxel_color_space`.
 
 #include <cmath>
 #include <cstdint>

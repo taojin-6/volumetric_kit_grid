@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// The voxel colour attribute's format, held together in its three places:
+// The voxel colour attribute's format, held together in its places:
 // volume/shaders/voxel_color.glsl, which fusion writes and the mesher reads
-// with; volume/voxel_color.hpp, its host half; and core/color_space.hpp's
-// published curve, the sensor boundary's. Two implementations of one curve is
-// the silent drift the 2026-08-02 colour-space decision exists to prevent, so
-// it is pinned rather than trusted.
+// with; volume/voxel_color.hpp, its host half; and the published sRGB curve
+// (IEC 61966-2-1), written out below as this test's own reference. Two
+// implementations of one curve is the silent drift the 2026-08-02 colour-space
+// decision exists to prevent, so it is pinned rather than trusted. The grid
+// takes no colour vocabulary from elsewhere: recon_tsdf_voxel_color_space
+// holds this curve to core/color_space.hpp's, in recon, which links both.
 //
-// Host, always: volume's curve, decode and running-mean encode are
-// color_space's, bit for bit, over every code and a sweep of linear values;
-// the unobserved word decodes to opaque white.
+// Host, always: volume's curve, decode and running-mean encode are the
+// reference's, bit for bit, over every code and a sweep of linear values, and
+// within 1e-6 of the curve in double; the unobserved word decodes to opaque
+// white.
 //
 // Device (shaders/voxel_color_cases.comp, skipped where no device is
 // present), over every grey code, the colour-unobserved word and words with
@@ -36,7 +39,6 @@
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
-#include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_color.hpp"
 
@@ -62,14 +64,46 @@ bool same_bits(const vr::Vec3f& a, const vr::Vec3f& b) {
   return same_bits(a.x, b.x) && same_bits(a.y, b.y) && same_bits(a.z, b.z);
 }
 
-// volume's half against color_space's: the same formula, so the same bits.
+// The published curve, written out here rather than taken from another tier,
+// in the float expression volume's half uses, so equal means the same bits.
+float ref_decode(float e) {
+  return e <= 0.04045f ? e * (1.0f / 12.92f)
+                       : std::pow((e + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+
+float ref_encode(float l) {
+  return l <= 0.0031308f ? l * 12.92f
+                         : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+}
+
+// The same curve in double, to hold the float one to the standard.
+double ref_decode_d(double e) {
+  return e <= 0.04045 ? e / 12.92 : std::pow((e + 0.055) / 1.055, 2.4);
+}
+
+// GLSL's packUnorm4x8 of the encoded channels: clamped, rounded to nearest.
+std::uint32_t ref_pack(const vr::Vec3f& linear) {
+  auto code = [](float v) -> std::uint32_t {
+    const float e = ref_encode(v);
+    const float c = (e > 0.0f) ? (e < 1.0f ? e : 1.0f) : 0.0f;
+    return static_cast<std::uint32_t>(c * 255.0f + 0.5f);
+  };
+  return code(linear.x) | (code(linear.y) << 8) | (code(linear.z) << 16) |
+         0xFF000000u;
+}
+
+// volume's half against the reference: the same formula, so the same bits.
 int check_host() {
   for (std::uint32_t c = 0; c < 256; ++c) {
     const float e = static_cast<float>(c) / 255.0f;
-    CHECK(same_bits(vol::srgb_to_linear(e), vr::srgb_to_linear(e)));
+    CHECK(same_bits(vol::srgb_to_linear(e), ref_decode(e)));
+    CHECK(std::fabs(static_cast<double>(vol::srgb_to_linear(e)) -
+                    ref_decode_d(static_cast<double>(e))) < 1e-6);
+    // A word's channel is its code times 1/255, as the format reads it.
     const std::uint32_t word = c | (c << 8) | (c << 16) | 0xFF000000u;
-    CHECK(same_bits(vol::voxel_color_to_linear(word),
-                    vr::unpack_srgb_to_linear(word)));
+    CHECK(same_bits(
+        vol::voxel_color_to_linear(word),
+        vr::Vec3f(ref_decode(static_cast<float>(c) * (1.0f / 255.0f)))));
   }
   // Unobserved reads opaque white, so it does not drag an average to black.
   CHECK(same_bits(vol::voxel_color_to_linear(vol::kVoxelColorUnobserved),
@@ -86,12 +120,11 @@ int check_host() {
     linear.push_back(static_cast<float>(i) / static_cast<float>(1 << 16));
   }
   for (const float l : linear) {
-    CHECK(std::isnan(l) ||
-          same_bits(vol::linear_to_srgb(l), vr::linear_to_srgb(l)));
+    CHECK(std::isnan(l) || same_bits(vol::linear_to_srgb(l), ref_encode(l)));
     const vr::Vec3f v(l, 1.0f - l, 0.5f * l);
-    CHECK(vol::voxel_color_from_linear(v) == vr::pack_linear_to_srgb(v));
+    CHECK(vol::voxel_color_from_linear(v) == ref_pack(v));
   }
-  std::puts("recon volume voxel colour: the host half matched color_space");
+  std::puts("recon volume voxel colour: the host half matched the curve");
   return 0;
 }
 

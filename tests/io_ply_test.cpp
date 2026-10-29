@@ -3,8 +3,9 @@
 
 // Host-only PLY export checks. Read bytes directly to pin the public layout
 // and color encoding independently of the writer's backend. The writer's
-// sRGB encode is a copy of its own, held here to core/color_space.hpp's
-// linear_to_srgb, code for code.
+// sRGB encode is a copy of its own, held here to the voxel colour format's
+// curve (volume/voxel_color.hpp, which recon_volume_voxel_color pins to the
+// published curve), code for code.
 
 #include <array>
 #include <cmath>
@@ -18,11 +19,12 @@
 
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
-#include "volumetric_kit/recon/core/color_space.hpp"
 #include "volumetric_kit/recon/io/ply_writer.hpp"
+#include "volumetric_kit/recon/volume/voxel_color.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace vr = volumetric_kit::recon;
+namespace vol = volumetric_kit::recon::volume;
 
 namespace {
 
@@ -60,12 +62,12 @@ vr::mesh::Mesh triangle() {
   return mesh;
 }
 
-// The code a linear channel writes, by core/color_space.hpp's curve: 0 for
+// The code a linear channel writes, by the voxel colour format's curve: 0 for
 // NaN and below, 255 from 1 up, else the encoded value rounded.
 std::uint8_t srgb_code(float linear) {
   if (!(linear > 0.0f)) return 0;
   if (linear >= 1.0f) return 255;
-  return static_cast<std::uint8_t>(vr::linear_to_srgb(linear) * 255.0f + 0.5f);
+  return static_cast<std::uint8_t>(vol::linear_to_srgb(linear) * 255.0f + 0.5f);
 }
 
 // Linear channels where a code changes: each code's rounding threshold and
@@ -74,7 +76,7 @@ std::uint8_t srgb_code(float linear) {
 std::vector<float> code_edges() {
   std::vector<float> values;
   for (int c = 0; c < 255; ++c) {
-    float t = vr::srgb_to_linear((static_cast<float>(c) + 0.5f) / 255.0f);
+    float t = vol::srgb_to_linear((static_cast<float>(c) + 0.5f) / 255.0f);
     for (int i = 0; i < 3; ++i) t = std::nextafter(t, 0.0f);
     for (int i = 0; i < 7; ++i) {
       values.push_back(t);
