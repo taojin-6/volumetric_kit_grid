@@ -38,6 +38,8 @@ jobs:
       # .env reaches jobs run directly on it (the Mac) but not a job container,
       # where ctest would otherwise run the suite one test at a time. 4 is a
       # 24-core host over grid's 6 runners.
+      # Each image is pinned by digest, the tag it was read from in a comment,
+      # so a new image comes only with a commit that moves the pin.
       # TODO: recon's and gfx's 6 runners share each host, so 2 would match the
       # split the core's setup-runners.sh writes for jobs on the host.
       #
@@ -62,13 +64,15 @@ jobs:
         include:
           - os: ubuntu-24.04
             runner: vk-linux-gpu
-            container: '{"image":"ubuntu:24.04","options":"--gpus all","env":{"NVIDIA_DRIVER_CAPABILITIES":"all","CMAKE_BUILD_PARALLEL_LEVEL":"4","CTEST_PARALLEL_LEVEL":"4","__GL_SHADER_DISK_CACHE_PATH":"/__w/_tool/nvidia-glcache","__GL_SHADER_DISK_CACHE_SKIP_CLEANUP":"1"}}'
+            # ubuntu:24.04
+            container: '{"image":"ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852","options":"--gpus all","env":{"NVIDIA_DRIVER_CAPABILITIES":"all","CMAKE_BUILD_PARALLEL_LEVEL":"4","CTEST_PARALLEL_LEVEL":"4","__GL_SHADER_DISK_CACHE_PATH":"/__w/_tool/nvidia-glcache","__GL_SHADER_DISK_CACHE_SKIP_CLEANUP":"1"}}'
             build_types: '["Release"]'
             assimp: true
             sync_validation: true
           - os: ubuntu-26.04
             runner: vk-linux-gpu
-            container: '{"image":"ubuntu:26.04","options":"--gpus all","env":{"NVIDIA_DRIVER_CAPABILITIES":"all","CMAKE_BUILD_PARALLEL_LEVEL":"4","CTEST_PARALLEL_LEVEL":"4","__GL_SHADER_DISK_CACHE_PATH":"/__w/_tool/nvidia-glcache","__GL_SHADER_DISK_CACHE_SKIP_CLEANUP":"1"}}'
+            # ubuntu:26.04
+            container: '{"image":"ubuntu@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c","options":"--gpus all","env":{"NVIDIA_DRIVER_CAPABILITIES":"all","CMAKE_BUILD_PARALLEL_LEVEL":"4","CTEST_PARALLEL_LEVEL":"4","__GL_SHADER_DISK_CACHE_PATH":"/__w/_tool/nvidia-glcache","__GL_SHADER_DISK_CACHE_SKIP_CLEANUP":"1"}}'
             build_types: '["Release"]'
             sync_validation: true
           - os: macos-26

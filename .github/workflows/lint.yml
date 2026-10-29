@@ -1,6 +1,7 @@
 name: lint
 
-# Styling + docs gate. Runs the same hooks as the local `pre-commit` install.
+# Styling + docs gate: the workflows' triggers, then the same hooks as the
+# local `pre-commit` install. No job pushes, so no checkout keeps a token.
 # Linux-only, on a GitHub-hosted runner: clang-format and cmake-format output is
 # deterministic across operating systems, so one runner is enough. Invoked by
 # ci.yml, which owns the push / pull_request triggers and the concurrency group.
@@ -18,6 +19,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # No workflow is triggered by an event an outsider can cause, or by a
+      # schedule (the core's tools/runners/README.md, "Who can trigger CI").
+      # The action is at the core commit that added it, newer than the core
+      # pin in third_party/CMakeLists.txt.
+      - uses: taojin-6/volumetric_kit_core/.github/actions/check-workflow-triggers@fcbbe0c99a2fcec8d2e5cc3ddaf77add1f5679af
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
