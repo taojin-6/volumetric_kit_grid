@@ -10,8 +10,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "buffer_readback.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_block_grid.hpp"
@@ -20,15 +20,18 @@
 
 namespace vr_test {
 
+namespace vkc = volumetric_kit::core;
+
 namespace detail {
 
 // The first `count` of `coords` as a device list; none for a zero count,
 // which every device-list call takes as a no-op.
 inline vkc::Result<vkc::Buffer> device_coords(
-    const Gpu& gpu, const volumetric_kit::recon::volume::BlockIndex* coords,
+    const vkc::test::Gpu& gpu,
+    const volumetric_kit::recon::volume::BlockIndex* coords,
     std::uint32_t count) {
   if (count == 0) return vkc::Buffer{};
-  return upload_device_buffer(
+  return vkc::test::upload_device_buffer(
       gpu.device, gpu.allocator, coords,
       VkDeviceSize(count) * sizeof(volumetric_kit::recon::volume::BlockIndex));
 }
@@ -37,7 +40,7 @@ inline vkc::Result<vkc::Buffer> device_coords(
 
 // VoxelHashMap::allocate over the first `count` of `coords`.
 inline vkc::Result<std::uint32_t> allocate_blocks(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
+    const vkc::test::Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
     const volumetric_kit::recon::volume::BlockIndex* coords,
     std::uint32_t count,
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
@@ -47,7 +50,7 @@ inline vkc::Result<std::uint32_t> allocate_blocks(
 
 // VoxelHashMap::allocate over all of `coords`.
 inline vkc::Result<std::uint32_t> allocate_blocks(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
+    const vkc::test::Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
     const std::vector<volumetric_kit::recon::volume::BlockIndex>& coords,
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
   return allocate_blocks(gpu, map, coords.data(),
@@ -58,7 +61,7 @@ inline vkc::Result<std::uint32_t> allocate_blocks(
 // VoxelHashMap::remove over the first `count` of `coords`: the index alone,
 // the attributes left as they are.
 inline vkc::Result<std::uint32_t> remove_blocks(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
+    const vkc::test::Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
     const volumetric_kit::recon::volume::BlockIndex* coords,
     std::uint32_t count,
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
@@ -68,7 +71,7 @@ inline vkc::Result<std::uint32_t> remove_blocks(
 
 // VoxelHashMap::remove over all of `coords`.
 inline vkc::Result<std::uint32_t> remove_blocks(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
+    const vkc::test::Gpu& gpu, volumetric_kit::recon::volume::VoxelHashMap& map,
     const std::vector<volumetric_kit::recon::volume::BlockIndex>& coords,
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
   return remove_blocks(gpu, map, coords.data(),
@@ -78,7 +81,8 @@ inline vkc::Result<std::uint32_t> remove_blocks(
 // VoxelBlockGrid::remove over the first `count` of `coords`: zeroed, then
 // freed.
 inline vkc::Result<std::uint32_t> remove_blocks(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const vkc::test::Gpu& gpu,
+    volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     const volumetric_kit::recon::volume::BlockIndex* coords,
     std::uint32_t count,
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
@@ -88,7 +92,8 @@ inline vkc::Result<std::uint32_t> remove_blocks(
 
 // VoxelBlockGrid::remove over all of `coords`.
 inline vkc::Result<std::uint32_t> remove_blocks(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelBlockGrid& grid,
+    const vkc::test::Gpu& gpu,
+    volumetric_kit::recon::volume::VoxelBlockGrid& grid,
     const std::vector<volumetric_kit::recon::volume::BlockIndex>& coords,
     volumetric_kit::recon::volume::AllocFailures* out_failures = nullptr) {
   return remove_blocks(gpu, grid, coords.data(),
@@ -103,7 +108,8 @@ inline vkc::Result<std::uint32_t> remove_blocks(
 // the tests' hash oracle (volume_hash_oracle.hpp) rests on, and what a GLSL
 // hash drifted from it would change.
 inline vkc::Result<std::uint32_t> chain_refusals(
-    const Gpu& gpu, volumetric_kit::recon::volume::VoxelGridParams grid,
+    const vkc::test::Gpu& gpu,
+    volumetric_kit::recon::volume::VoxelGridParams grid,
     const std::vector<volumetric_kit::recon::volume::BlockIndex>& coords) {
   grid.max_chain = 1;
   VKC_ASSIGN(volumetric_kit::recon::volume::VoxelHashMap map,

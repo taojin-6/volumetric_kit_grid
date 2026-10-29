@@ -50,8 +50,10 @@
 #include "volumetric_kit/recon/core/dispatch.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace d = volumetric_kit::recon::codec::detail;
@@ -250,14 +252,14 @@ vkc::Result<Fixture> make_fixture(Gpu& gpu,
   // its mirror's, which a kernel must never read.
   std::vector<vol::BlockIndex> poisoned = list;
   for (std::size_t e = 0; e < n; ++e) poisoned[e].ptr = list[n - 1 - e].ptr;
-  VKC_ASSIGN(
-      vkc::Buffer list_buffer,
-      vr_test::upload_device_buffer(gpu.device, gpu.allocator, poisoned.data(),
-                                    n * sizeof(vol::BlockIndex)));
+  VKC_ASSIGN(vkc::Buffer list_buffer,
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                             poisoned.data(),
+                                             n * sizeof(vol::BlockIndex)));
   VKC_ASSIGN(
       vkc::Buffer mask_buffer,
-      vr_test::upload_device_buffer(gpu.device, gpu.allocator, masks.data(),
-                                    masks.size() * sizeof(std::uint32_t)));
+      vkc::test::upload_device_buffer(gpu.device, gpu.allocator, masks.data(),
+                                      masks.size() * sizeof(std::uint32_t)));
   return Fixture{std::move(grid), std::move(order), std::move(list_buffer),
                  std::move(mask_buffer)};
 }
@@ -293,8 +295,8 @@ vkc::Status record(d::Deblock& deblock, vkc::CommandBatch& batch,
 // The blocks the last record's passes kept, once its batch ran.
 vkc::Result<std::uint32_t> exact_of(Gpu& gpu, const d::Deblock& deblock) {
   VKC_ASSIGN(const std::vector<std::uint32_t> words,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               deblock.exact(), 1));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 deblock.exact(), 1));
   return words[0];
 }
 
@@ -2047,7 +2049,7 @@ int rows_case(Gpu& gpu) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   if (rule_case() != 0) return 1;
   vkc::Result<std::unique_ptr<d::Deblock>> made =
       d::Deblock::create(gpu.device, gpu.allocator);
@@ -2076,4 +2078,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

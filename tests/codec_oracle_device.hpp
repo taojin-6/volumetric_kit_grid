@@ -14,11 +14,11 @@
 #include <optional>
 #include <vector>
 
-#include "buffer_readback.hpp"
 #include "codec_oracle.hpp"
 #include "dct_transform.hpp"
 #include "device_frame_writer.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/volume/hash_types.hpp"
@@ -49,7 +49,7 @@ struct Resident {
 // masks, coefficients with -32768 among them, coordinates out of order --
 // and ranks whose word M is *tail, the rest garbage.
 vkc::Result<Resident> resident(
-    const vr_test::Gpu& gpu, const DctBlocks& entries,
+    const vkc::test::Gpu& gpu, const DctBlocks& entries,
     const std::vector<d::BlockMode>& modes = {},
     const std::vector<vr::Vec3i>& coords = {}, std::uint16_t pad = 0,
     std::optional<std::uint32_t> tail = std::nullopt);
@@ -58,7 +58,7 @@ vkc::Result<Resident> resident(
 // read back, K coefficients to an entry, with @p cut, if given, as its cut
 // set; DctTransform::record_forward's refusals, or its reject count's,
 // leaving @p out empty.
-vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
+vkc::Status forward(const vkc::test::Gpu& gpu, d::DctTransform& t,
                     const vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
                     const codec::CodecParams& params, DctBlocks& out,
@@ -68,7 +68,7 @@ vkc::Status forward(const vr_test::Gpu& gpu, d::DctTransform& t,
 // reconstructed into @p grid by @p t's inverse; InvalidArgument for sizes
 // that disagree with the list or a trunc_dist other than the grid's, else
 // DctTransform::record_inverse's refusals, or its reject count's.
-vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
+vkc::Status inverse(const vkc::test::Gpu& gpu, d::DctTransform& t,
                     vol::VoxelBlockGrid& grid,
                     const std::vector<vol::BlockIndex>& blocks,
                     const DctBlocks& in);
@@ -78,14 +78,14 @@ vkc::Status inverse(const vr_test::Gpu& gpu, d::DctTransform& t,
 // and the payload joined, as the Encoder's encode joins them; or the first
 // refusal of record_code, the submit or finish.
 vkc::Result<std::vector<std::uint8_t>> write_counted(
-    const vr_test::Gpu& gpu, d::DeviceFrameWriter& writer,
+    const vkc::test::Gpu& gpu, d::DeviceFrameWriter& writer,
     const d::ResidentBlocks& counted, float voxel_size, float trunc_dist,
     const codec::CodecParams& params, const d::FrameReference* reference);
 
 // encode (codec_oracle_encode.hpp) through @p t, for a test that encodes
 // many grids on one transform.
 vkc::Result<std::vector<std::uint8_t>> encode(
-    const vr_test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
+    const vkc::test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
     const codec::EncoderConfig& config);
 
 }  // namespace codec_oracle

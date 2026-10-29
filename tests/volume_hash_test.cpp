@@ -9,8 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 
-#include "test_check.hpp"
 #include "volume_hash_oracle.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 
 namespace vr = volumetric_kit::recon;

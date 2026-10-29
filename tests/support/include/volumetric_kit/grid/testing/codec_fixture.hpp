@@ -17,8 +17,8 @@
 
 #include "device_blocks.hpp"
 #include "grid_readback.hpp"
-#include "test_check.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/instance.hpp"
@@ -38,7 +38,7 @@ constexpr std::uint32_t kVpb = 512;
 
 // The device and allocator every case runs on, never moved: the allocator
 // and every tier keep references to the device.
-using Gpu = vr_test::Gpu;
+using Gpu = vkc::test::Gpu;
 
 struct GridShape {
   float voxel_size = kVoxel;

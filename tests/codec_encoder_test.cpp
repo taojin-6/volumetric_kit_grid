@@ -46,8 +46,10 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/volume/grid_growth.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 
 namespace codec = volumetric_kit::recon::codec;
@@ -1112,7 +1114,7 @@ int counters_case(Gpu& gpu) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<codec::Encoder> made =
       codec::Encoder::create(gpu.device, gpu.allocator);
   CHECK(made.ok());
@@ -1147,4 +1149,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

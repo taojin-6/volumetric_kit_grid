@@ -15,12 +15,13 @@
 #include <new>
 #include <type_traits>
 
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/core/math/vector_types.hpp"
 #include "volumetric_kit/recon/volume/voxel_coords.hpp"
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 
+namespace vkc = volumetric_kit::core;
 namespace vr = volumetric_kit::recon;
 namespace vol = volumetric_kit::recon::volume;
 
@@ -113,7 +114,7 @@ int main() {
   {
     auto invalid = grid;
     invalid.voxel_size = 0.0f;
-    auto& failure = vr_test::allocation_failure;
+    auto& failure = vkc::test::allocation_failure;
     failure = {};
     failure.measure = true;
     const auto measured = invalid.validate();

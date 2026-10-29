@@ -10,14 +10,16 @@
 #include <cstdint>
 #include <vector>
 
-#include "buffer_readback.hpp"
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/vulkan/buffer.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/recon/core/dispatch.hpp"
 
 namespace vr_test {
+
+namespace vkc = volumetric_kit::core;
 
 // `items` items at `lanes` a group, in slices as the device writes them.
 struct HostSlices {
@@ -31,7 +33,8 @@ struct HostSlices {
   }
 };
 
-inline vkc::Result<HostSlices> host_slices(const Gpu& gpu, std::uint32_t items,
+inline vkc::Result<HostSlices> host_slices(const vkc::test::Gpu& gpu,
+                                           std::uint32_t items,
                                            std::uint32_t lanes) {
   namespace rd = volumetric_kit::recon::detail;
   VkPhysicalDeviceProperties props{};
@@ -54,7 +57,8 @@ inline vkc::Result<HostSlices> host_slices(const Gpu& gpu, std::uint32_t items,
   VKC_ASSIGN(out.buffer,
              vkc::device_storage_buffer(gpu.allocator, bytes,
                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT));
-  VKC_TRY(write_back(gpu.device, gpu.allocator, out.buffer, commands));
+  VKC_TRY(
+      vkc::test::write_back(gpu.device, gpu.allocator, out.buffer, commands));
   return out;
 }
 

@@ -31,8 +31,8 @@
 #include <utility>
 #include <vector>
 
-#include "test_check.hpp"
 #include "test_meshes.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
@@ -46,9 +46,10 @@
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 #include "volumetric_kit/recon/voxelize/mesh_integrator.hpp"
 
-#include "gpu_test.hpp"
 #include "grid_readback.hpp"
 #include "mesh_integrate_reference_comp.spv.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -99,7 +100,7 @@ struct RefResult {
   std::uint32_t largest_bin = 0;
 };
 
-vkc::Result<RefResult> run_reference(const vr_test::Gpu& gpu, Reference& ref,
+vkc::Result<RefResult> run_reference(const vkc::test::Gpu& gpu, Reference& ref,
                                      vol::VoxelBlockGrid& grid, const Mesh& m,
                                      const std::vector<vol::BlockIndex>& blocks,
                                      const vx::MeshSdfParams& params) {
@@ -127,25 +128,25 @@ vkc::Result<RefResult> run_reference(const vr_test::Gpu& gpu, Reference& ref,
     ref_blocks[b] = {blocks[b].coord, 0, 0};
     slot_block[std::size_t(blocks[b].ptr) / vpb] = std::int32_t(b);
   }
-  VKC_ASSIGN(vkc::Buffer slots, vr_test::upload_device_buffer(
+  VKC_ASSIGN(vkc::Buffer slots, vkc::test::upload_device_buffer(
                                     gpu.device, gpu.allocator,
                                     slot_block.data(), slot_block.size() * 4));
   VKC_ASSIGN(vkc::Buffer vertices,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                           m.v.data(), m.v.size() * 12));
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                             m.v.data(), m.v.size() * 12));
   VKC_ASSIGN(vkc::Buffer indices,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                           m.i.data(), m.i.size() * 4));
-  VKC_ASSIGN(vkc::Buffer offsets_buf,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                           offsets.data(), offsets.size() * 4));
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                             m.i.data(), m.i.size() * 4));
+  VKC_ASSIGN(vkc::Buffer offsets_buf, vkc::test::upload_device_buffer(
+                                          gpu.device, gpu.allocator,
+                                          offsets.data(), offsets.size() * 4));
   const std::vector<std::uint32_t> zeros((pairs + 31) / 32, 0u);
   VKC_ASSIGN(vkc::Buffer bits,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                           zeros.data(), zeros.size() * 4));
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                             zeros.data(), zeros.size() * 4));
   VKC_ASSIGN(vkc::Buffer blocks_buf,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                           ref_blocks.data(), nb * 20));
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                             ref_blocks.data(), nb * 20));
   VKC_ASSIGN(vkc::Buffer tsdf, vkc::device_storage_buffer(
                                    gpu.allocator, VkDeviceSize(voxels) * 4));
   VKC_ASSIGN(vkc::Buffer weight, vkc::device_storage_buffer(
@@ -174,8 +175,8 @@ vkc::Result<RefResult> run_reference(const vr_test::Gpu& gpu, Reference& ref,
 
   // The bins, each in triangle order.
   VKC_ASSIGN(const std::vector<std::uint32_t> got_bits,
-             vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator, bits,
-                                               zeros.size()));
+             vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 bits, zeros.size()));
   RefResult out;
   std::vector<std::uint32_t> lists;
   for (std::uint32_t b = 0; b < nb; ++b) {
@@ -193,19 +194,19 @@ vkc::Result<RefResult> run_reference(const vr_test::Gpu& gpu, Reference& ref,
   out.entries = static_cast<std::uint32_t>(lists.size());
   if (lists.empty()) lists.push_back(0);
   VKC_ASSIGN(vkc::Buffer lists_buf,
-             vr_test::upload_device_buffer(gpu.device, gpu.allocator,
-                                           lists.data(), lists.size() * 4));
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
+                                             lists.data(), lists.size() * 4));
   VKC_TRY(
-      vr_test::write_back(gpu.device, gpu.allocator, blocks_buf, ref_blocks));
+      vkc::test::write_back(gpu.device, gpu.allocator, blocks_buf, ref_blocks));
   bind(4, lists_buf);
   push.pass = kPassMeasure;
   VKC_TRY(vkc::dispatch(gpu.device, ref.kernel, &push, sizeof(push),
                         vkc::group_count(std::uint32_t(voxels), 256),
                         max_groups));
-  VKC_ASSIGN(out.tsdf, vr_test::read_back<float>(gpu.device, gpu.allocator,
-                                                 tsdf, voxels));
-  VKC_ASSIGN(out.weight, vr_test::read_back<float>(gpu.device, gpu.allocator,
-                                                   weight, voxels));
+  VKC_ASSIGN(out.tsdf, vkc::test::read_back<float>(gpu.device, gpu.allocator,
+                                                   tsdf, voxels));
+  VKC_ASSIGN(out.weight, vkc::test::read_back<float>(gpu.device, gpu.allocator,
+                                                     weight, voxels));
   return out;
 }
 
@@ -546,7 +547,7 @@ std::vector<Fixture> fixtures() {
 
 // A grid for `f`'s block size and band: 8,192 blocks, or 2^22 voxels where
 // that is fewer. The 20 m triangles take 5,741 8-voxel blocks.
-vkc::Result<vol::VoxelBlockGrid> make_grid(const vr_test::Gpu& gpu,
+vkc::Result<vol::VoxelBlockGrid> make_grid(const vkc::test::Gpu& gpu,
                                            const Fixture& f) {
   vol::VoxelGridParams gp{};
   gp.voxel_size = kVoxel;
@@ -564,7 +565,7 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(const vr_test::Gpu& gpu,
 
 // Convert `f` into `grid`, cleared, run the reference over the blocks
 // written, and compare every voxel's bits.
-int check_fixture(vr_test::GpuContext& gpu, vx::MeshIntegrator& integ,
+int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
                   Reference& ref, vol::VoxelBlockGrid& grid, const Fixture& f) {
   const vol::VoxelGridParams& gp = grid.grid();
   const Mesh& m = f.mesh;
@@ -653,7 +654,7 @@ int check_fixture(vr_test::GpuContext& gpu, vx::MeshIntegrator& integ,
   return differ == 0 ? 0 : 1;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   Reference ref;
   {
     VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RefPush)};
@@ -692,4 +693,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

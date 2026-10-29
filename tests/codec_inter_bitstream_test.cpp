@@ -30,7 +30,7 @@
 #include "codec_oracle_rans.hpp"
 #include "fnv1a.hpp"
 #include "frame_hash.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 
 namespace vr = volumetric_kit::recon;

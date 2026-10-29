@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "fnv1a.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
@@ -40,8 +40,9 @@
 #include "volumetric_kit/recon/volume/voxel_grid.hpp"
 #include "volumetric_kit/recon/volume/voxel_hash_map.hpp"
 
-#include "gpu_test.hpp"
 #include "grid_truncation_comp.spv.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -100,7 +101,7 @@ vr::Vec3i unproject_to_block(const vol::DepthPinhole& cam,
 // Exercise the real shared GLSL helper at the largest representable depth
 // candidate count. A tiny compute pass checks host/device parity without
 // enumerating the band, which would require billions of candidate visits.
-int truncation_bounds_case(const vr_test::Gpu& gpu) {
+int truncation_bounds_case(const vkc::test::Gpu& gpu) {
   const vol::VoxelGridParams base{0.125f, 8, 512, 1.0f, 8, 8, 64, 128};
   std::vector<vol::VoxelGridParams> grids(6, base);
   grids[0].trunc_dist = 0.25f;
@@ -121,7 +122,7 @@ int truncation_bounds_case(const vr_test::Gpu& gpu) {
                  vr_grid_truncation_comp_spv_size, 2)
             .ok());
   auto pool = builder.build();
-  auto input = vr_test::upload_device_buffer(
+  auto input = vkc::test::upload_device_buffer(
       gpu.device, gpu.allocator, grids.data(), count * sizeof(base));
   auto output = vkc::device_storage_buffer(gpu.allocator,
                                            count * 2 * sizeof(std::uint32_t));
@@ -131,8 +132,8 @@ int truncation_bounds_case(const vr_test::Gpu& gpu) {
   CHECK(vkc::dispatch(gpu.device, kernel, nullptr, 0, count,
                       gpu.device.caps().limits().maxComputeWorkGroupCount[0])
             .ok());
-  auto got = vr_test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                               *output, count * 2);
+  auto got = vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                                 *output, count * 2);
   CHECK(got.ok());
   for (std::size_t i = 0; i < grids.size(); ++i) {
     const auto tb =
@@ -319,14 +320,14 @@ constexpr Pinned kSet{8740, 8740, 0x0b3645e7, 0xedec4629};
 // The first frame alone at tick 3, from a host array and from a device buffer;
 // then the other two as a set at tick 5 over its blocks, blocking from host
 // arrays and recorded from device buffers. Every path gives the pinned values.
-int golden_case(vr_test::Gpu& gpu) {
+int golden_case(vkc::test::Gpu& gpu) {
   const vol::VoxelGridParams grid = golden_grid();
   std::vector<GoldenFrame> frames;
   std::vector<vkc::Buffer> device;
   for (int i = 0; i < 3; ++i) {
     frames.push_back(golden_frame(i, grid));
     const std::vector<float>& depth = frames.back().depth;
-    vkc::Result<vkc::Buffer> up = vr_test::upload_device_buffer(
+    vkc::Result<vkc::Buffer> up = vkc::test::upload_device_buffer(
         gpu.device, gpu.allocator, depth.data(), depth.size() * sizeof(float));
     CHECK(up.ok());
     device.push_back(std::move(up).value());
@@ -388,7 +389,7 @@ int golden_case(vr_test::Gpu& gpu) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(truncation_bounds_case(gpu) == 0);
   CHECK(golden_case(gpu) == 0);
   // A small grid: 1024 buckets x 8, 8192-block heap -- ample for a couple of
@@ -610,4 +611,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

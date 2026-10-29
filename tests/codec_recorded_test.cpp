@@ -36,9 +36,11 @@
 #include "volumetric_kit/recon/codec/encoder.hpp"
 #include "volumetric_kit/recon/mesh/marching_cubes.hpp"
 
-#include "gpu_test.hpp"
 #include "stage_rows.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
+namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::recon::codec;
 namespace mesh = volumetric_kit::recon::mesh;
@@ -406,7 +408,7 @@ int counters_case(Gpu& gpu) {
 // -- decoded and meshed in one batch records the dispatches and barriers
 // pinned here (DECISIONS.md, 2026-10-24). A change to the batch's commands
 // moves them; one that records an upload after a dispatch adds barriers.
-int pin_case(vr_test::GpuContext& gpu) {
+int pin_case(vkc::test::GpuContext& gpu) {
   vkc::Result<codec::Encoder> enc = encoder(gpu, 56, 0.2f, ~0u);
   CHECK(enc.ok());
   vkc::Result<std::vector<Bytes>> frames = chain(gpu, *enc, 4);
@@ -540,7 +542,7 @@ int growing_case(Gpu& gpu) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   if (equals_blocking_case(gpu) != 0) return 1;
   if (refusals_case(gpu) != 0) return 1;
   if (device_refusal_case(gpu) != 0) return 1;
@@ -555,4 +557,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}

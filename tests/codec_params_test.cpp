@@ -20,7 +20,7 @@
 
 #include "dct_tables.hpp"
 #include "fnv1a.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/codec/codec_params.hpp"
 #include "volumetric_kit/recon/codec/encoder.hpp"
 

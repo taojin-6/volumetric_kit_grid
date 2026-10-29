@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "info_log.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
 

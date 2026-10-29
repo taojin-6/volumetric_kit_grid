@@ -40,8 +40,8 @@
 
 #include "networking_loopback.hpp"
 #include "stream_files.hpp"
-#include "test_allocation_failure.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_allocation_failure.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
 namespace networking = volumetric_kit::recon::networking;
@@ -343,7 +343,7 @@ int flood_case() {
   }
   flood.join();
   CHECK(all_skipped);
-#ifndef VR_TEST_SANITIZED
+#ifndef VKC_TEST_SANITIZED
   // Under ASan or TSan, the calls are checked without the time limit.
   CHECK(prompt);
 #endif
@@ -440,7 +440,7 @@ int progress_oom_case() {
   CHECK(net::send_bytes(sender.peer.get(), Bytes(64, 'x')));
   Got got;
   CHECK(!settle(*client, &got).ok());
-  auto& failure = vr_test::allocation_failure;
+  auto& failure = vkc::test::allocation_failure;
   failure = {};
   failure.measure = true;
   const vkc::Result<bool> measured =

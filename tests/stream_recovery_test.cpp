@@ -22,7 +22,7 @@
 #include <vector>
 
 #include "stream_files.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/recon/stream/stream_reader.hpp"
 #include "volumetric_kit/recon/stream/stream_writer.hpp"
 
@@ -102,7 +102,7 @@ int crc_mismatch_case(const std::string& dir) {
   const std::vector<Bytes> payloads =
       write_sample(path, {40, 0, 300, 17, 64, 9}, true);
   CHECK(payloads.size() == 6);
-  const Bytes original = vr_test::read_bytes(path);
+  const Bytes original = vkc::test::read_bytes(path);
   const std::vector<vrst::ChunkAt> chunks = vrst::chunks(original);
   const std::vector<vrst::ChunkAt> records = of_tag(chunks, "RECD");
   const vrst::ChunkAt index = of_tag(chunks, "INDX").at(0);
@@ -187,7 +187,7 @@ int truncation_case(const std::string& dir) {
   const std::vector<Bytes> payloads =
       write_sample(path, {100, 33, 0, 250, 8, 7, 301}, true);
   CHECK(payloads.size() == 7);
-  const Bytes original = vr_test::read_bytes(path);
+  const Bytes original = vkc::test::read_bytes(path);
   const std::vector<vrst::ChunkAt> chunks = vrst::chunks(original);
   const vrst::ChunkAt session = chunks.at(0);
   const std::uint64_t last = of_tag(chunks, "RECD").back().offset;
@@ -248,7 +248,7 @@ int damaged_span_case(const std::string& dir) {
   const std::vector<Bytes> payloads =
       write_sample(path, {64, 200, 3 << 20, 50, 70}, false);
   CHECK(payloads.size() == 5);
-  const Bytes original = vr_test::read_bytes(path);
+  const Bytes original = vkc::test::read_bytes(path);
   const std::vector<vrst::ChunkAt> records =
       of_tag(vrst::chunks(original), "RECD");
 
@@ -448,7 +448,7 @@ int file_size_limit_case(const std::string& dir) {
 }  // namespace
 
 int main() {
-  vr_test::Scratch scratch("recon_stream_recovery_");
+  vkc::test::Scratch scratch("recon_stream_recovery_");
   const std::string dir = scratch.path.string();
   if (crc_mismatch_case(dir) != 0) return 1;
   if (truncation_case(dir) != 0) return 1;

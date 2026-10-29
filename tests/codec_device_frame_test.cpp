@@ -31,13 +31,14 @@
 #include "codec_oracle_device.hpp"
 #include "device_frame_reader.hpp"
 #include "device_frame_writer.hpp"
-#include "test_check.hpp"
+#include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 
-#include "gpu_test.hpp"
+#include "volumetric_kit/core/testing/gpu_test.hpp"
+#include "volumetric_kit/recon/core/device_requirements.hpp"
 
 namespace vr = volumetric_kit::recon;
 namespace vkc = volumetric_kit::core;
@@ -125,8 +126,8 @@ vkc::Result<Input> upload_input(const std::uint8_t* data, std::size_t size,
   std::copy(data, data + size, bytes.begin() + std::ptrdiff_t(shift));
   Input in;
   VKC_ASSIGN(in.buffer,
-             vr_test::upload_device_buffer(*g_device, *g_allocator,
-                                           bytes.data(), bytes.size()));
+             vkc::test::upload_device_buffer(*g_device, *g_allocator,
+                                             bytes.data(), bytes.size()));
   in.payload_at = shift + VkDeviceSize(parsed.payload - data);
   return in;
 }
@@ -145,8 +146,8 @@ vkc::Result<d::ResidentBlocks> record(d::DeviceFrameReader& reader,
 vkc::Status verdict_of(const d::DeviceFrameReader& reader,
                        const d::ParsedFrame& parsed) {
   VKC_ASSIGN(const std::vector<std::uint32_t> words,
-             vr_test::read_back<std::uint32_t>(*g_device, *g_allocator,
-                                               reader.verdict(), 2));
+             vkc::test::read_back<std::uint32_t>(*g_device, *g_allocator,
+                                                 reader.verdict(), 2));
   return d::DeviceFrameReader::judge(parsed.header.type,
                                      parsed.header.block_count,
                                      parsed.new_count, words[0], words[1]);
@@ -722,8 +723,8 @@ int parsed_frame_case(d::DeviceFrameReader& reader) {
   auto decoded = [&held] {
     std::vector<vr::Vec3i> coords;
     for (const vr::volume::BlockIndex& b :
-         vr_test::read_back<vr::volume::BlockIndex>(*g_device, *g_allocator,
-                                                    *held.list, held.count)
+         vkc::test::read_back<vr::volume::BlockIndex>(*g_device, *g_allocator,
+                                                      *held.list, held.count)
              .value()) {
       coords.push_back(b.coord);
     }
@@ -862,8 +863,8 @@ int ranks_case(d::DeviceFrameReader& reader) {
     CHECK(r.ok() && r.value().ranks != nullptr);
     CHECK(batch.submit().ok() && verdict_of(reader, parsed).ok());
     vkc::Result<std::vector<std::uint32_t>> ranks =
-        vr_test::read_back<std::uint32_t>(*g_device, *g_allocator,
-                                          *r.value().ranks, m + 1);
+        vkc::test::read_back<std::uint32_t>(*g_device, *g_allocator,
+                                            *r.value().ranks, m + 1);
     CHECK(ranks.ok());
     std::vector<std::uint32_t> survives(m + 1, 0);
     for (std::size_t e = 0; e < m; ++e) {
@@ -992,8 +993,8 @@ int refusals_case(vkc::Device& device, vkc::Allocator& allocator,
   };
   CHECK(survivors_refused(resident(p, m + 1).value(), m + 1, a + m + 1) == 0);
   const Resident past_blocks = resident(p, 0u).value();
-  CHECK(vr_test::write_back(*g_device, *g_allocator, *past_blocks.ranks,
-                            std::vector<std::uint32_t>(m + 1, a + 1))
+  CHECK(vkc::test::write_back(*g_device, *g_allocator, *past_blocks.ranks,
+                              std::vector<std::uint32_t>(m + 1, a + 1))
             .ok());
   CHECK(survivors_refused(past_blocks, a + 1, a) == 0);
 
@@ -1030,7 +1031,7 @@ int device_count_case(d::DeviceFrameWriter& writer) {
     }
     vkc::Result<Resident> r = resident(big);
     vkc::Result<vkc::Buffer> word =
-        vr_test::upload_device_buffer(*g_device, *g_allocator, &n, sizeof(n));
+        vkc::test::upload_device_buffer(*g_device, *g_allocator, &n, sizeof(n));
     CHECK(r.ok() && word.ok() && r->blocks.count == n + kGarbage);
     const vol::DeviceCount blocks{&word.value(), 0, n + kGarbage};
     vkc::CommandBatch batch(*g_device, *g_allocator);
@@ -1054,7 +1055,7 @@ int device_count_case(d::DeviceFrameWriter& writer) {
   return 0;
 }
 
-int gpu_main(vr_test::GpuContext& gpu) {
+int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::Result<std::unique_ptr<d::DeviceFrameWriter>> w =
       d::DeviceFrameWriter::create(gpu.device, gpu.allocator);
   CHECK(w.ok());
@@ -1084,4 +1085,6 @@ int gpu_main(vr_test::GpuContext& gpu) {
 
 }  // namespace
 
-int main() { return vr_test::run_on_gpu(gpu_main); }
+int main() {
+  return vkc::test::run_on_gpu(vr::device_requirements(), gpu_main);
+}
