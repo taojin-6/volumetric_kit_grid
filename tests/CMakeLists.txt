@@ -484,9 +484,9 @@ add_test(NAME grid_codec_device_frame COMMAND grid_codec_device_frame_test)
 # chains -- leaving the grid as the CPU oracle's decode of the same content
 # does, bit for bit, with NotFound, a segment longer than the format allows, the
 # refusals and failures that keep the reference, and moves; and the Encoder's
-# P-frames, the CPU oracle's bytes, with the diff's every choice and refusal.
-# Internal headers through the oracle (the public decoder test stays
-# public-only). Skips without a device.
+# P-frames, the CPU oracle's bytes, with the diff's every choice and refusal,
+# and their one-step hold against oracle::held. Internal headers through the
+# oracle (the public decoder test stays public-only). Skips without a device.
 add_executable(grid_codec_inter_test codec_inter_test.cpp)
 target_link_libraries(
   grid_codec_inter_test PRIVATE grid_codec_oracle Vulkan::Vulkan
@@ -542,7 +542,7 @@ endforeach()
 # with the codec end to end -- a decoded grid within the orthonormal bound of
 # its source, meshing to the analytic sphere it came from, frame after frame
 # into one grid, untouched on every early refusal, OutOfMemory that a resize
-# recovers, and P-frame chains decoding to the all-intra chain's grids. Public
+# recovers, and P-frame chains decoding to the oracle's held grids. Public
 # headers only, plus the shared codec_fixture.hpp and the oracle's public-typed
 # codec_oracle_encode.hpp; the decoder test links grid_mesh, which the tier may
 # not. Both skip with no device.
@@ -566,7 +566,7 @@ add_test(NAME grid_codec_encoder_oom COMMAND grid_codec_encoder_oom_test)
 add_executable(grid_codec_decoder_test codec_decoder_test.cpp)
 target_link_libraries(
   grid_codec_decoder_test
-  PRIVATE volumetric_kit::grid_codec volumetric_kit::grid_mesh Vulkan::Vulkan
+  PRIVATE grid_codec_oracle volumetric_kit::grid_mesh Vulkan::Vulkan
           volumetric_kit::core_test_policy)
 vgrid_target_warnings(grid_codec_decoder_test)
 add_test(NAME grid_codec_decoder COMMAND grid_codec_decoder_test)

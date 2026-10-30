@@ -59,8 +59,9 @@ struct FrameBuffers {
 /// (`inter_apply.comp`); an intra frame takes the same apply, from its
 /// payload alone, so every decoded frame lands in the store by one path. An
 /// encoder's comes from its sort and forward transform, intra or P alike,
-/// and a P-frame's entries are coded from it against the reference by
-/// @ref record_diff (`inter_diff.comp`). Every frame either side commits is
+/// and a P-frame is held against the reference by @ref record_hold
+/// (`inter_hold.comp`) and its entries coded from it against the reference
+/// by @ref record_diff (`inter_diff.comp`). Every frame either side commits is
 /// the q and masks the next one is coded or decoded against.
 ///
 /// Each slot takes `80 + 4 * coefficient_words(K)` bytes a block, and the
@@ -165,6 +166,32 @@ class VGRID_CODEC_API ReferenceStore {
   ///         @p faults blocks whose source was past what was bound.
   static core::Status check_faults(std::uint32_t faults);
 
+  /// @brief Record the one-step hold of the frame the spare holds against
+  ///        the held reference, once the commands @p batch already holds
+  ///        have run (an encoder's sort, into the spare's list, and its
+  ///        forward): a P-frame's, before @ref record_diff codes it.
+  ///
+  /// `inter_hold.comp` gives each coefficient of a frame block on a
+  /// reference coordinate the reference block's value when the two lie
+  /// within one quantization step, |q - q_ref| <= 1, in the spare in place;
+  /// masks, the blocks the reference lacks and the reference are left as
+  /// they are. So the frame decodes, and the next frame is coded against,
+  /// the held values, and a value that dithers across a rounding boundary
+  /// from frame to frame stays put: each held coefficient lies within one
+  /// step of the forward's. Reads nothing back; the frame's count stays on
+  /// the device, as in @ref record_diff.
+  /// @param batch   The batch to record into; submitted by the caller.
+  /// @param target  The frame's blocks, as @ref record_diff takes them.
+  /// @param k       Their K, the held reference's.
+  /// @param stage   As @ref record_apply.
+  /// @return OK, nothing recorded when either side has no block; or
+  ///         `Status::Code::InvalidArgument` for no reference held, a K
+  ///         other than its, a count word missing, misaligned or past its
+  ///         buffer, or a bound past what @ref reserve made room for.
+  core::Status record_hold(core::CommandBatch& batch,
+                           const volume::DeviceCount& target, std::uint32_t k,
+                           core::GpuStageScope* stage = nullptr);
+
   /// @brief Record a P-frame's entries against the held reference, coded
   ///        from the frame the spare holds once the commands @p batch already
   ///        holds have run (an encoder's sort, into the spare's list, and its
@@ -210,6 +237,10 @@ class VGRID_CODEC_API ReferenceStore {
  private:
   ReferenceStore() = default;
 
+  // @ref record_hold's and @ref record_diff's refusals, named by @p op.
+  core::Status check_target(const char* op, const volume::DeviceCount& target,
+                            std::uint32_t k) const;
+
   /// A frame's coefficients and masks, in the transform's layout, and its
   /// block list.
   struct Slot {
@@ -228,6 +259,7 @@ class VGRID_CODEC_API ReferenceStore {
   core::ComputeKernel apply_kernel_;
   core::ComputeKernel diff_kernel_;
   core::ComputeKernel ranks_kernel_;  // survivor_ranks.comp, between passes
+  core::ComputeKernel hold_kernel_;   // inter_hold.comp
   core::DescriptorPool pool_;
 
   // slots_[current_] holds the reference; the other is the spare.

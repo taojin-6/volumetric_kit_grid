@@ -18,6 +18,7 @@
 // path).
 #include "inter_apply_comp.spv.hpp"
 #include "inter_diff_comp.spv.hpp"
+#include "inter_hold_comp.spv.hpp"
 #include "survivor_ranks_comp.spv.hpp"
 
 namespace volumetric_kit::grid::codec::detail {
@@ -44,10 +45,21 @@ struct DiffPush {
 };
 static_assert(sizeof(DiffPush) == 24, "DiffPush must be 24 bytes");
 
+// Mirrors `Push` in inter_hold.comp.
+struct HoldPush {
+  std::uint32_t item_base = 0;
+  std::uint32_t reference_count = 0;
+  std::uint32_t target_bound = 0;
+  std::uint32_t coefficient_count = 0;
+  std::uint32_t target_word = 0;
+};
+static_assert(sizeof(HoldPush) == 20, "HoldPush must be 20 bytes");
+
 constexpr std::uint32_t kApplyBindings = 8;
 constexpr std::uint32_t kDiffBindings = 12;
 constexpr std::uint32_t kRanksBindings = 3;
-// inter_diff.comp's workgroup width.
+constexpr std::uint32_t kHoldBindings = 5;
+// inter_diff.comp's and inter_hold.comp's workgroup width.
 constexpr std::uint32_t kDiffLanes = 64;
 constexpr VkDeviceSize kEntryBytes = sizeof(volume::BlockIndex);
 constexpr VkDeviceSize kWordBytes = sizeof(std::uint32_t);
@@ -89,6 +101,8 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   diff_push.size = sizeof(DiffPush);
   VkPushConstantRange ranks_push = push;
   ranks_push.size = sizeof(RansPush);
+  VkPushConstantRange hold_push = push;
+  hold_push.size = sizeof(HoldPush);
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(s.apply_kernel_, "codec_inter_apply",
                  vgrid_inter_apply_comp_spv, vgrid_inter_apply_comp_spv_size,
@@ -98,6 +112,8 @@ core::Result<std::unique_ptr<ReferenceStore>> ReferenceStore::create(
   VKC_TRY(kb.add(
       s.ranks_kernel_, "codec_survivor_ranks", vgrid_survivor_ranks_comp_spv,
       vgrid_survivor_ranks_comp_spv_size, kRanksBindings, &ranks_push));
+  VKC_TRY(kb.add(s.hold_kernel_, "codec_inter_hold", vgrid_inter_hold_comp_spv,
+                 vgrid_inter_hold_comp_spv_size, kHoldBindings, &hold_push));
   VKC_ASSIGN(s.pool_, kb.build());
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(device.physical_device(), &props);
@@ -239,36 +255,73 @@ core::Status ReferenceStore::check_faults(std::uint32_t faults) {
   return {};
 }
 
-core::Result<ResidentBlocks> ReferenceStore::record_diff(
-    core::CommandBatch& batch, const volume::DeviceCount& target,
-    std::uint32_t k, core::GpuStageScope* stage) {
-  if (!held_) return fail("record_diff", "no reference is held");
-  // The target's bound, which every buffer and the second pass are sized
-  // for; its count stays on the device.
-  const std::uint32_t n = target.bound;
+core::Status ReferenceStore::check_target(const char* op,
+                                          const volume::DeviceCount& target,
+                                          std::uint32_t k) const {
+  if (!held_) return fail(op, "no reference is held");
   if (target.buffer == nullptr || !target.buffer->valid() ||
       target.offset % kWordBytes != 0 ||
       target.buffer->size() < target.offset + kWordBytes) {
-    return fail("record_diff",
+    return fail(op,
                 "the target's count word is missing, misaligned or past its "
                 "buffer");
   }
   const std::uint32_t held_k = reference_.header.params.coefficient_count;
   if (k != held_k) {
-    return fail("record_diff", "a frame at K " + std::to_string(k) +
-                                   " on a reference at K " +
-                                   std::to_string(held_k));
+    return fail(op, "a frame at K " + std::to_string(k) +
+                        " on a reference at K " + std::to_string(held_k));
   }
+  const Slot& spare = slots_[current_ ^ 1u];
+  const VkDeviceSize n = target.bound;
+  if (n * kMaskBytes > spare.masks.size() ||
+      n * coefficient_bytes(k) > spare.coefficients.size() ||
+      n * kEntryBytes > spare.list.size()) {
+    return fail(op, std::to_string(n) + " blocks, more than were reserved");
+  }
+  return {};
+}
+
+core::Status ReferenceStore::record_hold(core::CommandBatch& batch,
+                                         const volume::DeviceCount& target,
+                                         std::uint32_t k,
+                                         core::GpuStageScope* stage) {
+  VKC_TRY(check_target("record_hold", target, k));
+  const std::uint32_t m = reference_.header.block_count;
+  const std::uint32_t n = target.bound;
+  if (m == 0 || n == 0) return {};  // no block on both sides
+  const Slot& reference = slots_[current_];
+  const Slot& spare = slots_[current_ ^ 1u];
+  const VkDeviceSize row_bytes = coefficient_bytes(k);
+  const core::DescriptorSet& hold = hold_kernel_.set;
+  hold.write_storage_buffer(0, reference.list.handle(), 0,
+                            VkDeviceSize(m) * kEntryBytes);
+  hold.write_storage_buffer(1, spare.list.handle(), 0,
+                            VkDeviceSize(n) * kEntryBytes);
+  hold.write_storage_buffer(2, reference.coefficients.handle(), 0,
+                            VkDeviceSize(m) * row_bytes);
+  hold.write_storage_buffer(3, spare.coefficients.handle(), 0,
+                            VkDeviceSize(n) * row_bytes);
+  hold.write_storage_buffer(4, target.buffer->handle(), 0, VK_WHOLE_SIZE);
+  HoldPush push;
+  push.reference_count = m;
+  push.target_bound = n;
+  push.coefficient_count = k;
+  push.target_word = static_cast<std::uint32_t>(target.offset / kWordBytes);
+  return dispatch_items(batch, hold_kernel_, push, m, kDiffLanes,
+                        max_workgroup_count_x_, stage);
+}
+
+core::Result<ResidentBlocks> ReferenceStore::record_diff(
+    core::CommandBatch& batch, const volume::DeviceCount& target,
+    std::uint32_t k, core::GpuStageScope* stage) {
+  VKC_TRY(check_target("record_diff", target, k));
+  // The target's bound, which every buffer and the second pass are sized
+  // for; its count stays on the device.
+  const std::uint32_t n = target.bound;
   const std::uint32_t m = reference_.header.block_count;
   const Slot& reference = slots_[current_];
   const Slot& spare = slots_[current_ ^ 1u];
   const VkDeviceSize row_bytes = coefficient_bytes(k);
-  if (VkDeviceSize(n) * kMaskBytes > spare.masks.size() ||
-      VkDeviceSize(n) * row_bytes > spare.coefficients.size() ||
-      VkDeviceSize(n) * kEntryBytes > spare.list.size()) {
-    return fail("record_diff",
-                std::to_string(n) + " blocks, more than were reserved");
-  }
   // The stream positions: the M reference entries, then at most n new
   // blocks.
   const std::uint64_t entries = std::uint64_t(m) + n;

@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// The encoder's one-step hold (reference_store.hpp), run on a P-frame before
+// inter_diff.comp codes it: each coefficient of a target block on a
+// reference coordinate takes the reference block's value when the two lie
+// within one quantization step, |q_t - q_ref| <= 1, written into the target
+// in place -- the frame the forward made, in frame order, in the store's
+// spare, which the frame codes and the next frame is coded against. An
+// invocation a reference entry e: a binary search of the target's list for
+// its coordinate, none holding nothing. Integer only, so every device holds
+// alike; the masks, the blocks the reference lacks and an odd K's pad half
+// are left as they are. Writes stay below the target's count.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/coord_order.glsl"
+
+layout(local_size_x = 64) in;
+
+// Mirrors HoldPush in reference_store.cpp.
+layout(push_constant, std430) uniform Push {
+  uint item_base;          // first item this dispatch covers
+  uint reference_count;    // M, the reference's blocks
+  uint target_bound;       // the most the target holds
+  uint coefficient_count;  // K, the reference's and the target's
+  uint target_word;        // the target's blocks' word in TargetCount
+}
+pc;
+
+layout(set = 0, binding = 0, scalar) readonly buffer ReferenceList {
+  BlockIndex reference_list[];  // M, strictly increasing
+};
+layout(set = 0, binding = 1, scalar) readonly buffer TargetList {
+  BlockIndex target_list[];  // strictly increasing
+};
+layout(set = 0, binding = 2, std430) readonly buffer ReferenceCoefficients {
+  uint reference_coefficients[];  // two int16 a word, (K + 1) / 2 an entry
+};
+layout(set = 0, binding = 3, std430) buffer TargetCoefficients {
+  uint target_coefficients[];
+};
+// The target's blocks, a word a kernel wrote, read as at most target_bound:
+// only the device knows how many the forward made.
+layout(set = 0, binding = 4, std430) readonly buffer TargetCount {
+  uint target_words[];
+};
+
+VGRID_COORD_SEARCH(in_target, target_list)
+
+// The target's value, or the reference's within one step of it.
+int held(int t, int r) { return abs(t - r) <= 1 ? r : t; }
+
+void main() {
+  const uint e = pc.item_base + gl_GlobalInvocationID.x;
+  if (e >= pc.reference_count) return;
+  const ivec3 c = reference_list[e].coord;
+  const uint n = min(target_words[pc.target_word], pc.target_bound);
+  const uint t = in_target_lower(c, 0u, n);
+  if (t >= n || target_list[t].coord != c) return;
+  const uint k = pc.coefficient_count;
+  const uint words = (k + 1u) / 2u;  // coefficient_words
+  for (uint w = 0u; w < words; ++w) {
+    const uint tw = target_coefficients[t * words + w];
+    const uint rw = reference_coefficients[e * words + w];
+    const int lo = held(bitfieldExtract(int(tw), 0, 16),
+                        bitfieldExtract(int(rw), 0, 16));
+    // The high half of an odd K's last word is its pad, not a coefficient.
+    const uint hi = 2u * w + 1u < k
+                        ? uint(held(bitfieldExtract(int(tw), 16, 16),
+                                    bitfieldExtract(int(rw), 16, 16)))
+                        : tw >> 16u;
+    const uint word = (uint(lo) & 0xFFFFu) | (hi << 16u);
+    if (word != tw) target_coefficients[t * words + w] = word;
+  }
+}

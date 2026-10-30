@@ -86,6 +86,7 @@ vkc::Result<std::vector<std::uint8_t>> write_counted(
 // many grids on one transform.
 vkc::Result<std::vector<std::uint8_t>> encode(
     const vkc::test::Gpu& gpu, d::DctTransform& t, vol::VoxelBlockGrid& grid,
-    const codec::EncoderConfig& config);
+    const codec::EncoderConfig& config,
+    const std::vector<std::uint8_t>* previous = nullptr);
 
 }  // namespace codec_oracle

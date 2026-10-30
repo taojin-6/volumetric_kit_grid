@@ -62,7 +62,11 @@ struct VGRID_CODEC_API EncoderConfig {
   /// every frame is an I-frame; at N, an I-frame and N - 1 P-frames
   /// (@ref FrameType::kInter) take turns; a period past the stream's length
   /// codes P-frames after the first frame for as long as the rules on
-  /// @ref Encoder::encode allow.
+  /// @ref Encoder::encode allow. Only an I-frame re-centres the values the
+  /// P-frames hold (@ref Encoder): between I-frames they drift toward the
+  /// ends of the noise, so the longer the period, the rougher the decoded
+  /// surface toward its end, and an open-ended period decodes as the held
+  /// I-frames the 2026-10-29 decision measured.
   std::uint32_t intra_period = 1;
   /// Whether the grid holds a true (Euclidean) signed distance, as
   /// @ref voxelize::MeshIntegrator converts a mesh to. `false`, the default,
@@ -166,9 +170,20 @@ struct EncodedFrame {
 /// list -- so the reference is the one a @ref Decoder holds after decoding
 /// that frame: each block is skipped when unchanged, kept as residuals
 /// against the reference, recoded in full, or removed, and blocks the
-/// reference lacks follow as in an intra frame. A frame decodes to the same
-/// grid whichever type it is. Only a frame @ref encode returns becomes the
-/// reference, so a refusal keeps the chain, and a frame returned and then
+/// reference lacks follow as in an intra frame. Before it is coded, a P-frame
+/// is held against its reference (the 2026-10-29 decision): a coefficient of
+/// a block the reference holds keeps the reference's value when the
+/// transform's lies within one quantization step of it, |q - q_ref| <= 1. A
+/// coefficient that noise moves to and fro across a rounding boundary then
+/// stays put, so it stops flickering, and a block whose every coefficient
+/// holds and whose masks are unchanged is skipped; a change of more than one
+/// step passes in the same frame. So a P-frame decodes to within one step a
+/// coefficient of the I-frame of the same grid, which is quantized afresh:
+/// each I-frame re-centres the held values on its grid, at the cost of one
+/// frame of flicker, and between I-frames they drift
+/// (@ref EncoderConfig::intra_period). The format and
+/// the @ref Decoder are unchanged. Only a frame @ref encode returns becomes
+/// the reference, so a refusal keeps the chain, and a frame returned and then
 /// lost -- never decoded, or decoded out of order -- breaks it until the
 /// next I-frame: call @ref force_intra. The reference and the frame being
 /// encoded take `80 + 4 * ceil(K / 2)` bytes of device memory a block each,
@@ -207,8 +222,8 @@ struct EncodedFrame {
 class VGRID_CODEC_API Encoder {
  public:
   /// @brief Build the kernels: the forward transform's, the block lists'
-  ///        (the sort's among them), the reference store's (the P-frame
-  ///        diff's among them) and the rANS coder's.
+  ///        (the sort's among them), the reference store's (the hold's and
+  ///        the P-frame diff's among them) and the rANS coder's.
   /// @param device     The compute device (must outlive this object).
   /// @param allocator  The allocator per-call buffers come from (must outlive
   ///                   this object).
@@ -258,8 +273,8 @@ class VGRID_CODEC_API Encoder {
   ///                 (finding the blocks to code, with
   ///                 @ref EncoderConfig::true_sdf's passes),
   ///                 `"  ..forward"` (sorting them, the transform, a
-  ///                 P-frame's diff against the reference, and the symbol
-  ///                 count: the front's batch)
+  ///                 P-frame's hold and diff against the reference, and the
+  ///                 symbol count: the front's batch)
   ///                 and `"  ..rans encode"` (coding and laying out the
   ///                 frame); and `"  ..tables"`, the host's normalization of
   ///                 the counts, with its host half alone.
@@ -282,8 +297,9 @@ class VGRID_CODEC_API Encoder {
   /// @brief Record the front half of coding @p grid into @p batch, after what
   ///        it holds -- the set's fusion -- with every count on the device:
   ///        the active set, the blocks to code and their sort, the transform,
-  ///        a P-frame's diff against the reference, the symbol count and the
-  ///        coder steps' layout, then the results @ref record_back reads.
+  ///        a P-frame's hold and diff against the reference, the symbol count
+  ///        and the coder steps' layout, then the results @ref record_back
+  ///        reads.
   ///
   /// Decides I or P now by @ref encode's rules, all but "no block to code",
   /// which the device answers. Every step is sized for the grid's block slots
@@ -391,7 +407,8 @@ class VGRID_CODEC_API Encoder {
   std::unique_ptr<detail::DctTransform> transform_;
   std::unique_ptr<detail::BlockLists> lists_;
   std::unique_ptr<detail::DeviceFrameWriter> writer_;
-  // The reference a P-frame is coded against, and the diff against it.
+  // The reference a P-frame is held and coded against, and the hold and the
+  // diff.
   std::unique_ptr<detail::ReferenceStore> store_;
   // A held active list's count, set in the front's batch, for the passes
   // the device sizes from it.

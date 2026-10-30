@@ -77,9 +77,9 @@ target_include_directories(
   PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 # Compile the kernels -- the DCT's, the deblock's, the block lists', the P-frame
-# apply and diff and the rANS coders' -- to SPIR-V and embed them (their sources
-# #include the generated *.spv.hpp on a PRIVATE path), so grid_codec ships with
-# no runtime shader files.
+# apply and diff, the encoder's hold and the rANS coders' -- to SPIR-V and embed
+# them (their sources #include the generated *.spv.hpp on a PRIVATE path), so
+# grid_codec ships with no runtime shader files.
 include(vgrid_embed)
 vgrid_embed_shaders(
   grid_codec
@@ -101,6 +101,7 @@ vgrid_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid_diff.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_apply.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_diff.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_hold.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_count.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_decode.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/rans_ops.comp"

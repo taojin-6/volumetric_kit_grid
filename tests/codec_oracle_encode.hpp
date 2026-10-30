@@ -37,13 +37,17 @@ volumetric_kit::core::Result<SurfaceSet> surface_set(
     const volumetric_kit::core::test::Gpu& gpu,
     volumetric_kit::grid::volume::VoxelBlockGrid& grid);
 
-// What an Encoder of @p config must write for @p grid: the grid's active
-// blocks that hold an observed voxel -- with config.true_sdf, surface_set's
-// blocks and cut set -- found on the host, in (z, y, x) order, through the
-// device's forward transform, coded by write_frame.
+// What an Encoder of @p config must write for @p grid as an I-frame: the
+// grid's active blocks that hold an observed voxel -- with config.true_sdf,
+// surface_set's blocks and cut set -- found on the host, in (z, y, x) order,
+// through the device's forward transform, coded by write_frame. With
+// @p previous, an intra frame of what the encoder returned last, the content
+// is held against it first (codec_oracle::held): the intra frame of what a
+// P-frame after that frame decodes to.
 volumetric_kit::core::Result<std::vector<std::uint8_t>> encode(
     const volumetric_kit::core::test::Gpu& gpu,
     volumetric_kit::grid::volume::VoxelBlockGrid& grid,
-    const volumetric_kit::grid::codec::EncoderConfig& config);
+    const volumetric_kit::grid::codec::EncoderConfig& config,
+    const std::vector<std::uint8_t>* previous = nullptr);
 
 }  // namespace codec_oracle

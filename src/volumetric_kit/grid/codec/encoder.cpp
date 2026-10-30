@@ -272,10 +272,11 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
   // same content give the same bytes -- the sort's last level writing the
   // reference store's spare list, and through the forward into the spare:
   // the frame the decoder will hold, which this one holds too once it
-  // returns the frame. A P-frame's entries are coded against the reference
-  // there too, bounded at M plus the frame's blocks; the count takes the
-  // survivors off on the device. Either frame's symbols are counted, laid
-  // out and gathered for the host in the same batch.
+  // returns the frame. A P-frame is held against the reference there (the
+  // one-step hold, encoder.hpp), then its entries are coded against it,
+  // bounded at M plus the frame's blocks; the count takes the survivors off
+  // on the device. Either frame's symbols are counted, laid out and gathered
+  // for the host in the same batch.
   // TODO(codec): trim a P-frame's host overhead at small R, where its encode
   // is still slower than intra's (DECISIONS, the 2026-10-17 freeze).
   {
@@ -292,6 +293,7 @@ core::Result<PendingEncode> Encoder::front(core::CommandBatch& batch,
             *frame.coefficients,
             config_.true_sdf ? &transform_->cut_set() : nullptr, &forward));
     if (reference != nullptr) {
+      VKC_TRY(store_->record_hold(batch, observed, k, &forward));
       VKC_ASSIGN(recorded->entries,
                  store_->record_diff(batch, observed, k, &forward));
     }
