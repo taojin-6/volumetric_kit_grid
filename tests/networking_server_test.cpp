@@ -35,7 +35,13 @@
 // no longer counts; the writer's refusals send nothing, and so does a payload
 // over the parser's cap; start
 // refuses (a stall_limit of 0 or less among them); the destructor returns
-// within 1 s with no viewers, idle ones and a stalled one; the threads of
+// within 1 s with no viewers, idle ones and a stalled one; finish gives a
+// viewer reading nothing until it begins every record, the chunks past the
+// last frame included, then the end, replaying and on demand; a viewer that
+// takes no byte holds finish until kFinishLimit and no longer, a connection
+// meanwhile is closed before any byte, and after it publish and a
+// connection are refused; finish closes at once a viewer waiting for a key
+// and one that leaves meanwhile, and returns at once with none; the threads of
 // viewers that ended are joined as they go, the address space (on macOS, its
 // stacks) back near its start after 300; and 100 SIGUSR1 to a no-op handler
 // leave the stream whole. Every test that publishes first waits for the
@@ -1412,6 +1418,201 @@ int teardown_case() {
   return 0;
 }
 
+// --- Finishing.
+// ---------------------------------------------------------------
+
+// Within it finish returns however the viewers read: kFinishLimit, a poll
+// slice and the write under way.
+constexpr auto kFinishLimitSlack = networking::kFinishLimit + 500ms;
+
+// A server's finish, run on a thread of its own and timed, so a test reads
+// meanwhile. Joined as it goes.
+class Finisher {
+ public:
+  explicit Finisher(networking::StreamServer* server)
+      : thread_([this, server] {
+          const Clock::time_point start = Clock::now();
+          server->finish();
+          took_ = Clock::now() - start;
+          done_ = true;
+        }) {}
+  ~Finisher() { thread_.join(); }
+  Finisher(const Finisher&) = delete;
+  Finisher& operator=(const Finisher&) = delete;
+
+  // Whether finish returned within `timeout`.
+  bool returned_within(std::chrono::milliseconds timeout) const {
+    const Clock::time_point end = Clock::now() + timeout;
+    while (!done_) {
+      if (Clock::now() >= end) return false;
+      std::this_thread::sleep_for(5ms);
+    }
+    return true;
+  }
+  // How long it took, once returned.
+  Clock::duration took() const { return took_; }
+
+ private:
+  std::atomic<bool> done_{false};
+  Clock::duration took_{};  // written before done_
+  std::thread thread_;
+};
+
+// What a raw viewer read, `wire`, as records, each chunk passing its CRCs.
+int parse(const Bytes& wire, std::vector<Got>* got) {
+  stream::ChunkParser parser;
+  CHECK(parser.feed(wire.data(), wire.size()).ok());
+  for (;;) {
+    Got g;
+    const vkc::Result<bool> r = parser.next(&g.record, &g.payload);
+    CHECK(r.ok());
+    if (!*r) return 0;
+    got->push_back(std::move(g));
+  }
+}
+
+// A viewer that reads nothing while 8 frames of 1 MiB and their chunks are
+// published, then 25 chunks past the last frame, as a codec stream's finish
+// publishes what it holds, gets every record once finish has begun, those
+// past the last frame included, then the end, which finish waits for; the
+// viewer is no longer counted. Replaying and on demand.
+int finish_drains_case(bool replay) {
+  const stream::Session session = two_track_session();
+  networking::ServerOptions options;
+  options.replay_gop = replay;
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port(), 4096);
+  CHECK(viewer.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  std::vector<Published> records;
+  for (std::uint64_t k = 0; k < 8; ++k) {
+    records.push_back(frame(k, k == 0, 1 << 20));
+    if (k > 0) records.push_back(chunk(2 * k - 1));
+    records.push_back(chunk(2 * k));
+  }
+  for (std::uint64_t j = 15; j < 40; ++j) records.push_back(chunk(j));
+  for (const Published& r : records) {
+    CHECK(server->publish(r.info, r.payload.data(), r.payload.size()).ok());
+  }
+  Finisher finisher(server.get());
+  bool ended = false;
+  net::read_upto(viewer.get(), std::size_t{1} << 30, 5s, &wire, &ended);
+  CHECK(ended);
+  CHECK(finisher.returned_within(kFinishLimitSlack));
+  std::vector<Got> got;
+  CHECK(parse(wire, &got) == 0);
+  CHECK(got.size() == records.size());
+  for (std::size_t i = 0; i < records.size(); ++i)
+    CHECK(is(got[i], records[i]));
+  CHECK(server->viewers() == 0);
+  return 0;
+}
+
+// A viewer that takes no byte holds finish until kFinishLimit, no longer,
+// and is then closed, logged at Info; meanwhile a viewer that has read every
+// record gets its end at once, and a connection is closed at accept, before
+// any byte, logged at Info. After it, publish and a connection are refused,
+// and a second finish returns at once.
+int finish_bound_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  const stream::Session session = net::geometry_session();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  const std::uint16_t port = server->port();
+  auto reading = net::connect(port);
+  CHECK(reading != nullptr && net::wait_session(*reading));
+  const vkc::UniqueFd stalled = net::connect_loopback(port, 4096);
+  CHECK(stalled.valid());
+  Bytes header;
+  net::read_upto(stalled.get(), net::session_chunk(session).size(), 5s,
+                 &header);
+  CHECK(header.size() == net::session_chunk(session).size());
+  const std::string name = peer_name(stalled.get());
+  CHECK(log.wait_for(name, "joined", 2s));
+  for (std::uint64_t seq = 0; seq < 4; ++seq) {
+    const Bytes payload = net::record_payload(seq, 1 << 20);
+    CHECK(server
+              ->publish(net::record_info(seq, seq == 0), payload.data(),
+                        payload.size())
+              .ok());
+    Got got;
+    CHECK(net::next_within(*reading, &got) && got.record.info.seq == seq);
+  }
+  Finisher finisher(server.get());
+  // Its end says finish has begun.
+  CHECK(net::wait_end(*reading, port, 500ms));
+  const vkc::UniqueFd late = net::connect_loopback(port);
+  CHECK(late.valid());
+  Bytes none;
+  bool closed = false;
+  net::read_upto(late.get(), 1, 2s, &none, &closed);
+  CHECK(none.empty() && closed);
+  CHECK(log.wait_for(peer_name(late.get()), "refused viewer", 1s));
+  CHECK(finisher.returned_within(kFinishLimitSlack));
+  CHECK(finisher.took() >= networking::kFinishLimit);
+  CHECK(
+      log.has(name, "closed: still behind 1000 ms after the stream finished"));
+  CHECK(server->viewers() == 0);
+  Bytes rest;
+  bool ended = false;
+  net::read_upto(stalled.get(), std::size_t{1} << 30, 5s, &rest, &ended);
+  CHECK(ended);
+  const Bytes payload = net::record_payload(4, 10);
+  CHECK(
+      server->publish(net::record_info(4, true), payload.data(), payload.size())
+          .domain() == Code::InvalidArgument);
+  CHECK(!net::connect_loopback(port).valid());
+  CHECK(within_1s([&] { server->finish(); }));
+  return 0;
+}
+
+// Closed at once while finish waits: a viewer waiting for a key, which has
+// nothing queued and an empty socket, and one that leaves, so finish returns
+// well within kFinishLimit; and with no viewer, finish returns at once.
+int finish_at_once_case() {
+  Captured log;
+  const LogCapture capture(&log);
+  const stream::Session session = net::geometry_session();
+  auto alone = net::serve(session);
+  CHECK(alone != nullptr);
+  CHECK(within_1s([&] { alone->finish(); }));
+
+  networking::ServerOptions options;
+  options.replay_gop = false;
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const std::uint16_t port = server->port();
+  vkc::UniqueFd leaving = net::connect_loopback(port, 4096);
+  CHECK(leaving.valid());
+  Bytes header;
+  net::read_upto(leaving.get(), net::session_chunk(session).size(), 5s,
+                 &header);
+  CHECK(header.size() == net::session_chunk(session).size());
+  const std::string name = peer_name(leaving.get());
+  CHECK(log.wait_for(name, "joined", 2s));
+  for (std::uint64_t seq = 0; seq < 4; ++seq) {
+    const Bytes payload = net::record_payload(seq, 1 << 20);
+    CHECK(server
+              ->publish(net::record_info(seq, seq == 0), payload.data(),
+                        payload.size())
+              .ok());
+  }
+  auto waiting = net::connect(port);  // joins after the key: it waits
+  CHECK(waiting != nullptr && net::wait_session(*waiting));
+  Finisher finisher(server.get());
+  CHECK(net::wait_end(*waiting, port, 500ms));
+  leaving.reset();
+  CHECK(finisher.returned_within(500ms));
+  CHECK(finisher.took() < networking::kFinishLimit / 2);
+  CHECK(!log.has(name, "still behind"));
+  return 0;
+}
+
 #ifndef VKC_TEST_SANITIZED
 // The address space a thread never joined would grow, in bytes, or 0 when it
 // cannot be read: on macOS the regions tagged as stacks, as malloc maps a
@@ -1628,6 +1829,11 @@ int main() {
   if (join_leave_log_case() != 0) return 1;
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;
+  for (const bool replay : {true, false}) {
+    if (finish_drains_case(replay) != 0) return 1;
+  }
+  if (finish_bound_case() != 0) return 1;
+  if (finish_at_once_case() != 0) return 1;
   if (reaping_case() != 0) return 1;
   if (signals_case() != 0) return 1;
   std::puts("networking server: OK");

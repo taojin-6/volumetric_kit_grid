@@ -22,6 +22,10 @@ namespace volumetric_kit::grid::networking {
 /// The port a sender serves on, and a viewer connects to when none is named.
 inline constexpr std::uint16_t kDefaultPort = 47801;
 
+/// How long @ref StreamServer::finish lets the viewers take the records
+/// queued for them before it closes the ones still behind: 1 s.
+inline constexpr std::chrono::milliseconds kFinishLimit{1'000};
+
 /// @brief Where and how a @ref StreamServer serves.
 struct ServerOptions {
   /// A numeric IPv4 address to listen on; empty listens on every interface.
@@ -111,7 +115,7 @@ struct ServerOptions {
 /// VKC_TRY(server->publish(info, frame.data(), frame.size()));
 /// @endcode
 ///
-/// @warning Call @ref publish from one thread at a time.
+/// @warning Call @ref publish and @ref finish from one thread at a time.
 class VGRID_NETWORKING_API StreamServer {
  public:
   /// @brief Listen on @p options' address and start accepting viewers.
@@ -129,8 +133,10 @@ class VGRID_NETWORKING_API StreamServer {
   static core::Result<std::unique_ptr<StreamServer>> start(
       const stream::Session& session, const ServerOptions& options = {});
 
-  /// @brief Close every connection and join every thread: within one poll
-  ///        slice (about 20 ms) and the write under way.
+  /// @brief Close every connection at once, the records still queued for a
+  ///        viewer lost (@ref finish sends them first), and join every
+  ///        thread: within one poll slice (about 20 ms) and the write under
+  ///        way.
   ~StreamServer();
   StreamServer(const StreamServer&) = delete;
   StreamServer& operator=(const StreamServer&) = delete;
@@ -145,9 +151,9 @@ class VGRID_NETWORKING_API StreamServer {
   /// @param data  The payload; may be null when @p size is 0.
   /// @param size  The payload's bytes.
   /// @return OK, with viewers or none; `Status::Code::InvalidArgument` for a
-  ///         record breaking the rules, or a payload over
+  ///         record breaking the rules, a payload over
   ///         `stream::ChunkParser::kMaxBodyBytes` (64 MiB), which no viewer
-  ///         reads, with nothing sent;
+  ///         reads, or a call after @ref finish, with nothing sent;
   ///         `Status::Code::OutOfMemory` when it cannot be copied, which
   ///         drops it and every record until the next key, as an overflow
   ///         does. Never a viewer's failure.
@@ -159,6 +165,20 @@ class VGRID_NETWORKING_API StreamServer {
   /// @return As the other @ref publish.
   core::Status publish(const stream::RecordInfo& info,
                        const stream::RecordPayload& payload);
+
+  /// @brief End the stream: take no more records or viewers, and close each
+  ///        viewer once it has sent every record queued for it, so it reads
+  ///        the end right after the last record published.
+  ///
+  /// Returns once every viewer is closed and every thread joined: within
+  /// @ref kFinishLimit, a poll slice and the write under way, however the
+  /// viewers read. A viewer with nothing queued, as one waiting for a key,
+  /// is closed once its socket can take more; one that leaves or fails, at
+  /// once; one that stalls past @ref ServerOptions::stall_limit is closed as
+  /// ever; one still behind at @ref kFinishLimit is closed then, logged at
+  /// Info. A connection meanwhile is closed at accept, before any byte, and
+  /// one after is refused. Later calls do nothing.
+  void finish() noexcept;
 
   /// @return The port listened on: the one asked for, or the one taken for 0.
   std::uint16_t port() const noexcept;
@@ -176,8 +196,9 @@ class VGRID_NETWORKING_API StreamServer {
   std::uint64_t key_wanted() const noexcept;
 
   /// @brief The viewers being served now: each counted from its accepted
-  ///        connection, before its first byte, until the server closes it as
-  ///        it leaves, fails or stalls past @ref ServerOptions::stall_limit.
+  ///        connection, before its first byte, until the server closes it:
+  ///        as it leaves, fails or stalls past
+  ///        @ref ServerOptions::stall_limit, or at @ref finish.
   ///        A viewer waiting for a key counts; a connection refused at
   ///        @ref ServerOptions::max_viewers never does. Safe from any thread.
   /// @return The count, at most `max_viewers`.
