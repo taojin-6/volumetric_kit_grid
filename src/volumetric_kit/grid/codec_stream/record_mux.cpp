@@ -31,27 +31,27 @@ core::Status RecordMux::append(const stream::RecordInfo& info,
           " is not in the session's " + std::to_string(lanes_.size() + 1) +
           " tracks");
     }
-    const std::string track =
-        "CodecStream: track " + std::to_string(info.track);
-    if (!info.key) {
+    // Built on refusal only: a record taken makes no string.
+    const auto refused = [&info](const std::string& why) {
       return core::Status::invalid_argument(
-          track + ": record seq " + std::to_string(info.seq) +
-          " is not a key, as every Audio record is");
+          "CodecStream: track " + std::to_string(info.track) + ": " + why);
+    };
+    if (!info.key) {
+      return refused("record seq " + std::to_string(info.seq) +
+                     " is not a key, as every Audio record is");
     }
     if (data == nullptr && size != 0) {
-      return core::Status::invalid_argument(track + ": a null payload of " +
-                                            std::to_string(size) + " bytes");
+      return refused("a null payload of " + std::to_string(size) + " bytes");
     }
     Lane& lane = lanes_[info.track - 1];
     if (lane.any && info.seq <= lane.last_seq) {
-      return core::Status::invalid_argument(
-          track + ": seq " + std::to_string(info.seq) +
-          " does not follow seq " + std::to_string(lane.last_seq));
+      return refused("seq " + std::to_string(info.seq) +
+                     " does not follow seq " + std::to_string(lane.last_seq));
     }
     if (lane.any && info.pts_ns < lane.last_pts_ns) {
-      return core::Status::invalid_argument(
-          track + ": pts " + std::to_string(info.pts_ns) +
-          " ns goes back from " + std::to_string(lane.last_pts_ns) + " ns");
+      return refused("pts " + std::to_string(info.pts_ns) +
+                     " ns goes back from " + std::to_string(lane.last_pts_ns) +
+                     " ns");
     }
     const bool late = started_ && info.pts_ns < first_pts_ns_;
     if (!late) {

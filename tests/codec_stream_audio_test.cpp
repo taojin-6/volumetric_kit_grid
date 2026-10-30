@@ -255,11 +255,16 @@ int refused_records(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   const std::uint64_t pts = kT0 + 10 * kMs;
   CHECK(refused(vrst::info(0, true, pts, 6), chunk.data(), "track 0 is"));
   CHECK(refused(vrst::info(2, true, pts, 6), chunk.data(), "track 2 is not"));
-  CHECK(refused(vrst::info(1, false, pts, 6), chunk.data(), "not a key"));
-  CHECK(refused(vrst::info(1, true, pts, 5), chunk.data(), "seq 5 does not"));
-  CHECK(refused(vrst::info(1, true, pts, 4), chunk.data(), "seq 4 does not"));
-  CHECK(refused(vrst::info(1, true, pts - 1, 6), chunk.data(), "goes back"));
-  CHECK(refused(vrst::info(1, true, pts, 6), nullptr, "null payload"));
+  CHECK(refused(vrst::info(1, false, pts, 6), chunk.data(),
+                "track 1: record seq 6 is not a key"));
+  CHECK(refused(vrst::info(1, true, pts, 5), chunk.data(),
+                "track 1: seq 5 does not"));
+  CHECK(refused(vrst::info(1, true, pts, 4), chunk.data(),
+                "track 1: seq 4 does not"));
+  CHECK(refused(vrst::info(1, true, pts - 1, 6), chunk.data(),
+                "track 1: pts " + std::to_string(pts - 1) + " ns goes back"));
+  CHECK(
+      refused(vrst::info(1, true, pts, 6), nullptr, "track 1: a null payload"));
   CHECK(append(coder, 1, 6, pts).ok());
   CHECK(coder.append(vrst::info(1, true, pts, 7), nullptr, 0).ok());
   CHECK(counts_are(coder, 1, 3, 0, 0));
