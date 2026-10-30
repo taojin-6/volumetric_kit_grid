@@ -962,8 +962,14 @@ before its first byte and while it waits for a key, until the server closes
 it; a refused connection never counts. Viewers that join, leave or fail are
 logged at Info; a refusal at Warning, the first and then one in 10 s at
 most, the rest at Debug. The destructor stops every thread within a poll
-slice (20 ms) and the write under way. One track is served (`Unsupported`
-otherwise), and `publish` is called from one thread.
+slice (20 ms) and the write under way. `publish` is called from one thread.
+
+**Tracks** (the 2026-10-30 serving entry). Track 0 anchors the GOP: only its
+keys start one, in either mode. A record of any other track must be a key
+(`InvalidArgument` otherwise, before it is framed) and joins the log as a
+P-frame does, so it shares track 0's fate: a joiner or a skip starts at a
+track-0 key and gets every record published after it, on any track. With
+`CodecStream`'s mux, that is every audio record from the key's pts on.
 
 **Reading** (`StreamClient`). `connect` never blocks: a numeric IPv4 address
 is parsed at once, and a name is looked up on a detached thread, which the
@@ -1005,9 +1011,7 @@ session and `CodecOutputs`: a new `.vrst` file, the server's options, and
 whether to decode. It refuses a session whose track 0 is not Geometry or
 whose other tracks are not Audio with params a reader plays, on track 0's
 clock, naming the track; then makes the server, so a port in use leaves no
-file (the server serves one track, so a stream with an Audio track writes a
-file but is refused serving, `Unsupported`), then the
-file, which must be new, then the encoder and, with `decode`, the decoder,
+file, then the file, which must be new, then the encoder and, with `decode`, the decoder,
 so a refused output costs no kernel. A codec error removes the new file
 again, as does destroying the stream unfinished before its first frame. The
 file and the viewers get that session. `code(grid, set, pts_ns)`
@@ -1151,14 +1155,16 @@ tables, not fitted JPEG image tables: the criterion is decoded geometry at
 a given total size.
 
 **`serve_stream <in.vrst> [--port N]`** serves a recording live: a sender
-with no camera or GPU, so it builds wherever the examples do. It replays one
-track's records from its first key read whole, each due at its pts from its
-pass's start, in a loop until Ctrl+C (`ReplayLoop`, `stream_replay.hpp`).
-Each pass is restamped, seq past the passes before and pts a pass's span (the
-records' pts span and one mean step) later, so seq keeps rising and key pts
-never go back, as `publish` requires. A record whose payload fails its CRC
-is skipped with the P-frames after it, up to the pass's next key, and
-printed in the first pass. It listens on every interface, on 47801 or N (0
+with no camera or GPU, so it builds wherever the examples do. It replays
+every track's records, in file order, from track 0's first key read whole,
+each due at its pts from its pass's start, in a loop until Ctrl+C
+(`ReplayLoop`, `stream_replay.hpp`). Each pass is restamped: each track's
+seq past its own in the passes before, and every pts one pass's span (the
+records' pts span and one mean step of track 0) later, the same on every
+track, so the tracks stay together, seq keeps rising and key pts never go
+back, as `publish` requires. A record whose payload fails its CRC is skipped
+with its track's records after it that are not keys, up to that track's
+next key in the pass, and printed in the first pass. It listens on every interface, on 47801 or N (0
 takes a free one, which it prints). Bad arguments exit 2 with the usage; a
 failure, a missing file or no key whose payload reads whole included,
 exits 1.

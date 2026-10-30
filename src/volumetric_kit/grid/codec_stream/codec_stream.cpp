@@ -95,8 +95,6 @@ core::Result<std::unique_ptr<StreamCoder>> StreamCoder::create(
     const CodecOutputs& outputs) {
   VKC_TRY(check_session(session));
   std::unique_ptr<networking::StreamServer> server;
-  // A session with an Audio track is refused here, as Unsupported: the
-  // server serves one track. TODO: serve it once StreamServer serves more.
   if (outputs.serve) {
     VKC_ASSIGN(server,
                networking::StreamServer::start(session, *outputs.serve));

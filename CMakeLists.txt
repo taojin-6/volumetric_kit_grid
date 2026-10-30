@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(
   volumetric_kit_grid
-  VERSION 0.5.0
+  VERSION 0.6.0
   DESCRIPTION
     "Sparse voxel hashing, meshing and the TSDF geometry codec on Vulkan compute (MoltenVK on Apple) for the volumetric_kit family"
   HOMEPAGE_URL "https://github.com/taojin-6/volumetric_kit_grid"

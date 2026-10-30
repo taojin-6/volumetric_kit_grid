@@ -15,7 +15,13 @@
 // key, then every record, and one that stops reading falls back, counted,
 // past max_gop_bytes, then gets the next key, while one reading gets every
 // record, and a record past max_gop_bytes on its own is logged at Warning
-// (a copy that fails: networking_server_oom_test.cpp); a GOP past
+// (a copy that fails: networking_server_oom_test.cpp); a Geometry track
+// and an Audio track served, the wire the two-track file, and an audio
+// record that is not a key refused with nothing changed; a viewer joining
+// mid-GOP gets track 0's key, then every record after it, both tracks', and
+// a burst of audio keys reaches a stuck viewer whole, while a newer track-0
+// key skips the audio of the GOPs before it with their frames, replaying and
+// on demand alike; a GOP past
 // max_gop_bytes sends nothing until the next key; a viewer that takes no byte
 // is closed after stall_limit, never when it is milliseconds::max(), and on
 // Linux one that takes too few for its socket to poll writable within it is
@@ -65,6 +71,7 @@
 #include "volumetric_kit/core/base/log.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
+#include "volumetric_kit/grid/stream/audio.hpp"
 #include "volumetric_kit/grid/stream/stream_reader.hpp"
 #include "volumetric_kit/grid/stream/stream_writer.hpp"
 #include "volumetric_kit/grid/testing/networking_loopback.hpp"
@@ -157,15 +164,18 @@ std::string peer_name(int fd) {
 }
 
 // The records a raw viewer gets, each chunk passing its CRCs: from `wire`,
-// what it has read, then from `fd` until the record of seq `last`, within
-// 10 s.
-int drain(int fd, const Bytes& wire, std::uint64_t last,
-          std::vector<Got>* got) {
+// what it has read, then from `fd` until the record of seq `last` on track
+// `track`, within 10 s.
+int drain(int fd, const Bytes& wire, std::uint64_t last, std::vector<Got>* got,
+          std::uint16_t track = 0) {
   stream::ChunkParser parser;
   CHECK(parser.feed(wire.data(), wire.size()).ok());
   const Clock::time_point end = Clock::now() + 10s;
-  while ((got->empty() || got->back().record.info.seq < last) &&
-         Clock::now() < end) {
+  const auto done = [&] {
+    return !got->empty() && got->back().record.info.track == track &&
+           got->back().record.info.seq >= last;
+  };
+  while (!done() && Clock::now() < end) {
     Got g;
     const vkc::Result<bool> r = parser.next(&g.record, &g.payload);
     CHECK(r.ok());
@@ -658,6 +668,230 @@ int on_demand_limit_case() {
   return 0;
 }
 
+// --- Two tracks.
+// -------------------------------------------------------------
+
+constexpr std::uint64_t kFramePts = 40'000'000;  // 25 frames a second
+constexpr std::uint64_t kChunkPts = 20'000'000;  // 20 ms chunks
+constexpr std::size_t kChunkBytes = 1920;        // 960 mono s16 frames
+
+// A Geometry track 0 and an Audio track 1, as a sender with a mic has.
+stream::Session two_track_session() {
+  stream::Session s = net::geometry_session();
+  stream::Track audio;
+  audio.kind = stream::TrackKind::Audio;
+  audio.rate = {48000, 960};
+  audio.params = stream::encode_audio_params({});
+  s.tracks.push_back(audio);
+  return s;
+}
+
+// Frame `seq` of track 0 at 40 ms a frame, a key when `key`, of `size` bytes.
+Published frame(std::uint64_t seq, bool key, std::size_t size = 1000) {
+  return {vrst::info(0, key, seq * kFramePts, seq),
+          net::record_payload(seq, size)};
+}
+
+// Chunk `seq` of track 1 at 20 ms a chunk, a key as every one is.
+Published chunk(std::uint64_t seq) {
+  return {vrst::info(1, true, seq * kChunkPts, seq),
+          net::record_payload(1000 + seq, kChunkBytes)};
+}
+
+// Frames `first` to `last`, a key every `gop`, each followed by the chunks
+// CodecStream releases with it: those at or below its pts and above the
+// frame's before (chunk 0 with frame 0; 2k - 1 and 2k with frame k).
+std::vector<Published> muxed(std::uint64_t first, std::uint64_t last,
+                             std::uint64_t gop) {
+  std::vector<Published> out;
+  for (std::uint64_t k = first; k <= last; ++k) {
+    out.push_back(frame(k, k % gop == 0));
+    if (k > 0) out.push_back(chunk(2 * k - 1));
+    out.push_back(chunk(2 * k));
+  }
+  return out;
+}
+
+bool is(const Got& got, const Published& r) {
+  return vrst::same(got.record.info, r.info) && got.payload == r.payload;
+}
+
+// Two tracks served: a raw viewer's bytes are the writer's file of the same
+// two-track session and records, less its footer. A record of track 1 that
+// is not a key is refused, naming it, with nothing sent or changed: the same
+// seq as a key is taken after it, and the file never had it.
+int two_tracks_wire_case(const std::string& dir) {
+  const stream::Session session = two_track_session();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port());
+  CHECK(viewer.valid());
+  Bytes wire;
+  const std::size_t header = net::session_chunk(session).size();
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  const std::string path = dir + "/two_tracks.vrst";
+  auto writer = stream::StreamWriter::create(path, session);
+  CHECK(writer.ok());
+  for (const Published& r : muxed(0, 6, 3)) {
+    if (r.info.track == 1 && r.info.seq == 5) {
+      stream::RecordInfo inter = r.info;
+      inter.key = false;
+      const vkc::Status refused =
+          server->publish(inter, r.payload.data(), r.payload.size());
+      CHECK(refused.domain() == Code::InvalidArgument &&
+            refused.message().find("track 1 seq 5 is not a key") !=
+                std::string::npos);
+    }
+    CHECK((*writer)->append(r.info, r.payload.data(), r.payload.size()).ok());
+    CHECK(server->publish(r.info, r.payload.data(), r.payload.size()).ok());
+    const std::size_t want = (*writer)->size();
+    net::read_upto(viewer.get(), want, 5s, &wire);
+    CHECK(wire.size() == want);
+  }
+  CHECK((*writer)->finish().ok());
+  const Bytes file = vkc::test::read_bytes(path);
+  CHECK(vrst::index_offset(file) == wire.size());
+  CHECK(Bytes(file.begin(),
+              file.begin() + static_cast<std::ptrdiff_t>(wire.size())) == wire);
+  return 0;
+}
+
+// A viewer joining mid-GOP gets track 0's key first, then every record
+// published after it, the chunks at its pts and on included, and none from
+// before: replaying, the GOP's key, which the newer chunks, keys too, never
+// replace; keys on demand, nothing until the next track-0 key, the chunks
+// meanwhile, keys too, letting it in no earlier.
+int two_tracks_join_case(bool replay) {
+  networking::ServerOptions options;
+  options.replay_gop = replay;
+  auto server = net::serve(two_track_session(), options);
+  CHECK(server != nullptr);
+  const std::vector<Published> records = muxed(0, 7, 3);  // keys 0, 3, 6
+  // Where `records` holds track `track`'s record `seq`.
+  const auto at = [&](std::uint16_t track, std::uint64_t seq) {
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      if (records[i].info.track == track && records[i].info.seq == seq) {
+        return i;
+      }
+    }
+    return records.size();
+  };
+  const auto publish = [&](std::size_t from, std::size_t to) {
+    for (std::size_t i = from; i < to; ++i) {
+      const Published& r = records[i];
+      if (!server->publish(r.info, r.payload.data(), r.payload.size()).ok()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  std::unique_ptr<networking::StreamClient> client;
+  const auto read = [&](std::size_t from, std::size_t to) {
+    for (std::size_t i = from; i < to; ++i) {
+      Got got;
+      if (!net::next_within(*client, &got) || !is(got, records[i])) {
+        std::fprintf(stderr, "joined: record %zu not as published\n", i);
+        return false;
+      }
+    }
+    return true;
+  };
+  // Up to frame 4 and its chunks, mid-GOP: frame 3 the newest key.
+  const std::size_t joined_at = at(0, 5);
+  CHECK(publish(0, joined_at));
+  client = net::connect(server->port());
+  CHECK(client != nullptr);
+  // Replaying, it reads the GOP, whose key comes with its session, before a
+  // newer key is published, which it would start at otherwise; on demand it
+  // has joined once it has its session.
+  if (replay) {
+    CHECK(read(at(0, 3), joined_at));
+  } else {
+    CHECK(net::wait_session(*client));
+  }
+  // The rest, through frame 7's chunks, each read as it is published, so a
+  // newer key skips none: on demand from frame 6, the next key.
+  const std::size_t from = replay ? joined_at : at(0, 6);
+  CHECK(publish(joined_at, from));
+  for (std::size_t i = from; i < records.size(); ++i) {
+    CHECK(publish(i, i + 1) && read(i, i + 1));
+  }
+  Got extra;
+  CHECK(!net::next_within(*client, &extra, 100ms));
+  return 0;
+}
+
+// A raw viewer with a 4 KiB receive buffer reads its session and the header
+// of a 1 MiB track-0 key, then nothing while `records` are published after
+// it, each publish back at once; then it drains until the last. What it
+// gets.
+int slow_viewer_gets(bool replay, const std::vector<Published>& records,
+                     std::vector<Got>* got) {
+  const stream::Session session = two_track_session();
+  networking::ServerOptions options;
+  options.replay_gop = replay;
+  // Never closed, as in newest_key_wins_case.
+  options.stall_limit = std::chrono::milliseconds::max();
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(server->port(), 4096);
+  CHECK(viewer.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(viewer.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  const Published key = frame(0, true, 1 << 20);
+  CHECK(server->publish(key.info, key.payload.data(), key.payload.size()).ok());
+  net::read_upto(viewer.get(), header + 56, 5s, &wire);  // the key's header
+  CHECK(wire.size() == header + 56);
+  for (const Published& r : records) {
+    CHECK(server->publish(r.info, r.payload.data(), r.payload.size()).ok());
+  }
+  const stream::RecordInfo& last = records.back().info;
+  CHECK(drain(viewer.get(), wire, last.seq, got, last.track) == 0);
+  CHECK(!got->empty() && is(got->front(), key));
+  return 0;
+}
+
+// A burst of 200 chunks, every one a key, while a viewer is stuck in a 1 MiB
+// track-0 key, then a P-frame: the viewer gets the key, every chunk and the
+// P-frame, as only track 0's keys start a GOP. Replaying and on demand.
+int audio_burst_case(bool replay) {
+  std::vector<Published> burst;
+  for (std::uint64_t j = 0; j < 200; ++j) burst.push_back(chunk(j));
+  burst.push_back(frame(1, false));
+  std::vector<Got> got;
+  CHECK(slow_viewer_gets(replay, burst, &got) == 0);
+  CHECK(got.size() == 1 + burst.size());
+  for (std::size_t i = 0; i < burst.size(); ++i) CHECK(is(got[i + 1], burst[i]));
+  return 0;
+}
+
+// Newest key wins skips the chunks with the frames: a viewer stuck in a
+// 1 MiB track-0 key while the rest of its GOP and two more, 1 MiB frames
+// with their chunks, are published gets that key, then the newest GOP whole,
+// its chunks with it, and no chunk of the GOPs it skipped. Replaying and on
+// demand.
+int newest_key_skips_audio_case(bool replay) {
+  std::vector<Published> rest;
+  for (std::uint64_t k = 1; k < 9; ++k) {  // keys at 3 and 6
+    rest.push_back(frame(k, k % 3 == 0, 1 << 20));
+    rest.push_back(chunk(2 * k - 1));
+    rest.push_back(chunk(2 * k));
+  }
+  std::vector<Got> got;
+  CHECK(slow_viewer_gets(replay, rest, &got) == 0);
+  // The key, then frame 6 and everything after it.
+  const std::size_t newest = 3 * (6 - 1);
+  CHECK(rest[newest].info.track == 0 && rest[newest].info.seq == 6);
+  CHECK(got.size() == 1 + rest.size() - newest);
+  for (std::size_t i = newest; i < rest.size(); ++i) {
+    CHECK(is(got[1 + i - newest], rest[i]));
+  }
+  return 0;
+}
+
 // --- Limits.
 // ------------------------------------------------------------------
 
@@ -1061,7 +1295,7 @@ int rules_case() {
     return server->publish(info, data, size).domain();
   };
   CHECK(publish(vrst::info(0, true, 5000, 10), payload.data(), 64) == Code::Ok);
-  CHECK(publish(vrst::info(1, false, 6000, 11), payload.data(), 64) ==
+  CHECK(publish(vrst::info(1, true, 6000, 11), payload.data(), 64) ==
         Code::InvalidArgument);  // a track the session lacks
   CHECK(publish(vrst::info(0, false, 6000, 10), payload.data(), 64) ==
         Code::InvalidArgument);  // seq not above the last
@@ -1090,9 +1324,6 @@ int rules_case() {
   stream::Session no_kind = session;
   no_kind.tracks[0].kind = stream::TrackKind{};
   CHECK(start(no_kind, local) == Code::InvalidArgument);
-  stream::Session two = session;
-  two.tracks.push_back(session.tracks[0]);
-  CHECK(start(two, local) == Code::Unsupported);
   for (const char* host : {"localhost", "::1", "1.2.3", "256.0.0.1", " "}) {
     networking::ServerOptions named = local;
     named.host = host;
@@ -1374,6 +1605,12 @@ int main() {
   if (on_demand_join_case() != 0) return 1;
   if (on_demand_fall_back_case() != 0) return 1;
   if (on_demand_limit_case() != 0) return 1;
+  if (two_tracks_wire_case(dir) != 0) return 1;
+  for (const bool replay : {true, false}) {
+    if (two_tracks_join_case(replay) != 0) return 1;
+    if (audio_burst_case(replay) != 0) return 1;
+    if (newest_key_skips_audio_case(replay) != 0) return 1;
+  }
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
   if (stall_never_case() != 0) return 1;

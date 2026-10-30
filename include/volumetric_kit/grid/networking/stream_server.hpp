@@ -71,6 +71,12 @@ struct ServerOptions {
 /// unsent (`TCP_NOTSENT_LOWAT`), so little backlog hides in the kernel. A
 /// P-frame is never sent without the records it is predicted from.
 ///
+/// **Track 0 anchors the GOP.** A key on track 0 starts a GOP; every other
+/// track's records are keys, each joining the GOP it is published in as a
+/// P-frame does, so they share track 0's fate: a viewer that joins or skips
+/// starts at a track-0 key and gets every record published after it, on any
+/// track, and loses what was published before it.
+///
 /// **Newest key wins.** When a newer key arrives before a viewer has sent
 /// the records before it, the viewer finishes the chunk under way, skips the
 /// rest and goes on from that key, so one slower than the stream stays
@@ -110,13 +116,13 @@ class VGRID_NETWORKING_API StreamServer {
  public:
   /// @brief Listen on @p options' address and start accepting viewers.
   /// @param session  What each viewer gets first: a session
-  ///                 `stream::StreamWriter::create` takes, of one track.
+  ///                 `stream::StreamWriter::create` takes, its track 0 the
+  ///                 one whose keys start a GOP.
   /// @param options  Where and how it serves.
   /// @return The server; `Status::Code::InvalidArgument` for a session the
   ///         writer would refuse, a host that is not numeric IPv4, a
   ///         `max_viewers` of 0 or a `stall_limit` of 0 or less;
-  ///         `Status::Code::Unsupported` for more than
-  ///         one track; `Status::Code::IoError` for a port that cannot be
+  ///         `Status::Code::IoError` for a port that cannot be
   ///         bound (in use) or a thread that cannot start;
   ///         `Status::Code::OutOfMemory` when the session's chunk cannot be
   ///         allocated.
@@ -134,7 +140,8 @@ class VGRID_NETWORKING_API StreamServer {
   /// @brief Hand one record to every viewer, now or as each catches up.
   /// @param info  By `stream::StreamWriter::append`'s rules, checked by the
   ///              same code: a track the session has, seq above the track's
-  ///              last, a key's pts no lower than the last key's.
+  ///              last, a key's pts no lower than the track's last key's;
+  ///              and a key unless on track 0.
   /// @param data  The payload; may be null when @p size is 0.
   /// @param size  The payload's bytes.
   /// @return OK, with viewers or none; `Status::Code::InvalidArgument` for a
