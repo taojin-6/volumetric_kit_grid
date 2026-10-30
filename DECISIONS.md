@@ -8666,14 +8666,15 @@ recon's live-audio test had to accept a viewer missing any of them.
 the lock, after the last `publish`, so a viewer's thread that sees it has
 every record there will be. `publish` then refuses (`InvalidArgument`),
 and the accept thread closes a connection at accept, before any byte. A
-viewer's thread, at a chunk boundary with nothing left for it, closes its
-connection, the kernel sending what it holds and then the end; one with
-nothing queued, as one waiting for a key, closes at once. `finish` waits
-until no viewer is left, at most `kFinishLimit`, then stops the threads as
-the destructor does, closing any viewer still behind (logged at Info), and
-closes the listener, so a later connection is refused. The destructor
-alone still closes at once, as an error path, an unfinished `CodecStream`,
-must not wait.
+viewer's thread with nothing left for it, past its last record or waiting
+for a key, closes its connection once its socket can take more (under
+128 KiB unsent), the kernel sending what it holds and then the end; a
+socket holding more keeps it until the kernel sends below that, so it can
+still be behind at `kFinishLimit`. `finish` waits until no viewer is left,
+at most `kFinishLimit`, then stops the threads as the destructor does,
+closing any viewer still behind (logged at Info), and closes the listener,
+so a later connection is refused. The destructor alone still closes at
+once, as an error path, an unfinished `CodecStream`, must not wait.
 
 **Why 1 s.** `finish` must not hang on a viewer that stalled or vanished
 without its end: `stall_limit` (10 s) is too long to hold a sender's exit.

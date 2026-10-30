@@ -1572,8 +1572,8 @@ int finish_bound_case() {
 }
 
 // Closed at once while finish waits: a viewer waiting for a key, which has
-// nothing queued, and one that leaves, so finish returns well within
-// kFinishLimit; and with no viewer, finish returns at once.
+// nothing queued and an empty socket, and one that leaves, so finish returns
+// well within kFinishLimit; and with no viewer, finish returns at once.
 int finish_at_once_case() {
   Captured log;
   const LogCapture capture(&log);

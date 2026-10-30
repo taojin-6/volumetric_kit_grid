@@ -968,11 +968,11 @@ slice (20 ms) and the write under way, what is queued for a viewer lost.
 **Finishing** (the 2026-10-30 finish entry). `finish` ends the stream
 without losing its tail: later records are refused, a connection is closed
 at accept before any byte, and each viewer is closed once it has sent every
-record queued for it, at once when it has none (one waiting for a key), so
-it reads the end right after the last record. It returns once every viewer
-is closed, or after `kFinishLimit` (1 s), when any still behind is closed
-(logged at Info), then stops the threads as the destructor does and closes
-the listener, so a later connection is refused.
+record queued for it, none for one waiting for a key, and its socket polls
+writable, so it reads the end right after the last record. It returns once
+every viewer is closed, or after `kFinishLimit` (1 s), when any still behind
+is closed (logged at Info), then stops the threads as the destructor does
+and closes the listener, so a later connection is refused.
 
 **Tracks** (the 2026-10-30 serving entry). Track 0 anchors the GOP: only its
 keys start one, in either mode. A record of any other track must be a key

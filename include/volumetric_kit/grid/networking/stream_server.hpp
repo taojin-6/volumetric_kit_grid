@@ -173,11 +173,11 @@ class VGRID_NETWORKING_API StreamServer {
   /// Returns once every viewer is closed and every thread joined: within
   /// @ref kFinishLimit, a poll slice and the write under way, however the
   /// viewers read. A viewer with nothing queued, as one waiting for a key,
-  /// is closed at once, and so is one that leaves or fails; one that stalls
-  /// past @ref ServerOptions::stall_limit is closed as ever; one still
-  /// behind at @ref kFinishLimit is closed then, logged at Info. A
-  /// connection meanwhile is closed at accept, before any byte, and one
-  /// after is refused. Later calls do nothing.
+  /// is closed once its socket can take more; one that leaves or fails, at
+  /// once; one that stalls past @ref ServerOptions::stall_limit is closed as
+  /// ever; one still behind at @ref kFinishLimit is closed then, logged at
+  /// Info. A connection meanwhile is closed at accept, before any byte, and
+  /// one after is refused. Later calls do nothing.
   void finish() noexcept;
 
   /// @return The port listened on: the one asked for, or the one taken for 0.
