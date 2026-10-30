@@ -36,9 +36,11 @@ class ReplayLoop {
   /// @brief The loop over @p reader's records: from track 0's first key
   ///        read whole, every track's, read whole, in file order; a span the
   ///        reader finds damaged is left out.
-  /// @return The loop; `NotFound` for a track 0 with no key read whole; the
-  ///         reader's `IoError`; `OutOfMemory`, the reader's or the loop's
-  ///         own.
+  /// @return The loop; `NotFound` for a track 0 with no key read whole;
+  ///         `Unsupported`, naming it, for a record replayed of another
+  ///         track that is not a key, which `StreamServer::publish` refuses;
+  ///         the reader's `IoError`; `OutOfMemory`, the reader's or the
+  ///         loop's own.
   static vkc::Result<ReplayLoop> create(
       const vgrid::stream::StreamReader& reader) {
     try {
@@ -77,6 +79,13 @@ class ReplayLoop {
       std::uint64_t most0 = least;
       std::uint64_t frames = 0;  // track 0's records
       for (const vgrid::stream::Record& r : loop.records_) {
+        // Refused now, not by the server mid-pass.
+        if (r.info.track != 0 && !r.info.key) {
+          return vkc::Status::unsupported(
+              "ReplayLoop: track " + std::to_string(r.info.track) + " seq " +
+              std::to_string(r.info.seq) +
+              " is not a key; only track 0 may have records that are not");
+        }
         least = std::min(least, r.info.pts_ns);
         most = std::max(most, r.info.pts_ns);
         if (r.info.track == 0) {

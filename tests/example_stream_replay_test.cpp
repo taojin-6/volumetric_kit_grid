@@ -16,7 +16,9 @@
 // track's records in file order from track 0's first key, one pts offset a
 // pass on both, so they stay together across passes, each track's seq
 // rising by one across a pass, and a damaged frame skipping its track's
-// P-frames to the next key but no audio. Host-only.
+// P-frames to the next key but no audio; and a replayed audio record that is
+// not a key refused, naming it, but not one before track 0's first key.
+// Host-only.
 
 #include <chrono>
 #include <cstdint>
@@ -367,11 +369,12 @@ std::vector<stream::RecordInfo> muxed_infos() {
           chunk(4), chunk(5), frame(3), chunk(6), chunk(7), chunk(8), chunk(9)};
 }
 
-// A two-track file at `path` of muxed_infos(), each with its payload.
-bool write_muxed(const std::string& path) {
+// A two-track file at `path` of `infos`, each with its payload.
+bool write_two_tracks(const std::string& path,
+                      const std::vector<stream::RecordInfo>& infos) {
   auto writer = stream::StreamWriter::create(path, two_track_session());
   if (!writer.ok()) return false;
-  for (const stream::RecordInfo& info : muxed_infos()) {
+  for (const stream::RecordInfo& info : infos) {
     const vrst::Bytes payload = payload_of(info);
     if (!(*writer)->append(info, payload.data(), payload.size()).ok()) {
       return false;
@@ -389,7 +392,7 @@ bool write_muxed(const std::string& path) {
 int two_tracks_case(const std::string& dir) {
   const std::string path = dir + "/two_tracks.vrst";
   const std::vector<stream::RecordInfo> infos = muxed_infos();
-  CHECK(write_muxed(path));
+  CHECK(write_two_tracks(path, infos));
   const auto reader = reader_of(path);
   CHECK(reader != nullptr);
   vkc::Result<vgrid_example::ReplayLoop> made =
@@ -439,7 +442,7 @@ int two_tracks_case(const std::string& dir) {
 int two_tracks_damage_case(const std::string& dir) {
   const std::string path = dir + "/two_tracks_damaged.vrst";
   const std::vector<stream::RecordInfo> infos = muxed_infos();
-  CHECK(write_muxed(path));
+  CHECK(write_two_tracks(path, infos));
   vrst::Bytes file = vkc::test::read_bytes(path);
   std::vector<vrst::ChunkAt> records;
   for (const vrst::ChunkAt& c : vrst::chunks(file)) {
@@ -484,6 +487,32 @@ int two_tracks_damage_case(const std::string& dir) {
   return 0;
 }
 
+// A replayed record of track 1 that is not a key is refused at create,
+// naming it, as publish would refuse it mid-pass; one before track 0's first
+// key is never replayed, so that file replays.
+int two_tracks_refusal_case(const std::string& dir) {
+  const std::string path = dir + "/not_key.vrst";
+  CHECK(write_two_tracks(
+      path, {vrst::info(0, true, kT, 0), vrst::info(1, false, kT, 5)}));
+  const auto reader = reader_of(path);
+  CHECK(reader != nullptr);
+  const vkc::Status refused =
+      vgrid_example::ReplayLoop::create(*reader).status();
+  CHECK(refused.domain() == Code::Unsupported);
+  CHECK(refused.message().find("track 1 seq 5 is not a key") !=
+        std::string::npos);
+
+  const std::string early_path = dir + "/not_key_early.vrst";
+  CHECK(write_two_tracks(
+      early_path, {vrst::info(1, false, kT, 5), vrst::info(0, true, kT, 0)}));
+  const auto early = reader_of(early_path);
+  CHECK(early != nullptr);
+  const vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*early);
+  CHECK(loop.ok() && loop->records().size() == 1);
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -497,6 +526,7 @@ int main() {
   if (refusals_case(dir) != 0) return 1;
   if (two_tracks_case(dir) != 0) return 1;
   if (two_tracks_damage_case(dir) != 0) return 1;
+  if (two_tracks_refusal_case(dir) != 0) return 1;
   std::puts("stream replay: OK");
   return 0;
 }

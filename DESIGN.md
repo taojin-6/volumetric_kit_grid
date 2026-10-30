@@ -969,7 +969,8 @@ keys start one, in either mode. A record of any other track must be a key
 (`InvalidArgument` otherwise, before it is framed) and joins the log as a
 P-frame does, so it shares track 0's fate: a joiner or a skip starts at a
 track-0 key and gets every record published after it, on any track. With
-`CodecStream`'s mux, that is every audio record from the key's pts on.
+`CodecStream`'s mux, that is every audio record from the key's pts on
+while the frames keep up with the audio (the entry gives the bound).
 
 **Reading** (`StreamClient`). `connect` never blocks: a numeric IPv4 address
 is parsed at once, and a name is looked up on a detached thread, which the
@@ -1011,10 +1012,10 @@ session and `CodecOutputs`: a new `.vrst` file, the server's options, and
 whether to decode. It refuses a session whose track 0 is not Geometry or
 whose other tracks are not Audio with params a reader plays, on track 0's
 clock, naming the track; then makes the server, so a port in use leaves no
-file, then the file, which must be new, then the encoder and, with `decode`, the decoder,
-so a refused output costs no kernel. A codec error removes the new file
-again, as does destroying the stream unfinished before its first frame. The
-file and the viewers get that session. `code(grid, set, pts_ns)`
+file, then the file, which must be new, then the encoder and, with `decode`,
+the decoder, so a refused output costs no kernel. A codec error removes the
+new file again, as does destroying the stream unfinished before its first
+frame. The file and the viewers get that session. `code(grid, set, pts_ns)`
 encodes the grid, appends a record (a key exactly when an I-frame), serves
 it once it is in the file, so no viewer gets a frame the file lacks, then
 decodes it with `decode_growing` from the decoder's input buffer into a
@@ -1164,10 +1165,11 @@ records' pts span and one mean step of track 0) later, the same on every
 track, so the tracks stay together, seq keeps rising and key pts never go
 back, as `publish` requires. A record whose payload fails its CRC is skipped
 with its track's records after it that are not keys, up to that track's
-next key in the pass, and printed in the first pass. It listens on every interface, on 47801 or N (0
-takes a free one, which it prints). Bad arguments exit 2 with the usage; a
-failure, a missing file or no key whose payload reads whole included,
-exits 1.
+next key in the pass, and printed in the first pass. It listens on every
+interface, on 47801 or N (0 takes a free one, which it prints). Bad
+arguments exit 2 with the usage; a failure, a missing file or no key whose
+payload reads whole included, exits 1. So does a replayed record of another
+track that is not a key, which `publish` refuses, before serving.
 
 ## Next work
 

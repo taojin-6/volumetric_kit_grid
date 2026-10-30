@@ -8591,8 +8591,11 @@ until the next key. Anchored on track 0, audio rides in the geometry's GOP
 and shares its fate: a joiner or a skip starts at a track-0 key and gets
 every record published after it. With `CodecStream`'s mux, a record goes
 out right after the first frame at or past its pts, so that is every audio
-record from the key's pts on. Audio is lost only with its frames: a GOP
-past `max_gop_bytes`, a lost copy, or a skip.
+record from the key's pts on, while the frames keep within `kHoldLimitNs`
+(1 s) of the audio. Past it, the mux sends all it holds, so audio at or
+past a later key's pts can go out before that key, and a joiner at that key
+misses it with no frame lost. Otherwise audio is lost only with its frames:
+a GOP past `max_gop_bytes`, a lost copy, or a skip.
 
 **Why other tracks' records must be keys.** One that is not would join a
 GOP as a P-frame does, with nothing to say what it is predicted from, and a
@@ -8612,7 +8615,9 @@ slide audio against the frames by the difference of their spans every
 pass. Each track's seq moves by its own span, so each stays unbroken (a seq
 jump says records were lost). A damaged payload skips its own track's
 records that are not keys, up to that track's next key, so an audio key no
-longer ends a frame's skip. `create` takes no track.
+longer ends a frame's skip. `create` takes no track, and refuses a replayed
+record of another track that is not a key, naming it, which `publish`
+would refuse only once the pass reached it.
 
 **Without audio, the same bytes.** On a session of one track, a key on
 track 0 is every key, so the log gets what it did, and the server's framing
@@ -8632,7 +8637,8 @@ serves a stream with an Audio track, keys on demand, a raw viewer's bytes
 the file's less its footer, and never serves a chunk the file refuses.
 `grid_example_stream_replay` replays a two-track file: one pts offset a
 pass, each track's seq unbroken, three passes by the writer's rules, and a
-damaged frame skipping its GOP's P-frames but no audio. Three planted bugs
+damaged frame skipping its GOP's P-frames but no audio; and it refuses an
+audio record that is not a key at `create`. Three planted bugs
 each fail a test: every key starting a GOP (the joiner case, and the burst
 and newest-key cases each alone in both modes), serving an audio record
 before writing it (`grid_codec_stream_audio`), and a pts offset per track

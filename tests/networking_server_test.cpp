@@ -1296,8 +1296,13 @@ int rules_case() {
     return server->publish(info, data, size).domain();
   };
   CHECK(publish(vrst::info(0, true, 5000, 10), payload.data(), 64) == Code::Ok);
-  CHECK(publish(vrst::info(1, true, 6000, 11), payload.data(), 64) ==
-        Code::InvalidArgument);  // a track the session lacks
+  // A track the session lacks, named so, not as a track's record that is not
+  // a key.
+  const vkc::Status unknown =
+      server->publish(vrst::info(1, false, 6000, 11), payload.data(), 64);
+  CHECK(unknown.domain() == Code::InvalidArgument);
+  CHECK(unknown.message().find("track 1, but the session has 1") !=
+        std::string::npos);
   CHECK(publish(vrst::info(0, false, 6000, 10), payload.data(), 64) ==
         Code::InvalidArgument);  // seq not above the last
   CHECK(publish(vrst::info(0, true, 4999, 12), payload.data(), 64) ==

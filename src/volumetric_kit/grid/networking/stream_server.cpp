@@ -58,10 +58,11 @@ struct StreamServer::Impl {
     std::thread thread;
   };
 
-  Impl(stream::ChunkEncoder encoder_, const ServerOptions& options_,
-       detail::Chunk session_chunk_, core::UniqueFd listener_,
-       std::uint16_t port_)
+  Impl(stream::ChunkEncoder encoder_, std::size_t tracks_,
+       const ServerOptions& options_, detail::Chunk session_chunk_,
+       core::UniqueFd listener_, std::uint16_t port_)
       : encoder(std::move(encoder_)),
+        tracks(tracks_),
         options(options_),
         session_chunk(std::move(session_chunk_)),
         listener(std::move(listener_)),
@@ -87,6 +88,7 @@ struct StreamServer::Impl {
   void count_key_wanted() noexcept { key_wanted = log.key_wanted(); }
 
   stream::ChunkEncoder encoder;  // the publishing thread's
+  const std::size_t tracks;      // the session's
   const ServerOptions options;
   const detail::Chunk session_chunk;
   const core::UniqueFd listener;
@@ -336,8 +338,8 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
         encoder->session_chunk());
     std::unique_ptr<StreamServer> server(
         new StreamServer(std::make_unique<Impl>(
-            std::move(encoder).value(), options, std::move(session_chunk),
-            std::move(listener), port)));
+            std::move(encoder).value(), session.tracks.size(), options,
+            std::move(session_chunk), std::move(listener), port)));
     Impl* const s = server->impl_.get();
     s->acceptor = std::thread([s] { s->accept_loop(); });
     return server;
@@ -375,8 +377,9 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
           " a viewer reads");
     }
     // Only track 0's keys start a GOP, so a record of another track joins
-    // the GOP as a P-frame does, and must decode alone.
-    if (info.track != 0 && !info.key) {
+    // the GOP as a P-frame does, and must decode alone. A track the session
+    // lacks is the encoder's to refuse, named so.
+    if (info.track != 0 && info.track < s.tracks && !info.key) {
       return core::Status::invalid_argument(
           std::string(kApi) + ": track " + std::to_string(info.track) +
           " seq " + std::to_string(info.seq) +
