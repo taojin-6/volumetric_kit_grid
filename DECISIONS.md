@@ -220,7 +220,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   8-byte-aligned chunks, readable from a killed writer, in `recon_stream` on
   the core's base tier alone. *Amended 2026-10-14:* a Geometry track's
   params may hold a mesh source's transform. *Amended 2026-10-21:* its
-  chunks are made and read in memory too, publicly.
+  chunks are made and read in memory too, publicly. *Amended 2026-10-30:*
+  kind 2 is Audio, in version 0.
 - [**2026-10-12**](#2026-10-12--p-frames-are-frame-type-1-of-v3-each-reference-block-gets-a-mode-in-update-segments-new-blocks-follow-in-intra-segments-and-a-reference-section-names-the-reference-by-xxh64-of-its-bytes-experimental-until-golden-p-frames-freeze-it) —
   P-frames are frame type 1 of v3: a mode per reference block in update
   segments, new blocks in intra segments, the reference named by XXH64 of its
@@ -430,6 +431,12 @@ entries relevant to your task; later amendments supersede earlier rules.
   I-frames are quantized afresh, since holding them too lets the held
   values drift; they drift within a period too, so the intra period bounds
   the drift. Format and decoder unchanged.
+- [**2026-10-30**](#2026-10-30--an-audio-track-is-kind-2-of-vrst-v0-interleaved-samples-as-its-8-params-bytes-say-every-record-a-key-at-its-first-samples-capture-time-no-version-change-and-no-new-record-flag-amends-the-2026-10-12-container-entry) —
+  An Audio track is kind 2 of `.vrst` v0: interleaved samples as its 8
+  params bytes say (`stream/audio.hpp`: codec, channels, rate; PCM s16
+  first), every record a key at its first sample's capture time. No version
+  change, as readers pass an unknown kind through, and no new record flag;
+  a file without audio is byte for byte as before.
 
 ## Decision record
 
@@ -5456,6 +5463,9 @@ addition to the kind that keeps version 0.
 read in memory, publicly (`stream/chunks.hpp`), and the writer frames
 through the encoder.
 
+*Amended 2026-10-30 (the audio entry, below):* kind 2 is Audio, interleaved
+samples as its params say, in version 0 and with no new record flag.
+
 A recording holds tracks of several kinds, each on its own clock, the rig's
 calibration, and per record a pts, a sequence number, a capture set and
 whether decoding can start there. It must read up to its last whole record
@@ -8404,3 +8414,53 @@ P-frames encode faster because fewer entries survive to rANS (take1 Dynamic
 in the same time (take1 medians within 0.05 ms on both devices). The 4090's
 Rafa2 pair is left out: its I-frames, byte for byte the same, encoded 27%
 apart.
+
+### 2026-10-30 — An Audio track is kind 2 of `.vrst` v0: interleaved samples as its 8 params bytes say, every record a key at its first sample's capture time; no version change and no new record flag (amends the 2026-10-12 container entry).
+
+**The kind.** `TrackKind::Audio` (2) holds interleaved samples as its
+params say (`stream/audio.hpp`): 8 bytes, little-endian, codec `u16`,
+channels `u16` (1 to 64) and sample rate `u32` (frames a second). The one
+codec, `AudioCodec::PcmS16` (1), is signed 16-bit little-endian samples, a
+record whole frames. Every record is a key, as each decodes alone; each key
+costs 32 B of footer index, 5.76 MB an hour for a track of 20 ms records,
+which the writer holds until `finish`. A record's pts is its first sample's
+capture time on the track's clock, its seq the source's chunk count. Width
+and height are 0, the sensor is the source's id, and the rate is nominal:
+48 kHz in chunks of 960 is `{48000, 960}`.
+
+**No version change, no record flag.** Version 0's readers pass an unknown
+kind through, so a file with an Audio track reads wherever it did, and the
+version changes only for what an old reader must not ignore. A new `RECD`
+flag would make every audio record `Unsupported` to an old reader, and the
+key bit already says what it would. A file without an Audio track is byte
+for byte what 0.3.1 wrote, on disk and on the wire: `grid_stream_container`
+pins a geometry-only session and records as `d1fcbc4`'s writer wrote them.
+
+**The params refuse what no reader can play.** `decode_audio_params`
+refuses fewer than 8 bytes, 0 or more than 64 channels and a rate of 0 as
+`InvalidArgument`. It reads the codec first: one it does not know is
+`Unsupported` whatever the other fields hold, so a reader skips that track
+and plays the rest. Bytes past the 8 are ignored, so a later codec (Opus,
+with a trailing pre-skip field) is a codec value, not a new kind.
+`encode_audio_params` writes what it is given; the writer stores params
+unread, as every kind's.
+
+**PCM first.** Raw s16 needs no codec library and no compute: a mono
+48 kHz track in 20 ms records is 790 kbit/s with their headers, against
+take1's 13 to 51 Mbit/s of geometry (the 2026-10-29 entry).
+
+**Not here.** `CodecStream` and `StreamServer` still take one Geometry
+track; writing and serving an Audio track beside it comes with their next
+changes.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer: the full suite passes, 71 of 71. The new
+`grid_stream_audio`, host-only, checks the params' golden bytes, read back
+from bytes made by hand too; round trips, trailing bytes ignored; each
+refusal; and a file of a Geometry track and an Audio track of a synthetic
+440 Hz tone, opened from its footer and by a scan: every payload, each
+track's stats and keys alike both ways, seeking on the Audio track, and
+the Geometry track seeking as in a file of its records alone. Four planted
+bugs fail the tests: the sample rate big-endian in both directions, the
+more-than-64-channels check dropped, the channels checked before the
+codec, and a track entry's reserved word written nonzero (both goldens).

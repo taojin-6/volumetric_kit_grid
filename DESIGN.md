@@ -845,10 +845,13 @@ order marching cubes' atomics emitted the mesh in.
 header, the records appended after it in `RECD` chunks, and on `finish` a
 footer index (`INDX`, `TAIL`). The byte layout, the CRC and the rules a
 record follows are written down once, in `stream/session.hpp`. Payloads are
-stored and returned byte for byte. `TrackKind::Geometry`, a codec frame per
-record with key meaning intra, its params empty or a mesh source's
-transform, is the only kind defined; the writer takes any nonzero kind and
-the reader passes an unknown one through.
+stored and returned byte for byte. Two kinds are defined:
+`TrackKind::Geometry`, a codec frame per record with key meaning intra, its
+params empty or a mesh source's transform; and `TrackKind::Audio`,
+interleaved samples as its params say (`stream/audio.hpp`: codec, channels
+and rate in 8 bytes, `encode_audio_params` / `decode_audio_params`), every
+record a key at its first sample's capture time. The writer takes any
+nonzero kind and the reader passes an unknown one through.
 
 **Writing** (`StreamWriter`, one thread). `create` makes the file with
 `O_CREAT | O_EXCL`, so nothing at the path is touched, a symbolic link

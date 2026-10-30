@@ -705,6 +705,16 @@ target_link_libraries(
 vgrid_target_warnings(grid_stream_oom_test)
 add_test(NAME grid_stream_oom COMMAND grid_stream_oom_test)
 
+# An Audio track: its params' golden bytes, round trips and each refusal, and a
+# file of a Geometry and an Audio track, a synthetic tone, written and read
+# back, the Geometry track seeking as without audio, footer and scan agreeing.
+# Host-only.
+add_executable(grid_stream_audio_test stream_audio_test.cpp)
+target_link_libraries(grid_stream_audio_test
+                      PRIVATE volumetric_kit::grid_stream)
+vgrid_target_warnings(grid_stream_audio_test)
+add_test(NAME grid_stream_audio COMMAND grid_stream_audio_test)
+
 # networking: the server's GOP log with no sockets (join, newest key wins at a
 # chunk boundary, the GOP limit, a lost copy, no P-frame without its key; keys
 # on demand: joins and fall-backs counted, the bytes held bounded) and the

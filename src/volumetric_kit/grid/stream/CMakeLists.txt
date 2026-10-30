@@ -15,7 +15,7 @@ set(_vgrid_stream_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(grid_stream)
 add_library(volumetric_kit::grid_stream ALIAS grid_stream)
 
-target_sources(grid_stream PRIVATE chunk.cpp chunks.cpp file.cpp
+target_sources(grid_stream PRIVATE audio.cpp chunk.cpp chunks.cpp file.cpp
                                    stream_reader.cpp stream_writer.cpp)
 
 generate_export_header(
