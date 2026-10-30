@@ -782,8 +782,9 @@ add_test(NAME grid_networking_server_oom
 # moved from refused, an unfinished stream read whole and an empty one removed,
 # frames in halves around a caller's batch the file code() writes, the batch's
 # device rows split between the frame and the caller, the front half again,
-# decode off, and the frames served live to a client on 127.0.0.1 port 0 as the
-# file records them. The device part skips with no device.
+# decode off, the frames served live to a client on 127.0.0.1 port 0 as the file
+# records them, and a geometry-only session's file and wire byte for byte as
+# before audio. The device part skips with no device.
 add_executable(grid_codec_stream_test codec_stream_test.cpp)
 target_link_libraries(
   grid_codec_stream_test
