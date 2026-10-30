@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-30
+
+### Added
+
+- **Audio tracks in `.vrst`**: `TrackKind::Audio` (kind 2), interleaved
+  samples as its params say, every record a key at its first sample's
+  capture time. `stream/audio.hpp` holds the params: `AudioParams`,
+  `AudioCodec::PcmS16`, `encode_audio_params` and `decode_audio_params`,
+  8 bytes. The format stays version 0: a reader that does not know the kind
+  passes it through, and a file without audio is byte for byte as before
+  (DESIGN.md, stream; the 2026-10-30 entry in DECISIONS.md).
+
 ## [0.3.1] - 2026-10-29
 
 ### Changed

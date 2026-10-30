@@ -115,6 +115,11 @@ enum class TrackKind : std::uint16_t {
   /// (io/mesh_normalization.hpp): the transform that placed a mesh source in
   /// metres.
   Geometry = 1,
+  /// Interleaved audio as its params say (stream/audio.hpp,
+  /// @ref encode_audio_params). Every record is a key; its pts is its first
+  /// sample's capture time on the track's clock. The track has no width or
+  /// height.
+  Audio = 2,
 };
 
 /// @brief The clock of @ref Track::clock that is the host's
