@@ -4,8 +4,9 @@
 #pragma once
 
 // What a CodecStream holds and does, its calls each CodecStream's of the same
-// name, the frame in halves included. Internal: CodecStream owns one and
-// forwards to it, and only the tier's sources include this header.
+// name, the frame in halves and the pts mux included. Internal: CodecStream
+// owns one and forwards to it, and only the tier's sources include this
+// header.
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "record_mux.hpp"
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
@@ -61,7 +63,12 @@ class StreamCoder {
                                        core::StageMetrics* rows,
                                        const std::function<void()>& sent);
 
-  // As CodecStream::finish, ::player, ::server, ::last_pts_ns and ::coded.
+  // As CodecStream::append.
+  core::Status append(const stream::RecordInfo& info, const std::uint8_t* data,
+                      std::size_t size);
+
+  // As CodecStream::finish, ::player, ::server, ::last_pts_ns, ::coded and
+  // ::appended.
   core::Status finish();
   volume::VoxelBlockGrid* player() noexcept {
     return player_ ? &*player_ : nullptr;
@@ -71,13 +78,16 @@ class StreamCoder {
   }
   std::uint64_t last_pts_ns() const noexcept { return last_pts_ns_; }
   std::uint64_t coded() const noexcept { return coded_; }
+  AppendedRecords appended(std::uint16_t track) const noexcept {
+    return mux_.counts(track);
+  }
 
  private:
   StreamCoder(core::Device& device, core::Allocator& allocator,
               codec::Encoder enc, std::optional<codec::Decoder> dec,
               std::string path,
               std::unique_ptr<networking::StreamServer> server,
-              std::unique_ptr<stream::StreamWriter> writer);
+              std::unique_ptr<stream::StreamWriter> writer, std::size_t tracks);
 
   // Make the next frame an I-frame (Encoder::force_intra) when a viewer
   // joined or fell back since the last frame read the server's count: it
@@ -88,7 +98,8 @@ class StreamCoder {
 
   // What code() and finish_frame() do once the encoder returns frame `set`'s
   // `bytes` -- its head, then its payload where the encoder left it, under
-  // one CRC: write and serve them, run `sent`, and decode them into the
+  // one CRC: write and serve them, run `sent`, send the records the frame
+  // releases (RecordMux::frame), and decode them into the
   // player if the stream decodes, from the decoder's input buffer they are
   // copied into. `encoded` is the encode's stage rows and `tail` whether its
   // payload took a tail. The source's block capacity, `max_blocks`, bounds
@@ -109,6 +120,16 @@ class StreamCoder {
   // Null when not serving, or once finished.
   std::unique_ptr<networking::StreamServer> server_;
   std::unique_ptr<stream::StreamWriter> writer_;  // null without a file
+  // Write, then serve, a record of a track after the frames', as a frame's
+  // record: the writer's failure returned, the server's logged at Warning.
+  core::Status send(const stream::RecordInfo& info, const std::uint8_t* data,
+                    std::size_t size);
+  // send(), as the mux's sink.
+  RecordSink sink() {
+    return [this](const stream::RecordInfo& info, const std::uint8_t* data,
+                  std::size_t size) { return send(info, data, size); };
+  }
+
   // The server's key_wanted() when a frame last read it (key_on_request).
   std::uint64_t key_wanted_ = 0;
   std::uint64_t coded_ = 0;     // frames encoded and written: the next seq
@@ -116,6 +137,7 @@ class StreamCoder {
   std::uint64_t last_pts_ns_ = 0;
   bool finished_ = false;
   std::optional<volume::VoxelBlockGrid> player_;
+  RecordMux mux_;  // the Audio tracks' records, held for their frames
   // The frame in flight between record() and finish_frame(): its front
   // half's rows, and its source's block capacity.
   core::StageMetrics front_rows_;

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-30
+
+### Added
+
+- **`CodecStream` writes Audio tracks, muxed by pts**: `create` takes a
+  session of a Geometry track 0 and Audio tracks after it, each with params
+  a reader plays and on track 0's clock. `append` writes and serves an
+  Audio record right after the first frame at or past its pts, drops one
+  below the first frame and holds at most `kHoldLimitNs` (1 s) past the
+  last frame; `finish` writes what is held; `appended(track)` counts each
+  track's records held, dropped and written (DESIGN.md, codec_stream; the
+  2026-10-30 mux entry in DECISIONS.md).
+
+### Changed
+
+- **A session `CodecStream` refuses** is still `InvalidArgument`, its
+  message now naming the track. With `CodecOutputs::serve`, a session with
+  an Audio track is the server's `Unsupported`, as `StreamServer` serves
+  one track; its file works. A session with no Audio track writes and
+  serves the bytes 0.4.0 did.
+
 ## [0.4.0] - 2026-10-30
 
 ### Added

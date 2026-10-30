@@ -5,7 +5,8 @@
 
 /// @file codec_stream/codec_stream.hpp
 /// @brief A codec stream: each frame encoded, written to a `.vrst` file,
-///        served to live viewers, and decoded back as a viewer would.
+///        served to live viewers, and decoded back as a viewer would; the
+///        records of its Audio tracks muxed in by pts.
 
 #include <cstddef>
 #include <cstdint>
@@ -65,12 +66,30 @@ struct SentFrame {
   core::StageMetrics decode;
 };
 
+/// @brief How far past the last frame's pts @ref CodecStream::append holds
+///        a record, and how far below the newest it holds one before the
+///        first frame: 1 s.
+inline constexpr std::uint64_t kHoldLimitNs = 1'000'000'000;
+
+/// @brief What became of the records @ref CodecStream::append took on one
+///        track.
+struct AppendedRecords {
+  std::uint64_t held = 0;  ///< Held now, for a frame at or past their pts.
+  /// Dropped before the first frame: below its pts, or, before it, more
+  /// than @ref kHoldLimitNs below the newest held.
+  std::uint64_t dropped = 0;
+  /// Gone out: written and served as @ref CodecOutputs says (counted with
+  /// neither too).
+  std::uint64_t written = 0;
+};
+
 /// @brief Codes grids as frames (@ref codec::Encoder): each written to a
 ///        `.vrst` file and served live as @ref CodecOutputs says, then
 ///        decoded back into a player grid, as a viewer decodes it.
 ///
-/// The file and the viewers get one session of one Geometry track, each
-/// frame a record of it. The player grid is built from the first frame's
+/// The file and the viewers get one session: track 0 a Geometry track, each
+/// frame a record of it, and any Audio tracks after it, whose records
+/// @ref append muxes in by pts. The player grid is built from the first frame's
 /// header and grows as later frames need (codec/decode_grid.hpp). The
 /// encoder codes its next P-frame against every frame it returns, so any
 /// failure after an encode makes the next frame an I-frame
@@ -113,6 +132,17 @@ struct SentFrame {
 ///            stream.finish_frame(pending, set, pts_ns(set), &rows));
 /// @endcode
 ///
+/// An Audio track's records (track 1 here) as its source hands them over,
+/// between frames, each a key on the frames' clock:
+/// @code
+/// stream::RecordInfo info;
+/// info.track = 1;
+/// info.key = true;
+/// info.pts_ns = chunk.pts_ns;
+/// info.seq = chunk.sequence;
+/// VKC_TRY(stream.append(info, chunk.bytes.data(), chunk.bytes.size()));
+/// @endcode
+///
 /// @warning The `Device` and `Allocator` passed to @ref create must outlive
 ///          the stream. Not thread-safe: one call at a time.
 class VGRID_CODEC_STREAM_API CodecStream {
@@ -128,14 +158,20 @@ class VGRID_CODEC_STREAM_API CodecStream {
   ///                   stream).
   /// @param config     The encoder's settings.
   /// @param session    The file's and the viewers' session, written as given:
-  ///                   one Geometry track, whose records the frames are.
+  ///                   track 0 a Geometry track, whose records the frames
+  ///                   are, then any Audio tracks (@ref append), each with
+  ///                   params `stream::decode_audio_params` takes and on
+  ///                   track 0's clock, as @ref append compares their pts.
   ///                   With no id or start time, a rerun writes the same
   ///                   bytes.
   /// @param outputs    Where the frames go.
-  /// @return The stream; `Status::Code::InvalidArgument` for a session that
-  ///         is not one Geometry track; what
+  /// @return The stream; `Status::Code::InvalidArgument`, naming the track,
+  ///         for a session that is not so; what
   ///         @ref networking::StreamServer::start returns
-  ///         (`Status::Code::IoError` for a port in use); what
+  ///         (`Status::Code::IoError` for a port in use;
+  ///         `Status::Code::Unsupported` for a session of more than one
+  ///         track, so a stream with an Audio track writes a file but does
+  ///         not serve yet); what
   ///         @ref stream::StreamWriter::create returns
   ///         (`Status::Code::InvalidArgument` when something is at the path,
   ///         `Status::Code::NotFound` when its directory is missing); or the
@@ -159,7 +195,8 @@ class VGRID_CODEC_STREAM_API CodecStream {
   ///        back.
   ///
   /// Written as soon as it is encoded, so a frame the decoder refuses is
-  /// kept; served once written, so no viewer gets a frame the file lacks. A
+  /// kept; served once written, so no viewer gets a frame the file lacks;
+  /// then the records @ref append held for it go out, before the decode. A
   /// frame the server refuses is logged at Warning and fails nothing: the
   /// viewers lose the rest of its GOP, the file nothing.
   /// @param grid    The grid to code.
@@ -169,8 +206,10 @@ class VGRID_CODEC_STREAM_API CodecStream {
   /// @return The frame; `Status::Code::InvalidArgument`, before anything is
   ///         encoded, for a @p set or @p pts_ns out of order or a finished or
   ///         moved-from stream; the encode's error; what
-  ///         @ref stream::StreamWriter::append returns; or the decode's
-  ///         error, the frame written and counted by @ref coded.
+  ///         @ref stream::StreamWriter::append returns for the frame; or,
+  ///         the frame written, served and counted by @ref coded, the
+  ///         writer's error on a record the frame releases (@ref append), or
+  ///         the decode's error.
   core::Result<SentFrame> code(volume::VoxelBlockGrid& grid, std::uint64_t set,
                                std::uint64_t pts_ns);
 
@@ -236,7 +275,8 @@ class VGRID_CODEC_STREAM_API CodecStream {
   /// @param rows     Optional: the frame's rows, `"crc"`, `"write"`,
   ///                 `"publish"` and the wait.
   /// @param sent     Optional: runs once the frame is written and served,
-  ///                 before the decode.
+  ///                 before the records it releases and the decode, so it
+  ///                 has run whenever the frame was counted.
   /// @return As @ref code; a @p set or @p pts_ns out of order, or a
   ///         finished stream, refused with @p pending dropped;
   ///         `Status::Code::InvalidArgument` on a moved-from stream.
@@ -245,12 +285,55 @@ class VGRID_CODEC_STREAM_API CodecStream {
                                        core::StageMetrics* rows = nullptr,
                                        const std::function<void()>& sent = {});
 
+  /// @brief Write and serve one record of an Audio track, muxed with the
+  ///        frames by pts: it goes out right after the first frame whose
+  ///        pts is at or past its own, so a reader in file order meets it
+  ///        no earlier than the frame it plays with.
+  ///
+  /// - Held until such a frame is written and served; the records a frame
+  ///   releases follow it in pts order across tracks (the lower track first
+  ///   at equal pts), each track's in its order.
+  /// - A record at or below the last frame's pts goes out at once.
+  /// - Before the first frame every record is held; the first frame drops
+  ///   those below its pts, and a record below it later is dropped at once
+  ///   (@ref AppendedRecords::dropped). Before the first frame, a record
+  ///   more than @ref kHoldLimitNs below the newest held is dropped too.
+  /// - At most @ref kHoldLimitNs of pts past the last frame is held: when
+  ///   a record would be held further past it (the geometry stalls),
+  ///   everything held goes out, in pts order, and so does each record
+  ///   after it until a frame catches up. The bound is in pts, so it bounds
+  ///   memory only while a track's pts advance with its samples, as an
+  ///   audio sensor's do.
+  /// - @ref finish writes what is held, or drops it before any frame.
+  ///
+  /// Held records reach the file later, so the record rules are checked
+  /// here, against the track's last record taken (dropped ones too). A
+  /// record held is copied; @p data need not outlive the call.
+  /// @param info  Its track (an Audio track of the session), its key (set:
+  ///              every Audio record is one), its pts on the track's clock,
+  ///              no lower than the track's last, its seq above the track's
+  ///              last, and its set as written.
+  /// @param data  The payload; may be null when @p size is 0.
+  /// @param size  The payload's bytes.
+  /// @return OK, the record held, dropped or written;
+  ///         `Status::Code::InvalidArgument`, with nothing changed, for
+  ///         track 0, a track the session lacks, a record that is not a
+  ///         key, a seq or pts that goes back on its track, a null @p data
+  ///         with a nonzero @p size, or a finished or moved-from stream;
+  ///         `Status::Code::OutOfMemory`, with nothing changed, when it
+  ///         cannot be held; or what @ref stream::StreamWriter::append
+  ///         returns for a record it writes (a record the server refuses is
+  ///         logged at Warning, as a frame is).
+  core::Status append(const stream::RecordInfo& info, const std::uint8_t* data,
+                      std::size_t size);
+
   /// @brief Close the viewers, which see the stream end, and finish the file
   ///        with its footer index (@ref stream::StreamWriter::finish);
   ///        without either, only mark the stream finished. One attempt:
   ///        however it ends, every later call, this one included, is refused,
   ///        so a file whose footer failed stays unfinished, read as a killed
-  ///        writer's.
+  ///        writer's. First, the records @ref append holds are written and
+  ///        served, in pts order, or dropped before any frame.
   /// @return OK; `Status::Code::InvalidArgument` once finished or on a
   ///         moved-from stream; or the writer's error.
   core::Status finish();
@@ -272,6 +355,11 @@ class VGRID_CODEC_STREAM_API CodecStream {
   ///         among them; the destructor removes an unfinished stream's file
   ///         only while this is 0.
   std::uint64_t coded() const noexcept;
+
+  /// @return What became of the records @ref append took on @p track; all
+  ///         zero for track 0, a track the session lacks, and on a
+  ///         moved-from stream.
+  AppendedRecords appended(std::uint16_t track) const noexcept;
 
   /// @return Whether this owns its coder; false when moved-from.
   bool valid() const noexcept { return coder_ != nullptr; }

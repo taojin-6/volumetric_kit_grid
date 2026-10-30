@@ -3,8 +3,9 @@
 
 // A codec stream (codec_stream/codec_stream.hpp), on a grid holding a
 // sphere: outputs it cannot make refused on create, before the encoder, whose
-// refusal takes the stream's file back, a session that is not one Geometry
-// track refused, and none written without outputs; each frame as it
+// refusal takes the stream's file back, a session whose track 0 is not
+// Geometry, or with a second Geometry track, refused, and none written
+// without outputs; each frame as it
 // went out, its type, bytes and blocks the frame's and its encode and decode
 // rows its own; the .vrst's track as the session gave it, and every encoded
 // frame a record of it, a frame the decoder refuses included, counted by
@@ -25,12 +26,15 @@
 // file, a port in use refused before any file is made, and neither a client
 // that leaves nor a record the server refuses failing a frame. Without the
 // decode, the same file and records, frames with no decode rows, and no
-// player grid. The device part skips with no device.
+// player grid. A geometry-only session's file and wire, byte for byte as
+// before audio. The device part skips with no device.
 
 #include <signal.h>
 #include <sys/resource.h>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -54,7 +58,9 @@
 #include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/grid/networking/stream_client.hpp"
 #include "volumetric_kit/grid/networking/stream_server.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
 #include "volumetric_kit/grid/stream/stream_reader.hpp"
+#include "volumetric_kit/grid/stream/stream_writer.hpp"
 #include "volumetric_kit/grid/testing/codec_fixture.hpp"
 #include "volumetric_kit/grid/testing/networking_loopback.hpp"
 #include "volumetric_kit/grid/testing/stage_rows.hpp"
@@ -104,8 +110,9 @@ bool rows_of(const codec_stream::SentFrame& frame, bool decoded) {
 
 // Outputs that cannot be made are refused by create with the writer's code,
 // naming the path, before the encoder; outputs that can be made get the
-// encoder's refusal, and their file is taken back. A session that is not one
-// Geometry track is refused before any output is made.
+// encoder's refusal, and their file is taken back. A session whose track 0 is
+// not Geometry, or with a second Geometry track, is refused before any output
+// is made, naming the track (codec_stream_audio_test has the rest).
 int refused(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   const auto refuses = [&gpu](const codec_stream::CodecOutputs& outputs,
                               const stream::Session& s, vkc::Status::Code code,
@@ -133,17 +140,20 @@ int refused(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   CHECK(refuses(made, session(), vkc::Status::Code::InvalidArgument,
                 "intra_period"));
   CHECK(!fs::exists(made.stream));
-  // No track, a track of another kind, and two tracks, before the file.
+  // No track, a track of another kind, and two Geometry tracks, before the
+  // file.
   stream::Session none = session();
   none.tracks.clear();
   stream::Session other = session();
   other.tracks[0].kind = static_cast<stream::TrackKind>(7);
   stream::Session two = session();
   two.tracks.push_back(two.tracks[0]);
-  for (const stream::Session* s : {&none, &other, &two}) {
-    CHECK(refuses(made, *s, vkc::Status::Code::InvalidArgument, "Geometry"));
-    CHECK(!fs::exists(made.stream));
-  }
+  CHECK(refuses(made, none, vkc::Status::Code::InvalidArgument, "no track"));
+  CHECK(refuses(made, other, vkc::Status::Code::InvalidArgument,
+                "track 0 is of kind 7"));
+  CHECK(refuses(made, two, vkc::Status::Code::InvalidArgument,
+                "track 1 is of kind 1"));
+  CHECK(!fs::exists(made.stream));
   return 0;
 }
 
@@ -874,6 +884,96 @@ int decode_off(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   return 0;
 }
 
+// A session with no audio writes and serves the bytes grid 0.4.0's stream did
+// (01bdc64, before CodecStream took audio): its file is what a StreamWriter
+// writes of the same session and frames, byte for byte, and a raw viewer's
+// bytes what a ChunkEncoder frames of them, the file less its footer -- the
+// bytes grid_stream_container pins. A live sender's session (codec_session's,
+// on a rig) and serving (without replay_gop), at a period of 3, so P-frames
+// go out too; the frames from an encoder of their own, as check_records does.
+int geometry_only_bytes(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
+                        const vkc::test::Scratch& scratch) {
+  using namespace std::chrono_literals;
+  stream::Session s;
+  s.writer = "fuse_orbbec";
+  s.calibration = "{}";
+  stream::Track track;
+  track.kind = stream::TrackKind::Geometry;
+  track.rate = {25, 1};
+  s.tracks.push_back(track);
+  codec::EncoderConfig config;
+  config.intra_period = 3;
+  constexpr std::size_t kFrames = 5;
+  constexpr std::uint64_t kT0 = 1761800000000000000ull;  // a host clock's
+  const auto frame_pts = [](std::size_t frame) {
+    return kT0 + frame * std::uint64_t{40'000'000};
+  };
+
+  // What the stream wrote before: each frame a record, a key exactly when an
+  // I-frame, its seq and set its index.
+  const std::string expected_path =
+      (scratch.path / "geometry_only_expected.vrst").string();
+  vkc::Result<codec::Encoder> enc =
+      codec::Encoder::create(gpu.device, gpu.allocator, config);
+  vkc::Result<std::unique_ptr<stream::StreamWriter>> writer =
+      stream::StreamWriter::create(expected_path, s);
+  vkc::Result<stream::ChunkEncoder> framer = stream::ChunkEncoder::create(s);
+  CHECK(enc.ok() && writer.ok() && framer.ok());
+  net::Bytes wire = framer->session_chunk();
+  std::vector<std::size_t> sent_by;  // the wire's bytes up to each frame
+  std::size_t inter = 0;
+  for (std::size_t frame = 0; frame < kFrames; ++frame) {
+    const vkc::Result<std::vector<std::uint8_t>> bytes = enc->encode(source);
+    CHECK(bytes.ok());
+    const vkc::Result<codec::FrameInfo> info =
+        codec::read_frame_info(bytes->data(), bytes->size());
+    CHECK(info.ok());
+    inter += info->type == codec::FrameType::kInter ? 1 : 0;
+    stream::RecordInfo record;
+    record.key = info->type == codec::FrameType::kIntra;
+    record.pts_ns = frame_pts(frame);
+    record.seq = frame;
+    record.set = frame;
+    CHECK((*writer)->append(record, bytes->data(), bytes->size()).ok());
+    const vkc::Result<stream::ChunkEncoder::RecordFraming> framing =
+        framer->frame(record, bytes->data(), bytes->size());
+    CHECK(framing.ok());
+    wire.insert(wire.end(), framing->header.begin(), framing->header.end());
+    wire.insert(wire.end(), bytes->begin(), bytes->end());
+    wire.resize(wire.size() + framing->padding, 0);
+    sent_by.push_back(wire.size());
+  }
+  CHECK((*writer)->finish().ok() && inter == 3);
+
+  codec_stream::CodecOutputs outputs =
+      served_on_loopback(scratch.path / "geometry_only.vrst");
+  outputs.serve->replay_gop = false;
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, config, s,
+                                        outputs);
+  CHECK(made.ok());
+  codec_stream::CodecStream& coder = made.value();
+  // A raw viewer, joined once it has the session's chunk, reading each frame
+  // as it goes out.
+  const vkc::UniqueFd viewer = net::connect_loopback(coder.server()->port());
+  CHECK(viewer.valid());
+  net::Bytes served;
+  net::read_upto(viewer.get(), net::session_chunk(s).size(), 5s, &served);
+  for (std::size_t frame = 0; frame < kFrames; ++frame) {
+    CHECK(coder.code(source, frame, frame_pts(frame)).ok());
+    net::read_upto(viewer.get(), sent_by[frame], 5s, &served);
+  }
+  CHECK(coder.finish().ok());
+  bool ended = false;
+  net::read_upto(viewer.get(), wire.size() + 1, 5s, &served, &ended);
+  CHECK(ended && served == wire);
+  const std::vector<std::uint8_t> file = vkc::test::read_bytes(outputs.stream);
+  CHECK(file == vkc::test::read_bytes(expected_path));
+  CHECK(file.size() > wire.size() &&
+        std::equal(wire.begin(), wire.end(), file.begin()));
+  return 0;
+}
+
 int gpu_main(vkc::test::GpuContext& gpu) {
   const Sphere sphere{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f};
   vkc::Result<vol::VoxelBlockGrid> source = sphere_grid(gpu, sphere);
@@ -917,6 +1017,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(unrecorded_unserved(gpu, *source, scratch) == 0);
   CHECK(refused_publish(gpu, *source, scratch) == 0);
   CHECK(decode_off(gpu, *source, scratch) == 0);
+  CHECK(geometry_only_bytes(gpu, *source, scratch) == 0);
   std::puts("grid_codec_stream: OK");
   return 0;
 }

@@ -774,7 +774,7 @@ add_test(NAME grid_networking_server_oom
 
 # codec_stream tier: the codec stream (codec_stream/codec_stream.hpp) on a grid
 # holding a sphere, linking no fuser and no sensor tier -- outputs it cannot
-# make and a session that is not one Geometry track refused on create, none
+# make and a session whose track 0 is not Geometry refused on create, none
 # written without outputs, each frame as it went out, the .vrst's records (every
 # encoded frame, byte for byte, a frame the decoder refuses included and
 # counted, a key exactly when an I-frame, the same bytes on a rerun), an I-frame
@@ -782,8 +782,9 @@ add_test(NAME grid_networking_server_oom
 # moved from refused, an unfinished stream read whole and an empty one removed,
 # frames in halves around a caller's batch the file code() writes, the batch's
 # device rows split between the frame and the caller, the front half again,
-# decode off, and the frames served live to a client on 127.0.0.1 port 0 as the
-# file records them. The device part skips with no device.
+# decode off, the frames served live to a client on 127.0.0.1 port 0 as the file
+# records them, and a geometry-only session's file and wire byte for byte as
+# before audio. The device part skips with no device.
 add_executable(grid_codec_stream_test codec_stream_test.cpp)
 target_link_libraries(
   grid_codec_stream_test
@@ -791,6 +792,20 @@ target_link_libraries(
           Vulkan::Vulkan)
 vgrid_target_warnings(grid_codec_stream_test)
 add_test(NAME grid_codec_stream COMMAND grid_codec_stream_test)
+
+# The codec stream's Audio tracks (CodecStream::append), each record a chunk of
+# a synthetic tone: sessions refused, the server's refusal of a second track,
+# each refusal of append; records held until a frame at or past their pts and
+# then right after it, in pts order across two tracks, dropped below the first
+# frame, held within 1 s, flushed by finish; each file read back. The device
+# part skips with no device.
+add_executable(grid_codec_stream_audio_test codec_stream_audio_test.cpp)
+target_link_libraries(
+  grid_codec_stream_audio_test
+  PRIVATE volumetric_kit::core_test_policy volumetric_kit::grid_codec_stream
+          Vulkan::Vulkan)
+vgrid_target_warnings(grid_codec_stream_audio_test)
+add_test(NAME grid_codec_stream_audio COMMAND grid_codec_stream_audio_test)
 
 # serve_stream's replay (examples/common/stream_replay.hpp): the records from
 # the first key, seq and key pts across passes by the writer's rules, the dues,

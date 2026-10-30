@@ -13,6 +13,7 @@
 #include "volumetric_kit/core/base/log.hpp"
 #include "volumetric_kit/grid/base/log.hpp"
 #include "volumetric_kit/grid/codec/decode_grid.hpp"
+#include "volumetric_kit/grid/stream/audio.hpp"
 
 namespace volumetric_kit::grid::codec_stream {
 
@@ -46,18 +47,56 @@ core::Status out_of_order(std::uint64_t set, std::uint64_t pts_ns,
       std::to_string(last_set) + " at " + std::to_string(last_pts_ns) + " ns");
 }
 
+// OK for a session of a Geometry track 0 and Audio tracks after it, each
+// with params a reader plays and on track 0's clock, as the mux compares
+// their pts; InvalidArgument naming the first track that is not so.
+core::Status check_session(const stream::Session& session) {
+  if (session.tracks.empty()) {
+    return core::Status::invalid_argument(
+        "CodecStream: the session has no track; track 0 must be Geometry");
+  }
+  const stream::Track& frames = session.tracks[0];
+  if (frames.kind != stream::TrackKind::Geometry) {
+    return core::Status::invalid_argument(
+        "CodecStream: track 0 is of kind " +
+        std::to_string(static_cast<unsigned>(frames.kind)) +
+        "; it must be Geometry");
+  }
+  for (std::size_t i = 1; i < session.tracks.size(); ++i) {
+    const stream::Track& track = session.tracks[i];
+    const std::string name = "CodecStream: track " + std::to_string(i);
+    if (track.kind != stream::TrackKind::Audio) {
+      return core::Status::invalid_argument(
+          name + " is of kind " +
+          std::to_string(static_cast<unsigned>(track.kind)) +
+          "; a track after the Geometry track 0 must be Audio");
+    }
+    const core::Result<stream::AudioParams> params =
+        stream::decode_audio_params(track.params);
+    if (!params.ok()) {
+      return core::Status::invalid_argument(name + ": " +
+                                            params.status().message());
+    }
+    if (track.clock != frames.clock) {
+      return core::Status::invalid_argument(
+          name + " is on clock " + std::to_string(track.clock) +
+          ", track 0 on clock " + std::to_string(frames.clock) +
+          ": their pts are compared");
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 core::Result<std::unique_ptr<StreamCoder>> StreamCoder::create(
     core::Device& device, core::Allocator& allocator,
     const codec::EncoderConfig& config, const stream::Session& session,
     const CodecOutputs& outputs) {
-  if (session.tracks.size() != 1 ||
-      session.tracks[0].kind != stream::TrackKind::Geometry) {
-    return core::Status::invalid_argument(
-        "CodecStream: the session must be one Geometry track");
-  }
+  VKC_TRY(check_session(session));
   std::unique_ptr<networking::StreamServer> server;
+  // A session with an Audio track is refused here, as Unsupported: the
+  // server serves one track. TODO: serve it once StreamServer serves more.
   if (outputs.serve) {
     VKC_ASSIGN(server,
                networking::StreamServer::start(session, *outputs.serve));
@@ -83,23 +122,25 @@ core::Result<std::unique_ptr<StreamCoder>> StreamCoder::create(
     }
     dec.emplace(std::move(made).value());
   }
-  return std::unique_ptr<StreamCoder>(
-      new StreamCoder(device, allocator, std::move(enc).value(), std::move(dec),
-                      outputs.stream, std::move(server), std::move(writer)));
+  return std::unique_ptr<StreamCoder>(new StreamCoder(
+      device, allocator, std::move(enc).value(), std::move(dec), outputs.stream,
+      std::move(server), std::move(writer), session.tracks.size()));
 }
 
 StreamCoder::StreamCoder(core::Device& device, core::Allocator& allocator,
                          codec::Encoder enc, std::optional<codec::Decoder> dec,
                          std::string path,
                          std::unique_ptr<networking::StreamServer> server,
-                         std::unique_ptr<stream::StreamWriter> writer)
+                         std::unique_ptr<stream::StreamWriter> writer,
+                         std::size_t tracks)
     : device_(&device),
       allocator_(&allocator),
       encoder_(std::move(enc)),
       decoder_(std::move(dec)),
       path_(std::move(path)),
       server_(std::move(server)),
-      writer_(std::move(writer)) {}
+      writer_(std::move(writer)),
+      mux_(tracks) {}
 
 StreamCoder::~StreamCoder() {
   if (!finished_ && coded_ == 0) take_back(writer_, path_);
@@ -224,13 +265,38 @@ core::Result<SentFrame> StreamCoder::finish_frame(
   return played;
 }
 
+core::Status StreamCoder::append(const stream::RecordInfo& info,
+                                 const std::uint8_t* data, std::size_t size) {
+  if (finished_) {
+    return core::Status::invalid_argument("CodecStream: finished");
+  }
+  return mux_.append(info, data, size, sink());
+}
+
 core::Status StreamCoder::finish() {
   if (finished_) {
     return core::Status::invalid_argument("CodecStream: finished");
   }
   finished_ = true;
+  const core::Status flushed = mux_.flush(sink());
   server_.reset();
-  return writer_ ? writer_->finish() : core::Status{};
+  const core::Status footer = writer_ ? writer_->finish() : core::Status{};
+  return flushed.ok() ? footer : flushed;
+}
+
+core::Status StreamCoder::send(const stream::RecordInfo& info,
+                               const std::uint8_t* data, std::size_t size) {
+  if (writer_) VKC_TRY(writer_->append(info, data, size));
+  if (server_) {
+    const core::Status served = server_->publish(info, data, size);
+    if (!served.ok()) {
+      log_message(core::LogLevel::Warning,
+                  "CodecStream: track " + std::to_string(info.track) + " seq " +
+                      std::to_string(info.seq) +
+                      " not served: " + served.message());
+    }
+  }
+  return {};
 }
 
 void StreamCoder::key_on_request() noexcept {
@@ -273,6 +339,7 @@ core::Result<SentFrame> StreamCoder::play(
   last_set_ = set;
   last_pts_ns_ = pts_ns;
   if (sent) sent();
+  VKC_TRY(mux_.frame(pts_ns, sink()));
   SentFrame frame;
   frame.type = info.type;
   frame.bytes = bytes.size();
@@ -382,6 +449,18 @@ std::uint64_t CodecStream::last_pts_ns() const noexcept {
 
 std::uint64_t CodecStream::coded() const noexcept {
   return coder_ ? coder_->coded() : 0;
+}
+
+core::Status CodecStream::append(const stream::RecordInfo& info,
+                                 const std::uint8_t* data, std::size_t size) {
+  if (!coder_) {
+    return core::Status::invalid_argument("CodecStream: moved from");
+  }
+  return coder_->append(info, data, size);
+}
+
+AppendedRecords CodecStream::appended(std::uint16_t track) const noexcept {
+  return coder_ ? coder_->appended(track) : AppendedRecords{};
 }
 
 }  // namespace volumetric_kit::grid::codec_stream
