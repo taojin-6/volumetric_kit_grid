@@ -4,8 +4,9 @@
 # --- grid_codec_stream: a codec stream ----------------------------------------
 # Grids coded as frames, each written to a .vrst file, served to live viewers
 # and decoded back as a viewer would (CodecStream), a frame whole or in halves
-# around a caller's batch. The tier after networking: it links the codec, the
-# container and the server, and neither the fuser nor the sensor tiers.
+# around a caller's batch, with Audio tracks' records muxed in by pts
+# (record_mux). The tier after networking: it links the codec, the container and
+# the server, and neither the fuser nor the sensor tiers.
 include(GenerateExportHeader)
 
 set(_vgrid_codec_stream_generated_inc
@@ -14,7 +15,7 @@ set(_vgrid_codec_stream_generated_inc
 add_library(grid_codec_stream)
 add_library(volumetric_kit::grid_codec_stream ALIAS grid_codec_stream)
 
-target_sources(grid_codec_stream PRIVATE codec_stream.cpp)
+target_sources(grid_codec_stream PRIVATE codec_stream.cpp record_mux.cpp)
 
 generate_export_header(
   grid_codec_stream

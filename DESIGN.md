@@ -996,13 +996,17 @@ mode, has no socket, thread or clock, and is tested alone.
 ### codec_stream
 
 `grid_codec_stream` codes grids as frames into a `.vrst` file and to live
-viewers (`codec_stream/codec_stream.hpp`, the 2026-10-26 and 2026-10-28
+viewers, with the records of Audio tracks muxed in by pts
+(`codec_stream/codec_stream.hpp`, the 2026-10-26, 2026-10-28 and 2026-10-30
 entries). It links `codec` and `networking`, and no fusion or sensor tier.
 
 **The stream** (`CodecStream`). `create` takes the encoder's settings, the
 session and `CodecOutputs`: a new `.vrst` file, the server's options, and
-whether to decode. It refuses a session that is not one Geometry track,
-then makes the server, so a port in use leaves no file, then the
+whether to decode. It refuses a session whose track 0 is not Geometry or
+whose other tracks are not Audio with params a reader plays, on track 0's
+clock, naming the track; then makes the server, so a port in use leaves no
+file (the server serves one track, so a stream with an Audio track writes a
+file but is refused serving, `Unsupported`), then the
 file, which must be new, then the encoder and, with `decode`, the decoder,
 so a refused output costs no kernel. A codec error removes the new file
 again, as does destroying the stream unfinished before its first frame. The
@@ -1023,7 +1027,27 @@ where the encoder picks I or P, the stream reads the server's
 `key_wanted()`: a rise calls `force_intra()`, which stands until a frame is
 returned, so joins between two frames make one key, a refused frame or a
 front half recorded again keeps it, and the period counts from it.
-`finish` closes the viewers and writes the footer, in one attempt.
+`finish` writes what `append` holds, closes the viewers and writes the
+footer, in one attempt.
+
+**Audio tracks, muxed by pts** (`append`, `record_mux.cpp`). A record of
+an Audio track goes out, written then served as a frame is, right after the
+first frame whose pts is at or past its own, so a reader in file order
+meets it no earlier than the frame it plays with. Each frame, once written,
+served and
+`sent` has run, releases what it covers, in pts order across tracks (the
+lower track first at equal pts). A record at or below the last frame's pts
+goes out at once. The first frame drops what is below its pts, and a record
+below it later is dropped at once. What is held stays within
+`kHoldLimitNs` (1 s): before the first frame, a record more than that
+below the newest held is dropped; after it, once a record would be held
+more than that past the last frame, everything held goes out in pts order,
+and each record after it at once, until a frame catches up. `finish` writes
+what is held, or drops it before any frame. The record rules are checked at
+the call, against the track's last record taken, as a held record reaches
+the writer later; refusals change nothing. `appended(track)` counts each
+track's records held, dropped and written. A session with no Audio track
+writes and serves the bytes it did before.
 
 **A frame in halves.** A caller with work of its own on the grid codes the
 frame around its batch: `record_front` records the front half into that

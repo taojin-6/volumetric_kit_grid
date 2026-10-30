@@ -332,7 +332,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   references; a viewer joins at the cached GOP; `publish` never waits; a
   viewer types the sender's address. *Amended 2026-10-25:* a live sender
   serves keys on demand instead (`replay_gop` false), and the cached GOP
-  stays the default.
+  stays the default. *Amended 2026-10-30:* `CodecStream` writes Audio
+  tracks beside the Geometry track; the server still serves one track.
 - [**2026-10-21**](#2026-10-21--meshintegrator-finds-each-voxels-nearest-triangle-with-an-exact-early-exit-a-triangle-is-ruled-out-only-by-a-lower-bound-less-a-rounding-margin-of-its-own-strictly-above-the-voxels-limit) —
   `MeshIntegrator` finds each voxel's nearest triangle with an exact early
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
@@ -436,7 +437,16 @@ entries relevant to your task; later amendments supersede earlier rules.
   params bytes say (`stream/audio.hpp`: codec, channels, rate; PCM s16
   first), every record a key at its first sample's capture time. No version
   change, as readers pass an unknown kind through, and no new record flag;
-  a file without audio is byte for byte as before.
+  a file without audio is byte for byte as before. *Amended 2026-10-30:*
+  `CodecStream` writes Audio tracks, muxed by pts.
+- [**2026-10-30**](#2026-10-30--codecstream-muxes-audio-tracks-by-pts-a-record-goes-out-right-after-the-first-frame-at-or-past-its-pts-none-below-the-first-frame-and-at-most-1-s-held-past-the-last-the-server-still-serves-one-track-amends-the-2026-10-21-networking-and-2026-10-30-audio-track-entries) —
+  `CodecStream` takes Audio tracks after its Geometry track 0, on its
+  clock, and `append` muxes their records by pts: each goes out right
+  after the first frame at or past its pts, none below the first frame,
+  and at most `kHoldLimitNs` (1 s) is held past the last frame; `finish`
+  writes what is held. The record rules are checked at the call. The
+  server still serves one track, so serving one is `Unsupported`; a file
+  works, and without audio every byte is as before.
 
 ## Decision record
 
@@ -7107,7 +7117,9 @@ replaying a recording, sends; the player reads.
   only, and an IPv6 address could only be refused, or stall the connect
   where IPv6 is broken.
 - **One track.** Newest key wins is per GOP; a second track would need a GOP
-  of its own.
+  of its own. *Amended 2026-10-30 (the `CodecStream` mux entry, below):*
+  `CodecStream` writes Audio tracks beside the Geometry track, to a file;
+  the server still serves one track, so a stream that serves refuses them.
 
 **Verification.** Apple M5 Max, Debug and Release (117 tests each, all
 passing), and the stream and networking tests under ThreadSanitizer and
@@ -8451,7 +8463,8 @@ take1's 13 to 51 Mbit/s of geometry (the 2026-10-29 entry).
 
 **Not here.** `CodecStream` and `StreamServer` still take one Geometry
 track; writing and serving an Audio track beside it comes with their next
-changes.
+changes. *Amended 2026-10-30 (below):* `CodecStream` writes them, muxed by
+pts; `StreamServer` still serves one track.
 
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer: the full suite passes, 71 of 71. The new
@@ -8464,3 +8477,79 @@ the Geometry track seeking as in a file of its records alone. Four planted
 bugs fail the tests: the sample rate big-endian in both directions, the
 more-than-64-channels check dropped, the channels checked before the
 codec, and a track entry's reserved word written nonzero (both goldens).
+
+### 2026-10-30 — `CodecStream` muxes Audio tracks by pts: a record goes out right after the first frame at or past its pts, none below the first frame, and at most 1 s held past the last; the server still serves one track (amends the 2026-10-21 networking and 2026-10-30 audio-track entries).
+
+**The rule.** `CodecStream::create` takes a session of a Geometry track 0
+and any Audio tracks after it, each with params `decode_audio_params` takes
+and on track 0's clock; anything else is `InvalidArgument` naming the
+track. `append(info, data, size)` takes one Audio record and holds it until
+a frame at or past its pts has been written and served; then it is written
+and served right after that frame. The records a frame releases go in pts
+order across tracks, the lower track first at equal pts, each track's in
+its order. A record at or below the last frame's pts goes out at once. The
+first frame drops what is below its pts, and a record below it later is
+dropped at once. What is held stays within `kHoldLimitNs`, 1 s: before the
+first frame, a record more than 1 s below the newest held is dropped;
+after it, once a record would be held more than 1 s past the last frame,
+everything held goes out in pts order, and so does each record after it,
+until a frame catches up. `finish` writes what is held, or drops it before
+any frame. `appended(track)` counts each track's records held, dropped and
+written.
+
+**Why in `CodecStream`.** The rig publishes a set's frame about 366 ms
+after its capture; a mic's chunks are drained within 20 to 60 ms. Appended
+as drained, the audio of a key's first third of a second would precede the
+key in the file and on the wire, where a key clears what precedes it (the
+server's GOP), so a join or a skip would lose it, and a replay paced by
+file order would wait on audio pts ahead of each frame. `CodecStream` is the
+one writer of the file and the server, so both get the order from one
+place, and its calls already run on the sender's one thread: no lock.
+
+**Why at or past.** A record at a frame's pts plays from that frame on, so
+it goes after it, and a reader starting at that frame, a key, has it.
+
+**Why drop below the first frame.** Nothing plays before the first frame:
+a reader starts at a key, and a record before the first frame precedes
+every key.
+
+**Why 1 s.** Memory stays bounded while the geometry stalls (a rig set may
+come up to 10 s late before the rig gives up): 1 s of a 48 kHz mono track in
+20 ms records is 50 records, 96 KB. Past it, records go out as they come,
+between the last frame and the next, where a reader still finds them. The
+bound is above the rig's capture-to-publish lag, so a run that keeps up
+never meets it; before the first frame it keeps what the first frame, about
+that lag behind, can still release.
+
+**Order checked at the call.** The writer checks a record's seq and key pts
+when it writes it, for a held record during a later frame's call, where a
+refusal would fail an unrelated frame. So `append` refuses, with nothing
+changed, track 0, a track the session lacks, a record that is not a key, a
+seq or pts going back against the track's last record taken (dropped ones
+too) and a null payload with bytes.
+
+**Without audio, the same bytes.** A session with no Audio track writes no
+record the mux holds. `grid_codec_stream` pins a geometry-only stream's file
+and wire, I- and P-frames, against what `StreamWriter` and `ChunkEncoder`
+make of the same frames, committed and passing against 0.4.0 first; those
+bytes are what `grid_stream_container` pins.
+
+**Serving waits.** The server still serves one track (the "One track" rule
+of the 2026-10-21 networking entry): with `CodecOutputs::serve`, `create`
+returns its `Unsupported` for a session with an Audio track, nothing made.
+A file works now. A later change anchors the server's GOP on track 0 and
+lifts it.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer with a device required: the full suite passes, 72
+of 72. The new `grid_codec_stream_audio`, each record a chunk of a synthetic
+tone, checks the sessions refused, naming the track, and a served one the
+server's `Unsupported`, no file made; each refusal of `append`, nothing
+changed; records held until a frame at or past their pts, equal pts
+included, released right after it, from a frame in halves too, in pts order
+across two tracks; dropped below the first frame, before it and after; the
+1 s bound, before the first frame and in a stall, at its boundary; `finish`
+writing what is held, or dropping it before any frame; and each file read
+back in order, every payload intact, each track's stats. Four planted bugs
+each fail it: no hold after the first frame, release below a frame's pts
+alone (`<` for `<=`), no flush in `finish`, and no stall bound.
