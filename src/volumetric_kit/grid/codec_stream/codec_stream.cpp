@@ -277,8 +277,10 @@ core::Status StreamCoder::finish() {
   }
   finished_ = true;
   const core::Status flushed = mux_.flush(sink());
-  server_.reset();
+  // The file first, so a viewer sees the end only once the file is whole.
   const core::Status footer = writer_ ? writer_->finish() : core::Status{};
+  if (server_) server_->finish();
+  server_.reset();
   return flushed.ok() ? footer : flushed;
 }
 

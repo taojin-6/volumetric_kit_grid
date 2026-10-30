@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-30
+
+### Added
+
+- **`StreamServer::finish`** ends a stream without losing its tail: it
+  refuses later records and connections, closes each viewer once it has
+  sent every record queued for it, so the viewer reads the end right after
+  the last, and closes any still behind after `kFinishLimit` (1 s). The
+  destructor still closes at once (DESIGN.md, networking; the 2026-10-30
+  finish entry in DECISIONS.md).
+
+### Fixed
+
+- **A viewer of a finishing `CodecStream` gets its last records**:
+  `finish` writes the footer, then finishes the server, so a connected
+  viewer gets the records `finish` writes past the last frame, which the
+  file has, before its end. The bytes served are unchanged.
+
 ## [0.6.0] - 2026-10-30
 
 ### Changed

@@ -73,7 +73,7 @@ struct StreamServer::Impl {
   // the threads of viewers that have ended, until the stop.
   void accept_loop() noexcept;
   // Count `fd`'s viewer in and start its thread, or close it past
-  // max_viewers.
+  // max_viewers or once finishing.
   void admit(core::UniqueFd fd, std::string name);
   // Join the threads of the viewers that have ended.
   void reap();
@@ -81,22 +81,31 @@ struct StreamServer::Impl {
   // the log and say why.
   void serve(Viewer& viewer) noexcept;
   // Send the session chunk, then the log's chunks as the socket takes them,
-  // until the viewer leaves, fails or stalls, or the server stops: why.
+  // until the viewer leaves, fails or stalls, has every record once
+  // finishing, or the server stops: why.
   std::string send_all(Viewer& viewer);
   // Publish the log's count of the viewers that wanted a key. Under the
   // mutex.
   void count_key_wanted() noexcept { key_wanted = log.key_wanted(); }
+  // Stop every thread and join it: the destructor's work, and finish's once
+  // the viewers are done or kFinishLimit has passed.
+  void halt() noexcept;
 
   stream::ChunkEncoder encoder;  // the publishing thread's
   const std::size_t tracks;      // the session's
   const ServerOptions options;
   const detail::Chunk session_chunk;
-  const core::UniqueFd listener;
+  // The accept thread's; closed by finish once that thread has ended.
+  core::UniqueFd listener;
   const std::uint16_t port;
 
   std::mutex mutex;
-  std::condition_variable wake;   // a record published, or the stop
+  std::condition_variable wake;   // a record published, finish, or the stop
+  std::condition_variable ended;  // a viewer's thread ended, for finish
   detail::GopLog log;             // under the mutex
+  // Set under the mutex: finish has begun, and no record or viewer comes
+  // after it.
+  std::atomic<bool> finishing{false};
   std::atomic<bool> stop{false};  // set under the mutex
   // The log's key_wanted(), set under the mutex and read from any thread.
   std::atomic<std::uint64_t> key_wanted{0};
@@ -104,7 +113,7 @@ struct StreamServer::Impl {
   // viewer's thread as it ends, read from any thread.
   std::atomic<std::size_t> live{0};
 
-  std::list<Viewer> viewers;  // the accept thread's, then the destructor's
+  std::list<Viewer> viewers;  // the accept thread's, then halt's
   // The accept thread's: when a refusal was last logged at Warning.
   std::optional<Clock::time_point> refusal_warned;
   std::thread acceptor;
@@ -141,6 +150,12 @@ void StreamServer::Impl::accept_loop() noexcept {
 }
 
 void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
+  if (finishing) {
+    fd.reset();  // closed at accept, before any byte
+    log_at(core::LogLevel::Info, std::string(kServer) + ": refused viewer " +
+                                     name + ": the stream finished");
+    return;
+  }
   // Only this thread adds viewers, so one admitted after this check still
   // fits.
   std::size_t serving = live;
@@ -223,6 +238,7 @@ void StreamServer::Impl::serve(Viewer& viewer) noexcept {
     viewer.done = true;
     --live;
   }
+  ended.notify_all();
   try {
     log_at(core::LogLevel::Info,
            std::string(kServer) + ": viewer " + viewer.name + " " + why);
@@ -245,7 +261,12 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
   std::uint64_t taken = 0;    // of them, the ones the viewer acknowledged
   std::uint8_t drain[kDrainBytes];
   for (;;) {
-    if (stop) return "closed: the server stopped";
+    if (stop) {
+      return finishing ? "closed: still behind " +
+                             std::to_string(kFinishLimit.count()) +
+                             " ms after the stream finished"
+                       : std::string("closed: the server stopped");
+    }
     const core::Result<short> ready =
         detail::wait_for(api, fd, POLLIN | POLLOUT, detail::kPollSlice);
     if (!ready.ok()) return "failed: " + ready.status().message();
@@ -278,6 +299,8 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
       std::unique_lock<std::mutex> lock(mutex);
       chunk = log.next(&cursor);
       if (!chunk) {
+        // Finishing, no record comes after the ones it has sent.
+        if (finishing) return "closed: the stream finished";
         wake.wait_for(lock, detail::kPollSlice);
         continue;
       }
@@ -295,17 +318,34 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
 StreamServer::StreamServer(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 
-StreamServer::~StreamServer() {
-  Impl& s = *impl_;
+void StreamServer::Impl::halt() noexcept {
   {
-    const std::lock_guard<std::mutex> lock(s.mutex);
-    s.stop = true;
+    const std::lock_guard<std::mutex> lock(mutex);
+    stop = true;
   }
-  s.wake.notify_all();
-  if (s.acceptor.joinable()) s.acceptor.join();
-  for (Impl::Viewer& viewer : s.viewers) {
+  wake.notify_all();
+  if (acceptor.joinable()) acceptor.join();
+  for (Viewer& viewer : viewers) {
     if (viewer.thread.joinable()) viewer.thread.join();
   }
+}
+
+StreamServer::~StreamServer() { impl_->halt(); }
+
+void StreamServer::finish() noexcept {
+  Impl& s = *impl_;
+  {
+    std::unique_lock<std::mutex> lock(s.mutex);
+    if (s.finishing) return;
+    // After the last record published, which every viewer then sees with it.
+    s.finishing = true;
+    s.wake.notify_all();
+    // Each viewer's thread ends once it has sent its last record, or as it
+    // leaves, fails or stalls.
+    s.ended.wait_for(lock, kFinishLimit, [&s] { return s.live == 0; });
+  }
+  s.halt();
+  s.listener.reset();  // a connection from now on is refused
 }
 
 core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
@@ -368,6 +408,10 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
   constexpr std::string_view kApi = "StreamServer::publish";
   Impl& s = *impl_;
   try {
+    if (s.finishing) {
+      return core::Status::invalid_argument(std::string(kApi) +
+                                            ": the stream finished");
+    }
     const std::size_t size = payload.size();
     if (size > stream::ChunkParser::kMaxBodyBytes) {
       return core::Status::invalid_argument(

@@ -335,7 +335,9 @@ entries relevant to your task; later amendments supersede earlier rules.
   stays the default. *Amended 2026-10-30:* `CodecStream` writes Audio
   tracks beside the Geometry track; the server still serves one track.
   *Amended 2026-10-30 again:* the server serves every track, track 0's keys
-  anchoring the GOP.
+  anchoring the GOP. *Amended 2026-10-30 once more:* `finish` closes each
+  viewer once it has sent what is queued for it, within 1 s; the
+  destructor still closes at once.
 - [**2026-10-21**](#2026-10-21--meshintegrator-finds-each-voxels-nearest-triangle-with-an-exact-early-exit-a-triangle-is-ruled-out-only-by-a-lower-bound-less-a-rounding-margin-of-its-own-strictly-above-the-voxels-limit) —
   `MeshIntegrator` finds each voxel's nearest triangle with an exact early
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
@@ -449,7 +451,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   writes what is held. The record rules are checked at the call. The
   server still serves one track, so serving one is `Unsupported`; a file
   works, and without audio every byte is as before. *Amended 2026-10-30:*
-  served too.
+  served too. *Amended 2026-10-30 again:* a viewer gets what `finish`
+  writes before its end.
 - [**2026-10-30**](#2026-10-30--streamserver-serves-every-track-track-0s-keys-anchoring-the-gop-and-replayloop-replays-every-track-with-one-pts-offset-a-pass-amends-the-2026-10-21-networking-and-2026-10-30-mux-entries) —
   `StreamServer` serves every track: only track 0's keys start a GOP, and
   a record of any other track must be a key and joins the GOP as a P-frame
@@ -457,6 +460,13 @@ entries relevant to your task; later amendments supersede earlier rules.
   track-0 key and gets every record after it. `CodecStream` serves its
   Audio tracks, and `serve_stream`'s `ReplayLoop` replays every track, all
   moved by one pts offset a pass. Without audio, every byte is as before.
+- [**2026-10-30**](#2026-10-30--streamserverfinish-closes-each-viewer-once-it-has-sent-what-is-queued-for-it-within-1-s-so-a-finishing-stream-keeps-its-tail-the-destructor-still-closes-at-once-amends-the-2026-10-21-networking-and-2026-10-30-mux-entries) —
+  `StreamServer::finish` ends a stream without losing its tail: it refuses
+  later records and connections, closes each viewer once it has sent every
+  record queued for it, and closes any still behind after `kFinishLimit`
+  (1 s). `CodecStream::finish` writes the footer, then finishes the server,
+  so a viewer gets the records `finish` writes past the last frame. The
+  destructor still closes at once; without audio, every byte is as before.
 
 ## Decision record
 
@@ -8643,3 +8653,70 @@ each fail a test: every key starting a GOP (the joiner case, and the burst
 and newest-key cases each alone in both modes), serving an audio record
 before writing it (`grid_codec_stream_audio`), and a pts offset per track
 in the replay (`grid_example_stream_replay`).
+
+### 2026-10-30 — `StreamServer::finish` closes each viewer once it has sent what is queued for it, within 1 s, so a finishing stream keeps its tail; the destructor still closes at once (amends the 2026-10-21 networking and 2026-10-30 mux entries).
+
+**The defect.** `CodecStream::finish` wrote the records its mux held, up
+to `kHoldLimitNs` (1 s) of audio past the last frame, published them, then
+destroyed the server: each viewer's thread saw the stop within a poll
+slice and closed, so a connected viewer could miss records the file has.
+recon's live-audio test had to accept a viewer missing any of them.
+
+**The rule.** `StreamServer::finish()` marks the stream finishing under
+the lock, after the last `publish`, so a viewer's thread that sees it has
+every record there will be. `publish` then refuses (`InvalidArgument`),
+and the accept thread closes a connection at accept, before any byte. A
+viewer's thread, at a chunk boundary with nothing left for it, closes its
+connection, the kernel sending what it holds and then the end; one with
+nothing queued, as one waiting for a key, closes at once. `finish` waits
+until no viewer is left, at most `kFinishLimit`, then stops the threads as
+the destructor does, closing any viewer still behind (logged at Info), and
+closes the listener, so a later connection is refused. The destructor
+alone still closes at once, as an error path, an unfinished `CodecStream`,
+must not wait.
+
+**Why 1 s.** `finish` must not hang on a viewer that stalled or vanished
+without its end: `stall_limit` (10 s) is too long to hold a sender's exit.
+A viewer keeping up has at most the last frame and 1 s of audio (96 KB of
+48 kHz mono PCM) to take, about 0.1 s with a 0.78 MB rig key at the VPN's
+12 MB/s, so 1 s leaves room and adds at most 1 s to an exit. A viewer
+that leaves or fails meanwhile is seen within a poll slice, as ever: only
+a stalled one costs the whole second. A constant, as nothing needs another
+value.
+
+**Why refuse at accept.** The accept thread polls the listener, and
+closing it under that thread would race the descriptor's reuse; so the
+thread refuses while finishing, and `finish` closes the listener once it
+has joined it.
+
+**The footer first.** `CodecStream::finish` writes the footer, then
+finishes the server: the file is whole whatever happens during the wait,
+and a viewer sees the end only once the file is finished, as no viewer
+gets what the file lacks.
+
+**The same bytes.** Only when a connection closes changes, never a byte:
+`grid_codec_stream`'s geometry-only compares, file and wire, pass
+unchanged. recon can require the chunks past the last frame in its
+live-audio test with its next grid re-pin.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer with a device required: the full suite passes, 72
+of 72, and the two changed tests 5 runs of 5. `grid_networking_server`: a
+raw viewer reading nothing while 8 frames of 1 MiB and their chunks, then
+25 chunks past the last frame, are published gets every record once
+`finish` has begun, then the end, replaying and on demand; a viewer that
+takes no byte holds `finish` for `kFinishLimit` and no longer, logged as
+still behind, while a viewer that has every record gets its end at once
+and a connection meanwhile is closed before any byte; after it, `publish`
+and a connection are refused and a second `finish` returns at once; a
+viewer waiting for a key and one that leaves meanwhile are closed at once,
+`finish` returning within half the bound; with no viewer, at once. The
+destructor still returns within 1 s with a stalled viewer.
+`grid_codec_stream_audio`: a viewer gets the 25 chunks `finish` writes past
+the last frame, then the end, its bytes the file's less its footer; that
+viewer keeps up and the chunks fit the socket's buffers, so it passes
+without the wait too, and the server's cases are the ones that fail. Three
+planted bugs each fail `grid_networking_server`: no wait, as before (the
+reading-nothing case), an unbounded wait (the stalled viewer holds
+`finish` for its 10 s `stall_limit`), and admitting a viewer during the
+wait.

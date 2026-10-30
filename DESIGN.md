@@ -962,7 +962,17 @@ before its first byte and while it waits for a key, until the server closes
 it; a refused connection never counts. Viewers that join, leave or fail are
 logged at Info; a refusal at Warning, the first and then one in 10 s at
 most, the rest at Debug. The destructor stops every thread within a poll
-slice (20 ms) and the write under way. `publish` is called from one thread.
+slice (20 ms) and the write under way, what is queued for a viewer lost.
+`publish` and `finish` are called from one thread.
+
+**Finishing** (the 2026-10-30 finish entry). `finish` ends the stream
+without losing its tail: later records are refused, a connection is closed
+at accept before any byte, and each viewer is closed once it has sent every
+record queued for it, at once when it has none (one waiting for a key), so
+it reads the end right after the last record. It returns once every viewer
+is closed, or after `kFinishLimit` (1 s), when any still behind is closed
+(logged at Info), then stops the threads as the destructor does and closes
+the listener, so a later connection is refused.
 
 **Tracks** (the 2026-10-30 serving entry). Track 0 anchors the GOP: only its
 keys start one, in either mode. A record of any other track must be a key
@@ -1032,8 +1042,9 @@ where the encoder picks I or P, the stream reads the server's
 `key_wanted()`: a rise calls `force_intra()`, which stands until a frame is
 returned, so joins between two frames make one key, a refused frame or a
 front half recorded again keeps it, and the period counts from it.
-`finish` writes what `append` holds, closes the viewers and writes the
-footer, in one attempt.
+`finish` writes what `append` holds and the footer, then finishes the
+server, so each viewer gets those records before its end, in one attempt;
+the destructor closes the viewers at once.
 
 **Audio tracks, muxed by pts** (`append`, `record_mux.cpp`). A record of
 an Audio track goes out, written then served as a frame is, right after the

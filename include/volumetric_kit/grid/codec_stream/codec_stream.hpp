@@ -182,10 +182,10 @@ class VGRID_CODEC_STREAM_API CodecStream {
 
   CodecStream(CodecStream&& other) noexcept;
   CodecStream& operator=(CodecStream&&) = delete;
-  /// Closes the viewers and the file. A file never finished that holds no
-  /// record, as after a run that failed before its first frame, is removed,
-  /// so a rerun onto it is not refused; one that holds records stays, read as
-  /// a killed writer's.
+  /// Closes the viewers at once, unlike @ref finish, and the file. A file
+  /// never finished that holds no record, as after a run that failed before
+  /// its first frame, is removed, so a rerun onto it is not refused; one that
+  /// holds records stays, read as a killed writer's.
   ~CodecStream();
 
   /// @brief Encode @p grid as one frame, write it, serve it, then decode it
@@ -324,13 +324,16 @@ class VGRID_CODEC_STREAM_API CodecStream {
   core::Status append(const stream::RecordInfo& info, const std::uint8_t* data,
                       std::size_t size);
 
-  /// @brief Close the viewers, which see the stream end, and finish the file
-  ///        with its footer index (@ref stream::StreamWriter::finish);
-  ///        without either, only mark the stream finished. One attempt:
-  ///        however it ends, every later call, this one included, is refused,
-  ///        so a file whose footer failed stays unfinished, read as a killed
-  ///        writer's. First, the records @ref append holds are written and
-  ///        served, in pts order, or dropped before any frame.
+  /// @brief Finish the file with its footer index
+  ///        (@ref stream::StreamWriter::finish), then the viewers' stream
+  ///        (@ref networking::StreamServer::finish), each viewer getting
+  ///        every record served before its end unless still behind after
+  ///        @ref networking::kFinishLimit; without either, only mark the
+  ///        stream finished. One attempt: however it ends, every later call,
+  ///        this one included, is refused, so a file whose footer failed
+  ///        stays unfinished, read as a killed writer's. First, the records
+  ///        @ref append holds are written and served, in pts order, or
+  ///        dropped before any frame.
   /// @return OK; `Status::Code::InvalidArgument` once finished or on a
   ///         moved-from stream; or the writer's error.
   core::Status finish();

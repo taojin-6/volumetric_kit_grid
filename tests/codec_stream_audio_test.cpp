@@ -5,17 +5,17 @@
 // grid holding a sphere, each record a chunk of a synthetic tone: sessions
 // refused on create, naming the track, no file made; served on 127.0.0.1
 // port 0 as a live sender serves, a raw viewer's bytes the file's less its
-// footer, frames and chunks alike, and a chunk the file refuses never
-// served; every refusal of append, nothing
-// changed; records held until a frame at or past their pts, equal pts
-// included, then right after it, from a frame in halves too, in pts order
-// across two tracks, the lower track first at equal pts, and one at or below
-// the last frame's out at once; dropped below the first frame, before it and
-// after, and one at its pts after it out at once; the 1 s bound on what is
-// held, before the first frame and while the geometry stalls; finish writing
-// what is held, or dropping it before any frame; and each file read back:
-// frames and records in that order, every payload intact, each track's
-// stats. The device part skips with no device.
+// footer, frames and chunks alike, those finish writes past the last frame
+// included, and a chunk the file refuses never served; every refusal of
+// append, nothing changed; records held until a frame at or past their pts,
+// equal pts included, then right after it, from a frame in halves too, in
+// pts order across two tracks, the lower track first at equal pts, and one
+// at or below the last frame's out at once; dropped below the first frame,
+// before it and after, and one at its pts after it out at once; the 1 s
+// bound on what is held, before the first frame and while the geometry
+// stalls; finish writing what is held, or dropping it before any frame; and
+// each file read back: frames and records in that order, every payload
+// intact, each track's stats. The device part skips with no device.
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -250,7 +250,8 @@ codec_stream::CodecOutputs served(const fs::path& path) {
 // demand, at a period of 3): a raw viewer that joined before the first
 // frame, reading what the file holds after each frame, gets the file's bytes
 // less its footer, every frame and the chunks each released after it, the
-// one below the first frame dropped from both.
+// one below the first frame dropped from both, then the 25 chunks past the
+// last frame that finish writes and serves, then the end.
 int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
            const vkc::test::Scratch& scratch) {
   const fs::path path = scratch.path / "served.vrst";
@@ -285,16 +286,22 @@ int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     net::read_upto(viewer.get(), written, 5s, &wire);
     CHECK(wire.size() == written);
   }
-  CHECK(counts_are(coder, 1, 0, 1, j - 1));
+  constexpr std::uint64_t kTail = 25;  // up to 500 ms past the last frame
+  for (std::uint64_t i = 0; i < kTail; ++i, ++j) {
+    CHECK(append(coder, 1, j, chunk_pts(j)).ok());
+  }
+  CHECK(counts_are(coder, 1, kTail, 1, j - 1 - kTail));
   CHECK(coder.finish().ok());
+  CHECK(counts_are(coder, 1, 0, 1, j - 1));
   bool ended = false;
-  net::read_upto(viewer.get(), wire.size() + 1, 5s, &wire, &ended);
+  net::read_upto(viewer.get(), std::size_t{1} << 30, 5s, &wire, &ended);
   CHECK(ended);
   const net::Bytes file = vkc::test::read_bytes(path);
   CHECK(vrst::index_offset(file) == wire.size());
   CHECK(std::equal(wire.begin(), wire.end(), file.begin()));
   const std::vector<Entry> got = read_back(path.string());
   CHECK(got.size() == 4 + j - 1 && got[0].track == 0 && got[1].track == 1);
+  CHECK(got.back().track == 1 && got.back().id == j - 1);
   return 0;
 }
 
