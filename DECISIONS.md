@@ -334,6 +334,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   serves keys on demand instead (`replay_gop` false), and the cached GOP
   stays the default. *Amended 2026-10-30:* `CodecStream` writes Audio
   tracks beside the Geometry track; the server still serves one track.
+  *Amended 2026-10-30 again:* the server serves every track, track 0's keys
+  anchoring the GOP.
 - [**2026-10-21**](#2026-10-21--meshintegrator-finds-each-voxels-nearest-triangle-with-an-exact-early-exit-a-triangle-is-ruled-out-only-by-a-lower-bound-less-a-rounding-margin-of-its-own-strictly-above-the-voxels-limit) —
   `MeshIntegrator` finds each voxel's nearest triangle with an exact early
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
@@ -438,7 +440,7 @@ entries relevant to your task; later amendments supersede earlier rules.
   first), every record a key at its first sample's capture time. No version
   change, as readers pass an unknown kind through, and no new record flag;
   a file without audio is byte for byte as before. *Amended 2026-10-30:*
-  `CodecStream` writes Audio tracks, muxed by pts.
+  `CodecStream` writes Audio tracks, muxed by pts, and serves them.
 - [**2026-10-30**](#2026-10-30--codecstream-muxes-audio-tracks-by-pts-a-record-goes-out-right-after-the-first-frame-at-or-past-its-pts-none-below-the-first-frame-and-at-most-1-s-held-past-the-last-the-server-still-serves-one-track-amends-the-2026-10-21-networking-and-2026-10-30-audio-track-entries) —
   `CodecStream` takes Audio tracks after its Geometry track 0, on its
   clock, and `append` muxes their records by pts: each goes out right
@@ -446,7 +448,15 @@ entries relevant to your task; later amendments supersede earlier rules.
   and at most `kHoldLimitNs` (1 s) is held past the last frame; `finish`
   writes what is held. The record rules are checked at the call. The
   server still serves one track, so serving one is `Unsupported`; a file
-  works, and without audio every byte is as before.
+  works, and without audio every byte is as before. *Amended 2026-10-30:*
+  served too.
+- [**2026-10-30**](#2026-10-30--streamserver-serves-every-track-track-0s-keys-anchoring-the-gop-and-replayloop-replays-every-track-with-one-pts-offset-a-pass-amends-the-2026-10-21-networking-and-2026-10-30-mux-entries) —
+  `StreamServer` serves every track: only track 0's keys start a GOP, and
+  a record of any other track must be a key and joins the GOP as a P-frame
+  does, so audio shares the geometry's fate: a joiner or a skip starts at a
+  track-0 key and gets every record after it. `CodecStream` serves its
+  Audio tracks, and `serve_stream`'s `ReplayLoop` replays every track, all
+  moved by one pts offset a pass. Without audio, every byte is as before.
 
 ## Decision record
 
@@ -7120,6 +7130,9 @@ replaying a recording, sends; the player reads.
   of its own. *Amended 2026-10-30 (the `CodecStream` mux entry, below):*
   `CodecStream` writes Audio tracks beside the Geometry track, to a file;
   the server still serves one track, so a stream that serves refuses them.
+  *Amended 2026-10-30 (the serving entry, below):* one GOP serves every
+  track: track 0's keys start it, and every other track's records, keys
+  all, join it, so they need no GOP of their own.
 
 **Verification.** Apple M5 Max, Debug and Release (117 tests each, all
 passing), and the stream and networking tests under ThreadSanitizer and
@@ -8464,7 +8477,8 @@ take1's 13 to 51 Mbit/s of geometry (the 2026-10-29 entry).
 **Not here.** `CodecStream` and `StreamServer` still take one Geometry
 track; writing and serving an Audio track beside it comes with their next
 changes. *Amended 2026-10-30 (below):* `CodecStream` writes them, muxed by
-pts; `StreamServer` still serves one track.
+pts; `StreamServer` still serves one track. *Amended 2026-10-30 (the
+serving entry, below):* `StreamServer` serves them.
 
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer: the full suite passes, 71 of 71. The new
@@ -8541,7 +8555,7 @@ bytes are what `grid_stream_container` pins.
 of the 2026-10-21 networking entry): with `CodecOutputs::serve`, `create`
 returns its `Unsupported` for a session with an Audio track, nothing made.
 A file works now. A later change anchors the server's GOP on track 0 and
-lifts it.
+lifts it. *Amended 2026-10-30 (the serving entry, below):* lifted.
 
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer with a device required: the full suite passes, 72
@@ -8558,3 +8572,74 @@ payload intact, each track's stats. Five planted bugs each fail it: no hold
 after the first frame, release below a frame's pts alone (`<` for `<=`),
 dropping a record at the first frame's pts (`<=` for `<`), no flush in
 `finish`, and no stall bound.
+
+### 2026-10-30 — `StreamServer` serves every track, track 0's keys anchoring the GOP, and `ReplayLoop` replays every track with one pts offset a pass (amends the 2026-10-21 networking and 2026-10-30 mux entries).
+
+**The rule.** `publish` hands the GOP log a record as a key only when it is
+a key on track 0. A record of any other track must be a key; one that is
+not is `InvalidArgument`, refused before it is framed, so nothing changes.
+`start` takes any session the writer takes, and `CodecStream` serves a
+session with Audio tracks. The GOP log is unchanged: its key means "starts
+a GOP".
+
+**Why track 0.** A GOP is only as good as its geometry key: a P-frame needs
+it, and audio has nothing to play with until a frame shows. Every Audio
+record is a key, so if each started a GOP, newest key wins would move every
+viewer to the newest chunk every 20 ms: one behind would lose the frames
+under way, and a joiner would start at a chunk, with no frame to decode
+until the next key. Anchored on track 0, audio rides in the geometry's GOP
+and shares its fate: a joiner or a skip starts at a track-0 key and gets
+every record published after it. With `CodecStream`'s mux, a record goes
+out right after the first frame at or past its pts, so that is every audio
+record from the key's pts on, while the frames keep within `kHoldLimitNs`
+(1 s) of the audio. Past it, the mux sends all it holds, so audio at or
+past a later key's pts can go out before that key, and a joiner at that key
+misses it with no frame lost. Otherwise audio is lost only with its frames:
+a GOP past `max_gop_bytes`, a lost copy, or a skip.
+
+**Why other tracks' records must be keys.** One that is not would join a
+GOP as a P-frame does, with nothing to say what it is predicted from, and a
+viewer starting at a track-0 key could get it without its reference. Audio
+never meets the rule.
+
+**Head of line.** Audio behind a 0.78 MB rig key waits about 65 ms at the
+VPN's 12 MB/s, plus a round trip per lost segment; a player's playout delay
+takes it up. Serving audio first, per viewer, waits for a gap measured to be
+audible.
+
+**Replay.** `ReplayLoop` replays every track's records in file order from
+track 0's first key read whole. One pts offset a pass moves every track:
+the records' pts span and one mean step of track 0. So each record keeps
+its distance from the frames across passes; an offset per track would
+slide audio against the frames by the difference of their spans every
+pass. Each track's seq moves by its own span, so each stays unbroken (a seq
+jump says records were lost). A damaged payload skips its own track's
+records that are not keys, up to that track's next key, so an audio key no
+longer ends a frame's skip. `create` takes no track, and refuses a replayed
+record of another track that is not a key, naming it, which `publish`
+would refuse only once the pass reached it.
+
+**Without audio, the same bytes.** On a session of one track, a key on
+track 0 is every key, so the log gets what it did, and the server's framing
+is untouched. `grid_codec_stream`'s geometry-only compare, file and wire,
+passes unchanged.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer with a device required: the full suite passes, 72
+of 72. `grid_networking_server` serves a Geometry and an Audio track to a
+raw viewer whose bytes are the writer's two-track file less its footer, an
+audio record that is not a key refused with nothing changed; and,
+replaying and on demand, a joiner mid-GOP gets the track-0 key, then every
+record after it on both tracks; 200 audio keys published while a viewer is
+stuck in a 1 MiB key reach it whole; and a newer track-0 key skips the
+audio of the GOPs before it with their frames. `grid_codec_stream_audio`
+serves a stream with an Audio track, keys on demand, a raw viewer's bytes
+the file's less its footer, and never serves a chunk the file refuses.
+`grid_example_stream_replay` replays a two-track file: one pts offset a
+pass, each track's seq unbroken, three passes by the writer's rules, and a
+damaged frame skipping its GOP's P-frames but no audio; and it refuses an
+audio record that is not a key at `create`. Three planted bugs
+each fail a test: every key starting a GOP (the joiner case, and the burst
+and newest-key cases each alone in both modes), serving an audio record
+before writing it (`grid_codec_stream_audio`), and a pts offset per track
+in the replay (`grid_example_stream_replay`).

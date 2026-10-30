@@ -168,10 +168,7 @@ class VGRID_CODEC_STREAM_API CodecStream {
   /// @return The stream; `Status::Code::InvalidArgument`, naming the track,
   ///         for a session that is not so; what
   ///         @ref networking::StreamServer::start returns
-  ///         (`Status::Code::IoError` for a port in use;
-  ///         `Status::Code::Unsupported` for a session of more than one
-  ///         track, so a stream with an Audio track writes a file but does
-  ///         not serve yet); what
+  ///         (`Status::Code::IoError` for a port in use); what
   ///         @ref stream::StreamWriter::create returns
   ///         (`Status::Code::InvalidArgument` when something is at the path,
   ///         `Status::Code::NotFound` when its directory is missing); or the

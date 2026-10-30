@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-30
+
+### Changed
+
+- **`StreamServer` serves a session of any tracks**: track 0's keys start a
+  GOP, and a record of any other track must be a key (`InvalidArgument`
+  otherwise, nothing sent) and joins the GOP as a P-frame does. A viewer
+  that joins or skips to a newer key starts at a track-0 key and gets every
+  record published after it, on any track. `start` no longer returns
+  `Unsupported` for more than one track (DESIGN.md, networking; the
+  2026-10-30 serving entry in DECISIONS.md).
+- **`CodecStream` serves its Audio tracks**: with `CodecOutputs::serve`, a
+  session with an Audio track is served as its file is written. A session
+  with no Audio track writes and serves the bytes 0.5.0 did.
+- **`serve_stream` replays every track** (`vgrid_example::ReplayLoop`): from
+  track 0's first key, every track's records in file order, every pts moved
+  by one span a pass and each track's seq by its own, so the tracks stay
+  together across passes. A damaged payload skips its own track's records
+  that are not keys up to that track's next key. `ReplayLoop::create` takes
+  no track.
+
 ## [0.5.0] - 2026-10-30
 
 ### Added

@@ -794,11 +794,11 @@ vgrid_target_warnings(grid_codec_stream_test)
 add_test(NAME grid_codec_stream COMMAND grid_codec_stream_test)
 
 # The codec stream's Audio tracks (CodecStream::append), each record a chunk of
-# a synthetic tone: sessions refused, the server's refusal of a second track,
-# each refusal of append; records held until a frame at or past their pts and
-# then right after it, in pts order across two tracks, dropped below the first
-# frame, held within 1 s, flushed by finish; each file read back. The device
-# part skips with no device.
+# a synthetic tone: sessions refused, served as the file holds them, a chunk the
+# file refuses never served, each refusal of append; records held until a frame
+# at or past their pts and then right after it, in pts order across two tracks,
+# dropped below the first frame, held within 1 s, flushed by finish; each file
+# read back. The device part skips with no device.
 add_executable(grid_codec_stream_audio_test codec_stream_audio_test.cpp)
 target_link_libraries(
   grid_codec_stream_audio_test
@@ -807,10 +807,11 @@ target_link_libraries(
 vgrid_target_warnings(grid_codec_stream_audio_test)
 add_test(NAME grid_codec_stream_audio COMMAND grid_codec_stream_audio_test)
 
-# serve_stream's replay (examples/common/stream_replay.hpp): the records from
-# the first key, seq and key pts across passes by the writer's rules, the dues,
-# damage left out and an allocation failure past it refused, and a damaged
-# payload skipped to the next key. Host only.
+# serve_stream's replay (examples/common/stream_replay.hpp): every track's
+# records from track 0's first key, seq and key pts across passes by the
+# writer's rules, one pts offset a pass on every track, the dues, damage left
+# out and an allocation failure past it refused, and a damaged payload skipped
+# to its track's next key. Host only.
 add_executable(grid_example_stream_replay_test example_stream_replay_test.cpp)
 target_link_libraries(grid_example_stream_replay_test
                       PRIVATE grid_example_common)

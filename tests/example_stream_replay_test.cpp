@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Tao Jin
 
 // serve_stream's replay (examples/common/stream_replay.hpp), on a written
-// .vrst: the records from the track's first key; pass 0 unchanged; across
+// .vrst: the records from track 0's first key; pass 0 unchanged; across
 // passes seq rising and key pts never falling, so the writer's rules take
 // three passes in a row; dues following the pts gaps, a pass one mean step
 // after the last; a lone record paced by the track's rate, and the loop's
@@ -10,8 +10,15 @@
 // this version does not know left out, and an allocation failure reading
 // past the damage refused; a damaged first key left out with the P-frames
 // after it; a pass sending each record restamped, but a damaged payload and
-// the P-frames after it, and refusing to send nothing; and a track with no
-// key, no undamaged key, or none at all, refused. Host-only.
+// the P-frames after it, and refusing to send nothing; a track 0 with no
+// key, no undamaged key, or none at all, refused; and a Geometry track and
+// an Audio track, muxed as CodecStream writes them, replayed together: every
+// track's records in file order from track 0's first key, one pts offset a
+// pass on both, so they stay together across passes, each track's seq
+// rising by one across a pass, and a damaged frame skipping its track's
+// P-frames to the next key but no audio; and a replayed audio record that is
+// not a key refused, naming it, but not one before track 0's first key.
+// Host-only.
 
 #include <chrono>
 #include <cstdint>
@@ -23,6 +30,7 @@
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
+#include "volumetric_kit/grid/stream/audio.hpp"
 #include "volumetric_kit/grid/stream/chunks.hpp"
 #include "volumetric_kit/grid/stream/stream_writer.hpp"
 #include "volumetric_kit/grid/testing/stream_files.hpp"
@@ -131,7 +139,7 @@ int loop_case(const std::string& dir) {
 }
 
 // One record: a pass is the track's frame period. The loop's own last
-// allocation, its records' growth, failed is OutOfMemory.
+// allocation, its tracks' seq spans, failed is OutOfMemory.
 int lone_record_case(const std::string& dir) {
   const std::string path = dir + "/lone.vrst";
   CHECK(write(path, {vrst::info(0, true, 500, 4)}));
@@ -147,7 +155,7 @@ int lone_record_case(const std::string& dir) {
   const stream::RecordInfo next = loop->restamp(loop->records()[0].info, 1);
   CHECK(next.seq == 5 && next.pts_ns == 500 + 1'000'000'000 / 30);
 
-  CHECK(failure.bytes == sizeof(stream::Record));
+  CHECK(failure.bytes == sizeof(std::uint64_t));  // one track's
   failure.site = failure.measured_site;
   failure.armed = true;
   const Code refused =
@@ -321,8 +329,187 @@ int refusals_case(const std::string& dir) {
   CHECK(reader != nullptr);
   CHECK(vgrid_example::ReplayLoop::create(*reader).status().domain() ==
         Code::NotFound);
-  CHECK(vgrid_example::ReplayLoop::create(*reader, 1).status().domain() ==
-        Code::InvalidArgument);
+  return 0;
+}
+
+// --- Two tracks.
+
+constexpr std::uint64_t kT = 1'000'000'000;
+constexpr std::uint64_t kMs = 1'000'000;
+
+// A Geometry track 0 at 25 frames a second and an Audio track 1.
+stream::Session two_track_session() {
+  stream::Session s = session();
+  s.tracks[0].rate = {25, 1};
+  stream::Track audio;
+  audio.kind = stream::TrackKind::Audio;
+  audio.rate = {48000, 960};
+  audio.params = stream::encode_audio_params({});
+  s.tracks.push_back(audio);
+  return s;
+}
+
+// A record's payload: 100 bytes from its track and seq.
+vrst::Bytes payload_of(const stream::RecordInfo& info) {
+  return vrst::pattern(100, 1000 * info.track + info.seq);
+}
+
+// Frames 0-3 at 40 ms (keys 0 and 3) and chunks 0-9 at 20 ms, as CodecStream
+// writes them: each chunk right after the first frame at or past its pts,
+// the last two past the last frame, as finish writes them. Chunk 0 comes
+// before frame 0, as a file of another writer may hold.
+std::vector<stream::RecordInfo> muxed_infos() {
+  const auto frame = [](std::uint64_t k) {
+    return vrst::info(0, k % 3 == 0, kT + 40 * kMs * k, k);
+  };
+  const auto chunk = [](std::uint64_t j) {
+    return vrst::info(1, true, kT - 20 * kMs + 20 * kMs * j, j);
+  };
+  return {chunk(0), frame(0), chunk(1), frame(1), chunk(2), chunk(3), frame(2),
+          chunk(4), chunk(5), frame(3), chunk(6), chunk(7), chunk(8), chunk(9)};
+}
+
+// A two-track file at `path` of `infos`, each with its payload.
+bool write_two_tracks(const std::string& path,
+                      const std::vector<stream::RecordInfo>& infos) {
+  auto writer = stream::StreamWriter::create(path, two_track_session());
+  if (!writer.ok()) return false;
+  for (const stream::RecordInfo& info : infos) {
+    const vrst::Bytes payload = payload_of(info);
+    if (!(*writer)->append(info, payload.data(), payload.size()).ok()) {
+      return false;
+    }
+  }
+  return (*writer)->finish().ok();
+}
+
+// Every track's records from track 0's first key, in file order; one pts
+// offset a pass on both tracks (their span, T to T + 160 ms, and one mean
+// step of track 0, 40 ms), so each record keeps its distance from frame 0 in
+// every pass; each track's seq one past its last of the pass before; three
+// passes in a row by the writer's rules; and pass 1 one frame step after
+// pass 0's last record, a chunk past the last frame.
+int two_tracks_case(const std::string& dir) {
+  const std::string path = dir + "/two_tracks.vrst";
+  const std::vector<stream::RecordInfo> infos = muxed_infos();
+  CHECK(write_two_tracks(path, infos));
+  const auto reader = reader_of(path);
+  CHECK(reader != nullptr);
+  vkc::Result<vgrid_example::ReplayLoop> made =
+      vgrid_example::ReplayLoop::create(*reader);
+  CHECK(made.ok());
+  const vgrid_example::ReplayLoop& loop = *made;
+  CHECK(loop.records().size() == infos.size() - 1);
+  for (std::size_t i = 0; i < loop.records().size(); ++i) {
+    CHECK(vrst::same(loop.records()[i].info, infos[i + 1]));
+  }
+
+  constexpr std::uint64_t kPass = 160 * kMs + 40 * kMs;
+  const stream::RecordInfo& first = loop.records().front().info;
+  vkc::Result<stream::ChunkEncoder> encoder =
+      stream::ChunkEncoder::create(two_track_session());
+  CHECK(encoder.ok());
+  std::uint64_t last_seq[2] = {};
+  bool any[2] = {};
+  for (std::uint64_t pass = 0; pass < 3; ++pass) {
+    const stream::RecordInfo frame0 = loop.restamp(first, pass);
+    CHECK(frame0.pts_ns == kT + pass * kPass);
+    for (const stream::Record& r : loop.records()) {
+      const stream::RecordInfo info = loop.restamp(r.info, pass);
+      CHECK(encoder->frame(info, nullptr, 0).ok());
+      // Together: as far from frame 0 as in the file.
+      CHECK(info.pts_ns - frame0.pts_ns == r.info.pts_ns - first.pts_ns);
+      CHECK(!any[info.track] || info.seq == last_seq[info.track] + 1);
+      any[info.track] = true;
+      last_seq[info.track] = info.seq;
+    }
+  }
+  CHECK(last_seq[0] == 11 && last_seq[1] == 27);  // 3 passes of 4 and of 9
+
+  const Clock::time_point start = Clock::now();
+  const auto ns = [&](Clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t - start)
+        .count();
+  };
+  CHECK(ns(loop.due(start, 1, kT)) - ns(loop.due(start, 0, kT + 160 * kMs)) ==
+        static_cast<long long>(40 * kMs));
+  return 0;
+}
+
+// Frame 1's payload fails its CRC: each pass sends the rest, restamped, but
+// frames 1 and 2, its GOP's, up to frame 3, the next key; every chunk goes,
+// those between the damaged frames too.
+int two_tracks_damage_case(const std::string& dir) {
+  const std::string path = dir + "/two_tracks_damaged.vrst";
+  const std::vector<stream::RecordInfo> infos = muxed_infos();
+  CHECK(write_two_tracks(path, infos));
+  vrst::Bytes file = vkc::test::read_bytes(path);
+  std::vector<vrst::ChunkAt> records;
+  for (const vrst::ChunkAt& c : vrst::chunks(file)) {
+    if (c.tag == "RECD") records.push_back(c);
+  }
+  CHECK(records.size() == infos.size());
+  CHECK(infos[3].track == 0 && infos[3].seq == 1);
+  const std::uint64_t damaged = records[3].offset + records[3].header_bytes;
+  CHECK(vrst::write_bytes(path, vrst::flipped(file, damaged, 0)));
+  const auto reader = reader_of(path);
+  CHECK(reader != nullptr);
+  vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*reader);
+  CHECK(loop.ok() && loop->records().size() == infos.size() - 1);
+
+  struct Sent {
+    stream::RecordInfo info;
+    vrst::Bytes payload;
+  };
+  std::vector<Sent> sent;
+  const auto collect = [&](const stream::RecordInfo& info,
+                           const std::vector<std::uint8_t>& payload) {
+    sent.push_back({info, payload});
+    return vkc::Status{};
+  };
+  const Clock::time_point start = Clock::now();
+  for (std::uint64_t pass = 0; pass < 2; ++pass) {
+    CHECK(loop->send_pass(*reader, start, pass, collect).ok());
+  }
+  std::size_t at = 0;
+  for (std::uint64_t pass = 0; pass < 2; ++pass) {
+    for (std::size_t i = 1; i < infos.size(); ++i) {
+      const stream::RecordInfo& info = infos[i];
+      if (info.track == 0 && (info.seq == 1 || info.seq == 2)) continue;
+      CHECK(at < sent.size());
+      CHECK(vrst::same(sent[at].info, loop->restamp(info, pass)));
+      CHECK(sent[at].payload == payload_of(info));
+      ++at;
+    }
+  }
+  CHECK(at == sent.size());
+  return 0;
+}
+
+// A replayed record of track 1 that is not a key is refused at create,
+// naming it, as publish would refuse it mid-pass; one before track 0's first
+// key is never replayed, so that file replays.
+int two_tracks_refusal_case(const std::string& dir) {
+  const std::string path = dir + "/not_key.vrst";
+  CHECK(write_two_tracks(
+      path, {vrst::info(0, true, kT, 0), vrst::info(1, false, kT, 5)}));
+  const auto reader = reader_of(path);
+  CHECK(reader != nullptr);
+  const vkc::Status refused =
+      vgrid_example::ReplayLoop::create(*reader).status();
+  CHECK(refused.domain() == Code::Unsupported);
+  CHECK(refused.message().find("track 1 seq 5 is not a key") !=
+        std::string::npos);
+
+  const std::string early_path = dir + "/not_key_early.vrst";
+  CHECK(write_two_tracks(
+      early_path, {vrst::info(1, false, kT, 5), vrst::info(0, true, kT, 0)}));
+  const auto early = reader_of(early_path);
+  CHECK(early != nullptr);
+  const vkc::Result<vgrid_example::ReplayLoop> loop =
+      vgrid_example::ReplayLoop::create(*early);
+  CHECK(loop.ok() && loop->records().size() == 1);
   return 0;
 }
 
@@ -337,6 +524,9 @@ int main() {
   if (damaged_key_case(dir) != 0) return 1;
   if (payload_damage_case(dir) != 0) return 1;
   if (refusals_case(dir) != 0) return 1;
+  if (two_tracks_case(dir) != 0) return 1;
+  if (two_tracks_damage_case(dir) != 0) return 1;
+  if (two_tracks_refusal_case(dir) != 0) return 1;
   std::puts("stream replay: OK");
   return 0;
 }

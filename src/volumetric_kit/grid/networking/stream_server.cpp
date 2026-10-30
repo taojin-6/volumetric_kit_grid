@@ -58,10 +58,11 @@ struct StreamServer::Impl {
     std::thread thread;
   };
 
-  Impl(stream::ChunkEncoder encoder_, const ServerOptions& options_,
-       detail::Chunk session_chunk_, core::UniqueFd listener_,
-       std::uint16_t port_)
+  Impl(stream::ChunkEncoder encoder_, std::size_t tracks_,
+       const ServerOptions& options_, detail::Chunk session_chunk_,
+       core::UniqueFd listener_, std::uint16_t port_)
       : encoder(std::move(encoder_)),
+        tracks(tracks_),
         options(options_),
         session_chunk(std::move(session_chunk_)),
         listener(std::move(listener_)),
@@ -87,6 +88,7 @@ struct StreamServer::Impl {
   void count_key_wanted() noexcept { key_wanted = log.key_wanted(); }
 
   stream::ChunkEncoder encoder;  // the publishing thread's
+  const std::size_t tracks;      // the session's
   const ServerOptions options;
   const detail::Chunk session_chunk;
   const core::UniqueFd listener;
@@ -313,11 +315,6 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
     core::Result<stream::ChunkEncoder> encoder =
         stream::ChunkEncoder::create(session);
     if (!encoder.ok()) return std::move(encoder).status().with_context(kApi);
-    if (session.tracks.size() > 1) {
-      return core::Status::unsupported(std::string(kApi) + ": a session of " +
-                                       std::to_string(session.tracks.size()) +
-                                       " tracks; one is served");
-    }
     if (options.max_viewers == 0) {
       return core::Status::invalid_argument(std::string(kApi) +
                                             ": a max_viewers of 0");
@@ -341,8 +338,8 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
         encoder->session_chunk());
     std::unique_ptr<StreamServer> server(
         new StreamServer(std::make_unique<Impl>(
-            std::move(encoder).value(), options, std::move(session_chunk),
-            std::move(listener), port)));
+            std::move(encoder).value(), session.tracks.size(), options,
+            std::move(session_chunk), std::move(listener), port)));
     Impl* const s = server->impl_.get();
     s->acceptor = std::thread([s] { s->accept_loop(); });
     return server;
@@ -379,6 +376,16 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
           std::to_string(stream::ChunkParser::kMaxBodyBytes) +
           " a viewer reads");
     }
+    // Only track 0's keys start a GOP, so a record of another track joins
+    // the GOP as a P-frame does, and must decode alone. A track the session
+    // lacks is the encoder's to refuse, named so.
+    if (info.track != 0 && info.track < s.tracks && !info.key) {
+      return core::Status::invalid_argument(
+          std::string(kApi) + ": track " + std::to_string(info.track) +
+          " seq " + std::to_string(info.seq) +
+          " is not a key; only track 0 has records that are not");
+    }
+    const bool anchor = info.key && info.track == 0;
     core::Result<stream::ChunkEncoder::RecordFraming> framed =
         s.encoder.frame(info, payload);
     if (!framed.ok()) return std::move(framed).status().with_context(kApi);
@@ -402,13 +409,13 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
       }
       chunk->insert(chunk->end(), kZeros, kZeros + framing.padding);
       const std::lock_guard<std::mutex> lock(s.mutex);
-      // Whether a viewer would take it: replaying, a key or a record of an
-      // open GOP; on demand, a key while a viewer has joined, or a record
-      // while one is in.
+      // Whether a viewer would take it: replaying, a track-0 key or a record
+      // of an open GOP; on demand, a track-0 key while a viewer has joined,
+      // or a record while one is in.
       const bool joins =
-          info.key ? s.options.replay_gop || s.log.joined() : s.log.open();
+          anchor ? s.options.replay_gop || s.log.joined() : s.log.open();
       const std::uint64_t wanted = s.log.key_wanted();
-      kept = s.log.append(std::move(chunk), info.key);
+      kept = s.log.append(std::move(chunk), anchor);
       // Replaying, the GOP went past max_gop_bytes; on demand, the record
       // alone is past it, so no viewer can take it.
       overflow =
@@ -420,7 +427,7 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
       // Lost, so the records after it until the next key are too.
       try {
         const std::lock_guard<std::mutex> lock(s.mutex);
-        s.log.break_gop(info.key);
+        s.log.break_gop(anchor);
         s.count_key_wanted();
       } catch (...) {
       }

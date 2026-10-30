@@ -3,8 +3,10 @@
 
 // A codec stream's Audio tracks (codec_stream/codec_stream.hpp, append), on a
 // grid holding a sphere, each record a chunk of a synthetic tone: sessions
-// refused on create, naming the track, and one served refused with the
-// server's Unsupported, no file made; every refusal of append, nothing
+// refused on create, naming the track, no file made; served on 127.0.0.1
+// port 0 as a live sender serves, a raw viewer's bytes the file's less its
+// footer, frames and chunks alike, and a chunk the file refuses never
+// served; every refusal of append, nothing
 // changed; records held until a frame at or past their pts, equal pts
 // included, then right after it, from a frame in halves too, in pts order
 // across two tracks, the lower track first at equal pts, and one at or below
@@ -15,6 +17,11 @@
 // frames and records in that order, every payload intact, each track's
 // stats. The device part skips with no device.
 
+#include <signal.h>
+#include <sys/resource.h>
+
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -25,24 +32,30 @@
 #include <utility>
 #include <vector>
 
+#include "volumetric_kit/core/base/file_io.hpp"
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/core/testing/scratch_dir.hpp"
 #include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/grid/base/device_requirements.hpp"
 #include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
+#include "volumetric_kit/grid/networking/stream_client.hpp"
 #include "volumetric_kit/grid/stream/audio.hpp"
 #include "volumetric_kit/grid/stream/stream_reader.hpp"
 #include "volumetric_kit/grid/testing/codec_fixture.hpp"
+#include "volumetric_kit/grid/testing/networking_loopback.hpp"
 #include "volumetric_kit/grid/testing/stream_files.hpp"
 
 namespace vgrid = volumetric_kit::grid;
 namespace vkc = volumetric_kit::core;
 namespace codec = volumetric_kit::grid::codec;
 namespace codec_stream = volumetric_kit::grid::codec_stream;
+namespace networking = volumetric_kit::grid::networking;
 namespace stream = volumetric_kit::grid::stream;
 namespace vrst = vgrid_test::vrst;
+namespace net = vgrid_test::net;
 namespace fs = std::filesystem;
 using namespace codec_fixture;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -177,8 +190,7 @@ bool same(const std::vector<Entry>& got, const std::vector<Entry>& expected) {
 // Sessions the stream cannot mux are refused before any output is made,
 // naming the track: a second Geometry track, another kind, params no reader
 // plays (none, no channel, a codec it does not know), another clock than
-// the frames'. Served, a session with an Audio track is the server's
-// Unsupported, as it serves one track, with no file made.
+// the frames'.
 int refused_sessions(vkc::test::GpuContext& gpu,
                      const vkc::test::Scratch& scratch) {
   codec_stream::CodecOutputs outputs;
@@ -219,11 +231,110 @@ int refused_sessions(vkc::test::GpuContext& gpu,
   CHECK(refused(unknown_codec, Code::InvalidArgument, "track 1: "));
   CHECK(refused(other_clock, Code::InvalidArgument,
                 "track 1 is on clock 3, track 0 on clock 0"));
+  return 0;
+}
 
+// Outputs writing `path` and serving on 127.0.0.1, a free port, without the
+// decode.
+codec_stream::CodecOutputs served(const fs::path& path) {
+  codec_stream::CodecOutputs outputs;
+  outputs.stream = path.string();
+  outputs.decode = false;
   outputs.serve.emplace();
   outputs.serve->host = "127.0.0.1";
   outputs.serve->port = 0;
-  CHECK(refused(session(1), Code::Unsupported, "StreamServer::start"));
+  return outputs;
+}
+
+// A stream with an Audio track serves, as a live sender does (keys on
+// demand, at a period of 3): a raw viewer that joined before the first
+// frame, reading what the file holds after each frame, gets the file's bytes
+// less its footer, every frame and the chunks each released after it, the
+// one below the first frame dropped from both.
+int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
+           const vkc::test::Scratch& scratch) {
+  const fs::path path = scratch.path / "served.vrst";
+  codec_stream::CodecOutputs outputs = served(path);
+  outputs.serve->replay_gop = false;
+  codec::EncoderConfig config;
+  config.intra_period = 3;
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
+                                        session(1), outputs);
+  CHECK(made.ok());
+  codec_stream::CodecStream& coder = made.value();
+  CHECK(coder.server() != nullptr);
+  const vkc::UniqueFd viewer = net::connect_loopback(coder.server()->port());
+  CHECK(viewer.valid());
+  net::Bytes wire;
+  net::read_upto(viewer.get(), net::session_chunk(session(1)).size(), 5s,
+                 &wire);
+  CHECK(!wire.empty() && wire.size() == fs::file_size(path));
+  // Chunk j at kT0 - 20 ms + 20 ms j; frame k at kT0 + 40 ms k.
+  const auto chunk_pts = [](std::uint64_t j) {
+    return kT0 - 20 * kMs + 20 * kMs * j;
+  };
+  std::uint64_t j = 0;
+  for (std::uint64_t k = 0; k < 4; ++k) {
+    const std::uint64_t frame_pts = kT0 + 40 * kMs * k;
+    for (; chunk_pts(j) <= frame_pts; ++j) {
+      CHECK(append(coder, 1, j, chunk_pts(j)).ok());
+    }
+    CHECK(coder.code(source, k, frame_pts).ok());
+    const std::uintmax_t written = fs::file_size(path);
+    net::read_upto(viewer.get(), written, 5s, &wire);
+    CHECK(wire.size() == written);
+  }
+  CHECK(counts_are(coder, 1, 0, 1, j - 1));
+  CHECK(coder.finish().ok());
+  bool ended = false;
+  net::read_upto(viewer.get(), wire.size() + 1, 5s, &wire, &ended);
+  CHECK(ended);
+  const net::Bytes file = vkc::test::read_bytes(path);
+  CHECK(vrst::index_offset(file) == wire.size());
+  CHECK(std::equal(wire.begin(), wire.end(), file.begin()));
+  const std::vector<Entry> got = read_back(path.string());
+  CHECK(got.size() == 4 + j - 1 && got[0].track == 0 && got[1].track == 1);
+  return 0;
+}
+
+// A chunk the file refuses is never served: with the stream's file at its
+// size limit (SIGXFSZ ignored), a chunk at the last frame's pts, which goes
+// out at once, cannot be appended, and the client, which got the frame, gets
+// nothing, then the end once the stream is finished.
+int unwritten_unserved(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
+                       const vkc::test::Scratch& scratch) {
+  const fs::path path = scratch.path / "full.vrst";
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                        session(1), served(path));
+  CHECK(made.ok());
+  codec_stream::CodecStream& coder = made.value();
+  const std::uint16_t port = coder.server()->port();
+  const std::unique_ptr<networking::StreamClient> client = net::connect(port);
+  CHECK(client != nullptr && net::wait_session(*client));
+  CHECK(coder.code(source, 0, kT0).ok());
+  net::Got got;
+  CHECK(net::next_within(*client, &got) && got.record.info.track == 0);
+  // Only this process's limit and disposition change, for one chunk, and
+  // nothing else is written meanwhile.
+  const std::uintmax_t size = fs::file_size(path);
+  std::fflush(nullptr);
+  const auto handler = ::signal(SIGXFSZ, SIG_IGN);
+  CHECK(handler != SIG_ERR);
+  rlimit previous{};
+  CHECK(::getrlimit(RLIMIT_FSIZE, &previous) == 0);
+  const rlimit limited{static_cast<rlim_t>(size), previous.rlim_max};
+  CHECK(::setrlimit(RLIMIT_FSIZE, &limited) == 0);
+  const vkc::Status full = append(coder, 1, 0, kT0);
+  CHECK(::setrlimit(RLIMIT_FSIZE, &previous) == 0);
+  CHECK(::signal(SIGXFSZ, handler) != SIG_ERR);
+  CHECK(full.domain() == Code::IoError);
+  CHECK(!net::next_within(*client, &got, 200ms));
+  // The writer's failure sticks, so its footer fails too; the viewers are
+  // closed all the same.
+  CHECK(!coder.finish().ok() && coder.server() == nullptr);
+  CHECK(net::wait_end(*client, port));
   return 0;
 }
 
@@ -463,6 +574,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(source.ok());
   vkc::test::Scratch scratch("grid_codec_stream_audio_");
   CHECK(refused_sessions(gpu, scratch) == 0);
+  CHECK(serves(gpu, *source, scratch) == 0);
+  CHECK(unwritten_unserved(gpu, *source, scratch) == 0);
   CHECK(refused_records(gpu, *source, scratch) == 0);
   CHECK(muxed(gpu, *source, scratch) == 0);
   CHECK(bounded(gpu, *source, scratch) == 0);
