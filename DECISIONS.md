@@ -8421,10 +8421,12 @@ apart.
 params say (`stream/audio.hpp`): 8 bytes, little-endian, codec `u16`,
 channels `u16` (1 to 64) and sample rate `u32` (frames a second). The one
 codec, `AudioCodec::PcmS16` (1), is signed 16-bit little-endian samples, a
-record whole frames. Every record is a key, as each decodes alone; its pts
-is its first sample's capture time on the track's clock, its seq the
-source's chunk count. Width and height are 0, the sensor is the source's
-id, and the rate is nominal: 48 kHz in chunks of 960 is `{48000, 960}`.
+record whole frames. Every record is a key, as each decodes alone; each key
+costs 32 B of footer index, 5.76 MB an hour for a track of 20 ms records,
+which the writer holds until `finish`. A record's pts is its first sample's
+capture time on the track's clock, its seq the source's chunk count. Width
+and height are 0, the sensor is the source's id, and the rate is nominal:
+48 kHz in chunks of 960 is `{48000, 960}`.
 
 **No version change, no record flag.** Version 0's readers pass an unknown
 kind through, so a file with an Audio track reads wherever it did, and the
@@ -8461,5 +8463,4 @@ track's stats and keys alike both ways, seeking on the Audio track, and
 the Geometry track seeking as in a file of its records alone. Four planted
 bugs fail the tests: the sample rate big-endian in both directions, the
 more-than-64-channels check dropped, the channels checked before the
-codec, and a track entry's reserved word written nonzero (the geometry-only
-golden).
+codec, and a track entry's reserved word written nonzero (both goldens).

@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// Host-only tests of the .vrst container through its public API: golden
-// bytes, whose CRCs Python's zlib.crc32 computed, and a geometry-only file's,
-// written and served as before audio; the CRC of every length to
-// 64 at every alignment against a bitwise one; round trips of the session,
-// every record field and the payloads; seeking by key; unknown kinds, chunks
-// and header fields; the payload limit and a body size near 2^64; every
-// writer and reader refusal, a file cut short after its open included; reads
-// into caller memory; a payload appended in two runs, under the one CRC its
-// RecordPayload computed; two threads reading one reader; and a track's
-// nominal period, 30 a second's for an unknown rate.
+// Host-only tests of the .vrst container through its public API: golden bytes,
+// whose CRCs Python's zlib.crc32 computed, and a geometry-only file's, written
+// and served as before audio; the CRC of every length to 64 at every alignment
+// against a bitwise one; round trips of the session, every record field and the
+// payloads; seeking by key; unknown kinds, chunks and header fields; the
+// payload limit and a body size near 2^64; every writer and reader refusal, a
+// file cut short after its open included; reads into caller memory; a payload
+// appended in two runs, under the one CRC its RecordPayload computed; two
+// threads reading one reader; and a track's nominal period, 30 a second's for
+// an unknown rate.
 
 #include <sys/stat.h>
 #include <unistd.h>
