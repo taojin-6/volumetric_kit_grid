@@ -8515,11 +8515,14 @@ every key.
 
 **Why 1 s.** Memory stays bounded while the geometry stalls (a rig set may
 come up to 10 s late before the rig gives up): 1 s of a 48 kHz mono track in
-20 ms records is 50 records, 96 KB. Past it, records go out as they come,
-between the last frame and the next, where a reader still finds them. The
-bound is above the rig's capture-to-publish lag, so a run that keeps up
-never meets it; before the first frame it keeps what the first frame, about
-that lag behind, can still release.
+20 ms records is 50 records, 96 KB. The bound is in pts, not records, so it
+holds while a track's pts advance with its samples, the audio sensor's
+contract; records on a stuck stamp, which `append` takes while seq rises,
+can be held without limit. Past 1 s, records go out as they come, between
+the last frame and the next, where a reader still finds them. The bound is
+above the rig's capture-to-publish lag, so a run that keeps up never meets
+it; before the first frame it keeps what the first frame, about that lag
+behind, can still release.
 
 **Order checked at the call.** The writer checks a record's seq and key pts
 when it writes it, for a held record during a later frame's call, where a
@@ -8547,9 +8550,11 @@ tone, checks the sessions refused, naming the track, and a served one the
 server's `Unsupported`, no file made; each refusal of `append`, nothing
 changed; records held until a frame at or past their pts, equal pts
 included, released right after it, from a frame in halves too, in pts order
-across two tracks; dropped below the first frame, before it and after; the
-1 s bound, before the first frame and in a stall, at its boundary; `finish`
-writing what is held, or dropping it before any frame; and each file read
-back in order, every payload intact, each track's stats. Four planted bugs
-each fail it: no hold after the first frame, release below a frame's pts
-alone (`<` for `<=`), no flush in `finish`, and no stall bound.
+across two tracks; dropped below the first frame, before it and after, and
+one at its pts after it written at once; the 1 s bound, before the first
+frame and in a stall, at its boundary; `finish` writing what is held, or
+dropping it before any frame; and each file read back in order, every
+payload intact, each track's stats. Five planted bugs each fail it: no hold
+after the first frame, release below a frame's pts alone (`<` for `<=`),
+dropping a record at the first frame's pts (`<=` for `<`), no flush in
+`finish`, and no stall bound.

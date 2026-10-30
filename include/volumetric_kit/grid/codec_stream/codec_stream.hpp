@@ -206,8 +206,10 @@ class VGRID_CODEC_STREAM_API CodecStream {
   /// @return The frame; `Status::Code::InvalidArgument`, before anything is
   ///         encoded, for a @p set or @p pts_ns out of order or a finished or
   ///         moved-from stream; the encode's error; what
-  ///         @ref stream::StreamWriter::append returns; or the decode's
-  ///         error, the frame written and counted by @ref coded.
+  ///         @ref stream::StreamWriter::append returns for the frame; or,
+  ///         the frame written, served and counted by @ref coded, the
+  ///         writer's error on a record the frame releases (@ref append), or
+  ///         the decode's error.
   core::Result<SentFrame> code(volume::VoxelBlockGrid& grid, std::uint64_t set,
                                std::uint64_t pts_ns);
 
@@ -273,7 +275,8 @@ class VGRID_CODEC_STREAM_API CodecStream {
   /// @param rows     Optional: the frame's rows, `"crc"`, `"write"`,
   ///                 `"publish"` and the wait.
   /// @param sent     Optional: runs once the frame is written and served,
-  ///                 before the decode.
+  ///                 before the records it releases and the decode, so it
+  ///                 has run whenever the frame was counted.
   /// @return As @ref code; a @p set or @p pts_ns out of order, or a
   ///         finished stream, refused with @p pending dropped;
   ///         `Status::Code::InvalidArgument` on a moved-from stream.
@@ -298,7 +301,9 @@ class VGRID_CODEC_STREAM_API CodecStream {
   /// - At most @ref kHoldLimitNs of pts past the last frame is held: when
   ///   a record would be held further past it (the geometry stalls),
   ///   everything held goes out, in pts order, and so does each record
-  ///   after it until a frame catches up.
+  ///   after it until a frame catches up. The bound is in pts, so it bounds
+  ///   memory only while a track's pts advance with its samples, as an
+  ///   audio sensor's do.
   /// - @ref finish writes what is held, or drops it before any frame.
   ///
   /// Held records reach the file later, so the record rules are checked
