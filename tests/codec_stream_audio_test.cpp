@@ -9,10 +9,11 @@
 // included, then right after it, from a frame in halves too, in pts order
 // across two tracks, the lower track first at equal pts, and one at or below
 // the last frame's out at once; dropped below the first frame, before it and
-// after; the 1 s bound on what is held, before the first frame and while the
-// geometry stalls; finish writing what is held, or dropping it before any
-// frame; and each file read back: frames and records in that order, every
-// payload intact, each track's stats. The device part skips with no device.
+// after, and one at its pts after it out at once; the 1 s bound on what is
+// held, before the first frame and while the geometry stalls; finish writing
+// what is held, or dropping it before any frame; and each file read back:
+// frames and records in that order, every payload intact, each track's
+// stats. The device part skips with no device.
 
 #include <cmath>
 #include <cstddef>
@@ -286,12 +287,13 @@ int refused_records(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 
 // Two Audio tracks muxed with three frames, the second coded in halves. Held
 // before the first frame, which drops the one below its pts and releases the
-// one at it; one on track 2 below the first frame dropped at once; frame 1
-// releasing the two at or below its pts, and one at its pts appended after
-// it going out at once; five across both tracks held for frame 2, which
-// releases four in pts order, track 1 first at equal pts; finish writing the
-// last. The file: each record right after its frame, the records' pts never
-// going back, each payload its tone, each track's stats.
+// one at it; one on track 2 below the first frame dropped at once, and one
+// at it going out at once; frame 1 releasing the two at or below its pts,
+// and one at its pts appended after it going out at once; five across both
+// tracks held for frame 2, which releases four in pts order, track 1 first
+// at equal pts; finish writing the last. The file: each record right after
+// its frame, the records' pts never going back, each payload its tone, each
+// track's stats.
 int muxed(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
           const vkc::test::Scratch& scratch) {
   const fs::path path = scratch.path / "muxed.vrst";
@@ -309,6 +311,11 @@ int muxed(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   CHECK(same(read_back(path.string()), {{0, 0, kT0}, {1, 1, kT0}}));
   CHECK(append(coder, 2, 0, kT0 - 5 * kMs).ok());
   CHECK(counts_are(coder, 2, 0, 1, 0));
+  // At the first frame's pts, after it: out at once, not dropped.
+  CHECK(append(coder, 2, 1, kT0).ok());
+  CHECK(counts_are(coder, 2, 0, 1, 1));
+  CHECK(
+      same(read_back(path.string()), {{0, 0, kT0}, {1, 1, kT0}, {2, 1, kT0}}));
 
   {  // Frame 1 in halves.
     vkc::CommandBatch front(gpu.device, gpu.allocator);
@@ -321,33 +328,34 @@ int muxed(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
     CHECK(coder.finish_frame(*pending, 1, kT0 + 40 * kMs).ok());
   }
   CHECK(counts_are(coder, 1, 0, 1, 3));
-  CHECK(append(coder, 2, 1, kT0 + 40 * kMs).ok());
-  CHECK(counts_are(coder, 2, 0, 1, 1));
+  CHECK(append(coder, 2, 2, kT0 + 40 * kMs).ok());
+  CHECK(counts_are(coder, 2, 0, 1, 2));
 
   CHECK(append(coder, 1, 4, kT0 + 60 * kMs).ok());
-  CHECK(append(coder, 2, 2, kT0 + 50 * kMs).ok());
-  CHECK(append(coder, 2, 3, kT0 + 80 * kMs).ok());
+  CHECK(append(coder, 2, 3, kT0 + 50 * kMs).ok());
+  CHECK(append(coder, 2, 4, kT0 + 80 * kMs).ok());
   CHECK(append(coder, 1, 5, kT0 + 80 * kMs).ok());
-  CHECK(append(coder, 2, 4, kT0 + 90 * kMs).ok());
-  CHECK(counts_are(coder, 1, 2, 1, 3) && counts_are(coder, 2, 3, 1, 1));
+  CHECK(append(coder, 2, 5, kT0 + 90 * kMs).ok());
+  CHECK(counts_are(coder, 1, 2, 1, 3) && counts_are(coder, 2, 3, 1, 2));
   CHECK(coder.code(source, 2, kT0 + 80 * kMs).ok());
-  CHECK(counts_are(coder, 1, 0, 1, 5) && counts_are(coder, 2, 1, 1, 3));
+  CHECK(counts_are(coder, 1, 0, 1, 5) && counts_are(coder, 2, 1, 1, 4));
   CHECK(coder.finish().ok());
-  CHECK(counts_are(coder, 1, 0, 1, 5) && counts_are(coder, 2, 0, 1, 4));
+  CHECK(counts_are(coder, 1, 0, 1, 5) && counts_are(coder, 2, 0, 1, 5));
 
   const std::vector<Entry> got = read_back(path.string());
   CHECK(same(got, {{0, 0, kT0},
                    {1, 1, kT0},
+                   {2, 1, kT0},
                    {0, 1, kT0 + 40 * kMs},
                    {1, 2, kT0 + 20 * kMs},
                    {1, 3, kT0 + 40 * kMs},
-                   {2, 1, kT0 + 40 * kMs},
+                   {2, 2, kT0 + 40 * kMs},
                    {0, 2, kT0 + 80 * kMs},
-                   {2, 2, kT0 + 50 * kMs},
+                   {2, 3, kT0 + 50 * kMs},
                    {1, 4, kT0 + 60 * kMs},
                    {1, 5, kT0 + 80 * kMs},
-                   {2, 3, kT0 + 80 * kMs},
-                   {2, 4, kT0 + 90 * kMs}}));
+                   {2, 4, kT0 + 80 * kMs},
+                   {2, 5, kT0 + 90 * kMs}}));
   // Across tracks, a record's pts never below the one before it, and never
   // above the frame before it but for the last, which finish wrote.
   std::uint64_t last = 0;
@@ -370,8 +378,8 @@ int muxed(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   CHECK(reader->stats()[0].records == 3);
   CHECK(one.records == 5 && one.keys == 5 && one.payload_bytes == 5 * chunk);
   CHECK(one.min_pts_ns == kT0 && one.max_pts_ns == kT0 + 80 * kMs);
-  CHECK(two.records == 4 && two.keys == 4 && two.payload_bytes == 4 * chunk);
-  CHECK(two.min_pts_ns == kT0 + 40 * kMs && two.max_pts_ns == kT0 + 90 * kMs);
+  CHECK(two.records == 5 && two.keys == 5 && two.payload_bytes == 5 * chunk);
+  CHECK(two.min_pts_ns == kT0 && two.max_pts_ns == kT0 + 90 * kMs);
   return 0;
 }
 
