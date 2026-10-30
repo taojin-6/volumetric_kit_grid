@@ -94,8 +94,8 @@ class ReplayLoop {
       std::uint64_t step = 0;
       if (frames > 1) step = (most0 - least0) / (frames - 1);
       if (step == 0) {
-        step = vgrid::stream::nominal_period_ns(
-            reader.session().tracks[0].rate);
+        step =
+            vgrid::stream::nominal_period_ns(reader.session().tracks[0].rate);
       }
       loop.first_pts_ = least;
       loop.pass_ns_ = most - least + step;

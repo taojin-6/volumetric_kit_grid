@@ -864,7 +864,8 @@ int audio_burst_case(bool replay) {
   std::vector<Got> got;
   CHECK(slow_viewer_gets(replay, burst, &got) == 0);
   CHECK(got.size() == 1 + burst.size());
-  for (std::size_t i = 0; i < burst.size(); ++i) CHECK(is(got[i + 1], burst[i]));
+  for (std::size_t i = 0; i < burst.size(); ++i)
+    CHECK(is(got[i + 1], burst[i]));
   return 0;
 }
 

@@ -363,9 +363,8 @@ std::vector<stream::RecordInfo> muxed_infos() {
   const auto chunk = [](std::uint64_t j) {
     return vrst::info(1, true, kT - 20 * kMs + 20 * kMs * j, j);
   };
-  return {chunk(0), frame(0), chunk(1), frame(1), chunk(2),
-          chunk(3), frame(2), chunk(4), chunk(5), frame(3),
-          chunk(6), chunk(7), chunk(8), chunk(9)};
+  return {chunk(0), frame(0), chunk(1), frame(1), chunk(2), chunk(3), frame(2),
+          chunk(4), chunk(5), frame(3), chunk(6), chunk(7), chunk(8), chunk(9)};
 }
 
 // A two-track file at `path` of muxed_infos(), each with its payload.

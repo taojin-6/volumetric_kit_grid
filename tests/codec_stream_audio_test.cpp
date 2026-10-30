@@ -258,8 +258,9 @@ int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
   outputs.serve->replay_gop = false;
   codec::EncoderConfig config;
   config.intra_period = 3;
-  vkc::Result<codec_stream::CodecStream> made = codec_stream::CodecStream::create(
-      gpu.device, gpu.allocator, config, session(1), outputs);
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, config,
+                                        session(1), outputs);
   CHECK(made.ok());
   codec_stream::CodecStream& coder = made.value();
   CHECK(coder.server() != nullptr);
@@ -304,8 +305,9 @@ int serves(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 int unwritten_unserved(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
                        const vkc::test::Scratch& scratch) {
   const fs::path path = scratch.path / "full.vrst";
-  vkc::Result<codec_stream::CodecStream> made = codec_stream::CodecStream::create(
-      gpu.device, gpu.allocator, {}, session(1), served(path));
+  vkc::Result<codec_stream::CodecStream> made =
+      codec_stream::CodecStream::create(gpu.device, gpu.allocator, {},
+                                        session(1), served(path));
   CHECK(made.ok());
   codec_stream::CodecStream& coder = made.value();
   const std::uint16_t port = coder.server()->port();
