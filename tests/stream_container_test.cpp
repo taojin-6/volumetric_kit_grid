@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Tao Jin
 
 // Host-only tests of the .vrst container through its public API: golden
-// bytes, whose CRCs Python's zlib.crc32 computed; the CRC of every length to
+// bytes, whose CRCs Python's zlib.crc32 computed, and a geometry-only file's,
+// written and served as before audio; the CRC of every length to
 // 64 at every alignment against a bitwise one; round trips of the session,
 // every record field and the payloads; seeking by key; unknown kinds, chunks
 // and header fields; the payload limit and a body size near 2^64; every
@@ -21,9 +22,11 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "volumetric_kit/core/testing/test_check.hpp"
+#include "volumetric_kit/grid/stream/chunks.hpp"
 #include "volumetric_kit/grid/stream/stream_reader.hpp"
 #include "volumetric_kit/grid/stream/stream_writer.hpp"
 #include "volumetric_kit/grid/testing/stream_files.hpp"
@@ -230,6 +233,75 @@ int golden_case(const std::string& dir) {
     const vrst::ReadBack back = vrst::read_all(*r);
     CHECK(back.payloads.size() == 1 && back.payloads[0] == payload);
   }
+  return 0;
+}
+
+// --- A geometry-only file, as before audio. ----------------------------------
+
+// A live codec stream's session, one Geometry track as codec_session makes
+// it, and four records, finished: the 552 bytes grid 0.3.1's StreamWriter
+// wrote (d1fcbc4, before kind 2 was Audio), each CRC checked by Python's
+// zlib.crc32. A session with no audio writes them still, and serves them up
+// to the footer.
+constexpr const char* kGoldenGeometryOnly =
+    "56525354380000003500000000000000a38b36f2000000000000000000000000"
+    "000000000000000000000000000000000100000087e56c520100010019000000"
+    "010000000000000000000000000000000b000000667573655f6f726262656302"
+    "0000007b7d000000000000000000000052454344380000000b00000000000000"
+    "f6076c1d00000100008048fdc32b731800000000000000000000000000000000"
+    "000000003a739f918512beb7a0556fc6d7290f00000000005245434438000000"
+    "0300000000000000b5e451950000000000daaaffc32b73180100000000000000"
+    "01000000000000000000000026f465209ea3d700000000005245434438000000"
+    "0000000000000000000000000000000000340d02c42b73180200000000000000"
+    "020000000000000000000000be845dc852454344380000000800000000000000"
+    "1683e48400000100008e6f04c42b731803000000000000000300000000000000"
+    "000000007970287db733f0634bff3430494e4458280000006800000000000000"
+    "81519e3901000000020000000000000000000000287dbfb50400000000000000"
+    "02000000000000001600000000000000008048fdc32b7318008e6f04c42b7318"
+    "7000000000000000008048fdc32b731800000000000000000000000000000000"
+    "3001000000000000008e6f04c42b731803000000000000000000000000000000"
+    "5441494c28000000000000000000000000000000000000007001000000000000"
+    "00000000efc2fcbc";
+
+int geometry_only_case(const std::string& dir) {
+  stream::Session s;
+  s.writer = "fuse_orbbec";
+  s.calibration = "{}";
+  stream::Track t = geometry();
+  t.rate = {25, 1};
+  s.tracks = {t};
+  const std::uint64_t t0 = 1761800000000000000ull;
+  struct Record {
+    stream::RecordInfo info;
+    Bytes payload;
+  };
+  const Record records[] = {
+      {info(0, true, t0, 0, 0), pattern(11, 1)},
+      {info(0, false, t0 + 40000000, 1, 1), pattern(3, 2)},
+      {info(0, false, t0 + 80000000, 2, 2), {}},
+      {info(0, true, t0 + 120000000, 3, 3), pattern(8, 3)}};
+  const std::string path = dir + "/geometry_only.vrst";
+  auto w = create(path, s);
+  CHECK(w != nullptr);
+  for (const Record& r : records) CHECK(append(*w, r.info, r.payload));
+  CHECK(w->finish().ok());
+  const Bytes expected = unhex(kGoldenGeometryOnly);
+  CHECK(vkc::test::read_bytes(path) == expected);
+
+  // The wire: the session chunk and each record's, the file but its footer.
+  vkc::Result<stream::ChunkEncoder> encoder = stream::ChunkEncoder::create(s);
+  CHECK(encoder.ok());
+  Bytes wire = encoder->session_chunk();
+  for (const Record& r : records) {
+    const vkc::Result<stream::ChunkEncoder::RecordFraming> framing =
+        encoder->frame(r.info, r.payload.data(), r.payload.size());
+    CHECK(framing.ok());
+    wire.insert(wire.end(), framing->header.begin(), framing->header.end());
+    wire.insert(wire.end(), r.payload.begin(), r.payload.end());
+    wire.resize(wire.size() + framing->padding, 0);
+  }
+  CHECK(wire.size() == 368);
+  CHECK(Bytes(expected.begin(), expected.begin() + 368) == wire);
   return 0;
 }
 
@@ -931,6 +1003,7 @@ int main() {
   const std::string dir = scratch.path.string();
   if (crc_case(dir) != 0) return 1;
   if (golden_case(dir) != 0) return 1;
+  if (geometry_only_case(dir) != 0) return 1;
   if (round_trip_case(dir) != 0) return 1;
   if (seek_case(dir) != 0) return 1;
   if (unknown_case(dir) != 0) return 1;
