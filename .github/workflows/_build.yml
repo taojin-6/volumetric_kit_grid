@@ -1,10 +1,10 @@
 name: build (reusable)
 
 # Reusable build & test for one OS leg. ci.yml calls this once per entry in its
-# build matrix. Every leg runs on a self-hosted runner: the Ubuntu legs in an
-# OS-matched container with the GPU passed through (pass `container`), the
-# macOS leg directly on the Mac. The dependency-install steps key off
-# `runner.os` (Linux/macOS).
+# build matrix. Every leg runs on a self-hosted runner: the Ubuntu legs in a
+# job container of their release's CI image with the GPU passed through (pass
+# `image`), the macOS leg directly on the Mac, which checks its Homebrew
+# formulae.
 on:
   workflow_call:
     inputs:
@@ -17,17 +17,17 @@ on:
           The self-hosted runner label this leg runs on (vk-linux-gpu, mac).
         required: true
         type: string
-      container:
+      image:
         description: >-
-          JSON for the job container, e.g.
-          '{"image":"ubuntu:24.04","options":"--gpus all"}', or '' for none.
+          The job container's image, the CI image of the leg's Ubuntu release
+          by digest, or '' to run on the runner itself (macOS).
         required: false
         type: string
         default: ''
       assimp:
         description: >-
-          Install Assimp and build the optional mesh loader with
-          VGRID_WITH_ASSIMP=ON.
+          Build the optional mesh loader with VGRID_WITH_ASSIMP=ON (the macOS
+          leg checks the assimp formula too).
         required: false
         type: boolean
         default: false
@@ -46,16 +46,46 @@ on:
         type: boolean
         default: false
 
+# packages: the image is pulled from the core's GHCR package with the job's
+# token; ci.yml grants it too.
 permissions:
   contents: read
+  packages: read
 
 jobs:
   build:
     runs-on: [self-hosted, '${{ inputs.runner }}']
-    # Render the container JSON to a map only when one was requested; the
-    # macOS leg passes '' and runs directly on the runner. `&&` short-circuits,
-    # so fromJSON is never handed the empty string.
-    container: ${{ inputs.container != '' && fromJSON(inputs.container) || null }}
+    # The image holds everything the Linux legs build and test with (the
+    # core's tools/ci/images). Its only Vulkan driver is the NVIDIA ICD the
+    # container toolkit mounts (NVIDIA_DRIVER_CAPABILITIES=all), so the tests
+    # run on the real GPU, and the GPU diagnostic below fails the leg without
+    # it. An empty image runs the job on the runner itself: the macOS leg.
+    # The token can be named only here, under `credentials`, so the container
+    # is a mapping, not JSON from the caller.
+    container:
+      image: ${{ inputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --gpus all
+      # A runner's .env reaches jobs run directly on it (the Mac) but not a
+      # job container, where ctest would otherwise run the suite one test at a
+      # time, so the build and test fan-out is set here: 4 is a 24-core host
+      # over grid's 6 runners.
+      # TODO: recon's and gfx's 6 runners share each host, so 2 would match the
+      # split the core's setup-runners.sh writes for jobs on the host.
+      #
+      # So is the NVIDIA driver's shader cache. By default it lives under
+      # $HOME/.cache, which a job container lacks, and the driver then caches
+      # nothing, so every test process compiled every pipeline cold. /__w/_tool,
+      # the runner's tool cache, outlives the job, so the cache stays warm
+      # across runs (the driver keys it by driver and GPU).
+      env:
+        NVIDIA_DRIVER_CAPABILITIES: all
+        CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        CTEST_PARALLEL_LEVEL: '4'
+        __GL_SHADER_DISK_CACHE_PATH: /__w/_tool/nvidia-glcache
+        __GL_SHADER_DISK_CACHE_SKIP_CLEANUP: '1'
     timeout-minutes: 30
     defaults:
       run:
@@ -64,9 +94,8 @@ jobs:
         shell: bash
     env:
       # 'true' when this leg runs in a container (the self-hosted GPU boxes'
-      # Ubuntu legs, where the image is a bare ubuntu:* with the GPU passed
-      # through); drives the toolchain install and the GPU check below.
-      IN_CONTAINER: ${{ inputs.container != '' }}
+      # Ubuntu legs); drives the GPU check below.
+      IN_CONTAINER: ${{ inputs.image != '' }}
     strategy:
       fail-fast: false
       # One job per build type the caller asks for: ci.yml runs an optimized
@@ -75,52 +104,16 @@ jobs:
       matrix:
         build_type: ${{ fromJSON(inputs.build_types) }}
     steps:
-      # Bare ubuntu:* images lack git (actions/checkout and FetchContent need
-      # it) and sudo (the install steps use it); we run as root in the
-      # container, so install them before anything else. The NVIDIA driver's
-      # shader cache directory, which the container env names (ci.yml says
-      # why), is made here: the driver creates nothing above its own GLCache.
-      - name: Bootstrap container
-        if: inputs.container != ''
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates git sudo
-          if [ -n "${__GL_SHADER_DISK_CACHE_PATH:-}" ]; then
-            mkdir -p "${__GL_SHADER_DISK_CACHE_PATH}"
-          fi
+      # The shader cache directory the container env names is made here: the
+      # driver creates nothing above its own GLCache, and the image cannot
+      # hold it, as /__w is mounted at run time.
+      - name: Shader cache directory
+        if: inputs.image != ''
+        run: mkdir -p "${__GL_SHADER_DISK_CACHE_PATH}"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          # libglm-dev supplies the GLM headers + CMake config that grid_base's
-          # vector/matrix types alias. vulkan-tools provides vulkaninfo;
-          # glslang-tools/spirv-tools cover the compute-shader toolchain.
-          pkgs="cmake libglm-dev libvulkan-dev vulkan-validationlayers spirv-tools glslang-tools vulkan-tools"
-          if [ "$IN_CONTAINER" = "true" ]; then
-            # A bare container lacks a C/C++ toolchain and make, and the two
-            # client libraries the NVIDIA Vulkan ICD needs before it will hand
-            # the loader a vkCreateInstance: libGLX_nvidia.so.0 links
-            # libXext.so.6 and dlopens libEGL.so.1 while initialising. Without
-            # them the ICD the toolkit mounts is found and then discarded
-            # ("Found no drivers!"), and every GPU test would fail.
-            pkgs="$pkgs build-essential libxext6 libegl1"
-          fi
-          if [ "${{ inputs.assimp }}" = "true" ]; then
-            # Ubuntu's Assimp CMake export references libz.so but does not
-            # pull in the development package that provides that link.
-            pkgs="$pkgs libassimp-dev zlib1g-dev"
-          fi
-          # shellcheck disable=SC2086  # intentional: split $pkgs into separate args
-          sudo apt-get install -y --no-install-recommends $pkgs
-          # The loader is pinned to nothing: the NVIDIA Vulkan ICD injected by
-          # the container toolkit is then the only ICD, so the Vulkan tests run
-          # on the real GPU — and if it is absent, the GPU diagnostic below
-          # fails the leg.
 
       # The leg's Homebrew formulae, named once for the key below: glm
       # supplies the GLM math headers grid_base's types alias; molten-vk is
@@ -211,15 +204,16 @@ jobs:
       #
       # The key also hashes the dep-pin home (third_party/CMakeLists.txt) and
       # the root list, so a FetchContent version bump busts the cache. And it
-      # carries the Homebrew key (`none` off macOS), in the restore prefix too,
-      # so no tree built on other Homebrew versions is restored.
+      # carries the Homebrew key (`none` off macOS) and the image (on Linux),
+      # in the restore prefix too, so no tree built on other Homebrew versions
+      # or in another image is restored.
       - name: Cache third-party deps
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build/_deps
-          key: deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}-ws${{ steps.ws.outputs.hash }}-${{ hashFiles('third_party/CMakeLists.txt', 'CMakeLists.txt') }}
+          key: deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}${{ inputs.image && format('-{0}', inputs.image) || '' }}-ws${{ steps.ws.outputs.hash }}-${{ hashFiles('third_party/CMakeLists.txt', 'CMakeLists.txt') }}
           restore-keys: |
-            deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}-ws${{ steps.ws.outputs.hash }}-
+            deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}${{ inputs.image && format('-{0}', inputs.image) || '' }}-ws${{ steps.ws.outputs.hash }}-
 
       # A self-hosted runner keeps its _work tree between jobs, so a build/ left
       # by a previous checkout survives a runner relocation with the old absolute
