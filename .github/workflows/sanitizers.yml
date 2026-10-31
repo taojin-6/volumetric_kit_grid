@@ -10,24 +10,30 @@ name: sanitizers
 # and the concurrency group.
 #
 # It runs on the owner's Linux GPU boxes in a job container of ci.yml's
-# ubuntu-26.04 image, the hosts' own release, and installs what it needs
-# there, as _build.yml's container legs do. No GPU is passed through: the
-# loader is pinned to lavapipe, so no driver whose allocations LSan would
-# report as leaks is loaded.
+# ubuntu-26.04 image, the hosts' own release, which holds clang, its sanitizer
+# runtimes, llvm-symbolizer and lavapipe. No GPU is passed through: the loader
+# is pinned to lavapipe, so no driver whose allocations LSan would report as
+# leaks is loaded.
 on:
   workflow_call:
 
+# packages, for the image, as in _build.yml; ci.yml grants it too.
 permissions:
   contents: read
+  packages: read
 
 jobs:
   asan-ubsan-lsan:
     runs-on: [self-hosted, vk-linux-gpu]
-    # ubuntu:26.04, pinned by digest as ci.yml pins it. A runner's .env does
-    # not reach a job container, so the build and test fan-out is set here,
-    # as ci.yml sets it for its legs.
+    # Pinned by digest and pulled with the job's token as in _build.yml. A
+    # runner's .env does not reach a job container, so the build and test
+    # fan-out is set here, as _build.yml sets it for its legs.
     container:
-      image: ubuntu@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+      # ghcr.io/taojin-6/volumetric_kit_ci:ubuntu-26.04
+      image: ghcr.io/taojin-6/volumetric_kit_ci@sha256:b39be8613b4e8140a45c98cfc23bb1f40f98300d213fdab901c3108f02df626e
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
       env:
         CMAKE_BUILD_PARALLEL_LEVEL: '4'
         CTEST_PARALLEL_LEVEL: '4'
@@ -44,33 +50,21 @@ jobs:
       # root's files would outlive it.
       XDG_CACHE_HOME: /tmp
     steps:
-      # The bare image lacks git, which the checkout needs, and the
-      # toolchain. Ubuntu packages clang's sanitizer runtimes apart from it
-      # (libclang-rt-dev), its llvm-symbolizer too (llvm), and lavapipe in
-      # mesa-vulkan-drivers.
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates git \
-            clang libclang-rt-dev llvm cmake make libglm-dev libvulkan-dev \
-            vulkan-validationlayers spirv-tools glslang-tools vulkan-tools \
-            mesa-vulkan-drivers
-
       # The job runs as root, as the build legs do, so it checks out where
       # they do and cleans what they leave.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # lavapipe's ICD is found, not hardcoded, as its path moves between Mesa
-      # versions, and the loader is pinned to it alone. The suppressions'
-      # path is absolute, as ctest changes cwd per test, and is the
-      # container's: ${{ github.workspace }} names the host's.
+      # The image keeps lavapipe's ICD out of the loader's search path and
+      # names it in VKC_CI_LAVAPIPE_ICD; the loader is pinned to it alone.
+      # The suppressions' path is absolute, as ctest changes cwd per test, and
+      # is the container's: ${{ github.workspace }} names the host's.
       - name: Pin the loader to lavapipe, point LSan at the suppressions
         run: |
-          icd=""; for f in /usr/share/vulkan/icd.d/lvp_icd*.json; do [ -e "$f" ] && { icd="$f"; break; }; done
-          if [ -z "$icd" ]; then
-            echo "::error::mesa-vulkan-drivers installed no lavapipe ICD"
+          icd="${VKC_CI_LAVAPIPE_ICD:-}"
+          if [ -z "$icd" ] || [ ! -r "$icd" ]; then
+            echo "::error::the image names no readable lavapipe ICD (VKC_CI_LAVAPIPE_ICD='${icd}')"
             exit 1
           fi
           echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
@@ -123,7 +117,7 @@ jobs:
           cc=$(clang --version | head -1 | hash)
           os=$(. /etc/os-release && printf '%s%s' "${ID}" "${VERSION_ID}")
           pk=$(dpkg-query -W -f='${Package}=${Version}\n' \
-            libvulkan-dev libglm-dev glslang-tools | hash)
+            libvulkan-dev libglm-dev glslc | hash)
           echo "key=sanitizers-deps-ws${ws}-cc${cc}-${os}-pk${pk}" >> "${GITHUB_OUTPUT}"
 
       - name: Cache third-party deps
