@@ -204,15 +204,16 @@ jobs:
       #
       # The key also hashes the dep-pin home (third_party/CMakeLists.txt) and
       # the root list, so a FetchContent version bump busts the cache. And it
-      # carries the Homebrew key (`none` off macOS), in the restore prefix too,
-      # so no tree built on other Homebrew versions is restored.
+      # carries the Homebrew key (`none` off macOS) and the image (on Linux),
+      # in the restore prefix too, so no tree built on other Homebrew versions
+      # or in another image is restored.
       - name: Cache third-party deps
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build/_deps
-          key: deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}-ws${{ steps.ws.outputs.hash }}-${{ hashFiles('third_party/CMakeLists.txt', 'CMakeLists.txt') }}
+          key: deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}${{ inputs.image && format('-{0}', inputs.image) || '' }}-ws${{ steps.ws.outputs.hash }}-${{ hashFiles('third_party/CMakeLists.txt', 'CMakeLists.txt') }}
           restore-keys: |
-            deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}-ws${{ steps.ws.outputs.hash }}-
+            deps-${{ inputs.os }}-${{ matrix.build_type }}-brew${{ steps.brew.outputs.key || 'none' }}${{ inputs.image && format('-{0}', inputs.image) || '' }}-ws${{ steps.ws.outputs.hash }}-
 
       # A self-hosted runner keeps its _work tree between jobs, so a build/ left
       # by a previous checkout survives a runner relocation with the old absolute
