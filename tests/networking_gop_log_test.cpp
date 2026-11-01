@@ -18,8 +18,9 @@
 // draining counts each viewer in still to send the newest key's records,
 // the one under way included, and none waiting; and, over seeded random runs,
 // the bytes held stay within max_gop_bytes, none with no viewer in, the count
-// is exactly the joins, the fall-backs and the waits a lost key ends, and each
-// viewer's records are its key's run, broken only by the newest key.
+// is exactly the joins, the fall-backs and the waits a lost key ends, each
+// viewer's records are its key's run, broken only by the newest key, and a
+// key made while draining is 0 breaks none.
 
 #include <cstddef>
 #include <cstdint>
@@ -501,8 +502,11 @@ int on_demand_draining_case() {
 // each join, each viewer in that falls back, and each viewer waiting when a
 // key is lost, and by none for a key kept; a viewer's first chunk is the
 // newest key kept, and so is the next chunk of one that has not had it;
-// otherwise each chunk follows the one it got before.
+// otherwise each chunk follows the one it got before; a key appended while
+// draining() is 0 finds each viewer in holding every record before it, so
+// its run goes on unbroken.
 int on_demand_random_case() {
+  std::uint64_t quiet_keys = 0;  // keys made at 0 with a viewer in
   for (std::uint32_t seed = 1; seed <= 40; ++seed) {
     std::mt19937 rng(seed);
     const auto pick = [&rng](std::uint64_t low, std::uint64_t high) {
@@ -529,6 +533,15 @@ int on_demand_random_case() {
       const std::uint64_t what = pick(0, 99);
       if (what < 30) {
         const bool key = pick(0, 9) == 0;
+        if (key && log.draining() == 0) {
+          bool any_in = false;
+          for (const Viewer& v : viewers) {
+            if (v.cursor.waiting) continue;
+            CHECK(v.any && v.last + 1 == seq);
+            any_in = true;
+          }
+          quiet_keys += any_in ? 1 : 0;
+        }
         before();
         if (log.append(chunk(seq, key, pick(9, 600)), key) && key) {
           newest = seq;
@@ -585,6 +598,7 @@ int on_demand_random_case() {
     }
     CHECK(got > 0 && jumps > 0);
   }
+  CHECK(quiet_keys > 0);
   return 0;
 }
 

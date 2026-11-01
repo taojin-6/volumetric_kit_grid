@@ -43,7 +43,8 @@ class GopLog {
   // the key of the GOP there is at its first chunk, or of the next. Keys on
   // demand: whether it waits for a key, and once one let it in, the number
   // of its next record (the log numbers the records it keeps), and whether
-  // it still sends the chunk its last next() handed it since then.
+  // the chunk its last next() handed out is still under way (a key's let-in
+  // clears it).
   struct Cursor {
     std::uint64_t gop = 0;
     std::uint64_t next = 0;

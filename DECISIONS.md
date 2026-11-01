@@ -469,13 +469,9 @@ entries relevant to your task; later amendments supersede earlier rules.
   so a viewer gets the records `finish` writes past the last frame. The
   destructor still closes at once; without audio, every byte is as before.
 - [**2026-11-01**](#2026-11-01--streamserverdraining-counts-the-viewers-still-sending-the-newest-keys-records-each-until-it-would-take-its-next-so-a-sender-may-wait-to-make-a-key-amends-the-2026-10-21-networking-entry) —
-  `StreamServer::draining()` counts, without `replay_gop`, each viewer
-  going on from the newest key that has not yet sent it and every record
-  after it, a record counting until the viewer would take its next (its
-  last byte written, its socket polling writable). A key made meanwhile
-  makes those viewers skip what they have not begun, so a live sender may
-  wait to make one until the count is 0. Read under the server's lock;
-  the record path takes no extra lock and allocates nothing.
+  `StreamServer::draining()` counts the viewers still sending the newest
+  key and the records after it, so a live sender may wait to make a key
+  until none would skip a record.
 
 ## Decision record
 
@@ -8744,8 +8740,10 @@ while viewers still drain the last one; it has to know when they have.
 **The rule.** Without `replay_gop`, `draining()` counts each viewer going
 on from the newest track-0 key that has not yet sent that key and every
 record published after it. A record is sent once the viewer's thread has
-written its last byte to the socket and the socket polls writable again
-(under 128 KiB unsent), when the viewer would take its next. A viewer
+written its last byte to the socket and the socket polls writable again,
+when the viewer would take its next. A record counts every viewer in from
+its publish and the count only falls until the next, so a sender reads it
+just before publishing a key, with nothing published in between. A viewer
 waiting for a key, a joiner or one fallen back, never counts: a key is
 what it wants. With `replay_gop` it is 0, as `key_wanted()` is.
 
@@ -8769,17 +8767,11 @@ record path only sets a flag where it already holds the lock. A count, as
 
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer with a device required: the full suite passes, 72
-of 72, and the two changed tests 3 runs of 3. `grid_networking_gop_log`:
-none with no viewer or with viewers waiting; a key counts each viewer it
-lets in; one holding the key under way counts with nothing after it and
-with a record to take, until it asks again and gets none; one that falls
-back does not, its chunk under way still; one that leaves does not;
-replaying, none. `grid_networking_server`, on loopback: a raw viewer
-reading nothing after its session counts while it holds a key of 1 MiB
-under way, 200 ms on, and with a P-frame to take, until it drains, while a
-client reading soon does not; a joiner then waits and does not count; in
-the fall-back case, the viewer fallen back does not count, and the key
-counts it again until it drains. Five planted bugs each fail both tests: a
-waiting viewer counted, the record under way not counted, the records
-still to take not counted, a viewer that has sent everything counted, and
-the record under way never cleared.
+of 72. `grid_networking_gop_log` checks the count case by case and, over
+its seeded random runs, that a key made at 0 finds every viewer in holding
+every record before it; `grid_networking_server` checks it on loopback,
+with a raw viewer holding a key of 1 MiB under way and in the fall-back
+case. Five planted bugs each fail both tests: a waiting viewer counted,
+the record under way not counted, the records still to take not counted,
+a viewer that has sent everything counted, and the record under way never
+cleared; the random runs alone catch the records still to take.
