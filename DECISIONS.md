@@ -467,6 +467,11 @@ entries relevant to your task; later amendments supersede earlier rules.
   (1 s). `CodecStream::finish` writes the footer, then finishes the server,
   so a viewer gets the records `finish` writes past the last frame. The
   destructor still closes at once; without audio, every byte is as before.
+- [**2026-11-01**](#2026-11-01--a-senders-socket-to-a-viewer-that-is-not-on-loopback-uses-bbr-on-linux-when-the-kernel-allows-it-else-the-kernels-default) —
+  On Linux a sender's socket to a viewer that is not on loopback uses BBR
+  when `tcp_allowed_congestion_control` lists it, else the kernel's default,
+  said once a process: CUBIC collapses on loss at a long round trip and
+  decays while a stream idles between frames.
 
 ## Decision record
 
@@ -8721,3 +8726,49 @@ planted bugs each fail `grid_networking_server`: no wait, as before (the
 reading-nothing case), an unbounded wait (the stalled viewer holds
 `finish` for its 10 s `stall_limit`), and admitting a viewer during the
 wait.
+
+### 2026-11-01 — A sender's socket to a viewer that is not on loopback uses BBR on Linux when the kernel allows it, else the kernel's default.
+
+Viewers reach a live sender across the country over a VPN, at round trips
+of 70 to 250 ms with some loss.
+
+**Why BBR.** CUBIC takes each loss for congestion and cuts its window, which
+regrows slowly at a long round trip, so its rate falls with the loss rate:
+by its response function (RFC 8312), at 100 ms about 20 Mbit/s at 0.01 %
+loss and 4 Mbit/s at 0.1 %, well below the 75 Mbit/s (9.4 MB/s) the rig's
+stream needs at 1 cm (the 2026-10-21 entry). BBR paces at the bandwidth and
+round trip it measures and does not take a random loss for congestion. It
+also skips the decay of a window left idle or unused
+(`tcp_slow_start_after_idle`), which a stream sent frame by frame meets
+between frames on a host that leaves that on. Its known costs: Linux's BBR
+(v1) drops to 4 packets for about 200 ms every 10 s to measure the round
+trip again, and since it ignores loss, at a shallow bottleneck, as a
+viewer's home link, it can retransmit heavily and crowd out other traffic.
+
+**The rule.** `accept_next` sets `TCP_CONGESTION` to `bbr` on each accepted
+socket whose peer is not in 127.0.0.0/8, when
+`/proc/sys/net/ipv4/tcp_allowed_congestion_control` lists it, read at each
+accept so a change reaches the next viewer. Linux limits a process without
+`CAP_NET_ADMIN` to the listed algorithms; `accept_next` consults the list
+itself, so one the kernel would let choose any, as root, behaves as every
+other. Otherwise, or if the kernel refuses, the socket keeps the kernel's
+default, said once a process at Info, and the accept goes on. Loopback has
+no loss or long round trip and keeps the default, so the loopback tests'
+measured behaviour stands. Apple has no `TCP_CONGESTION`, and nothing
+changes there. No option: nothing needs another algorithm. The list is
+global: a container sees its host's, read-only, and its network namespace
+starts with the host's default, so a CI job container tests what its host
+allows.
+
+**Verification.** Linux 7.0 (Ubuntu 26.04), Release: the networking tests
+pass on a host whose list has bbr, where `grid_networking_socket` finds a
+socket accepted from the host's own LAN address using bbr and one from
+loopback the default, cubic; so does that test in the CI's ubuntu:26.04 job
+container on that host, as root, and on a host whose list lacks bbr, where
+both keep cubic, said once. By hand, `serve_stream` on the first host with
+a viewer across the LAN and one on loopback: `ss -tin` showed `bbr` and
+`cubic`. Apple M5 Max, Release: the networking tests pass, the list and
+loopback cases included. Four planted bugs each fail
+`grid_networking_socket` on the first host: the list matched within a word
+(`bbr2`), loopback not exempted, the list not consulted, and the default
+said on every socket.

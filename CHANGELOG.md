@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-11-01
+
+### Changed
+
+- **A viewer that is not on loopback gets BBR on Linux**: `StreamServer`
+  sets `TCP_CONGESTION` to `bbr` on each such accepted socket when
+  `/proc/sys/net/ipv4/tcp_allowed_congestion_control` lists it, and
+  otherwise keeps the kernel's default, said once a process at Info; the
+  accept never fails for it. Loopback viewers and Apple senders are
+  unchanged, as is every byte served (DESIGN.md, networking; the
+  2026-11-01 entry in DECISIONS.md).
+
 ## [0.7.0] - 2026-10-30
 
 ### Added

@@ -23,6 +23,12 @@
 #include <limits>
 #include <memory>
 #include <system_error>
+#ifdef __linux__
+#include <atomic>
+#include <fstream>
+
+#include "volumetric_kit/grid/base/log.hpp"
+#endif
 
 namespace volumetric_kit::grid::networking::detail {
 namespace {
@@ -89,6 +95,23 @@ const sockaddr* as_sockaddr(const Address& address) {
   return reinterpret_cast<const sockaddr*>(&address.in);
 }
 
+#ifdef __linux__
+constexpr char kAllowedCongestion[] =
+    "/proc/sys/net/ipv4/tcp_allowed_congestion_control";
+
+// The algorithms tcp_allowed_congestion_control lists, read at each accept
+// so a change to it reaches the next viewer; empty if it cannot be read.
+std::string allowed_congestion() {
+  std::ifstream file(kAllowedCongestion);
+  std::string text;
+  std::getline(file, text);
+  return text;
+}
+
+// Set by the first socket of the process that keeps the default.
+std::atomic<bool> kept_default_said{false};
+#endif
+
 }  // namespace
 
 bool parse_ipv4(const std::string& host, std::uint16_t port, Address* out) {
@@ -147,6 +170,53 @@ std::string to_string(const Address& address) {
   ::inet_ntop(AF_INET, &address.in.sin_addr, text, sizeof text);
   return std::string(text) + ":" + std::to_string(ntohs(address.in.sin_port));
 }
+
+bool is_loopback(const Address& address) {
+  return (ntohl(address.in.sin_addr.s_addr) >> 24) == 127;
+}
+
+bool lists(std::string_view allowed, std::string_view name) {
+  constexpr std::string_view kSpace = " \t\n\v\f\r";
+  for (std::size_t at = allowed.find_first_not_of(kSpace);
+       at != std::string_view::npos;) {
+    const std::size_t end =
+        std::min(allowed.find_first_of(kSpace, at), allowed.size());
+    if (allowed.substr(at, end - at) == name) return true;
+    at = allowed.find_first_not_of(kSpace, end);
+  }
+  return false;
+}
+
+#ifdef __linux__
+bool prefer_congestion(std::string_view api, int fd, std::string_view allowed) {
+  int error = 0;
+  if (lists(allowed, kCongestion)) {
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, kCongestion.data(),
+                     static_cast<socklen_t>(kCongestion.size())) == 0) {
+      return true;
+    }
+    error = errno;
+  }
+  if (!kept_default_said.exchange(true)) {
+    try {
+      std::string message(api);
+      message += ": viewers keep the kernel's congestion control, not ";
+      message += kCongestion;
+      message += ": ";
+      if (error != 0) {
+        message += "cannot set TCP_CONGESTION: ";
+        message += std::generic_category().message(error);
+      } else {
+        message += "not in ";
+        message += kAllowedCongestion;
+      }
+      log_message(core::LogLevel::Info, message);
+    } catch (...) {
+    }
+  }
+  return false;
+}
+#endif
 
 core::Result<core::UniqueFd> listen_on(std::string_view api,
                                        const Address& address) {
@@ -216,6 +286,12 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
              .ok()) {
       return core::UniqueFd();
     }
+#ifdef __linux__
+    // Loopback has no loss or long round trip, and keeps the default.
+    if (!is_loopback(*peer)) {
+      (void)prefer_congestion(api, fd.get(), allowed_congestion());
+    }
+#endif
     return fd;
   }
 }
