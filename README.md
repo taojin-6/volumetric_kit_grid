@@ -193,6 +193,16 @@ connection fails, ends with `closed: <why>` or `failed: <why>` in place of
 [vgrid info] StreamServer: viewer 192.168.1.20:52311 left
 ```
 
+On Linux a viewer that is not on loopback gets BBR congestion control if
+the sender's kernel lists it as allowed; a sender that prints `viewers keep
+the kernel's congestion control, not bbr` lacks it. As root, until a reboot
+(`/etc/modules-load.d` and `/etc/sysctl.d` keep them):
+
+```sh
+modprobe tcp_bbr
+sysctl -w net.ipv4.tcp_allowed_congestion_control="$(cat /proc/sys/net/ipv4/tcp_allowed_congestion_control) bbr"
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -10,7 +10,8 @@
 // raises SIGPIPE: SO_NOSIGPIPE on Apple, MSG_NOSIGNAL elsewhere, chosen by
 // platform since Apple's SDKs define MSG_NOSIGNAL too. Every call is retried
 // on EINTR: an application's signal handler, as fuse_orbbec's for Ctrl+C,
-// interrupts poll, which is never restarted.
+// interrupts poll, which is never restarted. On Linux a sender's socket to a
+// peer that is not loopback uses kCongestion when the kernel lets it.
 
 #include <netinet/in.h>
 
@@ -37,6 +38,11 @@ inline constexpr int kSendLowWater = 128 << 10;
 // behind can hide from the sender's drop rule. Sized for the rig's stream
 // over the VPN (DECISIONS.md, 2026-10-21 networking).
 inline constexpr int kReceiveBuffer = 2 << 20;
+// The congestion control a sender's socket to a peer that is not loopback
+// asks for, on Linux (TCP_CONGESTION): at a long round trip CUBIC's window
+// collapses on loss and decays while a stream idles between frames; BBR's
+// does neither (DECISIONS.md, 2026-11-01 networking).
+inline constexpr std::string_view kCongestion = "bbr";
 
 // `from` + `limit`, saturating: a limit past the clock's end, as
 // milliseconds::max() ("never"), gives that end; one of 0 or less, `from`.
@@ -75,6 +81,14 @@ core::Result<std::vector<Address>> resolve(std::string_view api,
 // "a.b.c.d:port".
 std::string to_string(const Address& address);
 
+// Whether `address` is IPv4 loopback, 127.0.0.0/8.
+bool is_loopback(const Address& address);
+
+// Whether `allowed`, names separated by white space as
+// /proc/sys/net/ipv4/tcp_allowed_congestion_control holds them, lists `name`
+// as a whole word.
+bool lists(std::string_view allowed, std::string_view name);
+
 // A socket listening on `address` (SO_REUSEADDR, so a restarted sender takes
 // its port back at once). IoError for an address that cannot be bound.
 core::Result<core::UniqueFd> listen_on(std::string_view api,
@@ -84,11 +98,21 @@ core::Result<core::UniqueFd> listen_on(std::string_view api,
 core::Result<std::uint16_t> bound_port(std::string_view api, int fd);
 
 // The next connection waiting on `listener`, set up to send (TCP_NODELAY,
-// TCP_NOTSENT_LOWAT at kSendLowWater), and its peer; an empty fd when none
-// is waiting, or one failed before it was taken or cannot be set up, which
-// is closed.
+// TCP_NOTSENT_LOWAT at kSendLowWater, and on Linux prefer_congestion for a
+// peer that is not loopback), and its peer; an empty fd when none is waiting,
+// or one failed before it was taken or cannot be set up, which is closed.
 core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
                                          Address* peer);
+
+#ifdef __linux__
+// Set `fd` to kCongestion if `allowed`, the text of
+// tcp_allowed_congestion_control, lists it: whether it did. Linux lets a
+// process choose only the algorithms listed there unless it has
+// CAP_NET_ADMIN, so the list decides alike for every process. Otherwise, or
+// if the kernel refuses, `fd` keeps the kernel's default, and the first such
+// socket of a process says so at Info, naming `api`.
+bool prefer_congestion(std::string_view api, int fd, std::string_view allowed);
+#endif
 
 // A socket, its receive buffer kReceiveBuffer, connecting to `address`
 // without waiting: `*connected` says whether it already has, else poll it

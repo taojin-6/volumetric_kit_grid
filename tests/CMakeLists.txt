@@ -719,12 +719,14 @@ add_test(NAME grid_stream_audio COMMAND grid_stream_audio_test)
 # chunk boundary, the GOP limit, a lost copy, no P-frame without its key; keys
 # on demand: joins and fall-backs counted, the bytes held bounded) and the
 # socket calls (each socket's settings read back, no SIGPIPE, the bytes a peer
-# has not acknowledged, a wait a signal interrupts) -- internal and unexported,
-# so the tests compile their sources themselves -- then the server and the
-# client on loopback, 127.0.0.1 port 0 only: the wire against the writer's file,
-# joins, newest key wins, keys on demand, the limits, the rules, teardown,
-# signals, the client's errors against raw senders, and a stress run in both
-# modes for ThreadSanitizer. Host-only.
+# has not acknowledged, a wait a signal interrupts, and on Linux the congestion
+# control of a socket accepted from the host's own address that is not loopback)
+# -- internal and unexported, so the tests compile their sources themselves, the
+# socket calls with grid's log seam -- then the server and the client on
+# loopback, 127.0.0.1 port 0 only: the wire against the writer's file, joins,
+# newest key wins, keys on demand, the limits, the rules, teardown, signals, the
+# client's errors against raw senders, and a stress run in both modes for
+# ThreadSanitizer. Host-only.
 set(_vgrid_networking_src
     ${PROJECT_SOURCE_DIR}/src/volumetric_kit/grid/networking)
 add_executable(grid_networking_gop_log_test
@@ -736,8 +738,9 @@ add_test(NAME grid_networking_gop_log COMMAND grid_networking_gop_log_test)
 
 add_executable(grid_networking_socket_test networking_socket_test.cpp
                                            ${_vgrid_networking_src}/socket.cpp)
-target_include_directories(grid_networking_socket_test
-                           PRIVATE ${_vgrid_networking_src})
+target_include_directories(
+  grid_networking_socket_test PRIVATE ${_vgrid_networking_src}
+                                      ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(grid_networking_socket_test
                       PRIVATE volumetric_kit::core_base Threads::Threads)
 vgrid_target_warnings(grid_networking_socket_test)
