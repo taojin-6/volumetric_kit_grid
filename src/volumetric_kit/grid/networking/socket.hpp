@@ -10,8 +10,7 @@
 // raises SIGPIPE: SO_NOSIGPIPE on Apple, MSG_NOSIGNAL elsewhere, chosen by
 // platform since Apple's SDKs define MSG_NOSIGNAL too. Every call is retried
 // on EINTR: an application's signal handler, as fuse_orbbec's for Ctrl+C,
-// interrupts poll, which is never restarted. On Linux a sender's socket to a
-// peer that is not loopback uses kCongestion when the kernel lets it.
+// interrupts poll, which is never restarted.
 
 #include <netinet/in.h>
 
@@ -106,11 +105,11 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
 
 #ifdef __linux__
 // Set `fd` to kCongestion if `allowed`, the text of
-// tcp_allowed_congestion_control, lists it: whether it did. Linux lets a
-// process choose only the algorithms listed there unless it has
-// CAP_NET_ADMIN, so the list decides alike for every process. Otherwise, or
-// if the kernel refuses, `fd` keeps the kernel's default, and the first such
-// socket of a process says so at Info, naming `api`.
+// tcp_allowed_congestion_control, lists it: whether it did. Linux limits a
+// process without CAP_NET_ADMIN to the algorithms listed there; consulting
+// the list here makes one with it, as root, behave as every other.
+// Otherwise, or if the kernel refuses, `fd` keeps the kernel's default, and
+// the first such socket of a process says so at Info, naming `api`.
 bool prefer_congestion(std::string_view api, int fd, std::string_view allowed);
 #endif
 

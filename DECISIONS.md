@@ -8735,27 +8735,30 @@ of 70 to 250 ms with some loss.
 **Why BBR.** CUBIC takes each loss for congestion and cuts its window, which
 regrows slowly at a long round trip, so its rate falls with the loss rate:
 by its response function (RFC 8312), at 100 ms about 20 Mbit/s at 0.01 %
-loss and 4 Mbit/s at 0.1 %, well below the 9.4 MB/s the rig's stream needs
-at 1 cm (the 2026-10-21 entry). BBR paces at the bandwidth and round trip it
-measures and does not take a random loss for congestion. It also skips the
-decay of a window left idle or unused (`tcp_slow_start_after_idle`), which a
-stream sent frame by frame meets between frames on a host that leaves that
-on. Its known cost: Linux's BBR (v1) drops to 4 packets for about 200 ms
-every 10 s to measure the round trip again.
+loss and 4 Mbit/s at 0.1 %, well below the 75 Mbit/s (9.4 MB/s) the rig's
+stream needs at 1 cm (the 2026-10-21 entry). BBR paces at the bandwidth and
+round trip it measures and does not take a random loss for congestion. It
+also skips the decay of a window left idle or unused
+(`tcp_slow_start_after_idle`), which a stream sent frame by frame meets
+between frames on a host that leaves that on. Its known costs: Linux's BBR
+(v1) drops to 4 packets for about 200 ms every 10 s to measure the round
+trip again, and since it ignores loss, at a shallow bottleneck, as a
+viewer's home link, it can retransmit heavily and crowd out other traffic.
 
 **The rule.** `accept_next` sets `TCP_CONGESTION` to `bbr` on each accepted
 socket whose peer is not in 127.0.0.0/8, when
 `/proc/sys/net/ipv4/tcp_allowed_congestion_control` lists it, read at each
-accept so a change reaches the next viewer. Linux lets a process without
-`CAP_NET_ADMIN` choose only the listed algorithms, so the list decides for
-every process alike, root's included. Otherwise, or if the kernel refuses,
-the socket keeps the kernel's default, said once a process at Info, and the
-accept goes on. Loopback has no loss or long round trip and keeps the
-default, so the loopback tests' measured behaviour stands. Apple has no
-`TCP_CONGESTION`, and nothing changes there. No option: nothing needs
-another algorithm. The list is global: a container sees its host's,
-read-only, and its network namespace starts with the host's default, so a
-CI job container tests what its host allows.
+accept so a change reaches the next viewer. Linux limits a process without
+`CAP_NET_ADMIN` to the listed algorithms; `accept_next` consults the list
+itself, so one the kernel would let choose any, as root, behaves as every
+other. Otherwise, or if the kernel refuses, the socket keeps the kernel's
+default, said once a process at Info, and the accept goes on. Loopback has
+no loss or long round trip and keeps the default, so the loopback tests'
+measured behaviour stands. Apple has no `TCP_CONGESTION`, and nothing
+changes there. No option: nothing needs another algorithm. The list is
+global: a container sees its host's, read-only, and its network namespace
+starts with the host's default, so a CI job container tests what its host
+allows.
 
 **Verification.** Linux 7.0 (Ubuntu 26.04), Release: the networking tests
 pass on a host whose list has bbr, where `grid_networking_socket` finds a
