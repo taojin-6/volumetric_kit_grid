@@ -14,7 +14,9 @@
 // without replay_gop, a joiner is counted and gets nothing until the next
 // key, then every record, and one that stops reading falls back, counted,
 // past max_gop_bytes, then gets the next key, while one reading gets every
-// record, and a record past max_gop_bytes on its own is logged at Warning
+// record; draining() counts a viewer that reads nothing while it holds the
+// key under way, and none waiting, fallen back or drained; a record past
+// max_gop_bytes on its own is logged at Warning
 // (a copy that fails: networking_server_oom_test.cpp); a Geometry track
 // and an Audio track served, the wire the two-track file, and an audio
 // record that is not a key refused with nothing changed; a viewer joining
@@ -194,6 +196,17 @@ int drain(int fd, const Bytes& wire, std::uint64_t last, std::vector<Got>* got,
     CHECK(parser.feed(more.data(), more.size()).ok());
   }
   return 0;
+}
+
+// Whether `server` counts `n` viewers draining within 5 s: a viewer's thread
+// that has sent its last record asks again within a poll slice.
+bool draining_within(const networking::StreamServer& server, std::size_t n) {
+  const Clock::time_point end = Clock::now() + 5s;
+  while (server.draining() != n) {
+    if (Clock::now() >= end) return false;
+    std::this_thread::sleep_for(5ms);
+  }
+  return true;
 }
 
 // --- The wire.
@@ -567,10 +580,11 @@ int on_demand_join_case() {
 // its session, then nothing, while one GOP of 64 KiB records is published,
 // falls back, counted, once a record would leave it more than that behind
 // what its socket took, each publish back while it reads nothing; a client
-// reading each record as it comes gets every one and is not counted. Then a
-// key and two P-frames: the raw viewer, draining, gets each chunk whole, a
-// run from the first key, then the new key and the P-frames after it, so no
-// P-frame without the records it is predicted from; the client gets them all.
+// reading each record as it comes gets every one and is not counted. Neither
+// then counts draining. Then a key and two P-frames: the raw viewer counts
+// draining until it drains, and gets each chunk whole, a run from the first
+// key, then the new key and the P-frames after it, so no P-frame without the
+// records it is predicted from; the client gets them all.
 int on_demand_fall_back_case() {
   constexpr std::size_t kSize = 64 << 10;
   const stream::Session session = net::geometry_session();
@@ -605,13 +619,16 @@ int on_demand_fall_back_case() {
     ++seq;
   }
   CHECK(server->key_wanted() == 3);
+  CHECK(draining_within(*server, 0));  // waiting, its chunk under way
   const std::uint64_t key = seq;
   for (; seq < key + 3; ++seq) {
     CHECK(publish(seq, seq == key));
     CHECK(net::next_within(*fast, &got) && got.record.info.seq == seq);
   }
+  CHECK(draining_within(*server, 1));  // in again, the key to take
   std::vector<Got> drained;
   CHECK(drain(slow.get(), wire, key + 2, &drained) == 0);
+  CHECK(draining_within(*server, 0));
   CHECK(drained.size() > 3);
   const std::size_t run = drained.size() - 3;
   CHECK(run < key);  // it missed records
@@ -624,6 +641,66 @@ int on_demand_fall_back_case() {
   CHECK(server->key_wanted() == 3);
   std::printf("on demand: fell back after %llu records, %zu sent before\n",
               static_cast<unsigned long long>(key), run);
+  return 0;
+}
+
+// Without replay_gop: draining() is 0 with no viewer, and with a client and a
+// raw viewer that wait for a key. A key of 1 MiB lets both in: the client,
+// reading, soon has it all and no longer counts, while the raw viewer, which
+// reads nothing after its session, counts with the key under way and nothing
+// after it, for as long as it reads nothing, then with a P-frame to take too,
+// until it drains. A client joining then waits and does not count, and a
+// small key that every viewer's socket takes at once soon leaves none.
+int on_demand_draining_case() {
+  constexpr std::size_t kKey = 1 << 20;
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.replay_gop = false;
+  // Never closed, a raw viewer that reads nothing until it drains, as in
+  // newest_key_wins_case.
+  options.stall_limit = std::chrono::milliseconds::max();
+  auto server = net::serve(session, options);
+  CHECK(server != nullptr);
+  const auto publish = [&](std::uint64_t seq, bool key, std::size_t size) {
+    const Bytes payload = net::record_payload(seq, size);
+    return server
+        ->publish(net::record_info(seq, key), payload.data(), payload.size())
+        .ok();
+  };
+  CHECK(server->draining() == 0);
+  CHECK(publish(0, true, 100));  // to no viewer
+  CHECK(server->draining() == 0);
+  auto client = net::connect(server->port());
+  CHECK(client != nullptr && net::wait_session(*client));
+  const vkc::UniqueFd raw = net::connect_loopback(server->port(), 4096);
+  CHECK(raw.valid());
+  const std::size_t header = net::session_chunk(session).size();
+  Bytes wire;
+  net::read_upto(raw.get(), header, 5s, &wire);
+  CHECK(wire.size() == header);
+  CHECK(server->draining() == 0);  // both wait for a key
+  CHECK(publish(1, true, kKey));
+  Got got;
+  CHECK(net::next_within(*client, &got) && got.record.info.seq == 1);
+  CHECK(draining_within(*server, 1));
+  std::this_thread::sleep_for(200ms);
+  CHECK(server->draining() == 1);  // the raw viewer's key still under way
+  CHECK(publish(2, false, 100));
+  CHECK(net::next_within(*client, &got) && got.record.info.seq == 2);
+  CHECK(draining_within(*server, 1));
+  std::vector<Got> drained;
+  CHECK(drain(raw.get(), wire, 2, &drained) == 0);
+  CHECK(drained.size() == 2 && drained[0].record.info.seq == 1 &&
+        drained[1].record.info.seq == 2);
+  CHECK(draining_within(*server, 0));
+  auto late = net::connect(server->port());
+  CHECK(late != nullptr && net::wait_session(*late));
+  CHECK(server->viewers() == 3 && server->draining() == 0);
+  CHECK(publish(3, true, 100));
+  for (auto* reader : {client.get(), late.get()}) {
+    CHECK(net::next_within(*reader, &got) && got.record.info.seq == 3);
+  }
+  CHECK(draining_within(*server, 0));
   return 0;
 }
 
@@ -1811,6 +1888,7 @@ int main() {
   if (newest_key_wins_case(false) != 0) return 1;
   if (on_demand_join_case() != 0) return 1;
   if (on_demand_fall_back_case() != 0) return 1;
+  if (on_demand_draining_case() != 0) return 1;
   if (on_demand_limit_case() != 0) return 1;
   if (two_tracks_wire_case(dir) != 0) return 1;
   for (const bool replay : {true, false}) {

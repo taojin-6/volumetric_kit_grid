@@ -42,11 +42,14 @@ class GopLog {
   // chunk of it to hand out; a new viewer's, {}, is in no GOP: it starts at
   // the key of the GOP there is at its first chunk, or of the next. Keys on
   // demand: whether it waits for a key, and once one let it in, the number
-  // of its next record (the log numbers the records it keeps).
+  // of its next record (the log numbers the records it keeps), and whether
+  // the chunk its last next() handed out is still under way (a key's let-in
+  // clears it).
   struct Cursor {
     std::uint64_t gop = 0;
     std::uint64_t next = 0;
     bool waiting = true;
+    bool sending = false;
   };
 
   // A log keeping chunks of at most `max_gop_bytes`: one GOP while
@@ -82,7 +85,8 @@ class GopLog {
   // The next chunk for the viewer at `cursor`, which it moves on: replaying,
   // from the key of a newer GOP than the cursor's, else the GOP's next; keys
   // on demand, its next record unless it waits. Null when the viewer has
-  // every chunk there is for it. Called at a chunk boundary.
+  // every chunk there is for it. Called at a chunk boundary, once the chunk
+  // it handed before is sent.
   Chunk next(Cursor* cursor) const noexcept;
 
   // Replaying: whether a GOP is open, a key has come and the GOP is not
@@ -95,6 +99,13 @@ class GopLog {
 
   // Keys on demand: the joins and fall-backs so far. Replaying: 0.
   std::uint64_t key_wanted() const noexcept;
+
+  // Keys on demand: the viewers in that have not sent all the log kept for
+  // them, the newest key and every record after it: one still to hand out,
+  // or the one handed out last, until their next call to next(). A key
+  // appended now makes each skip the records still to hand out. Replaying:
+  // 0.
+  std::size_t draining() const noexcept;
 
   // The chunk bytes the log holds.
   std::uint64_t bytes() const noexcept;

@@ -104,7 +104,8 @@ void GopLog::break_gop(bool key) noexcept {
 
 Chunk GopLog::next(Cursor* cursor) const noexcept {
   if (!replay_) {
-    if (cursor->waiting || cursor->next >= head()) return nullptr;
+    cursor->sending = !cursor->waiting && cursor->next < head();
+    if (!cursor->sending) return nullptr;
     return held_[cursor->next++ - first_].chunk;
   }
   if (cursor->gop != gop_) *cursor = {gop_, 0, false};
@@ -121,6 +122,15 @@ bool GopLog::open() const noexcept {
 bool GopLog::joined() const noexcept { return !viewers_.empty(); }
 
 std::uint64_t GopLog::key_wanted() const noexcept { return key_wanted_; }
+
+std::size_t GopLog::draining() const noexcept {
+  // A key's let-in clears `sending`: the chunk under way is older than the
+  // key, which the viewer still has to take.
+  return static_cast<std::size_t>(std::count_if(
+      viewers_.begin(), viewers_.end(), [this](const Cursor* viewer) {
+        return !viewer->waiting && (viewer->sending || viewer->next < head());
+      }));
+}
 
 std::uint64_t GopLog::bytes() const noexcept {
   if (replay_) return bytes_;

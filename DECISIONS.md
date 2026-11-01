@@ -337,7 +337,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   *Amended 2026-10-30 again:* the server serves every track, track 0's keys
   anchoring the GOP. *Amended 2026-10-30 once more:* `finish` closes each
   viewer once it has sent what is queued for it, within 1 s; the
-  destructor still closes at once.
+  destructor still closes at once. *Amended 2026-11-01:* `draining()`
+  counts the viewers still sending the newest key's records.
 - [**2026-10-21**](#2026-10-21--meshintegrator-finds-each-voxels-nearest-triangle-with-an-exact-early-exit-a-triangle-is-ruled-out-only-by-a-lower-bound-less-a-rounding-margin-of-its-own-strictly-above-the-voxels-limit) —
   `MeshIntegrator` finds each voxel's nearest triangle with an exact early
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
@@ -472,6 +473,10 @@ entries relevant to your task; later amendments supersede earlier rules.
   when `tcp_allowed_congestion_control` lists it, else the kernel's default,
   said once a process: CUBIC collapses on loss at a long round trip and
   decays while a stream idles between frames.
+- [**2026-11-01**](#2026-11-01--streamserverdraining-counts-the-viewers-still-sending-the-newest-keys-records-each-until-it-would-take-its-next-so-a-sender-may-wait-to-make-a-key-amends-the-2026-10-21-networking-entry) —
+  `StreamServer::draining()` counts the viewers still sending the newest
+  key and the records after it, so a live sender may wait to make a key
+  until none would skip a record.
 
 ## Decision record
 
@@ -8772,3 +8777,52 @@ loopback cases included. Four planted bugs each fail
 `grid_networking_socket` on the first host: the list matched within a word
 (`bbr2`), loopback not exempted, the list not consulted, and the default
 said on every socket.
+
+### 2026-11-01 — `StreamServer::draining()` counts the viewers still sending the newest key's records, each until it would take its next, so a sender may wait to make a key (amends the 2026-10-21 networking entry).
+
+**The need.** Newest key wins: a key sends every viewer on from it, and
+one that has not begun the records before it skips them, its seq jumping
+to the key. A key is far larger than the frames after it, so over a slow
+path a viewer can still be sending the last key when a joiner's request
+makes the next, and that viewer then skips what is queued behind it. A
+live sender may wait, a bounded while, to make a key a viewer asked for
+while viewers still drain the last one; it has to know when they have.
+
+**The rule.** Without `replay_gop`, `draining()` counts each viewer going
+on from the newest track-0 key that has not yet sent that key and every
+record published after it. A record is sent once the viewer's thread has
+written its last byte to the socket and the socket polls writable again,
+when the viewer would take its next. A record counts every viewer in from
+its publish and the count only falls until the next, so a sender reads it
+just before publishing a key, with nothing published in between. A viewer
+waiting for a key, a joiner or one fallen back, never counts: a key is
+what it wants. With `replay_gop` it is 0, as `key_wanted()` is.
+
+**Why the records after the key.** A key made once a viewer has written
+the last key still skips the frames queued behind it, so counting the key
+alone would leave the jump. At 0, a key published now skips no record for
+any viewer.
+
+**Why written, then writable.** A viewer takes a chunk from the log whole,
+at its first byte, so the log's place alone would call a key of megabytes
+sent as it starts. The record under way counts until the viewer's thread
+comes back for the next, which it does only once the socket polls
+writable, so what the kernel still holds then, not counted, is under the
+low-water mark.
+
+**Why a count read under the lock.** It changes each time a viewer takes a
+record, so an atomic would add work to every take. Read on call, under the
+lock `publish` takes, it scans at most `max_viewers` cursors, and the
+record path only sets a flag where it already holds the lock. A count, as
+`viewers()` and `key_wanted()` are, so a sender can log it.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer with a device required: the full suite passes, 72
+of 72. `grid_networking_gop_log` checks the count case by case and, over
+its seeded random runs, that a key made at 0 finds every viewer in holding
+every record before it; `grid_networking_server` checks it on loopback,
+with a raw viewer holding a key of 1 MiB under way and in the fall-back
+case. Five planted bugs each fail both tests: a waiting viewer counted,
+the record under way not counted, the records still to take not counted,
+a viewer that has sent everything counted, and the record under way never
+cleared; the random runs alone catch the records still to take.

@@ -953,7 +953,14 @@ atomic any thread reads, which a live sender answers with a key at its next
 frame; a lost key counts its waiting viewers again, a key within
 `max_gop_bytes` counts none, and with `replay_gop` it stays 0. A fall-back
 is logged at Info, and a record past `max_gop_bytes` on its own, which no
-viewer can take, at Warning. A viewer whose end acknowledges no
+viewer can take, at Warning. `draining()` (the 2026-11-01 entry) counts,
+under the lock, each viewer going on from the newest key, none waiting for
+one, that has not yet sent it and every record after it: a record counts
+from its publish until the viewer would take its next, its last byte
+written and its socket polling writable. A key published meanwhile would
+make one skip what it has not begun, so a live sender may wait to make a
+key while it is above 0, reading it just before the key's publish. A
+viewer whose end acknowledges no
 byte for `stall_limit` (10 s) with bytes waiting is closed: a slow reader
 stays while its end acknowledges a byte within the limit (one behind a large
 receive buffer may not), as does one with nothing waiting. `viewers()`, an
