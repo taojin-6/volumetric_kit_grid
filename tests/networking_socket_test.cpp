@@ -2,16 +2,21 @@
 // Copyright (c) 2026 Tao Jin
 
 // The networking tier's socket calls (src/volumetric_kit/grid/networking/
-// socket.hpp) on loopback, 127.0.0.1 port 0 only: what each socket is set to,
-// read back (non-blocking and close-on-exec on every one, the listener's
-// SO_REUSEADDR, the accepted sender's TCP_NODELAY and 128 KiB
-// TCP_NOTSENT_LOWAT, the client's 2 MiB receive buffer, SO_NOSIGPIPE on
-// Apple); a send to a closed peer failing rather than raising SIGPIPE; the
-// bytes a peer has not acknowledged, none, then all it has not taken in, then
-// none once it has read them; a wait interrupted by a signal going on to its
-// end; the end and an empty receive told apart; a deadline saturating at the
-// clock's end; numeric IPv4 parsed, anything else not; and localhost resolved
-// to IPv4 alone.
+// socket.hpp) on loopback, 127.0.0.1 port 0, but for one connection on Linux
+// from the host's own address: what each socket is set to, read back
+// (non-blocking and close-on-exec on every one, the listener's SO_REUSEADDR,
+// the accepted sender's TCP_NODELAY and 128 KiB TCP_NOTSENT_LOWAT, the
+// client's 2 MiB receive buffer, SO_NOSIGPIPE on Apple); a send to a closed
+// peer failing rather than raising SIGPIPE; the bytes a peer has not
+// acknowledged, none, then all it has not taken in, then none once it has read
+// them; a wait interrupted by a signal going on to its end; the end and an
+// empty receive told apart; a deadline saturating at the clock's end; numeric
+// IPv4 parsed, anything else not; localhost resolved to IPv4 alone; and the
+// congestion control: the allowed list read word by word and 127.0.0.0/8 told
+// from other addresses, on every platform, and on Linux a socket accepted from
+// the host's own address that is not loopback using BBR exactly when /proc
+// lists it, one from loopback and one asked with a list that lacks it keeping
+// the default, said once a process.
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -22,17 +27,26 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "socket.hpp"
+#include "volumetric_kit/core/base/log.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 
 namespace vkc = volumetric_kit::core;
@@ -79,17 +93,19 @@ struct Connected {
   std::uint16_t port = 0;
 };
 
-int connect_pair(Connected* c) {
-  vkc::Result<vkc::UniqueFd> listener = detail::listen_on("test", loopback(0));
+// On `host`'s address, port 0, loopback by default.
+int connect_pair(Connected* c, detail::Address host = loopback(0)) {
+  vkc::Result<vkc::UniqueFd> listener = detail::listen_on("test", host);
   CHECK(listener.ok());
   c->listener = std::move(listener).value();
   vkc::Result<std::uint16_t> port =
       detail::bound_port("test", c->listener.get());
   CHECK(port.ok() && *port != 0);
   c->port = *port;
+  host.in.sin_port = htons(c->port);
   bool connected = false;
   vkc::Result<vkc::UniqueFd> client =
-      detail::start_connect("test", loopback(c->port), &connected);
+      detail::start_connect("test", host, &connected);
   CHECK(client.ok());
   c->client = std::move(client).value();
   if (!connected) {
@@ -313,6 +329,132 @@ int addresses_case() {
   return 0;
 }
 
+#ifdef __linux__
+// The first line of `path`; empty if it cannot be read.
+std::string first_line(const char* path) {
+  std::ifstream file(path);
+  std::string line;
+  std::getline(file, line);
+  return line;
+}
+
+// The congestion control `fd` uses (TCP_CONGESTION); empty on a failure.
+std::string congestion(int fd) {
+  char name[32] = {};
+  socklen_t size = sizeof name;
+  if (::getsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, name, &size) != 0) {
+    return "";
+  }
+  return std::string(name, ::strnlen(name, size));
+}
+
+// Whether /proc's allowed list names `name`, read apart from detail::lists.
+bool proc_allows(const std::string& name) {
+  std::istringstream words(
+      first_line("/proc/sys/net/ipv4/tcp_allowed_congestion_control"));
+  for (std::string word; words >> word;) {
+    if (word == name) return true;
+  }
+  return false;
+}
+
+// The host's first IPv4 address on an interface that is up and not loopback,
+// port 0; false if it has none.
+bool own_address(detail::Address* out) {
+  ifaddrs* all = nullptr;
+  if (::getifaddrs(&all) != 0) return false;
+  bool found = false;
+  for (const ifaddrs* i = all; i != nullptr && !found; i = i->ifa_next) {
+    if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != AF_INET ||
+        (i->ifa_flags & IFF_UP) == 0 || (i->ifa_flags & IFF_LOOPBACK) != 0) {
+      continue;
+    }
+    std::memcpy(&out->in, i->ifa_addr, sizeof out->in);
+    out->in.sin_port = 0;
+    found = true;
+  }
+  ::freeifaddrs(all);
+  return found;
+}
+
+std::atomic<int> infos{0};  // grid's Info messages, once counted
+#endif
+
+// The allowed list read word by word, and loopback told apart; on Linux, the
+// accepted socket's congestion control against /proc.
+int congestion_case() {
+  CHECK(detail::kCongestion == "bbr");
+  for (const char* allowed :
+       {"bbr", "reno cubic bbr", "bbr reno", "reno\tbbr\n", "  bbr  "}) {
+    CHECK(detail::lists(allowed, "bbr"));
+  }
+  for (const char* allowed : {"", " \n", "reno cubic", "reno cubic bbr2",
+                              "bbr2 xbbr", "reno bb cubic", "renobbr"}) {
+    CHECK(!detail::lists(allowed, "bbr"));
+  }
+  CHECK(detail::lists("reno cubic", "cubic"));
+  CHECK(!detail::lists("reno cubic", ""));
+  detail::Address a;
+  for (const char* host :
+       {"127.0.0.1", "127.0.0.0", "127.1.2.3", "127.255.255.255"}) {
+    CHECK(detail::parse_ipv4(host, 1, &a) && detail::is_loopback(a));
+  }
+  for (const char* host : {"0.0.0.0", "10.0.0.1", "126.255.255.255",
+                           "128.0.0.1", "192.168.1.20", "255.255.255.255"}) {
+    CHECK(detail::parse_ipv4(host, 1, &a) && !detail::is_loopback(a));
+  }
+
+#ifdef __linux__
+  vkc::set_log_handler(
+      [](vkc::LogLevel level, std::string_view source, std::string_view) {
+        if (level == vkc::LogLevel::Info && source == "vgrid") ++infos;
+      });
+  const std::string fallback =
+      first_line("/proc/sys/net/ipv4/tcp_congestion_control");
+  const bool allowed = proc_allows("bbr");
+  CHECK(!fallback.empty());
+  std::printf("networking socket: /proc allows bbr: %s, default %s\n",
+              allowed ? "yes" : "no", fallback.c_str());
+
+  // Loopback keeps the default, unsaid.
+  Connected local;
+  CHECK(connect_pair(&local) == 0);
+  CHECK(congestion(local.accepted.get()) == fallback);
+  CHECK(infos == 0);
+
+  // A peer at the host's own address that is not loopback: BBR exactly when
+  // /proc lists it, else the default, said.
+  detail::Address own;
+  if (own_address(&own)) {
+    Connected remote;
+    CHECK(connect_pair(&remote, own) == 0);
+    CHECK(!detail::is_loopback(remote.peer));
+    CHECK(congestion(remote.accepted.get()) == (allowed ? "bbr" : fallback));
+    CHECK(infos == (allowed ? 0 : 1));
+  } else {
+    std::puts(
+        "networking socket: SKIPPED the accepted congestion check: the host "
+        "has no IPv4 address but loopback");
+  }
+
+  // A list that lacks it keeps the default whatever this process may choose,
+  // as does a refusal; said once a process, here or above.
+  CHECK(!detail::prefer_congestion("test", local.accepted.get(),
+                                   "reno cubic bbr2"));
+  CHECK(congestion(local.accepted.get()) == fallback);
+  CHECK(!detail::prefer_congestion("test", -1, "reno bbr"));
+  CHECK(infos == 1);
+  if (allowed) {
+    CHECK(detail::prefer_congestion(
+        "test", local.accepted.get(),
+        first_line("/proc/sys/net/ipv4/tcp_allowed_congestion_control")));
+    CHECK(congestion(local.accepted.get()) == "bbr");
+  }
+  vkc::set_log_handler({});
+#endif
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -322,6 +464,7 @@ int main() {
   if (interrupted_wait_case() != 0) return 1;
   if (after_case() != 0) return 1;
   if (addresses_case() != 0) return 1;
+  if (congestion_case() != 0) return 1;
   std::puts("networking socket: OK");
   return 0;
 }

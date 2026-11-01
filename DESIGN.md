@@ -1014,7 +1014,10 @@ three-argument overload forwards without requesting progress.
 the server listens on it, and a name is looked up for it. Every socket is
 non-blocking and close-on-exec, accepted ones included, and never raises
 SIGPIPE; every call is retried on `EINTR`. The sender sets `TCP_NODELAY`
-and the listener `SO_REUSEADDR`. The GOP log (`gop_log.cpp`), in either
+and the listener `SO_REUSEADDR`. On Linux a socket accepted from a peer
+that is not loopback uses BBR when `tcp_allowed_congestion_control` lists
+it, else the kernel's default, said once a process at Info (the 2026-11-01
+entry). The GOP log (`gop_log.cpp`), in either
 mode, has no socket, thread or clock, and is tested alone.
 
 ### codec_stream
