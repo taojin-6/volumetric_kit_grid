@@ -15,10 +15,11 @@
 // key, which counts none even where the viewer would otherwise fall back; a
 // lost copy sends every viewer back to waiting, and a lost key counts the
 // waiting ones again; each join and each fall-back counts in key_wanted;
-// and, over seeded random runs, the bytes held stay within max_gop_bytes,
-// none with no viewer in, the count is exactly the joins, the fall-backs and
-// the waits a lost key ends, and each viewer's records are its key's run,
-// broken only by the newest key.
+// draining counts each viewer in still to send the newest key's records,
+// the one under way included, and none waiting; and, over seeded random runs,
+// the bytes held stay within max_gop_bytes, none with no viewer in, the count
+// is exactly the joins, the fall-backs and the waits a lost key ends, and each
+// viewer's records are its key's run, broken only by the newest key.
 
 #include <cstddef>
 #include <cstdint>
@@ -433,6 +434,66 @@ int on_demand_newest_key_wins_case() {
   return 0;
 }
 
+// Keys on demand, max_gop_bytes 3000: draining() counts each viewer in that
+// has not sent the newest key and every record after it, the chunk its last
+// next() handed it included, until it asks again and gets none. None with no
+// viewer or with viewers waiting for a key; a key counts each viewer it lets
+// in; one holding the key under way counts with nothing after it, and with a
+// record still to take; one that falls back does not, its chunk under way
+// still; one that leaves does not. Replaying, none.
+int on_demand_draining_case() {
+  GopLog log(3000, false);
+  CHECK(log.draining() == 0);
+  CHECK(!log.append(chunk(0, true, 1000), true));  // no viewer
+  CHECK(log.draining() == 0);
+  GopLog::Cursor slow;
+  GopLog::Cursor fast;
+  log.join(&slow);
+  log.join(&fast);
+  CHECK(!log.append(chunk(1, false, 1000), false));
+  CHECK(log.next(&slow) == nullptr);
+  CHECK(log.draining() == 0);  // both wait for a key
+  CHECK(log.append(chunk(2, true, 1000), true));
+  CHECK(log.draining() == 2);
+  CHECK(drain(log, &fast) == (Seqs{2}));
+  CHECK(log.draining() == 1);
+  const Chunk key = log.next(&slow);
+  CHECK(key != nullptr && seq_of(key) == 2);
+  CHECK(log.draining() == 1);  // the key under way, nothing after it
+  CHECK(log.append(chunk(3, false, 1000), false));
+  CHECK(drain(log, &fast) == (Seqs{3}));
+  CHECK(log.draining() == 1);  // and a P-frame to take
+  CHECK(seq_of(log.next(&slow)) == 3);
+  CHECK(log.draining() == 1);
+  CHECK(log.next(&slow) == nullptr);
+  CHECK(log.draining() == 0);
+  // The slow one holds 4 under way and has 5 to take, 1000 bytes behind, so
+  // 6, of 2001, sends it back to waiting.
+  CHECK(log.append(chunk(4, false, 1000), false));
+  CHECK(log.append(chunk(5, false, 1000), false));
+  CHECK(drain(log, &fast) == (Seqs{4, 5}));
+  CHECK(seq_of(log.next(&slow)) == 4);
+  CHECK(log.draining() == 1);
+  CHECK(log.append(chunk(6, false, 2001), false));
+  CHECK(slow.waiting && log.key_wanted() == 3);
+  CHECK(drain(log, &fast) == (Seqs{6}));
+  CHECK(log.draining() == 0);
+  CHECK(log.append(chunk(7, true, 1000), true));
+  CHECK(log.draining() == 2);
+  CHECK(drain(log, &slow) == (Seqs{7}));
+  CHECK(log.draining() == 1);
+  log.leave(&fast);
+  CHECK(log.draining() == 0);
+
+  GopLog replay(1 << 20);
+  GopLog::Cursor viewer;
+  replay.join(&viewer);
+  CHECK(replay.append(chunk(0, true), true));
+  CHECK(replay.next(&viewer) != nullptr);
+  CHECK(replay.draining() == 0);
+  return 0;
+}
+
 // Keys on demand, seeded runs of records (a key now and then, sizes past a
 // small limit at times, a lost copy at times, a key at times) and viewers
 // that join, pull, fall behind and leave at random: the bytes held never pass
@@ -541,6 +602,7 @@ int main() {
   if (on_demand_fall_back_case() != 0) return 1;
   if (on_demand_lost_copy_case() != 0) return 1;
   if (on_demand_newest_key_wins_case() != 0) return 1;
+  if (on_demand_draining_case() != 0) return 1;
   if (on_demand_random_case() != 0) return 1;
   std::puts("networking gop log: OK");
   return 0;

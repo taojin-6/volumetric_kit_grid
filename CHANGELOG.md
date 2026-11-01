@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-01
+
+### Added
+
+- **`StreamServer::draining()`** counts, without `replay_gop`, the viewers
+  still sending the newest key's records: each going on from the newest
+  key that has not yet sent it and every record after it, a record counting
+  until the viewer would take its next. A key published meanwhile makes
+  them skip what they have not begun, so a live sender may wait to make a
+  key until the count is 0. Safe from any thread (DESIGN.md, networking;
+  the 2026-11-01 entry in DECISIONS.md).
+
 ## [0.7.0] - 2026-10-30
 
 ### Added

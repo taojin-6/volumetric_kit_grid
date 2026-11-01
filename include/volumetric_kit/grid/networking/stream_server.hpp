@@ -195,6 +195,21 @@ class VGRID_NETWORKING_API StreamServer {
   ///         `replay_gop`, whose joiners start at the GOP's key.
   std::uint64_t key_wanted() const noexcept;
 
+  /// @brief Viewers still sending the newest key's records: without
+  ///        @ref ServerOptions::replay_gop, each viewer going on from the
+  ///        newest track-0 key (one waiting for a key never counts) that has
+  ///        not yet sent that key and every record published after it. A
+  ///        record is sent once the viewer's thread has written its last
+  ///        byte to the socket and the socket polls writable again (under
+  ///        128 KiB unsent), when the viewer would take its next; the bytes
+  ///        the kernel still holds then are not counted. A key published
+  ///        while this is above 0 makes those viewers skip the records they
+  ///        have not begun (newest key wins), so a live sender may wait to
+  ///        make the next key until it is 0. Safe from any thread: it takes
+  ///        the lock @ref publish takes, briefly, and allocates nothing.
+  /// @return The count, at most `max_viewers`; always 0 with `replay_gop`.
+  std::size_t draining() const noexcept;
+
   /// @brief The viewers being served now: each counted from its accepted
   ///        connection, before its first byte, until the server closes it:
   ///        as it leaves, fails or stalls past

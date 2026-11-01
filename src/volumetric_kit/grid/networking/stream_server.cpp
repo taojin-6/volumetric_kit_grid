@@ -509,6 +509,11 @@ std::uint64_t StreamServer::key_wanted() const noexcept {
   return impl_->key_wanted.load();
 }
 
+std::size_t StreamServer::draining() const noexcept {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->log.draining();
+}
+
 std::size_t StreamServer::viewers() const noexcept {
   return impl_->live.load();
 }
