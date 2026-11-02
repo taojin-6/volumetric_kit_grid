@@ -54,8 +54,9 @@ struct RayCasterConfig {
 /// not answer reads as unobserved. A trilinear sample (the hit's refinement
 /// and its normal) answers only when all 8 of its corners do.
 struct CastFilter {
-  /// The least weight that answers; by default @ref kObservedWeight, the
-  /// mesher's and the codec's rule.
+  /// The least weight that answers; positive and finite, so a voxel never
+  /// integrated (weight 0) never answers. By default @ref kObservedWeight,
+  /// the mesher's and the codec's rule.
   float min_weight = kObservedWeight;
   /// A 1-byte attribute of the grid, by its @ref AttributeSpec name, or
   /// empty for no attribute test. Its characters must outlive every
@@ -172,10 +173,12 @@ class VGRID_VOLUME_API RayCaster {
   ///         - an @p out buffer smaller than its views, or more rays than
   ///           one dispatch holds;
   ///         - a grid without 4-byte `tsdf` and `weight`, or without the
-  ///           filter's attribute at 1 byte.
+  ///           filter's attribute at 1 byte;
+  ///         - a filter whose `min_weight` is not positive and finite.
   ///         Otherwise a refusal @p batch makes.
   /// @pre Every batch this caster recorded into before, other than @p batch,
-  ///      has resolved: its wait returned, or it is no longer in flight.
+  ///      has resolved: its wait returned, or it is no longer in flight. So
+  ///      two batches in flight at once take two casters.
   core::Status record_cast(core::CommandBatch& batch,
                            const VoxelBlockGrid& grid,
                            const core::Buffer& cameras, std::uint32_t count,

@@ -165,6 +165,13 @@ core::Status RayCaster::record_cast(core::CommandBatch& batch,
         "RayCaster::record_cast: count " + std::to_string(count) +
         " is not 1 to the view's " + std::to_string(out.views));
   }
+  // At a floor of 0 or below, a voxel never integrated (weight 0, tsdf 0)
+  // would answer as a surface.
+  if (!(filter.min_weight > 0.0f) || !std::isfinite(filter.min_weight)) {
+    return core::Status::invalid_argument(
+        "RayCaster::record_cast: the filter's min_weight must be positive "
+        "and finite");
+  }
   const std::uint64_t pixels = std::uint64_t(out.width) * out.height;
   const std::uint64_t view_rays = pixels * out.views;
   const std::uint64_t rays = pixels * count;

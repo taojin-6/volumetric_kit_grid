@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -697,8 +698,8 @@ int recast(vkc::test::GpuContext& gpu, vol::RayCaster& caster,
 
 // 7. A grid grown between two batches is cast with its new blocks: a plane
 // at 1 m left of x = 0, every set of the caster used once, then a resize, a
-// second plane at 1.5 m to the right, and a cast in a new batch through the
-// first set again.
+// second plane at 1.5 m to the right, and a cast in a new batch through a
+// set used before.
 int grown(vkc::test::GpuContext& gpu, vol::RayCaster& caster) {
   auto grid = make_grid(gpu, grid_params(kVoxel, kTrunc, 256));
   CHECK(grid.ok());
@@ -881,13 +882,26 @@ int refusals(vkc::test::GpuContext& gpu, vol::RayCaster& caster,
   vol::CastFilter wide;
   wide.attribute = vol::kWeightAttribute;
   CHECK(refused(rec(grid, *cams, 1, wide, *view)));
+  // Weight floors at which a voxel never integrated would answer, and NaN
+  // and infinity.
+  for (const float floor_w :
+       {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity()}) {
+    vol::CastFilter f;
+    f.min_weight = floor_w;
+    CHECK(refused(rec(grid, *cams, 1, f, *view)));
+  }
   CHECK(batch.submit().ok());
   return 0;
 }
 
 // The room for the timing case: inside a 4 x 2.5 x 4 m box, a sphere of
-// 0.4 m on the floor's side, at 1 cm voxels and a 4 cm band.
+// 0.4 m on the floor's side, at 1 cm voxels and a 4 cm band. It sits off the
+// voxel lattice, as a scanned room does: walls on block boundaries cost the
+// most.
+constexpr float kRoomShift = 0.0137f;  // metres, on every axis
 float room_sdf(Vec3f p) {
+  p -= Vec3f(kRoomShift);
   const Vec3f half(2.0f, 1.25f, 2.0f);
   const Vec3f in = half - glm::abs(p);
   const float wall = std::min({in.x, in.y, in.z});
@@ -909,9 +923,10 @@ int timing(vkc::test::GpuContext& gpu) {
   auto grid = make_grid(gpu, grid_params(kVoxel, kTrunc, 8192));
   auto timer = vkc::GpuTimer::create(gpu.device);
   CHECK(caster.ok() && grid.ok() && timer.ok());
+  const Vec3f shift(kRoomShift);
   const std::vector<vol::BlockIndex> blocks =
-      band_blocks(grid->grid(), Vec3f(-2.1f, -1.35f, -2.1f),
-                  Vec3f(2.1f, 1.35f, 2.1f), room_sdf);
+      band_blocks(grid->grid(), shift + Vec3f(-2.1f, -1.35f, -2.1f),
+                  shift + Vec3f(2.1f, 1.35f, 2.1f), room_sdf);
   CHECK(fill(gpu, *grid, blocks, [](Vec3f p, Vec3i) {
           return fused(room_sdf(p), kTrunc);
         }).ok());
@@ -920,8 +935,9 @@ int timing(vkc::test::GpuContext& gpu) {
   std::vector<vol::DepthPinhole> cams;
   for (int i = 0; i < 20; ++i) {
     const float a = 0.314159f * float(i);
-    const Vec3f eye(0.7f * std::cos(a), -0.3f + 0.03f * float(i),
-                    0.7f * std::sin(a));
+    const Vec3f eye =
+        shift +
+        Vec3f(0.7f * std::cos(a), -0.3f + 0.03f * float(i), 0.7f * std::sin(a));
     const Vec3f target =
         eye + Vec3f(std::cos(a + 2.0f), 0.2f, std::sin(a + 2.0f));
     cams.push_back(pinhole(w, h, 212.0f, look_at(eye, target)));

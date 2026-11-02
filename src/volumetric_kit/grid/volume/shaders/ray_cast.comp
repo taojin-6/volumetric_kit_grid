@@ -81,7 +81,9 @@ bool answers(int idx) {
 }
 
 // The trilinear field at world point p and its gradient, per metre; false
-// unless all 8 corners answer.
+// unless all 8 corners answer. The corners' blocks are, on each axis, the
+// base corner's or the next, so a cube across a block boundary walks each
+// of its blocks once, not once a corner through the one-block cache.
 bool trilinear(vec3 p, out float s, out vec3 grad) {
   s = 0.0;
   grad = vec3(0.0);
@@ -90,11 +92,22 @@ bool trilinear(vec3 p, out float s, out vec3 grad) {
   vec3 lo = floor(g);
   vec3 f = g - lo;
   ivec3 base = ivec3(lo);
+  ivec3 b0 = voxelToBlock(base, pc.grid);
+  ivec3 up = voxelToBlock(base + ivec3(1), pc.grid) - b0;  // 0 or 1 an axis
+  // Corner k takes the next block on the axes of k & across, its key in
+  // ptrs; -2 marks a block not walked yet.
+  int across = up.x | (up.y << 1) | (up.z << 2);
+  int ptrs[8] = int[8](-2, -2, -2, -2, -2, -2, -2, -2);
   float c[8];
   for (int k = 0; k < 8; ++k) {
-    ivec3 v = base + ivec3(k & 1, (k >> 1) & 1, k >> 2);
-    ivec3 block = voxelToBlock(v, pc.grid);
-    int ptr = block_ptr(block);
+    ivec3 d = ivec3(k & 1, (k >> 1) & 1, k >> 2);
+    ivec3 v = base + d;
+    ivec3 block = b0 + up * d;
+    int key = k & across;
+    if (ptrs[key] == -2) {
+      ptrs[key] = block_ptr(block);
+    }
+    int ptr = ptrs[key];
     if (ptr < 0) {
       return false;
     }
