@@ -8891,3 +8891,12 @@ exactly, and a sphere's within 0.02 voxel and 0.79° away from its
 silhouette. Three planted bugs each fail it: the allow word indexed by
 `v & 7`, every view casting camera 0, and a set's bindings written only at
 its first cast.
+
+**Cost.** Its timing case, Release, device time: a 4 × 2.5 × 4 m room with
+a sphere at 1 cm voxels (28,146 blocks), 20 cameras inside it at 256×192,
+p50 of 100. On an RTX 4090, one view is 0.33 ms, 20 stacked 2.4 ms and 20
+single casts in one batch 7.5 ms; on an Apple M4, 2.2, 34.1 and 38.9 ms.
+Stacking is worth 3.1× on NVIDIA and 12% on Apple, where one view already
+fills the GPU. A ray here crosses about 2 m of unallocated room, a table
+walk a block, before its wall, so its cost is that walk's more than the
+march's near the surface.

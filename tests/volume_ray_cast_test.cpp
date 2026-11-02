@@ -894,7 +894,7 @@ float room_sdf(Vec3f p) {
   return std::min(wall, glm::length(p - Vec3f(0.6f, 0.85f, 0.9f)) - 0.4f);
 }
 
-double percentile(std::vector<double> v, double q) {
+double quantile(std::vector<double> v, double q) {
   std::sort(v.begin(), v.end());
   return v[std::min(v.size() - 1, std::size_t(q * double(v.size())))];
 }
@@ -983,9 +983,9 @@ int timing(vkc::test::GpuContext& gpu) {
       "    K = 20 stacked:    p50 %.3f ms, p95 %.3f ms\n"
       "    20 single casts:   p50 %.3f ms, p95 %.3f ms\n",
       gpu.device.caps().properties().deviceName, blocks.size(), w, h,
-      hits(img->depth), img->depth.size(), percentile(k1, 0.5),
-      percentile(k1, 0.95), percentile(k20, 0.5), percentile(k20, 0.95),
-      percentile(singles, 0.5), percentile(singles, 0.95));
+      hits(img->depth), img->depth.size(), quantile(k1, 0.5),
+      quantile(k1, 0.95), quantile(k20, 0.5), quantile(k20, 0.95),
+      quantile(singles, 0.5), quantile(singles, 0.95));
   return 0;
 }
 
