@@ -964,13 +964,37 @@ viewer whose end acknowledges no
 byte for `stall_limit` (10 s) with bytes waiting is closed: a slow reader
 stays while its end acknowledges a byte within the limit (one behind a large
 receive buffer may not), as does one with nothing waiting. `viewers()`, an
-atomic any thread reads, counts each viewer from its accepted connection,
-before its first byte and while it waits for a key, until the server closes
-it; a refused connection never counts. Viewers that join, leave or fail are
-logged at Info; a refusal at Warning, the first and then one in 10 s at
-most, the rest at Debug. The destructor stops every thread within a poll
-slice (20 ms) and the write under way, what is queued for a viewer lost.
-`publish` and `finish` are called from one thread.
+atomic any thread reads, counts each viewer from its accepted connection
+or its `add_viewer`, before its first byte and while it waits for a key,
+until the server closes it; a refused connection never counts. Viewers that
+join, leave or fail are logged at Info; an accept's refusal at Warning, the
+first and then one in 10 s at most, the rest at Debug. The destructor stops
+every thread within a poll slice (20 ms) and the write under way, what is
+queued for a viewer lost. `publish` and `finish` are called from one thread.
+
+**Dialling out** (`networking/dial.hpp`, the 2026-11-02 entry). A sender
+that must not listen, a phone, starts with `listen` false: no socket, no
+accept thread, `port()` 0. `dial` connects to the reader's numeric IPv4
+address within its limit, refusing an empty, named or wildcard host, port 0
+and a limit of 0 or less with sentences an address entry can show.
+`add_viewer` serves a socket the caller connected as an accepted one, in
+either mode: it must be a connected IPv4 stream socket; it is prepared and
+given the sender setup accept gives, one function (`set_up_sender`), then
+admitted as accept admits: joined to the log and counted in `viewers()`
+before it returns, so on demand `key_wanted()` has risen; past
+`max_viewers` or once finishing it is closed before any byte and the
+refusal returned. Admission holds a lock of its own, which `finish` takes
+as it begins, so a viewer is admitted wholly before it or not at all;
+without `listen` the threads of viewers that ended are joined at each
+`add_viewer` that comes before `finish`. The reader's `Listener` listens on
+one numeric address, never the wildcard, its listening socket given the
+client's 2 MiB receive buffer before `listen`, so each accepted socket
+inherits it and the window scale fits it; `accept(wait)` hands out each
+connection, prepared, never one reset as it waited (accept's, so the
+server's too), and `StreamClient::adopt` reads it as a connected client is
+read, named by its peer, with no lookup or connect. One reset after it was
+taken fails at `adopt`, and the reader takes the next. The wire is
+unchanged.
 
 **Finishing** (the 2026-10-30 finish entry). `finish` ends the stream
 without losing its tail: later records are refused, a connection is closed
@@ -1013,8 +1037,9 @@ three-argument overload forwards without requesting progress.
 **Sockets** (private `socket.hpp`, which gives the reasons). IPv4 only:
 the server listens on it, and a name is looked up for it. Every socket is
 non-blocking and close-on-exec, accepted ones included, and never raises
-SIGPIPE; every call is retried on `EINTR`. The sender sets `TCP_NODELAY`
-and the listener `SO_REUSEADDR`. On Linux a socket accepted from a peer
+SIGPIPE; every call is retried on `EINTR`. A sender's socket, accepted or
+added, gets `TCP_NODELAY` and the low-water mark, and a listener
+`SO_REUSEADDR`. On Linux a sender's socket to a peer
 that is not loopback uses BBR when `tcp_allowed_congestion_control` lists
 it, else the kernel's default, said once a process at Info (the 2026-11-01
 entry). The GOP log (`gop_log.cpp`), in either

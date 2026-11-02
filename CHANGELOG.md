@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-02
+
+### Added
+
+- **A sender that dials out** (`networking/dial.hpp`): with
+  `ServerOptions::listen` false a `StreamServer` binds no socket, so no
+  host that reaches the sender can connect to it; `dial(host, port, limit)`
+  connects to the reader's numeric IPv4 address, and
+  `StreamServer::add_viewer` serves the socket as an accepted one, in
+  either mode, with the same sender setup (`TCP_NODELAY`, the 128 KiB
+  low-water mark, BBR on Linux off loopback), counted in `viewers()` and,
+  on demand, `key_wanted()` before it returns. The reader listens on one
+  numeric address with `Listener`, never the wildcard, each accepted socket
+  with a client's 2 MiB receive buffer, and reads each connection with
+  `StreamClient::adopt`. `dial`'s refusals are sentences an address entry
+  can show (DESIGN.md, networking; the 2026-11-02 entry in DECISIONS.md).
+
+### Changed
+
+- **A viewer counts in `key_wanted()` as it is admitted**, before its
+  thread starts, rather than as its thread starts: earlier, never later.
+  The bytes served are unchanged.
+
+### Fixed
+
+- **On Linux a connection reset while it waited to be accepted is closed
+  at accept**, as on macOS: Linux hands it out with its setup succeeding,
+  and only naming its peer fails, so a server no longer admits it.
+
 ## [0.8.0] - 2026-11-01
 
 ### Added
