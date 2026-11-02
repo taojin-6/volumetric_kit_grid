@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/unique_fd.hpp"
 #include "volumetric_kit/grid/networking/export.hpp"
 #include "volumetric_kit/grid/networking/stream_server.hpp"  // kDefaultPort
 #include "volumetric_kit/grid/stream/session.hpp"
@@ -23,7 +24,8 @@ namespace volumetric_kit::grid::networking {
 /// @brief How a @ref StreamClient reads.
 struct ClientOptions {
   /// No byte for this long, counted from @ref StreamClient::connect (the
-  /// name lookup and the TCP connect included), ends the connection with
+  /// name lookup and the TCP connect included) or @ref StreamClient::adopt,
+  /// ends the connection with
   /// `Status::Code::IoError`: a sender that stalled, or a path that died (the
   /// VPN dropped). @ref StreamClient::next judges it after taking what has
   /// come (the lookup's answer, the connect's end, bytes), so a caller back
@@ -39,23 +41,27 @@ struct ClientOptions {
 /// A chunk that fails a check ends the connection; nothing is resynced. A
 /// seq may jump where the server skipped to a newer key, and a geometry
 /// consumer then decodes again from the next key (`codec::Decoder`'s
-/// `NotFound`). Its receive buffer is 2 MiB, set before the connect: the most
-/// a stream carries a round trip, and what a reader that falls behind can
-/// hide from the server's drop rule. Linux holds it to `net.core.rmem_max`.
+/// `NotFound`). From @ref connect, its receive buffer is 2 MiB, set before
+/// the connect: the most a stream carries a round trip, and what a reader
+/// that falls behind can hide from the server's drop rule. Linux holds it to
+/// `net.core.rmem_max`. An adopted socket keeps its own; a @ref Listener's
+/// is the same 2 MiB.
 ///
 /// **Messages.** Every error @ref next returns reads
 /// `"StreamClient: <host>:<port>: <reason>"`, the host and port as given to
-/// @ref connect, and the reason never names them again: a caller showing the
-/// address drops the prefix. The reasons: "cannot look up the name: …" (the
-/// resolver's words, or "no IPv4 address for TCP") and "cannot connect: …"
-/// (the system's); past the idle limit, the stage it ended: "the lookup gave
+/// @ref connect, or the peer's for @ref adopt, and the reason never names
+/// them again: a caller showing the address drops the prefix. The reasons:
+/// "cannot look up the name: …" (the resolver's words, or "no IPv4 address
+/// for TCP") and "cannot connect: …" (the system's), never an adopted
+/// client's; past the idle limit, the stage it ended: "the lookup gave
 /// no answer within N ms", "cannot connect within N ms", "connected, but no
 /// session within N ms" or "no byte for N ms"; "the sender closed the
 /// connection", with " before its session (it may already serve its most
 /// viewers)" when none had come; a failed check's `stream::ChunkParser`
 /// message; a socket call's ("cannot receive: …"); or "out of memory" for an
 /// allocation that failed, bare when even the prefix cannot be allocated.
-/// @ref connect's own refusals read `"StreamClient::connect: <reason>"`.
+/// @ref connect's own refusals read `"StreamClient::connect: <reason>"`, and
+/// @ref adopt's `"StreamClient::adopt: <reason>"`.
 ///
 /// @code
 /// VKC_ASSIGN(auto client, networking::StreamClient::connect(
@@ -89,6 +95,26 @@ class VGRID_NETWORKING_API StreamClient {
       const std::string& host, std::uint16_t port,
       const ClientOptions& options = {});
 
+  /// @brief A client of the sender at the other end of @p connected, as
+  ///        @ref Listener::accept gives one: read as a connected one is, with
+  ///        no lookup and no connect. Never blocks.
+  ///
+  /// The socket is made non-blocking and close-on-exec, and on Apple never
+  /// raises SIGPIPE; its receive buffer stays as it is.
+  /// @ref ClientOptions::idle_limit counts from here.
+  /// @param connected  A connected IPv4 stream socket. The client owns it
+  ///                   from the call, and closes it on a refusal.
+  /// @param options    How it reads.
+  /// @return The client; `Status::Code::InvalidArgument` for an empty
+  ///         @p connected, one that is not an IPv4 stream socket, or an
+  ///         `idle_limit` of 0 or less; `Status::Code::IoError` for a socket
+  ///         not connected (or reset already, as one can be since
+  ///         @ref Listener::accept: a reader takes the next) or that cannot
+  ///         be set up;
+  ///         `Status::Code::OutOfMemory` when the client cannot be allocated.
+  static core::Result<std::unique_ptr<StreamClient>> adopt(
+      core::UniqueFd connected, const ClientOptions& options = {});
+
   /// @brief Closes the connection; never waits for a lookup.
   ~StreamClient();
   StreamClient(const StreamClient&) = delete;
@@ -100,9 +126,9 @@ class VGRID_NETWORKING_API StreamClient {
   ///         first record; null before.
   const stream::Session* session() const noexcept;
 
-  /// @brief Wait up to @p wait for the next record, finishing the lookup and
-  ///        the connect first. Each address is tried in turn; any connect
-  ///        error moves to the next.
+  /// @brief Wait up to @p wait for the next record, finishing a
+  ///        @ref connect's lookup and connect first. Each address is tried in
+  ///        turn; any connect error moves to the next.
   /// @param wait          The longest to wait: however fast bytes come, a
   ///                      call ends within it and one receive (up to
   ///                      2 MiB) more. 0 takes only that receive of what

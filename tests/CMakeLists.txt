@@ -738,8 +738,11 @@ add_test(NAME grid_stream_audio COMMAND grid_stream_audio_test)
 # socket calls with grid's log seam -- then the server and the client on
 # loopback, 127.0.0.1 port 0 only: the wire against the writer's file, joins,
 # newest key wins, keys on demand, the limits, the rules, teardown, signals, the
-# client's errors against raw senders, and a stress run in both modes for
-# ThreadSanitizer. Host-only.
+# client's errors against raw senders, a sender that dials out (dial, Listener,
+# add_viewer, adopt: an adopted viewer reads what a connected one reads, listen
+# false binds nothing, each refusal, a thread adding viewers while another
+# publishes and finishes), and a stress run in both modes for ThreadSanitizer.
+# Host-only.
 set(_vgrid_networking_src
     ${PROJECT_SOURCE_DIR}/src/volumetric_kit/grid/networking)
 add_executable(grid_networking_gop_log_test
@@ -759,7 +762,7 @@ target_link_libraries(grid_networking_socket_test
 vgrid_target_warnings(grid_networking_socket_test)
 add_test(NAME grid_networking_socket COMMAND grid_networking_socket_test)
 
-foreach(_vgrid_networking_test server client stress)
+foreach(_vgrid_networking_test server client dial stress)
   add_executable(grid_networking_${_vgrid_networking_test}_test
                  networking_${_vgrid_networking_test}_test.cpp)
   target_link_libraries(
@@ -852,6 +855,7 @@ add_dependencies(
   grid_networking_server_test
   grid_networking_server_oom_test
   grid_networking_client_test
+  grid_networking_dial_test
   grid_networking_stress_test
   grid_example_info_log_test)
 

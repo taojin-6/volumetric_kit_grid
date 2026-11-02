@@ -194,6 +194,13 @@ connection fails, ends with `closed: <why>` or `failed: <why>` in place of
 [vgrid info] StreamServer: viewer 192.168.1.20:52311 left
 ```
 
+A sender that must not listen, as a phone, dials its reader instead
+(`networking/dial.hpp`): it serves with `ServerOptions::listen` false, so
+it binds nothing, connects with `dial` and serves the socket with
+`StreamServer::add_viewer`; the reader listens on one numeric address with
+`Listener` and reads each connection with `StreamClient::adopt`. The
+stream is plain TCP, so it belongs inside a VPN.
+
 On Linux a viewer that is not on loopback gets BBR congestion control if
 the sender's kernel lists it as allowed; a sender that prints `viewers keep
 the kernel's congestion control, not bbr` lacks it. As root, until a reboot

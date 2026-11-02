@@ -46,10 +46,9 @@ struct StreamClient::Impl {
     std::vector<detail::Address> addresses;
   };
 
-  Impl(const std::string& host_, std::uint16_t port_,
-       const ClientOptions& options_)
+  Impl(std::string name_, const ClientOptions& options_)
       : options(options_),
-        name(host_ + ":" + std::to_string(port_)),
+        name(std::move(name_)),
         api(std::string(kClient) + ": " + name),
         last_byte(Clock::now()),
         buffer(kReceiveBytes) {}
@@ -65,10 +64,10 @@ struct StreamClient::Impl {
   core::Status fail(core::Status status);
 
   const ClientOptions options;
-  const std::string name;                  // "host:port"
-  const std::string api;                   // what every message starts with
-  Clock::time_point last_byte;             // connect, then each byte's arrival
-  std::shared_ptr<Lookup> lookup;          // a name's, until it is taken
+  const std::string name;          // "host:port"
+  const std::string api;           // what every message starts with
+  Clock::time_point last_byte;     // connect or adopt, then each byte's arrival
+  std::shared_ptr<Lookup> lookup;  // a name's, until it is taken
   std::vector<detail::Address> addresses;  // to try, in order
   std::size_t tried = 0;                   // those tried, fd's included
   core::Status refused;  // why the last address tried did not connect
@@ -181,7 +180,8 @@ core::Result<std::unique_ptr<StreamClient>> StreamClient::connect(
           std::string(kApi) + ": an idle_limit of " +
           std::to_string(options.idle_limit.count()) + " ms");
     }
-    auto impl = std::make_unique<Impl>(host, port, options);
+    auto impl =
+        std::make_unique<Impl>(host + ":" + std::to_string(port), options);
     detail::Address address;
     if (detail::parse_ipv4(host, port, &address)) {
       impl->addresses.push_back(address);
@@ -209,6 +209,32 @@ core::Result<std::unique_ptr<StreamClient>> StreamClient::connect(
       }).detach();
       impl->lookup = std::move(lookup);
     }
+    return std::unique_ptr<StreamClient>(new StreamClient(std::move(impl)));
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
+  }
+}
+
+core::Result<std::unique_ptr<StreamClient>> StreamClient::adopt(
+    core::UniqueFd connected, const ClientOptions& options) {
+  constexpr std::string_view kApi = "StreamClient::adopt";
+  try {
+    if (!connected.valid()) {
+      return core::Status::invalid_argument(std::string(kApi) +
+                                            ": an empty socket");
+    }
+    if (options.idle_limit <= std::chrono::milliseconds{0}) {
+      return core::Status::invalid_argument(
+          std::string(kApi) + ": an idle_limit of " +
+          std::to_string(options.idle_limit.count()) + " ms");
+    }
+    detail::Address peer;
+    VKC_TRY(detail::peer_of(kApi, connected.get(), &peer));
+    VKC_TRY(detail::prepare(kApi, connected.get()));
+    // Connected, so next goes straight to receiving: no address to try.
+    auto impl = std::make_unique<Impl>(detail::to_string(peer), options);
+    impl->fd = std::move(connected);
+    impl->connected = true;
     return std::unique_ptr<StreamClient>(new StreamClient(std::move(impl)));
   } catch (...) {
     return core::exception_status(kApi, core::Status::Code::IoError);

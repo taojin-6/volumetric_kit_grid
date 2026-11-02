@@ -338,7 +338,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   anchoring the GOP. *Amended 2026-10-30 once more:* `finish` closes each
   viewer once it has sent what is queued for it, within 1 s; the
   destructor still closes at once. *Amended 2026-11-01:* `draining()`
-  counts the viewers still sending the newest key's records.
+  counts the viewers still sending the newest key's records. *Amended
+  2026-11-02:* a sender may dial its reader, which listens, instead.
 - [**2026-10-21**](#2026-10-21--meshintegrator-finds-each-voxels-nearest-triangle-with-an-exact-early-exit-a-triangle-is-ruled-out-only-by-a-lower-bound-less-a-rounding-margin-of-its-own-strictly-above-the-voxels-limit) —
   `MeshIntegrator` finds each voxel's nearest triangle with an exact early
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
@@ -477,6 +478,11 @@ entries relevant to your task; later amendments supersede earlier rules.
   `StreamServer::draining()` counts the viewers still sending the newest
   key and the records after it, so a live sender may wait to make a key
   until none would skip a record.
+- [**2026-11-02**](#2026-11-02--a-sender-may-dial-out-serveroptionslisten-false-binds-nothing-dial-connects-to-the-readers-listener-streamserveradd_viewer-serves-the-socket-as-an-accepted-one-and-streamclientadopt-reads-it-amends-the-2026-10-21-networking-entry) —
+  A sender may dial out: with `listen` false the server binds nothing,
+  `dial` connects to the reader's `Listener` on one numeric address, never
+  the wildcard, `add_viewer` serves the socket with the accepted viewers'
+  setup and count, and `StreamClient::adopt` reads it.
 - [**2026-11-02**](#2026-11-02--the-model-view-is-a-cast-in-volume-k-device-cameras-in-one-dispatch-a-ring-of-sets-with-every-binding-written-per-cast-and-a-256-value-allow-set-over-a-named-byte) —
   The model view is a cast in `volume`: `RayCaster` casts K device cameras
   in one dispatch into a stacked `ModelView`, through a ring of descriptor
@@ -7150,7 +7156,9 @@ replaying a recording, sends; the player reads.
   `host:port`; Bonjour is deferred, as are authentication and encryption.
   IPv4 alone, a name's lookup included: the lab's name has an A record
   only, and an IPv6 address could only be refused, or stall the connect
-  where IPv6 is broken.
+  where IPv6 is broken. *Amended 2026-11-02 (the dial-out entry, below):*
+  a sender that must not listen dials its reader instead, which listens on
+  one numeric address; the sender is then given the reader's address.
 - **One track.** Newest key wins is per GOP; a second track would need a GOP
   of its own. *Amended 2026-10-30 (the `CodecStream` mux entry, below):*
   `CodecStream` writes Audio tracks beside the Geometry track, to a file;
@@ -8831,6 +8839,103 @@ case. Five planted bugs each fail both tests: a waiting viewer counted,
 the record under way not counted, the records still to take not counted,
 a viewer that has sent everything counted, and the record under way never
 cleared; the random runs alone catch the records still to take.
+
+### 2026-11-02 — A sender may dial out: `ServerOptions::listen` false binds nothing, `dial` connects to the reader's `Listener`, `StreamServer::add_viewer` serves the socket as an accepted one, and `StreamClient::adopt` reads it (amends the 2026-10-21 networking entry).
+
+**The need.** A phone serving its live camera must not listen:
+`StreamServer` has no authentication, and an empty host listens on every
+interface, so whatever reaches the port could connect and watch. So the
+phone dials its reader, inside the tunnel, and the reader listens on one
+address and takes whatever dials. The phone's on-screen entry of the
+reader's IPv4 address and port (the owner, 2026-11-02) feeds `dial`, so
+`dial`'s refusals must read as an entry field shows them.
+
+**The rule.**
+- `ServerOptions::listen`, true by default. False binds no socket and
+  starts no accept thread; `host` and `port` are not read, and `port()` is
+  0. Viewers come only through `add_viewer`.
+- `dial(host, port, limit)` only connects: a numeric IPv4 host, never the
+  wildcard, port 0 and a limit of 0 or less refused, each as
+  `dial: <reason>`, a sentence: `the host is empty`, `"lab" is not a
+  numeric IPv4 address`, `0.0.0.0 is the wildcard, not one host's
+  address`, `port 0 is not a port to dial`. A refused connect gives the
+  system's words, one past the limit `cannot connect within N ms`. The
+  `Listener` refuses the same hosts with the same reasons.
+- `add_viewer(fd)`, in either mode, takes a connected IPv4 stream socket:
+  an empty one, a Unix or UDP socket, a pipe or a call once finishing is
+  `InvalidArgument`, the last always `StreamServer::add_viewer: the stream
+  finished`; one not connected is `IoError`. It is prepared
+  (non-blocking, close-on-exec, no SIGPIPE) and given the sender setup
+  accept gives, `TCP_NODELAY`, the 128 KiB low-water mark and on Linux BBR
+  off loopback: one function, which both run, so every added socket gets
+  it. It is admitted as an accepted one is, and is counted in `viewers()`
+  and, on demand, `key_wanted()` before it returns: the log's join moved
+  from the viewer's thread to admission, for accepted viewers too, which
+  counts them earlier and never later. Past `max_viewers` or once
+  finishing it is closed before any byte, and the refusal returned.
+- `Listener::create(host, port)` listens on one numeric address, and sets
+  the client's 2 MiB receive buffer on the listening socket before
+  `listen`: each accepted socket inherits it, and the window scale the
+  SYN-ACK carries fits it, which a buffer set after `accept` would come too
+  late for. `port()` names the port 0 took. `accept(wait)` hands out each
+  connection, prepared; one reset as it waited is closed and an empty fd
+  returned, as the server's accept closes it.
+- `StreamClient::adopt(fd)` reads a connected IPv4 stream socket as
+  `connect`'s is read, named by its peer, its receive buffer as it came.
+
+**Why a lock to admit.** The check against `max_viewers` and the count
+were the accept thread's alone; with `add_viewer` from any thread they hold
+a lock of their own, which also guards the viewers' list and the reaping.
+`finish` takes it as it begins, so a viewer being admitted is counted
+before `finish` waits for the viewers, and none is admitted after. The
+admission lock comes before the log's, never after. Without `listen` there
+is no accept thread to reap, so each `add_viewer` joins the threads of the
+viewers that ended: they are never more than `max_viewers`. It checks for
+`finish` first, as the threads are joined once `finish` has stopped them.
+
+**Why IPv4 stream sockets alone.** The tier is IPv4 only, and its messages
+name a peer as `a.b.c.d:port`.
+
+**What does not change.** The wire, the GOP log, `publish` and the send
+loop; a server with `listen` serves as before, and `kDefaultPort` stays a
+sender's port: a host that serves on every interface there cannot also
+listen there, so a `Listener` is given its port.
+
+**Found while building.** macOS rounds an accepted socket's receive buffer
+up by an amount that varies (2,100,528 or 2,106,828 bytes for 2 MiB asked,
+on loopback, by the listener's queue length), so the test checks the 2 MiB
+floor (on Linux twice the least of it and `net.core.rmem_max`) and that a
+socket with none set reads below it, not equality with a reference socket.
+macOS drops a connection whose accept ran out of descriptors, where Linux
+keeps it queued, so `Listener::accept` promises only that the listener goes
+on. macOS cannot read `SO_ACCEPTCONN`, so "binds nothing" is checked by a
+scan for bound IPv4 sockets with no peer.
+
+**Found in review.** Linux hands a connection reset in the accept queue
+out of `accept`, its setup succeeding, and only naming its peer fails
+(`ENOTCONN`), where macOS fails the setup: so accept names the peer too.
+An `add_viewer` that passed its early check as `finish` began reaped after
+`finish` had joined the threads, and joining one twice threw: `IoError
+"thread::join failed"` in place of "the stream finished", in most rounds of
+a probe on either OS, so admission checks for `finish` before reaping and
+reaps only threads not yet joined.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer with a device required: the full suite passes, 73
+of 73; the networking tests under ThreadSanitizer (Debug), 5 of 5. The lab
+box (Linux 7.0, Release with warnings as errors): the networking tests, 7
+of 7. `grid_networking_dial` runs every case above on loopback. Planted
+bugs each fail it: `listen` false still binding (caught by `port()`, and
+with `port()` hidden by the scan); the `Listener` taking the wildcard (run
+on Linux, where no firewall asks); `add_viewer` skipping the sender setup;
+and the setup losing the low-water mark, which `grid_networking_socket`
+also catches. After review: `adopt` skipping its setup; the stream-type
+check gone (a connected UDP socket); admission reaping before its `finish`
+check, with an unchecked join (in every run, on either OS); and, on Linux,
+accept not naming the peer, and `add_viewer` not reaping, which grows the
+process by one thread stack per ended viewer (50.0 stacks over 50 viewers,
+0.0 reaped; the count of mappings grew by 2 at most, glibc 2.43 on Linux
+7.0, so the test measures the size).
 
 ### 2026-11-02 — The model view is a cast in `volume`: K device cameras in one dispatch, a ring of sets with every binding written per cast, and a 256-value allow set over a named byte.
 
