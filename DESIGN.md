@@ -314,7 +314,9 @@ pixel (x, y) of view i: f32 depth along the camera's +Z and a 12-byte world
 normal, zeros for a miss. A ray runs through the pixel's integer coordinates,
 as depth allocation unprojects them, from `min_depth` to `max_depth`,
 sampling the nearest voxel, whose block it finds through `hash_lookup.glsl`
-with a one-block cache. An unallocated block is skipped to where the ray
+with a one-block cache; a trilinear sample takes each corner's block, on each
+axis, as the base corner's or the next one's, and walks each block once. An
+unallocated block is skipped to where the ray
 leaves the space whose nearest voxel it holds, one step however wide; a voxel
 that does not answer takes a free step of `free_step` bands, and a positive
 one `min(s, trunc)·free_step`, at least `min_step_voxels`. A negative voxel
@@ -323,9 +325,10 @@ widens by half voxels, at most 4 each way, until the trilinear field's signs
 agree, and 4 rounds of false position (Illinois) refine it; the normal is the
 field's gradient there. Any other negative voxel, a sample with a corner that
 does not answer, or a hit outside the depth range is a miss. A `CastFilter`
-says which voxels answer: weight at or above its floor, and the bit of a
-named 1-byte attribute's value in a 256-bit allow set, the attribute read as
-words; with none named, the weight array fills its binding, since the core
+says which voxels answer: weight at or above its floor, which `record_cast`
+holds positive and finite so a voxel never integrated never answers, and the
+bit of a named 1-byte attribute's value in a 256-bit allow set, the attribute
+read as words; with none named, the weight array fills its binding, since the core
 enables no null descriptors. The push is 96 bytes. The caster holds
 `casts_per_batch` descriptor sets and writes every binding of the next one at
 each cast, so a grid resized since the last is bound afresh and one batch can

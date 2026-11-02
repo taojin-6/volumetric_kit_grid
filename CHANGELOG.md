@@ -14,8 +14,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   normal there, into a stacked `ModelView` that later kernels read in place.
   Rays skip unallocated blocks whole, march free space in steps of the band,
   and refine a + to - crossing on the trilinear field. A `CastFilter` says
-  which voxels answer: a weight floor (at or above, `kObservedWeight` by
-  default) and a 256-value allow set over a named 1-byte attribute; a
+  which voxels answer: a positive, finite weight floor (at or above,
+  `kObservedWeight` by default) and a 256-value allow set over a named 1-byte attribute; a
   trilinear sample answers only when its 8 corners do. The cameras may be
   written earlier in the batch, and a ring of `casts_per_batch` descriptor
   sets, every binding written at each cast, lets one batch recast at poses

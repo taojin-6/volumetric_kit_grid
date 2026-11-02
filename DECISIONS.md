@@ -8849,7 +8849,8 @@ crossing from + to - between two voxels that answer is refined by false
 position on the trilinear field, the normal its gradient. A `CastFilter`
 says which voxels answer: weight at or above its floor, and the bit of a
 named 1-byte attribute's value in a 256-bit allow set. A trilinear sample
-answers only when its 8 corners do. The caster holds `casts_per_batch`
+answers only when its 8 corners do, and walks each of its corners' blocks
+once. The caster holds `casts_per_batch`
 descriptor sets and writes every binding of the next at each cast.
 
 **Why in `volume`.** Only grid walks its hash table: a cast reads the
@@ -8877,7 +8878,11 @@ table is one allow set, so no table is fixed here. The set is 32 bytes of
 the push, which with the grid, the march and the size makes 96, within the
 128 guaranteed. With no attribute named, the weight array fills the
 binding, since the core enables no null descriptors. The weight floor
-answers at `>=`, the mesher's and the codec's rule for `kObservedWeight`.
+answers at `>=`, the mesher's and the codec's rule for `kObservedWeight`. It
+must be positive and finite: a voxel never integrated holds weight 0 and
+tsdf 0, so at a floor of 0 it answers as a surface, a ray entering its block
+misses and one reaching it after a positive voxel brackets a hit that is not
+there; a NaN floor answers nothing.
 
 **Why the 8-corner rule.** A trilinear sample with an unobserved or
 excluded corner mixes in a value that is not the surface's, so the hit's
@@ -8887,16 +8892,23 @@ band from unobserved space, is a miss.
 **Verification.** Apple M5 Max, Release, under the Khronos validation layer
 with a device required: the full suite passes, 73 of 73.
 `grid_volume_ray_cast` holds a plane's depth to 6e-8 m and its normal
-exactly, and a sphere's within 0.02 voxel and 0.79° away from its
-silhouette. Three planted bugs each fail it: the allow word indexed by
-`v & 7`, every view casting camera 0, and a set's bindings written only at
-its first cast.
+exactly (to 6e-8 on an RTX 4090), and a sphere's within 0.02 voxel and 0.79°
+away from its silhouette. Five planted bugs each fail it: the allow word
+indexed by `v & 7`, every view casting camera 0, a set's bindings written
+only at its first cast, a floor of 0 or −1 accepted, and every corner of a
+trilinear sample read through the base corner's block. A trilinear sample
+that walked its corners' blocks through the one-block cache alone gave the
+same depths and normals bit for bit; it walked up to 8 blocks a sample
+across an x face of a block.
 
 **Cost.** Its timing case, Release, device time: a 4 × 2.5 × 4 m room with
-a sphere at 1 cm voxels (28,146 blocks), 20 cameras inside it at 256×192,
-p50 of 100. On an RTX 4090, one view is 0.33 ms, 20 stacked 2.4 ms and 20
-single casts in one batch 7.5 ms; on an Apple M4, 2.2, 34.1 and 38.9 ms.
-Stacking is worth 3.1× on NVIDIA and 12% on Apple, where one view already
-fills the GPU. A ray here crosses about 2 m of unallocated room, a table
-walk a block, before its wall, so its cost is that walk's more than the
-march's near the surface.
+a sphere at 1 cm voxels, 0.0137 m off the voxel lattice (34,363 blocks), 20
+cameras inside it at 256×192, p50 of 100. On an RTX 4090, one view is
+0.25 ms, 20 stacked 1.8 ms and 20 single casts in one batch 5.3 ms; on an
+Apple M4, 1.5, 25.4 and 28.9 ms. Stacking is worth 2.9× on NVIDIA and 12%
+on Apple, where one view already fills the GPU. Where surfaces sit on the
+lattice moves the cost by about 10–30%, walls on block boundaries the most,
+so the room sits off it. A ray here crosses about 2 m of unallocated room, a
+table walk a block, before its wall, so most of its cost is that walk: on
+an Apple M5 Max, a wall moved from 0.36 to 3.6 m takes the 20-view cast
+from 1.4 to 7.1 ms.
