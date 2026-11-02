@@ -13,6 +13,7 @@
 #include <string>
 
 #include "volumetric_kit/core/base/result.hpp"
+#include "volumetric_kit/core/base/unique_fd.hpp"
 #include "volumetric_kit/grid/networking/export.hpp"
 #include "volumetric_kit/grid/stream/chunks.hpp"
 #include "volumetric_kit/grid/stream/session.hpp"
@@ -29,14 +30,16 @@ inline constexpr std::chrono::milliseconds kFinishLimit{1'000};
 /// @brief Where and how a @ref StreamServer serves.
 struct ServerOptions {
   /// A numeric IPv4 address to listen on; empty listens on every interface.
+  /// Not read without @ref listen.
   std::string host;
-  /// The port; 0 takes a free one, which @ref StreamServer::port names.
+  /// The port; 0 takes a free one, which @ref StreamServer::port names. Not
+  /// read without @ref listen.
   std::uint16_t port = kDefaultPort;
   /// Viewers served at once, first come: a connection past them is closed at
   /// accept, the first such refusal and then one in 10 s at most logged at
   /// Warning, the rest at Debug. With no authentication, any host reaching
   /// the port can take a slot, and keeps it until it leaves or stalls
-  /// (@ref stall_limit).
+  /// (@ref stall_limit). @ref StreamServer::add_viewer refuses one past them.
   std::size_t max_viewers = 4;
   /// With @ref replay_gop, the most one GOP (a key record and every record
   /// after it) may hold: a record that would pass it is dropped with the
@@ -60,6 +63,11 @@ struct ServerOptions {
   /// @ref max_gop_bytes behind; a viewer that would fall further waits for
   /// the next key. Newest key wins either way.
   bool replay_gop = true;
+  /// true: listen on @ref host and @ref port and accept viewers. false, for
+  /// a sender that dials out (@ref dial): bind no socket, so no host that
+  /// reaches the sender can connect to it; viewers come only through
+  /// @ref StreamServer::add_viewer.
+  bool listen = true;
 };
 
 /// @brief Serves one session to viewers over TCP as it is recorded: each
@@ -102,10 +110,17 @@ struct ServerOptions {
 /// @ref key_wanted, so a live sender makes its next frame a key and the
 /// viewer waits one frame.
 ///
+/// **Dialling out** (@ref ServerOptions::listen false). The server binds
+/// nothing. The sender connects to its reader with @ref dial and hands the
+/// socket to @ref add_viewer, which serves it as an accepted one; the reader
+/// takes it from a @ref Listener with @ref StreamClient::adopt. Every rule
+/// above holds for it.
+///
 /// **Threads.** @ref publish never waits on a socket or a viewer: it copies
-/// the record once, takes one lock and wakes the viewers. One thread accepts
-/// and one thread per viewer sends. A viewer that joins, leaves or fails is
-/// logged at Info, and never reaches @ref publish.
+/// the record once, takes one lock and wakes the viewers. With
+/// @ref ServerOptions::listen one thread accepts, and one thread per viewer
+/// sends. A viewer that joins, leaves or fails is logged at Info, by its
+/// peer's address, and never reaches @ref publish.
 ///
 /// @code
 /// stream::Session session;
@@ -118,20 +133,47 @@ struct ServerOptions {
 /// @warning Call @ref publish and @ref finish from one thread at a time.
 class VGRID_NETWORKING_API StreamServer {
  public:
-  /// @brief Listen on @p options' address and start accepting viewers.
+  /// @brief Listen on @p options' address and start accepting viewers, or,
+  ///        without @ref ServerOptions::listen, bind nothing.
   /// @param session  What each viewer gets first: a session
   ///                 `stream::StreamWriter::create` takes, its track 0 the
   ///                 one whose keys start a GOP.
   /// @param options  Where and how it serves.
   /// @return The server; `Status::Code::InvalidArgument` for a session the
-  ///         writer would refuse, a host that is not numeric IPv4, a
-  ///         `max_viewers` of 0 or a `stall_limit` of 0 or less;
-  ///         `Status::Code::IoError` for a port that cannot be
-  ///         bound (in use) or a thread that cannot start;
+  ///         writer would refuse, a `max_viewers` of 0, a `stall_limit` of 0
+  ///         or less, or, with `listen`, a host that is not numeric IPv4;
+  ///         `Status::Code::IoError` for a port that cannot be bound (in
+  ///         use, with `listen`) or a thread that cannot start;
   ///         `Status::Code::OutOfMemory` when the session's chunk cannot be
   ///         allocated.
   static core::Result<std::unique_ptr<StreamServer>> start(
       const stream::Session& session, const ServerOptions& options = {});
+
+  /// @brief Serve a socket the caller connected, as an accepted one is
+  ///        served: a sender that dials out (@ref dial) serves its reader
+  ///        through it, in either @ref ServerOptions::listen mode.
+  ///
+  /// The socket is set up to send as an accepted one is: `TCP_NODELAY`,
+  /// `TCP_NOTSENT_LOWAT` at 128 KiB, and on Linux BBR for a peer not on
+  /// loopback. It is counted in @ref viewers, and without `replay_gop` in
+  /// @ref key_wanted, by the time this returns, and a thread of its own
+  /// serves it. Safe from any thread, alongside @ref publish and
+  /// @ref finish. It joins the threads of viewers that have ended, which
+  /// without `listen` only it, @ref finish and the destructor do.
+  ///
+  /// Errors read `"StreamServer::add_viewer: <reason>"`, with the peer's
+  /// `"<host>:<port>: "` before the reason once it is known.
+  /// @param connected  A connected IPv4 stream socket. The server owns it
+  ///                   from the call and closes it on any refusal, so its
+  ///                   peer reads its end before any byte.
+  /// @return OK; `Status::Code::InvalidArgument` for an empty @p connected,
+  ///         one that is not an IPv4 stream socket, or a call once
+  ///         @ref finish has begun; `Status::Code::IoError` past
+  ///         @ref ServerOptions::max_viewers, for a socket not connected (or
+  ///         reset already) or that cannot be set up to send, or a thread
+  ///         that cannot start; `Status::Code::OutOfMemory` when the viewer
+  ///         cannot be allocated.
+  core::Status add_viewer(core::UniqueFd connected);
 
   /// @brief Close every connection at once, the records still queued for a
   ///        viewer lost (@ref finish sends them first), and join every
@@ -177,10 +219,12 @@ class VGRID_NETWORKING_API StreamServer {
   /// once; one that stalls past @ref ServerOptions::stall_limit is closed as
   /// ever; one still behind at @ref kFinishLimit is closed then, logged at
   /// Info. A connection meanwhile is closed at accept, before any byte, and
-  /// one after is refused. Later calls do nothing.
+  /// one after is refused; @ref add_viewer meanwhile and after is refused,
+  /// its socket closed. Later calls do nothing.
   void finish() noexcept;
 
-  /// @return The port listened on: the one asked for, or the one taken for 0.
+  /// @return The port listened on: the one asked for, or the one taken for
+  ///         0; 0 without @ref ServerOptions::listen.
   std::uint16_t port() const noexcept;
 
   /// @brief Viewers that joined or fell back to waiting for a key: without
@@ -214,10 +258,10 @@ class VGRID_NETWORKING_API StreamServer {
   std::size_t draining() const noexcept;
 
   /// @brief The viewers being served now: each counted from its accepted
-  ///        connection, before its first byte, until the server closes it:
-  ///        as it leaves, fails or stalls past
-  ///        @ref ServerOptions::stall_limit, or at @ref finish.
-  ///        A viewer waiting for a key counts; a connection refused at
+  ///        connection or its @ref add_viewer, before its first byte, until
+  ///        the server closes it: as it leaves, fails or stalls past
+  ///        @ref ServerOptions::stall_limit, or at @ref finish. A viewer
+  ///        waiting for a key counts; a connection or a socket refused at
   ///        @ref ServerOptions::max_viewers never does. Safe from any thread.
   /// @return The count, at most `max_viewers`.
   std::size_t viewers() const noexcept;

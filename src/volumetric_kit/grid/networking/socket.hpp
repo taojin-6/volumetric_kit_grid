@@ -83,23 +83,55 @@ std::string to_string(const Address& address);
 // Whether `address` is IPv4 loopback, 127.0.0.0/8.
 bool is_loopback(const Address& address);
 
+// `host`, one host's numeric IPv4 address, with `port`: InvalidArgument
+// "<api>: <reason>" for a host that is empty, not numeric IPv4, or the
+// wildcard 0.0.0.0, which names every interface to listen on and no host to
+// connect to. Each reason a sentence an address entry can show.
+core::Result<Address> one_host(std::string_view api, const std::string& host,
+                               std::uint16_t port);
+
 // Whether `allowed`, names separated by white space as
 // /proc/sys/net/ipv4/tcp_allowed_congestion_control holds them, lists `name`
 // as a whole word.
 bool lists(std::string_view allowed, std::string_view name);
 
+// Make `fd` close-on-exec and non-blocking, and on Apple never raise
+// SIGPIPE, as every socket of the tier is.
+core::Status prepare(std::string_view api, int fd);
+
 // A socket listening on `address` (SO_REUSEADDR, so a restarted sender takes
-// its port back at once). IoError for an address that cannot be bound.
+// its port back at once), its receive buffer `receive_buffer` bytes when
+// positive, set before the listen so that each socket it accepts inherits
+// it and the window scale fits it. IoError for an address that cannot be
+// bound.
 core::Result<core::UniqueFd> listen_on(std::string_view api,
-                                       const Address& address);
+                                       const Address& address,
+                                       int receive_buffer = 0);
 
 // The port `fd` is bound to.
 core::Result<std::uint16_t> bound_port(std::string_view api, int fd);
 
-// The next connection waiting on `listener`, set up to send (TCP_NODELAY,
-// TCP_NOTSENT_LOWAT at kSendLowWater, and on Linux prefer_congestion for a
-// peer that is not loopback), and its peer; an empty fd when none is waiting,
-// or one failed before it was taken or cannot be set up, which is closed.
+// The peer of `fd`, which must be a connected IPv4 stream socket:
+// InvalidArgument for one that is not a socket, not a stream socket or not
+// IPv4; IoError for one not connected, or reset already.
+core::Status peer_of(std::string_view api, int fd, Address* peer);
+
+// Set `fd`, connected to `peer`, up to send: TCP_NODELAY, TCP_NOTSENT_LOWAT
+// at kSendLowWater, and on Linux prefer_congestion for a peer that is not
+// loopback. The accepted viewers' and the added ones' one setup; IoError for
+// a socket that cannot be set up, as one its peer reset.
+core::Status set_up_sender(std::string_view api, int fd, const Address& peer);
+
+// The next connection waiting on `listener`, prepared, and its peer; an
+// empty fd when none is waiting, or one failed before it was taken or cannot
+// be prepared, which is closed. IoError (OutOfMemory for the kernel's
+// memory) for an accept that fails otherwise, as out of descriptors: Linux
+// keeps that connection queued, and macOS drops it.
+core::Result<core::UniqueFd> accept_one(std::string_view api, int listener,
+                                        Address* peer);
+
+// accept_one's connection, set up to send (set_up_sender); one that cannot
+// be is closed, and an empty fd returned.
 core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
                                          Address* peer);
 
@@ -113,16 +145,26 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
 bool prefer_congestion(std::string_view api, int fd, std::string_view allowed);
 #endif
 
-// A socket, its receive buffer kReceiveBuffer, connecting to `address`
-// without waiting: `*connected` says whether it already has, else poll it
-// writable and call finish_connect. `api` names the address.
+// A socket, its receive buffer `receive_buffer` bytes when positive (a
+// client's kReceiveBuffer by default), connecting to `address` without
+// waiting: `*connected` says whether it already has, else poll it writable
+// and call finish_connect. `api` names the address.
 core::Result<core::UniqueFd> start_connect(std::string_view api,
                                            const Address& address,
-                                           bool* connected);
+                                           bool* connected,
+                                           int receive_buffer = kReceiveBuffer);
 
 // The outcome of the connect start_connect began on `fd`, once it polls
 // writable.
 core::Status finish_connect(std::string_view api, int fd);
+
+// A socket connected to `address` within `limit`, which is positive, its
+// receive buffer the kernel's: start_connect, a wait, then finish_connect.
+// IoError "<api>: cannot connect: <the system's reason>", or "<api>: cannot
+// connect within N ms" past `limit`.
+core::Result<core::UniqueFd> connect_within(std::string_view api,
+                                            const Address& address,
+                                            std::chrono::milliseconds limit);
 
 // Wait up to `timeout` for `events` on `fd` (poll): the events that came, 0
 // when none did.

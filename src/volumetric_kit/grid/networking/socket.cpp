@@ -67,23 +67,6 @@ core::Status set_option(std::string_view api, int fd, int level, int name,
   return {};
 }
 
-// Close-on-exec, non-blocking, and on Apple no SIGPIPE.
-core::Status prepare(std::string_view api, int fd) {
-  const int fd_flags = ::fcntl(fd, F_GETFD);
-  if (fd_flags < 0 || ::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
-    return failure(api, "cannot set FD_CLOEXEC", errno);
-  }
-  const int flags = ::fcntl(fd, F_GETFL);
-  if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-    return failure(api, "cannot set O_NONBLOCK", errno);
-  }
-#ifdef __APPLE__
-  VKC_TRY(set_option(api, fd, SOL_SOCKET, SO_NOSIGPIPE, 1,
-                     "cannot set SO_NOSIGPIPE"));
-#endif
-  return {};
-}
-
 core::Result<core::UniqueFd> new_socket(std::string_view api) {
   core::UniqueFd fd(::socket(AF_INET, SOCK_STREAM, 0));
   if (!fd.valid()) return failure(api, "cannot make a socket", errno);
@@ -113,6 +96,22 @@ std::atomic<bool> kept_default_said{false};
 #endif
 
 }  // namespace
+
+core::Status prepare(std::string_view api, int fd) {
+  const int fd_flags = ::fcntl(fd, F_GETFD);
+  if (fd_flags < 0 || ::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+    return failure(api, "cannot set FD_CLOEXEC", errno);
+  }
+  const int flags = ::fcntl(fd, F_GETFL);
+  if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+    return failure(api, "cannot set O_NONBLOCK", errno);
+  }
+#ifdef __APPLE__
+  VKC_TRY(set_option(api, fd, SOL_SOCKET, SO_NOSIGPIPE, 1,
+                     "cannot set SO_NOSIGPIPE"));
+#endif
+  return {};
+}
 
 bool parse_ipv4(const std::string& host, std::uint16_t port, Address* out) {
   Address address;
@@ -175,6 +174,24 @@ bool is_loopback(const Address& address) {
   return (ntohl(address.in.sin_addr.s_addr) >> 24) == 127;
 }
 
+core::Result<Address> one_host(std::string_view api, const std::string& host,
+                               std::uint16_t port) {
+  if (host.empty()) {
+    return core::Status::invalid_argument(std::string(api) +
+                                          ": the host is empty");
+  }
+  Address address;
+  if (!parse_ipv4(host, port, &address)) {
+    return core::Status::invalid_argument(std::string(api) + ": \"" + host +
+                                          "\" is not a numeric IPv4 address");
+  }
+  if (address.in.sin_addr.s_addr == htonl(INADDR_ANY)) {
+    return core::Status::invalid_argument(
+        std::string(api) + ": 0.0.0.0 is the wildcard, not one host's address");
+  }
+  return address;
+}
+
 bool lists(std::string_view allowed, std::string_view name) {
   constexpr std::string_view kSpace = " \t\n\v\f\r";
   for (std::size_t at = allowed.find_first_not_of(kSpace);
@@ -219,10 +236,15 @@ bool prefer_congestion(std::string_view api, int fd, std::string_view allowed) {
 #endif
 
 core::Result<core::UniqueFd> listen_on(std::string_view api,
-                                       const Address& address) {
+                                       const Address& address,
+                                       int receive_buffer) {
   VKC_ASSIGN(core::UniqueFd fd, new_socket(api));
   VKC_TRY(set_option(api, fd.get(), SOL_SOCKET, SO_REUSEADDR, 1,
                      "cannot set SO_REUSEADDR"));
+  if (receive_buffer > 0) {
+    VKC_TRY(set_option(api, fd.get(), SOL_SOCKET, SO_RCVBUF, receive_buffer,
+                       "cannot set SO_RCVBUF"));
+  }
   if (::bind(fd.get(), as_sockaddr(address), sizeof address.in) != 0 ||
       ::listen(fd.get(), kBacklog) != 0) {
     const int error = errno;  // before the message's allocations
@@ -240,8 +262,57 @@ core::Result<std::uint16_t> bound_port(std::string_view api, int fd) {
   return ntohs(address.in.sin_port);
 }
 
-core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
-                                         Address* peer) {
+core::Status peer_of(std::string_view api, int fd, Address* peer) {
+  int type = 0;
+  socklen_t type_size = sizeof type;
+  if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_size) != 0) {
+    const int error = errno;
+    if (error == ENOTSOCK || error == EBADF) {
+      return core::Status::invalid_argument(std::string(api) +
+                                            ": not a socket");
+    }
+    return failure(api, "cannot read the socket's type", error);
+  }
+  if (type != SOCK_STREAM) {
+    return core::Status::invalid_argument(std::string(api) +
+                                          ": not a stream socket");
+  }
+  sockaddr_storage local{};
+  socklen_t local_size = sizeof local;
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local), &local_size) !=
+      0) {
+    return failure(api, "cannot name the socket", errno);
+  }
+  if (local.ss_family != AF_INET) {
+    return core::Status::invalid_argument(std::string(api) +
+                                          ": not an IPv4 socket");
+  }
+  *peer = {};
+  socklen_t size = sizeof peer->in;
+  if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer->in), &size) != 0) {
+    return failure(api, "cannot name the peer", errno);
+  }
+  return {};
+}
+
+core::Status set_up_sender(std::string_view api, int fd, const Address& peer) {
+  VKC_TRY(set_option(api, fd, IPPROTO_TCP, TCP_NODELAY, 1,
+                     "cannot set TCP_NODELAY"));
+  VKC_TRY(set_option(api, fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, kSendLowWater,
+                     "cannot set TCP_NOTSENT_LOWAT"));
+#ifdef __linux__
+  // Loopback has no loss or long round trip, and keeps the default.
+  if (!is_loopback(peer)) {
+    (void)prefer_congestion(api, fd, allowed_congestion());
+  }
+#else
+  (void)peer;
+#endif
+  return {};
+}
+
+core::Result<core::UniqueFd> accept_one(std::string_view api, int listener,
+                                        Address* peer) {
   for (;;) {
     *peer = {};
     socklen_t size = sizeof peer->in;
@@ -275,33 +346,32 @@ core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
           return failure(api, "cannot accept", errno);
       }
     }
-    // One that cannot be set up failed after it was queued, as macOS shows
-    // one its peer reset (EINVAL at the first setsockopt): it goes too.
-    if (!prepare(api, fd.get()).ok() ||
-        !set_option(api, fd.get(), IPPROTO_TCP, TCP_NODELAY, 1,
-                    "cannot set TCP_NODELAY")
-             .ok() ||
-        !set_option(api, fd.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT,
-                    kSendLowWater, "cannot set TCP_NOTSENT_LOWAT")
-             .ok()) {
-      return core::UniqueFd();
-    }
-#ifdef __linux__
-    // Loopback has no loss or long round trip, and keeps the default.
-    if (!is_loopback(*peer)) {
-      (void)prefer_congestion(api, fd.get(), allowed_congestion());
-    }
-#endif
+    // One that cannot be prepared failed after it was queued, as macOS
+    // shows one its peer reset (EINVAL at its first setsockopt): it goes
+    // too.
+    if (!prepare(api, fd.get()).ok()) return core::UniqueFd();
     return fd;
   }
 }
 
+core::Result<core::UniqueFd> accept_next(std::string_view api, int listener,
+                                         Address* peer) {
+  VKC_ASSIGN(core::UniqueFd fd, accept_one(api, listener, peer));
+  if (fd.valid() && !set_up_sender(api, fd.get(), *peer).ok()) {
+    return core::UniqueFd();
+  }
+  return fd;
+}
+
 core::Result<core::UniqueFd> start_connect(std::string_view api,
                                            const Address& address,
-                                           bool* connected) {
+                                           bool* connected,
+                                           int receive_buffer) {
   VKC_ASSIGN(core::UniqueFd fd, new_socket(api));
-  VKC_TRY(set_option(api, fd.get(), SOL_SOCKET, SO_RCVBUF, kReceiveBuffer,
-                     "cannot set SO_RCVBUF"));
+  if (receive_buffer > 0) {
+    VKC_TRY(set_option(api, fd.get(), SOL_SOCKET, SO_RCVBUF, receive_buffer,
+                       "cannot set SO_RCVBUF"));
+  }
   *connected =
       ::connect(fd.get(), as_sockaddr(address), sizeof address.in) == 0;
   const int error = errno;  // before the message's allocations
@@ -320,6 +390,22 @@ core::Status finish_connect(std::string_view api, int fd) {
   }
   if (error != 0) return failure(api, "cannot connect", error);
   return {};
+}
+
+core::Result<core::UniqueFd> connect_within(std::string_view api,
+                                            const Address& address,
+                                            std::chrono::milliseconds limit) {
+  bool connected = false;
+  VKC_ASSIGN(core::UniqueFd fd, start_connect(api, address, &connected, 0));
+  if (connected) return fd;
+  VKC_ASSIGN(const short ready, wait_for(api, fd.get(), POLLOUT, limit));
+  if (ready == 0) {
+    return core::Status::io_error(std::string(api) +
+                                  ": cannot connect within " +
+                                  std::to_string(limit.count()) + " ms");
+  }
+  VKC_TRY(finish_connect(api, fd.get()));
+  return fd;
 }
 
 core::Result<short> wait_for(std::string_view api, int fd, short events,

@@ -52,8 +52,8 @@ struct StreamServer::Impl {
     core::UniqueFd fd;  // its thread's, which closes it
     std::string name;   // its address, for the log
     bool done = false;  // under the mutex: its thread has ended
-    // Under the mutex: its place in the log, which it joins as its thread
-    // starts and leaves as it ends.
+    // Under the mutex: its place in the log, which it joins as it is
+    // admitted and leaves as its thread ends.
     detail::GopLog::Cursor cursor;
     std::thread thread;
   };
@@ -72,13 +72,20 @@ struct StreamServer::Impl {
   // The accept thread: take each connection, admit it or close it, and join
   // the threads of viewers that have ended, until the stop.
   void accept_loop() noexcept;
-  // Count `fd`'s viewer in and start its thread, or close it past
-  // max_viewers or once finishing.
-  void admit(core::UniqueFd fd, std::string name);
-  // Join the threads of the viewers that have ended.
+  // Join the threads of the viewers that have ended, then count `fd`'s
+  // viewer, at `name`, in: in the log, so a live sender's key is on its way
+  // before its first byte, and in `live`; then start its thread. Once
+  // finishing, or past max_viewers, `fd` is closed and the refusal returned,
+  // its message the bare reason: InvalidArgument "the stream finished",
+  // IoError "<n> viewers already". Throws, counting none, what the log or
+  // the thread's start throws. Takes `admitting`.
+  core::Status admit(core::UniqueFd fd, std::string name);
+  // Log the accept thread's refusal of the viewer at `name`.
+  void say_refused(const std::string& name, const core::Status& refusal);
+  // Join the threads of the viewers that have ended. Under `admitting`.
   void reap();
-  // A viewer's thread: join the log, send it everything, then close it, leave
-  // the log and say why.
+  // A viewer's thread: send it everything, then close it, leave the log and
+  // say why.
   void serve(Viewer& viewer) noexcept;
   // Send the session chunk, then the log's chunks as the socket takes them,
   // until the viewer leaves, fails or stalls, has every record once
@@ -95,7 +102,8 @@ struct StreamServer::Impl {
   const std::size_t tracks;      // the session's
   const ServerOptions options;
   const detail::Chunk session_chunk;
-  // The accept thread's; closed by finish once that thread has ended.
+  // The accept thread's, empty without listen; closed by finish once that
+  // thread has ended.
   core::UniqueFd listener;
   const std::uint16_t port;
 
@@ -109,11 +117,15 @@ struct StreamServer::Impl {
   std::atomic<bool> stop{false};  // set under the mutex
   // The log's key_wanted(), set under the mutex and read from any thread.
   std::atomic<std::uint64_t> key_wanted{0};
-  // The viewers being served: added by the accept thread, taken off by each
+  // The viewers being served: added under `admitting`, taken off by each
   // viewer's thread as it ends, read from any thread.
   std::atomic<std::size_t> live{0};
 
-  std::list<Viewer> viewers;  // the accept thread's, then halt's
+  // Held to add a viewer, to reap or join the viewers' threads, and by
+  // finish as it begins, so a viewer is admitted wholly before it or not at
+  // all; taken before `mutex`, never after.
+  std::mutex admitting;
+  std::list<Viewer> viewers;  // under `admitting`
   // The accept thread's: when a refusal was last logged at Warning.
   std::optional<Clock::time_point> refusal_warned;
   std::thread acceptor;
@@ -122,7 +134,10 @@ struct StreamServer::Impl {
 void StreamServer::Impl::accept_loop() noexcept {
   while (!stop) {
     try {
-      reap();
+      {
+        const std::lock_guard<std::mutex> lock(admitting);
+        reap();
+      }
       const core::Result<short> ready =
           detail::wait_for(kServer, listener.get(), POLLIN, detail::kPollSlice);
       if (ready.ok() && *ready == 0) continue;
@@ -138,7 +153,9 @@ void StreamServer::Impl::accept_loop() noexcept {
         continue;
       }
       if (accepted->valid()) {
-        admit(std::move(accepted).value(), detail::to_string(peer));
+        const std::string name = detail::to_string(peer);
+        const core::Status admitted = admit(std::move(accepted).value(), name);
+        if (!admitted.ok()) say_refused(name, admitted);
       }
     } catch (...) {
       log_at(core::LogLevel::Warning,
@@ -149,36 +166,35 @@ void StreamServer::Impl::accept_loop() noexcept {
   }
 }
 
-void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
-  if (finishing) {
-    fd.reset();  // closed at accept, before any byte
-    log_at(core::LogLevel::Info, std::string(kServer) + ": refused viewer " +
-                                     name + ": the stream finished");
-    return;
+core::Status StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
+  const std::lock_guard<std::mutex> lock(admitting);
+  reap();
+  // Closed on return, before any byte: the viewer sees its end at once.
+  if (finishing || stop) {
+    return core::Status::invalid_argument("the stream finished");
   }
-  // Only this thread adds viewers, so one admitted after this check still
-  // fits.
+  // Only a holder of `admitting` adds viewers, so one admitted after this
+  // check still fits.
   std::size_t serving = live;
   if (serving >= options.max_viewers) {
-    fd.reset();  // closed at accept: the viewer sees its end before any byte
-    // At Warning, which the default sink prints, so the owner sees why a
-    // viewer gets nothing: the first refusal, then one in 10 s at most. The
-    // rest at Debug, so a sender that prints Info is not flooded either.
-    const Clock::time_point now = Clock::now();
-    const bool warn =
-        !refusal_warned || now - *refusal_warned >= kRefusalWarningEvery;
-    if (warn) refusal_warned = now;
-    log_at(warn ? core::LogLevel::Warning : core::LogLevel::Debug,
-           std::string(kServer) + ": refused viewer " + name + ": " +
-               std::to_string(serving) + " viewers already");
-    return;
+    return core::Status::io_error(std::to_string(serving) + " viewers already");
   }
-  // Nothing from here to its thread's start throws but that start, which is
-  // undone: a viewer counted with no thread would keep its slot and its
-  // connection for the server's life.
+  // Nothing from here to its thread's start throws but the log's join and
+  // that start, each undone: a viewer counted with no thread would keep its
+  // place under max_viewers and its connection for the server's life.
   Viewer& viewer = viewers.emplace_back();
   viewer.fd = std::move(fd);
   viewer.name = std::move(name);
+  try {
+    // Counted before its first byte, so a live sender's key is on its way
+    // while the session chunk goes, and before add_viewer returns.
+    const std::lock_guard<std::mutex> log_lock(mutex);
+    log.join(&viewer.cursor);
+    count_key_wanted();
+  } catch (...) {
+    viewers.pop_back();
+    throw;
+  }
   serving = ++live;
   try {
     log_at(core::LogLevel::Info, std::string(kServer) + ": viewer " +
@@ -191,9 +207,33 @@ void StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
     viewer.thread = std::thread([this, &viewer] { serve(viewer); });
   } catch (...) {
     --live;
+    {
+      const std::lock_guard<std::mutex> log_lock(mutex);
+      log.leave(&viewer.cursor);
+    }
     viewers.pop_back();
     throw;
   }
+  return {};
+}
+
+void StreamServer::Impl::say_refused(const std::string& name,
+                                     const core::Status& refusal) {
+  const std::string message = std::string(kServer) + ": refused viewer " +
+                              name + ": " + refusal.message();
+  if (refusal.domain() != core::Status::Code::IoError) {
+    log_at(core::LogLevel::Info, message);
+    return;
+  }
+  // Past max_viewers. At Warning, which the default sink prints, so the
+  // owner sees why a viewer gets nothing: the first refusal, then one in
+  // 10 s at most. The rest at Debug, so a sender that prints Info is not
+  // flooded either.
+  const Clock::time_point now = Clock::now();
+  const bool warn =
+      !refusal_warned || now - *refusal_warned >= kRefusalWarningEvery;
+  if (warn) refusal_warned = now;
+  log_at(warn ? core::LogLevel::Warning : core::LogLevel::Debug, message);
 }
 
 void StreamServer::Impl::reap() {
@@ -215,13 +255,6 @@ void StreamServer::Impl::reap() {
 void StreamServer::Impl::serve(Viewer& viewer) noexcept {
   std::string why;
   try {
-    {
-      // Counted before its first byte, so a live sender's key is on its way
-      // while the session chunk goes.
-      const std::lock_guard<std::mutex> lock(mutex);
-      log.join(&viewer.cursor);
-      count_key_wanted();
-    }
     why = send_all(viewer);
   } catch (...) {
     try {
@@ -324,7 +357,9 @@ void StreamServer::Impl::halt() noexcept {
     stop = true;
   }
   wake.notify_all();
+  // The accept thread first, which takes `admitting` to admit and reap.
   if (acceptor.joinable()) acceptor.join();
+  const std::lock_guard<std::mutex> lock(admitting);
   for (Viewer& viewer : viewers) {
     if (viewer.thread.joinable()) viewer.thread.join();
   }
@@ -335,13 +370,19 @@ StreamServer::~StreamServer() { impl_->halt(); }
 void StreamServer::finish() noexcept {
   Impl& s = *impl_;
   {
-    std::unique_lock<std::mutex> lock(s.mutex);
+    // Under `admitting` too, so a viewer being admitted is counted before
+    // this waits for it, and none is admitted after.
+    const std::lock_guard<std::mutex> admit_lock(s.admitting);
+    const std::lock_guard<std::mutex> lock(s.mutex);
     if (s.finishing) return;
     // After the last record published, which every viewer then sees with it.
     s.finishing = true;
-    s.wake.notify_all();
+  }
+  s.wake.notify_all();
+  {
     // Each viewer's thread ends once it has sent its last record, or as it
     // leaves, fails or stalls.
+    std::unique_lock<std::mutex> lock(s.mutex);
     s.ended.wait_for(lock, kFinishLimit, [&s] { return s.live == 0; });
   }
   s.halt();
@@ -364,16 +405,21 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
           std::string(kApi) + ": a stall_limit of " +
           std::to_string(options.stall_limit.count()) + " ms");
     }
-    detail::Address address;
-    if (!detail::parse_ipv4(options.host.empty() ? "0.0.0.0" : options.host,
-                            options.port, &address)) {
-      return core::Status::invalid_argument(std::string(kApi) + ": host \"" +
-                                            options.host +
-                                            "\" is not a numeric IPv4 address");
+    // Without listen, no socket and no accept thread: viewers come only
+    // through add_viewer.
+    core::UniqueFd listener;
+    std::uint16_t port = 0;
+    if (options.listen) {
+      detail::Address address;
+      if (!detail::parse_ipv4(options.host.empty() ? "0.0.0.0" : options.host,
+                              options.port, &address)) {
+        return core::Status::invalid_argument(
+            std::string(kApi) + ": host \"" + options.host +
+            "\" is not a numeric IPv4 address");
+      }
+      VKC_ASSIGN(listener, detail::listen_on(kApi, address));
+      VKC_ASSIGN(port, detail::bound_port(kApi, listener.get()));
     }
-    VKC_ASSIGN(core::UniqueFd listener, detail::listen_on(kApi, address));
-    VKC_ASSIGN(const std::uint16_t port,
-               detail::bound_port(kApi, listener.get()));
     auto session_chunk = std::make_shared<const std::vector<std::uint8_t>>(
         encoder->session_chunk());
     std::unique_ptr<StreamServer> server(
@@ -381,8 +427,36 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
             std::move(encoder).value(), session.tracks.size(), options,
             std::move(session_chunk), std::move(listener), port)));
     Impl* const s = server->impl_.get();
-    s->acceptor = std::thread([s] { s->accept_loop(); });
+    if (options.listen) s->acceptor = std::thread([s] { s->accept_loop(); });
     return server;
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::IoError);
+  }
+}
+
+core::Status StreamServer::add_viewer(core::UniqueFd connected) {
+  constexpr std::string_view kApi = "StreamServer::add_viewer";
+  Impl& s = *impl_;
+  try {
+    if (!connected.valid()) {
+      return core::Status::invalid_argument(std::string(kApi) +
+                                            ": an empty socket");
+    }
+    // Before the socket's checks, so a call once finishing is refused as
+    // such; admit checks again, under its lock.
+    if (s.finishing || s.stop) {
+      return core::Status::invalid_argument(std::string(kApi) +
+                                            ": the stream finished");
+    }
+    detail::Address peer;
+    VKC_TRY(detail::peer_of(kApi, connected.get(), &peer));
+    std::string name = detail::to_string(peer);
+    const std::string api = std::string(kApi) + ": " + name;
+    VKC_TRY(detail::prepare(api, connected.get()));
+    VKC_TRY(detail::set_up_sender(api, connected.get(), peer));
+    core::Status admitted = s.admit(std::move(connected), std::move(name));
+    if (!admitted.ok()) return std::move(admitted).with_context(api);
+    return {};
   } catch (...) {
     return core::exception_status(kApi, core::Status::Code::IoError);
   }
