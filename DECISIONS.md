@@ -8857,8 +8857,9 @@ reader's IPv4 address and port (the owner, 2026-11-02) feeds `dial`, so
   system's words, one past the limit `cannot connect within N ms`. The
   `Listener` refuses the same hosts with the same reasons.
 - `add_viewer(fd)`, in either mode, takes a connected IPv4 stream socket:
-  an empty one, a Unix socket, a pipe or a call once finishing is
-  `InvalidArgument`, one not connected `IoError`. It is prepared
+  an empty one, a Unix or UDP socket, a pipe or a call once finishing is
+  `InvalidArgument`, the last always `StreamServer::add_viewer: the stream
+  finished`; one not connected is `IoError`. It is prepared
   (non-blocking, close-on-exec, no SIGPIPE) and given the sender setup
   accept gives, `TCP_NODELAY`, the 128 KiB low-water mark and on Linux BBR
   off loopback: one function, which both run, so every added socket gets
@@ -8872,7 +8873,8 @@ reader's IPv4 address and port (the owner, 2026-11-02) feeds `dial`, so
   `listen`: each accepted socket inherits it, and the window scale the
   SYN-ACK carries fits it, which a buffer set after `accept` would come too
   late for. `port()` names the port 0 took. `accept(wait)` hands out each
-  connection, prepared.
+  connection, prepared; one reset as it waited is closed and an empty fd
+  returned, as the server's accept closes it.
 - `StreamClient::adopt(fd)` reads a connected IPv4 stream socket as
   `connect`'s is read, named by its peer, its receive buffer as it came.
 
@@ -8883,7 +8885,8 @@ a lock of their own, which also guards the viewers' list and the reaping.
 before `finish` waits for the viewers, and none is admitted after. The
 admission lock comes before the log's, never after. Without `listen` there
 is no accept thread to reap, so each `add_viewer` joins the threads of the
-viewers that ended: they are never more than `max_viewers`.
+viewers that ended: they are never more than `max_viewers`. It checks for
+`finish` first, as the threads are joined once `finish` has stopped them.
 
 **Why IPv4 stream sockets alone.** The tier is IPv4 only, and its messages
 name a peer as `a.b.c.d:port`.
@@ -8903,6 +8906,15 @@ keeps it queued, so `Listener::accept` promises only that the listener goes
 on. macOS cannot read `SO_ACCEPTCONN`, so "binds nothing" is checked by a
 scan for bound IPv4 sockets with no peer.
 
+**Found in review.** Linux hands a connection reset in the accept queue
+out of `accept`, its setup succeeding, and only naming its peer fails
+(`ENOTCONN`), where macOS fails the setup: so accept names the peer too.
+An `add_viewer` that passed its early check as `finish` began reaped after
+`finish` had joined the threads, and joining one twice threw: `IoError
+"thread::join failed"` in place of "the stream finished", in most rounds of
+a probe on either OS, so admission checks for `finish` before reaping and
+reaps only threads not yet joined.
+
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer with a device required: the full suite passes, 73
 of 73; the networking tests under ThreadSanitizer (Debug), 5 of 5. The lab
@@ -8912,4 +8924,10 @@ bugs each fail it: `listen` false still binding (caught by `port()`, and
 with `port()` hidden by the scan); the `Listener` taking the wildcard (run
 on Linux, where no firewall asks); `add_viewer` skipping the sender setup;
 and the setup losing the low-water mark, which `grid_networking_socket`
-also catches.
+also catches. After review: `adopt` skipping its setup; the stream-type
+check gone (a connected UDP socket); admission reaping before its `finish`
+check, with an unchecked join (in every run, on either OS); and, on Linux,
+accept not naming the peer, and `add_viewer` not reaping, which grows the
+process by one thread stack per ended viewer (50.0 stacks over 50 viewers,
+0.0 reaped; the count of mappings grew by 2 at most, glibc 2.43 on Linux
+7.0, so the test measures the size).

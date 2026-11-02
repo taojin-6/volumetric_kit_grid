@@ -72,17 +72,20 @@ struct StreamServer::Impl {
   // The accept thread: take each connection, admit it or close it, and join
   // the threads of viewers that have ended, until the stop.
   void accept_loop() noexcept;
-  // Join the threads of the viewers that have ended, then count `fd`'s
-  // viewer, at `name`, in: in the log, so a live sender's key is on its way
-  // before its first byte, and in `live`; then start its thread. Once
-  // finishing, or past max_viewers, `fd` is closed and the refusal returned,
-  // its message the bare reason: InvalidArgument "the stream finished",
-  // IoError "<n> viewers already". Throws, counting none, what the log or
-  // the thread's start throws. Takes `admitting`.
+  // Unless finishing, join the threads of the viewers that have ended; then
+  // count `fd`'s viewer, at `name`, in: in the log, so a live sender's key
+  // is on its way before its first byte, and in `live`; then start its
+  // thread. Once finishing, or past max_viewers, `fd` is closed and the
+  // refusal returned, its message the bare reason: InvalidArgument "the
+  // stream finished", IoError "<n> viewers already". Throws what the log or
+  // the thread's start throws, counting none in `live` (a start that throws
+  // leaves the join in key_wanted, which only rises: one key too many).
+  // Takes `admitting`.
   core::Status admit(core::UniqueFd fd, std::string name);
   // Log the accept thread's refusal of the viewer at `name`.
   void say_refused(const std::string& name, const core::Status& refusal);
-  // Join the threads of the viewers that have ended. Under `admitting`.
+  // Join the threads of the viewers that have ended, and forget them; halt
+  // has joined some already. Under `admitting`.
   void reap();
   // A viewer's thread: send it everything, then close it, leave the log and
   // say why.
@@ -168,11 +171,12 @@ void StreamServer::Impl::accept_loop() noexcept {
 
 core::Status StreamServer::Impl::admit(core::UniqueFd fd, std::string name) {
   const std::lock_guard<std::mutex> lock(admitting);
-  reap();
   // Closed on return, before any byte: the viewer sees its end at once.
+  // Before the reaping, which halt has done once stop is set.
   if (finishing || stop) {
     return core::Status::invalid_argument("the stream finished");
   }
+  reap();
   // Only a holder of `admitting` adds viewers, so one admitted after this
   // check still fits.
   std::size_t serving = live;
@@ -244,7 +248,7 @@ void StreamServer::Impl::reap() {
       done = it->done;
     }
     if (done) {
-      it->thread.join();
+      if (it->thread.joinable()) it->thread.join();
       it = viewers.erase(it);
     } else {
       ++it;
@@ -455,8 +459,13 @@ core::Status StreamServer::add_viewer(core::UniqueFd connected) {
     VKC_TRY(detail::prepare(api, connected.get()));
     VKC_TRY(detail::set_up_sender(api, connected.get(), peer));
     core::Status admitted = s.admit(std::move(connected), std::move(name));
-    if (!admitted.ok()) return std::move(admitted).with_context(api);
-    return {};
+    if (admitted.ok()) return {};
+    // "The stream finished" reads as the check above gives it, whenever
+    // finish began; a refusal past max_viewers names the viewer.
+    const bool finished =
+        admitted.domain() == core::Status::Code::InvalidArgument;
+    return std::move(admitted).with_context(finished ? kApi
+                                                     : std::string_view(api));
   } catch (...) {
     return core::exception_status(kApi, core::Status::Code::IoError);
   }

@@ -928,8 +928,7 @@ nothing; the server reads and drops what one does send, and closes on its
 end. The port is 47801 (`kDefaultPort`).
 
 **Serving** (`StreamServer`). `start` listens on a numeric IPv4 address, or
-every interface, and starts an accept thread (unless it dials out, below);
-one thread per viewer sends,
+every interface, and starts an accept thread; one thread per viewer sends,
 at most `max_viewers` (4) at once, first come, and a connection past them is
 closed at accept. `publish` frames the record by the writer's rules, copies
 its chunk once, takes one lock to append it to the GOP log and wakes the
@@ -969,10 +968,9 @@ atomic any thread reads, counts each viewer from its accepted connection
 or its `add_viewer`, before its first byte and while it waits for a key,
 until the server closes it; a refused connection never counts. Viewers that
 join, leave or fail are logged at Info; an accept's refusal at Warning, the
-first and then one in 10 s at
-most, the rest at Debug. The destructor stops every thread within a poll
-slice (20 ms) and the write under way, what is queued for a viewer lost.
-`publish` and `finish` are called from one thread.
+first and then one in 10 s at most, the rest at Debug. The destructor stops
+every thread within a poll slice (20 ms) and the write under way, what is
+queued for a viewer lost. `publish` and `finish` are called from one thread.
 
 **Dialling out** (`networking/dial.hpp`, the 2026-11-02 entry). A sender
 that must not listen, a phone, starts with `listen` false: no socket, no
@@ -988,12 +986,15 @@ before it returns, so on demand `key_wanted()` has risen; past
 refusal returned. Admission holds a lock of its own, which `finish` takes
 as it begins, so a viewer is admitted wholly before it or not at all;
 without `listen` the threads of viewers that ended are joined at each
-`add_viewer`. The reader's `Listener` listens on one numeric address, never
-the wildcard, its listening socket given the client's 2 MiB receive buffer
-before `listen`, so each accepted socket inherits it and the window scale
-fits it; `accept(wait)` hands out each connection, prepared, and
-`StreamClient::adopt` reads it as a connected client is read, named by its
-peer, with no lookup or connect. The wire is unchanged.
+`add_viewer` that comes before `finish`. The reader's `Listener` listens on
+one numeric address, never the wildcard, its listening socket given the
+client's 2 MiB receive buffer before `listen`, so each accepted socket
+inherits it and the window scale fits it; `accept(wait)` hands out each
+connection, prepared, never one reset as it waited (accept's, so the
+server's too), and `StreamClient::adopt` reads it as a connected client is
+read, named by its peer, with no lookup or connect. One reset after it was
+taken fails at `adopt`, and the reader takes the next. The wire is
+unchanged.
 
 **Finishing** (the 2026-10-30 finish entry). `finish` ends the stream
 without losing its tail: later records are refused, a connection is closed

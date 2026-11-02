@@ -162,7 +162,9 @@ class VGRID_NETWORKING_API StreamServer {
   /// without `listen` only it, @ref finish and the destructor do.
   ///
   /// Errors read `"StreamServer::add_viewer: <reason>"`, with the peer's
-  /// `"<host>:<port>: "` before the reason once it is known.
+  /// `"<host>:<port>: "` before the reason once it is known; a call once
+  /// @ref finish has begun reads `"StreamServer::add_viewer: the stream
+  /// finished"` alone.
   /// @param connected  A connected IPv4 stream socket. The server owns it
   ///                   from the call and closes it on any refusal, so its
   ///                   peer reads its end before any byte.

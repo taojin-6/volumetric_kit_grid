@@ -108,7 +108,9 @@ class VGRID_NETWORKING_API StreamClient {
   /// @return The client; `Status::Code::InvalidArgument` for an empty
   ///         @p connected, one that is not an IPv4 stream socket, or an
   ///         `idle_limit` of 0 or less; `Status::Code::IoError` for a socket
-  ///         not connected (or reset already) or that cannot be set up;
+  ///         not connected (or reset already, as one can be since
+  ///         @ref Listener::accept: a reader takes the next) or that cannot
+  ///         be set up;
   ///         `Status::Code::OutOfMemory` when the client cannot be allocated.
   static core::Result<std::unique_ptr<StreamClient>> adopt(
       core::UniqueFd connected, const ClientOptions& options = {});

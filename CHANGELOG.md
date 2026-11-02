@@ -27,6 +27,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   thread starts, rather than as its thread starts: earlier, never later.
   The bytes served are unchanged.
 
+### Fixed
+
+- **On Linux a connection reset while it waited to be accepted is closed
+  at accept**, as on macOS: Linux hands it out with its setup succeeding,
+  and only naming its peer fails, so a server no longer admits it.
+
 ## [0.8.0] - 2026-11-01
 
 ### Added

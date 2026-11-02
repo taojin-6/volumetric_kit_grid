@@ -64,8 +64,9 @@ VGRID_NETWORKING_API core::Result<core::UniqueFd> dial(
 /// for (;;) {
 ///   VKC_ASSIGN(core::UniqueFd fd, listener->accept(100ms));
 ///   if (!fd.valid()) continue;  // none yet: look at quit here
-///   VKC_ASSIGN(auto client, networking::StreamClient::adopt(std::move(fd)));
-///   // read client as a connected one is read until it ends, then accept again
+///   auto client = networking::StreamClient::adopt(std::move(fd));
+///   if (!client.ok()) continue;  // reset as it was taken: log it, go on
+///   // read *client as a connected one is read until it ends; accept again
 /// }
 /// @endcode
 ///
@@ -95,10 +96,12 @@ class VGRID_NETWORKING_API Listener {
   ///              waiting.
   /// @return The connection, non-blocking and close-on-exec, for
   ///         @ref StreamClient::adopt; an empty fd when none came, or when
-  ///         one failed before it was taken; `Status::Code::IoError` (or
-  ///         `Status::Code::OutOfMemory`) for an accept that fails otherwise,
-  ///         as out of descriptors, which leaves the listener listening
-  ///         (Linux keeps that connection queued; macOS drops it).
+  ///         one failed before it was taken, as one reset while it waited;
+  ///         `Status::Code::IoError` (or `Status::Code::OutOfMemory`) for an
+  ///         accept that fails otherwise, as out of descriptors, which
+  ///         leaves the listener listening. Linux keeps that connection
+  ///         queued, so the next accept fails at once: a caller that goes
+  ///         on waits a little first. macOS drops it.
   core::Result<core::UniqueFd> accept(std::chrono::milliseconds wait);
 
   /// @return The port listened on: the one asked for, or the one taken for 0.

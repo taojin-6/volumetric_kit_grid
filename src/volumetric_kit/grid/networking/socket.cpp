@@ -346,10 +346,16 @@ core::Result<core::UniqueFd> accept_one(std::string_view api, int listener,
           return failure(api, "cannot accept", errno);
       }
     }
-    // One that cannot be prepared failed after it was queued, as macOS
-    // shows one its peer reset (EINVAL at its first setsockopt): it goes
-    // too.
-    if (!prepare(api, fd.get()).ok()) return core::UniqueFd();
+    // One that cannot be prepared, or has no peer left, failed after it was
+    // queued: macOS shows one its peer reset as EINVAL at its first
+    // setsockopt, Linux only as ENOTCONN when it is named. It goes too.
+    sockaddr_storage named{};
+    socklen_t named_size = sizeof named;
+    if (!prepare(api, fd.get()).ok() ||
+        ::getpeername(fd.get(), reinterpret_cast<sockaddr*>(&named),
+                      &named_size) != 0) {
+      return core::UniqueFd();
+    }
     return fd;
   }
 }

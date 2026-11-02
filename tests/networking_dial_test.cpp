@@ -8,28 +8,32 @@
 // replay_gop modes, an add counted in viewers() and on demand in
 // key_wanted() by the time it returns; a server with listen false binds no
 // socket, names port 0 and reads no host, where one with listen binds one;
-// add_viewer refuses an empty fd, a socket that is not IPv4 or not a socket,
-// one not connected, one past max_viewers and one once finished, each
-// closed so its peer reads its end before any byte; an added socket, a
-// blocking one the test connected, is set up as an accepted one is
-// (non-blocking, TCP_NODELAY, the 128 KiB low-water mark); Listener refuses
-// an empty, wildcard or named host, an address in use and one not this
-// host's, takes a free port for 0, gives an empty fd with nothing waiting,
-// within its wait, and accepted sockets the 2 MiB receive buffer, above the
-// default, refuses connections once destroyed, and an accept out of
-// descriptors is an IoError naming it, after which it goes on; dial refuses
-// each bad entry with a message an address field can show, a closed port with
-// the system's words and a connect that never finishes at its limit, and
-// connects to a Listener with a non-blocking, close-on-exec socket; adopt
-// refuses an empty fd, a Unix socket and an idle_limit of 0, and its errors
-// name the dialler's address, a peer that sends nothing ending as "connected,
-// but no session"; and a thread adding viewers while another publishes and
-// finishes, for ThreadSanitizer.
+// add_viewer refuses an empty fd, a socket that is not IPv4, not a stream or
+// not a socket, one not connected, one past max_viewers and one once
+// finished, each closed so its peer reads its end before any byte; an added
+// socket, a blocking one the test connected, is set up as an accepted one is
+// (non-blocking, close-on-exec, TCP_NODELAY, the 128 KiB low-water mark);
+// Listener refuses an empty, wildcard or named host, an address in use and
+// one not this host's, takes a free port for 0, gives an empty fd with
+// nothing waiting, within its wait, or for a connection reset as it waited,
+// and accepted sockets the 2 MiB receive buffer, above the default, refuses
+// connections once destroyed, and an accept out of descriptors is an IoError
+// naming it, after which it goes on; dial refuses each bad entry with a
+// message an address field can show, a closed port with the system's words
+// and a connect that never finishes at its limit, and connects to a Listener
+// with a non-blocking, close-on-exec socket; adopt refuses an empty fd, a
+// Unix or UDP socket and an idle_limit of 0, makes a blocking socket
+// non-blocking and close-on-exec, and its errors name the dialler's address,
+// a peer that sends nothing ending as "connected, but no session"; a thread
+// adding viewers while another publishes and finishes, for ThreadSanitizer;
+// an add racing finish is served or refused as finished; and ended viewers'
+// threads are joined, the process's size bounded (Linux).
 
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -88,6 +92,22 @@ std::uint16_t peer_port(int fd) {
 
 bool starts_with(const std::string& s, const std::string& prefix) {
   return s.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ends_with(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() &&
+         s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// A UDP socket connected to 127.0.0.1:`port`: IPv4, not a stream.
+vkc::UniqueFd connected_udp(std::uint16_t port) {
+  vkc::UniqueFd fd(::socket(AF_INET, SOCK_DGRAM, 0));
+  const sockaddr_in to = net::loopback(port);
+  if (!fd.valid() || ::connect(fd.get(), reinterpret_cast<const sockaddr*>(&to),
+                               sizeof to) != 0) {
+    return {};
+  }
+  return fd;
 }
 
 // Whether `s` is `code` with `message`, or with a message starting with it
@@ -341,6 +361,12 @@ int add_viewer_refusals_case() {
   const vkc::UniqueFd pipe_read(pipe_fds[0]);
   s = server->add_viewer(vkc::UniqueFd(pipe_fds[1]));
   CHECK(is(s, Code::InvalidArgument, "StreamServer::add_viewer: not a socket"));
+  // Connected, but not a stream.
+  vkc::UniqueFd udp = connected_udp(listener->port());
+  CHECK(udp.valid());
+  s = server->add_viewer(std::move(udp));
+  CHECK(is(s, Code::InvalidArgument,
+           "StreamServer::add_viewer: not a stream socket"));
   // Not connected.
   s = server->add_viewer(vkc::UniqueFd(::socket(AF_INET, SOCK_STREAM, 0)));
   CHECK(is(s, Code::IoError,
@@ -374,8 +400,8 @@ int add_viewer_refusals_case() {
 }
 
 // A blocking socket the test connected, added, is set up to send as an
-// accepted one is: non-blocking, TCP_NODELAY, the 128 KiB low-water mark;
-// and it is served.
+// accepted one is: non-blocking, close-on-exec, TCP_NODELAY, the 128 KiB
+// low-water mark; and it is served.
 int sender_setup_case() {
   const stream::Session session = net::geometry_session();
   auto server = dialling(session);
@@ -384,14 +410,17 @@ int sender_setup_case() {
   CHECK(listener != nullptr);
   vkc::UniqueFd fd = net::connect_loopback(listener->port());
   CHECK(fd.valid());
-  // A second descriptor of the same socket, to read its options back.
+  // A second descriptor of the same socket, to read its options back; the
+  // descriptor's own flag, close-on-exec, is read on the server's, which
+  // stays open while its viewer is unread.
   const vkc::UniqueFd kept(::dup(fd.get()));
+  const int added = fd.get();
   CHECK(kept.valid());
-  CHECK(!nonblocking(kept.get()));
+  CHECK(!nonblocking(kept.get()) && !cloexec(added));
   CHECK(option(kept.get(), IPPROTO_TCP, TCP_NODELAY) == 0);
   CHECK(option(kept.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT) != 128 << 10);
   CHECK(server->add_viewer(std::move(fd)).ok());
-  CHECK(nonblocking(kept.get()));
+  CHECK(nonblocking(kept.get()) && cloexec(added));
   CHECK(option(kept.get(), IPPROTO_TCP, TCP_NODELAY) != 0);
   CHECK(option(kept.get(), IPPROTO_TCP, TCP_NOTSENT_LOWAT) == 128 << 10);
 #ifdef __APPLE__
@@ -479,6 +508,31 @@ int listener_case() {
   const std::uint16_t port = listener->port();
   listener.reset();
   CHECK(!net::connect_loopback(port).valid());
+  return 0;
+}
+
+// A connection reset as it waits is never handed out, on either system
+// (macOS fails its setup, Linux has no peer to name): accept gives an empty
+// fd, and the next connection is accepted and adopted.
+int listener_reset_case() {
+  auto listener = listen_loopback();
+  CHECK(listener != nullptr);
+  {
+    const vkc::UniqueFd reset = net::connect_loopback(listener->port());
+    CHECK(reset.valid());
+    const linger hard{1, 0};  // its close sends a reset
+    CHECK(::setsockopt(reset.get(), SOL_SOCKET, SO_LINGER, &hard,
+                       sizeof hard) == 0);
+  }
+  std::this_thread::sleep_for(20ms);
+  const vkc::Result<vkc::UniqueFd> none = listener->accept(200ms);
+  CHECK(none.ok() && !none->valid());
+  const vkc::UniqueFd next = dial_to(*listener);
+  CHECK(next.valid());
+  vkc::UniqueFd accepted = accept_from(*listener);
+  CHECK(accepted.valid() &&
+        peer_port(accepted.get()) == net::local_port(next.get()));
+  CHECK(adopt(std::move(accepted)) != nullptr);
   return 0;
 }
 
@@ -617,6 +671,11 @@ int adopt_case() {
 
   auto listener = listen_loopback();
   CHECK(listener != nullptr);
+  vkc::UniqueFd udp = connected_udp(listener->port());
+  CHECK(udp.valid());
+  r = StreamClient::adopt(std::move(udp));
+  CHECK(is(r.status(), Code::InvalidArgument,
+           "StreamClient::adopt: not a stream socket"));
   {
     const vkc::UniqueFd dialled = dial_to(*listener);
     CHECK(dialled.valid());
@@ -662,6 +721,35 @@ int adopt_case() {
         net::client_reason(next.status().message(), closer) ==
             "the sender closed the connection before its session (it may "
             "already serve its most viewers)");
+  return 0;
+}
+
+// A blocking socket the test connected to a server, adopted, is made
+// non-blocking and close-on-exec, and on Apple never raises SIGPIPE; and it
+// reads the session.
+int adopt_setup_case() {
+  const stream::Session session = net::geometry_session();
+  auto server = net::serve(session);
+  CHECK(server != nullptr);
+  vkc::UniqueFd fd = net::connect_loopback(server->port());
+  CHECK(fd.valid());
+  // The socket's state read through a second descriptor; close-on-exec,
+  // the descriptor's own, on the client's.
+  const vkc::UniqueFd kept(::dup(fd.get()));
+  const int adopted = fd.get();
+  CHECK(kept.valid());
+  CHECK(!nonblocking(kept.get()) && !cloexec(adopted));
+#ifdef __APPLE__
+  CHECK(option(kept.get(), SOL_SOCKET, SO_NOSIGPIPE) == 0);
+#endif
+  auto client = adopt(std::move(fd));
+  CHECK(client != nullptr);
+  CHECK(nonblocking(kept.get()) && cloexec(adopted));
+#ifdef __APPLE__
+  CHECK(option(kept.get(), SOL_SOCKET, SO_NOSIGPIPE) != 0);
+#endif
+  CHECK(net::wait_session(*client));
+  CHECK(vrst::same(*client->session(), session));
   return 0;
 }
 
@@ -714,12 +802,17 @@ int threads_case() {
       (void)server->draining();
       if (s.ok()) {
         ++added;
-      } else if (s.domain() == Code::IoError) {
+      } else if (s.domain() == Code::IoError &&
+                 ends_with(s.message(), ": 2 viewers already")) {
         ++full;
-      } else if (s.domain() == Code::InvalidArgument) {
+      } else if (s.domain() == Code::InvalidArgument &&
+                 s.message() ==
+                     "StreamServer::add_viewer: the stream finished") {
         ++finished;
         return;
       } else {
+        std::fprintf(stderr, "add_viewer: %d \"%s\"\n",
+                     static_cast<int>(s.domain()), s.message().c_str());
         ++other;
         return;
       }
@@ -746,6 +839,87 @@ int threads_case() {
   return 0;
 }
 
+// A viewer added, ended at once: whether add_viewer took it and the server
+// let it go within 5 s.
+bool add_and_end(networking::StreamServer& server,
+                 networking::Listener& listener) {
+  if (!server.add_viewer(dial_to(listener)).ok()) return false;
+  if (!accept_from(listener).valid()) return false;  // closed: it ends
+  return net::serves_within(server, 0);
+}
+
+// add_viewer racing finish while a viewer that ended is still unjoined, a
+// dialler's usual state (it adds one only while none is served): the add is
+// served, or refused as finished, never anything else; 50 rounds.
+int add_racing_finish_case() {
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.max_viewers = 1;
+  for (int round = 0; round < 50; ++round) {
+    auto server = dialling(session, options);
+    CHECK(server != nullptr);
+    auto listener = listen_loopback();
+    CHECK(listener != nullptr);
+    CHECK(add_and_end(*server, *listener));
+    vkc::UniqueFd fd = dial_to(*listener);
+    CHECK(fd.valid());
+    std::atomic<int> ready{0};
+    vkc::Status added;
+    std::thread adder([&] {
+      ++ready;
+      while (ready < 2) std::this_thread::yield();
+      added = server->add_viewer(std::move(fd));
+    });
+    ++ready;
+    while (ready < 2) std::this_thread::yield();
+    server->finish();
+    adder.join();
+    CHECK(added.ok() || is(added, Code::InvalidArgument,
+                           "StreamServer::add_viewer: the stream finished"));
+  }
+  return 0;
+}
+
+// The process's virtual size in thread stacks, on Linux: glibc keeps an
+// ended thread's stack mapped until it is joined, then reuses it. 0
+// elsewhere.
+double virtual_stacks() {
+#ifdef __linux__
+  pthread_attr_t attr;
+  std::size_t stack = 0;
+  if (::pthread_attr_init(&attr) != 0) return 0;
+  ::pthread_attr_getstacksize(&attr, &stack);
+  ::pthread_attr_destroy(&attr);
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (starts_with(line, "VmSize:") && stack > 0) {
+      return std::stod(line.substr(7)) * 1024.0 / static_cast<double>(stack);
+    }
+  }
+#endif
+  return 0;
+}
+
+// Without listen, add_viewer joins the threads of viewers that ended: 50
+// added and ended one after another leave the process's size as it was,
+// where unjoined they would hold 50 stacks more (measured on Linux).
+int reaps_ended_viewers_case() {
+  const stream::Session session = net::geometry_session();
+  networking::ServerOptions options;
+  options.max_viewers = 1;
+  auto server = dialling(session, options);
+  CHECK(server != nullptr);
+  auto listener = listen_loopback();
+  CHECK(listener != nullptr);
+  for (int i = 0; i < 5; ++i) CHECK(add_and_end(*server, *listener));
+  const double before = virtual_stacks();
+  for (int i = 0; i < 50; ++i) CHECK(add_and_end(*server, *listener));
+  const double grown = virtual_stacks() - before;
+  std::printf("reaping: %.1f stacks grown over 50 viewers\n", grown);
+  CHECK(grown < 10);
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -756,11 +930,15 @@ int main() {
   if (add_viewer_refusals_case() != 0) return 1;
   if (sender_setup_case() != 0) return 1;
   if (listener_case() != 0) return 1;
+  if (listener_reset_case() != 0) return 1;
   if (listener_out_of_descriptors_case() != 0) return 1;
   if (dial_case() != 0) return 1;
   if (dial_limit_case() != 0) return 1;
   if (adopt_case() != 0) return 1;
+  if (adopt_setup_case() != 0) return 1;
   if (threads_case() != 0) return 1;
+  if (add_racing_finish_case() != 0) return 1;
+  if (reaps_ended_viewers_case() != 0) return 1;
   std::puts("networking dial: OK");
   return 0;
 }

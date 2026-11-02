@@ -123,8 +123,9 @@ core::Status peer_of(std::string_view api, int fd, Address* peer);
 core::Status set_up_sender(std::string_view api, int fd, const Address& peer);
 
 // The next connection waiting on `listener`, prepared, and its peer; an
-// empty fd when none is waiting, or one failed before it was taken or cannot
-// be prepared, which is closed. IoError (OutOfMemory for the kernel's
+// empty fd when none is waiting, or one failed before it was taken, cannot
+// be prepared or has no peer left (reset as it waited), which is closed.
+// IoError (OutOfMemory for the kernel's
 // memory) for an accept that fails otherwise, as out of descriptors: Linux
 // keeps that connection queued, and macOS drops it.
 core::Result<core::UniqueFd> accept_one(std::string_view api, int listener,
