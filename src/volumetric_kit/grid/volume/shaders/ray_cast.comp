@@ -1,0 +1,264 @@
+#version 450
+
+// The model view (volume/ray_caster.hpp): posed pinhole cameras' rays cast
+// into the sparse TSDF, K views in one dispatch. One thread a ray: element
+// gid = (i * height + y) * width + x is pixel (x, y) of view i, cast from
+// camera i. The ray runs through the pixel's integer coordinates, in camera
+// depth t from min_depth to max_depth, sampling the nearest voxel:
+// - in an unallocated block it skips to where it leaves the block, one step;
+// - at a voxel that does not answer the filter it takes a free step;
+// - at a positive one it steps min(s, trunc) * free_step, at least
+//   min_step_voxels;
+// - at a negative one right after a positive one it has bracketed the
+//   surface, which is refined by false position on the trilinear field; any
+//   other negative one ends it as a miss (it started behind a surface, or
+//   entered a back band from unobserved space).
+// A trilinear sample answers only when all 8 of its corners do. A hit writes
+// its depth and the trilinear field's unit gradient there, toward free space;
+// a miss writes zeros. The table must be quiescent (hash_lookup.glsl).
+
+#extension GL_GOOGLE_include_directive : require
+#define VGRID_HASH_ENTRIES_BINDING 0
+#include "hash_lookup.glsl"
+#include "depth_pinhole.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 1, scalar) readonly buffer Tsdf { float tsdf[]; };
+layout(set = 0, binding = 2, scalar) readonly buffer Weight { float weight[]; };
+// The filter's 1-byte attribute, voxel i's byte in bits 8 * (i & 3) of word
+// i >> 2; the weight array, never read, when the filter names none.
+layout(set = 0, binding = 3, scalar) readonly buffer Attr { uint attr_words[]; };
+layout(set = 0, binding = 4, scalar) readonly buffer Cams { DepthPinhole cams[]; };
+layout(set = 0, binding = 5, scalar) writeonly buffer Depth { float out_depth[]; };
+// Three floats a pixel.
+layout(set = 0, binding = 6, scalar) writeonly buffer Normal {
+  float out_normal[];
+};
+
+// Mirrors CastPush in ray_caster.cpp.
+layout(push_constant, scalar) uniform Push {
+  VoxelGridParams grid;
+  float free_step;        // share of trunc_dist a free step crosses
+  float min_step_voxels;  // the smallest step near a surface
+  float min_weight;       // the least weight that answers
+  uint max_steps;
+  uint allow[8];  // byte v answers when bit v & 31 of allow[v >> 5] is set
+  uint width;
+  uint height;
+  uint count;          // views cast
+  uint use_attribute;  // 0: no attribute test
+} pc;
+
+// Half-voxel steps the bracket may widen by, and false-position rounds.
+const int kWiden = 4;
+const int kRefine = 4;
+
+// A one-block cache of the table walk: a ray's samples mostly share a block.
+ivec3 g_block = ivec3(0x7fffffff);
+int g_ptr = -1;
+
+int block_ptr(ivec3 block) {
+  if (block != g_block) {
+    g_block = block;
+    g_ptr = vgridFindBlockPtr(block, pc.grid.num_buckets, pc.grid.bucket_size,
+                              pc.grid.max_chain);
+  }
+  return g_ptr;
+}
+
+// Whether the voxel at attribute index idx answers the filter.
+bool answers(int idx) {
+  if (!(weight[idx] >= pc.min_weight)) {
+    return false;
+  }
+  if (pc.use_attribute == 0u) {
+    return true;
+  }
+  uint i = uint(idx);
+  uint v = (attr_words[i >> 2] >> (8u * (i & 3u))) & 0xFFu;
+  return ((pc.allow[v >> 5] >> (v & 31u)) & 1u) != 0u;
+}
+
+// The trilinear field at world point p and its gradient, per metre; false
+// unless all 8 corners answer.
+bool trilinear(vec3 p, out float s, out vec3 grad) {
+  s = 0.0;
+  grad = vec3(0.0);
+  int bs = pc.grid.block_size;
+  vec3 g = p / pc.grid.voxel_size;
+  vec3 lo = floor(g);
+  vec3 f = g - lo;
+  ivec3 base = ivec3(lo);
+  float c[8];
+  for (int k = 0; k < 8; ++k) {
+    ivec3 v = base + ivec3(k & 1, (k >> 1) & 1, k >> 2);
+    ivec3 block = voxelToBlock(v, pc.grid);
+    int ptr = block_ptr(block);
+    if (ptr < 0) {
+      return false;
+    }
+    int idx = ptr + vgridLocalIndex(v - block * bs, bs);
+    if (!answers(idx)) {
+      return false;
+    }
+    c[k] = tsdf[idx];
+  }
+  // x first, then y, then z.
+  float c00 = mix(c[0], c[1], f.x);
+  float c10 = mix(c[2], c[3], f.x);
+  float c01 = mix(c[4], c[5], f.x);
+  float c11 = mix(c[6], c[7], f.x);
+  float c0 = mix(c00, c10, f.y);
+  float c1 = mix(c01, c11, f.y);
+  s = mix(c0, c1, f.z);
+  float dx = mix(mix(c[1] - c[0], c[3] - c[2], f.y),
+                 mix(c[5] - c[4], c[7] - c[6], f.y), f.z);
+  float dy = mix(c10 - c00, c11 - c01, f.z);
+  float dz = c1 - c0;
+  grad = vec3(dx, dy, dz) / pc.grid.voxel_size;
+  return true;
+}
+
+// The surface between depths ta, whose nearest voxel is positive, and tb,
+// whose nearest voxel is negative, on the trilinear field: t and the
+// gradient there. The nearest voxel and the field may take different sides
+// within a voxel of the surface, so the bracket first widens by half voxels
+// until the field's signs agree.
+bool refine(vec3 o, vec3 dir, float ta, float tb, float half_voxel,
+            out float t, out vec3 grad) {
+  t = 0.0;
+  float fa;
+  float fb;
+  vec3 ga;
+  if (!trilinear(o + ta * dir, fa, ga) || !trilinear(o + tb * dir, fb, grad)) {
+    return false;
+  }
+  for (int k = 0; k < kWiden && !(fa > 0.0); ++k) {
+    ta -= half_voxel;
+    if (!trilinear(o + ta * dir, fa, ga)) {
+      return false;
+    }
+  }
+  for (int k = 0; k < kWiden && fb > 0.0; ++k) {
+    tb += half_voxel;
+    if (!trilinear(o + tb * dir, fb, grad)) {
+      return false;
+    }
+  }
+  if (!(fa > 0.0) || fb > 0.0) {
+    return false;
+  }
+  // False position, Illinois: an end kept twice in a row has its value
+  // halved, so a curved field converges from both sides.
+  int kept = 0;
+  float tol = 1e-4 * pc.grid.voxel_size;
+  for (int k = 0; k < kRefine; ++k) {
+    t = ta + (tb - ta) * fa / (fa - fb);
+    float ft;
+    if (!trilinear(o + t * dir, ft, grad)) {
+      return false;
+    }
+    if (abs(ft) <= tol) {
+      break;
+    }
+    if (ft > 0.0) {
+      ta = t;
+      fa = ft;
+      if (kept == 1) {
+        fb *= 0.5;
+      }
+      kept = 1;
+    } else {
+      tb = t;
+      fb = ft;
+      if (kept == -1) {
+        fa *= 0.5;
+      }
+      kept = -1;
+    }
+  }
+  return true;
+}
+
+// Cast one ray: its hit's depth and the field's gradient there, or false
+// for a miss.
+bool cast_ray(DepthPinhole cam, uint u, uint v, out float t_hit,
+              out vec3 grad) {
+  t_hit = 0.0;
+  grad = vec3(0.0);
+  mat4 T = cam.cam_to_world;
+  vec3 o = T[3].xyz;
+  vec3 dir = mat3(T) * vec3((float(u) - cam.cx) / cam.fx,
+                            (float(v) - cam.cy) / cam.fy, 1.0);
+  float len = length(dir);  // metres along the ray a unit of depth
+  vec3 inv = vec3(1.0) / vec3(abs(dir.x) > 1e-12 ? dir.x : 1e-12,
+                              abs(dir.y) > 1e-12 ? dir.y : 1e-12,
+                              abs(dir.z) > 1e-12 ? dir.z : 1e-12);
+  float vs = pc.grid.voxel_size;
+  int bs = pc.grid.block_size;
+  float trunc = pc.grid.trunc_dist;
+  float min_step = pc.min_step_voxels * vs / len;  // in depth
+  float free_step = pc.free_step * trunc / len;
+  float t = cam.min_depth;
+  float t_prev = 0.0;
+  bool have_prev = false;  // the last sample answered, positive
+  for (uint it = 0u; it < pc.max_steps && t < cam.max_depth; ++it) {
+    vec3 p = o + t * dir;
+    ivec3 vox = worldToVoxel(p, pc.grid);
+    ivec3 block = voxelToBlock(vox, pc.grid);
+    int ptr = block_ptr(block);
+    if (ptr < 0) {
+      // To where the ray leaves the space whose nearest voxel is this
+      // block's, just past it.
+      vec3 lo = (vec3(block * bs) - 0.5) * vs;
+      vec3 hi = lo + float(bs) * vs;
+      vec3 t_far = max((lo - o) * inv, (hi - o) * inv);
+      float t_exit = min(min(t_far.x, t_far.y), t_far.z);
+      t = max(t_exit + 0.01 * vs / len, t + min_step);
+      have_prev = false;
+      continue;
+    }
+    int idx = ptr + vgridLocalIndex(vox - block * bs, bs);
+    if (!answers(idx)) {
+      have_prev = false;
+      t += free_step;
+      continue;
+    }
+    float s = tsdf[idx];
+    if (s <= 0.0) {
+      if (!have_prev ||
+          !refine(o, dir, t_prev, t, 0.5 * vs / len, t_hit, grad)) {
+        return false;
+      }
+      return t_hit >= cam.min_depth && t_hit <= cam.max_depth &&
+             length(grad) > 1e-6;
+    }
+    have_prev = true;
+    t_prev = t;
+    t += max(min(s, trunc) * pc.free_step / len, min_step);
+  }
+  return false;
+}
+
+void main() {
+  uint pixels = pc.width * pc.height;
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= pc.count * pixels) {
+    return;
+  }
+  uint view = gid / pixels;
+  uint pixel = gid - view * pixels;
+  float depth = 0.0;
+  vec3 normal = vec3(0.0);
+  float t;
+  vec3 grad;
+  if (cast_ray(cams[view], pixel % pc.width, pixel / pc.width, t, grad)) {
+    depth = t;
+    normal = normalize(grad);
+  }
+  out_depth[gid] = depth;
+  out_normal[3u * gid] = normal.x;
+  out_normal[3u * gid + 1u] = normal.y;
+  out_normal[3u * gid + 2u] = normal.z;
+}
