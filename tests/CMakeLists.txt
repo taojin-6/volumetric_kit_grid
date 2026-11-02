@@ -279,6 +279,19 @@ target_link_libraries(
 vgrid_target_warnings(grid_volume_recorded_test)
 add_test(NAME grid_volume_recorded COMMAND grid_volume_recorded_test)
 
+# volume ray cast: RayCaster over analytic scenes the test writes -- a plane's
+# exact depth and normal, a sphere's within a tenth of a voxel, the misses, the
+# block skip, the allow set and weight floor with the 8-corner rule, a K-view
+# cast against K single casts bit for bit, a recast at poses the batch moved, a
+# grown grid, the ring of sets and the refusals. VGRID_RAY_CAST_TIMING=1 adds
+# the timing case. Skips with no device.
+add_executable(grid_volume_ray_cast_test volume_ray_cast_test.cpp)
+target_link_libraries(
+  grid_volume_ray_cast_test PRIVATE volumetric_kit::grid_volume Vulkan::Vulkan
+                                    volumetric_kit::core_test_policy)
+vgrid_target_warnings(grid_volume_ray_cast_test)
+add_test(NAME grid_volume_ray_cast COMMAND grid_volume_ray_cast_test)
+
 # volume resize: allocate, grow the table to more buckets, and verify the active
 # set survives + further allocation past the old capacity works. Skips with no
 # device.

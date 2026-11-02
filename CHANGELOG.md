@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-11-02
+
+### Added
+
+- **`volume::RayCaster`** (`volume/ray_caster.hpp`) casts K posed pinhole
+  cameras into a grid's `tsdf` and `weight` in one dispatch: per pixel, the
+  first observed surface's depth along the camera's +Z and the world unit
+  normal there, into a stacked `ModelView` that later kernels read in place.
+  Rays skip unallocated blocks whole, march free space in steps of the band,
+  and refine a + to - crossing on the trilinear field. A `CastFilter` says
+  which voxels answer: a positive, finite weight floor (at or above,
+  `kObservedWeight` by default) and a 256-value allow set over a named 1-byte attribute; a
+  trilinear sample answers only when its 8 corners do. The cameras may be
+  written earlier in the batch, and a ring of `casts_per_batch` descriptor
+  sets, every binding written at each cast, lets one batch recast at poses
+  it moved (DESIGN.md, volume; the 2026-11-02 entry in DECISIONS.md).
+
 ## [0.9.0] - 2026-11-02
 
 ### Added

@@ -16,8 +16,9 @@ set(_vgrid_volume_generated_inc "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 add_library(grid_volume)
 add_library(volumetric_kit::grid_volume ALIAS grid_volume)
 
-target_sources(grid_volume PRIVATE grid_growth.cpp triangle_candidates.cpp
-                                   voxel_hash_map.cpp voxel_block_grid.cpp)
+target_sources(
+  grid_volume PRIVATE grid_growth.cpp ray_caster.cpp triangle_candidates.cpp
+                      voxel_hash_map.cpp voxel_block_grid.cpp)
 
 # Per-tier export header (VGRID_VOLUME_API / VGRID_VOLUME_STATIC_DEFINE),
 # isolated from grid_base's so the macros never collide on one include path.
@@ -70,7 +71,8 @@ vgrid_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_compact_frustum.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_delete_coords.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rehash.comp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rounds.comp")
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_rounds.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ray_cast.comp")
 
 # The grid's device contract and its colour attribute's format, for any kernel's
 # #include ("volumetric_kit/grid/volume/shaders/grid_types.glsl") through the

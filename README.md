@@ -3,10 +3,11 @@
 [![ci](https://github.com/taojin-6/volumetric_kit_grid/actions/workflows/ci.yml/badge.svg)](https://github.com/taojin-6/volumetric_kit_grid/actions/workflows/ci.yml)
 
 The **sparse voxel grid** of the `volumetric_kit` family and what reads it:
-voxel hashing on the GPU, a triangle mesh's distance field, marching cubes and
-the mesh containers, mesh files, mesh-to-mesh quality measurement, the
-per-frame TSDF geometry codec, the `.vrst` session container, and a session
-served live over TCP, all on Vulkan compute (MoltenVK on Apple).
+voxel hashing on the GPU, posed cameras' ray casts into the grid, a triangle
+mesh's distance field, marching cubes and the mesh containers, mesh files,
+mesh-to-mesh quality measurement, the per-frame TSDF geometry codec, the
+`.vrst` session container, and a session served live over TCP, all on Vulkan
+compute (MoltenVK on Apple).
 
 It builds on [`volumetric_kit_core`](https://github.com/taojin-6/volumetric_kit_core)
 alone. [`volumetric_kit_recon`](https://github.com/taojin-6/volumetric_kit_recon)

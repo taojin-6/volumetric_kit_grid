@@ -483,6 +483,11 @@ entries relevant to your task; later amendments supersede earlier rules.
   `dial` connects to the reader's `Listener` on one numeric address, never
   the wildcard, `add_viewer` serves the socket with the accepted viewers'
   setup and count, and `StreamClient::adopt` reads it.
+- [**2026-11-02**](#2026-11-02--the-model-view-is-a-cast-in-volume-k-device-cameras-in-one-dispatch-a-ring-of-sets-with-every-binding-written-per-cast-and-a-256-value-allow-set-over-a-named-byte) —
+  The model view is a cast in `volume`: `RayCaster` casts K device cameras
+  in one dispatch into a stacked `ModelView`, through a ring of descriptor
+  sets with every binding written per cast, and a `CastFilter` of a weight
+  floor and a 256-value allow set over a named 1-byte attribute.
 
 ## Decision record
 
@@ -8931,3 +8936,84 @@ accept not naming the peer, and `add_viewer` not reaping, which grows the
 process by one thread stack per ended viewer (50.0 stacks over 50 viewers,
 0.0 reaped; the count of mappings grew by 2 at most, glibc 2.43 on Linux
 7.0, so the test measures the size).
+
+### 2026-11-02 — The model view is a cast in `volume`: K device cameras in one dispatch, a ring of sets with every binding written per cast, and a 256-value allow set over a named byte.
+
+**The need.** A frame-to-model tracker fits each frame against the model's
+depth and normals as its cameras would see them. Its fit casts a window of
+frames at once, each at its own intrinsics and at a pose the fit's solve
+wrote on the device, and recasts at the moved poses in the same batch, with
+no host round trip. Some callers cast only part of the model: the voxels
+of one source, or those observed often enough.
+
+**The rule.** `RayCaster::record_cast` casts camera i of a device buffer of
+`DepthPinhole`s into view i of a stacked `ModelView`, every view in one
+dispatch, a thread a ray. A ray marches the nearest voxel: an unallocated
+block is skipped whole, free space is crossed in steps of the band, and a
+crossing from + to - between two voxels that answer is refined by false
+position on the trilinear field, the normal its gradient. A `CastFilter`
+says which voxels answer: weight at or above its floor, and the bit of a
+named 1-byte attribute's value in a 256-bit allow set. A trilinear sample
+answers only when its 8 corners do, and walks each of its corners' blocks
+once. The caster holds `casts_per_batch`
+descriptor sets and writes every binding of the next at each cast.
+
+**Why in `volume`.** Only grid walks its hash table: a cast reads the
+entries through `hash_lookup.glsl`, whose layout is internal (the
+2026-10-28 contract entry). The camera is volume's own `DepthPinhole`, so
+the tier stays camera-free.
+
+**Why K views in one dispatch.** The views are one thread grid, so 20
+casts cost one dispatch's launch and barrier, not 20. The limit is the
+device's: `maxComputeWorkGroupCount[0]` × 64 rays, at least 4.19 M, which is
+85 views at 256×192, and the normals within one binding. A camera's own
+size is not read; the view's governs, so no index leaves it.
+
+**Why a ring of sets, every binding written.** A batch binds a set when it
+submits, so two casts in one batch need two sets, and a set rewritten after
+its dispatch was recorded makes the core refuse the batch: the ring's size
+bounds a batch's casts, and a cast past it fails at the submit, loudly. A
+`resize` replaces the grid's buffers, so a set written once would bind
+freed memory; writing all seven bindings costs a few descriptor writes a
+cast.
+
+**Why a 256-value allow set over a named byte.** grid gives the byte no
+meaning: its owner (recon's source byte) builds the filters, and any value
+table is one allow set, so no table is fixed here. The set is 32 bytes of
+the push, which with the grid, the march and the size makes 96, within the
+128 guaranteed. With no attribute named, the weight array fills the
+binding, since the core enables no null descriptors. The weight floor
+answers at `>=`, the mesher's and the codec's rule for `kObservedWeight`. It
+must be positive and finite: a voxel never integrated holds weight 0 and
+tsdf 0, so at a floor of 0 it answers as a surface, a ray entering its block
+misses and one reaching it after a positive voxel brackets a hit that is not
+there; a NaN floor answers nothing.
+
+**Why the 8-corner rule.** A trilinear sample with an unobserved or
+excluded corner mixes in a value that is not the surface's, so the hit's
+depth and normal would carry it; such a sample, like a ray entering a back
+band from unobserved space, is a miss.
+
+**Verification.** Apple M5 Max, Release, under the Khronos validation layer
+with a device required: the full suite passes, 73 of 73.
+`grid_volume_ray_cast` holds a plane's depth to 6e-8 m and its normal
+exactly (to 6e-8 on an RTX 4090), and a sphere's within 0.02 voxel and 0.79°
+away from its silhouette. Five planted bugs each fail it: the allow word
+indexed by `v & 7`, every view casting camera 0, a set's bindings written
+only at its first cast, a floor of 0 or −1 accepted, and every corner of a
+trilinear sample read through the base corner's block. A trilinear sample
+that walked its corners' blocks through the one-block cache alone gave the
+same depths and normals bit for bit; it walked up to 8 blocks a sample
+across an x face of a block.
+
+**Cost.** Its timing case, Release, device time: a 4 × 2.5 × 4 m room with
+a sphere at 1 cm voxels, 0.0137 m off the voxel lattice (34,363 blocks), 20
+cameras inside it at 256×192, p50 of 100. On an RTX 4090, one view is
+0.25 ms, 20 stacked 1.8 ms and 20 single casts in one batch 5.3 ms; on an
+Apple M4, 1.5, 25.4 and 28.9 ms. Stacking is worth 2.9× on NVIDIA and 12%
+on Apple, where one view already fills the GPU. Where surfaces sit on the
+lattice moves the cost by about 10–30%, walls on block boundaries the most,
+so the room sits off it. A ray here crosses about 2 m of unallocated room, a
+table walk a block, before its wall, so most of its cost is that walk: on
+an Apple M5 Max, a wall moved from 0.36 to 3.6 m takes the 20-view cast
+from 1.4 to 7.1 ms.
