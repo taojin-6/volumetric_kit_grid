@@ -54,8 +54,9 @@ them ([core](https://github.com/taojin-6/volumetric_kit_recon/blob/main/DESIGN.m
 
 ## Tiered architecture
 
-A tier depends only on tiers to its left; no upward includes, and nothing
-of recon's or sensor's (`tests/package_boundary.cmake`).
+A tier depends only on tiers to its left; no upward includes, nothing of
+recon's or sensor's, and no socket header in `src/` or `include/`, the
+core's net tier making every socket call (`tests/package_boundary.cmake`).
 
 ```text
 base → volume → mesh → mesh_io
@@ -87,7 +88,8 @@ stream → networking → codec_stream
   on `volume` alone.
 - **`stream`** — the `.vrst` session container, on the core's base tier
   alone: no Vulkan, no other tier.
-- **`networking`** — a session served and read live over TCP, on `stream`.
+- **`networking`** — a session served and read live over TCP, on `stream`,
+  through the core's net tier's sockets (`core_net`, linked privately).
 - **`codec_stream`** — grids coded as frames into a `.vrst` file and to live
   viewers, decoded back, on `codec` and `networking`.
 
@@ -1003,11 +1005,13 @@ first and then one in 10 s at most, the rest at Debug. The destructor stops
 every thread within a poll slice (20 ms) and the write under way, what is
 queued for a viewer lost. `publish` and `finish` are called from one thread.
 
-**Dialling out** (`networking/dial.hpp`, the 2026-11-02 entry). A sender
+**Dialling out** (the 2026-11-02 dial-out entry; `dial` and `Listener` are
+the core's, `core/net/dial.hpp`, since the 2026-11-02 net entry). A sender
 that must not listen, a phone, starts with `listen` false: no socket, no
-accept thread, `port()` 0. `dial` connects to the reader's numeric IPv4
-address within its limit, refusing an empty, named or wildcard host, port 0
-and a limit of 0 or less with sentences an address entry can show.
+accept thread, `port()` 0. `core::net::dial` connects to the reader's
+numeric IPv4 address within its limit, refusing an empty, named or wildcard
+host, port 0 and a limit of 0 or less with sentences an address entry can
+show.
 `add_viewer` serves a socket the caller connected as an accepted one, in
 either mode: it must be a connected IPv4 stream socket; it is prepared and
 given the sender setup accept gives, one function (`set_up_sender`), then
@@ -1017,8 +1021,8 @@ before it returns, so on demand `key_wanted()` has risen; past
 refusal returned. Admission holds a lock of its own, which `finish` takes
 as it begins, so a viewer is admitted wholly before it or not at all;
 without `listen` the threads of viewers that ended are joined at each
-`add_viewer` that comes before `finish`. The reader's `Listener` listens on
-one numeric address, never the wildcard, its listening socket given the
+`add_viewer` that comes before `finish`. The reader's `core::net::Listener`
+listens on one numeric address, never the wildcard, its listening socket given the
 client's 2 MiB receive buffer before `listen`, so each accepted socket
 inherits it and the window scale fits it; `accept(wait)` hands out each
 connection, prepared, never one reset as it waited (accept's, so the
@@ -1065,16 +1069,19 @@ controls drain while progress is true. On an error the output covers only
 earlier successful steps, and the error remains terminal. The original
 three-argument overload forwards without requesting progress.
 
-**Sockets** (private `socket.hpp`, which gives the reasons). IPv4 only:
-the server listens on it, and a name is looked up for it. Every socket is
-non-blocking and close-on-exec, accepted ones included, and never raises
-SIGPIPE; every call is retried on `EINTR`. A sender's socket, accepted or
-added, gets `TCP_NODELAY` and the low-water mark, and a listener
-`SO_REUSEADDR`. On Linux a sender's socket to a peer
-that is not loopback uses BBR when `tcp_allowed_congestion_control` lists
-it, else the kernel's default, said once a process at Info (the 2026-11-01
-entry). The GOP log (`gop_log.cpp`), in either
-mode, has no socket, thread or clock, and is tested alone.
+**Sockets** (the core's net tier, `core/net/socket.hpp` and
+`core/net/address.hpp`, which give the reasons; the 2026-11-02 net entry).
+`grid_networking` makes no socket call of its own and links `core_net`
+privately: no public header of grid's includes a `core/net/` header. IPv4
+only: the server listens on it, and a name is looked up for it. Every
+socket is non-blocking and close-on-exec, accepted ones included, and never
+raises SIGPIPE; every call is retried on `EINTR`. A sender's socket,
+accepted or added, gets `TCP_NODELAY` and the low-water mark, and a
+listener `SO_REUSEADDR`. On Linux a sender's socket to a peer that is not
+loopback uses BBR when `tcp_allowed_congestion_control` lists it, else the
+kernel's default, said once a process at Info, log source `"net"` (the
+2026-11-01 entry). The GOP log (`gop_log.cpp`), in either mode, has no
+socket, thread or clock, and is tested alone.
 
 ### codec_stream
 

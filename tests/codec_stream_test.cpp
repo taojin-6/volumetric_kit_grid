@@ -716,7 +716,7 @@ int serves_alone(vkc::test::GpuContext& gpu, vol::VoxelBlockGrid& source,
 // A port in use fails create with the server's IoError, naming it, before
 // the stream or the encoder is made.
 int port_in_use(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
-  const net::Listener taken = net::bind_loopback();
+  const net::LoopbackListener taken = net::bind_loopback();
   CHECK(taken.port != 0);
   codec_stream::CodecOutputs outputs =
       served_on_loopback(scratch.path / "unserved.vrst");

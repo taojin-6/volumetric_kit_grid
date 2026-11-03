@@ -8,24 +8,27 @@
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
 
-#include "socket.hpp"
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
+#include "volumetric_kit/core/net/address.hpp"
+#include "volumetric_kit/core/net/socket.hpp"
 #include "volumetric_kit/grid/stream/chunks.hpp"
 
 namespace volumetric_kit::grid::networking {
 namespace {
 
+namespace net = core::net;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::string_view kClient = "StreamClient";
 // What one receive reads at most: as much as the receive buffer, so one
 // next(0) takes a key (about 230 KB) already in the socket.
-constexpr std::size_t kReceiveBytes = detail::kReceiveBuffer;
+constexpr std::size_t kReceiveBytes = net::kReceiveBuffer;
 
 std::chrono::milliseconds until(Clock::time_point when) {
   return std::max(
@@ -43,7 +46,7 @@ struct StreamClient::Impl {
     std::condition_variable done_cv;
     bool done = false;  // under the mutex, as the two below
     core::Status failure;
-    std::vector<detail::Address> addresses;
+    std::vector<net::Endpoint> addresses;
   };
 
   Impl(std::string name_, const ClientOptions& options_)
@@ -68,8 +71,8 @@ struct StreamClient::Impl {
   const std::string api;           // what every message starts with
   Clock::time_point last_byte;     // connect or adopt, then each byte's arrival
   std::shared_ptr<Lookup> lookup;  // a name's, until it is taken
-  std::vector<detail::Address> addresses;  // to try, in order
-  std::size_t tried = 0;                   // those tried, fd's included
+  std::vector<net::Endpoint> addresses;  // to try, in order
+  std::size_t tried = 0;                 // those tried, fd's included
   core::Status refused;  // why the last address tried did not connect
   core::UniqueFd fd;
   bool connected = false;
@@ -97,7 +100,7 @@ core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
                           : refused;
     }
     core::Result<core::UniqueFd> started =
-        detail::start_connect(api, addresses[tried++], &connected);
+        net::start_connect(api, addresses[tried++], &connected);
     if (!started.ok()) {
       refused = std::move(started).status();
       return true;
@@ -107,9 +110,9 @@ core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
   }
   if (!connected) {
     VKC_ASSIGN(const short ready,
-               detail::wait_for(api, fd.get(), POLLOUT, until(deadline)));
+               net::wait_for(api, fd.get(), POLLOUT, until(deadline)));
     if (ready == 0) return false;
-    core::Status done = detail::finish_connect(api, fd.get());
+    core::Status done = net::finish_connect(api, fd.get());
     if (!done.ok()) {
       refused = std::move(done);
       fd.reset();
@@ -119,10 +122,10 @@ core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
     return true;
   }
   VKC_ASSIGN(const short ready,
-             detail::wait_for(api, fd.get(), POLLIN, until(deadline)));
+             net::wait_for(api, fd.get(), POLLIN, until(deadline)));
   if (ready == 0) return false;
-  VKC_ASSIGN(const detail::Received got,
-             detail::receive_some(api, fd.get(), buffer.data(), buffer.size()));
+  VKC_ASSIGN(const net::Received got,
+             net::receive_some(api, fd.get(), buffer.data(), buffer.size()));
   if (got.closed) {
     // A sender at its most viewers closes a connection before any byte.
     return core::Status::io_error(
@@ -182,17 +185,17 @@ core::Result<std::unique_ptr<StreamClient>> StreamClient::connect(
     }
     auto impl =
         std::make_unique<Impl>(host + ":" + std::to_string(port), options);
-    detail::Address address;
-    if (detail::parse_ipv4(host, port, &address)) {
-      impl->addresses.push_back(address);
+    if (const std::optional<net::Endpoint> address =
+            net::parse_ipv4(host, port)) {
+      impl->addresses.push_back(*address);
     } else {
       auto lookup = std::make_shared<Impl::Lookup>();
       std::thread([lookup, host, port, api = impl->api] {
         core::Status failure;
-        std::vector<detail::Address> addresses;
+        std::vector<net::Endpoint> addresses;
         try {
-          core::Result<std::vector<detail::Address>> found =
-              detail::resolve(api, host, port);
+          core::Result<std::vector<net::Endpoint>> found =
+              net::resolve(api, host, port);
           if (found.ok()) {
             addresses = std::move(found).value();
           } else {
@@ -228,11 +231,10 @@ core::Result<std::unique_ptr<StreamClient>> StreamClient::adopt(
           std::string(kApi) + ": an idle_limit of " +
           std::to_string(options.idle_limit.count()) + " ms");
     }
-    detail::Address peer;
-    VKC_TRY(detail::peer_of(kApi, connected.get(), &peer));
-    VKC_TRY(detail::prepare(kApi, connected.get()));
+    VKC_ASSIGN(const net::Endpoint peer, net::peer_of(kApi, connected.get()));
+    VKC_TRY(net::prepare(kApi, connected.get()));
     // Connected, so next goes straight to receiving: no address to try.
-    auto impl = std::make_unique<Impl>(detail::to_string(peer), options);
+    auto impl = std::make_unique<Impl>(net::to_string(peer), options);
     impl->fd = std::move(connected);
     impl->connected = true;
     return std::unique_ptr<StreamClient>(new StreamClient(std::move(impl)));
@@ -260,7 +262,7 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
   Impl& s = *impl_;
   try {
     if (!s.failure.ok()) return s.failure;
-    const Clock::time_point deadline = detail::after(Clock::now(), wait);
+    const Clock::time_point deadline = net::deadline_after(Clock::now(), wait);
     // At least one step, so a wait of 0 still reads what has come. The idle
     // limit is judged only after a step that moved nothing, so a caller back
     // late first takes what came meanwhile: the lookup's answer, the
@@ -274,7 +276,7 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
         return true;
       }
       const Clock::time_point idle =
-          detail::after(s.last_byte, s.options.idle_limit);
+          net::deadline_after(s.last_byte, s.options.idle_limit);
       if (stepped && !moved && Clock::now() >= idle) {
         return s.fail(s.idle_failure());
       }

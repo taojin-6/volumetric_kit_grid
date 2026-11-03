@@ -16,14 +16,16 @@
 #include <vector>
 
 #include "gop_log.hpp"
-#include "socket.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
+#include "volumetric_kit/core/net/address.hpp"
+#include "volumetric_kit/core/net/socket.hpp"
 #include "volumetric_kit/grid/base/log.hpp"
 #include "volumetric_kit/grid/stream/chunks.hpp"
 
 namespace volumetric_kit::grid::networking {
 namespace {
 
+namespace net = core::net;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::string_view kServer = "StreamServer";
@@ -142,21 +144,21 @@ void StreamServer::Impl::accept_loop() noexcept {
         reap();
       }
       const core::Result<short> ready =
-          detail::wait_for(kServer, listener.get(), POLLIN, detail::kPollSlice);
+          net::wait_for(kServer, listener.get(), POLLIN, net::kPollSlice);
       if (ready.ok() && *ready == 0) continue;
-      detail::Address peer;
+      net::Endpoint peer;
       core::Result<core::UniqueFd> accepted =
-          ready.ok() ? detail::accept_next(kServer, listener.get(), &peer)
+          ready.ok() ? net::accept_next(kServer, listener.get(), &peer)
                      : core::Result<core::UniqueFd>(ready.status());
       if (!accepted.ok()) {
         // A failure that may pass (out of descriptors): say so, wait a
         // slice and try again.
         log_at(core::LogLevel::Warning, accepted.status().message());
-        std::this_thread::sleep_for(detail::kPollSlice);
+        std::this_thread::sleep_for(net::kPollSlice);
         continue;
       }
       if (accepted->valid()) {
-        const std::string name = detail::to_string(peer);
+        const std::string name = net::to_string(peer);
         const core::Status admitted = admit(std::move(accepted).value(), name);
         if (!admitted.ok()) say_refused(name, admitted);
       }
@@ -164,7 +166,7 @@ void StreamServer::Impl::accept_loop() noexcept {
       log_at(core::LogLevel::Warning,
              core::exception_status(kServer, core::Status::Code::IoError)
                  .message());
-      std::this_thread::sleep_for(detail::kPollSlice);
+      std::this_thread::sleep_for(net::kPollSlice);
     }
   }
 }
@@ -305,12 +307,12 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
                        : std::string("closed: the server stopped");
     }
     const core::Result<short> ready =
-        detail::wait_for(api, fd, POLLIN | POLLOUT, detail::kPollSlice);
+        net::wait_for(api, fd, POLLIN | POLLOUT, net::kPollSlice);
     if (!ready.ok()) return "failed: " + ready.status().message();
     if ((*ready & (POLLIN | POLLHUP | POLLERR)) != 0) {
       // What a viewer sends is dropped; its end ends it.
-      const core::Result<detail::Received> got =
-          detail::receive_some(api, fd, drain, sizeof drain);
+      const core::Result<net::Received> got =
+          net::receive_some(api, fd, drain, sizeof drain);
       if (!got.ok()) return "failed: " + got.status().message();
       if (got->closed) return "left";
     }
@@ -318,12 +320,13 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
       // Under the low-water mark the socket polls writable, so this one
       // holds at least that much; the viewer takes what it acknowledges,
       // which a slow one does above the mark.
-      const core::Result<std::size_t> held = detail::unacknowledged(api, fd);
+      const core::Result<std::size_t> held = net::unacknowledged(api, fd);
       if (!held.ok()) return "failed: " + held.status().message();
       if (*held < written - taken) {
         taken = written - *held;
         taking = Clock::now();
-      } else if (Clock::now() >= detail::after(taking, options.stall_limit)) {
+      } else if (Clock::now() >=
+                 net::deadline_after(taking, options.stall_limit)) {
         return "closed: took no byte for " +
                std::to_string(options.stall_limit.count()) + " ms";
       }
@@ -338,13 +341,13 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
       if (!chunk) {
         // Finishing, no record comes after the ones it has sent.
         if (finishing) return "closed: the stream finished";
-        wake.wait_for(lock, detail::kPollSlice);
+        wake.wait_for(lock, net::kPollSlice);
         continue;
       }
       sent = 0;
     }
     const core::Result<std::size_t> n =
-        detail::send_some(api, fd, chunk->data() + sent, chunk->size() - sent);
+        net::send_some(api, fd, chunk->data() + sent, chunk->size() - sent);
     if (!n.ok()) return "failed: " + n.status().message();
     sent += *n;
     written += *n;
@@ -414,15 +417,15 @@ core::Result<std::unique_ptr<StreamServer>> StreamServer::start(
     core::UniqueFd listener;
     std::uint16_t port = 0;
     if (options.listen) {
-      detail::Address address;
-      if (!detail::parse_ipv4(options.host.empty() ? "0.0.0.0" : options.host,
-                              options.port, &address)) {
+      const std::optional<net::Endpoint> address = net::parse_ipv4(
+          options.host.empty() ? "0.0.0.0" : options.host, options.port);
+      if (!address) {
         return core::Status::invalid_argument(
             std::string(kApi) + ": host \"" + options.host +
             "\" is not a numeric IPv4 address");
       }
-      VKC_ASSIGN(listener, detail::listen_on(kApi, address));
-      VKC_ASSIGN(port, detail::bound_port(kApi, listener.get()));
+      VKC_ASSIGN(listener, net::listen_on(kApi, *address));
+      VKC_ASSIGN(port, net::bound_port(kApi, listener.get()));
     }
     auto session_chunk = std::make_shared<const std::vector<std::uint8_t>>(
         encoder->session_chunk());
@@ -452,12 +455,11 @@ core::Status StreamServer::add_viewer(core::UniqueFd connected) {
       return core::Status::invalid_argument(std::string(kApi) +
                                             ": the stream finished");
     }
-    detail::Address peer;
-    VKC_TRY(detail::peer_of(kApi, connected.get(), &peer));
-    std::string name = detail::to_string(peer);
+    VKC_ASSIGN(const net::Endpoint peer, net::peer_of(kApi, connected.get()));
+    std::string name = net::to_string(peer);
     const std::string api = std::string(kApi) + ": " + name;
-    VKC_TRY(detail::prepare(api, connected.get()));
-    VKC_TRY(detail::set_up_sender(api, connected.get(), peer));
+    VKC_TRY(net::prepare(api, connected.get()));
+    VKC_TRY(net::set_up_sender(api, connected.get(), peer));
     core::Status admitted = s.admit(std::move(connected), std::move(name));
     if (admitted.ok()) return {};
     // "The stream finished" reads as the check above gives it, whenever
