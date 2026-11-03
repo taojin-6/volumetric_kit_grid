@@ -489,6 +489,11 @@ entries relevant to your task; later amendments supersede earlier rules.
   in one dispatch into a stacked `ModelView`, through a ring of descriptor
   sets with every binding written per cast, and a `CastFilter` of a weight
   floor and a 256-value allow set over a named 1-byte attribute.
+- [**2026-11-02**](#2026-11-02--grids-sockets-are-the-cores-net-tier-dial-and-listener-move-to-corenet-grid_networking-links-core_net-privately-and-no-source-of-grids-includes-a-socket-header-amends-the-2026-10-21-networking-and-2026-11-02-dial-out-entries) —
+  grid's sockets are the core's net tier (core 0.43.0): `dial` and
+  `Listener` move to `core::net`, `grid_networking` links `core_net`
+  privately, and no source of grid's includes a socket header; the server,
+  the client, their messages and the wire are unchanged.
 - [**2026-11-02**](#2026-11-02--rgb-d-tracks-are-kinds-3-and-4-of-vrst-v0-bytes-the-sensor-package-defines-and-grid-never-parses-and-a-records-payload-takes-a-third-run-amends-the-2026-10-12-container-entry) —
   RGB-D tracks are kinds 3 and 4 of `.vrst` v0: `RgbdDepth`, a sensor's
   frames, each frame's depth half a record, every record a key, and
@@ -7161,7 +7166,9 @@ replaying a recording, sends; the player reads.
   into no private detail of stream. Its socket calls
   and its GOP log, the drop rule with no socket, thread or clock, are tested
   alone, under the loopback tests. The core gets no TCP helper until a
-  second sibling needs one.
+  second sibling needs one. *Amended 2026-11-02 (the net entry, below):*
+  at the owner's ask the socket calls, `dial` and `Listener` are the
+  core's net tier, and grid makes no socket call of its own.
 - **`publish` never waits.** fuse_orbbec's fusion thread calls it, and a
   slow iteration drops camera sets. It copies the record once, takes one
   lock and wakes the viewers; one thread per viewer sends, and a viewer's
@@ -8898,6 +8905,10 @@ reader's IPv4 address and port (the owner, 2026-11-02) feeds `dial`, so
 - `StreamClient::adopt(fd)` reads a connected IPv4 stream socket as
   `connect`'s is read, named by its peer, its receive buffer as it came.
 
+*Amended 2026-11-02 (the net entry, below):* `dial` and `Listener` are the
+core's, `core::net::dial` and `core::net::Listener`, with these rules and
+messages unchanged.
+
 **Why a lock to admit.** The check against `max_viewers` and the count
 were the accept thread's alone; with `add_viewer` from any thread they hold
 a lock of their own, which also guards the viewers' list and the reaping.
@@ -9033,6 +9044,76 @@ table walk a block, before its wall, so most of its cost is that walk: on
 an Apple M5 Max, a wall moved from 0.36 to 3.6 m takes the 20-view cast
 from 1.4 to 7.1 ms.
 
+### 2026-11-02 — grid's sockets are the core's net tier: `dial` and `Listener` move to `core::net`, `grid_networking` links `core_net` privately, and no source of grid's includes a socket header (amends the 2026-10-21 networking and 2026-11-02 dial-out entries).
+
+**The need.** The owner, 2026-11-02: "can you explore how we can take the
+networking part out of the packages and probably put in core/? I think many
+parts are reusing it and might as well depend on core/ to have all
+networking related stuff in one place?" The owner approved the cut
+recommended: the transport to the core, the format kept here. Core 0.43.0
+holds it, its `net` tier (`volumetric_kit::core_net`, the core's 2026-11-02
+net entry): IPv4 addresses and their checks, the TCP socket calls with every
+socket option and platform rule, and `dial` / `Listener`, moved from grid
+0.10.0 with their behaviour and messages.
+
+**The rule.**
+- grid keeps the `.vrst` live stream: `StreamServer`, `StreamClient`, the
+  GOP log and its rules, and `kDefaultPort`. Their sockets are the core's
+  calls; grid's private socket calls are gone.
+- `dial` and `Listener` leave grid's API (`networking/dial.hpp`, from
+  0.9.0); a caller includes `volumetric_kit/core/net/dial.hpp` and calls
+  `core::net::dial` and `core::net::Listener`, with the same arguments,
+  results and messages.
+- `grid_networking` links `volumetric_kit::core_net` PRIVATE: no public
+  header of grid's includes a `core/net/` header, and grid links PUBLIC only
+  what its headers need. A target that calls `core::net` links `core_net`
+  itself; without it `core/net/export.hpp` is not on its include path, so
+  the missing link fails at compile time.
+- Nothing under `src/` or `include/` includes `<sys/socket.h>`,
+  `<netinet/…>`, `<arpa/inet.h>` or `<netdb.h>`
+  (`tests/package_boundary.cmake`). `<poll.h>` stays, for `POLLIN` and
+  `POLLOUT`.
+- The core floor is 0.43.0, the first core with `core_net`. grid's tests
+  take their raw loopback sockets from the core's
+  `core/testing/net_loopback.hpp`, named in `vgrid_test::net` as before,
+  its listener struct now `LoopbackListener`.
+
+**Why move `dial` and `Listener` now.** No consumer uses them: they came in
+0.9.0, and every consumer pins 0.8.0 or older. Moved later, their first
+users would move with them.
+
+**Why the server and the client stay.** Their API takes the stream's
+`Session`, `RecordInfo` and `Record`: moving them would move the `.vrst`
+container, a versioned grid format, into the core, and their GOP rules are
+the stream's.
+
+**What does not change.** The wire; every declaration, option and message
+of `StreamServer` and `StreamClient` (a viewer parses the client's
+prefixes); `kDefaultPort`. Visible alone: the BBR note logs with source
+`"net"`, not `"vgrid"`. The core's calls catch an allocation that fails
+while building a message and return `OutOfMemory`, where grid's callers
+caught it, so a message differs only when memory runs out. The core's
+releases from 0.31.0 to 0.43.0 ask grid for nothing beyond the pin: 0.32.0
+drops a field grid never names, 0.39.0 and 0.40.0 add enumerators no
+`switch` of grid's lists, and 0.42.0's refusal binds a fusion program,
+which grid is not.
+
+**What it costs.** A socket-level fix is a core release, then a grid
+re-pin. Following a viewer's send path spans two repositories.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer with a device required: the full suite passes, 77
+of 77; the networking tests and the rest of the ThreadSanitizer set
+(Debug), 9 of 9. `grid_networking_server`, `_client`, `_stress`,
+`_server_oom` and `_gop_log` are unchanged and pin every message;
+`grid_networking_dial` keeps its `add_viewer` and `adopt` cases, on the
+core's `dial` and `Listener`. The socket calls' own tests, the `Listener`
+and `dial` cases and the Linux BBR case moved with the code and run in the
+core. Planted bugs each fail: a socket header in `stream_server.cpp`
+(`grid_package_boundary`, which also names all seven in grid 0.10.0's
+sources), `adopt` skipping its socket setup and `add_viewer` skipping the
+sender setup (`grid_networking_dial`).
+
 ### 2026-11-02 — RGB-D tracks are kinds 3 and 4 of `.vrst` v0, bytes the sensor package defines and grid never parses, and a record's payload takes a third run (amends the 2026-10-12 container entry).
 
 **The kinds.** `TrackKind::RgbdDepth` (3) holds one RGB-D sensor's
@@ -9080,7 +9161,7 @@ than a copy no test could reach. The new parameters default to none, so
 every call of one or two runs frames, writes and serves the same bytes.
 
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
-Khronos validation layer: the full suite passes, 75 of 75. The new
+Khronos validation layer: the full suite passes, 74 of 74. The new
 `grid_stream_rgbd_kinds`, host-only, checks a session chunk whose track 0
 is `RgbdColor` and track 1 `RgbdDepth`, with opaque params, against bytes
 built by hand with the numbers 4 and 3; writes their records, the depth in

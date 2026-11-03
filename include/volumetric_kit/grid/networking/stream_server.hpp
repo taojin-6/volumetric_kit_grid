@@ -64,8 +64,8 @@ struct ServerOptions {
   /// the next key. Newest key wins either way.
   bool replay_gop = true;
   /// true: listen on @ref host and @ref port and accept viewers. false, for
-  /// a sender that dials out (@ref dial): bind no socket, so no host that
-  /// reaches the sender can connect to it; viewers come only through
+  /// a sender that dials out (`core::net::dial`): bind no socket, so no host
+  /// that reaches the sender can connect to it; viewers come only through
   /// @ref StreamServer::add_viewer.
   bool listen = true;
 };
@@ -111,10 +111,10 @@ struct ServerOptions {
 /// viewer waits one frame.
 ///
 /// **Dialling out** (@ref ServerOptions::listen false). The server binds
-/// nothing. The sender connects to its reader with @ref dial and hands the
-/// socket to @ref add_viewer, which serves it as an accepted one; the reader
-/// takes it from a @ref Listener with @ref StreamClient::adopt. Every rule
-/// above holds for it.
+/// nothing. The sender connects to its reader with `core::net::dial` and
+/// hands the socket to @ref add_viewer, which serves it as an accepted one;
+/// the reader takes it from a `core::net::Listener` with
+/// @ref StreamClient::adopt. Every rule above holds for it.
 ///
 /// **Threads.** @ref publish never waits on a socket or a viewer: it copies
 /// the record once, takes one lock and wakes the viewers. With
@@ -150,8 +150,8 @@ class VGRID_NETWORKING_API StreamServer {
       const stream::Session& session, const ServerOptions& options = {});
 
   /// @brief Serve a socket the caller connected, as an accepted one is
-  ///        served: a sender that dials out (@ref dial) serves its reader
-  ///        through it, in either @ref ServerOptions::listen mode.
+  ///        served: a sender that dials out (`core::net::dial`) serves its
+  ///        reader through it, in either @ref ServerOptions::listen mode.
   ///
   /// The socket is set up to send as an accepted one is: `TCP_NODELAY`,
   /// `TCP_NOTSENT_LOWAT` at 128 KiB, and on Linux BBR for a peer not on

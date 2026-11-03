@@ -39,7 +39,8 @@ vgrid_target_warnings(grid_base_smoke_test)
 add_test(NAME grid_base_smoke COMMAND grid_base_smoke_test)
 
 # The package boundary (package_boundary.cmake): no file under grid/ includes a
-# header or GLSL file of recon or sensor, the packages above it.
+# header or GLSL file of recon or sensor, the packages above it, and none under
+# src/ or include/ a socket header, the core's net tier's alone.
 add_test(NAME grid_package_boundary
          COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${PROJECT_SOURCE_DIR}" -P
                  "${CMAKE_CURRENT_SOURCE_DIR}/package_boundary.cmake")
@@ -742,19 +743,16 @@ add_test(NAME grid_stream_rgbd_kinds COMMAND grid_stream_rgbd_kinds_test)
 
 # networking: the server's GOP log with no sockets (join, newest key wins at a
 # chunk boundary, the GOP limit, a lost copy, no P-frame without its key; keys
-# on demand: joins and fall-backs counted, the bytes held bounded) and the
-# socket calls (each socket's settings read back, no SIGPIPE, the bytes a peer
-# has not acknowledged, a wait a signal interrupts, and on Linux the congestion
-# control of a socket accepted from the host's own address that is not loopback)
-# -- internal and unexported, so the tests compile their sources themselves, the
-# socket calls with grid's log seam -- then the server and the client on
-# loopback, 127.0.0.1 port 0 only: the wire against the writer's file, joins,
-# newest key wins, keys on demand, the limits, the rules, teardown, signals, the
-# client's errors against raw senders, a sender that dials out (dial, Listener,
-# add_viewer, adopt: an adopted viewer reads what a connected one reads, listen
-# false binds nothing, each refusal, a thread adding viewers while another
-# publishes and finishes), and a stress run in both modes for ThreadSanitizer.
-# Host-only.
+# on demand: joins and fall-backs counted, the bytes held bounded) -- internal
+# and unexported, so its test compiles its source itself -- then the server and
+# the client on loopback, 127.0.0.1 port 0 only: the wire against the writer's
+# file, joins, newest key wins, keys on demand, the limits, the rules, teardown,
+# signals, the client's errors against raw senders, a sender that dials out
+# (add_viewer, adopt, on the core's dial and Listener: an adopted viewer reads
+# what a connected one reads, listen false binds nothing, each refusal, a thread
+# adding viewers while another publishes and finishes), and a stress run in both
+# modes for ThreadSanitizer. The socket calls, dial and Listener are the core's
+# net tier, tested there. Host-only.
 set(_vgrid_networking_src
     ${PROJECT_SOURCE_DIR}/src/volumetric_kit/grid/networking)
 add_executable(grid_networking_gop_log_test
@@ -763,16 +761,6 @@ target_include_directories(grid_networking_gop_log_test
                            PRIVATE ${_vgrid_networking_src})
 vgrid_target_warnings(grid_networking_gop_log_test)
 add_test(NAME grid_networking_gop_log COMMAND grid_networking_gop_log_test)
-
-add_executable(grid_networking_socket_test networking_socket_test.cpp
-                                           ${_vgrid_networking_src}/socket.cpp)
-target_include_directories(
-  grid_networking_socket_test PRIVATE ${_vgrid_networking_src}
-                                      ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(grid_networking_socket_test
-                      PRIVATE volumetric_kit::core_base Threads::Threads)
-vgrid_target_warnings(grid_networking_socket_test)
-add_test(NAME grid_networking_socket COMMAND grid_networking_socket_test)
 
 foreach(_vgrid_networking_test server client dial stress)
   add_executable(grid_networking_${_vgrid_networking_test}_test
@@ -784,6 +772,11 @@ foreach(_vgrid_networking_test server client dial stress)
   add_test(NAME grid_networking_${_vgrid_networking_test}
            COMMAND grid_networking_${_vgrid_networking_test}_test)
 endforeach()
+
+# The dial test dials and listens with the core's net tier itself, which
+# grid_networking links privately.
+target_link_libraries(grid_networking_dial_test
+                      PRIVATE volumetric_kit::core_net)
 
 # The client also checks its progress output across an allocation failure while
 # copying a saved error.
@@ -863,7 +856,6 @@ add_dependencies(
   grid_stream_container_test
   grid_mesh_exchange_test
   grid_networking_gop_log_test
-  grid_networking_socket_test
   grid_networking_server_test
   grid_networking_server_oom_test
   grid_networking_client_test

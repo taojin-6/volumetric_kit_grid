@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.11.0] - 2026-11-02
+## [0.12.0] - 2026-11-02
 
 ### Added
 
@@ -20,6 +20,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `StreamServer::publish` makes its one copy from them, and both carry the
   CRC `of` computed (DESIGN.md, stream; the 2026-11-02 RGB-D entry in
   DECISIONS.md). A payload of one or two runs is framed as before.
+
+## [0.11.0] - 2026-11-02
+
+### Removed
+
+- **`networking/dial.hpp`, a breaking move**: `dial` and `Listener` are
+  the core's now, `core::net::dial` and `core::net::Listener` in
+  `volumetric_kit/core/net/dial.hpp` (core 0.43.0, `volumetric_kit::core_net`),
+  with the same arguments, results and messages. No consumer uses them
+  yet: every consumer pins grid 0.8.0 or older (DESIGN.md, networking; the
+  2026-11-02 net entry in DECISIONS.md).
+
+### Changed
+
+- **`grid_networking`'s sockets are the core's net tier**, which it links
+  PRIVATE; grid's own socket calls are gone, and nothing under `src/` or
+  `include/` includes a socket header (`tests/package_boundary.cmake`).
+  `StreamServer` and `StreamClient` keep every declaration, option and
+  message, and the wire is unchanged. The BBR note on Linux logs with
+  source `"net"`, not `"vgrid"`.
+- **The core floor is 0.43.0** (`VGRID_CORE_MIN_VERSION`), the first core
+  with `core_net`, and the pin is core 0.43.0.
+- **The test support's raw loopback sockets are the core's**
+  (`core/testing/net_loopback.hpp`): `networking_loopback.hpp` names them in
+  `vgrid_test::net` as before, its listener struct now `LoopbackListener`.
+
+### Migration
+
+- A consumer that calls `dial` or `Listener` includes
+  `volumetric_kit/core/net/dial.hpp`, calls `core::net::dial` and
+  `core::net::Listener`, and links `volumetric_kit::core_net`.
+- A consumer that declares the core first pins core 0.43.0 or newer with
+  this grid; an older one fails grid's configure (`vkc_require_core`).
+- A test on grid's test support writes `net::LoopbackListener` for
+  `net::Listener`.
 
 ## [0.10.0] - 2026-11-02
 
