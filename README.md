@@ -59,7 +59,7 @@ vkc_compile_shaders(my_kernels INCLUDE_TARGETS volumetric_kit::grid_volume
                     SPIRV_VAL_ARGS --scalar-block-layout SHADERS my.comp)
 ```
 
-grid needs the core at `VGRID_CORE_MIN_VERSION` (0.30.0) or newer, with its
+grid needs the core at `VGRID_CORE_MIN_VERSION` (0.43.0) or newer, with its
 vulkan tier, and checks it with the core's `vkc_require_core`. A project that
 also fetches another sibling declares `volumetric_kit_core` first and sets
 `VKC_WITH_VULKAN ON` before its first `FetchContent_MakeAvailable`; pass
@@ -194,12 +194,14 @@ connection fails, ends with `closed: <why>` or `failed: <why>` in place of
 [vgrid info] StreamServer: viewer 192.168.1.20:52311 left
 ```
 
-A sender that must not listen, as a phone, dials its reader instead
-(`networking/dial.hpp`): it serves with `ServerOptions::listen` false, so
-it binds nothing, connects with `dial` and serves the socket with
-`StreamServer::add_viewer`; the reader listens on one numeric address with
-`Listener` and reads each connection with `StreamClient::adopt`. The
-stream is plain TCP, so it belongs inside a VPN.
+A sender that must not listen, as a phone, dials its reader instead: it
+serves with `ServerOptions::listen` false, so it binds nothing, connects
+with the core's `core::net::dial` (`volumetric_kit/core/net/dial.hpp`) and
+serves the socket with `StreamServer::add_viewer`; the reader listens on
+one numeric address with `core::net::Listener` and reads each connection
+with `StreamClient::adopt`. A target that calls them links
+`volumetric_kit::core_net` itself. The stream is plain TCP, so it belongs
+inside a VPN.
 
 On Linux a viewer that is not on loopback gets BBR congestion control if
 the sender's kernel lists it as allowed; a sender that prints `viewers keep

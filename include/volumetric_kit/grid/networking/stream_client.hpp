@@ -44,8 +44,8 @@ struct ClientOptions {
 /// `NotFound`). From @ref connect, its receive buffer is 2 MiB, set before
 /// the connect: the most a stream carries a round trip, and what a reader
 /// that falls behind can hide from the server's drop rule. Linux holds it to
-/// `net.core.rmem_max`. An adopted socket keeps its own; a @ref Listener's
-/// is the same 2 MiB.
+/// `net.core.rmem_max`. An adopted socket keeps its own; a
+/// `core::net::Listener`'s is the same 2 MiB.
 ///
 /// **Messages.** Every error @ref next returns reads
 /// `"StreamClient: <host>:<port>: <reason>"`, the host and port as given to
@@ -96,8 +96,8 @@ class VGRID_NETWORKING_API StreamClient {
       const ClientOptions& options = {});
 
   /// @brief A client of the sender at the other end of @p connected, as
-  ///        @ref Listener::accept gives one: read as a connected one is, with
-  ///        no lookup and no connect. Never blocks.
+  ///        `core::net::Listener::accept` gives one: read as a connected one
+  ///        is, with no lookup and no connect. Never blocks.
   ///
   /// The socket is made non-blocking and close-on-exec, and on Apple never
   /// raises SIGPIPE; its receive buffer stays as it is.
@@ -109,8 +109,8 @@ class VGRID_NETWORKING_API StreamClient {
   ///         @p connected, one that is not an IPv4 stream socket, or an
   ///         `idle_limit` of 0 or less; `Status::Code::IoError` for a socket
   ///         not connected (or reset already, as one can be since
-  ///         @ref Listener::accept: a reader takes the next) or that cannot
-  ///         be set up;
+  ///         `core::net::Listener::accept`: a reader takes the next) or that
+  ///         cannot be set up;
   ///         `Status::Code::OutOfMemory` when the client cannot be allocated.
   static core::Result<std::unique_ptr<StreamClient>> adopt(
       core::UniqueFd connected, const ClientOptions& options = {});

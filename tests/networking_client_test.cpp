@@ -59,7 +59,7 @@ using namespace std::chrono_literals;
 
 // A raw sender: a listener, and the connection a client made to it.
 struct Sender {
-  net::Listener listener = net::bind_loopback();
+  net::LoopbackListener listener = net::bind_loopback();
   vkc::UniqueFd peer;
 
   // Connect `client` and take its connection.

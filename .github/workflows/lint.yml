@@ -21,8 +21,7 @@ jobs:
           persist-credentials: false
       # No workflow is triggered by an event an outsider can cause, or by a
       # schedule (the core's tools/runners/README.md, "Who can trigger CI").
-      # The action is at the core commit that added it, newer than the core
-      # pin in third_party/CMakeLists.txt.
+      # The action is at the core commit that added it.
       - uses: taojin-6/volumetric_kit_core/.github/actions/check-workflow-triggers@fcbbe0c99a2fcec8d2e5cc3ddaf77add1f5679af
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:

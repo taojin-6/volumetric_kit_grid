@@ -23,12 +23,12 @@ include(FetchContent)
 # -DFETCHCONTENT_SOURCE_DIR_VOLUMETRIC_KIT_CORE=<core checkout>. The core's
 # tests and -Werror stay off in a subproject.
 #
-# The pin is core 0.30.0 (2120e62, core #70's merge). The tests are main()s of
+# The pin is core 0.43.0 (0996d87, core #89's head). The tests are main()s of
 # their own on the core's test support.
 FetchContent_Declare(
   volumetric_kit_core
   GIT_REPOSITORY https://github.com/taojin-6/volumetric_kit_core.git
-  GIT_TAG 2120e6294e3c7ead8bb168d757f940b21d21267c)
+  GIT_TAG 0996d87f57ca193a43137748b9e44bebedae917b)
 set(VKC_WITH_VULKAN ON)
 if(VGRID_BUILD_TESTS OR VGRID_BUILD_TEST_SUPPORT)
   set(VKC_BUILD_TEST_SUPPORT ON)

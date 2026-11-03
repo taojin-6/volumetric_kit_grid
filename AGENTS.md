@@ -46,10 +46,11 @@ stream → networking → codec_stream
 ```
 
 - No upward includes. `stream` links the core's base tier alone,
-  `networking` links `stream`, `codec` and `voxelize` link `volume`, `eval`
-  and `mesh_io` link `mesh`, and `codec_stream` links `codec` and
-  `networking`. Assimp is an optional private backend of
-  `grid_mesh_io_assimp`.
+  `networking` links `stream` and, privately, the core's net tier, `codec`
+  and `voxelize` link `volume`, `eval` and `mesh_io` link `mesh`, and
+  `codec_stream` links `codec` and `networking`. grid makes no socket call
+  of its own: the core's net tier makes them (`tests/package_boundary.cmake`).
+  Assimp is an optional private backend of `grid_mesh_io_assimp`.
 - C++17, no compiler extensions. Namespace `volumetric_kit::grid` (`vgrid::`
   in docs), nested per tier except `base`. Headers:
   `include/volumetric_kit/grid/<tier>/…`. Macros `VGRID_`; GLSL functions

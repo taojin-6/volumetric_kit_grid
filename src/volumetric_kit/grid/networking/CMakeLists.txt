@@ -4,12 +4,13 @@
 # --- grid_networking: a session served and read live over TCP -----------------
 # A sender serves one session's chunks, the .vrst file's own bytes, to viewers
 # as it records; a viewer reads them as they arrive (the 2026-10-21 decision). A
-# sender may instead dial its reader, which listens (dial.cpp, the 2026-11-02
-# decision). Host-only, over grid_stream (the chunks: ChunkEncoder and
-# ChunkParser) and the family core's base tier, with BSD sockets and threads of
-# its own. Its own tier, apart from the format, so the sockets are tested apart
-# from it. It logs through grid's log seam (base/log.hpp), header-only over that
-# base tier.
+# sender may instead dial its reader, which listens, through the core's dial and
+# Listener (the 2026-11-02 decisions). Host-only, over grid_stream (the chunks:
+# ChunkEncoder and ChunkParser) and the family core's base tier, with threads of
+# its own; its sockets are the core's net tier (the 2026-11-02 net entry), so
+# nothing here makes a socket call of its own (tests/package_boundary.cmake).
+# Its own tier, apart from the format. It logs through grid's log seam
+# (base/log.hpp), header-only over that base tier.
 include(GenerateExportHeader)
 
 set(_vgrid_networking_generated_inc
@@ -18,8 +19,8 @@ set(_vgrid_networking_generated_inc
 add_library(grid_networking)
 add_library(volumetric_kit::grid_networking ALIAS grid_networking)
 
-target_sources(grid_networking PRIVATE dial.cpp gop_log.cpp socket.cpp
-                                       stream_client.cpp stream_server.cpp)
+target_sources(grid_networking PRIVATE gop_log.cpp stream_client.cpp
+                                       stream_server.cpp)
 
 generate_export_header(
   grid_networking
@@ -50,13 +51,15 @@ target_compile_features(grid_networking PUBLIC cxx_std_17)
 target_compile_options(grid_networking PRIVATE -fexceptions)
 
 # PUBLIC: the headers return the core's Status/Result and the stream's Session
-# and Record. The server and the client run threads of their own, so a static
-# archive's link interface names Threads.
+# and Record. PRIVATE: the core's net tier, which no public header includes; a
+# target that calls core::net links volumetric_kit::core_net itself. The server
+# and the client run threads of their own, so a static archive's link interface
+# names Threads.
 find_package(Threads REQUIRED)
 target_link_libraries(
   grid_networking
   PUBLIC volumetric_kit::grid_stream volumetric_kit::core_base
-  PRIVATE Threads::Threads)
+  PRIVATE volumetric_kit::core_net Threads::Threads)
 
 target_include_directories(
   grid_networking
