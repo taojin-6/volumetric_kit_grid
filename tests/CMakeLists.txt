@@ -728,6 +728,18 @@ target_link_libraries(grid_stream_audio_test
 vgrid_target_warnings(grid_stream_audio_test)
 add_test(NAME grid_stream_audio COMMAND grid_stream_audio_test)
 
+# The RGB-D kinds and a payload in three runs: a session of a colour and a depth
+# track, opaque params, against its chunk built by hand; its records, the depth
+# in three runs, read back from the footer, by a scan, by a parser and by a
+# client on 127.0.0.1 port 0 alike; three runs at every split, and the shorter
+# payloads, framed, written and served as their joined bytes, under of()'s CRC.
+# Host-only.
+add_executable(grid_stream_rgbd_kinds_test stream_rgbd_kinds_test.cpp)
+target_link_libraries(grid_stream_rgbd_kinds_test
+                      PRIVATE volumetric_kit::grid_networking Threads::Threads)
+vgrid_target_warnings(grid_stream_rgbd_kinds_test)
+add_test(NAME grid_stream_rgbd_kinds COMMAND grid_stream_rgbd_kinds_test)
+
 # networking: the server's GOP log with no sockets (join, newest key wins at a
 # chunk boundary, the GOP limit, a lost copy, no P-frame without its key; keys
 # on demand: joins and fall-backs counted, the bytes held bounded) and the

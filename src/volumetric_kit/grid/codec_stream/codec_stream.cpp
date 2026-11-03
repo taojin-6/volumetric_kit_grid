@@ -356,6 +356,10 @@ core::Result<SentFrame> StreamCoder::play(
       std::memcpy(input.data() + bytes.first_size(), bytes.second(),
                   bytes.second_size());
     }
+    if (bytes.third_size() != 0) {
+      std::memcpy(input.data() + bytes.first_size() + bytes.second_size(),
+                  bytes.third(), bytes.third_size());
+    }
     if (!player_) {
       VKC_ASSIGN(volume::VoxelBlockGrid grid,
                  codec::make_decode_grid(*device_, *allocator_, input.data(),

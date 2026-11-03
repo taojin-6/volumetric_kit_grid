@@ -109,12 +109,13 @@ core::Status StreamWriter::append(const RecordInfo& info,
                                                      path_);
     }
     const ChunkEncoder::RecordFraming& framing = *framed;
-    const detail::Bytes parts[4] = {
+    const detail::Bytes parts[5] = {
         {framing.header.data(), framing.header.size()},
         {payload.first(), payload.first_size()},
         {payload.second(), payload.second_size()},
+        {payload.third(), payload.third_size()},
         {kZeros, framing.padding}};
-    core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 4);
+    core::Status written = detail::write_all(kApi, path_, fd_.get(), parts, 5);
     if (!written.ok()) {
       failure_ = std::move(written);
       return failure_;

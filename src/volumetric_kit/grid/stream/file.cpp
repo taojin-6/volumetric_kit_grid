@@ -31,9 +31,9 @@ static_assert(sizeof(off_t) == 8, "offsets past 2 GiB need a 64-bit off_t");
 // One read() or write() moves at most this much: macOS refuses a count above
 // INT_MAX.
 constexpr std::size_t kMaxIo = std::size_t{1} << 30;
-// The most runs one write_all takes: a record's header, its payload's two
+// The most runs one write_all takes: a record's header, its payload's three
 // runs and its padding.
-constexpr int kMaxParts = 4;
+constexpr int kMaxParts = 5;
 
 constexpr mode_t kNewFileMode =
     S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
@@ -104,7 +104,7 @@ core::Result<std::uint64_t> regular_file_size(std::string_view api,
 
 core::Status write_all(std::string_view api, const std::string& path, int fd,
                        const Bytes* parts, int count) {
-  VKC_CHECK(count >= 0 && count <= kMaxParts, "write_all takes 0 to 4 runs");
+  VKC_CHECK(count >= 0 && count <= kMaxParts, "write_all takes 0 to 5 runs");
   int first = 0;         // the first part with bytes left
   std::size_t done = 0;  // its bytes written
   iovec iov[kMaxParts];

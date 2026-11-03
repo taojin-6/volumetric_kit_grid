@@ -120,6 +120,21 @@ enum class TrackKind : std::uint16_t {
   /// sample's capture time on the track's clock. The track has no width or
   /// height.
   Audio = 2,
+  /// One RGB-D sensor's frames, the depth half of one a record, in bytes
+  /// grid carries and does not read: the sensor package's wire form
+  /// (`sensor/wire/rgbd_wire.hpp`) defines the params, which say what the
+  /// sensor is, and the payloads. Every record is a key. Its pts is the
+  /// frame's capture time on the track's clock; its seq is one up per record
+  /// written, so a jump is a frame lost after the writer; its set is the
+  /// frame's, which the frame's @ref TrackKind::RgbdColor record shares. The
+  /// track's width and height are the depth's, its sensor the sensor's id.
+  RgbdDepth = 3,
+  /// The same sensor's colour, one coded picture a record, in the same wire
+  /// form; a key is a picture decoding can start at. Its sensor, clock, rate
+  /// and sets are its @ref TrackKind::RgbdDepth track's; its width and height
+  /// are the pictures'. Served live it is track 0, which anchors the GOP, and
+  /// each frame's colour record comes before its depth record.
+  RgbdColor = 4,
 };
 
 /// @brief The clock of @ref Track::clock that is the host's
