@@ -98,13 +98,13 @@ class StreamCoder {
 
   // What code() and finish_frame() do once the encoder returns frame `set`'s
   // `bytes` -- its head, then its payload where the encoder left it, under
-  // one CRC: write and serve them, run `sent`, send the records the frame
-  // releases (RecordMux::frame), and decode them into the
-  // player if the stream decodes, from the decoder's input buffer they are
-  // copied into. `encoded` is the encode's stage rows and `tail` whether its
-  // payload took a tail. The source's block capacity, `max_blocks`, bounds
-  // its frames' blocks: the player's ceiling. `rows`, when given, takes the
-  // write's and the serve's rows.
+  // one CRC, and no third run (VKC_CHECK): write and serve them, run `sent`,
+  // send the records the frame releases (RecordMux::frame), and decode them
+  // into the player if the stream decodes, from the decoder's input buffer
+  // they are copied into. `encoded` is the encode's stage rows and `tail`
+  // whether its payload took a tail. The source's block capacity,
+  // `max_blocks`, bounds its frames' blocks: the player's ceiling. `rows`,
+  // when given, takes the write's and the serve's rows.
   core::Result<SentFrame> play(const stream::RecordPayload& bytes,
                                std::uint64_t set, std::uint64_t pts_ns,
                                core::StageMetrics encoded, bool tail,

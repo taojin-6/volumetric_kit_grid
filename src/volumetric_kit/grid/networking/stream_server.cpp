@@ -524,7 +524,7 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
     bool overflow = false;
     std::uint64_t fell_back = 0;  // viewers that now wait for a key
     try {
-      // The one copy, made before the lock, of both runs.
+      // The one copy, made before the lock, of every run.
       auto chunk = std::make_shared<std::vector<std::uint8_t>>();
       chunk->reserve(bytes);
       chunk->insert(chunk->end(), framing.header.begin(), framing.header.end());
@@ -535,6 +535,10 @@ core::Status StreamServer::publish(const stream::RecordInfo& info,
       if (payload.second_size() != 0) {
         chunk->insert(chunk->end(), payload.second(),
                       payload.second() + payload.second_size());
+      }
+      if (payload.third_size() != 0) {
+        chunk->insert(chunk->end(), payload.third(),
+                      payload.third() + payload.third_size());
       }
       chunk->insert(chunk->end(), kZeros, kZeros + framing.padding);
       const std::lock_guard<std::mutex> lock(s.mutex);

@@ -221,7 +221,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   the core's base tier alone. *Amended 2026-10-14:* a Geometry track's
   params may hold a mesh source's transform. *Amended 2026-10-21:* its
   chunks are made and read in memory too, publicly. *Amended 2026-10-30:*
-  kind 2 is Audio, in version 0.
+  kind 2 is Audio, in version 0. *Amended 2026-11-02:* kinds 3 and 4 are a
+  sensor's RGB-D frames, in version 0, and a payload takes three runs.
 - [**2026-10-12**](#2026-10-12--p-frames-are-frame-type-1-of-v3-each-reference-block-gets-a-mode-in-update-segments-new-blocks-follow-in-intra-segments-and-a-reference-section-names-the-reference-by-xxh64-of-its-bytes-experimental-until-golden-p-frames-freeze-it) —
   P-frames are frame type 1 of v3: a mode per reference block in update
   segments, new blocks in intra segments, the reference named by XXH64 of its
@@ -493,6 +494,15 @@ entries relevant to your task; later amendments supersede earlier rules.
   `Listener` move to `core::net`, `grid_networking` links `core_net`
   privately, and no source of grid's includes a socket header; the server,
   the client, their messages and the wire are unchanged.
+- [**2026-11-02**](#2026-11-02--rgb-d-tracks-are-kinds-3-and-4-of-vrst-v0-bytes-the-sensor-package-defines-and-grid-never-parses-and-a-records-payload-takes-a-third-run-amends-the-2026-10-12-container-entry) —
+  RGB-D tracks are kinds 3 and 4 of `.vrst` v0: `RgbdDepth`, a sensor's
+  frames, each frame's depth half a record, every record a key, and
+  `RgbdColor`, its coded pictures, which must be track 0 when served, so a
+  live session serves one sensor's colour. On both, seq is one up per
+  record written. Their params and payloads are the sensor package's wire
+  form, which grid never parses. No version change and no record flag. `RecordPayload`
+  takes a third run, which the writer's `writev` and the server's copy
+  take; the codec stream's copy checks there is none.
 
 ## Decision record
 
@@ -5522,6 +5532,11 @@ through the encoder.
 *Amended 2026-10-30 (the audio entry, below):* kind 2 is Audio, interleaved
 samples as its params say, in version 0 and with no new record flag.
 
+*Amended 2026-11-02 (the RGB-D entry, below):* kinds 3 and 4 are
+`RgbdDepth` and `RgbdColor`, one sensor's frames in the sensor package's
+wire form, in version 0 and with no new record flag; a record's payload
+takes three runs.
+
 A recording holds tracks of several kinds, each on its own clock, the rig's
 calibration, and per record a pts, a sequence number, a capture set and
 whether decoding can start there. It must read up to its last whole record
@@ -9098,3 +9113,63 @@ core. Planted bugs each fail: a socket header in `stream_server.cpp`
 (`grid_package_boundary`, which also names all seven in grid 0.10.0's
 sources), `adopt` skipping its socket setup and `add_viewer` skipping the
 sender setup (`grid_networking_dial`).
+
+### 2026-11-02 — RGB-D tracks are kinds 3 and 4 of `.vrst` v0, bytes the sensor package defines and grid never parses, and a record's payload takes a third run (amends the 2026-10-12 container entry).
+
+**The kinds.** `TrackKind::RgbdDepth` (3) holds one RGB-D sensor's
+frames, each frame's depth half a record, and `TrackKind::RgbdColor` (4)
+the same sensor's colour, one coded picture a record. Their params and
+payloads are the sensor package's wire form (its `wire/rgbd_wire.hpp`):
+the depth track's params say what the sensor is, and each record carries
+its frame's cameras, pose, units, range and noise before the samples.
+Every depth record is a key; a colour key is a picture decoding can start
+at. A frame's two records share its pts and set, and both tracks name the
+sensor's id, clock and rate. Each track's seq is one up per record
+written, so a frame the writer is not given leaves no gap and a jump is a
+record lost after the writer: the kinds' docs say so over the container's
+general rule, where a jump is a loss before the writer. The tracks' width
+and height repeat the cameras' sizes in the depth track's params, which
+the sensor's reader goes by; grid checks neither, as it parses no params.
+Served live, the pictures must be track 0: only track 0's records may be
+other than keys (the 2026-10-30 serving entry), so their keys anchor the
+GOP, a live session serves one sensor's colour, and each frame's colour
+record goes before its depth record.
+
+**The bytes are sensor's.** The frame and its sensor's description are
+sensor types, and grid may not include sensor (the package rule), so the
+frame's bytes and their checks live beside the frame, in sensor, where every
+writer and reader above both packages (recon, ios) shares one form. grid
+holds the container alone: two numbers and their docs. The wire form
+versions itself in its params, which a reader that does not know the
+version skips with the track.
+
+**No version change, no record flag.** As for Audio: version 0's readers
+pass an unknown kind through, the key bit says what a flag would, and a
+file without these kinds is byte for byte as before.
+
+**A third run.** A depth record is a prefix, the depth rows and the
+confidence plane, three buffers a capture holds apart: a prefix of a few
+hundred bytes (sensor's `kDepthPrefixBytes`), then 98,304 and 49,152
+bytes at 256×192. With two runs a writer would join two of them, 147 KB a
+frame copied on the capturing device, since nothing makes a frame's rows
+and plane contiguous. `RecordPayload::of` takes a third run, its CRC
+continuing the second's. `StreamWriter::append`'s one `writev` gains an
+iovec and `StreamServer::publish` makes its one copy from the three. The
+codec stream hands on only the encoder's two runs, so its copy into its
+decoder input takes two, and a `VKC_CHECK` says there is no third, rather
+than a copy no test could reach. The new parameters default to none, so
+every call of one or two runs frames, writes and serves the same bytes.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer: the full suite passes, 74 of 74. The new
+`grid_stream_rgbd_kinds`, host-only, checks a session chunk whose track 0
+is `RgbdColor` and track 1 `RgbdDepth`, with opaque params, against bytes
+built by hand with the numbers 4 and 3; writes their records, the depth in
+three runs, and reads them back from the footer and by a scan, through a parser
+fed the file in pieces and through a client on loopback, all alike, the
+kinds included; frames, writes and serves three runs at each of 21 pairs of
+splits, empty runs included, as the same bytes in one run, under the CRC
+`of` computed; and takes a third run with no second, or none, as the
+shorter payload. Four planted bugs fail it: the third run left out of the
+CRC, its iovec dropped from the `writev`, the server's copy without it, and
+`RgbdDepth` numbered 4.

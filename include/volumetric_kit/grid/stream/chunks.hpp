@@ -21,7 +21,7 @@
 
 namespace volumetric_kit::grid::stream {
 
-/// @brief A record's payload as one or two runs of bytes, and their CRC,
+/// @brief A record's payload as up to three runs of bytes, and their CRC,
 ///        computed once, by @ref of, for every chunk that frames it: a
 ///        file's and a server's.
 ///
@@ -30,23 +30,28 @@ namespace volumetric_kit::grid::stream {
 /// the bytes hold by then.
 ///
 /// @code
-/// const stream::RecordPayload payload =
-///     stream::RecordPayload::of(head.data(), head.size(), body, body_size);
+/// const stream::RecordPayload payload = stream::RecordPayload::of(
+///     prefix.data(), prefix.size(), rows, rows_size, plane, plane_size);
 /// VKC_TRY(writer->append(info, payload));   // one writev, no joined copy
 /// VKC_TRY(server->publish(info, payload));  // its one copy, no second CRC
 /// @endcode
 class VGRID_STREAM_API RecordPayload {
  public:
-  /// @brief The payload @p first then @p second, and its CRC.
+  /// @brief The payload @p first, then @p second, then @p third, and its
+  ///        CRC.
   /// @param first        Its first run; may be null when @p first_size is 0.
   /// @param first_size   Its bytes.
   /// @param second       Its second run, or null for none.
   /// @param second_size  Its bytes; 0 with a null @p second.
+  /// @param third        Its third run, or null for none.
+  /// @param third_size   Its bytes; 0 with a null @p third.
   /// @return The payload. A null run with bytes is a programmer error
   ///         (`VKC_CHECK`).
   static RecordPayload of(const std::uint8_t* first, std::size_t first_size,
                           const std::uint8_t* second = nullptr,
-                          std::size_t second_size = 0) noexcept;
+                          std::size_t second_size = 0,
+                          const std::uint8_t* third = nullptr,
+                          std::size_t third_size = 0) noexcept;
   /// @return The first run.
   const std::uint8_t* first() const noexcept { return first_; }
   /// @return Its bytes.
@@ -55,9 +60,15 @@ class VGRID_STREAM_API RecordPayload {
   const std::uint8_t* second() const noexcept { return second_; }
   /// @return Its bytes.
   std::size_t second_size() const noexcept { return second_size_; }
-  /// @return Both runs' bytes.
-  std::size_t size() const noexcept { return first_size_ + second_size_; }
-  /// @return The CRC of both, as a `RECD` header carries it.
+  /// @return The third run, or null.
+  const std::uint8_t* third() const noexcept { return third_; }
+  /// @return Its bytes.
+  std::size_t third_size() const noexcept { return third_size_; }
+  /// @return The three runs' bytes.
+  std::size_t size() const noexcept {
+    return first_size_ + second_size_ + third_size_;
+  }
+  /// @return The CRC of all three, as a `RECD` header carries it.
   std::uint32_t crc() const noexcept { return crc_; }
 
  private:
@@ -67,6 +78,8 @@ class VGRID_STREAM_API RecordPayload {
   std::size_t first_size_ = 0;
   const std::uint8_t* second_ = nullptr;
   std::size_t second_size_ = 0;
+  const std::uint8_t* third_ = nullptr;
+  std::size_t third_size_ = 0;
   std::uint32_t crc_ = 0;
 };
 
@@ -126,7 +139,7 @@ class VGRID_STREAM_API ChunkEncoder {
   core::Result<RecordFraming> frame(const RecordInfo& info,
                                     const std::uint8_t* data, std::size_t size);
 
-  /// @brief @ref frame a payload in up to two runs, its CRC the one
+  /// @brief @ref frame a payload in up to three runs, its CRC the one
   ///        @p payload carries, not computed again.
   /// @return As the other @ref frame.
   core::Result<RecordFraming> frame(const RecordInfo& info,

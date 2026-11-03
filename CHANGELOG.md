@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-11-02
+
+### Added
+
+- **RGB-D tracks in `.vrst`**: `TrackKind::RgbdDepth` (kind 3), one RGB-D
+  sensor's frames, each frame's depth half a record and every record a key,
+  and `TrackKind::RgbdColor` (kind 4), the same sensor's colour, one coded
+  picture a record. Their params and payloads are the sensor package's wire
+  form, bytes grid carries and never parses. The format stays version 0: a
+  reader that does not know a kind passes it through.
+- **A record's payload in three runs**: `RecordPayload::of` takes a third
+  run, so a depth record's prefix, rows and plane go out as they lie, with no
+  joined copy: `StreamWriter::append` writes them in its one `writev`,
+  `StreamServer::publish` makes its one copy from them, and both carry the
+  CRC `of` computed (DESIGN.md, stream; the 2026-11-02 RGB-D entry in
+  DECISIONS.md). A payload of one or two runs is framed as before.
+
 ## [0.11.0] - 2026-11-02
 
 ### Removed

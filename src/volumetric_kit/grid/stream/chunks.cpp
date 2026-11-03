@@ -33,18 +33,24 @@ constexpr std::uint64_t kUnbounded = ~std::uint64_t{0};
 RecordPayload RecordPayload::of(const std::uint8_t* first,
                                 std::size_t first_size,
                                 const std::uint8_t* second,
-                                std::size_t second_size) noexcept {
+                                std::size_t second_size,
+                                const std::uint8_t* third,
+                                std::size_t third_size) noexcept {
   VKC_CHECK((first != nullptr || first_size == 0) &&
-                (second != nullptr || second_size == 0),
+                (second != nullptr || second_size == 0) &&
+                (third != nullptr || third_size == 0),
             "RecordPayload::of takes bytes for every run with a size");
   RecordPayload payload;
   payload.first_ = first;
   payload.first_size_ = first_size;
   payload.second_ = second;
   payload.second_size_ = second_size;
-  // The second run's CRC continues the first's, as zlib's does.
-  payload.crc_ =
-      detail::crc32(second, second_size, detail::crc32(first, first_size));
+  payload.third_ = third;
+  payload.third_size_ = third_size;
+  // Each run's CRC continues the one before's, as zlib's does.
+  payload.crc_ = detail::crc32(
+      third, third_size,
+      detail::crc32(second, second_size, detail::crc32(first, first_size)));
   return payload;
 }
 

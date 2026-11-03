@@ -204,8 +204,9 @@ class VGRID_NETWORKING_API StreamServer {
   core::Status publish(const stream::RecordInfo& info, const std::uint8_t* data,
                        std::size_t size);
 
-  /// @brief @ref publish a payload in up to two runs: its one copy made from
-  ///        both, its CRC the one @p payload carries, not computed again.
+  /// @brief @ref publish a payload in up to three runs: its one copy made
+  ///        from every run, its CRC the one @p payload carries, not computed
+  ///        again.
   /// @return As the other @ref publish.
   core::Status publish(const stream::RecordInfo& info,
                        const stream::RecordPayload& payload);

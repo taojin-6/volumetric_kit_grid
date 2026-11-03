@@ -878,19 +878,28 @@ order marching cubes' atomics emitted the mesh in.
 header, the records appended after it in `RECD` chunks, and on `finish` a
 footer index (`INDX`, `TAIL`). The byte layout, the CRC and the rules a
 record follows are written down once, in `stream/session.hpp`. Payloads are
-stored and returned byte for byte. Two kinds are defined:
+stored and returned byte for byte. Four kinds are defined:
 `TrackKind::Geometry`, a codec frame per record with key meaning intra, its
-params empty or a mesh source's transform; and `TrackKind::Audio`,
+params empty or a mesh source's transform; `TrackKind::Audio`,
 interleaved samples as its params say (`stream/audio.hpp`: codec, channels
 and rate in 8 bytes, `encode_audio_params` / `decode_audio_params`), every
-record a key at its first sample's capture time. The writer takes any
-nonzero kind and the reader passes an unknown one through.
+record a key at its first sample's capture time; and two that hold one
+RGB-D sensor's frames as the sensor package's wire form defines them, bytes
+grid never parses: `TrackKind::RgbdDepth`, each frame's depth half a record,
+every record a key, and `TrackKind::RgbdColor`, one coded picture a record,
+in the same sets. Served live, the pictures must be track 0, so their keys
+anchor the GOP and a live session serves one sensor's colour. The writer
+takes any nonzero kind and the reader passes an unknown one through.
 
 **Writing** (`StreamWriter`, one thread). `create` makes the file with
 `O_CREAT | O_EXCL`, so nothing at the path is touched, a symbolic link
 included, then writes the session header and flushes the file and its
 directory. Each `append` checks the record rules, then is one `writev` with
-no buffering, so a killed process loses nothing it appended. `sync` flushes
+no buffering, so a killed process loses nothing it appended. A payload is
+handed in up to three runs (`RecordPayload`, `stream/chunks.hpp`), such as a
+depth record's prefix, rows and plane as they lie, under one CRC that `of`
+computes; the `writev` takes the header, the runs and the padding, and the
+server's one copy (below) is made from the same runs. `sync` flushes
 to storage (`F_FULLFSYNC` on Apple); a power loss can lose what came after
 the last one. A failed write or flush sticks: every later call returns it,
 and the file reads as a killed writer's. `finish` writes the footer, flushes
