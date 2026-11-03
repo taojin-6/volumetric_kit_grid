@@ -491,11 +491,13 @@ entries relevant to your task; later amendments supersede earlier rules.
   floor and a 256-value allow set over a named 1-byte attribute.
 - [**2026-11-02**](#2026-11-02--rgb-d-tracks-are-kinds-3-and-4-of-vrst-v0-bytes-the-sensor-package-defines-and-grid-never-parses-and-a-records-payload-takes-a-third-run-amends-the-2026-10-12-container-entry) —
   RGB-D tracks are kinds 3 and 4 of `.vrst` v0: `RgbdDepth`, a sensor's
-  depth half of each frame a record, every record a key, and `RgbdColor`,
-  its coded pictures, track 0 when served. Their params and payloads are
-  the sensor package's wire form, which grid never parses. No version
-  change and no record flag. `RecordPayload` takes a third run, which the
-  writer's `writev`, the server's copy and the codec stream's copy all take.
+  frames, each frame's depth half a record, every record a key, and
+  `RgbdColor`, its coded pictures, which must be track 0 when served, so a
+  live session serves one sensor's colour. On both, seq is one up per
+  record written. Their params and payloads are the sensor package's wire
+  form, which grid never parses. No version change and no record flag. `RecordPayload`
+  takes a third run, which the writer's `writev` and the server's copy
+  take; the codec stream's copy checks there is none.
 
 ## Decision record
 
@@ -9034,17 +9036,23 @@ from 1.4 to 7.1 ms.
 ### 2026-11-02 — RGB-D tracks are kinds 3 and 4 of `.vrst` v0, bytes the sensor package defines and grid never parses, and a record's payload takes a third run (amends the 2026-10-12 container entry).
 
 **The kinds.** `TrackKind::RgbdDepth` (3) holds one RGB-D sensor's
-frames, the depth half of each a record, and `TrackKind::RgbdColor` (4)
+frames, each frame's depth half a record, and `TrackKind::RgbdColor` (4)
 the same sensor's colour, one coded picture a record. Their params and
 payloads are the sensor package's wire form (its `wire/rgbd_wire.hpp`):
 the depth track's params say what the sensor is, and each record carries
 its frame's cameras, pose, units, range and noise before the samples.
 Every depth record is a key; a colour key is a picture decoding can start
-at. A frame's two records share its pts and set, the depth track's seq is
-one up per record written, and both tracks name the sensor's id, clock and
-rate. Served live, the pictures are track 0: only track 0's records may
-be other than keys (the 2026-10-30 serving entry), so their keys anchor
-the GOP, and each frame's colour record goes before its depth record.
+at. A frame's two records share its pts and set, and both tracks name the
+sensor's id, clock and rate. Each track's seq is one up per record
+written, so a frame the writer is not given leaves no gap and a jump is a
+record lost after the writer: the kinds' docs say so over the container's
+general rule, where a jump is a loss before the writer. The tracks' width
+and height repeat the cameras' sizes in the depth track's params, which
+the sensor's reader goes by; grid checks neither, as it parses no params.
+Served live, the pictures must be track 0: only track 0's records may be
+other than keys (the 2026-10-30 serving entry), so their keys anchor the
+GOP, a live session serves one sensor's colour, and each frame's colour
+record goes before its depth record.
 
 **The bytes are sensor's.** The frame and its sensor's description are
 sensor types, and grid may not include sensor (the package rule), so the
@@ -9059,16 +9067,17 @@ pass an unknown kind through, the key bit says what a flag would, and a
 file without these kinds is byte for byte as before.
 
 **A third run.** A depth record is a prefix, the depth rows and the
-confidence plane, three buffers a capture holds apart: 392, 98,304 and
-49,152 bytes at 256×192. With two runs a writer would join two of them,
-147 KB a frame copied on the capturing device, since nothing makes a
-frame's rows and plane contiguous. `RecordPayload::of` takes a third run,
-its CRC continuing the second's. Every reader of the runs takes it:
-`StreamWriter::append`'s one `writev` gains an iovec, `StreamServer::publish`
-makes its one copy from the three, and the codec stream's copy into its
-decoder input copies the third too, though its payloads stay the encoder's
-two. The new parameters default to none, so every call of one or two runs
-frames, writes and serves the same bytes.
+confidence plane, three buffers a capture holds apart: a prefix of a few
+hundred bytes (sensor's `kDepthPrefixBytes`), then 98,304 and 49,152
+bytes at 256×192. With two runs a writer would join two of them, 147 KB a
+frame copied on the capturing device, since nothing makes a frame's rows
+and plane contiguous. `RecordPayload::of` takes a third run, its CRC
+continuing the second's. `StreamWriter::append`'s one `writev` gains an
+iovec and `StreamServer::publish` makes its one copy from the three. The
+codec stream hands on only the encoder's two runs, so its copy into its
+decoder input takes two, and a `VKC_CHECK` says there is no third, rather
+than a copy no test could reach. The new parameters default to none, so
+every call of one or two runs frames, writes and serves the same bytes.
 
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer: the full suite passes, 75 of 75. The new

@@ -9,7 +9,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **RGB-D tracks in `.vrst`**: `TrackKind::RgbdDepth` (kind 3), one RGB-D
-  sensor's frames, the depth half of each a record and every record a key,
+  sensor's frames, each frame's depth half a record and every record a key,
   and `TrackKind::RgbdColor` (kind 4), the same sensor's colour, one coded
   picture a record. Their params and payloads are the sensor package's wire
   form, bytes grid carries and never parses. The format stays version 0: a
@@ -18,7 +18,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run, so a depth record's prefix, rows and plane go out as they lie, with no
   joined copy: `StreamWriter::append` writes them in its one `writev`,
   `StreamServer::publish` makes its one copy from them, and both carry the
-  CRC `of` computed (DESIGN.md, stream; the 2026-11-02 entry in
+  CRC `of` computed (DESIGN.md, stream; the 2026-11-02 RGB-D entry in
   DECISIONS.md). A payload of one or two runs is framed as before.
 
 ## [0.10.0] - 2026-11-02

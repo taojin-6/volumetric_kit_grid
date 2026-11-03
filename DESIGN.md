@@ -885,9 +885,9 @@ record a key at its first sample's capture time; and two that hold one
 RGB-D sensor's frames as the sensor package's wire form defines them, bytes
 grid never parses: `TrackKind::RgbdDepth`, each frame's depth half a record,
 every record a key, and `TrackKind::RgbdColor`, one coded picture a record,
-in the same sets. Served live, the pictures are track 0, so their keys
-anchor the GOP. The writer takes any nonzero kind and the reader passes an
-unknown one through.
+in the same sets. Served live, the pictures must be track 0, so their keys
+anchor the GOP and a live session serves one sensor's colour. The writer
+takes any nonzero kind and the reader passes an unknown one through.
 
 **Writing** (`StreamWriter`, one thread). `create` makes the file with
 `O_CREAT | O_EXCL`, so nothing at the path is touched, a symbolic link

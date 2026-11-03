@@ -88,9 +88,10 @@
 ///
 /// **Rules.**
 /// - A record's track's records are in decode order, its seq strictly
-///   increasing (a jump: records lost before the writer saw them), and a key
-///   record's pts never below the previous key's; other pts may go back.
-///   Tracks interleave in append order.
+///   increasing (a jump: records lost before the writer saw them, unless the
+///   track's kind says otherwise), and a key record's pts never below the
+///   previous key's; other pts may go back. Tracks interleave in append
+///   order.
 /// - A reader skips an unknown tag by its size and ignores the trailing
 ///   fields of an H larger than it knows. Reserved fields are written as zero
 ///   and ignored when read.
@@ -120,20 +121,27 @@ enum class TrackKind : std::uint16_t {
   /// sample's capture time on the track's clock. The track has no width or
   /// height.
   Audio = 2,
-  /// One RGB-D sensor's frames, the depth half of one a record, in bytes
+  /// One RGB-D sensor's frames, each frame's depth half a record, in bytes
   /// grid carries and does not read: the sensor package's wire form
   /// (`sensor/wire/rgbd_wire.hpp`) defines the params, which say what the
   /// sensor is, and the payloads. Every record is a key. Its pts is the
-  /// frame's capture time on the track's clock; its seq is one up per record
-  /// written, so a jump is a frame lost after the writer; its set is the
-  /// frame's, which the frame's @ref TrackKind::RgbdColor record shares. The
-  /// track's width and height are the depth's, its sensor the sensor's id.
+  /// frame's capture time on the track's clock; its set is the frame's,
+  /// which the frame's @ref TrackKind::RgbdColor record shares. Its seq,
+  /// unlike the container's general rule, is one up per record written, so a
+  /// jump is a frame lost after the writer. The track's sensor is the
+  /// sensor's id; its width and height repeat the depth camera's size, which
+  /// the params state and a reader of the frames goes by.
   RgbdDepth = 3,
   /// The same sensor's colour, one coded picture a record, in the same wire
   /// form; a key is a picture decoding can start at. Its sensor, clock, rate
-  /// and sets are its @ref TrackKind::RgbdDepth track's; its width and height
-  /// are the pictures'. Served live it is track 0, which anchors the GOP, and
-  /// each frame's colour record comes before its depth record.
+  /// and sets are its @ref TrackKind::RgbdDepth track's; a record's pts is
+  /// its frame's, the frame's depth record's. Its seq, as the depth track's,
+  /// is one up per record written, so a jump is a picture lost after the
+  /// writer, and decoding waits for the next key. Its width and height repeat
+  /// the colour camera's size in the depth track's params: the picture as
+  /// shown, not its coded size. Served live it must be track 0, which
+  /// anchors the GOP, so a live session serves one sensor's colour; each
+  /// frame's colour record comes before its depth record.
   RgbdColor = 4,
 };
 
@@ -206,7 +214,8 @@ struct RecordInfo {
   bool key = false;
   std::uint64_t pts_ns = 0;  ///< Its time on its track's clock.
   /// Its number in its track, strictly increasing; a jump says records were
-  /// lost before the writer saw them.
+  /// lost before the writer saw them, unless its track's @ref TrackKind says
+  /// otherwise.
   std::uint64_t seq = 0;
   /// The capture set it belongs to, across tracks, or @ref kNoSet.
   std::uint64_t set = kNoSet;

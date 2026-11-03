@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "stream_coder.hpp"
+#include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/log.hpp"
 #include "volumetric_kit/grid/base/log.hpp"
 #include "volumetric_kit/grid/codec/decode_grid.hpp"
@@ -311,6 +312,9 @@ core::Result<SentFrame> StreamCoder::play(
     const stream::RecordPayload& bytes, std::uint64_t set, std::uint64_t pts_ns,
     core::StageMetrics encoded, bool tail, std::uint32_t max_blocks,
     core::StageMetrics* rows, const std::function<void()>& sent) {
+  // The encoder's head and payload: the decoder's copy below takes two runs.
+  VKC_CHECK(bytes.third_size() == 0,
+            "StreamCoder::play takes the encoder's two runs");
   VKC_ASSIGN(const codec::FrameInfo info,
              codec::read_frame_info(bytes.first(), bytes.first_size()));
   stream::RecordInfo record;
@@ -355,10 +359,6 @@ core::Result<SentFrame> StreamCoder::play(
     if (bytes.second_size() != 0) {
       std::memcpy(input.data() + bytes.first_size(), bytes.second(),
                   bytes.second_size());
-    }
-    if (bytes.third_size() != 0) {
-      std::memcpy(input.data() + bytes.first_size() + bytes.second_size(),
-                  bytes.third(), bytes.third_size());
     }
     if (!player_) {
       VKC_ASSIGN(volume::VoxelBlockGrid grid,
