@@ -22,8 +22,8 @@
 //            of a slot stores the same
 //            coordinate). An item whose band block the table does not hold
 //            adds 1 to `missing` instead -- one per (triangle, block) pair, not
-//            per block -- which the host reads, and refuses, before anything is
-//            written. The scan rewrites counts[] in place as each bin's
+//            per block -- which the host reads after the first batch, and
+//            refuses. The scan rewrites counts[] in place as each bin's
 //            first entry (an exclusive prefix sum), and they become cursors.
 //   fill  -- replays the count pass's slots rather than re-deriving them: an
 //            item takes the next entry of its slot's bin and writes its
@@ -38,7 +38,7 @@
 // With a full band, the count pass also grades each block it bins: a block
 // whose centre lies within pc.full_band + its half-diagonal (plus a rounding
 // margin) of some triangle -- so one holding a voxel within pc.full_band of
-// the mesh is never missed -- gets kFullBlock in slot_mask, which
+// the mesh is never missed -- gets VGRID_FULL_BLOCK in slot_mask, which
 // mesh_full_band.comp dilates and prunes by. The grading measures its own
 // distance after the band test, which stays vgridBlockInBand untouched, and
 // only where the triangle's bounding box comes that near the centre.
@@ -85,7 +85,8 @@ layout(set = 0, binding = 8, scalar) writeonly buffer BinTris {
   uint bin_tris[];
 };
 // binding 9: with a full band only -- each slot's write mask
-// (mesh_full_band.comp): kFullBlock from the count pass, read by the fill.
+// (mesh_full_band.comp): VGRID_FULL_BLOCK from the count pass, read by the
+// fill.
 layout(set = 0, binding = 9, scalar) buffer SlotMask { uint slot_mask[]; };
 
 layout(push_constant, scalar) uniform PushConstants {
@@ -99,12 +100,7 @@ layout(push_constant, scalar) uniform PushConstants {
 const uint kPassCount = 0u;
 const uint kPassFill = 1u;
 const uint kNoSlot = 0xFFFFFFFFu;
-const uint kFullBlock = 0x80000000u;  // mesh_full_band.comp's
-// 2^-14 per metre of coordinate and distance: the rounding margin the full
-// band's radius takes, as mesh_integrate_body.glsl's bounds take theirs.
-const float kMargin = 1.0 / 16384.0;
-
-float sizeOf(vec3 v) { return max(abs(v.x), max(abs(v.y), abs(v.z))); }
+#include "mesh_common.glsl"
 
 void main() {
   uint gid = pc.item_base + gl_GlobalInvocationID.x;
@@ -147,7 +143,7 @@ void main() {
         float s = max(sizeOf(centre),
                       max(sizeOf(v0), max(sizeOf(v1), sizeOf(v2))));
         float reach = pc.full_band + 0.5 * sqrt(3.0) * span;
-        reach += kMargin * (s + reach);
+        reach += VGRID_MARGIN * (s + reach);
         // The triangle lies in its bounding box: a box farther than the
         // reach rules the block out without the closest point.
         vec3 out_box = max(max(min(v0, min(v1, v2)) - centre,
@@ -157,7 +153,7 @@ void main() {
           vec3 closest;
           if (vgridPointTriangleDistance(centre, v0, v1, v2, closest) <=
               reach) {
-            slot_mask[slot] = kFullBlock;
+            slot_mask[slot] = VGRID_FULL_BLOCK;
           }
         }
       }

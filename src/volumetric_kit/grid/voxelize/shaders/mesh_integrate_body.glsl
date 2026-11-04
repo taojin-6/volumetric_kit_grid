@@ -12,10 +12,10 @@
 // every other voxel of the block gets tsdf 0, weight 0 -- a fresh block's
 // zeros, which the mesher and the codec read as unobserved.
 //
-// With a full band (pc.masked), a block mesh_full_band.comp marked kFullBlock
-// is written whole; any other block it kept writes only its apron -- the
-// voxels one step (across a face, an edge or a corner) from a full neighbour
-// whose direction bit its mask holds -- and its other voxels 0/0. Each voxel
+// With a full band (pc.masked), a block mesh_full_band.comp marked
+// VGRID_FULL_BLOCK is written whole; any other block it kept writes only its
+// apron -- the voxels one step (across a face, an edge or a corner) from a full
+// neighbour whose direction bit its mask holds -- and its other voxels 0/0. Each voxel
 // written is measured exactly as without the mask, over the same bin.
 //
 //   Signed -- +-distance, the sign from the closest triangle's face normal:
@@ -232,7 +232,6 @@ layout(push_constant, scalar) uniform PushConstants {
 const uint kModeSigned = 0u;
 const uint kModeShell = 1u;
 const uint kNoTriangle = 0xFFFFFFFFu;
-const uint kFullBlock = 0x80000000u;  // mesh_full_band.comp's
 
 const uint kThreads = uint(VGRID_THREADS);
 const uint kLaneVoxels = uint(VGRID_LANE_VOXELS);
@@ -241,9 +240,6 @@ const uint kGroup = uint(VGRID_GROUP);
 const uint kChunk = uint(VGRID_CHUNK);
 const uint kBuckets = uint(VGRID_BUCKETS);
 const uint kMaxSorted = uint(VGRID_MAX_SORTED);
-// 2^-14: the margin per metre of coordinate magnitude and of band (see the
-// top), about 1,000 times float's unit roundoff.
-const float kMargin = 1.0 / 16384.0;
 
 // The sort: each entry's bucket (4 to a word), then the bin's indices in
 // bucket order (2 to a word), and each bucket's first sorted position.
@@ -274,7 +270,7 @@ shared uint s_any;
 
 vec3 vertexOf(uint t, uint k) { return vertices[indices[3u * t + k]]; }
 
-float sizeOf(vec3 v) { return max(abs(v.x), max(abs(v.y), abs(v.z))); }
+#include "mesh_common.glsl"
 
 // The support plane of triangle (a, b, cc) facing c: u, and its bound at c.
 vec4 supportPlane(vec3 c, vec3 a, vec3 b, vec3 cc) {
@@ -338,8 +334,7 @@ ivec3 voxelOf(uint v0, uint lid, uint k, int bs, uint vpb, out bool live) {
 }
 
 // Whether local voxel lc lies one step from a full neighbour whose direction
-// bit `mask` holds: bit (dx + 1) + 3 (dy + 1) + 9 (dz + 1) for the neighbour
-// at offset (dx, dy, dz) (mesh_full_band.comp).
+// bit `mask` holds (mesh_common.glsl's VGRID_APRON_BIT).
 bool apronVoxel(ivec3 lc, int bs, uint mask) {
   for (int dz = -1; dz <= 1; ++dz) {
     if ((dz < 0 && lc.z != 0) || (dz > 0 && lc.z != bs - 1)) continue;
@@ -347,7 +342,7 @@ bool apronVoxel(ivec3 lc, int bs, uint mask) {
       if ((dy < 0 && lc.y != 0) || (dy > 0 && lc.y != bs - 1)) continue;
       for (int dx = -1; dx <= 1; ++dx) {
         if ((dx < 0 && lc.x != 0) || (dx > 0 && lc.x != bs - 1)) continue;
-        uint bit = uint((dx + 1) + 3 * (dy + 1) + 9 * (dz + 1));
+        uint bit = VGRID_APRON_BIT(dx + 1, dy + 1, dz + 1);
         if (bit != 13u && ((mask >> bit) & 1u) != 0u) return true;
       }
     }
@@ -414,8 +409,8 @@ void main() {
   if (lid == 0u) {
     stamps[slot].changed = pc.tick;
   }
-  uint wmask = pc.masked != 0u ? slot_mask[slot] : kFullBlock;
-  bool whole = (wmask & kFullBlock) != 0u;
+  uint wmask = pc.masked != 0u ? slot_mask[slot] : VGRID_FULL_BLOCK;
+  bool whole = (wmask & VGRID_FULL_BLOCK) != 0u;
 
   int bs = pc.grid.block_size;
   ivec3 coord = slot_coord[slot];
@@ -453,7 +448,7 @@ void main() {
     vec3 a = ra.xyz;
     vec3 b = tri_rec[t].b.xyz;
     vec3 c = tri_rec[t].c.xyz;
-    float m = kMargin * (max(centre_size, ra.w) + band);
+    float m = VGRID_MARGIN * (max(centre_size, ra.w) + band);
     uint key = bucketOf(supportPlane(centre, a, b, c).w - m, step);
     atomicAdd(s_start[key], 1u);
     atomicOr(s_bucket[i >> 2u], key << ((i & 3u) << 3u));
@@ -542,7 +537,8 @@ void main() {
       best_d2[k] = 3.4e38;
       best_t[k] = kNoTriangle;
       best_closest[k] = p[k];
-      reach[k] = length(p[k] - centre) + kMargin * (centre_size + band);
+      reach[k] =
+          length(p[k] - centre) + VGRID_MARGIN * (centre_size + band);
       scanning[k] = wanted[k];
     }
 #if VGRID_SUBGROUP_CULL
@@ -636,7 +632,7 @@ void main() {
         vec3 a = ra.xyz;
         vec3 b = rb.xyz;
         vec3 c = rc.xyz;
-        float m = kMargin * (max(centre_size, ra.w) + band);
+        float m = VGRID_MARGIN * (max(centre_size, ra.w) + band);
         s_tri[j] = t;
         s_vtx[9u * j] = a.x;
         s_vtx[9u * j + 1u] = a.y;

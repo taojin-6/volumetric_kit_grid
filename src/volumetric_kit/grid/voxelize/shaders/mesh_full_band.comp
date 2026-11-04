@@ -6,9 +6,9 @@
 // MeshSdfParams::full_band_m's two passes over the grid's block slots,
 // between mesh_bin.comp's count pass and the scan. One invocation a slot.
 //
-//   apron -- every slot the count pass marked kFullBlock (a block within the
-//            full band) looks up its 26 neighbours in the hash table and sets,
-//            in each one's mask, the bit of the direction back to it. A voxel
+//   apron -- every slot the count pass marked VGRID_FULL_BLOCK (a block within
+//            the full band) looks up its 26 neighbours in the hash table and
+//            sets, in each one's mask, the bit of the direction back to it. A voxel
 //            of a block not marked full is then written only if it lies one
 //            step -- across a face, an edge or a corner -- from a full block
 //            whose direction bit its block holds: the apron.
@@ -18,10 +18,8 @@
 //            dropped, y the blocks dropped, z the blocks written whole, w the
 //            blocks written for their apron.
 //
-// The bit of neighbour offset d (each component in -1..1) is
-// (d.x + 1) + 3 (d.y + 1) + 9 (d.z + 1); bit 13, d = 0, is never set, and
-// bit 31 is kFullBlock. Every write is an atomicOr or atomicAdd, so the masks
-// do not depend on the order the invocations run in.
+// The bits are mesh_common.glsl's. Every write is an atomicOr or atomicAdd, so
+// the masks do not depend on the order the invocations run in.
 
 #extension GL_GOOGLE_include_directive : require
 #define VGRID_HASH_ENTRIES_BINDING 0
@@ -50,7 +48,7 @@ layout(push_constant, scalar) uniform PushConstants {
 
 const uint kPassApron = 0u;
 const uint kPassPrune = 1u;
-const uint kFullBlock = 0x80000000u;
+#include "mesh_common.glsl"
 
 void main() {
   uint slot = pc.item_base + gl_GlobalInvocationID.x;
@@ -59,7 +57,7 @@ void main() {
   }
   uint mask = slot_mask[slot];
   if (pc.pass == kPassApron) {
-    if ((mask & kFullBlock) == 0u) {
+    if ((mask & VGRID_FULL_BLOCK) == 0u) {
       return;
     }
     ivec3 coord = slot_coord[slot];
@@ -77,7 +75,7 @@ void main() {
             continue;
           }
           // The direction from the neighbour back to this block: -d.
-          uint bit = uint((1 - dx) + 3 * (1 - dy) + 9 * (1 - dz));
+          uint bit = VGRID_APRON_BIT(1 - dx, 1 - dy, 1 - dz);
           atomicOr(slot_mask[uint(ptr) / vpb], 1u << bit);
         }
       }
@@ -88,7 +86,7 @@ void main() {
   if (count == 0u) {
     return;
   }
-  if ((mask & kFullBlock) != 0u) {
+  if ((mask & VGRID_FULL_BLOCK) != 0u) {
     atomicAdd(stats.z, 1u);
   } else if (mask != 0u) {
     atomicAdd(stats.w, 1u);

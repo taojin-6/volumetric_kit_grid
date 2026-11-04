@@ -2,12 +2,14 @@
 // Copyright (c) 2026 Tao Jin
 
 // Shared block-allocation machinery for the voxel-hash allocate kernels
-// (hash_allocate_coords / hash_allocate_depth / hash_allocate_triangles): the
-// hash-table buffers they all touch, the lock-free/bucket-locked insert
-// (allocate_block + helpers, ported from allocateBlock in hash_ops.metal), the
-// per-reason failure tally, and the truncation-band dilation depth allocation
-// uses. The per-kernel INPUT buffer (coords / depth / triangles) is
-// declared at binding 4 by each kernel; everything common lives here.
+// (hash_allocate_coords / hash_allocate_depth / hash_insert_distinct, and the
+// rehash): the hash-table buffers they all touch, the lock-free/bucket-locked
+// insert (allocate_block + helpers, ported from allocateBlock in
+// hash_ops.metal), the per-reason failure tally, and the truncation-band
+// dilation depth allocation uses. The per-kernel INPUT buffer (coords / depth
+// / the rehash's snapshot) is declared at binding 4 by each kernel; everything
+// common lives here. hash_insert_distinct places its distinct list with an
+// insert of its own, without the bucket locks.
 //
 // #include this AFTER hash_common.glsl: it supplies the struct layouts, the
 // hash-table constants (kFreeEntry/...), the spin retry cap, the coord
@@ -365,7 +367,7 @@ int insert_block(ivec3 coord, int preset_ptr, out int ptr) {
 }
 
 // Allocate `coord` if absent, drawing a fresh block off the heap -- the name the
-// allocate-from-coords / -depth / -triangles kernels call. A thin
+// allocate-from-coords / -depth kernels call. A thin
 // wrapper over insert_block's heap path (kNoPresetPtr) that stamps the block as
 // requested; rehash calls insert_block directly with each block's preserved
 // pointer.
