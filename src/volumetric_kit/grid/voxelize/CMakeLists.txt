@@ -54,10 +54,10 @@ target_include_directories(
          "$<BUILD_INTERFACE:${_vgrid_voxelize_generated_inc}>"
   PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
-# The candidate count, triangle records, binning, scan, compaction and write
-# kernels, compiled to SPIR-V and embedded (the sources #include the generated
-# *.spv.hpp on a PRIVATE path). The count, binning and write kernels include
-# volume's GLSL by root-relative path. The write kernel is one body
+# The candidate count, triangle records, binning, full-band, scan, compaction
+# and write kernels, compiled to SPIR-V and embedded (the sources #include the
+# generated *.spv.hpp on a PRIVATE path). The count, binning and write kernels
+# include volume's GLSL by root-relative path. The write kernel is one body
 # (mesh_integrate_body.glsl) built in four layouts, of which MeshIntegrator
 # builds the one the device's facts pick.
 include(vgrid_embed)
@@ -71,6 +71,7 @@ vgrid_embed_shaders(
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_scan_add.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_compact_bins.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_bin_ranges.comp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_full_band.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_integrate_wide.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_integrate_pair.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_integrate_wide_subgroup.comp"

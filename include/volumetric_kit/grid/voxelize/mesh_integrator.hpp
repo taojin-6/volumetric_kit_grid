@@ -75,14 +75,30 @@ struct MeshSdfParams {
   /// Refused at or above `trunc_dist` too, where no observed voxel would ever
   /// read as outside.
   float shell_voxels = 1.5f;
+  /// How far from the field's zero level, in metres, the band is written
+  /// whole. 0, the default, writes every band block whole.
+  ///
+  /// Above 0, a band block is written whole where its centre lies within
+  /// this distance, plus its voxels' half-diagonal, of the mesh -- plus the
+  /// shell's half-thickness in shell mode -- so every voxel whose field lies
+  /// within this distance of zero is written. Of every other band block, only
+  /// the voxels one step -- across a face, an edge or a corner -- from a block
+  /// written whole are written; its other voxels, and every voxel of a band
+  /// block with none, stay unobserved. Every voxel written holds the bytes a
+  /// whole-band write gives it, so a reader that looks only at voxels whose
+  /// field lies within this distance of zero, and at their neighbours one
+  /// step away, sees the whole band's field. Refused when negative or not
+  /// finite.
+  float full_band_m = 0.0f;
 
   /// @brief Check these parameters against the grid they will write: the
   ///        rule @ref MeshIntegrator::convert applies, for a caller that
   ///        refuses before any GPU work.
   /// @param grid The grid's geometry: its voxel size and `trunc_dist`.
-  /// @return OK, or `Status::invalid_argument` for an unknown mode, or in
-  ///         shell mode a @ref shell_voxels below `sqrt(3) / 2` or a shell
-  ///         not thinner than `trunc_dist`.
+  /// @return OK, or `Status::invalid_argument` for an unknown mode, a
+  ///         negative or non-finite @ref full_band_m, or in shell mode a
+  ///         @ref shell_voxels below `sqrt(3) / 2` or a shell not thinner
+  ///         than `trunc_dist`.
   VGRID_VOXELIZE_API core::Status validate(
       const volume::VoxelGridParams& grid) const;
 };
@@ -91,9 +107,14 @@ struct MeshSdfParams {
 struct MeshIntegrateStats {
   /// Triangles that took part. A zero-area or non-finite triangle is skipped.
   std::uint32_t triangles = 0;
-  /// Blocks written, each allocated by the call: every block the mesh's
-  /// truncation band reaches.
+  /// Blocks written, whole or in part, each allocated by the call: every
+  /// block the mesh's truncation band reaches. With
+  /// @ref MeshSdfParams::full_band_m, the band's other blocks stay allocated
+  /// with no observed voxel.
   std::uint32_t blocks = 0;
+  /// With @ref MeshSdfParams::full_band_m: of @ref blocks, those written
+  /// whole. 0 without it.
+  std::uint32_t full_blocks = 0;
   /// Triangle-in-block incidences: what the binning passes scale with, and
   /// the write's worst case -- a voxel measures at most every triangle binned
   /// into its block, and in practice the few no lower bound rules out.
@@ -116,7 +137,9 @@ struct MeshIntegrateStats {
 /// distance, clamped to `+-trunc_dist`, and `weight = 1`; elsewhere with
 /// `tsdf = 0, weight = 0`, which the mesher and the codec read as
 /// unobserved. The grid then reads exactly like a frame the codec decoded,
-/// and a mesh sequence converts one mesh a frame.
+/// and a mesh sequence converts one mesh a frame. With
+/// @ref MeshSdfParams::full_band_m, only the voxels near the field's zero
+/// level, and a one-voxel apron around them, are written.
 ///
 /// The work runs one item per (triangle, candidate block) pair, a
 /// triangle's candidates being the blocks of its box grown by `trunc_dist`,
@@ -224,7 +247,8 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   ///                        read during the call only.
   /// @param triangle_count  How many triangles. 0, or none both finite and
   ///                        of non-zero area, leaves the grid empty.
-  /// @param params          The mode, and the shell's thickness.
+  /// @param params          The mode, the shell's thickness, and how much of
+  ///                        the band is written whole.
   /// @param metrics         Optional: receives a `"mesh convert"` row with
   ///                        both halves, and its `"  ..allocate"` and
   ///                        `"  ..write"` parts.
@@ -274,11 +298,13 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   VkDeviceSize max_storage_buffer_range_ = 0;
 
   // The binning kernel (dispatched twice: count, then fill), the write
-  // kernel, the compaction and range kernels, and the kernel that sizes the
-  // first batch's passes from the device's pair total; their sets allocated
-  // from pool_ (which must outlive them).
+  // kernel, the full band's apron and prune passes, the compaction and range
+  // kernels, and the kernel that sizes the first batch's passes from the
+  // device's pair total; their sets allocated from pool_ (which must outlive
+  // them).
   core::ComputeKernel bin_;
   core::ComputeKernel integrate_;
+  core::ComputeKernel full_band_;
   core::ComputeKernel compact_bins_;
   core::ComputeKernel bin_ranges_;
   core::ComputeKernel pair_args_;
@@ -291,10 +317,14 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   // A 1-element stand-in for the fill pass's output during the count pass, so
   // every declared descriptor stays bound.
   core::Buffer dummy_;
+  // The full band's tallies: entries and blocks pruned, blocks written whole
+  // and for their apron.
+  core::Buffer full_band_stats_;
   // Grow-only bulk storage; descriptors are rebound before recording each
   // call so mesh changes, grid replacement and allocation growth are safe.
   // item_slots_ is the per-pair scratch, its size the first batch's bound.
   core::Buffer counts_;
+  core::Buffer slot_masks_;
   core::Buffer coordinates_;
   core::Buffer item_slots_;
   core::Buffer bins_;

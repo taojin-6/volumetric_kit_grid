@@ -12,6 +12,12 @@
 // every other voxel of the block gets tsdf 0, weight 0 -- a fresh block's
 // zeros, which the mesher and the codec read as unobserved.
 //
+// With a full band (pc.masked), a block mesh_full_band.comp marked kFullBlock
+// is written whole; any other block it kept writes only its apron -- the
+// voxels one step (across a face, an edge or a corner) from a full neighbour
+// whose direction bit its mask holds -- and its other voxels 0/0. Each voxel
+// written is measured exactly as without the mask, over the same bin.
+//
 //   Signed -- +-distance, the sign from the closest triangle's face normal:
 //             the rule the research codec shipped. No topology, so it trusts
 //             the mesh to be closed and outward-wound, and a voxel off a sharp
@@ -195,6 +201,10 @@ layout(set = 0, binding = 6, scalar) readonly buffer SlotCoords {
 // The map's block stamps: every block written is stamped changed, since the
 // write overwrites it whole.
 layout(set = 0, binding = 7, scalar) buffer Stamps { BlockStamp stamps[]; };
+// Each slot's write mask (mesh_full_band.comp), read with pc.masked only.
+layout(set = 0, binding = 9, scalar) readonly buffer SlotMask {
+  uint slot_mask[];
+};
 // One record per triangle (mesh_tri_records.comp), 64 bytes.
 struct TriRecord {
   vec4 a;  // vertex a, and s_T
@@ -216,11 +226,13 @@ layout(push_constant, scalar) uniform PushConstants {
   uint mode;    // kModeSigned or kModeShell (voxelize::MeshSdfMode)
   float shell;  // shell half-thickness, metres
   uint tick;    // the map's tick, which each block written is stamped with
+  uint masked;  // 1: write the voxels the slot masks name (a full band)
 } pc;
 
 const uint kModeSigned = 0u;
 const uint kModeShell = 1u;
 const uint kNoTriangle = 0xFFFFFFFFu;
+const uint kFullBlock = 0x80000000u;  // mesh_full_band.comp's
 
 const uint kThreads = uint(VGRID_THREADS);
 const uint kLaneVoxels = uint(VGRID_LANE_VOXELS);
@@ -325,6 +337,24 @@ ivec3 voxelOf(uint v0, uint lid, uint k, int bs, uint vpb, out bool live) {
   return vgridLocalBase(live ? v : 0u, bs);
 }
 
+// Whether local voxel lc lies one step from a full neighbour whose direction
+// bit `mask` holds: bit (dx + 1) + 3 (dy + 1) + 9 (dz + 1) for the neighbour
+// at offset (dx, dy, dz) (mesh_full_band.comp).
+bool apronVoxel(ivec3 lc, int bs, uint mask) {
+  for (int dz = -1; dz <= 1; ++dz) {
+    if ((dz < 0 && lc.z != 0) || (dz > 0 && lc.z != bs - 1)) continue;
+    for (int dy = -1; dy <= 1; ++dy) {
+      if ((dy < 0 && lc.y != 0) || (dy > 0 && lc.y != bs - 1)) continue;
+      for (int dx = -1; dx <= 1; ++dx) {
+        if ((dx < 0 && lc.x != 0) || (dx > 0 && lc.x != bs - 1)) continue;
+        uint bit = uint((dx + 1) + 3 * (dy + 1) + 9 * (dz + 1));
+        if (bit != 13u && ((mask >> bit) & 1u) != 0u) return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Measure triangle t, vertices (a, b, c), from p: the minimum over (d^2, t).
 void measure(vec3 p, uint t, vec3 a, vec3 b, vec3 c, inout float best_d2,
              inout uint best_t, inout vec3 best_closest) {
@@ -384,6 +414,8 @@ void main() {
   if (lid == 0u) {
     stamps[slot].changed = pc.tick;
   }
+  uint wmask = pc.masked != 0u ? slot_mask[slot] : kFullBlock;
+  bool whole = (wmask & kFullBlock) != 0u;
 
   int bs = pc.grid.block_size;
   ivec3 coord = slot_coord[slot];
@@ -466,7 +498,8 @@ void main() {
 #endif
   for (uint v0 = 0u; v0 < vpb; v0 += kRound) {
     bool live[VGRID_LANE_VOXELS];
-    // The voxels this round writes: every live one.
+    // The voxels this round measures: every live one of a whole block, the
+    // apron's of another.
     bool wanted[VGRID_LANE_VOXELS];
     bool scanning[VGRID_LANE_VOXELS];
     uint local[VGRID_LANE_VOXELS];
@@ -492,7 +525,7 @@ void main() {
       ivec3 lc = voxelOf(v0, vlid, k, bs, vpb, live[k]);
       local[k] = uint(vgridLocalIndex(lc, bs));
       p[k] = vec3(coord * bs + lc) * pc.grid.voxel_size;
-      wanted[k] = live[k];
+      wanted[k] = live[k] && (whole || apronVoxel(lc, bs, wmask));
       if (wanted[k]) {
 #if VGRID_SUBGROUP_CULL
         wlo = min(wlo, lc);
@@ -749,6 +782,11 @@ void main() {
         continue;
       }
       uint idx = uint(bin.ptr) + local[k];
+      if (!wanted[k]) {
+        tsdf[idx] = 0.0;
+        weight[idx] = 0.0;
+        continue;
+      }
       float dist = sqrt(best_d2[k]);
       bool observed = best_t[k] != kNoTriangle && dist <= trunc_dist;
       float sdf = 0.0;

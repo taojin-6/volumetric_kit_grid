@@ -29,6 +29,7 @@
 #include "mesh_bin_comp.spv.hpp"
 #include "mesh_bin_ranges_comp.spv.hpp"
 #include "mesh_compact_bins_comp.spv.hpp"
+#include "mesh_full_band_comp.spv.hpp"
 #include "mesh_integrate_pair_comp.spv.hpp"
 #include "mesh_integrate_pair_subgroup_comp.spv.hpp"
 #include "mesh_integrate_wide_comp.spv.hpp"
@@ -61,21 +62,39 @@ constexpr std::uint32_t kMaxRuns = 16;
 // mesh_bin.comp's pc.pass.
 constexpr std::uint32_t kPassCount = 0;
 constexpr std::uint32_t kPassFill = 1;
+// mesh_full_band.comp's pc.pass.
+constexpr std::uint32_t kPassApron = 0;
+constexpr std::uint32_t kPassPrune = 1;
 
 // The distance from a point to the nearest node of a cubic lattice can reach
 // half the cell's diagonal, so a shell thinner than this can fall between
 // voxels and extract with holes.
 constexpr float kMinShellVoxels = 0.8660254f;  // sqrt(3) / 2
 
-// Mirrors the push-constant blocks of mesh_bin.comp and
-// mesh_integrate_body.glsl, and their MeshBin struct, under scalar block
-// layout.
+// Mirrors the push-constant blocks of mesh_bin.comp, mesh_full_band.comp and
+// mesh_integrate_body.glsl, and their MeshBin struct and the full band's
+// tallies, under scalar block layout.
 struct BinPush {
   VoxelGridParams grid;
   std::uint32_t tri_count;
   std::uint32_t pass;
   // The first work item this dispatch covers (vgrid::detail::dispatch_items).
   std::uint32_t item_base = 0;
+  // The full band's radius from the mesh, metres; 0 writes every band block
+  // whole.
+  float full_band = 0.0f;
+};
+struct FullBandPush {
+  VoxelGridParams grid;
+  std::uint32_t size;
+  std::uint32_t pass;
+  std::uint32_t item_base = 0;
+};
+struct FullBandStats {
+  std::uint32_t pruned_entries;
+  std::uint32_t pruned_blocks;
+  std::uint32_t full_blocks;
+  std::uint32_t apron_blocks;
 };
 struct IntegratePush {
   VoxelGridParams grid;
@@ -83,7 +102,8 @@ struct IntegratePush {
   std::uint32_t num_bins;
   std::uint32_t mode;
   float shell;
-  std::uint32_t tick;  // the map's tick, which each block written takes
+  std::uint32_t tick;    // the map's tick, which each block written takes
+  std::uint32_t masked;  // 1: write the voxels the slot masks name
 };
 struct MeshBin {
   std::int32_t ptr;
@@ -118,11 +138,16 @@ static_assert(sizeof(RangesPush) == 16, "RangesPush layout drift");
 static_assert(sizeof(ScanSummary) == 16, "ScanSummary layout drift");
 static_assert(sizeof(BinRange) == 8, "BinRange layout drift");
 
-static_assert(sizeof(BinPush) == 44, "BinPush must be 44 bytes");
+static_assert(sizeof(BinPush) == 48, "BinPush must be 48 bytes");
 static_assert(offsetof(BinPush, tri_count) == 32, "BinPush layout drift");
 static_assert(offsetof(BinPush, pass) == 36, "BinPush layout drift");
 static_assert(offsetof(BinPush, item_base) == 40, "BinPush layout drift");
-static_assert(sizeof(IntegratePush) == 52, "IntegratePush must be 52 bytes");
+static_assert(offsetof(BinPush, full_band) == 44, "BinPush layout drift");
+static_assert(sizeof(FullBandPush) == 44, "FullBandPush must be 44 bytes");
+static_assert(offsetof(FullBandPush, item_base) == 40,
+              "FullBandPush layout drift");
+static_assert(sizeof(FullBandStats) == 16, "FullBandStats layout drift");
+static_assert(sizeof(IntegratePush) == 56, "IntegratePush must be 56 bytes");
 static_assert(offsetof(IntegratePush, first_bin) == 32,
               "IntegratePush layout drift");
 static_assert(offsetof(IntegratePush, num_bins) == 36,
@@ -132,6 +157,8 @@ static_assert(offsetof(IntegratePush, mode) == 40,
 static_assert(offsetof(IntegratePush, shell) == 44,
               "IntegratePush layout drift");
 static_assert(offsetof(IntegratePush, tick) == 48,
+              "IntegratePush layout drift");
+static_assert(offsetof(IntegratePush, masked) == 52,
               "IntegratePush layout drift");
 static_assert(sizeof(MeshBin) == 12, "MeshBin must be 12 bytes");
 static_assert(offsetof(MeshBin, begin) == 4, "MeshBin layout drift");
@@ -217,6 +244,10 @@ void detail::set_test_write_layout(const WriteLayout* layout) {
 }
 
 core::Status MeshSdfParams::validate(const VoxelGridParams& grid) const {
+  if (!(std::isfinite(full_band_m) && full_band_m >= 0.0f)) {
+    return core::Status::invalid_argument(
+        "MeshSdfParams: full_band_m must be finite and not negative");
+  }
   if (mode == MeshSdfMode::Signed) return {};
   if (mode != MeshSdfMode::Shell) {
     return core::Status::invalid_argument("MeshSdfParams: unknown mode");
@@ -276,12 +307,14 @@ core::Result<MeshIntegrator> MeshIntegrator::create(
                  : Spirv{vgrid_mesh_integrate_pair_comp_spv,
                          vgrid_mesh_integrate_pair_comp_spv_size});
 
-  // mesh_bin takes 9 storage buffers: 0 hash entries, 1 vertices, 2 indices,
+  // mesh_bin takes 10 storage buffers: 0 hash entries, 1 vertices, 2 indices,
   // 3 candidate offsets, 4 per-slot counts then cursors, 5 per-item slots,
-  // 6 per-slot coordinates, 7 missing-block counter, 8 bins. The write kernel
-  // takes 9: 0 tsdf, 1 weight, 2 vertices, 3 indices, 4 block bins, 5 bins,
-  // 6 per-slot coordinates, 7 stamps, 8 triangle records. These counts and
-  // the shaders move together.
+  // 6 per-slot coordinates, 7 missing-block counter, 8 bins, 9 per-slot write
+  // masks. mesh_full_band takes 5: 0 hash entries, 1 counts, 2 per-slot
+  // coordinates, 3 per-slot write masks, 4 its tallies. The write kernel
+  // takes 10: 0 tsdf, 1 weight, 2 vertices, 3 indices, 4 block bins, 5 bins,
+  // 6 per-slot coordinates, 7 stamps, 8 triangle records, 9 per-slot write
+  // masks. These counts and the shaders move together.
   VkPushConstantRange bin_range{};
   bin_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   bin_range.size = sizeof(BinPush);
@@ -290,9 +323,14 @@ core::Result<MeshIntegrator> MeshIntegrator::create(
   integrate_range.size = sizeof(IntegratePush);
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(integ.bin_, "voxelize_mesh_bin", vgrid_mesh_bin_comp_spv,
-                 vgrid_mesh_bin_comp_spv_size, 9, &bin_range));
+                 vgrid_mesh_bin_comp_spv_size, 10, &bin_range));
   VKC_TRY(kb.add(integ.integrate_, "voxelize_mesh_integrate", write.data,
-                 write.size, 9, &integrate_range));
+                 write.size, 10, &integrate_range));
+  VkPushConstantRange full_band_range{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                      sizeof(FullBandPush)};
+  VKC_TRY(kb.add(integ.full_band_, "voxelize_mesh_full_band",
+                 vgrid_mesh_full_band_comp_spv,
+                 vgrid_mesh_full_band_comp_spv_size, 5, &full_band_range));
   VkPushConstantRange compact_range{VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                     sizeof(CompactPush)};
   VKC_TRY(kb.add(integ.compact_bins_, "voxelize_mesh_compact_bins",
@@ -320,8 +358,12 @@ core::Result<MeshIntegrator> MeshIntegrator::create(
              core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
   VKC_ASSIGN(integ.dummy_,
              core::device_storage_buffer(allocator, sizeof(std::uint32_t)));
+  VKC_ASSIGN(integ.full_band_stats_,
+             core::device_storage_buffer(allocator, sizeof(FullBandStats)));
   integ.bin_.set.write_storage_buffer(7, integ.missing_.handle(), 0,
                                       VK_WHOLE_SIZE);
+  integ.full_band_.set.write_storage_buffer(4, integ.full_band_stats_.handle(),
+                                            0, VK_WHOLE_SIZE);
 
   device.set_object_name(VK_OBJECT_TYPE_BUFFER,
                          core::debug_object_handle(integ.missing_.handle()),
@@ -353,6 +395,11 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
   VKC_TRY(params.validate(grid.grid()));
   const bool is_signed = params.mode == MeshSdfMode::Signed;
   const float shell_m = params.shell_voxels * grid.grid().voxel_size;
+  // The full band, from the mesh: from the field's zero level, which in shell
+  // mode lies the shell's half-thickness out.
+  const bool full_band = params.full_band_m > 0.0f;
+  const float full_band_radius =
+      full_band ? params.full_band_m + (is_signed ? 0.0f : shell_m) : 0.0f;
   {
     VKC_ASSIGN(const AttributeView tsdf_view,
                grid.attribute(volume::kTsdfAttribute));
@@ -378,6 +425,7 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
 
   MeshIntegrateStats stats;
   ScanSummary summary{};
+  FullBandStats band_stats{};
   std::vector<BinRange> dispatch_ranges;
   {
     core::GpuStageScope allocate(metrics, gpu_timer_, "  ..allocate");
@@ -443,6 +491,8 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
           VkDeviceSize(range_count) * sizeof(BinRange);
       // Every buffer the batch binds is grown before the clear is recorded.
       VKC_TRY(ensure_scratch(counts_, count_bytes, "voxelize.mesh_bin_counts"));
+      VKC_TRY(
+          ensure_scratch(slot_masks_, count_bytes, "voxelize.mesh_slot_masks"));
       VKC_TRY(ensure_scratch(coordinates_, coord_bytes,
                              "voxelize.mesh_coordinates"));
       VKC_TRY(ensure_scratch(blocks_, block_bytes, "voxelize.mesh_blocks"));
@@ -461,6 +511,13 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
       bind(bin_, 5, item_slots_);
       bind(bin_, 6, coordinates_);
       bind(bin_, 8, dummy_);
+      bind(bin_, 9, slot_masks_);
+      full_band_.set.write_storage_buffer(
+          0, volume::VoxelHashMap::Internal::entries_buffer(grid.map()), 0,
+          entries_bytes);
+      bind(full_band_, 1, counts_);
+      bind(full_band_, 2, coordinates_);
+      bind(full_band_, 3, slot_masks_);
       bind(compact_bins_, 0, counts_);
       bind(compact_bins_, 1, scan_->first());
       bind(compact_bins_, 2, scan_->root());
@@ -492,7 +549,12 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
                                        first ? &slices : nullptr, &allocate));
         VKC_TRY(batch.fill(counts_, 0, count_bytes, 0u));
         VKC_TRY(batch.fill(missing_, 0, sizeof(missing), 0u));
-        const BinPush count_push{g, triangle_count, kPassCount};
+        if (full_band) {
+          VKC_TRY(batch.fill(slot_masks_, 0, count_bytes, 0u));
+          VKC_TRY(batch.fill(full_band_stats_, 0, sizeof(FullBandStats), 0u));
+        }
+        const BinPush count_push{g, triangle_count, kPassCount, 0,
+                                 full_band_radius};
         if (first) {
           VKC_TRY(volumetric_kit::grid::detail::dispatch_slices(
               batch, bin_, count_push, slices, &allocate));
@@ -500,6 +562,17 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
           VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
               batch, bin_, count_push, pairs, kLocalSize,
               max_workgroup_count_x_, &allocate));
+        }
+        if (full_band) {
+          // Dilate the full blocks into their neighbours' masks, then drop
+          // every binned block the masks leave out, before the scan sizes
+          // the bins.
+          VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
+              batch, full_band_, FullBandPush{g, num_blocks, kPassApron},
+              num_blocks, kLocalSize, max_workgroup_count_x_, &allocate));
+          VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
+              batch, full_band_, FullBandPush{g, num_blocks, kPassPrune},
+              num_blocks, kLocalSize, max_workgroup_count_x_, &allocate));
         }
         VKC_TRY(scan_->record(batch, num_blocks, &allocate));
         const std::uint32_t groups = group_count(num_blocks);
@@ -520,6 +593,10 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
             batch.readback(ranges_, 0, range_bytes, dispatch_ranges.data()));
         VKC_TRY(batch.readback(missing_, 0, sizeof(missing), &missing));
         VKC_TRY(batch.readback(scan_->root(), 0, sizeof(summary), &summary));
+        if (full_band) {
+          VKC_TRY(batch.readback(full_band_stats_, 0, sizeof(band_stats),
+                                 &band_stats));
+        }
         VKC_TRY(batch.submit());
         VKC_ASSIGN(failed, grid.map().settle(placed));
       }
@@ -599,6 +676,7 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
   bind(integrate_, 6, coordinates_);
   bind(integrate_, 7, grid.map().stamps_buffer());
   bind(integrate_, 8, band_->record_buffer());
+  bind(integrate_, 9, slot_masks_);
   const std::uint32_t tick = grid.map().tick();
 
   // Every range satisfies the entry budget. Splitting further for the device's
@@ -622,7 +700,7 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
   }
   std::vector<core::PendingBatch> pending;
   pending.reserve(submissions);
-  const BinPush fill_push{g, triangle_count, kPassFill};
+  const BinPush fill_push{g, triangle_count, kPassFill, 0, full_band_radius};
   for (const BinRange& range : dispatch_ranges) {
     for (std::uint32_t offset = 0; offset < range.count;) {
       const std::uint32_t n =
@@ -638,7 +716,8 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
                                n,
                                static_cast<std::uint32_t>(params.mode),
                                is_signed ? 0.0f : shell_m,
-                               tick};
+                               tick,
+                               full_band ? 1u : 0u};
       VKC_TRY(batch.dispatch(integrate_, &push, sizeof(push), n,
                              max_workgroup_count_x_, &write));
       VKC_ASSIGN(core::PendingBatch submitted, batch.submit_async({}, {}));
@@ -653,6 +732,7 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
     if (metrics != nullptr) metrics->merge_device(done.device_rows());
   }
   stats.blocks = summary.blocks;
+  stats.full_blocks = full_band ? band_stats.full_blocks : 0;
   stats.bin_entries = summary.entries;
   return stats;
 }

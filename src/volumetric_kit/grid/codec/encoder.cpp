@@ -62,6 +62,11 @@ core::Status fail(const char* op, const std::string& why) {
 
 }  // namespace
 
+float true_sdf_keep_distance(float voxel_size) noexcept {
+  return detail::true_sdf_near_distance(voxel_size) +
+         detail::true_sdf_cut_distance(voxel_size);
+}
+
 core::Status EncoderConfig::validate() const {
   VKC_TRY(params.validate());
   VKC_TRY(detail::check_segment_size("EncoderConfig", "segment_size",

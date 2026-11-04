@@ -112,14 +112,6 @@ VkDeviceSize cut_bytes(std::int32_t slots) {
   return VkDeviceSize(slots) * kMaskWordsPerBlock * sizeof(std::uint32_t);
 }
 
-// How far from zero a corner of a sign-change cell is cut, in metres: past
-// sqrt(3) voxels, no crossing of a distance field has a corner, and the
-// 1e-6 m margin keeps float rounding of a true one from reaching it. One
-// fused multiply-add, so every host computes the same float.
-float cut_distance(float voxel_size) {
-  return std::fma(std::sqrt(3.0f), voxel_size, 1e-6f);
-}
-
 core::Status fail(const char* op, const std::string& why) {
   return core::Status::invalid_argument(std::string("DctTransform::") + op +
                                         ": " + why);
@@ -131,6 +123,12 @@ std::size_t padded_count(std::uint32_t k) {
 }
 
 }  // namespace
+
+float true_sdf_cut_distance(float voxel_size) noexcept {
+  return std::fma(std::sqrt(3.0f), voxel_size, 1e-6f);
+}
+
+float true_sdf_near_distance(float voxel_size) noexcept { return voxel_size; }
 
 core::Result<std::unique_ptr<DctTransform>> DctTransform::create(
     core::Device& device, core::Allocator& allocator) {
@@ -314,8 +312,8 @@ core::Status DctTransform::record(
   push.max_quantized = kMaxQuantizedMagnitude;
   push.tick = grid.map().tick();
   push.true_sdf = true_sdf.on ? 1u : 0u;
-  push.cut_distance = cut_distance(gp.voxel_size);
-  push.near_distance = gp.voxel_size;
+  push.cut_distance = true_sdf_cut_distance(gp.voxel_size);
+  push.near_distance = true_sdf_near_distance(gp.voxel_size);
   VKC_TRY(batch.fill(counts, 0, sizeof(Counts), 0u));
   // A workgroup a block. Room0 alone (~107 k blocks) passes the 65535 groups
   // Vulkan guarantees, so a longer list takes several dispatches, which touch

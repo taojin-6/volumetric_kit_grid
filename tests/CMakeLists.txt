@@ -143,9 +143,9 @@ add_test(NAME grid_volume_block_stamps COMMAND grid_volume_block_stamps_test)
 # written block against a brute-force host reference -- an independent closest
 # point, and the winding number for inside/outside -- on a sharp tetrahedron, a
 # dented cube, an open quad and a triangle soup, plus determinism (a split
-# binning and a write in several ranges among it), the call's submits, waits
-# and tick, an emptied grid each call, and every refusal. The write-range seam
-# is voxelize's (voxelize/mesh_band.hpp, by src/). Skips with no device.
+# binning and a write in several ranges among it), the call's submits, waits and
+# tick, an emptied grid each call, and every refusal. The write-range seam is
+# voxelize's (voxelize/mesh_band.hpp, by src/). Skips with no device.
 add_executable(grid_voxelize_mesh_integrate_test
                voxelize_mesh_integrate_test.cpp)
 target_link_libraries(
@@ -159,8 +159,8 @@ add_test(NAME grid_voxelize_mesh_integrate
          COMMAND grid_voxelize_mesh_integrate_test)
 
 # voxelize mesh candidates: the band's candidate offsets and block range,
-# counted on the device (voxelize/mesh_band.hpp, by src/), equal the host
-# oracle (grid_test_support's triangle_oracle.hpp) word for word on degenerate,
+# counted on the device (voxelize/mesh_band.hpp, by src/), equal the host oracle
+# (grid_test_support's triangle_oracle.hpp) word for word on degenerate,
 # non-finite, body-like and soup meshes and past two scan levels; an index out
 # of range is refused on the host, a total past 2^32 at the wait; and on
 # half-voxel ties convert allocates every band block. Skips with no device.
@@ -195,8 +195,9 @@ add_test(NAME grid_voxelize_mesh_band COMMAND grid_voxelize_mesh_band_test)
 # what a brute force (shaders/mesh_integrate_reference.comp) writes measuring
 # every triangle of each voxel's bin -- on shared vertices with opposite
 # windings, duplicates, near-coincident sheets, slivers, metre-long triangles, a
-# far sphere, bins past the kernel's sort, three block sizes, both modes. The
-# brute force binds the hash entries (volume/hash_map_internal.hpp, by src/)
+# far sphere, bins past the kernel's sort, three block sizes, both modes; on
+# every write layout the device takes, and the triangle records the write reads.
+# The brute force binds the hash entries (volume/hash_map_internal.hpp, by src/)
 # and replays the device's candidate count (voxelize/mesh_band.hpp). Skips with
 # no device.
 add_executable(grid_voxelize_mesh_integrate_exact_test
@@ -213,6 +214,25 @@ vgrid_embed_shaders(
 vgrid_target_warnings(grid_voxelize_mesh_integrate_exact_test)
 add_test(NAME grid_voxelize_mesh_integrate_exact
          COMMAND grid_voxelize_mesh_integrate_exact_test)
+
+# voxelize mesh full band (MeshSdfParams::full_band_m): against a host oracle of
+# the blocks within the full band and of their one-voxel apron, convert writes
+# the whole band's bytes there and leaves the rest unobserved, on every write
+# layout the device takes; in shell mode, every voxel near the zero level and
+# its neighbours hold the whole band's bytes; and a sign flip along an apron
+# face codes, as a true-SDF frame (grid_codec), the whole band's bytes. Skips
+# with no device.
+add_executable(grid_voxelize_mesh_full_band_test
+               voxelize_mesh_full_band_test.cpp)
+target_link_libraries(
+  grid_voxelize_mesh_full_band_test
+  PRIVATE volumetric_kit::grid_voxelize volumetric_kit::grid_codec
+          Vulkan::Vulkan volumetric_kit::core_test_policy)
+target_include_directories(grid_voxelize_mesh_full_band_test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src)
+vgrid_target_warnings(grid_voxelize_mesh_full_band_test)
+add_test(NAME grid_voxelize_mesh_full_band
+         COMMAND grid_voxelize_mesh_full_band_test)
 
 # The core parses and validates scenarios. This test pins the conversion of the
 # codec_mesh templates and of written scenarios into the runtime codec options

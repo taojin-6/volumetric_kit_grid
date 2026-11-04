@@ -20,6 +20,7 @@
 
 #include "codec_config.hpp"
 #include "codec_sweep.hpp"
+#include "volumetric_kit/grid/codec/encoder.hpp"
 #include "volumetric_kit/grid/networking/stream_server.hpp"
 #include "volumetric_kit/grid/volume/voxel_grid.hpp"
 
@@ -388,6 +389,11 @@ int main() {
     CHECK(std::memcmp(&codec->grid, &params, sizeof params) == 0);
     CHECK(codec->sdf.mode == sdf->mode &&
           codec->sdf.shell_voxels == sdf->shell_voxels);
+    // Written whole only where the true-SDF frame reads, in both modes.
+    CHECK(sdf->full_band_m == 0.0f &&
+          codec->sdf.full_band_m ==
+              vgrid::codec::true_sdf_keep_distance(params.voxel_size) &&
+          codec->sdf.full_band_m > 0.0f);
   }
   const auto narrow = cfg::parse(R"({"version": 1, "operation": "codec",
       "source": {"kind": "mesh", "path": "person.obj", "height_m": 1.7,
