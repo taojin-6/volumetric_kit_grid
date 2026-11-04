@@ -20,6 +20,31 @@ bool all_finite(Vec3f v) {
   return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
 
+// Whether a triangle has zero area: |cross(v1 - v0, v2 - v0)|^2 <= 0, glm's
+// cross and dot in their order, each product rounded on its own -- what
+// voxelize's triangle_counts.comp computes `precise`. No multiply-add may be
+// fused here: arm64 compilers fuse by default, and a fused `a*b - b*a` keeps
+// the first product's rounding error, so a triangle with two equal vertices
+// would read as having area on the host and none on the device.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+#endif
+bool zero_area(Vec3f v0, Vec3f v1, Vec3f v2) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+  const Vec3f a = v1 - v0;
+  const Vec3f b = v2 - v0;
+  const float nx = a.y * b.z - b.y * a.z;
+  const float ny = a.z * b.x - b.z * a.x;
+  const float nz = a.x * b.y - b.x * a.y;
+  return nx * nx + ny * ny + nz * nz <= 0.0f;
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
+
 }  // namespace
 
 core::Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
@@ -61,8 +86,7 @@ core::Result<std::vector<std::uint32_t>> triangle_candidate_offsets(
     if (!all_finite(v0) || !all_finite(v1) || !all_finite(v2)) {
       continue;
     }
-    const Vec3f normal = cross(v1 - v0, v2 - v0);
-    if (dot(normal, normal) <= 0.0f) {
+    if (zero_area(v0, v1, v2)) {
       continue;
     }
 

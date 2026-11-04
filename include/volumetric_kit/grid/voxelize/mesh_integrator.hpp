@@ -8,8 +8,8 @@
 ///        @ref VoxelBlockGrid's `tsdf` + `weight` attributes, signed or as a
 ///        shell.
 
-#include <array>
 #include <cstdint>
+#include <memory>
 
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/stage_metrics.hpp"
@@ -23,6 +23,11 @@
 #include "volumetric_kit/grid/voxelize/export.hpp"
 
 namespace volumetric_kit::grid::voxelize {
+
+namespace detail {
+class MeshBand;  // src/volumetric_kit/grid/voxelize/mesh_band.hpp
+class MeshScan;  // src/volumetric_kit/grid/voxelize/mesh_scan.hpp
+}  // namespace detail
 
 /// @brief How @ref MeshIntegrator::integrate turns distance to the mesh into a
 ///        signed field.
@@ -113,9 +118,10 @@ struct MeshIntegrateStats {
 ///
 /// The blocks must already be allocated:
 /// @ref VoxelHashMap::allocate_from_triangles with the same mesh allocates
-/// exactly them, because both calls enumerate the same candidates through
-/// `volume::triangle_candidate_offsets` and keep them with the same band test.
-/// A band block that is missing is refused, with the count, before anything is
+/// exactly them, because both calls enumerate the same candidates -- counted
+/// here on the device, by the rules `volume::triangle_candidate_offsets`
+/// counts by on the host -- and keep them with the same band test. A band
+/// block that is missing is refused, with the count, before anything is
 /// written.
 ///
 /// Two dispatches bin every triangle into each block its band reaches (a
@@ -177,12 +183,11 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   static core::Result<MeshIntegrator> create(core::Device& device,
                                              core::Allocator& allocator);
 
-  // Rule of zero: every owned pipeline / pool / buffer self-frees and
-  // self-resets on move; device_ / allocator_ are borrowed, so the defaulted
-  // moves leave a moved-from integrator empty (valid() == false).
-  ~MeshIntegrator() = default;
-  MeshIntegrator(MeshIntegrator&&) noexcept = default;
-  MeshIntegrator& operator=(MeshIntegrator&&) noexcept = default;
+  // Move-only. A moved-from integrator is empty (valid() == false). Defined
+  // in the source, which sees detail::MeshBand whole.
+  ~MeshIntegrator();
+  MeshIntegrator(MeshIntegrator&&) noexcept;
+  MeshIntegrator& operator=(MeshIntegrator&&) noexcept;
   MeshIntegrator(const MeshIntegrator&) = delete;
   MeshIntegrator& operator=(const MeshIntegrator&) = delete;
 
@@ -222,10 +227,10 @@ class VGRID_VOXELIZE_API MeshIntegrator {
       core::StageMetrics* metrics = nullptr);
 
   /// @return `true` if this owns live pipelines (`false` when moved-from).
-  bool valid() const noexcept { return bin_.valid() && integrate_.valid(); }
+  bool valid() const noexcept;
 
  private:
-  MeshIntegrator() = default;
+  MeshIntegrator();
 
   core::Status ensure_scratch(core::Buffer& buffer, VkDeviceSize bytes,
                               const char* name);
@@ -244,9 +249,6 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   // kernel, their sets allocated from pool_ (which must outlive them).
   core::ComputeKernel bin_;
   core::ComputeKernel integrate_;
-  core::ComputeKernel scan_counts_;
-  std::array<core::ComputeKernel, 3> scan_sums_;
-  std::array<core::ComputeKernel, 2> scan_add_;
   core::ComputeKernel compact_bins_;
   core::ComputeKernel bin_ranges_;
   core::DescriptorPool pool_;
@@ -260,17 +262,16 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   core::Buffer dummy_;
   // Grow-only bulk storage; descriptors are rebound before recording each
   // call so mesh changes, grid replacement and allocation growth are safe.
-  core::Buffer vertices_;
-  core::Buffer indices_;
-  core::Buffer offsets_;
   core::Buffer counts_;
   core::Buffer coordinates_;
   core::Buffer item_slots_;
   core::Buffer bins_;
   core::Buffer blocks_;
   core::Buffer ranges_;
-  // 256-way scan levels, including the final 16-byte validation summary.
-  std::array<core::Buffer, 4> scan_levels_;
+  // The bins' 256-way scan, its last level the 16-byte validation summary.
+  std::unique_ptr<detail::MeshScan> scan_;
+  // The mesh on the device, and its candidate count and offsets.
+  std::unique_ptr<detail::MeshBand> band_;
 };
 
 }  // namespace volumetric_kit::grid::voxelize

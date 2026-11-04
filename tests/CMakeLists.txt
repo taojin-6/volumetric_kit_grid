@@ -154,6 +154,23 @@ vgrid_target_warnings(grid_voxelize_mesh_integrate_test)
 add_test(NAME grid_voxelize_mesh_integrate
          COMMAND grid_voxelize_mesh_integrate_test)
 
+# voxelize mesh candidates: the band's candidate offsets and block range,
+# counted on the device (voxelize/mesh_band.hpp, by src/), equal the host
+# oracle word for word on degenerate, non-finite, body-like and soup meshes and
+# past two scan levels; an index out of range is refused on the host, a total
+# past 2^32 at the wait. Skips with no device.
+add_executable(grid_voxelize_mesh_candidates_test
+               voxelize_mesh_candidates_test.cpp)
+target_link_libraries(
+  grid_voxelize_mesh_candidates_test
+  PRIVATE volumetric_kit::grid_voxelize Vulkan::Vulkan
+          volumetric_kit::core_test_policy)
+target_include_directories(grid_voxelize_mesh_candidates_test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src)
+vgrid_target_warnings(grid_voxelize_mesh_candidates_test)
+add_test(NAME grid_voxelize_mesh_candidates
+         COMMAND grid_voxelize_mesh_candidates_test)
+
 # voxelize mesh integrate, exactly: the kernel's early exit writes, bit for bit,
 # what a brute force (shaders/mesh_integrate_reference.comp) writes measuring
 # every triangle of each voxel's bin -- on shared vertices with opposite

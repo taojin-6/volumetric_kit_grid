@@ -3,9 +3,9 @@
 
 // The (triangle, candidate block) work decomposition, device side: which
 // triangle a work item belongs to, which block it names, and whether the
-// truncation band reaches that block. The host side is
-// volume::triangle_candidate_offsets, which counts each triangle's candidates
-// and uploads the exclusive prefix sum this file searches.
+// truncation band reaches that block. voxelize's triangle_counts.comp counts
+// each triangle's candidates, and its scan and triangle_offsets.comp turn the
+// counts into the exclusive prefix sum this file searches.
 //
 // Shared rather than restated by every triangle-driven kernel.
 // hash_allocate_triangles.comp allocates the blocks that pass vgridBlockInBand,
@@ -27,6 +27,7 @@
 #error "define VGRID_TRI_OFFSETS_BINDING before including triangle_candidates.glsl"
 #endif
 
+#include "volumetric_kit/grid/volume/shaders/triangle_box.glsl"
 #include "volumetric_kit/grid/volume/shaders/triangle_common.glsl"
 
 // Exclusive prefix sum of per-triangle candidate-block counts, tri_count + 1
@@ -39,7 +40,7 @@ layout(set = 0, binding = VGRID_TRI_OFFSETS_BINDING, scalar) readonly buffer
 
 // The triangle owning work item `gid`: the largest t with offsets[t] <= gid.
 //
-// "Largest", not "any", is what makes a skipped triangle free: the host records
+// "Largest", not "any", is what makes a skipped triangle free: the count records
 // a zero count for a degenerate or non-finite one, leaving offsets[t] ==
 // offsets[t+1], and taking the largest match steps over every such run to the
 // triangle that actually owns the item. offsets[tri_count] is the total and
@@ -61,20 +62,16 @@ uint vgridTriangleOf(uint gid, uint tri_count) {
 
 // Decode work item `local` of triangle (v0, v1, v2) into the block it names.
 //
-// Recomputes the candidate box the host counted rather than reading one back:
-// the host mirrors worldToBlock exactly (round_half_even <-> roundEven, the
-// same negative bias -- the invariant hash_allocate_depth already rests on),
-// and min/max/subtract are exact in IEEE, so the two agree bit-for-bit. The
-// `local >= n` refusal is what makes a future divergence fail SAFE: it drops a
-// candidate, rather than decoding `local` onto some unrelated coordinate.
+// Recomputes the candidate box the count pass counted rather than reading one
+// back: both call vgridCandidateBox (triangle_box.glsl), so they agree bit for
+// bit. The `local >= n` refusal is what makes a future divergence fail SAFE:
+// it drops a candidate, rather than decoding `local` onto some unrelated
+// coordinate.
 bool vgridCandidateBlock(uint local, vec3 v0, vec3 v1, vec3 v2,
                       VoxelGridParams grid, out ivec3 coord) {
-  float trunc = grid.trunc_dist;
-  vec3 lo_world = min(v0, min(v1, v2)) - vec3(trunc);
-  vec3 hi_world = max(v0, max(v1, v2)) + vec3(trunc);
-  ivec3 bmin = worldToBlock(lo_world, grid);
-  ivec3 bmax = worldToBlock(hi_world, grid);
-  uvec3 ext = uvec3(bmax - bmin + ivec3(1));
+  ivec3 bmin;
+  uvec3 ext;
+  vgridCandidateBox(v0, v1, v2, grid, bmin, ext);
 
   uint plane = ext.x * ext.y;
   coord = bmin;

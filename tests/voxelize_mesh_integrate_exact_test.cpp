@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,6 +35,7 @@
 #include "test_meshes.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/compute_kernel.hpp"
 #include "volumetric_kit/core/vulkan/compute_util.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
@@ -41,10 +43,10 @@
 #include "volumetric_kit/grid/base/math/vector_types.hpp"
 #include "volumetric_kit/grid/volume/hash_map_internal.hpp"
 #include "volumetric_kit/grid/volume/hash_types.hpp"
-#include "volumetric_kit/grid/volume/triangle_candidates.hpp"
 #include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/grid/volume/voxel_grid.hpp"
 #include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_band.hpp"
 #include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 #include "mesh_integrate_reference_comp.spv.hpp"
@@ -90,6 +92,10 @@ constexpr std::uint32_t kPassMeasure = 1;
 struct Reference {
   vkc::ComputeKernel kernel;
   vkc::DescriptorPool pool;
+  // The candidate offsets the bins replay: the device's count, by a band of
+  // the test's own, since a device rounds a coordinate far from the origin
+  // within its division's ulps and decodes by its own count.
+  std::unique_ptr<vx::detail::MeshBand> band;
 };
 
 // What the brute force writes for `blocks`, block by block: vpb tsdf values
@@ -113,10 +119,15 @@ vkc::Result<RefResult> run_reference(const vkc::test::Gpu& gpu, Reference& ref,
       gpu.device.caps().limits().maxComputeWorkGroupCount[0];
   const std::uint64_t pairs = std::uint64_t{nb} * nt;
   const std::uint64_t voxels = std::uint64_t{nb} * vpb;
-  VKC_ASSIGN(const std::vector<std::uint32_t> offsets,
-             vol::triangle_candidate_offsets(g, m.v.data(), m.vertex_count(),
-                                             m.i.data(), nt, "reference"));
-  const std::uint32_t items = offsets[nt];
+  VKC_TRY(ref.band->set_mesh(g, m.v.data(), m.vertex_count(), m.i.data(), nt,
+                             "reference"));
+  {
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    VKC_TRY(ref.band->record_count(batch, nullptr));
+    VKC_TRY(batch.submit());
+  }
+  VKC_TRY(ref.band->settle_count("reference"));
+  const std::uint32_t items = ref.band->total();
   if (pairs > 0xFFFFFFFFull || items == 0 ||
       std::uint64_t{items} + 255 > 0xFFFFFFFFull ||
       (std::uint64_t{items} + 255) / 256 > max_groups ||
@@ -138,9 +149,6 @@ vkc::Result<RefResult> run_reference(const vkc::test::Gpu& gpu, Reference& ref,
   VKC_ASSIGN(vkc::Buffer indices,
              vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
                                              m.i.data(), m.i.size() * 4));
-  VKC_ASSIGN(vkc::Buffer offsets_buf, vkc::test::upload_device_buffer(
-                                          gpu.device, gpu.allocator,
-                                          offsets.data(), offsets.size() * 4));
   const std::vector<std::uint32_t> zeros((pairs + 31) / 32, 0u);
   VKC_ASSIGN(vkc::Buffer bits,
              vkc::test::upload_device_buffer(gpu.device, gpu.allocator,
@@ -158,7 +166,7 @@ vkc::Result<RefResult> run_reference(const vkc::test::Gpu& gpu, Reference& ref,
   };
   bind(0, vertices);
   bind(1, indices);
-  bind(2, offsets_buf);
+  bind(2, ref.band->offset_buffer());
   bind(3, blocks_buf);
   bind(4, bits);
   bind(5, tsdf);
@@ -671,6 +679,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vkc::Result<vkc::DescriptorPool> pool = builder.build();
     CHECK(pool.ok());
     ref.pool = std::move(pool).value();
+    vkc::Result<std::unique_ptr<vx::detail::MeshBand>> band =
+        vx::detail::MeshBand::create(gpu.device, gpu.allocator);
+    CHECK(band.ok());
+    ref.band = std::move(band).value();
   }
   vkc::Result<vx::MeshIntegrator> integ_r =
       vx::MeshIntegrator::create(gpu.device, gpu.allocator);

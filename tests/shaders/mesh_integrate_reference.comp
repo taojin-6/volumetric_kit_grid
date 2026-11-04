@@ -32,7 +32,7 @@ layout(set = 0, binding = 0, scalar) readonly buffer Vertices {
   vec3 vertices[];
 };
 layout(set = 0, binding = 1, scalar) readonly buffer Indices { uint indices[]; };
-// binding 2: the host's candidate offsets (triangle_candidates.glsl).
+// binding 2: the device's candidate offsets (triangle_candidates.glsl).
 layout(set = 0, binding = 3, scalar) readonly buffer Blocks {
   RefBlock blocks[];
 };
