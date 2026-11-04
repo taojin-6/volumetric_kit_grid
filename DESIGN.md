@@ -363,13 +363,13 @@ any mesh.
 (`triangle_counts.comp`, the 256-way scan, `triangle_offsets.comp`) gives
 each triangle its candidate blocks, drops a zero-area or non-finite one —
 the one input that divides by zero in the closest point — and leaves the
-candidates' block range; the host keeps only the index check. Every pass
-over the mesh runs one item per (triangle, candidate block) pair.
-`hash_classify_triangles.comp` runs the band test once a pair into a bounded
-open-addressed set of the band's distinct blocks, keyed within a window of
-2048 × 1024 × 1024 blocks (one pass a window past it); the set starts at
-twice the grid's blocks and grows when a probe passes 64 slots or its list
-half the set. Gated on no overflow, volume's distinct insert places the
+candidates' block range; the host keeps only the index check. The index,
+the bin count and the fill run one item per (triangle, candidate block)
+pair. `hash_classify_triangles.comp` runs the band test once a pair into a
+bounded open-addressed set of the band's distinct blocks, keyed within a
+window of 2048 × 1024 × 1024 blocks (one pass a window past it); the set
+starts at twice the grid's blocks and grows when a probe passes 64 slots or
+its list half the set. Gated on no overflow, volume's distinct insert places the
 list in one round. The count also writes each triangle's record for the
 write (`mesh_tri_records.comp`): its vertices, s_T, R, H and unit normal.
 
@@ -379,9 +379,9 @@ binding), advances the map's tick once, and records one batch: the mesh's
 upload and count, the grid's clear (`VoxelBlockGrid::record_clear`), the
 band index and its insert, the bin count, the full band's passes (below),
 the bins' scan and compaction, and the write's range plan. Every buffer it
-binds is grown before the clear is recorded. Its pair passes run over
-indirect slices sized on the device, bounded by the per-pair scratch the
-integrator retains. After the wait it runs again, without the count and the
+binds is grown before the clear is recorded. On its first run the pair
+passes take indirect slices sized on the device, bounded by the per-pair
+scratch the integrator retains. After the wait it runs again, without the count and the
 clear, for candidate pairs past that scratch (an integrator's first call;
 with core's 1.5× headroom a sequence like Rafa2 pays it once), an index that
 overflowed, candidates past one key window, or a band the grid does not
