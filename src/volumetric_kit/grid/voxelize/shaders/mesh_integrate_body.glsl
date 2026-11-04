@@ -481,8 +481,11 @@ void main() {
 #if VGRID_SUBGROUP_CULL
   // The group is the subgroup; its voxels follow from its id and the lane's.
   // TODO: request full 32-wide subgroups (REQUIRE_FULL_SUBGROUPS and a
-  // required size of 32) once the core's KernelSetBuilder passes stage flags;
-  // until then the host builds this only where subgroups are 32 wide.
+  // required size of 32) once the core's KernelSetBuilder passes stage flags.
+  // Until then this is correct only because the host builds it where
+  // subgroupSize is 32 and the build is SPIR-V 1.5, whose SubgroupSize is
+  // that subgroupSize (mesh_integrator.cpp's static_assert); SPIR-V 1.6
+  // would let a device run narrower subgroups and write the wrong voxels.
   uint g = gl_SubgroupID;
   uint lane = gl_SubgroupInvocationID;
   uint vlid = g * kGroup + lane;

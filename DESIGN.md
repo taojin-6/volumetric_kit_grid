@@ -420,8 +420,10 @@ plane before the cylinder. The layout is a device fact
 (`detail::default_write_layout`, 2026-11-03): 512 invocations of one voxel
 where the device takes 512 and, without the subgroup cull, 18,436 bytes of
 shared memory, but not on Apple GPUs; 256 of two (a z pair) otherwise; and
-each culling group one subgroup where compute subgroups are always 32 wide
-with vote, ballot and arithmetic. Blocks past `kMaxVoxelsPerBlock` (16³
+each culling group one subgroup where compute subgroups are 32 wide with
+vote, ballot and arithmetic. Those builds map voxels by subgroup, so they
+stay SPIR-V 1.5, whose subgroups take the device's `subgroupSize` (a
+`static_assert` holds them there). Blocks past `kMaxVoxelsPerBlock` (16³
 voxels, 8 rounds) are refused.
 
 **The full band** (`MeshSdfParams::full_band_m`, 2026-11-03). The bin count

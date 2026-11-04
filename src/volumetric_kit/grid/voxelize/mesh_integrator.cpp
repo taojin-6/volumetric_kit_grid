@@ -183,10 +183,29 @@ constexpr std::uint32_t kVendorApple = 0x106B;
 // What set_test_write_layout set: 0 for none, else 1 + wide + 2 subgroup_cull.
 std::atomic<std::uint32_t> g_test_write_layout{0};
 
-// Whether the device runs compute subgroups 32 wide, always, with the
-// operations the subgroup cull takes -- so a culling group of 32 invocations
-// can be one subgroup. A device that may pick a wider subgroup than its
-// default (Vulkan 1.3's maxSubgroupSize) does not qualify.
+// The subgroup cull's builds give each invocation its voxels by
+// gl_SubgroupID and gl_SubgroupInvocationID, so they hold only while every
+// subgroup is 32 wide. Vulkan fixes SubgroupSize at the device's subgroupSize
+// for a module of SPIR-V 1.5 or older created without a required or varying
+// size, as MeshIntegrator::create creates it; from SPIR-V 1.6 the size may
+// take any value from minSubgroupSize to maxSubgroupSize (4 to 32 under
+// MoltenVK). So these builds must stay at SPIR-V 1.5 (the core's default
+// vulkan1.2 target) until create can require a size of 32
+// (mesh_integrate_body.glsl's TODO). The version word is bytes 4-7: minor at
+// 5, major at 6.
+constexpr bool spirv_at_most_1_5(const unsigned char* spv) {
+  return spv[6] == 1 && spv[5] <= 5;
+}
+static_assert(
+    spirv_at_most_1_5(vgrid_mesh_integrate_wide_subgroup_comp_spv) &&
+        spirv_at_most_1_5(vgrid_mesh_integrate_pair_subgroup_comp_spv),
+    "the subgroup cull's write builds need SPIR-V 1.5 or older");
+
+// Whether the device runs compute subgroups 32 wide, with the operations the
+// subgroup cull takes -- so a culling group of 32 invocations can be one
+// subgroup. Its subgroupSize is what the SPIR-V 1.5 builds above run at; a
+// device that may pick a wider subgroup (Vulkan 1.3's maxSubgroupSize) does
+// not qualify either.
 bool subgroups_of_32(const core::Device& device) {
   if (device.caps().api_version() < VK_API_VERSION_1_1) return false;
   VkPhysicalDeviceSubgroupProperties sub{};
