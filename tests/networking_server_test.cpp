@@ -100,8 +100,9 @@ using net::Got;
 using net::serves_within;
 using namespace std::chrono_literals;
 
-// How long a check that a client gets nothing reads: a record the server sent
-// it reaches a client on loopback well within this.
+// How long a check that a client gets nothing reads. Each such check is
+// followed by a read on the same client that checks the next record's seq, so
+// a record sent wrongly fails there if it arrives after this window.
 constexpr auto kNothingWithin = 50ms;
 
 struct Published {

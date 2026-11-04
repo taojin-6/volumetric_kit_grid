@@ -6444,13 +6444,13 @@ synchronization validation too.
   decodes to its I-frame's grid. *Amended 2026-11-04 (the test budget):*
   the chains run at period 4 alone, five frames each (an I-frame, three
   P-frames, the next I-frame): the open-ended chains' later P-frames had the
-  first three's modes, and no planted bug needed them; `grid_codec_decoder`
-  still decodes open-ended chains. It makes each of the diff's choices from
-  one edit: all skip, one block changed, a mask alone (keep, residuals 0),
-  a block gone and one added, unrelated content zero and a small change
-  keep, an empty frame all removed and then an I-frame; and a DC step of
-  32768 zero where the price would keep. It also holds the diff's
-  refusals.
+  first three's modes, and no planted bug needed them; `true_sdf_chain`
+  still checks an open-ended chain against the oracle's bytes. It makes each
+  of the diff's choices from one edit: all skip, one block changed, a mask
+  alone (keep, residuals 0), a block gone and one added, unrelated content
+  zero and a small change keep, an empty frame all removed and then an
+  I-frame; and a DC step of 32768 zero where the price would keep. It also
+  holds the diff's refusals.
 - `recon_codec_encoder`: an intra period of 0 refused; each I-frame rule at
   period 3, rows included; refusals (another block size, no weight) that
   keep the reference, the count and a pending `force_intra()`; and a chain

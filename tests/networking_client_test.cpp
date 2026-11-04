@@ -437,9 +437,12 @@ int progress_case() {
       sender.peer.get(),
       concat({vrst::record(0, 0, 1, 1, stream::kNoSet, small),
               vrst::record(0, 0, 2, 2, stream::kNoSet, small)})));
+  // A call returns once its record parses, so the 5 s bound only covers a
+  // late segment: under ThreadSanitizer on macOS, these records came back
+  // 5-13 ms after send() returned, about as late as a 128 KiB piece.
   for (std::uint64_t seq = 1; seq <= 2; ++seq) {
     progressed = false;
-    r = client->next(20ms, &got.record, &got.payload, &progressed);
+    r = client->next(5s, &got.record, &got.payload, &progressed);
     CHECK(r.ok() && *r && progressed && got.record.info.seq == seq);
     CHECK(got.payload == small);
   }

@@ -1001,7 +1001,7 @@ _vgrid_expect_message(
 # Start the slowest tests first under `ctest --parallel`. Without a COST, CTest
 # runs tests in the order they were added, and a fresh CI runner has no timing
 # history, so a slow test added late finished last. Seconds under the sanitizer
-# job's settings, the longest in CI, on its home box with the suite at
+# job's settings, the longest in CI, on a 4090 runner with the suite at
 # --parallel 4 (2026-11-04), for each test over 5 s there; only the order
 # matters.
 set_tests_properties(grid_voxelize_mesh_candidates PROPERTIES COST 83)
