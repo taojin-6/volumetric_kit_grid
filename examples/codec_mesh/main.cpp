@@ -48,7 +48,9 @@ vkc::Status run(const Options& opt) {
   // Before any GPU work, and before the first pass loads every frame: a
   // step the codec or the conversion refuses costs neither.
   vgrid_example::MeshCodecConfig codec;
-  if (!inspect) VKC_ASSIGN(codec, vgrid_example::mesh_codec_config(opt));
+  if (!inspect) {
+    VKC_ASSIGN(codec, vgrid_example::mesh_codec_config(opt));
+  }
   VKC_ASSIGN(const vgrid_example::MeshSequence sequence,
              vgrid_example::MeshSequence::open(opt));
   sequence.print();
