@@ -87,6 +87,9 @@ entries relevant to your task; later amendments supersede earlier rules.
 - [**2026-08-31**](#2026-08-31--a-triangles-work-unit-is-the-candidate-block-not-the-triangle-and-the-band-it-allocates-is-measured-from-the-surface-not-dilated-from-a-point) —
   A triangle's work unit is the candidate *block*, not the triangle; and the
   band it allocates is measured from the surface, not dilated from a point.
+  *Amended 2026-11-03:* the candidates are counted on the device and the
+  band is allocated inside `MeshIntegrator::convert`;
+  `allocate_from_triangles` and `triangle_candidate_offsets` are gone.
 - [**2026-09-26**](#2026-09-26--the-tsdf-codec-is-one-codec-tier-over-volume-with-separate-encoder-and-decoder-classes-a-geometry-only-intra-frame-of-per-block-dct-coefficients-an-observed-voxel-mask-and-sorted-block-coordinates-entropy-coded-by-chunked-static-table-rans) —
   The TSDF codec is one `codec` tier over `volume`, with separate `Encoder` and
   `Decoder` classes: a geometry-only intra frame of per-block DCT coefficients,
@@ -163,6 +166,8 @@ entries relevant to your task; later amendments supersede earlier rules.
 - [**2026-10-02**](#2026-10-02--mesh-input-binning-keeps-counts-cursors-and-occupied-bins-on-the-device-retains-scratch-and-reads-only-validation-and-bounded-dispatch-control) —
   Mesh input binning keeps counts, cursors and occupied bins on the device,
   retains scratch, and reads only validation and bounded dispatch control.
+  *Amended 2026-11-03:* a refusal only the device finds comes after the
+  clear in `convert`'s first batch, and leaves no observed voxel.
 
 - [**2026-10-03**](#2026-10-03--asset-loading-and-export-belong-to-io-with-assimp-as-an-optional-private-backend) —
   Asset loading and export move into the installed `io` tier; Assimp adds
@@ -346,7 +351,9 @@ entries relevant to your task; later amendments supersede earlier rules.
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
   is ruled out only by a bound, less a rounding margin of its own, strictly
   above the voxel's limit, so every voxel writes what its whole bin writes.
-  Blocks past 16^3 voxels are refused.
+  Blocks past 16^3 voxels are refused. *Amended 2026-11-03:* one round a
+  block, from per-triangle records, in a layout by device fact; the
+  cylinder's bound is compared squared, inside the same margin.
 - [**2026-10-21**](#2026-10-21--a-true-signed-distance-codes-without-the-observed-mask-encoderconfigtrue_sdf-cuts-each-corner-farther-than-3-voxels-from-zero-of-a-cell-whose-sign-changes-and-codes-only-the-blocks-that-hold-surface-whole-codec_mesh-alone-sets-it-in-a-band-of-at-least-15-voxels-so-fused-depth-keeps-its-mask-and-the-mesh-templates-convert-in-16-voxels-and-code-at-k-56-amends-the-2026-09-27-encoder-2026-10-01-codec-review-and-2026-10-14-codec-mesh-entries) —
   A true signed distance codes without the observed mask:
   `EncoderConfig::true_sdf` cuts each corner farther than √3 voxels from
@@ -354,7 +361,9 @@ entries relevant to your task; later amendments supersede earlier rules.
   surface. `codec_mesh` alone sets it, in code, so multi-view RGB-D capture
   keeps its mask, byte for byte. The mesh templates convert in 16 voxels
   and code at K 56, about 2 Mbit/s on Rafa2; the format, the decoder and
-  the goldens are unchanged.
+  the goldens are unchanged. *Amended 2026-11-03:* the mesh templates write
+  the band whole only within `codec::true_sdf_keep_distance` of zero, and
+  code the same bytes.
 - [**2026-10-21**](#2026-10-21--the-decoder-deblocks-on-request-a-runtime-switch-off-by-default-runs-the-studys-step-keyed-line-fit-and-gaussian-on-the-device-in-the-decodes-last-submit-keeping-each-block-with-an-unobserved-voxel-as-decoded-and-a-paused-player-rebuilds-its-frame-from-the-reference-amends-the-2026-10-13-decoder-entry) —
   The decoder deblocks on request: `Decoder::set_deblock`, off by default
   and read at each decode, runs the study's step-keyed line fit and
@@ -503,6 +512,16 @@ entries relevant to your task; later amendments supersede earlier rules.
   form, which grid never parses. No version change and no record flag. `RecordPayload`
   takes a third run, which the writer's `writev` and the server's copy
   take; the codec stream's copy checks there is none.
+- [**2026-11-03**](#2026-11-03--a-mesh-converts-into-a-grid-in-one-call-meshintegratorconvert-its-candidates-counted-on-the-device-the-bands-distinct-blocks-placed-without-bucket-locks-the-clear-in-its-first-batch-and-the-write-queued-without-host-waits-the-write-takes-a-block-in-one-round-from-per-triangle-records-in-a-layout-the-devices-facts-pick-and-full_band_m-writes-the-band-whole-only-near-the-zero-level-amends-the-2026-08-31-triangle-2026-10-02-binning-2026-10-21-meshintegrator-and-2026-10-21-true-sdf-entries) —
+  A mesh converts in one call: `MeshIntegrator::convert` empties the grid,
+  allocates the band and writes it, growing the grid once when the band does
+  not fit, in two blocking waits once warm; `allocate_from_triangles`,
+  `integrate` and `triangle_candidates.hpp` go. Refusals only the device
+  finds come after the clear and leave no observed voxel. The write takes a
+  block in one round from per-triangle records, in a layout picked by the
+  vendor and the subgroup width, and `MeshSdfParams::full_band_m` writes
+  the band whole only near the zero level, plus a one-voxel apron, with the
+  same bytes there; `codec_mesh` sets it and codes what it coded before.
 
 ## Decision record
 
@@ -2329,6 +2348,9 @@ is still drawing from. Keeping a host entry point is what keeps a PLY writer
 off the ring contract entirely.
 
 ### 2026-08-31 — A triangle's work unit is the candidate *block*, not the triangle; and the band it allocates is measured from the surface, not dilated from a point.
+
+*Amended 2026-11-03 (below):* the band is counted on the device and
+allocated inside `MeshIntegrator::convert`.
 
 Putting a mesh into the volume — the mesh-to-SDF pass that comes next — first
 needs the blocks the mesh's truncation band covers. (This was first planned as
@@ -4431,6 +4453,9 @@ on both devices. These checks validate correctness and synchronization; no
 garbage-collection latency comparison was made.
 
 ### 2026-10-02 — Mesh input binning keeps counts, cursors and occupied bins on the device, retains scratch, and reads only validation and bounded dispatch control.
+
+*Amended 2026-11-03 (below):* device-found refusals come after
+`convert`'s clear.
 
 Amends the 2026-09-28 residency entry's mesh-input count readback. The two
 triangle-candidate passes were device-local, but each call allocated eight
@@ -7227,6 +7252,9 @@ reconnects each began at a key.
 
 ### 2026-10-21 — `MeshIntegrator` finds each voxel's nearest triangle with an exact early exit: a triangle is ruled out only by a lower bound, less a rounding margin of its own, strictly above the voxel's limit.
 
+*Amended 2026-11-03 (below):* one round a block, from per-triangle
+records; the squared cylinder compare's margin step.
+
 A mesh sequence converts each frame with `MeshIntegrator`, whose write
 measured every voxel against every triangle of its block's bin. In the
 16-voxel band the mesh templates move to with the K56 point (#262), Rafa2
@@ -7288,6 +7316,9 @@ fail.
 Next work.
 
 ### 2026-10-21 — A true signed distance codes without the observed mask: `EncoderConfig::true_sdf` cuts each corner farther than √3 voxels from zero of a cell whose sign changes, and codes only the blocks that hold surface, whole; `codec_mesh` alone sets it, in a band of at least 15 voxels, so fused depth keeps its mask, and the mesh templates convert in 16 voxels and code at K 56 (amends the 2026-09-27 encoder, 2026-10-01 codec-review and 2026-10-14 codec-mesh entries).
+
+*Amended 2026-11-03 (below):* the mesh templates write the band whole
+only within `codec::true_sdf_keep_distance` of zero.
 
 The mask is 43% of an I-frame's bytes and 51% of a P-frame's on Rafa2 (the
 2026-10-21 quantization study), and it says which voxels a fused grid
@@ -9173,3 +9204,131 @@ splits, empty runs included, as the same bytes in one run, under the CRC
 shorter payload. Four planted bugs fail it: the third run left out of the
 CRC, its iovec dropped from the `writev`, the server's copy without it, and
 `RgbdDepth` numbered 4.
+
+### 2026-11-03 — A mesh converts into a grid in one call, `MeshIntegrator::convert`: its candidates counted on the device, the band's distinct blocks placed without bucket locks, the clear in its first batch and the write queued without host waits; the write takes a block in one round from per-triangle records, in a layout the device's facts pick; and `full_band_m` writes the band whole only near the zero level (amends the 2026-08-31 triangle, 2026-10-02 binning, 2026-10-21 `MeshIntegrator` and 2026-10-21 true-SDF entries).
+
+A mesh sequence converted each frame in three calls: `clear`, then
+`allocate_from_triangles` in a loop that grew the grid and retried lost
+bucket-lock races, then `integrate`. The host counted every triangle's
+candidate blocks twice a frame, once for each call, the allocation ran its
+band test per pair under bucket locks, and a frame took ten blocking waits.
+Every caller repeated the loop. On Rafa2 frames 1–150 (5 mm, 0.08 m, K 56,
+period 30, true SDF), conversion p50 over frames 11–150 was 14.0 / 19.3 /
+18.6 / 44.7 ms on an RTX 5090 / RTX 4090 / M5 Max / M4, measured against
+same-session controls in the prototypes below.
+
+**The rule.** `convert(grid, mesh, params)` makes the grid hold the mesh's
+field and nothing else, in one tick; the two-step path is removed, so a
+caller's old code fails to compile rather than changing meaning.
+
+- **One batch, then the write.** The mesh's upload and its candidate count
+  run on the device (`detail::MeshBand`), then the clear
+  (`VoxelBlockGrid::record_clear`), the band index, the insert and the
+  write's plan, in one batch; the write's ranges then queue back to back
+  and the call waits once more. A warm call makes 2 blocking waits. The
+  batch runs again for pairs past the per-pair scratch (always a fresh
+  integrator's first call), an index overflow, candidates past one key
+  window, or a band the grid does not fit.
+- **Each band block meets the hash table once.** The band test runs once a
+  pair into a bounded index of distinct blocks, and volume's distinct insert
+  places the list in one round without bucket locks. The prototype's insert
+  could push past `max_chain` when lanes pushed onto one chain at once,
+  leaving the oldest node unreachable, a block silently lost; a push now
+  counts the chain under the head it swaps against, and a lost swap adds
+  the nodes pushed since. A push refused that way keeps the heap block it
+  drew until a clear or the resize the chain failure asks for.
+- **Growth moves into `convert`.** A band of more blocks than the grid holds
+  grows it once, to twice its buckets or the band's need at
+  `kGrowThreshold`, whichever is more, then doubles only while a chain
+  overflows. A grid the band fits is never grown: Rafa2 fills 6,015 of
+  8,192 blocks (load 0.73), and a load trigger would double the clear's
+  33.5 MB of zeroing on frame 1.
+- **Refusals.** Everything the host can check, the index range included
+  (about 0.03 ms), still refuses before any GPU work. What only the device
+  finds — a candidate total past 2^32, a bin past `kMaxBinTriangles`, the
+  index's own refusals, a band past the largest grid — now comes after the
+  clear, and leaves no observed voxel (this amends the 2026-10-02 rule that
+  no grid write precedes validation). A first batch that fails to record or
+  run leaves the grid undefined until the next `convert` or `clear`; every
+  buffer it binds is grown before the clear is recorded.
+
+**The fold, left out.** Taking the write's bins from the index would drop
+`mesh_bin`'s second band test. Measured on the M5 Max, six runs alternated,
+md5-identical: p50 8.786 → 8.531 ms (−0.255, −2.9%), mean −0.35 ms (−3.9%),
+under the 0.5 ms / 5% bar, so the bin count stays.
+
+**The write in one round.** The two-round kernel staged each bin chunk
+twice a block and recomputed each staged triangle's constants through the
+index buffer. Now one round covers an 8³ block, the sort and the staging
+read a 64-byte record per triangle written once a call, and a voxel tests
+the support plane, which rules out about three checks in four, before the
+cylinder, whose bound is compared squared: the squaring differs from the
+square root's by a few units of float's roundoff in the bound, within the
+margin's 2^-14 (s + band) (`mesh_integrate_body.glsl` has the step). The
+closest point, the minimum over (d², index) and the sign are unchanged.
+Against the two rounds, on Rafa2's write: 512 invocations of one voxel
+measured −19% on the 5090 and −10.5% on the 4090, where 256 of two was
++2–3%; on the M5 Max 256 × 2 measured −5 to −11%, where 512 × 1 was 0 to
+−3%. No capability separated the two, so the vendor picks: 256 × 2 on Apple
+GPUs (0x106B), else 512 × 1 where 512 invocations and its 18,436 bytes of
+shared memory fit, else 256 × 2. Where compute subgroups are always 32 wide
+with vote, ballot and arithmetic, a culling group is one subgroup: two
+barriers a chunk instead of five, level on NVIDIA and −1 to −4% on the M5
+Max. A 4,096-entry sort, and a subgroup scan of the sort's buckets, were
+dropped: the first was slower on the M5 Max, the second wrong by a few ulps
+on the 5090 for reasons not found.
+
+**The full band** (`MeshSdfParams::full_band_m`). A true-SDF frame keeps a
+cell only when a corner lies within one voxel of zero and the others within
+√3 voxels of it, or the cell changes sign with no corner past √3 voxels:
+every corner it keeps lies within `codec::true_sdf_keep_distance` (13.66 mm
+at 5 mm voxels) of zero. A block whose centre lies within that, plus its
+voxels' half-diagonal and a rounding margin, of the mesh — plus the shell's
+half-thickness in shell mode — is written whole; of the band's other
+blocks only the voxels one step from a full block, which the codec's cut
+test reaches across a face. Every voxel written is measured over its whole
+bin, so its bytes are the whole band's; the rest stay unobserved, which the
+frame never reads. Each apron block keeps a workgroup of its own. Two
+cheaper aprons were measured and dropped: full blocks writing their own
+apron from bins grown by a ring (a dearer bin count ate its write saving on
+the M5 Max), and a second pass seeded from a full neighbour's nearest
+triangle (−0.21 ms on the M4, +0.25 ms on the M5 Max and +0.7 ms on NVIDIA
+on top of the one-round write).
+
+**Measured** (Rafa2 1–150, frames 11–150 p50, ms; the prototypes on all
+four boxes, NVIDIA at full clocks, against same-session controls):
+
+| | 5090 | 4090 | M5 Max | M4 |
+|---|---|---|---|---|
+| Before (three calls) | 14.0 | 19.3 | 18.6 | 44.7 |
+| The count, insert and batch prototype | 3.47 | 4.38 | 9.41 | 34.85 |
+| Plus the one-round write and the full band | 2.79 | 3.79 | 8.99 | 24.56 |
+
+This PR's own sanity runs, one per arm with the control repeated last, from
+copies with a local per-frame print: the 5090, clocks between P1 and P8
+with another session's server resident, 3.63 / 3.64 (one call) → 3.07 (one
+round) → 2.94 (full band); the M5 Max, on battery at load 5.7–6.2, 8.88 /
+8.92 → 8.14 → 8.53. The full band's write saving on the M5 Max is about what
+its grading and its two passes cost there; on the M4 it cut the
+conversion by 7 ms in the prototype.
+
+**Verification.** codec_mesh on Rafa2 frames 1–150 writes each box's
+baseline `.vrst` with the PR head's setup (full band on): 12cfcd94… on the
+5090, 48715851… on the 4090, cb37b9ac… on the M5 Max and the M4. The grid
+suite passes in Release under the validation layer on all four. Tests: the
+host oracle of the candidate offsets (`grid_voxelize_mesh_candidates`), the
+band's block set against a double-precision oracle, the index bound and
+growth (`grid_voxelize_mesh_band`), the call's submits and waits from the
+core's `DeviceCounters`, the first call's redo, the write in four ranges
+equal to one, and the refusals (`grid_voxelize_mesh_integrate`), the brute
+force on every write layout the device takes and the records
+(`grid_voxelize_mesh_integrate_exact`), and the full band's oracle, shell
+and curtain cases (`grid_voxelize_mesh_full_band`). Planted mutants, each
+failing a test: a clear zeroing no attribute; the index check after the
+first batch; the clear in a submit of its own; zero-area triangles counted;
+the scan's carry ignored; a refused total kept; the classify without its
+overflow gate; the insert without the chain recount; stamps of 0; growth
+that only doubles; the records' R without one vertex; the subgroup ballot's
+upper half dropped; a 256 × 2 lane writing one voxel twice; no apron pass;
+an apron of face neighbours only; a grading without the half-diagonal; and
+a prune that keeps the dropped blocks' counts.
