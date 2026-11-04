@@ -168,12 +168,15 @@ struct MeshIntegrateStats {
 /// blocks. A grid that must grow adds the resize's own submits and one more
 /// run of the first batch.
 ///
-/// **Growth.** A band of more blocks than the grid holds grows the grid once
-/// (@ref volume::grow_grid), to twice its buckets or to the buckets that
-/// hold the band at @ref volume::VoxelHashMap::kGrowThreshold, whichever is
-/// more, keeping the blocks already placed; it doubles again only if a
-/// collision chain still overflows. A grid the band fits is never grown,
-/// whatever its load. A band past @ref volume::VoxelBlockGrid::max_num_buckets
+/// **Growth.** The grid grows only when the band's insert meets a capacity
+/// limit: more band blocks than the grid holds, a full collision chain, or a
+/// block pushed onto a chain with under an eighth of the grid's blocks free --
+/// so a band past about 7/8 of the grid grows it, and a band below that only
+/// for a full chain, never for its load. The first grow
+/// (@ref volume::grow_grid) goes to twice the grid's buckets or to the buckets
+/// that hold the band at @ref volume::VoxelHashMap::kGrowThreshold, whichever
+/// is more, keeping the blocks already placed; it doubles again only while a
+/// chain stays full. A band past @ref volume::VoxelBlockGrid::max_num_buckets
 /// is refused before any resize. A grow replaces the grid's buffers, as
 /// @ref volume::VoxelBlockGrid::resize says.
 ///
@@ -239,7 +242,8 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   /// Blocks until the field is written (the class notes give its submits and
   /// waits), so the grid can be encoded or meshed as soon as it returns.
   /// @param grid            A grid carrying float `tsdf` and `weight`
-  ///                        attributes; grown when the band does not fit.
+  ///                        attributes; grown when the band meets a
+  ///                        capacity limit (the class notes).
   /// @param vertices        World-space vertex positions, metres; read
   ///                        during the call only.
   /// @param vertex_count    How many @p vertices.
@@ -311,8 +315,8 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   core::DescriptorPool pool_;
   // The device-span collector, idle until a caller passes a StageMetrics.
   core::GpuTimer gpu_timer_;
-  // The count pass's one output the host must read before anything is
-  // written: how many band blocks the hash table could not find.
+  // The bin count's band pairs whose block the hash table lacks, read after
+  // the first batch.
   core::Buffer missing_;
   // A 1-element stand-in for the fill pass's output during the count pass, so
   // every declared descriptor stays bound.

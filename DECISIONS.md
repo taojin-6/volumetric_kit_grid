@@ -514,14 +514,15 @@ entries relevant to your task; later amendments supersede earlier rules.
   take; the codec stream's copy checks there is none.
 - [**2026-11-03**](#2026-11-03--a-mesh-converts-into-a-grid-in-one-call-meshintegratorconvert-its-candidates-counted-on-the-device-the-bands-distinct-blocks-placed-without-bucket-locks-the-clear-in-its-first-batch-and-the-write-queued-without-host-waits-the-write-takes-a-block-in-one-round-from-per-triangle-records-in-a-layout-the-devices-facts-pick-and-full_band_m-writes-the-band-whole-only-near-the-zero-level-amends-the-2026-08-31-triangle-2026-10-02-binning-2026-10-21-meshintegrator-and-2026-10-21-true-sdf-entries) —
   A mesh converts in one call: `MeshIntegrator::convert` empties the grid,
-  allocates the band and writes it, growing the grid once when the band does
-  not fit, in two blocking waits once warm; `allocate_from_triangles`,
-  `integrate` and `triangle_candidates.hpp` go. Refusals only the device
-  finds come after the clear and leave no observed voxel. The write takes a
-  block in one round from per-triangle records, in a layout picked by the
-  vendor and the subgroup width, and `MeshSdfParams::full_band_m` writes
-  the band whole only near the zero level, plus a one-voxel apron, with the
-  same bytes there; `codec_mesh` sets it and codes what it coded before.
+  allocates the band and writes it, growing the grid only when the insert
+  meets a capacity limit, in two blocking waits once warm;
+  `allocate_from_triangles`, `integrate` and `triangle_candidates.hpp` go.
+  Refusals only the device finds come after the clear and leave no observed
+  voxel. The write takes a block in one round from per-triangle records, in
+  a layout picked by the vendor and the subgroup width, and
+  `MeshSdfParams::full_band_m` writes the band whole only near the zero
+  level, plus a one-voxel apron, with the same bytes there; `codec_mesh`
+  sets it and codes what it coded before.
 
 ## Decision record
 
@@ -9228,7 +9229,7 @@ caller's old code fails to compile rather than changing meaning.
   and the call waits once more. A warm call makes 2 blocking waits. The
   batch runs again for pairs past the per-pair scratch (always a fresh
   integrator's first call), an index overflow, candidates past one key
-  window, or a band the grid does not fit.
+  window, or an insert that met a capacity limit.
 - **Each band block meets the hash table once.** The band test runs once a
   pair into a bounded index of distinct blocks, and volume's distinct insert
   places the list in one round without bucket locks. The prototype's insert
@@ -9237,12 +9238,14 @@ caller's old code fails to compile rather than changing meaning.
   counts the chain under the head it swaps against, and a lost swap adds
   the nodes pushed since. A push refused that way keeps the heap block it
   drew until a clear or the resize the chain failure asks for.
-- **Growth moves into `convert`.** A band of more blocks than the grid holds
-  grows it once, to twice its buckets or the band's need at
-  `kGrowThreshold`, whichever is more, then doubles only while a chain
-  overflows. A grid the band fits is never grown: Rafa2 fills 6,015 of
-  8,192 blocks (load 0.73), and a load trigger would double the clear's
-  33.5 MB of zeroing on frame 1.
+- **Growth moves into `convert`.** The grid grows only when the insert
+  meets a capacity limit: more band blocks than the grid holds, a full
+  chain, or a chain push with under an eighth of the blocks free (so a band
+  past about 7/8 of the grid). It grows first to twice its buckets or the
+  band's need at `kGrowThreshold`, whichever is more, then doubles only
+  while a chain stays full. Load below those limits never grows it: Rafa2
+  fills 6,015 of 8,192 blocks (load 0.73), and a trigger at
+  `kGrowThreshold` would double the clear's 33.5 MB of zeroing on frame 1.
 - **Refusals.** Everything the host can check, the index range included
   (about 0.03 ms), still refuses before any GPU work. What only the device
   finds — a candidate total past 2^32, a bin past `kMaxBinTriangles`, the

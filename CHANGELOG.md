@@ -19,13 +19,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and nothing else in one call. It empties the grid, every attribute zeroed
   as `clear` zeroes them; counts the mesh's candidate blocks on the device;
   places the band's distinct blocks in one lock-free insert; and writes the
-  band. It grows the grid itself, once and only when the band does not fit,
-  to twice its buckets or the band's need, whichever is more. A warm call
-  makes two blocking waits. A refusal the host can make leaves the grid
-  untouched; one only the device can find (a candidate total past 2^32, a
-  bin past `kMaxBinTriangles`, the band index's own, a band past the
-  largest grid) leaves it with no observed voxel (DESIGN.md, voxelize; the
-  2026-11-03 entry in DECISIONS.md).
+  band. It grows the grid itself, only when the insert meets a capacity
+  limit (more band blocks than the grid holds, a full chain, or a band past
+  about 7/8 of the grid), to twice its buckets or the band's need,
+  whichever is more. A warm call makes two blocking waits. A refusal the
+  host can make leaves the grid untouched; one only the device can find (a
+  candidate total past 2^32, a bin past `kMaxBinTriangles`, the band
+  index's own, a band past the largest grid) leaves it with no observed
+  voxel (DESIGN.md, voxelize; the 2026-11-03 entry in DECISIONS.md).
 - **`VoxelBlockGrid::record_clear`**: records `clear` into a caller's batch.
 - **`MeshSdfParams::full_band_m`**: writes the band whole only within this
   distance of the field's zero level, plus a one-voxel apron, each voxel

@@ -384,10 +384,12 @@ passes take indirect slices sized on the device, bounded by the per-pair
 scratch the integrator retains. After the wait it runs again, without the count and the
 clear, for candidate pairs past that scratch (an integrator's first call;
 with core's 1.5× headroom a sequence like Rafa2 pays it once), an index that
-overflowed, candidates past one key window, or a band the grid does not
-fit. That last grows the grid once, to twice its buckets or the band's need
-at `kGrowThreshold`, whichever is more, then by doubling while a chain still
-overflows; a grid the band fits is never grown, whatever its load. The
+overflowed, candidates past one key window, or an insert that met a
+capacity limit: more band blocks than the grid's, a full chain, or a chain
+push with under an eighth of the blocks free, so a band past about 7/8 of
+the grid. That last grows the grid, first to twice its buckets or the band's
+need at `kGrowThreshold`, whichever is more, then by doubling while a chain
+stays full; below those limits load alone never grows it. The
 write's ranges then go to the queue back to back, a submit each with no
 host wait between them, and the call waits once, for the last: two blocking
 waits a warm call. Host refusals leave the grid untouched; the ones only the

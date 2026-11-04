@@ -283,8 +283,8 @@ vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
   VKC_TRY(sequence.admit(number, coded.frame.topology));
   const std::string name = frame_name(number, coded.frame.path);
   const mesh_io::TriangleMesh& mesh = coded.frame.mesh;
-  // One call empties the grid, allocates the band (growing the grid once if
-  // it does not fit) and writes it: two waits a frame once warm.
+  // One call empties the grid, allocates the band (growing the grid if the
+  // band meets its capacity) and writes it: two waits a frame once warm.
   vkc::Result<vgrid::voxelize::MeshIntegrateStats> stats = integrator.convert(
       grid, mesh.positions.data(), std::uint32_t(mesh.positions.size()),
       mesh.indices.data(), std::uint32_t(mesh.indices.size() / 3), params,
