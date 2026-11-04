@@ -265,10 +265,32 @@ class VGRID_VOLUME_API VoxelBlockGrid {
   /// attribute range is about to be re-drawn; zeroing them here is what keeps
   /// "a freshly allocated block reads as zero" true after a clear, exactly as
   /// it is after @ref create. The zeroing runs first, so a failure never frees
-  /// an index over stale data.
-  /// @return OK, or a non-OK `Status` if the grid is moved-from, the
-  ///         zeroing fails, or the underlying @ref VoxelHashMap::clear fails.
+  /// an index over stale data. It is @ref record_clear and one submit.
+  /// @return OK, or a non-OK `Status` if the grid is moved-from, or the
+  ///         recording or the submit fails.
   core::Status clear();
+
+  /// @brief Record @ref clear into @p batch: every attribute zeroed, then the
+  ///        block index emptied, in that order, so no index is freed over
+  ///        stale data.
+  ///
+  /// For work that empties the grid inside a batch it submits anyway, as
+  /// `voxelize::MeshIntegrator::convert` does in its first, rather than in a
+  /// submit of its own. The host's view moves now: @ref topology_epoch is
+  /// redrawn, @ref VoxelHashMap::allocated_blocks reads 0, and every device
+  /// list the map compacted before is stale.
+  /// @param batch  Records the work; the caller submits it. Work recorded
+  ///               after this sees an empty grid.
+  /// @param stage  Optional: the caller's scope, whose tile the work counts
+  ///               to.
+  /// @return OK; or, with nothing recorded and the host's view unchanged,
+  ///         `Status::Code::InvalidArgument` for a moved-from grid; or the
+  ///         batch's refusal, after which the caller drops @p batch.
+  /// @pre Every other batch that reads or writes this grid has resolved. If
+  ///      @p batch is then dropped or fails, the grid's contents are
+  ///      undefined until a @ref clear.
+  core::Status record_clear(core::CommandBatch& batch,
+                            core::GpuStageScope* stage = nullptr);
 
   /// @return `true` if an attribute of @p name was declared.
   bool has_attribute(std::string_view name) const noexcept;

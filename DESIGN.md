@@ -146,28 +146,34 @@ default block layout: 8³-voxel blocks in the default hash layout, as many
 blocks as bucket entries, at the caller's resolution, band and table; the
 fusion grid, the decode grid and codec_mesh build with it (2026-10-25).
 
-`VoxelHashMap` drives init / allocate-from-coords, -depth,
--triangles / remove / compact / compact-in-frusta / resize as GLSL
-kernels
+`VoxelHashMap` drives init / allocate-from-coords, -depth / remove /
+compact / compact-in-frusta / resize as GLSL kernels
 (`volume/shaders/hash_*.comp`) over the scalar-block-layout ABI. Depth
 allocation unprojects a posed frame and dilates each surface block into the
 `(2·tb+1)³` truncation band — a solid cube, not a ray march — a 16 × 16
 pixel tile a workgroup, each distinct block of the tile dilated once and its
 band shared out over the lanes (2026-09-30);
-`allocate_from_triangles` deliberately does **not** dilate that cube
+A triangle mesh's band deliberately does **not** dilate that cube
 (2026-08-31): a triangle wider than the band — which is one block, 40 mm, at
-the defaults — would hole through the middle, so a block is allocated when its
-centre is within `trunc_dist` + the block's half-diagonal of some triangle,
-and the work is split per *candidate block* rather than per triangle so one
-lane cannot own a 250 000-block quad; as a depth tile does, a workgroup asks
-for each distinct block its lanes name once. The host pass that counts those
-blocks is also where an index is bounds-checked and a zero-area or non-finite
-triangle is dropped — the former being the one input that divides by zero in
-the closest-point solve, which lives in `volume/shaders/triangle_common.glsl`
-so mesh-to-SDF evaluates the field with the same function. That pass is the
-public `triangle_candidate_offsets`, and the decode and band test are
-`volume/shaders/triangle_candidates.glsl`: `voxelize`'s mesh integrator bins
-over both, so the blocks allocated and the blocks binned cannot drift apart.
+the defaults — would hole through the middle, so a block is in the band when
+its centre is within `trunc_dist` + the block's half-diagonal of some
+triangle, and the work is split per *candidate block* rather than per
+triangle so one lane cannot own a 250 000-block quad. `volume/shaders/` holds
+the rules every pass over a mesh shares: the closest point
+(`triangle_common.glsl`, so mesh-to-SDF evaluates the field with the same
+function), a triangle's candidate box (`triangle_box.glsl`), and the decode
+and band test (`triangle_candidates.glsl`); `voxelize` allocates and bins
+over them, so the blocks allocated and the blocks binned cannot drift apart.
+It allocates through `VoxelHashMap::Internal::record_allocate_distinct`
+(`hash_insert_distinct.comp`): a list whose coordinates are distinct, placed
+in one round with no bucket locks, since no two lanes hold one coordinate. A
+lane claims a free slot of its bucket by a swap, or pushes a slot further on
+onto the bucket's chain; a push counts the chain under the head it swaps
+against, and a lost swap adds the nodes pushed since, so concurrent pushes
+cannot pass `max_chain`. A push refused that way has drawn its heap block,
+which stays out of the heap until a clear or the resize the chain failure
+asks for. It is internal: its precondition, every coordinate distinct, is
+unchecked, and a violation would insert a block twice.
 Frustum-culled compaction gives the per-frame working set, from frusta built
 by `make_frustum_planes` off a depth camera's pinhole
 intrinsics or — since 2026-08-12 — off a *render* camera's `view_proj`, whose
@@ -198,7 +204,9 @@ attribute arrays (`tsdf`, `weight`, `color`, …), each
 needs; the three the tiers share are named by `kTsdfAttribute`,
 `kWeightAttribute` and `kColorAttribute`. Every buffer of both is
 device-local, reached through a `CommandBatch`: `create`, `clear` and
-`remove` zero on the device (`clear` and `remove` before any index is freed,
+`remove` zero on the device (`clear` and `remove` before any index is freed;
+`record_clear` records the clear into a caller's batch, and `clear` is it
+and one submit;
 `remove` by a kernel that finds each coord's block itself, so its cost is
 the count's, not the grid's), `resize` copies there, and a call's inputs
 are uploaded in its batch.
@@ -341,41 +349,97 @@ so its normals fit one binding.
 
 ### voxelize
 
-`MeshIntegrator` writes a triangle mesh's distance field into a grid
-(2026-09-27), **overwriting** every voxel of every block the band reaches:
-weight 1 within `trunc_dist` of the mesh, the codec inverse's fresh zeros
-elsewhere, so a mesh-derived grid reads like a decoded frame. `Signed` signs
-by the closest triangle's face normal, the research codec's rule, and builds
-no topology and checks nothing: the field is the codec's input, not a
+`MeshIntegrator::convert` makes a grid hold one triangle mesh's distance
+field and nothing else (2026-09-27; one call since 2026-11-03): weight 1
+within `trunc_dist` of the mesh, the codec inverse's fresh zeros elsewhere,
+so a mesh-derived grid reads like a decoded frame. `Signed` signs by the
+closest triangle's face normal, the research codec's rule, and builds no
+topology and checks nothing: the field is the codec's input, not a
 reconstruction of the mesh, so it gives up the sign past edges sharper than
 90° and grows a skirt past an open mesh's rim. `Shell` is `d − σ` and takes
-any mesh. The blocks must be
-allocated by `allocate_from_triangles` — a missing one is refused before
-anything is written — and triangles are binned per block over that
-allocation's own candidates, so no voxel measures the whole mesh. The fill
-replays the slots the count pass recorded, so no bin comes up short; a bin
-past `kMaxBinTriangles` is refused, and the write splits into dispatches of
-at most `kMaxDispatchBinEntries` bin entries, each submitted on its own.
-Counts, fill cursors and occupied bins stay on the device: a hierarchical
-256-way prefix scan carries entry totals, occupied counts, largest bin and
-overflow, then compacts bins in slot order. The host reads 20 bytes of
-validation/size control plus 8 bytes per bounded dispatch range, at most
-34,960 bytes of ranges even for the uint32 candidate limit. Prefix windows
-of `kMaxDispatchBinEntries - kMaxBinTriangles + 1` bound every range; the host
-only splits them further for the device thread limit. Bulk scratch grows
-with demand and stays allocated. If the compact list outgrows its retained
-capacity, only compaction/range planning retries after growth; normal calls
-need one planning submission plus one per write. No grid write precedes
-missing-block, overflow, bin-size and binding-range validation
-(2026-10-02). Ties break on the triangle index, so the same mesh writes the same
-bytes. One workgroup writes each block, and a voxel measures only the
-triangles no lower bound rules out; a bound, less a rounding margin of the
-triangle's own, rules a triangle out only when it is strictly farther than
-the voxel's best so far, or than `trunc_dist` where that is nearer, so every
-voxel writes what measuring its whole bin writes (2026-10-21;
-`mesh_integrate.comp` has the bounds and the rounding count). Blocks past
-`kMaxVoxelsPerBlock` (16^3 voxels) are refused. Each call is a tick, and
-every block it writes is stamped `changed`.
+any mesh.
+
+**The band.** `detail::MeshBand` holds the mesh on the device. Its count
+(`triangle_counts.comp`, the 256-way scan, `triangle_offsets.comp`) gives
+each triangle its candidate blocks, drops a zero-area or non-finite one —
+the one input that divides by zero in the closest point — and leaves the
+candidates' block range; the host keeps only the index check. The index,
+the bin count and the fill run one item per (triangle, candidate block)
+pair. `hash_classify_triangles.comp` runs the band test once a pair into a
+bounded open-addressed set of the band's distinct blocks, keyed within a
+window of 2048 × 1024 × 1024 blocks (one pass a window past it); the set
+starts at twice the grid's blocks and grows when a probe passes 64 slots or
+its list half the set. Gated on no overflow, volume's distinct insert places the
+list in one round. The count also writes each triangle's record for the
+write (`mesh_tri_records.comp`): its vertices, s_T, R, H and unit normal.
+
+**One batch, then the write.** A call makes the host's checks first (params,
+attributes, block size, null arrays, every index, each array against one
+binding), advances the map's tick once, and records one batch: the mesh's
+upload and count, the grid's clear (`VoxelBlockGrid::record_clear`), the
+band index and its insert, the bin count, the full band's passes (below),
+the bins' scan and compaction, and the write's range plan. Every buffer it
+binds is grown before the clear is recorded. On its first run the pair
+passes take indirect slices sized on the device, bounded by the per-pair
+scratch the integrator retains. After the wait it runs again, without the count and the
+clear, for candidate pairs past that scratch (an integrator's first call;
+with core's 1.5× headroom a sequence like Rafa2 pays it once), an index that
+overflowed, candidates past one key window, or an insert that met a
+capacity limit: more band blocks than the grid's, a full chain, or a chain
+push with under an eighth of the blocks free, so a band past about 7/8 of
+the grid. That last grows the grid, first to twice its buckets or the band's
+need at `kGrowThreshold`, whichever is more, then by doubling while a chain
+stays full; below those limits load alone never grows it. The
+write's ranges then go to the queue back to back, a submit each with no
+host wait between them, and the call waits once, for the last: two blocking
+waits a warm call. Host refusals leave the grid untouched; the ones only the
+device finds (a candidate total past 2^32, a bin past `kMaxBinTriangles`,
+the index's own, a band past the largest grid) come after the clear and
+leave no observed voxel (2026-11-03).
+
+**Binning.** `mesh_bin.comp`'s count pass probes each in-band pair's block,
+records its slot per pair and counts it; the fill replays those slots, so no
+bin comes up short. Counts, cursors and occupied bins stay on the device: the
+scan carries entry totals, occupied counts, largest bin and overflow, then
+compacts bins in slot order, and the host reads its 16 bytes and 8 a range.
+Prefix windows of `kMaxDispatchBinEntries - kMaxBinTriangles + 1` bound
+every range, which the host splits further only for the device's group
+limit. The count pass repeats the band test; bins taken from the index
+instead measured under the 0.5 ms / 5% bar on the M5 Max (2026-11-03).
+
+**The write.** One workgroup per block, an 8³ block's voxels in one round
+(`mesh_integrate_body.glsl`). It sorts its bin by a support-plane bound at
+its centre, and a voxel measures only the triangles no lower bound rules
+out; a bound, less a rounding margin of the triangle's own, rules a triangle
+out only when it is strictly farther than the voxel's best so far, or than
+`trunc_dist` where that is nearer, so every voxel writes what measuring its
+whole bin writes (2026-10-21; the body has the bounds and the rounding
+count). Ties break on the triangle index, so the same mesh writes the same
+bytes. The sort and the staging read the records; a voxel tests the support
+plane before the cylinder. The layout is a device fact
+(`detail::default_write_layout`, 2026-11-03): 512 invocations of one voxel
+where the device takes 512 and, without the subgroup cull, 18,436 bytes of
+shared memory, but not on Apple GPUs; 256 of two (a z pair) otherwise; and
+each culling group one subgroup where compute subgroups are 32 wide with
+vote, ballot and arithmetic. Those builds map voxels by subgroup, so they
+stay SPIR-V 1.5, whose subgroups take the device's `subgroupSize` (a
+`static_assert` holds them there). Blocks past `kMaxVoxelsPerBlock` (16³
+voxels, 8 rounds) are refused.
+
+**The full band** (`MeshSdfParams::full_band_m`, 2026-11-03). The bin count
+grades a block full when its centre lies within the full band — the field's
+distance from zero, plus the shell's half-thickness in shell mode, the
+block's half-diagonal and a 2^-14 rounding margin — of some triangle.
+`mesh_full_band.comp` then sets, for each full block, the direction bit back
+to it in each allocated neighbour's mask, and zeroes the count of every
+binned block whose mask stays empty, so that block takes no bin and no
+workgroup. The write writes a full block whole and another kept block's
+apron, its voxels one step from a full neighbour, each over its whole bin,
+and 0/0 elsewhere; a dropped block keeps the clear's zeros.
+
+Scratch grows with the largest mesh and grid and stays allocated. Each call
+is one tick: its insert stamps every band block `requested`, its write each
+block it writes `changed`.
 
 ### mesh
 
@@ -807,6 +871,11 @@ first pass sets, in each counted cell whose sign changes, the cut bit of
 every corner with |tsdf| > √3 h + 1e-6 m; the second flags each block
 holding a corner of a counted cell with no corner cut, whose sign changes or
 that has a corner with |tsdf| < h; the filter appends the flagged blocks.
+So every corner of every cell a frame keeps lies within h + √3 h + 1e-6 m
+of zero: `codec::true_sdf_keep_distance`, the one public form of those two
+distances (`dct_transform.cpp` holds them). A field written whole that near
+zero, and one voxel past it, codes the same bytes as one written whole
+everywhere (`MeshSdfParams::full_band_m`, the 2026-11-03 entry).
 Metres on the raw `tsdf`, strict comparisons, below 0 inside, and every
 write an `atomicOr`, so the order the workgroups run in changes nothing. The
 forward reads the cut set: a cut voxel is unobserved, its mask bit 0 and its
@@ -1216,7 +1285,9 @@ missing or not a regular file, checks a shell against the truncation
 (`check_true_sdf_band`). It codes with `EncoderConfig::true_sdf` (the
 2026-10-21 entry): `codec_config.hpp`'s `mesh_codec_config`, the one place
 that sets it, makes the codec's settings and those two checks for any example
-that codes a mesh, and `create_mesh_grid` its source grid. Its first pass
+that codes a mesh, sets the conversion's `full_band_m` to
+`codec::true_sdf_keep_distance`, and `create_mesh_grid` makes its source
+grid. Its first pass
 loads each frame, joins its bounds along `source.up_vector` (`mesh_io::extend_bounds`),
 audits it and drops it, so memory does not grow with the range. In exact
 arithmetic a proper similarity changes none of the audit's counts, so a
@@ -1229,8 +1300,9 @@ still; it is printed once and stored as the Geometry track's params
 before any frame is converted, so a rerun onto it is refused before any
 conversion or output. Each frame (`code_frame`) is loaded, placed, audited again on the
 placed coordinates (the audit that decides, as rounding can make a triangle
-degenerate), converted into the one source grid after a `clear`, so no block
-of an earlier frame stays, and coded as one record: set the frame's
+degenerate), converted into the one source grid by `MeshIntegrator::convert`,
+which empties it first, so no block of an earlier frame stays, and coded as
+one record: set the frame's
 number, pts that number at 30 fps, seq from 0. The last frame alone is
 extracted from the source and player grids with `mesh::MarchingCubes` and
 compared, conversion error against the placed input apart from codec error
@@ -1290,12 +1362,12 @@ before the masked blocks of live RGB-D frames, nearly all of theirs, are
 filtered.
 
 **On `voxelize`**, mesh → TSDF has its two modes (2026-09-27), a second way
-into the grid the codec encodes: a mesh sequence converts frame by frame. A
-winding-number sign would fix at the root the sign errors a true-SDF stream
-cuts (the 2026-10-21 true-SDF entry), and the folds within √3 voxels that it
-cannot. Both modes cost the same. On Rafa2 the band's allocation costs what
-recon's PERF.md MESH3 row gives, and the write what the 2026-10-21
-`MeshIntegrator` entry gives. Smaller costs around them remain: writing only
-the blocks the codec will code, chaining the write's submissions, and
-computing `triangle_candidate_offsets` and uploading the mesh once a frame
-rather than once to allocate and again to write.
+into the grid the codec encodes: a mesh sequence converts frame by frame, one
+`convert` a frame (2026-11-03). A winding-number sign would fix at the root
+the sign errors a true-SDF stream cuts (the 2026-10-21 true-SDF entry), and
+the folds within √3 voxels that it cannot. Both modes cost the same. What the
+2026-11-03 entry left: a conversion recorded into a caller's batch, when
+something on the device needs it; the subgroup cull's full 32-wide subgroups
+requested, once the core's kernel builder passes stage flags; and on Apple
+GPUs, where the write's per-voxel loop dominates, fewer bound checks a
+voxel.

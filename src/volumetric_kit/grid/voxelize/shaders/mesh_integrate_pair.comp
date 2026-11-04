@@ -1,0 +1,8 @@
+#version 450
+
+// The write kernel (mesh_integrate_body.glsl): 256 invocations,
+// two voxels each.
+#extension GL_GOOGLE_include_directive : require
+#define VGRID_THREADS 256
+#define VGRID_LANE_VOXELS 2
+#include "mesh_integrate_body.glsl"

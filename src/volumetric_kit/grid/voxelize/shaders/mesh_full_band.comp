@@ -1,0 +1,98 @@
+#version 450
+
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Tao Jin
+
+// MeshSdfParams::full_band_m's two passes over the grid's block slots,
+// between mesh_bin.comp's count pass and the scan. One invocation a slot.
+//
+//   apron -- every slot the count pass marked VGRID_FULL_BLOCK (a block within
+//            the full band) looks up its 26 neighbours in the hash table and
+//            sets, in each one's mask, the bit of the direction back to it. A voxel
+//            of a block not marked full is then written only if it lies one
+//            step -- across a face, an edge or a corner -- from a full block
+//            whose direction bit its block holds: the apron.
+//   prune -- a binned slot whose mask is still 0 is not written: its count
+//            goes to 0 before the scan, so it takes no bin, and the fill skips
+//            its items. stats counts what each slot became: x the bin entries
+//            dropped, y the blocks dropped, z the blocks written whole, w the
+//            blocks written for their apron.
+//
+// The bits are mesh_common.glsl's. Every write is an atomicOr or atomicAdd, so
+// the masks do not depend on the order the invocations run in.
+
+#extension GL_GOOGLE_include_directive : require
+#define VGRID_HASH_ENTRIES_BINDING 0
+#include "volumetric_kit/grid/volume/shaders/hash_lookup.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 0: the grid's hash entries (hash_lookup.glsl).
+// binding 1: per-slot bin counts, before the scan.
+layout(set = 0, binding = 1, scalar) buffer Counts { uint counts[]; };
+// binding 2: each binned slot's block coordinate (mesh_bin.comp).
+layout(set = 0, binding = 2, scalar) readonly buffer SlotCoords {
+  ivec3 slot_coord[];
+};
+// binding 3: each slot's write mask.
+layout(set = 0, binding = 3, scalar) buffer SlotMask { uint slot_mask[]; };
+// binding 4: the prune pass's tallies (see the top).
+layout(set = 0, binding = 4, scalar) buffer Stats { uvec4 stats; };
+
+layout(push_constant, scalar) uniform PushConstants {
+  VoxelGridParams grid;
+  uint size;  // block slots: the grid's num_blocks
+  uint pass;  // kPassApron or kPassPrune
+  uint item_base;  // the first slot this dispatch covers
+} pc;
+
+const uint kPassApron = 0u;
+const uint kPassPrune = 1u;
+#include "mesh_common.glsl"
+
+void main() {
+  uint slot = pc.item_base + gl_GlobalInvocationID.x;
+  if (slot >= pc.size) {
+    return;
+  }
+  uint mask = slot_mask[slot];
+  if (pc.pass == kPassApron) {
+    if ((mask & VGRID_FULL_BLOCK) == 0u) {
+      return;
+    }
+    ivec3 coord = slot_coord[slot];
+    uint vpb = uint(pc.grid.voxels_per_block);
+    for (int dz = -1; dz <= 1; ++dz) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          if (dx == 0 && dy == 0 && dz == 0) {
+            continue;
+          }
+          int ptr = vgridFindBlockPtr(coord + ivec3(dx, dy, dz),
+                                      pc.grid.num_buckets,
+                                      pc.grid.bucket_size, pc.grid.max_chain);
+          if (ptr < 0) {
+            continue;
+          }
+          // The direction from the neighbour back to this block: -d.
+          uint bit = VGRID_APRON_BIT(1 - dx, 1 - dy, 1 - dz);
+          atomicOr(slot_mask[uint(ptr) / vpb], 1u << bit);
+        }
+      }
+    }
+    return;
+  }
+  uint count = counts[slot];
+  if (count == 0u) {
+    return;
+  }
+  if ((mask & VGRID_FULL_BLOCK) != 0u) {
+    atomicAdd(stats.z, 1u);
+  } else if (mask != 0u) {
+    atomicAdd(stats.w, 1u);
+  } else {
+    atomicAdd(stats.x, count);
+    atomicAdd(stats.y, 1u);
+    counts[slot] = 0u;
+  }
+}

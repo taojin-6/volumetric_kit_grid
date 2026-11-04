@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-03
+
+### Removed
+
+- **The two-step mesh conversion, a breaking change**:
+  `VoxelHashMap::allocate_from_triangles`, `MeshIntegrator::integrate`, and
+  `volume/triangle_candidates.hpp` (`triangle_candidate_offsets`).
+  `MeshIntegrator::convert` replaces all three.
+
+### Added
+
+- **`MeshIntegrator::convert`**: makes a grid hold one mesh's distance field
+  and nothing else in one call. It empties the grid, every attribute zeroed
+  as `clear` zeroes them; counts the mesh's candidate blocks on the device;
+  places the band's distinct blocks in one lock-free insert; and writes the
+  band. It grows the grid itself, only when the insert meets a capacity
+  limit (more band blocks than the grid holds, a full chain, or a band past
+  about 7/8 of the grid), to twice its buckets or the band's need,
+  whichever is more. A warm call makes two blocking waits. A refusal the
+  host can make leaves the grid untouched; one only the device can find (a
+  candidate total past 2^32, a bin past `kMaxBinTriangles`, the band
+  index's own, a band past the largest grid) leaves it with no observed
+  voxel (DESIGN.md, voxelize; the 2026-11-03 entry in DECISIONS.md).
+- **`VoxelBlockGrid::record_clear`**: records `clear` into a caller's batch.
+- **`MeshSdfParams::full_band_m`**: writes the band whole only within this
+  distance of the field's zero level, plus a one-voxel apron, each voxel
+  written with the whole band's bytes; 0, the default, writes it all.
+  `MeshIntegrateStats::full_blocks` counts the blocks written whole.
+- **`codec::true_sdf_keep_distance`**: the distance from zero within which
+  every corner of every cell a true-SDF frame keeps lies.
+  `mesh_codec_config` sets `full_band_m` to it, and `codec_mesh` writes the
+  bytes 0.12.1 did.
+
+### Changed
+
+- **`clear()` is one submit**: `record_clear` and a submit.
+- **The conversion's rows** are `mesh convert`, `  ..allocate` and
+  `  ..write`.
+- **A conversion is one tick**: its band blocks' `requested` and its written
+  blocks' `changed` carry the same value.
+- **`MeshIntegrateStats::blocks`** counts the blocks written, whole or in
+  part.
+- **The write measures a block in one round**, from per-triangle records,
+  in a layout the device's facts pick: no voxel's bytes change.
+
+Migration: replace "clear, allocate with retries and growth, integrate" with
+one `convert`. It grows the grid itself, and zeroes every attribute the grid
+declares.
+
 ## [0.12.1] - 2026-11-03
 
 ### Added

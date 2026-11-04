@@ -181,7 +181,9 @@ struct MeshCodecConfig {
   volumetric_kit::grid::volume::VoxelGridParams grid{};
   /// `codec`'s settings (@ref encoder_config), with `true_sdf` set.
   volumetric_kit::grid::codec::EncoderConfig encoder;
-  /// `source`'s conversion (@ref mesh_sdf_config).
+  /// `source`'s conversion (@ref mesh_sdf_config), written whole only as
+  /// near the zero level as the true-SDF frame reads
+  /// (`codec::true_sdf_keep_distance`).
   volumetric_kit::grid::voxelize::MeshSdfParams sdf;
 };
 
@@ -200,6 +202,8 @@ inline volumetric_kit::core::Result<MeshCodecConfig> mesh_codec_config(
   VKC_ASSIGN(result.encoder, encoder_config(settings.codec));
   VKC_ASSIGN(result.sdf, mesh_sdf_config(settings.source, result.grid));
   result.encoder.true_sdf = true;
+  result.sdf.full_band_m = volumetric_kit::grid::codec::true_sdf_keep_distance(
+      result.grid.voxel_size);
   VKC_TRY(check_true_sdf_band(result.sdf, result.grid));
   return result;
 }

@@ -1,0 +1,140 @@
+#version 450
+
+// The band index (voxelize::detail::MeshBand): the distinct blocks a triangle
+// mesh's truncation band reaches, as a list that volume's distinct insert
+// (hash_insert_distinct.comp) then places once each.
+//
+// One thread per (triangle, candidate block) work item, the decomposition
+// mesh_bin.comp bins over (volume's triangle_candidates.glsl): the item is
+// decoded and band-tested once, by the same vgridBlockInBand, so the blocks
+// listed here are exactly the blocks the binning finds.
+//
+// A few hundred items name each block, so they meet in an open-addressed set
+// in device memory rather than at the hash table's bucket locks. A slot holds
+// a block's key or 0 (empty). A probe reads the slot first, and only an empty
+// one is claimed with a compare-and-swap; nothing spins and nothing waits on
+// another lane, so no SIMD group can livelock. The lane whose swap claims a
+// slot appends the block to the list.
+//
+// The key packs the block's coordinate relative to the window's first block,
+// 11 + 10 + 10 bits under a set top bit, so it is never 0 and two blocks of a
+// window never share one. The window's first block is the candidates' smallest
+// (binding 6, the band's count leaves it) plus the window's offset the host
+// pushes. A block outside the window is left to another dispatch of the host's
+// window loop.
+//
+// Bounded: a probe gives up after kMaxProbes slots, and the list holds at most
+// pc.list_capacity entries. Either limit sets the overflow word and closes the
+// gate the insert reads, so it inserts nothing; the host grows the index and
+// records the pass again.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#define VGRID_TRI_OFFSETS_BINDING 2
+#include "volumetric_kit/grid/volume/shaders/triangle_candidates.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 0: mesh vertices, tightly packed vec3 (scalar: a 12-byte stride).
+layout(set = 0, binding = 0, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+// binding 1: triangle indices, 3 a triangle, checked on the host.
+layout(set = 0, binding = 1, scalar) readonly buffer Indices { uint indices[]; };
+// binding 2: the per-triangle candidate offsets (triangle_candidates.glsl).
+// binding 3: the index's slots, zeroed before each window's dispatch.
+layout(set = 0, binding = 3) buffer Keys { uint keys[]; };
+// binding 4: the distinct blocks, in the order their slots were claimed.
+layout(set = 0, binding = 4, scalar) writeonly buffer List {
+  BlockIndex list[];
+};
+// binding 5: [0] blocks claimed (may pass the capacity), [1] the insert's
+// gate, [2] overflow.
+layout(set = 0, binding = 5) buffer State { uint state[]; };
+// binding 6: the candidates' smallest block, each window's base.
+layout(set = 0, binding = 6, scalar) readonly buffer Origin {
+  ivec3 origin_base;
+};
+
+layout(push_constant, scalar) uniform Push {
+  VoxelGridParams grid;
+  ivec3 origin;       // the window's first block, less origin_base
+  uint tri_count;     // the offsets' bound
+  uint slot_mask;     // slots - 1; a power of two
+  uint list_capacity;
+  uint item_base;     // the first work item this dispatch covers
+} pc;
+
+const uint kKeyFlag = 0x80000000u;
+const ivec3 kWindow = ivec3(2048, 1024, 1024);
+const uint kMaxProbes = 64u;
+
+uint vgridBlockKey(ivec3 rel) {
+  return kKeyFlag | uint(rel.x) | (uint(rel.y) << 11) | (uint(rel.z) << 21);
+}
+
+// A 32-bit mixer (lowbias32), so neighbouring blocks spread over the slots.
+uint vgridMixKey(uint x) {
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+void vgridOverflow() {
+  state[2] = 1u;
+  state[1] = 0u;
+}
+
+void main() {
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
+  if (gid >= vgrid_tri_offsets[pc.tri_count]) {
+    return;
+  }
+  uint t = vgridTriangleOf(gid, pc.tri_count);
+  uint local = gid - vgrid_tri_offsets[t];
+  vec3 v0 = vertices[indices[3u * t]];
+  vec3 v1 = vertices[indices[3u * t + 1u]];
+  vec3 v2 = vertices[indices[3u * t + 2u]];
+  ivec3 coord;
+  if (!vgridCandidateBlock(local, v0, v1, v2, pc.grid, coord)) {
+    return;
+  }
+  ivec3 rel = coord - (origin_base + pc.origin);
+  if (any(lessThan(rel, ivec3(0))) || any(greaterThanEqual(rel, kWindow))) {
+    return;
+  }
+  if (!vgridBlockInBand(coord, v0, v1, v2, pc.grid)) {
+    return;
+  }
+
+  uint key = vgridBlockKey(rel);
+  uint h = vgridMixKey(key) & pc.slot_mask;
+  for (uint probe = 0u; probe < kMaxProbes; ++probe) {
+    // A slot only ever goes from 0 to a key, so a key read here is final; a
+    // stale 0 is settled by the swap.
+    uint seen = keys[h];
+    if (seen == 0u) {
+      seen = atomicCompSwap(keys[h], 0u, key);
+      if (seen == 0u) {
+        uint at = atomicAdd(state[0], 1u);
+        if (at < pc.list_capacity) {
+          list[at] = BlockIndex(coord, -1);
+        } else {
+          vgridOverflow();
+        }
+        return;
+      }
+    }
+    if (seen == key) {
+      return;
+    }
+    h = (h + 1u) & pc.slot_mask;
+  }
+  vgridOverflow();
+}

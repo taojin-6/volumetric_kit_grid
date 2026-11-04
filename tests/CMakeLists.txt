@@ -138,29 +138,69 @@ target_link_libraries(
 vgrid_target_warnings(grid_volume_block_stamps_test)
 add_test(NAME grid_volume_block_stamps COMMAND grid_volume_block_stamps_test)
 
-# voxelize mesh integrate: write a mesh's truncated distance field (signed
-# through pseudonormals, or as a shell) and check every voxel of every written
-# block against a brute-force host reference -- an independent closest point,
-# and the winding number for inside/outside -- on a sharp tetrahedron, a dented
-# cube, an open quad and a triangle soup, plus determinism (a split binning
-# among it) and every refusal. Skips with no device.
+# voxelize mesh integrate: convert a mesh into its truncated distance field
+# (signed through pseudonormals, or as a shell) and check every voxel of every
+# written block against a brute-force host reference -- an independent closest
+# point, and the winding number for inside/outside -- on a sharp tetrahedron, a
+# dented cube, an open quad and a triangle soup, plus determinism (a split
+# binning and a write in several ranges among it), the call's submits, waits and
+# tick, an emptied grid each call, and every refusal. The write-range seam is
+# voxelize's (voxelize/mesh_band.hpp, by src/). Skips with no device.
 add_executable(grid_voxelize_mesh_integrate_test
                voxelize_mesh_integrate_test.cpp)
 target_link_libraries(
   grid_voxelize_mesh_integrate_test
   PRIVATE volumetric_kit::grid_voxelize Vulkan::Vulkan
           volumetric_kit::core_test_policy)
+target_include_directories(grid_voxelize_mesh_integrate_test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src)
 vgrid_target_warnings(grid_voxelize_mesh_integrate_test)
 add_test(NAME grid_voxelize_mesh_integrate
          COMMAND grid_voxelize_mesh_integrate_test)
+
+# voxelize mesh candidates: the band's candidate offsets and block range,
+# counted on the device (voxelize/mesh_band.hpp, by src/), equal the host oracle
+# (grid_test_support's triangle_oracle.hpp) word for word on degenerate,
+# non-finite, body-like and soup meshes and past two scan levels; an index out
+# of range is refused on the host, a total past 2^32 at the wait; and on
+# half-voxel ties convert allocates every band block. Skips with no device.
+add_executable(grid_voxelize_mesh_candidates_test
+               voxelize_mesh_candidates_test.cpp)
+target_link_libraries(
+  grid_voxelize_mesh_candidates_test
+  PRIVATE volumetric_kit::grid_voxelize Vulkan::Vulkan
+          volumetric_kit::core_test_policy)
+target_include_directories(grid_voxelize_mesh_candidates_test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src)
+vgrid_target_warnings(grid_voxelize_mesh_candidates_test)
+add_test(NAME grid_voxelize_mesh_candidates
+         COMMAND grid_voxelize_mesh_candidates_test)
+
+# voxelize mesh band: the blocks convert allocates equal a host oracle of the
+# band test on a sphere, a soup, two equal vertices, an index grown from 16
+# slots and four key windows, each listed once; containment against a voxel
+# brute force; and a grid grown once, to the band's need, when the band meets
+# its capacity, and kept when it does not. The band is voxelize's
+# (voxelize/mesh_band.hpp, by src/). Skips with no device.
+add_executable(grid_voxelize_mesh_band_test voxelize_mesh_band_test.cpp)
+target_link_libraries(
+  grid_voxelize_mesh_band_test
+  PRIVATE volumetric_kit::grid_voxelize Vulkan::Vulkan
+          volumetric_kit::core_test_policy)
+target_include_directories(grid_voxelize_mesh_band_test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src)
+vgrid_target_warnings(grid_voxelize_mesh_band_test)
+add_test(NAME grid_voxelize_mesh_band COMMAND grid_voxelize_mesh_band_test)
 
 # voxelize mesh integrate, exactly: the kernel's early exit writes, bit for bit,
 # what a brute force (shaders/mesh_integrate_reference.comp) writes measuring
 # every triangle of each voxel's bin -- on shared vertices with opposite
 # windings, duplicates, near-coincident sheets, slivers, metre-long triangles, a
-# far sphere, bins past the kernel's sort, three block sizes, both modes. The
-# brute force binds the hash entries (volume/hash_map_internal.hpp, by src/).
-# Skips with no device.
+# far sphere, bins past the kernel's sort, three block sizes, both modes; on
+# every write layout the device takes, and the triangle records the write reads.
+# The brute force binds the hash entries (volume/hash_map_internal.hpp, by src/)
+# and replays the device's candidate count (voxelize/mesh_band.hpp). Skips with
+# no device.
 add_executable(grid_voxelize_mesh_integrate_exact_test
                voxelize_mesh_integrate_exact_test.cpp)
 target_link_libraries(
@@ -175,6 +215,25 @@ vgrid_embed_shaders(
 vgrid_target_warnings(grid_voxelize_mesh_integrate_exact_test)
 add_test(NAME grid_voxelize_mesh_integrate_exact
          COMMAND grid_voxelize_mesh_integrate_exact_test)
+
+# voxelize mesh full band (MeshSdfParams::full_band_m): against a host oracle of
+# the blocks within the full band and of their one-voxel apron, convert writes
+# the whole band's bytes there and leaves the rest unobserved, on every write
+# layout the device takes; in shell mode, every voxel near the zero level and
+# its neighbours hold the whole band's bytes; and a sign flip along an apron
+# face codes, as a true-SDF frame (grid_codec), the whole band's bytes. Skips
+# with no device.
+add_executable(grid_voxelize_mesh_full_band_test
+               voxelize_mesh_full_band_test.cpp)
+target_link_libraries(
+  grid_voxelize_mesh_full_band_test
+  PRIVATE volumetric_kit::grid_voxelize volumetric_kit::grid_codec
+          Vulkan::Vulkan volumetric_kit::core_test_policy)
+target_include_directories(grid_voxelize_mesh_full_band_test
+                           PRIVATE ${PROJECT_SOURCE_DIR}/src)
+vgrid_target_warnings(grid_voxelize_mesh_full_band_test)
+add_test(NAME grid_voxelize_mesh_full_band
+         COMMAND grid_voxelize_mesh_full_band_test)
 
 # The core parses and validates scenarios. This test pins the conversion of the
 # codec_mesh templates and of written scenarios into the runtime codec options
@@ -330,23 +389,6 @@ vgrid_target_warnings(grid_volume_allocate_test)
 vgrid_embed_shaders(grid_volume_allocate_test SHADERS
                     shaders/grid_truncation.comp)
 add_test(NAME grid_volume_allocate COMMAND grid_volume_allocate_test)
-
-# volume triangle-mesh allocation: allocate from a small mesh, then verify on
-# the real driver that every block holding a voxel within trunc_dist is present
-# -- brute-forced on the host against an independent closest-point -- that a
-# triangle wider than the band leaves no hole (where the point path does), that
-# the distance prune keeps the bounding box's far corners out, and that a split
-# dispatch (base/dispatch.hpp's test seam) allocates the same blocks. Skips
-# where no device is present.
-add_executable(grid_volume_allocate_triangles_test
-               volume_allocate_triangles_test.cpp)
-target_link_libraries(
-  grid_volume_allocate_triangles_test
-  PRIVATE volumetric_kit::grid_volume Vulkan::Vulkan
-          volumetric_kit::core_test_policy)
-vgrid_target_warnings(grid_volume_allocate_triangles_test)
-add_test(NAME grid_volume_allocate_triangles
-         COMMAND grid_volume_allocate_triangles_test)
 
 # volume frustum-culled compaction: allocate blocks at known world positions
 # (one dead-centre, others behind / beyond-far / off to the side), then verify

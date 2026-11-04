@@ -36,6 +36,16 @@ namespace volumetric_kit::grid::codec::detail {
 /// fused into. Pushed to the kernel, so this is its one definition.
 inline constexpr float kDecodedWeight = 1.0f;
 
+/// @return How far from zero, in metres, an `EncoderConfig::true_sdf` frame
+///         cuts a corner of a sign-change cell: past `sqrt(3)` voxels no
+///         crossing of a distance field has a corner, and 1e-6 m keeps float
+///         rounding of a true one from reaching it. One fused multiply-add,
+///         so every host computes the same float.
+float true_sdf_cut_distance(float voxel_size) noexcept;
+/// @return How near zero, in metres, a corner keeps its cell in an
+///         `EncoderConfig::true_sdf` frame: one voxel.
+float true_sdf_near_distance(float voxel_size) noexcept;
+
 /// @brief The words one entry's @p k coefficients take on the device: two
 ///        int16 a word, each entry starting a word of its own, so an odd K
 ///        pads each entry by a half-word (`coefficient_words` in

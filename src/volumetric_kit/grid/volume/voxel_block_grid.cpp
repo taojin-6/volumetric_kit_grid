@@ -381,16 +381,26 @@ core::Status VoxelBlockGrid::clear() {
     return core::Status::invalid_argument(
         "VoxelBlockGrid::clear: moved-from grid");
   }
-  // Zero first, then free: a failure between the two leaves every block
-  // still owning its index, at worst reading as unobserved. Freeing first
-  // would hand the indices back over the old surface if the zeroing then
-  // failed, and the LIFO heap would re-draw them onto it at full weight.
   core::CommandBatch batch(*device_, *allocator_);
+  VKC_TRY(record_clear(batch));
+  return batch.submit();
+}
+
+core::Status VoxelBlockGrid::record_clear(core::CommandBatch& batch,
+                                          core::GpuStageScope* stage) {
+  if (!valid()) {
+    return core::Status::invalid_argument(
+        "VoxelBlockGrid::record_clear: moved-from grid");
+  }
+  // Zero first, then free, in the batch's order: a block's attribute range is
+  // zero before its index can be drawn again. Freeing first would hand the
+  // indices back over the old surface, and the LIFO heap would re-draw them
+  // onto it at full weight.
   for (const Attribute& attr : attributes_) {
     VKC_TRY(batch.zero(attr.buffer, 0, attr.buffer.size()));
   }
-  VKC_TRY(batch.submit());
-  return map_.clear();  // moves the topology epoch; see topology_epoch()
+  // Moves the topology epoch; see topology_epoch().
+  return VoxelHashMap::Internal::record_clear(map_, batch, stage);
 }
 
 core::Status VoxelBlockGrid::prepare_block_pass() {

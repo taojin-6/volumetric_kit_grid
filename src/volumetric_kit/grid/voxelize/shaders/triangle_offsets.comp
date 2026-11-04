@@ -1,0 +1,46 @@
+#version 450
+
+// Finish the candidate offsets (voxelize::detail::MeshBand): after the 256-way
+// scan (mesh_scan_*.comp) left each count as the exclusive prefix within its
+// group of 256 and the group prefixes in the first level, add the group's
+// prefix, so offsets[t] is the exclusive prefix of the whole mesh and
+// offsets[tri_count] the total.
+//
+// The invocation of the last slot also judges the mesh. A total past 2^32 --
+// a count that did not fit, or the scan's sticky carry -- writes a total of 0,
+// so every pass sized by it, on the device or the host, runs no item: nothing
+// reads a wrapped offset, and the host refuses once it reads the result. The
+// result is 16 bytes: the total, the triangles with candidates, the refusal
+// and the largest count.
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+layout(scalar, binding = 0) buffer Offsets { uint offsets[]; };
+layout(scalar, binding = 1) readonly buffer Groups { uvec4 groups[]; };
+layout(scalar, binding = 2) readonly buffer Root { uvec4 root; };
+layout(scalar, binding = 3) readonly buffer Flags { uint overflow; };
+layout(scalar, binding = 4) writeonly buffer Result { uvec4 result; };
+
+layout(push_constant, scalar) uniform Push {
+  uint size;       // tri_count + 1
+  uint tri_count;
+  uint item_base;  // the first slot this dispatch covers
+} pc;
+
+void main() {
+  uint t = pc.item_base + gl_GlobalInvocationID.x;
+  if (t >= pc.size) {
+    return;
+  }
+  uint offset = offsets[t] + groups[t / 256u].x;
+  if (t == pc.tri_count) {
+    uint refused = (root.w != 0u || overflow != 0u) ? 1u : 0u;
+    if (refused != 0u) {
+      offset = 0u;
+    }
+    result = uvec4(offset, root.y, refused, root.z);
+  }
+  offsets[t] = offset;
+}
