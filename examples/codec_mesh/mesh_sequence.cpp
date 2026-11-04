@@ -9,7 +9,6 @@
 
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/grid/mesh_io/mesh_io.hpp"
-#include "volumetric_kit/grid/volume/grid_growth.hpp"
 
 namespace vgrid_example {
 namespace {
@@ -272,37 +271,6 @@ vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence) {
   return result;
 }
 
-vkc::Result<vgrid::voxelize::MeshIntegrateStats> convert_frame(
-    vgrid::volume::VoxelBlockGrid& grid,
-    vgrid::voxelize::MeshIntegrator& integrator,
-    const mesh_io::TriangleMesh& mesh,
-    const vgrid::voxelize::MeshSdfParams& params, vkc::StageMetrics* metrics) {
-  VKC_TRY(grid.clear());
-  const auto vertices = std::uint32_t(mesh.positions.size());
-  const auto triangles = std::uint32_t(mesh.indices.size() / 3);
-  // Grow only for a capacity limit. Lost bucket-lock races leave a residue
-  // over a table with room, which a retry places: the mesh integrator refuses
-  // a band with a block missing.
-  for (int contended = 0;;) {
-    vgrid::volume::AllocFailures failures;
-    VKC_ASSIGN(const auto failed,
-               grid.map().allocate_from_triangles(
-                   mesh.positions.data(), vertices, mesh.indices.data(),
-                   triangles, &failures, metrics));
-    if (failed == 0) break;
-    if (!failures.capacity_limited()) {
-      if (++contended == 5) {
-        return vkc::Status::io_error(
-            "mesh allocation kept losing bucket-lock races");
-      }
-      continue;
-    }
-    VKC_TRY(vgrid::volume::grow_grid(grid));
-  }
-  return integrator.integrate(grid, mesh.positions.data(), vertices,
-                              mesh.indices.data(), triangles, params, metrics);
-}
-
 vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
                                    std::uint32_t number,
                                    vgrid::volume::VoxelBlockGrid& grid,
@@ -314,8 +282,13 @@ vkc::Result<CodedFrame> code_frame(const MeshSequence& sequence,
   VKC_ASSIGN(coded.frame, sequence.load(number));
   VKC_TRY(sequence.admit(number, coded.frame.topology));
   const std::string name = frame_name(number, coded.frame.path);
-  vkc::Result<vgrid::voxelize::MeshIntegrateStats> stats =
-      convert_frame(grid, integrator, coded.frame.mesh, params, conversion);
+  const mesh_io::TriangleMesh& mesh = coded.frame.mesh;
+  // One call empties the grid, allocates the band (growing the grid once if
+  // it does not fit) and writes it: two waits a frame once warm.
+  vkc::Result<vgrid::voxelize::MeshIntegrateStats> stats = integrator.convert(
+      grid, mesh.positions.data(), std::uint32_t(mesh.positions.size()),
+      mesh.indices.data(), std::uint32_t(mesh.indices.size() / 3), params,
+      conversion);
   if (!stats.ok()) return stats.status().with_context(name);
   coded.stats = *stats;
   vkc::Result<vgrid::codec_stream::SentFrame> recorded =

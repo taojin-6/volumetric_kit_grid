@@ -4,6 +4,7 @@
 #include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -16,6 +17,7 @@
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/grid/base/device_requirements.hpp"
 #include "volumetric_kit/grid/base/dispatch.hpp"
+#include "volumetric_kit/grid/volume/grid_growth.hpp"
 #include "volumetric_kit/grid/volume/hash_map_internal.hpp"
 
 #include "mesh_band.hpp"
@@ -35,7 +37,7 @@ using volume::AttributeView;
 using volume::VoxelBlockGrid;
 using volume::VoxelGridParams;
 
-constexpr const char* kWho = "MeshIntegrator::integrate";
+constexpr const char* kWho = "MeshIntegrator::convert";
 
 // Local group size, matching `layout(local_size_x = 256)` in the binning,
 // scan and compaction kernels; mesh_integrate.comp runs a workgroup per block.
@@ -44,6 +46,13 @@ constexpr std::uint32_t kLocalSize = 256;
 // their first and last starts, plus at most kMaxBinTriangles for the last bin.
 constexpr std::uint32_t kBinWindow = MeshIntegrator::kMaxDispatchBinEntries -
                                      MeshIntegrator::kMaxBinTriangles + 1;
+
+// The per-pair scratch a fresh integrator starts with, in pairs: one group's
+// worth, so its first call sizes it from the device's count.
+constexpr std::uint32_t kMinPairs = kLocalSize;
+// Runs of the first batch one call may take: each grows what the run before
+// found short -- the per-pair scratch, the index, the key windows, the grid.
+constexpr std::uint32_t kMaxRuns = 16;
 
 // mesh_bin.comp's pc.pass.
 constexpr std::uint32_t kPassCount = 0;
@@ -127,6 +136,11 @@ std::uint32_t group_count(std::uint32_t items) {
   return core::group_count(items, kLocalSize);
 }
 
+void bind(const core::ComputeKernel& kernel, std::uint32_t binding,
+          const core::Buffer& buffer) {
+  kernel.set.write_storage_buffer(binding, buffer.handle(), 0, VK_WHOLE_SIZE);
+}
+
 }  // namespace
 
 core::Status MeshSdfParams::validate(const VoxelGridParams& grid) const {
@@ -187,6 +201,8 @@ core::Result<MeshIntegrator> MeshIntegrator::create(
   VKC_TRY(kb.add(integ.bin_ranges_, "voxelize_mesh_bin_ranges",
                  vgrid_mesh_bin_ranges_comp_spv,
                  vgrid_mesh_bin_ranges_comp_spv_size, 3, &ranges_range));
+  VKC_TRY(volumetric_kit::grid::detail::add_dispatch_args(
+      kb, integ.pair_args_, "voxelize_mesh_pair_args"));
   VKC_ASSIGN(integ.pool_, kb.build());
   VKC_ASSIGN(integ.scan_, detail::MeshScan::create(device, allocator,
                                                    "voxelize.mesh_scan_level"));
@@ -221,172 +237,227 @@ core::Status MeshIntegrator::ensure_scratch(core::Buffer& buffer,
                                      max_storage_buffer_range_, name);
 }
 
-core::Result<MeshIntegrateStats> MeshIntegrator::integrate(
+core::Result<MeshIntegrateStats> MeshIntegrator::convert(
     VoxelBlockGrid& grid, const Vec3f* vertices, std::uint32_t vertex_count,
     const std::uint32_t* indices, std::uint32_t triangle_count,
     const MeshSdfParams& params, core::StageMetrics* metrics) {
   // Opened before the checks so a refused call still costs its row, as
   // TsdfIntegrator::integrate.
-  core::GpuStageScope stage(metrics, gpu_timer_, "mesh integrate");
+  core::GpuStageScope stage(metrics, gpu_timer_, "mesh convert");
   if (!valid()) {
     return core::Status::invalid_argument(std::string(kWho) +
                                           ": moved-from integrator");
   }
-  const VoxelGridParams& g = grid.grid();
-  VKC_TRY(params.validate(g));
+  VKC_TRY(params.validate(grid.grid()));
   const bool is_signed = params.mode == MeshSdfMode::Signed;
-  const float shell_m = params.shell_voxels * g.voxel_size;
-
-  VKC_ASSIGN(AttributeView tsdf_view, grid.attribute(volume::kTsdfAttribute));
-  VKC_ASSIGN(AttributeView weight_view,
-             grid.attribute(volume::kWeightAttribute));
-  if (tsdf_view.element_size != sizeof(float) ||
-      weight_view.element_size != sizeof(float)) {
-    return core::Status::invalid_argument(
-        std::string(kWho) + ": tsdf/weight attributes must be float");
+  const float shell_m = params.shell_voxels * grid.grid().voxel_size;
+  {
+    VKC_ASSIGN(const AttributeView tsdf_view,
+               grid.attribute(volume::kTsdfAttribute));
+    VKC_ASSIGN(const AttributeView weight_view,
+               grid.attribute(volume::kWeightAttribute));
+    if (tsdf_view.element_size != sizeof(float) ||
+        weight_view.element_size != sizeof(float)) {
+      return core::Status::invalid_argument(
+          std::string(kWho) + ": tsdf/weight attributes must be float");
+    }
   }
-  if (static_cast<std::uint32_t>(g.voxels_per_block) > kMaxVoxelsPerBlock) {
+  if (static_cast<std::uint32_t>(grid.grid().voxels_per_block) >
+      kMaxVoxelsPerBlock) {
     return core::Status::invalid_argument(
         std::string(kWho) + ": voxels_per_block exceeds kMaxVoxelsPerBlock (" +
         std::to_string(kMaxVoxelsPerBlock) + "), what one workgroup writes");
   }
+  // The host's checks -- every index among them -- and the mesh's buffers.
+  VKC_TRY(band_->set_mesh(grid.grid(), vertices, vertex_count, indices,
+                          triangle_count, kWho));
+  // Nothing the host can refuse is left: the call is one tick from here.
+  grid.map().advance_tick();
 
   MeshIntegrateStats stats;
-  if (triangle_count == 0) {
-    return stats;
-  }
-
-  // The mesh goes to the device once, and its candidate offsets are counted
-  // there: the decomposition allocate_from_triangles dispatched over. The
-  // host checks every index first.
-  VKC_TRY(band_->set_mesh(g, vertices, vertex_count, indices, triangle_count,
-                          kWho));
-  {
-    core::CommandBatch batch(*device_, *allocator_);
-    VKC_TRY(band_->record_count(batch, &stage));
-    VKC_TRY(batch.submit());
-  }
-  VKC_TRY(band_->settle_count(kWho));
-  const std::uint32_t work_items = band_->total();
-  if (work_items == 0) {
-    return stats;  // every triangle degenerate or non-finite
-  }
-  stats.triangles = band_->used_triangles();
-
-  // The scratch is per-call and bound whole, so each is checked against what
-  // one binding may cover. The hash entries are the one buffer another tier
-  // sized, and are bound with their real range.
-  const auto num_blocks = static_cast<std::uint32_t>(g.num_blocks);
-  const VkDeviceSize count_bytes =
-      VkDeviceSize(num_blocks) * sizeof(std::uint32_t);
-  const VkDeviceSize coord_bytes = VkDeviceSize(num_blocks) * sizeof(Vec3i);
-  const VkDeviceSize entries_bytes =
-      volume::VoxelHashMap::Internal::entries_buffer_size(grid.map());
-  const VkDeviceSize item_bytes =
-      VkDeviceSize(work_items) * sizeof(std::uint32_t);
-  const struct {
-    const char* what;
-    VkDeviceSize bytes;
-  } ranges[] = {
-      {"the bin counts", count_bytes},
-      {"the bin coordinates", coord_bytes},
-      {"the hash entries", entries_bytes},
-      {"the work-item slots", item_bytes},
-  };
-  for (const auto& r : ranges) {
-    VKC_TRY(core::check_storage_buffer_range(
-        (std::string(kWho) + ": " + r.what).c_str(), r.bytes,
-        max_storage_buffer_range_));
-  }
-
-  // All bulk storage is retained. Only the count/reset state is refreshed,
-  // including when a different mesh or grid fits the same capacity.
-  VKC_TRY(ensure_scratch(counts_, count_bytes, "voxelize.mesh_bin_counts"));
-  VKC_TRY(
-      ensure_scratch(coordinates_, coord_bytes, "voxelize.mesh_coordinates"));
-  VKC_TRY(ensure_scratch(item_slots_, item_bytes, "voxelize.mesh_item_slots"));
-  VKC_TRY(scan_->prepare(counts_, num_blocks));
-  const auto vpb = static_cast<std::uint32_t>(g.voxels_per_block);
-  // Candidate work is an upper bound on bin entries. These 8-byte ranges
-  // therefore fit in <=34,960 bytes even for UINT32_MAX candidates. Reading
-  // the upper bound lets validation and chunk planning share one submission.
-  const std::uint32_t range_count = 1u + (work_items - 1u) / kBinWindow;
-  const VkDeviceSize range_bytes = VkDeviceSize(range_count) * sizeof(BinRange);
-  VKC_TRY(
-      ensure_scratch(ranges_, range_bytes, "voxelize.mesh_dispatch_ranges"));
-  // A compact list needs no full-capacity reservation. If this guess is short,
-  // the GPU leaves local prefixes intact and only compaction/ranges retry.
-  VKC_TRY(ensure_scratch(
-      blocks_, VkDeviceSize(std::min(num_blocks, 4096u)) * sizeof(MeshBin),
-      "voxelize.mesh_blocks"));
-
-  const auto bind = [](core::ComputeKernel& kernel, std::uint32_t binding,
-                       const core::Buffer& buffer) {
-    kernel.set.write_storage_buffer(binding, buffer.handle(), 0, VK_WHOLE_SIZE);
-  };
-  bin_.set.write_storage_buffer(
-      0, volume::VoxelHashMap::Internal::entries_buffer(grid.map()), 0,
-      entries_bytes);
-  bind(bin_, 1, band_->vertex_buffer());
-  bind(bin_, 2, band_->index_buffer());
-  bind(bin_, 3, band_->offset_buffer());
-  bind(bin_, 4, counts_);
-  bind(bin_, 5, item_slots_);
-  bind(bin_, 6, coordinates_);
-  bind(bin_, 8, dummy_);
-  bind(compact_bins_, 0, counts_);
-  bind(compact_bins_, 1, scan_->first());
-  bind(compact_bins_, 2, scan_->root());
-  bind(compact_bins_, 3, blocks_);
-  bind(bin_ranges_, 0, blocks_);
-  bind(bin_ranges_, 1, scan_->root());
-  bind(bin_ranges_, 2, ranges_);
-
-  std::vector<BinRange> dispatch_ranges(range_count);
-  const auto compact = [&](core::CommandBatch& batch) -> core::Status {
-    const auto capacity =
-        static_cast<std::uint32_t>(blocks_.size() / sizeof(MeshBin));
-    const std::uint32_t groups = group_count(num_blocks);
-    for (std::uint32_t first = 0; first < groups;) {
-      const std::uint32_t n = std::min(groups - first, max_workgroup_count_x_);
-      const CompactPush push{num_blocks, vpb, capacity, kMaxBinTriangles,
-                             first};
-      VKC_TRY(batch.dispatch(compact_bins_, &push, sizeof(push), n,
-                             max_workgroup_count_x_, &stage));
-      first += n;
-    }
-    const RangesPush push{range_count, capacity, kBinWindow, kMaxBinTriangles};
-    VKC_TRY(batch.dispatch(bin_ranges_, &push, sizeof(push),
-                           group_count(range_count), max_workgroup_count_x_,
-                           &stage));
-    VKC_TRY(batch.readback(ranges_, 0, range_bytes, dispatch_ranges.data()));
-    return {};
-  };
-
   ScanSummary summary{};
-  std::uint32_t missing = 0;
+  std::vector<BinRange> dispatch_ranges;
   {
-    core::CommandBatch batch(*device_, *allocator_);
-    VKC_TRY(batch.fill(counts_, 0, count_bytes, 0u));
-    VKC_TRY(batch.fill(missing_, 0, sizeof(missing), 0u));
-    const BinPush push{g, triangle_count, kPassCount};
-    VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
-        batch, bin_, push, work_items, kLocalSize, max_workgroup_count_x_,
-        &stage));
-    VKC_TRY(scan_->record(batch, num_blocks, &stage));
-    VKC_TRY(compact(batch));
-    VKC_TRY(batch.readback(missing_, 0, sizeof(missing), &missing));
-    VKC_TRY(batch.readback(scan_->root(), 0, sizeof(summary), &summary));
-    VKC_TRY(batch.submit());
-  }
-  if (missing != 0) {
-    return core::Status::invalid_argument(
-        std::string(kWho) +
-        ": the band reaches blocks that are not allocated (" +
-        std::to_string(missing) +
-        " triangle-block pair(s) found none); run "
-        "VoxelHashMap::allocate_from_triangles with this mesh first, and "
-        "check it reported no failures");
+    core::GpuStageScope allocate(metrics, gpu_timer_, "  ..allocate");
+    if (triangle_count == 0) {
+      core::CommandBatch batch(*device_, *allocator_);
+      VKC_TRY(grid.record_clear(batch, &allocate));
+      VKC_TRY(batch.submit());
+      return stats;
+    }
+    // The first batch: the mesh's count, the clear, the band index and its
+    // insert, and the write's plan. Its first run sizes its pair passes on
+    // the device, at the per-pair scratch retained; a run again, for what
+    // the first could not hold, sizes them on the host.
+    bool grown = false;
+    for (std::uint32_t run = 0;; ++run) {
+      if (run == kMaxRuns) {
+        return core::Status::io_error(std::string(kWho) +
+                                      ": the first batch kept running again");
+      }
+      const bool first = run == 0;
+      const VoxelGridParams& g = grid.grid();  // a grow replaces it
+      const auto num_blocks = static_cast<std::uint32_t>(g.num_blocks);
+      const auto vpb = static_cast<std::uint32_t>(g.voxels_per_block);
+      const VkDeviceSize count_bytes =
+          VkDeviceSize(num_blocks) * sizeof(std::uint32_t);
+      const VkDeviceSize coord_bytes = VkDeviceSize(num_blocks) * sizeof(Vec3i);
+      const VkDeviceSize block_bytes =
+          VkDeviceSize(num_blocks) * sizeof(MeshBin);
+      const VkDeviceSize entries_bytes =
+          volume::VoxelHashMap::Internal::entries_buffer_size(grid.map());
+      const struct {
+        const char* what;
+        VkDeviceSize bytes;
+      } ranges[] = {
+          {"the bin counts", count_bytes},
+          {"the bin coordinates", coord_bytes},
+          {"the block list", block_bytes},
+          {"the hash entries", entries_bytes},
+      };
+      for (const auto& r : ranges) {
+        VKC_TRY(core::check_storage_buffer_range(
+            (std::string(kWho) + ": " + r.what).c_str(), r.bytes,
+            max_storage_buffer_range_));
+      }
+      // The pair passes' bound: the per-pair scratch's items, whole groups
+      // of them, on the first run; the settled total after.
+      VKC_TRY(ensure_scratch(item_slots_,
+                             VkDeviceSize(first ? kMinPairs : band_->total()) *
+                                 sizeof(std::uint32_t),
+                             "voxelize.mesh_item_slots"));
+      const std::uint32_t pairs =
+          first ? static_cast<std::uint32_t>(std::min<VkDeviceSize>(
+                      item_slots_.size() / sizeof(std::uint32_t) /
+                          kLocalSize * kLocalSize,
+                      0xFFFFFF00u))
+                : band_->total();
+      const std::uint32_t test_window = detail::test_write_range_window();
+      const std::uint32_t window = test_window != 0 ? test_window : kBinWindow;
+      // Bin entries are at most the pairs, so these 8-byte ranges cover them.
+      const std::uint32_t range_count = 1u + (std::max(pairs, 1u) - 1u) / window;
+      const VkDeviceSize range_bytes =
+          VkDeviceSize(range_count) * sizeof(BinRange);
+      // Every buffer the batch binds is grown before the clear is recorded.
+      VKC_TRY(ensure_scratch(counts_, count_bytes, "voxelize.mesh_bin_counts"));
+      VKC_TRY(ensure_scratch(coordinates_, coord_bytes,
+                             "voxelize.mesh_coordinates"));
+      VKC_TRY(ensure_scratch(blocks_, block_bytes, "voxelize.mesh_blocks"));
+      VKC_TRY(ensure_scratch(ranges_, range_bytes,
+                             "voxelize.mesh_dispatch_ranges"));
+      VKC_TRY(scan_->prepare(counts_, num_blocks));
+      VKC_TRY(band_->prepare_index(g));
+
+      bin_.set.write_storage_buffer(
+          0, volume::VoxelHashMap::Internal::entries_buffer(grid.map()), 0,
+          entries_bytes);
+      bind(bin_, 1, band_->vertex_buffer());
+      bind(bin_, 2, band_->index_buffer());
+      bind(bin_, 3, band_->offset_buffer());
+      bind(bin_, 4, counts_);
+      bind(bin_, 5, item_slots_);
+      bind(bin_, 6, coordinates_);
+      bind(bin_, 8, dummy_);
+      bind(compact_bins_, 0, counts_);
+      bind(compact_bins_, 1, scan_->first());
+      bind(compact_bins_, 2, scan_->root());
+      bind(compact_bins_, 3, blocks_);
+      bind(bin_ranges_, 0, blocks_);
+      bind(bin_ranges_, 1, scan_->root());
+      bind(bin_ranges_, 2, ranges_);
+
+      dispatch_ranges.assign(range_count, BinRange{});
+      std::uint32_t missing = 0;
+      volume::AllocFailures failed;
+      {
+        core::CommandBatch batch(*device_, *allocator_);
+        volumetric_kit::grid::detail::IndirectSlices slices{};
+        if (first) {
+          VKC_TRY(band_->record_count(batch, &allocate));
+          volumetric_kit::grid::detail::SlicedCount total{};
+          total.buffer = &band_->offset_buffer();
+          total.offset = VkDeviceSize(triangle_count) * sizeof(std::uint32_t);
+          total.bound = pairs;
+          VKC_TRY(volumetric_kit::grid::detail::record_dispatch_args(
+              batch, *device_, *allocator_, pair_args_, pair_slices_,
+              "voxelize.mesh_pair_slices", total, kLocalSize, &slices, 0,
+              nullptr, max_workgroup_count_x_, &allocate));
+          VKC_TRY(grid.record_clear(batch, &allocate));
+        }
+        VKC_ASSIGN(const volume::RecordedRounds placed,
+                   band_->record_index(batch, grid.map(),
+                                       first ? &slices : nullptr, &allocate));
+        VKC_TRY(batch.fill(counts_, 0, count_bytes, 0u));
+        VKC_TRY(batch.fill(missing_, 0, sizeof(missing), 0u));
+        const BinPush count_push{g, triangle_count, kPassCount};
+        if (first) {
+          VKC_TRY(volumetric_kit::grid::detail::dispatch_slices(
+              batch, bin_, count_push, slices, &allocate));
+        } else {
+          VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
+              batch, bin_, count_push, pairs, kLocalSize,
+              max_workgroup_count_x_, &allocate));
+        }
+        VKC_TRY(scan_->record(batch, num_blocks, &allocate));
+        const std::uint32_t groups = group_count(num_blocks);
+        for (std::uint32_t at = 0; at < groups;) {
+          const std::uint32_t n = std::min(groups - at, max_workgroup_count_x_);
+          const CompactPush push{num_blocks, vpb, num_blocks, kMaxBinTriangles,
+                                 at};
+          VKC_TRY(batch.dispatch(compact_bins_, &push, sizeof(push), n,
+                                 max_workgroup_count_x_, &allocate));
+          at += n;
+        }
+        const RangesPush ranges_push{range_count, num_blocks, window,
+                                     kMaxBinTriangles};
+        VKC_TRY(batch.dispatch(bin_ranges_, &ranges_push, sizeof(ranges_push),
+                               group_count(range_count), max_workgroup_count_x_,
+                               &allocate));
+        VKC_TRY(batch.readback(ranges_, 0, range_bytes, dispatch_ranges.data()));
+        VKC_TRY(batch.readback(missing_, 0, sizeof(missing), &missing));
+        VKC_TRY(batch.readback(scan_->root(), 0, sizeof(summary), &summary));
+        VKC_TRY(batch.submit());
+        VKC_ASSIGN(failed, grid.map().settle(placed));
+      }
+      // Found on the device, after the clear: the grid holds no observed
+      // voxel when any of these refuses.
+      VKC_TRY(band_->settle_count(kWho));
+      const std::uint32_t total = band_->total();
+      if (total == 0) return stats;  // every triangle degenerate or not finite
+      if (band_->index_overflowed()) {
+        VKC_TRY(band_->grow_index(kWho));
+        continue;
+      }
+      bool again = first && band_->spans_windows();
+      if (total > pairs) {
+        VKC_TRY(core::check_storage_buffer_range(
+            (std::string(kWho) + ": the per-pair scratch").c_str(),
+            VkDeviceSize(total) * sizeof(std::uint32_t),
+            max_storage_buffer_range_));
+        again = true;
+      }
+      if (again) continue;
+      if (failed.capacity_limited()) {
+        // Once to the band's need, then a doubling for a chain still full.
+        std::int32_t at_least = 0;
+        if (!grown) {
+          const double blocks = std::ceil(double(band_->band_blocks()) /
+                                          volume::VoxelHashMap::kGrowThreshold);
+          at_least = static_cast<std::int32_t>(std::min(
+              std::ceil(blocks / double(g.bucket_size)), double(INT32_MAX)));
+        }
+        VKC_TRY(volume::grow_grid(grid, at_least));
+        grown = true;
+        continue;
+      }
+      if (missing != 0) {
+        return core::Status::io_error(
+            std::string(kWho) + ": " + std::to_string(missing) +
+            " band pair(s) found no block after the band was placed");
+      }
+      stats.triangles = band_->used_triangles();
+      break;
+    }
   }
   if (summary.overflow != 0) {
     return core::Status::invalid_argument(std::string(kWho) +
@@ -404,24 +475,16 @@ core::Result<MeshIntegrateStats> MeshIntegrator::integrate(
   }
   const VkDeviceSize bins_bytes =
       VkDeviceSize(summary.entries) * sizeof(std::uint32_t);
-  const VkDeviceSize block_bytes =
-      VkDeviceSize(summary.blocks) * sizeof(MeshBin);
   VKC_TRY(core::check_storage_buffer_range(
       (std::string(kWho) + ": the bins").c_str(), bins_bytes,
       max_storage_buffer_range_));
-  VKC_TRY(core::check_storage_buffer_range(
-      (std::string(kWho) + ": the block list").c_str(), block_bytes,
-      max_storage_buffer_range_));
-  if (blocks_.size() < block_bytes) {
-    VKC_TRY(ensure_scratch(blocks_, block_bytes, "voxelize.mesh_blocks"));
-    bind(compact_bins_, 3, blocks_);
-    bind(bin_ranges_, 0, blocks_);
-    core::CommandBatch batch(*device_, *allocator_);
-    VKC_TRY(compact(batch));
-    VKC_TRY(batch.submit());
-  }
   VKC_TRY(ensure_scratch(bins_, bins_bytes, "voxelize.mesh_bins"));
 
+  const VoxelGridParams& g = grid.grid();
+  VKC_ASSIGN(const AttributeView tsdf_view,
+             grid.attribute(volume::kTsdfAttribute));
+  VKC_ASSIGN(const AttributeView weight_view,
+             grid.attribute(volume::kWeightAttribute));
   bind(bin_, 8, bins_);
   bind(integrate_, 0, *tsdf_view.buffer);
   bind(integrate_, 1, *weight_view.buffer);
@@ -431,13 +494,29 @@ core::Result<MeshIntegrateStats> MeshIntegrator::integrate(
   bind(integrate_, 5, bins_);
   bind(integrate_, 6, coordinates_);
   bind(integrate_, 7, grid.map().stamps_buffer());
-  grid.map().advance_tick();
   const std::uint32_t tick = grid.map().tick();
 
   // Every range satisfies the entry budget. Splitting further for the device's
   // workgroup-count limit (mesh_integrate.comp runs a workgroup per block)
-  // only reduces its work. Keep one submission per write, with the fill in
-  // the first: combining them would undo the watchdog contract.
+  // only reduces its work. One submission per range, with the fill in the
+  // first: combining them would undo the watchdog contract. They go to the
+  // queue without a host wait between them -- each batch's closing barrier
+  // orders the next one's commands after its own -- and the call waits once,
+  // for the last, after which each earlier batch's wait finds its work done.
+  core::GpuStageScope write(metrics, gpu_timer_, "  ..write");
+  std::uint32_t submissions = 0;
+  for (const BinRange& range : dispatch_ranges) {
+    submissions += (range.count + max_workgroup_count_x_ - 1) /
+                   max_workgroup_count_x_;
+  }
+  // Each pending submission keeps its query range until its wait reads it.
+  if (metrics != nullptr && submissions > 8) {
+    VKC_TRY(gpu_timer_.reserve(
+        *device_, std::min<std::uint32_t>(core::GpuTimer::kMaxSpans,
+                                          4 * submissions + 16)));
+  }
+  std::vector<core::PendingBatch> pending;
+  pending.reserve(submissions);
   const BinPush fill_push{g, triangle_count, kPassFill};
   for (const BinRange& range : dispatch_ranges) {
     for (std::uint32_t offset = 0; offset < range.count;) {
@@ -446,8 +525,8 @@ core::Result<MeshIntegrateStats> MeshIntegrator::integrate(
       core::CommandBatch batch(*device_, *allocator_);
       if (stats.dispatches == 0) {
         VKC_TRY(volumetric_kit::grid::detail::dispatch_items(
-            batch, bin_, fill_push, work_items, kLocalSize,
-            max_workgroup_count_x_, &stage));
+            batch, bin_, fill_push, band_->total(), kLocalSize,
+            max_workgroup_count_x_, &write));
       }
       const IntegratePush push{g,
                                range.first + offset,
@@ -456,11 +535,17 @@ core::Result<MeshIntegrateStats> MeshIntegrator::integrate(
                                is_signed ? 0.0f : shell_m,
                                tick};
       VKC_TRY(batch.dispatch(integrate_, &push, sizeof(push), n,
-                             max_workgroup_count_x_, &stage));
-      VKC_TRY(batch.submit());
+                             max_workgroup_count_x_, &write));
+      VKC_ASSIGN(core::PendingBatch submitted, batch.submit_async({}, {}));
+      pending.push_back(std::move(submitted));
       ++stats.dispatches;
       offset += n;
     }
+  }
+  if (!pending.empty()) VKC_TRY(pending.back().wait());
+  for (core::PendingBatch& done : pending) {
+    VKC_TRY(done.wait());
+    if (metrics != nullptr) metrics->merge_device(done.device_rows());
   }
   stats.blocks = summary.blocks;
   stats.bin_entries = summary.entries;

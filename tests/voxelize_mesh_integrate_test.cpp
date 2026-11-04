@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Tao Jin
 
-// GPU test for mesh -> TSDF. Every voxel of every block the band reaches is
-// checked against a brute-force HOST reference that shares nothing with the
-// kernel but the contract:
+// GPU test for MeshIntegrator::convert, mesh -> TSDF. Every voxel of every
+// block the band reaches is checked against a brute-force HOST reference that
+// shares nothing with the kernel but the contract:
 //
 //   - distance: an independent closest point (barycentric projection with an
 //     edge clamp, not the shader's region test), minimised over EVERY triangle
@@ -21,10 +21,16 @@
 // rim, since there is no topology to find one. A soup must write the same bytes
 // as its indexed mesh, and the same mesh twice the same bytes. A triangle under
 // a millimetre across checks the closest point has no size threshold, and a
-// finely divided sheet splits the write across dispatches. Then every refusal,
-// each checked to leave the grid untouched. Skips where no device is
-// present.
+// finely divided sheet splits the write across dispatches; a small mesh
+// written in three ranges or more (a test seam) writes the bytes one range
+// does. A call is two submits past its ranges on a fresh integrator and one
+// on a warm one, with at most two blocking waits; it is one tick, every band
+// block requested and changed at it. Each call empties the grid first: a
+// frame equals a fresh grid's, a 2-bucket grid grows, a degenerate mesh leaves
+// it empty. A refusal the host finds leaves the grid untouched; one the device
+// finds leaves no observed voxel. Skips where no device is present.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +57,7 @@
 #include "volumetric_kit/grid/volume/voxel_coords.hpp"
 #include "volumetric_kit/grid/volume/voxel_grid.hpp"
 #include "volumetric_kit/grid/volume/voxel_hash_map.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_band.hpp"
 #include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
@@ -366,18 +373,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vx::MeshIntegrator integ = std::move(integ_r).value();
   CHECK(integ.valid());
 
-  // Allocate `m`'s band into a cleared grid, then write it.
   auto convert = [&](const Mesh& m, const vx::MeshSdfParams& params)
       -> vkc::Result<vx::MeshIntegrateStats> {
-    VKC_TRY(grid.clear());
-    VKC_ASSIGN(std::uint32_t failed, grid.map().allocate_from_triangles(
-                                         m.v.data(), m.vertex_count(),
-                                         m.i.data(), m.triangle_count()));
-    if (failed != 0) {
-      return vkc::Status::out_of_memory("allocate_from_triangles failed");
-    }
-    return integ.integrate(grid, m.v.data(), m.vertex_count(), m.i.data(),
-                           m.triangle_count(), params);
+    return integ.convert(grid, m.v.data(), m.vertex_count(), m.i.data(),
+                         m.triangle_count(), params);
   };
   const vx::MeshSdfParams kSigned{vx::MeshSdfMode::Signed, 1.5f};
   const vx::MeshSdfParams kShell{vx::MeshSdfMode::Shell, 1.5f};
@@ -414,12 +413,11 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(tet_sign_checked < tet_observed);  // the sharp edges are exercised
 
   // ---- 2. Same mesh, same bytes ------------------------------------------
-  // And every block written stamped changed, at a tick of the call's own.
+  // And the call is one tick: every band block requested and changed at it,
+  // every other slot's record zeroed by the clear.
   const std::map<Coord, std::vector<float>> tet_bytes = by_coord(gpu, grid);
   const std::uint32_t tick_before = grid.map().tick();
-  vkc::Result<vx::MeshIntegrateStats> again =
-      integ.integrate(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
-                      tet.triangle_count(), kSigned);
+  vkc::Result<vx::MeshIntegrateStats> again = convert(tet, kSigned);
   CHECK(again.ok());
   CHECK(by_coord(gpu, grid) == tet_bytes);
   CHECK(grid.map().tick() == tick_before + 1);
@@ -427,9 +425,20 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vkc::Result<std::vector<vol::BlockStamp>> st =
         grid.map().read_block_stamps();
     CHECK(st.ok());
+    std::vector<bool> band(st.value().size(), false);
+    for (const vol::BlockIndex& b : active_blocks(grid)) {
+      band[std::size_t(b.ptr / gp.voxels_per_block)] = true;
+    }
     std::uint32_t stamped = 0;
-    for (const vol::BlockStamp& s : st.value()) {
-      stamped += s.changed == grid.map().tick() ? 1u : 0u;
+    for (std::size_t slot = 0; slot < band.size(); ++slot) {
+      const vol::BlockStamp& st_slot = st.value()[slot];
+      if (band[slot]) {
+        CHECK(st_slot.requested == grid.map().tick() &&
+              st_slot.changed == st_slot.requested);
+        ++stamped;
+      } else {
+        CHECK(st_slot.requested == 0 && st_slot.changed == 0);
+      }
     }
     CHECK(stamped == again.value().blocks);
   }
@@ -587,52 +596,139 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     }
   }
 
-  // ---- 8. Blocks the band does not reach keep what they held ------------
-  CHECK(grid.clear().ok());
+  // ---- 8. Each call empties the grid first --------------------------------
+  // A block the band does not reach goes, its values with it.
   const vol::BlockIndex far_block{vgrid::Vec3i(40, 40, 40), 0};
   CHECK(vgrid_test::allocate_blocks(gpu, grid.map(), &far_block, 1).ok());
-  std::int32_t far_ptr = -1;
-  for (const vol::BlockIndex& b : active_blocks(grid)) far_ptr = b.ptr;
-  CHECK(far_ptr >= 0);
   {
     std::vector<float> tsdf = attr(gpu, grid, vol::kTsdfAttribute);
-    std::vector<float> weight = attr(gpu, grid, vol::kWeightAttribute);
-    for (int k = 0; k < gp.voxels_per_block; ++k) {
-      tsdf[far_ptr + k] = 7.0f;
-      weight[far_ptr + k] = 7.0f;
-    }
+    std::fill(tsdf.begin(), tsdf.end(), 7.0f);
     CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
                                       vol::kTsdfAttribute, tsdf)
               .ok());
-    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
-                                      vol::kWeightAttribute, weight)
-              .ok());
   }
-  CHECK(grid.map()
-            .allocate_from_triangles(tet.v.data(), tet.vertex_count(),
-                                     tet.i.data(), tet.triangle_count())
-            .ok());
-  vkc::Result<vx::MeshIntegrateStats> beside =
-      integ.integrate(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
-                      tet.triangle_count(), kSigned);
-  CHECK(beside.ok());
-  CHECK(beside.value().blocks == active_blocks(grid).size() - 1);
+  vkc::Result<vx::MeshIntegrateStats> alone = convert(tet, kSigned);
+  CHECK(alone.ok());
+  CHECK(alone.value().blocks == active_blocks(grid).size());
+  CHECK(by_coord(gpu, grid) == tet_bytes);
+  for (const vol::BlockIndex& b : active_blocks(grid)) {
+    CHECK(b.coord != far_block.coord);
+  }
+  // Each frame equals what a fresh grid holds, whatever the frame before
+  // left; and a 2-bucket grid, which the first band does not fit, grows.
   {
-    const std::vector<float> tsdf = attr(gpu, grid, vol::kTsdfAttribute);
-    const std::vector<float> weight = attr(gpu, grid, vol::kWeightAttribute);
-    for (int k = 0; k < gp.voxels_per_block; ++k) {
-      CHECK(tsdf[far_ptr + k] == 7.0f);
-      CHECK(weight[far_ptr + k] == 7.0f);
+    const Mesh a =
+        test_meshes::cube(vgrid::Vec3f(0.013f, 0.021f, 0.007f), 0.06f);
+    const Mesh b =
+        test_meshes::cube(vgrid::Vec3f(0.513f, 0.021f, 0.007f), 0.06f);
+    vol::VoxelGridParams two = gp;
+    two.num_buckets = 2;
+    two.num_blocks = 16;
+    const auto fresh_grid = [&]() {
+      return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, two, attrs,
+                                         2);
+    };
+    const auto only = [&](const Mesh& m) {
+      vkc::Result<vol::VoxelBlockGrid> fresh = fresh_grid();
+      if (!fresh.ok() ||
+          !integ
+               .convert(*fresh, m.v.data(), m.vertex_count(), m.i.data(),
+                        m.triangle_count(), kSigned)
+               .ok()) {
+        return std::map<Coord, std::vector<float>>{};
+      }
+      return by_coord(gpu, *fresh);
+    };
+    const std::map<Coord, std::vector<float>> only_a = only(a);
+    const std::map<Coord, std::vector<float>> only_b = only(b);
+    CHECK(!only_a.empty() && !only_b.empty() && only_a != only_b);
+    vkc::Result<vol::VoxelBlockGrid> frames = fresh_grid();
+    CHECK(frames.ok());
+    for (const Mesh* m : {&a, &b, &a}) {
+      vkc::Result<vx::MeshIntegrateStats> stats =
+          integ.convert(*frames, m->v.data(), m->vertex_count(), m->i.data(),
+                        m->triangle_count(), kSigned);
+      CHECK(stats.ok() && stats->blocks > 0);
+      CHECK(by_coord(gpu, *frames) == (m == &a ? only_a : only_b));
+    }
+    CHECK(frames->grid().num_buckets > two.num_buckets);
+  }
+  // A mesh of degenerate triangles only, or of none, still empties it.
+  {
+    Mesh flat;
+    flat.v = {{0.1f, 0.1f, 0.1f}, {0.2f, 0.1f, 0.1f}, {0.3f, 0.1f, 0.1f}};
+    flat.i = {0, 1, 2, 0, 0, 1};
+    for (const std::uint32_t triangles : {2u, 0u}) {
+      CHECK(convert(tet, kSigned).ok() && !active_blocks(grid).empty());
+      vkc::Result<vx::MeshIntegrateStats> none =
+          integ.convert(grid, flat.v.data(), flat.vertex_count(),
+                        flat.i.data(), triangles, kSigned);
+      CHECK(none.ok() && none.value().blocks == 0 &&
+            none.value().triangles == 0);
+      CHECK(active_blocks(grid).empty());
+      for (const float w : attr(gpu, grid, vol::kWeightAttribute)) {
+        CHECK(w == 0.0f);
+      }
     }
   }
 
-  // ---- 9. Refusals, each before the grid is written ---------------------
+  // ---- 9. The submits and waits, and the first batch run again -------------
+  // A warm call: one submit for the first batch and one a range, and at most
+  // two waits that found the work unfinished. A fresh integrator's first call
+  // runs the first batch again for its per-pair scratch -- one submit more --
+  // and writes the same bytes.
+  {
+    const Mesh sheet =
+        divided_quad(-0.187f, 0.213f, -0.193f, 0.207f, 0.052f, 120);
+    CHECK(convert(sheet, kSigned).ok());
+    const std::map<Coord, std::vector<float>> warm_bytes = by_coord(gpu, grid);
+    const vkc::DeviceCounters before = gpu.device.counters();
+    vkc::Result<vx::MeshIntegrateStats> warm = convert(sheet, kSigned);
+    const vkc::DeviceCounters after = gpu.device.counters();
+    CHECK(warm.ok() && warm->dispatches >= 1);
+    CHECK(after.submits - before.submits == 1 + warm->dispatches);
+    CHECK(after.host_waits - before.host_waits <= 2);
+    CHECK(by_coord(gpu, grid) == warm_bytes);
+    vkc::Result<vx::MeshIntegrator> fresh =
+        vx::MeshIntegrator::create(gpu.device, gpu.allocator);
+    CHECK(fresh.ok());
+    const vkc::DeviceCounters first_before = gpu.device.counters();
+    vkc::Result<vx::MeshIntegrateStats> first =
+        fresh->convert(grid, sheet.v.data(), sheet.vertex_count(),
+                       sheet.i.data(), sheet.triangle_count(), kSigned);
+    const vkc::DeviceCounters first_after = gpu.device.counters();
+    CHECK(first.ok());
+    CHECK(first_after.submits - first_before.submits == 2 + first->dispatches);
+    CHECK(by_coord(gpu, grid) == warm_bytes);
+
+    // Written in three ranges or more, through the test seam's window, the
+    // sheet writes the bytes one range does, and the reference's.
+    vx::detail::set_test_write_range_window(warm->bin_entries / 4);
+    vkc::Result<vx::MeshIntegrateStats> split = convert(sheet, kSigned);
+    vx::detail::set_test_write_range_window(0);
+    CHECK(split.ok() && split->dispatches >= 3 && warm->dispatches == 1);
+    CHECK(split->bin_entries == warm->bin_entries);
+    CHECK(by_coord(gpu, grid) == warm_bytes);
+    if (verify(gpu, grid, "signed sheet, in ranges", [&](vgrid::Vec3f p) {
+          return signed_sheets(p, {{-0.187f, 0.213f, -0.193f, 0.207f}}, 0.052f,
+                               trunc);
+        }) != 0) {
+      return 1;
+    }
+    std::printf("sheet: %u range(s) warm, %u through the seam\n",
+                warm->dispatches, split->dispatches);
+  }
+
+  // ---- 10. Refusals ------------------------------------------------------
+  // One the host finds leaves the grid as it was: every block, every value
+  // and the epoch.
   auto refused = [&](const Mesh& m, const vx::MeshSdfParams& params,
                      const char* needle) -> bool {
     const std::vector<float> before = snapshot(gpu, grid);
+    const std::uint64_t epoch = grid.topology_epoch();
     vkc::Result<vx::MeshIntegrateStats> r =
-        integ.integrate(grid, m.v.data(), m.vertex_count(), m.i.data(),
-                        m.triangle_count(), params);
+        integ.convert(grid, m.v.data(), m.vertex_count(), m.i.data(),
+                      m.triangle_count(), params);
     if (r.ok()) {
       std::fprintf(stderr, "expected a refusal containing \"%s\"\n", needle);
       return false;
@@ -642,33 +738,36 @@ int gpu_main(vkc::test::GpuContext& gpu) {
                    r.status().message().c_str(), needle);
       return false;
     }
-    return snapshot(gpu, grid) == before;
+    return snapshot(gpu, grid) == before && grid.topology_epoch() == epoch;
   };
 
-  // A band that was never allocated.
-  CHECK(grid.clear().ok());
-  CHECK(refused(tet, kSigned, "not allocated"));
-  // One block of it missing.
-  CHECK(grid.map()
-            .allocate_from_triangles(tet.v.data(), tet.vertex_count(),
-                                     tet.i.data(), tet.triangle_count())
-            .ok());
+  // An index past the vertices: every block and value kept, set to 0.25 and
+  // 1.0 so a zeroing would show.
   {
+    CHECK(convert(tet, kSigned).ok());
     const std::vector<vol::BlockIndex> band = active_blocks(grid);
-    CHECK(!band.empty());
-    CHECK(vgrid_test::remove_blocks(gpu, grid, &band[band.size() / 2], 1).ok());
+    std::vector<float> tsdf = attr(gpu, grid, vol::kTsdfAttribute);
+    std::vector<float> weight = attr(gpu, grid, vol::kWeightAttribute);
+    std::fill(tsdf.begin(), tsdf.end(), 0.25f);
+    std::fill(weight.begin(), weight.end(), 1.0f);
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kTsdfAttribute, tsdf)
+              .ok());
+    CHECK(vgrid_test::write_attribute(gpu.device, gpu.allocator, grid,
+                                      vol::kWeightAttribute, weight)
+              .ok());
+    Mesh bad = tet;
+    bad.i[7] = bad.vertex_count();
+    CHECK(refused(bad, kSigned, "vertex_count"));
+    CHECK(active_blocks(grid).size() == band.size());
   }
-  CHECK(refused(tet, kSigned, "not allocated"));
 
   // Signed mode checks nothing about the mesh: a face wound the other way,
   // and three triangles on one edge, are both written rather than refused.
   CHECK(convert(tet, kSigned).ok());
   Mesh flipped = tet;
   std::swap(flipped.i[1], flipped.i[2]);
-  CHECK(integ
-            .integrate(grid, flipped.v.data(), flipped.vertex_count(),
-                       flipped.i.data(), flipped.triangle_count(), kSigned)
-            .ok());
+  CHECK(convert(flipped, kSigned).ok());
   Mesh book;
   book.v = {{0.0f, 0.0f, 0.0f},
             {0.2f, 0.0f, 0.0f},
@@ -679,15 +778,16 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(convert(book, kSigned).ok());
 
   // A mesh far finer than the voxels: a 30 mm patch of 0.15 mm cells puts all
-  // 80 000 of its triangles in the bins of the blocks around it.
+  // 80 000 of its triangles in the bins of the blocks around it. Found on the
+  // device, after the clear: the grid holds no observed voxel.
   {
     const Mesh fine = divided_quad(0.013f, 0.043f, 0.027f, 0.057f, z0, 200);
-    CHECK(grid.clear().ok());
-    CHECK(grid.map()
-              .allocate_from_triangles(fine.v.data(), fine.vertex_count(),
-                                       fine.i.data(), fine.triangle_count())
-              .ok());
-    CHECK(refused(fine, kShell, "kMaxBinTriangles"));
+    vkc::Result<vx::MeshIntegrateStats> r = convert(fine, kShell);
+    CHECK(!r.ok() && r.status().message().find("kMaxBinTriangles") !=
+                         std::string::npos);
+    for (const float w : attr(gpu, grid, vol::kWeightAttribute)) {
+      CHECK(w == 0.0f);
+    }
   }
 
   // Parameters and inputs.
@@ -695,7 +795,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(refused(tet, {vx::MeshSdfMode::Shell, 0.5f}, "shell_voxels"));
   CHECK(refused(tet, {vx::MeshSdfMode::Shell, 4.0f}, "shell_voxels"));
   CHECK(refused(tet, {static_cast<vx::MeshSdfMode>(7), 1.5f}, "unknown mode"));
-  // MeshSdfParams::validate is integrate's rule, refusal for refusal and
+  // MeshSdfParams::validate is convert's rule, refusal for refusal and
   // message for message, against the grid's own truncation: a shell of 4
   // voxels is refused in this 4-voxel band and taken in an 8-voxel one.
   for (const vx::MeshSdfParams& bad :
@@ -707,9 +807,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         vx::MeshSdfParams{static_cast<vx::MeshSdfMode>(7), 1.5f}}) {
     const vkc::Status checked = bad.validate(gp);
     CHECK(checked.domain() == vkc::Status::Code::InvalidArgument);
-    vkc::Result<vx::MeshIntegrateStats> r =
-        integ.integrate(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
-                        tet.triangle_count(), bad);
+    vkc::Result<vx::MeshIntegrateStats> r = convert(tet, bad);
     CHECK(!r.ok() && r.status().message() == checked.message());
   }
   const auto takes = [](vx::MeshSdfMode mode, float shell,
@@ -726,15 +824,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
   {
     const std::vector<float> before = snapshot(gpu, grid);
-    CHECK(!integ.integrate(grid, nullptr, 4, tet.i.data(), 4, kSigned).ok());
-    CHECK(!integ.integrate(grid, tet.v.data(), 4, nullptr, 4, kSigned).ok());
+    CHECK(!integ.convert(grid, nullptr, 4, tet.i.data(), 4, kSigned).ok());
+    CHECK(!integ.convert(grid, tet.v.data(), 4, nullptr, 4, kSigned).ok());
     const std::uint32_t bad[3] = {0, 1, 4};
-    CHECK(!integ.integrate(grid, tet.v.data(), 4, bad, 1, kSigned).ok());
-    // No triangles: nothing to write, and not an error.
-    vkc::Result<vx::MeshIntegrateStats> none =
-        integ.integrate(grid, tet.v.data(), 4, tet.i.data(), 0, kSigned);
-    CHECK(none.ok());
-    CHECK(none.value().blocks == 0);
+    CHECK(!integ.convert(grid, tet.v.data(), 4, bad, 1, kSigned).ok());
     CHECK(snapshot(gpu, grid) == before);
   }
   // A grid without a weight attribute.
@@ -745,8 +838,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         gpu.device, gpu.allocator, gp, tsdf_only, 1);
     CHECK(bare.ok());
     CHECK(!integ
-               .integrate(bare.value(), tet.v.data(), tet.vertex_count(),
-                          tet.i.data(), tet.triangle_count(), kSigned)
+               .convert(bare.value(), tet.v.data(), tet.vertex_count(),
+                        tet.i.data(), tet.triangle_count(), kSigned)
                .ok());
   }
   // Blocks past kMaxVoxelsPerBlock: 32^3 voxels.
@@ -761,17 +854,17 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(big_grid.ok());
     const std::vector<float> before = snapshot(gpu, big_grid.value());
     vkc::Result<vx::MeshIntegrateStats> r =
-        integ.integrate(big_grid.value(), tet.v.data(), tet.vertex_count(),
-                        tet.i.data(), tet.triangle_count(), kSigned);
+        integ.convert(big_grid.value(), tet.v.data(), tet.vertex_count(),
+                      tet.i.data(), tet.triangle_count(), kSigned);
     CHECK(!r.ok() &&
           r.status().message().find("kMaxVoxelsPerBlock") != std::string::npos);
     CHECK(snapshot(gpu, big_grid.value()) == before);
   }
 
   // A capacity past 256^2 with a partial final group exercises a second
-  // prefix level. A coarse sheet reaches >4096 blocks, growing the compact
-  // output on the first call; all later calls reuse it. Move the same input
-  // allocation and flip winding so neither geometry nor bins may be cached.
+  // prefix level, and a coarse sheet of more than 4096 blocks a block list to
+  // match. Move the same mesh and flip its winding so neither geometry nor
+  // bins may be cached.
   {
     vol::VoxelGridParams wide_gp = gp;
     wide_gp.block_size = 2;
@@ -785,13 +878,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     vol::VoxelBlockGrid wide = std::move(wide_r).value();
     Mesh moving = divided_quad(-0.487f, 0.513f, -0.493f, 0.507f, z0, 1);
     auto write = [&]() -> vkc::Result<vx::MeshIntegrateStats> {
-      VKC_TRY(wide.clear());
-      VKC_ASSIGN(auto failed, wide.map().allocate_from_triangles(
-                                  moving.v.data(), moving.vertex_count(),
-                                  moving.i.data(), moving.triangle_count()));
-      if (failed != 0) return vkc::Status::out_of_memory("wide allocation");
-      return integ.integrate(wide, moving.v.data(), moving.vertex_count(),
-                             moving.i.data(), moving.triangle_count(), kSigned);
+      return integ.convert(wide, moving.v.data(), moving.vertex_count(),
+                           moving.i.data(), moving.triangle_count(), kSigned);
     };
     auto initial = write();
     CHECK(initial.ok());
@@ -819,14 +907,14 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(by_coord(gpu, grid) == tet_bytes);
   }
 
-  // ---- 10. Move semantics ------------------------------------------------
+  // ---- 11. Move semantics ------------------------------------------------
   {
     vx::MeshIntegrator moved(std::move(integ));
     CHECK(moved.valid());
     CHECK(!integ.valid());  // NOLINT(bugprone-use-after-move): the point
     CHECK(!integ
-               .integrate(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
-                          tet.triangle_count(), kSigned)
+               .convert(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
+                        tet.triangle_count(), kSigned)
                .ok());
     vkc::Result<vx::MeshIntegrator> other_r =
         vx::MeshIntegrator::create(gpu.device, gpu.allocator);
@@ -839,8 +927,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     other = std::move(*self);  // self-move, laundered past -Wself-move
     CHECK(other.valid());
     CHECK(other
-              .integrate(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
-                         tet.triangle_count(), kSigned)
+              .convert(grid, tet.v.data(), tet.vertex_count(), tet.i.data(),
+                       tet.triangle_count(), kSigned)
               .ok());
   }
 

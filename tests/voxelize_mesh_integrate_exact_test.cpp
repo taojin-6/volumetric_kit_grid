@@ -573,20 +573,16 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(const vkc::test::Gpu& gpu,
   return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
 }
 
-// Convert `f` into `grid`, cleared, run the reference over the blocks
-// written, and compare every voxel's bits.
+// Convert `f` into `grid`, which empties it first, run the reference over the
+// blocks written, and compare every voxel's bits.
 int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
                   Reference& ref, vol::VoxelBlockGrid& grid, const Fixture& f) {
   const vol::VoxelGridParams& gp = grid.grid();
   const Mesh& m = f.mesh;
-  CHECK(grid.clear().ok());
-  vkc::Result<std::uint32_t> failed = grid.map().allocate_from_triangles(
-      m.v.data(), m.vertex_count(), m.i.data(), m.triangle_count());
-  CHECK(failed.ok() && failed.value() == 0);
   const vx::MeshSdfParams params{f.mode, 1.5f};
   vkc::Result<vx::MeshIntegrateStats> stats =
-      integ.integrate(grid, m.v.data(), m.vertex_count(), m.i.data(),
-                      m.triangle_count(), params);
+      integ.convert(grid, m.v.data(), m.vertex_count(), m.i.data(),
+                    m.triangle_count(), params);
   if (!stats.ok()) {
     std::fprintf(stderr, "%s: %s\n", f.name.c_str(),
                  stats.status().message().c_str());
@@ -689,7 +685,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   CHECK(integ_r.ok());
   vx::MeshIntegrator integ = std::move(integ_r).value();
 
-  // One grid per block size and band, cleared for each fixture.
+  // One grid per block size and band, emptied by each fixture's convert.
   std::map<std::pair<int, float>, vol::VoxelBlockGrid> grids;
   int failures = 0;
   for (const Fixture& f : fixtures()) {

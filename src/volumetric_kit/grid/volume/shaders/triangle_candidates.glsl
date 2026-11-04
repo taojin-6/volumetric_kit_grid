@@ -7,11 +7,11 @@
 // each triangle's candidates, and its scan and triangle_offsets.comp turn the
 // counts into the exclusive prefix sum this file searches.
 //
-// Shared rather than restated by every triangle-driven kernel.
-// hash_allocate_triangles.comp allocates the blocks that pass vgridBlockInBand,
-// and voxelize's mesh_bin.comp bins triangles into exactly the blocks that
-// pass it. A second copy of the test would compile clean and let the
-// integrator look for a block the allocator never made -- or skip one it did.
+// Shared rather than restated by every triangle-driven kernel. voxelize's
+// hash_classify_triangles.comp lists the blocks that pass vgridBlockInBand for
+// allocation, and its mesh_bin.comp bins triangles into exactly the blocks
+// that pass it. A second copy of the test would compile clean and let the
+// binning look for a block the allocation never made -- or skip one it did.
 //
 // The includer must include hash_common.glsl first (directly, or through
 // hash_lookup.glsl), for VoxelGridParams and worldToBlock, and must #define

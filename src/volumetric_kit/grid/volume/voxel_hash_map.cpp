@@ -21,7 +21,6 @@
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/grid/base/device_requirements.hpp"
 #include "volumetric_kit/grid/base/dispatch.hpp"
-#include "volumetric_kit/grid/volume/triangle_candidates.hpp"
 
 #include "hash.hpp"
 #include "hash_map_internal.hpp"
@@ -31,7 +30,6 @@
 // path).
 #include "hash_allocate_coords_comp.spv.hpp"
 #include "hash_allocate_depth_comp.spv.hpp"
-#include "hash_allocate_triangles_comp.spv.hpp"
 #include "hash_compact_comp.spv.hpp"
 #include "hash_compact_frustum_comp.spv.hpp"
 #include "hash_delete_coords_comp.spv.hpp"
@@ -86,8 +84,8 @@ struct PushConstants {
   VoxelGridParams grid;
   std::uint32_t arg;
   std::uint32_t tick;  // what allocation stamps a block with
-  // The triangle kernel's first work item a dispatch covers
-  // (vgrid::detail::dispatch_items); the other kernels ignore it.
+  // The first work item a sliced dispatch covers (vgrid::detail::
+  // dispatch_items / dispatch_slices); the other kernels ignore it.
   std::uint32_t item_base = 0;
 };
 static_assert(sizeof(PushConstants) == 44, "PushConstants layout drift");
@@ -311,9 +309,6 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
   VKC_TRY(kb.add(map.depth_, "hash_allocate_depth",
                  vgrid_hash_allocate_depth_comp_spv,
                  vgrid_hash_allocate_depth_comp_spv_size, 8, &push));
-  VKC_TRY(kb.add(map.triangles_, "hash_allocate_triangles",
-                 vgrid_hash_allocate_triangles_comp_spv,
-                 vgrid_hash_allocate_triangles_comp_spv_size, 9, &push));
   VKC_TRY(kb.add(map.compact_frustum_, "hash_compact_frustum",
                  vgrid_hash_compact_frustum_comp_spv,
                  vgrid_hash_compact_frustum_comp_spv_size, 4, &push));
@@ -330,13 +325,12 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
 }
 
 void VoxelHashMap::write_persistent_bindings() {
-  // Bindings 0-3 (the table) are identical across the init, allocate, delete,
-  // points, and triangles sets. The allocate-family sets (allocate / delete /
-  // points / triangles) additionally share the fail-counts buffer at binding
-  // 5 -- they never run in the same dispatch, and each re-zeroes it before
-  // use. Their per-call input (coords / points at binding 4, delete's done
-  // flags at 6, vertices+indices+offsets at 4+6+7) is written before each
-  // dispatch. The depth kernel's sets (depth_sets_) are written whole by each
+  // Bindings 0-3 (the table) are identical across the init, allocate,
+  // distinct-insert, delete and rehash sets. The allocate-family sets
+  // (allocate / distinct insert / delete / rehash) additionally share the
+  // fail-counts buffer at binding 5 -- they never run in the same dispatch,
+  // and each re-zeroes it before use. Their per-call input (coords at binding
+  // 4, delete's done flags at 6) is written before each dispatch. The depth kernel's sets (depth_sets_) are written whole by each
   // allocate_from_depth. Compact uses entries + the compaction output + its
   // counter.
   const VkBuffer entries = entries_.handle();
@@ -345,7 +339,7 @@ void VoxelHashMap::write_persistent_bindings() {
   const VkBuffer mutex = bucket_mutex_.handle();
   for (const core::DescriptorSet* set :
        {&init_.set, &allocate_.set, &insert_distinct_.set, &delete_.set,
-        &triangles_.set, &rehash_.set}) {
+        &rehash_.set}) {
     set->write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(1, heap, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
@@ -353,8 +347,7 @@ void VoxelHashMap::write_persistent_bindings() {
   }
   const VkBuffer fail = fail_counts_.handle();
   for (const core::DescriptorSet* set :
-       {&allocate_.set, &insert_distinct_.set, &delete_.set, &triangles_.set,
-        &rehash_.set}) {
+       {&allocate_.set, &insert_distinct_.set, &delete_.set, &rehash_.set}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
   const VkBuffer stamps = stamps_.handle();
@@ -379,7 +372,6 @@ void VoxelHashMap::write_persistent_bindings() {
   depth_rounds_.set.write_storage_buffer(0, rounds, 0, VK_WHOLE_SIZE);
   depth_rounds_.set.write_storage_buffer(5, host_count_.handle(), 0,
                                          VK_WHOLE_SIZE);
-  triangles_.set.write_storage_buffer(8, stamps, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(1, compacted_.handle(), 0, VK_WHOLE_SIZE);
   compact_.set.write_storage_buffer(2, active_count_.handle(), 0,
@@ -964,76 +956,6 @@ core::Result<RecordedRounds> VoxelHashMap::record_depth(
   VKC_TRY(batch.dispatch(depth_rounds_, &judge, sizeof(judge), 1,
                          max_workgroup_count_x_, stage));
   return RecordedRounds{std::move(slot), ++record_serial_};
-}
-
-core::Result<std::uint32_t> VoxelHashMap::allocate_from_triangles(
-    const Vec3f* vertices, std::uint32_t vertex_count,
-    const std::uint32_t* indices, std::uint32_t triangle_count,
-    AllocFailures* out_failures, core::StageMetrics* metrics) {
-  // Before the validity check, as allocate_from_depth: a refused call still
-  // costs its row, and here the row's CPU half is the point -- the host pass
-  // below is the one part of this call a GPU capture cannot see.
-  core::GpuStageScope stage(metrics, gpu_timer_, "allocate");
-  if (!valid()) {
-    return core::Status::invalid_argument(
-        "VoxelHashMap::allocate_from_triangles: moved-from map");
-  }
-  if (triangle_count == 0) {
-    return std::uint32_t{0};
-  }
-
-  // The host pass: one candidate-block count per triangle, as an exclusive
-  // prefix sum (see triangle_candidate_offsets). It buys the kernel a uniform
-  // work item, and it is where every index is bounds-checked and a degenerate
-  // or non-finite triangle is dropped.
-  VKC_ASSIGN(std::vector<std::uint32_t> offsets,
-             triangle_candidate_offsets(
-                 grid_, vertices, vertex_count, indices, triangle_count,
-                 "VoxelHashMap::allocate_from_triangles"));
-  const std::uint32_t total = offsets[triangle_count];
-  if (total == 0) {
-    return std::uint32_t{0};  // every triangle degenerate or non-finite
-  }
-
-  // Three transient inputs (the mesh is per-call and variable), each bound
-  // whole, so each is checked against what one binding may cover.
-  const VkDeviceSize vertex_bytes = VkDeviceSize(vertex_count) * sizeof(Vec3f);
-  const VkDeviceSize index_bytes =
-      VkDeviceSize(triangle_count) * 3 * sizeof(std::uint32_t);
-  const VkDeviceSize offset_bytes =
-      VkDeviceSize(offsets.size()) * sizeof(std::uint32_t);
-  VKC_TRY(core::check_storage_buffer_range(
-      "VoxelHashMap::allocate_from_triangles: the vertex buffer", vertex_bytes,
-      max_storage_buffer_range_));
-  VKC_TRY(core::check_storage_buffer_range(
-      "VoxelHashMap::allocate_from_triangles: the index buffer", index_bytes,
-      max_storage_buffer_range_));
-  VKC_TRY(core::check_storage_buffer_range(
-      "VoxelHashMap::allocate_from_triangles: the offset buffer", offset_bytes,
-      max_storage_buffer_range_));
-  core::Buffer vertex_buf, index_buf, offset_buf;  // alive across every round
-
-  // pc.arg is the TRIANGLE count (the kernel's binary-search bound), not the
-  // dispatch width -- the kernel reads that from offsets[pc.arg]. A mesh's
-  // candidates can pass 16.7 M, 65535 groups of 256, so they may take several
-  // dispatches.
-  const PushConstants push{grid_, triangle_count, tick_};
-  return dispatch_with_retry(
-      [&](core::CommandBatch& batch) {
-        return volumetric_kit::grid::detail::dispatch_items(
-            batch, triangles_, push, total, kLocalSize, max_workgroup_count_x_,
-            &stage);
-      },
-      out_failures,
-      [&](core::CommandBatch& batch) -> core::Status {
-        VKC_ASSIGN(vertex_buf, upload_to_binding(batch, triangles_.set, 4,
-                                                 vertices, vertex_bytes));
-        VKC_ASSIGN(index_buf, upload_to_binding(batch, triangles_.set, 6,
-                                                indices, index_bytes));
-        VKC_ASSIGN(offset_buf, upload_to_binding(batch, triangles_.set, 7,
-                                                 offsets.data(), offset_bytes));
-        return {};
-      });
 }
 
 core::Result<std::uint32_t> VoxelHashMap::remove(

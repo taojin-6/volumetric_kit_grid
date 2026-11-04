@@ -210,9 +210,10 @@ struct RecordedRounds {
 /// `ComputePipeline`, `Device::submit_single_time`). The GLSL kernels
 /// read the hash structs through scalar block layout (the 2026-07-05 ABI), so
 /// the host @ref BlockIndex / @ref BlockStamp and their shader mirrors agree
-/// byte-for-byte. Covers init, allocate-from-coords / -depth / -triangles,
-/// remove, compact / compact-in-frusta, and an **index-preserving**
-/// @ref resize (the GPU rehash that keeps each block's `ptr`).
+/// byte-for-byte. Covers init, allocate-from-coords / -depth, remove,
+/// compact / compact-in-frusta, and an **index-preserving** @ref resize (the
+/// GPU rehash that keeps each block's `ptr`). A triangle mesh's band is
+/// allocated by `voxelize::MeshIntegrator::convert`, through @ref Internal.
 ///
 /// @warning The `Device` and `Allocator` passed to @ref create must
 ///          outlive this object; it stores references to them.
@@ -473,51 +474,6 @@ class VGRID_VOLUME_API VoxelHashMap {
   core::Result<RecordedRounds> record_allocate_from_depth(
       core::CommandBatch& batch, const std::vector<DepthInput>& frames,
       const DeviceCount* gate = nullptr, core::GpuStageScope* stage = nullptr);
-
-  // TODO(volume): the candidate count is a host pass over the triangles, as
-  // in voxelize's MeshIntegrator (the 2026-10-13 volume block-list entry's
-  // Next).
-  /// @brief Allocate the voxel blocks a triangle mesh's truncation band covers.
-  ///
-  /// A block is allocated when its centre lies within `trunc_dist` plus the
-  /// block's half-diagonal of some triangle -- conservative, so a block holding
-  /// **any** voxel within `trunc_dist` of the surface is never missed, which is
-  /// exactly the set a mesh-to-SDF pass then writes.
-  ///
-  /// Not expressible as dilating each vertex into the `(2*tb+1)^3` band, as
-  /// @ref allocate_from_depth dilates a point: a triangle wider than that band
-  /// would leave an unallocated hole through its middle -- and the band is
-  /// one block (40 mm) with 5 mm voxels and a 40 mm band, which any mesh that
-  /// is not a dense scan exceeds routinely. Nor is it a per-triangle dispatch:
-  /// triangle size is unbounded, and one lane owning a large triangle's whole
-  /// bounding box is the dispatch shape that hangs a mobile GPU. The work is
-  /// therefore split per *candidate block*, which costs a host pass over the
-  /// triangles to count them (`StageMetrics` reports it in the row's CPU half).
-  ///
-  /// A triangle is skipped, costing nothing, when it holds a non-finite vertex
-  /// or has zero area; a zero-area triangle is dropped here rather than guarded
-  /// in the kernel because it is the one input that makes the closest-point
-  /// solve divide by zero. Already-present blocks are untouched, so overlapping
-  /// triangles de-duplicate at the table.
-  /// @param vertices      World-space vertex positions, metres.
-  /// @param vertex_count  How many @p vertices.
-  /// @param indices       `3 * triangle_count` indices into @p vertices.
-  /// @param triangle_count  How many triangles.
-  /// @param out_failures  Optional: receives the per-reason split (see
-  ///                      @ref AllocFailures). Untouched when null.
-  /// @param metrics       Optional: receives an `"allocate"` row, as
-  ///                      @ref allocate_from_depth.
-  /// @return The number of block allocations that failed (0 = all succeeded),
-  ///         or a non-OK `Status`: `Status::Code::InvalidArgument` for a
-  ///         moved-from map, a null @p vertices / @p indices, an index at or
-  ///         past @p vertex_count, or a candidate-block total past 2^32 (a
-  ///         mesh grossly mis-scaled against the grid -- metres read as
-  ///         millimetres, say); or whatever a buffer or the dispatch returns.
-  core::Result<std::uint32_t> allocate_from_triangles(
-      const Vec3f* vertices, std::uint32_t vertex_count,
-      const std::uint32_t* indices, std::uint32_t triangle_count,
-      AllocFailures* out_failures = nullptr,
-      core::StageMetrics* metrics = nullptr);
 
   /// @brief Remove the voxel blocks at the block coordinates a device buffer
   ///        of @ref BlockIndex lists (only `coord` is read), returning each
@@ -809,8 +765,9 @@ class VGRID_VOLUME_API VoxelHashMap {
   ///        Starts at 1; 0 is no tick.
   ///
   /// It counts the passes that write voxels -- each `tsdf::TsdfIntegrator`
-  /// integrate call (one per set, for a rig), `voxelize::MeshIntegrator` call
-  /// and codec decode -- since each advances it before it stamps `changed`. So
+  /// integrate call (one per set, for a rig), `voxelize::MeshIntegrator`
+  /// convert (one tick for its allocation and its write) and codec decode --
+  /// since each advances it before it stamps `changed`. So
   /// a reader that records the tick it read at sees every later change as
   /// newer, however its calls interleave with the writers'. Ticks compare
   /// modulo 2^32, so an age is right up to 2^31 of them.
@@ -905,7 +862,7 @@ class VGRID_VOLUME_API VoxelHashMap {
   /// non-zero, to converge past transient same-bucket lock contention, until
   /// a round has no lock failure or hits a capacity limit, or the rounds run
   /// out. Re-zeroes the tally
-  /// each round. The host rounds of the triangle and rehash allocations;
+  /// each round. The host rounds of the rehash;
   /// @ref allocate, @ref remove and @ref allocate_from_depth round through
   /// recordings instead (@ref record_rounds, @ref record_depth).
   /// The tally's non-retryable slot is accumulated across rounds and added to
@@ -988,8 +945,7 @@ class VGRID_VOLUME_API VoxelHashMap {
   // valid() is what says that map owns nothing.
   std::uint64_t topology_epoch_ = 0;
   // Cached maxComputeWorkGroupCount[0] -- the device cap on a 1-D dispatch's
-  // groupCountX. allocate_from_triangles splits past it; every other dispatch
-  // rejects an input that would exceed it.
+  // groupCountX; a dispatch past it is split or refused.
   std::uint32_t max_workgroup_count_x_ = 0;
   // The ceiling on one storage-buffer binding's range, read once at create().
   // The per-call input uploads (a depth frame, a coord or point list) are bound
@@ -1076,18 +1032,16 @@ class VGRID_VOLUME_API VoxelHashMap {
   core::GpuTimer gpu_timer_;
   // One ComputeKernel per shader -- its descriptor-set layout, pipeline, and
   // the set allocated from the shared pool_ (see `ComputeKernel`). The
-  // KernelSetBuilder in create() builds all eight and sizes pool_ to them.
+  // KernelSetBuilder in create() builds all seven and sizes pool_ to them.
   // Every persistent-buffer binding is written once by
   // write_persistent_bindings(); only the genuinely per-call input (coords /
-  // depth+camera / triangles) is (re)written before a dispatch. Depth adds the
-  // camera-params buffer at binding 6, and triangles adds indices at 6 + the
-  // prefix-sum offsets at 7.
+  // depth+camera) is (re)written before a dispatch. Depth adds the
+  // camera-params buffer at binding 6.
   core::ComputeKernel init_;
   core::ComputeKernel allocate_;
   core::ComputeKernel compact_;
   core::ComputeKernel delete_;
   core::ComputeKernel depth_;
-  core::ComputeKernel triangles_;
   // hash_insert_distinct.comp: a list whose coordinates are distinct, placed
   // without bucket locks in one round (Internal::record_allocate_distinct);
   // allocate_'s bindings.

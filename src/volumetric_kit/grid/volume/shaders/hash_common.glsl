@@ -96,11 +96,11 @@ const int kFailSlots = 6;
 #ifndef VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
 layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;
-  uint arg;  // allocate and delete: their count's word in the rounds' state;
-             // compact: output capacity; depth: the frame's tile count
-             // along x; rehash and triangles: their input's count.
+  uint arg;  // allocate, distinct insert and delete: their count's word in
+             // the rounds' state; compact: output capacity; depth: the
+             // frame's tile count along x; rehash: its input's count.
   uint tick;  // the map's clock, which allocation stamps a block with
-  uint item_base;  // triangles: the first work item this dispatch covers
+  uint item_base;  // a sliced dispatch: the first work item it covers
 } pc;
 #endif
 

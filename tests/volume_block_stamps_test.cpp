@@ -242,19 +242,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
 
   // Every allocation path stamps what it asks for, through a binding of its
-  // own: coords (above), triangles and depth.
-  map.advance_tick();  // 5
+  // own: coords (above) and depth. A mesh's band is voxelize's convert's,
+  // whose test checks its stamps.
+  map.advance_tick();
   auto before = slots(grid);
-  CHECK(before.ok());
-  const vgrid::Vec3f tri[] = {
-      {-1.0f, 1.0f, 0.0f}, {-0.9f, 1.0f, 0.0f}, {-1.0f, 1.1f, 0.0f}};
-  const std::uint32_t idx[] = {0, 1, 2};
-  CHECK(map.allocate_from_triangles(tri, 3, idx, 1).ok());
-  auto stamped = new_blocks_requested_now(grid, before.value());
-  CHECK(stamped.ok() && stamped.value());
-
-  map.advance_tick();  // 7
-  before = slots(grid);
   CHECK(before.ok());
   vol::DepthPinhole cam{};
   cam.fx = cam.fy = 16.0f;
@@ -266,12 +257,12 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   cam.cam_to_world[3] = vgrid::Vec4f(0.0f, -1.0f, 0.0f, 1.0f);
   const std::vector<float> depth(16 * 16, 0.5f);
   CHECK(map.allocate_from_depth(depth.data(), cam).ok());
-  stamped = new_blocks_requested_now(grid, before.value());
+  auto stamped = new_blocks_requested_now(grid, before.value());
   CHECK(stamped.ok() && stamped.value());
 
   // resize keeps each record in its slot -- the rehash does not restamp at
-  // tick 8 -- and the new slots are zeroed.
-  map.advance_tick();  // 8
+  // the tick it runs at -- and the new slots are zeroed.
+  map.advance_tick();
   st = map.read_block_stamps();
   CHECK(st.ok());
   CHECK(grid.resize(params().num_buckets * 2).ok());

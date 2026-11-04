@@ -2,12 +2,12 @@
 # Copyright (c) 2026 Tao Jin
 
 # --- grid_voxelize: a triangle mesh's distance field --------------------------
-# MeshIntegrator writes a mesh's truncated distance field into a
-# VoxelBlockGrid's tsdf/weight, signed or as a shell, over the blocks
-# VoxelHashMap::allocate_from_triangles allocates (the 2026-09-27 and 2026-10-28
-# decisions). Links grid_volume ALONE: it needs the grid, the triangle
-# candidates and grid_base's dispatch helper, not depth fusion, so a mesh caller
-# need not link the fuser or its kernels.
+# MeshIntegrator converts a mesh into a VoxelBlockGrid's truncated distance
+# field, its tsdf/weight, signed or as a shell (the 2026-09-27 and 2026-10-28
+# decisions): it counts the mesh's candidate blocks, allocates its band through
+# volume's internal distinct insert, and writes it. Links grid_volume ALONE: it
+# needs the grid and grid_base's dispatch helper, not depth fusion, so a mesh
+# caller need not link the fuser or its kernels.
 include(GenerateExportHeader)
 
 set(_vgrid_voxelize_generated_inc
@@ -62,6 +62,7 @@ include(vgrid_embed)
 vgrid_embed_shaders(
   grid_voxelize
   SHADERS
+  "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hash_classify_triangles.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_bin.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_scan_counts.comp"
   "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_scan_sums.comp"

@@ -4,10 +4,10 @@
 // integrate pass can give each voxel the short list of triangles that can be
 // within trunc_dist of it instead of the whole mesh.
 //
-// One work item per (triangle, candidate block) pair -- the decomposition
-// VoxelHashMap::allocate_from_triangles allocates over, decoded and pruned by
-// the same triangle_candidates.glsl -- so this bins a triangle into exactly the
-// blocks that allocation made, and a large triangle costs more work items
+// One work item per (triangle, candidate block) pair -- the decomposition the
+// band index (hash_classify_triangles.comp) allocates over, decoded and pruned
+// by the same triangle_candidates.glsl -- so this bins a triangle into exactly
+// the blocks that allocation made, and a large triangle costs more work items
 // rather than a longer one. The prior engine signed its field brute force,
 // every voxel against every triangle of the mesh, which is the long-dispatch
 // shape the 2026-08-08 overflow-scan entry records hanging an M5 iPad.

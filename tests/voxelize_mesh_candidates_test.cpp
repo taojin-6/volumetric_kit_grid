@@ -3,7 +3,7 @@
 
 // GPU test for voxelize::detail::MeshBand's candidate count: the offsets
 // counted and scanned on the device, and the block range the candidates fall
-// in. The oracle is the host's triangle_candidate_offsets: every offset, the
+// in. The oracle is tests/support's triangle_candidate_offsets: every offset, the
 // total included, and the range equal it word for word -- on a tilted quad,
 // degenerate triangles (a repeated vertex, exactly collinear, one vertex three
 // times, first and last, all of them), two equal vertices, non-finite
@@ -11,12 +11,17 @@
 // 240k triangles, triangle soups of small and large triangles, and a mesh past
 // two scan levels. An index at or past vertex_count is refused on the host; a
 // total past 2^32, one triangle's or the sum's, at the wait, with a total of
-// 0 left on the device. Skips where no device is present.
+// 0 left on the device. On half-voxel ties, where a device may divide within
+// its ulps and round apart from the host, the device's count and decode agree:
+// MeshIntegrator::convert allocates every band block, by host brute force.
+// Skips where no device is present.
 
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <set>
+#include <tuple>
 #include <vector>
 
 #include "test_meshes.hpp"
@@ -27,10 +32,13 @@
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/grid/base/math/vector_types.hpp"
-#include "volumetric_kit/grid/volume/triangle_candidates.hpp"
+#include "volumetric_kit/grid/testing/triangle_oracle.hpp"
+#include "volumetric_kit/grid/volume/hash_types.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/grid/volume/voxel_coords.hpp"
 #include "volumetric_kit/grid/volume/voxel_grid.hpp"
 #include "volumetric_kit/grid/voxelize/mesh_band.hpp"
+#include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 #include "volumetric_kit/core/testing/gpu_test.hpp"
 #include "volumetric_kit/grid/base/device_requirements.hpp"
@@ -96,7 +104,7 @@ int same_as_host(vkc::test::GpuContext& gpu, MeshBand& band,
                  const vol::VoxelGridParams& grid, const Mesh& m,
                  const char* what) {
   vkc::Result<std::vector<std::uint32_t>> host =
-      vol::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
+      vgrid_test::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
                                       m.i.data(), m.triangle_count(), what);
   CHECK(host.ok());
   const vkc::Status counted = count(gpu, band, grid, m);
@@ -142,7 +150,7 @@ int same_as_host(vkc::test::GpuContext& gpu, MeshBand& band,
 int device_refuses(vkc::test::GpuContext& gpu, MeshBand& band,
                    const vol::VoxelGridParams& grid, const Mesh& m,
                    const char* what) {
-  CHECK(!vol::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
+  CHECK(!vgrid_test::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
                                          m.i.data(), m.triangle_count(), what)
              .ok());
   CHECK(band.set_mesh(grid, m.v.data(), m.vertex_count(), m.i.data(),
@@ -296,6 +304,67 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       five.i.insert(five.i.end(), {3 * t, 3 * t + 1, 3 * t + 2});
     }
     if (device_refuses(gpu, band, grid, five, "sum past 2^32") != 0) return 1;
+  }
+
+  std::printf("ties:\n");
+  {
+    // Every block holding a voxel within trunc_dist of a triangle, brute
+    // force over each triangle's box and a block beyond it on every side.
+    const Mesh tied = test_meshes::ties(300, 11, 40);  // within 0.1 m
+    const vol::AttributeSpec attrs[] = {
+        {vol::kTsdfAttribute, sizeof(float)},
+        {vol::kWeightAttribute, sizeof(float)}};
+    vkc::Result<vol::VoxelBlockGrid> block_grid =
+        vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, attrs, 2);
+    vkc::Result<vgrid::voxelize::MeshIntegrator> integ =
+        vgrid::voxelize::MeshIntegrator::create(gpu.device, gpu.allocator);
+    CHECK(block_grid.ok() && integ.ok());
+    CHECK(integ
+              ->convert(*block_grid, tied.v.data(), tied.vertex_count(),
+                        tied.i.data(), tied.triangle_count())
+              .ok());
+    vkc::Result<std::vector<vol::BlockIndex>> active =
+        block_grid->map().compact_active_blocks();
+    CHECK(active.ok());
+    std::set<std::tuple<int, int, int>> got;
+    for (const vol::BlockIndex& b : *active) {
+      got.insert({b.coord.x, b.coord.y, b.coord.z});
+    }
+    std::size_t want = 0;
+    for (std::uint32_t t = 0; t < tied.triangle_count(); ++t) {
+      const Vec3f a = test_meshes::corner(tied, t, 0);
+      const Vec3f b = test_meshes::corner(tied, t, 1);
+      const Vec3f c = test_meshes::corner(tied, t, 2);
+      const vgrid::Vec3i lo = vol::world_to_block(
+          glm::min(a, glm::min(b, c)) - Vec3f(grid.trunc_dist), grid);
+      const vgrid::Vec3i hi = vol::world_to_block(
+          glm::max(a, glm::max(b, c)) + Vec3f(grid.trunc_dist), grid);
+      for (int z = lo.z - 1; z <= hi.z + 1; ++z) {
+        for (int y = lo.y - 1; y <= hi.y + 1; ++y) {
+          for (int x = lo.x - 1; x <= hi.x + 1; ++x) {
+            const vgrid::Vec3i base =
+                vol::block_to_voxel(vgrid::Vec3i(x, y, z), grid);
+            bool hit = false;
+            for (int v = 0; v < grid.voxels_per_block && !hit; ++v) {
+              const Vec3f p = vol::voxel_to_world(
+                  base + vgrid::Vec3i(v % 8, (v / 8) % 8, v / 64), grid);
+              hit = vgrid::length(p - test_meshes::closest_point(p, a, b, c)) <=
+                    grid.trunc_dist;
+            }
+            if (hit && got.count({x, y, z}) == 0) {
+              std::fprintf(stderr, "FAIL ties: band block (%d,%d,%d) missing\n",
+                           x, y, z);
+              return 1;
+            }
+            want += hit ? 1 : 0;
+          }
+        }
+      }
+    }
+    CHECK(want > 0);
+    std::printf("  300 triangles on half-voxel ties: every band block of %zu "
+                "allocated\n",
+                got.size());
   }
 
   std::printf("voxelize_mesh_candidates: OK\n");
