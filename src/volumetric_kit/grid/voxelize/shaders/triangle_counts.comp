@@ -1,0 +1,113 @@
+#version 450
+
+// Count each triangle's candidate blocks (voxelize::detail::MeshBand): the
+// per-triangle half of the (triangle, candidate block) work decomposition,
+// which the 256-way scan (mesh_scan_*.comp) and triangle_offsets.comp turn into
+// the exclusive prefix sum volume's triangle_candidates.glsl searches.
+//
+// One invocation per triangle, plus one for the slot past the last, which
+// counts zero so the scan leaves the total there. Indices were checked on the
+// host. The rules are the host oracle's (tests/support's triangle_oracle.hpp),
+// op for op:
+//   - a triangle with a non-finite vertex counts zero (tested on the bits, so
+//     no compiler can assume it away);
+//   - a zero-area one counts zero: |cross(v1-v0, v2-v0)|^2 <= 0, written out
+//     in the oracle's operation order and `precise`, so no multiply-add is
+//     fused where the oracle rounds each product;
+//   - otherwise its count is its candidate box's volume in blocks
+//     (vgridCandidateBox, the decode's own definition). A product past 2^32
+//     raises the overflow flag, as a sum past 2^32 sets the scan's carry.
+//
+// It also leaves the block range every counted triangle's candidates fall in:
+// each workgroup reduces its boxes in shared memory, then merges them into the
+// range with one atomic a word. The band index places its key window there.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#define VGRID_HASH_COMMON_NO_PUSH_CONSTANTS
+#include "volumetric_kit/grid/volume/shaders/hash_common.glsl"
+#include "volumetric_kit/grid/volume/shaders/triangle_box.glsl"
+
+layout(local_size_x = 256) in;
+
+// binding 0: vertices, tightly packed vec3 (scalar stride 12).
+layout(set = 0, binding = 0, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+// binding 1: 3 indices a triangle.
+layout(set = 0, binding = 1, scalar) readonly buffer Indices { uint indices[]; };
+// binding 2: tri_count + 1 counts, scanned in place afterwards.
+layout(set = 0, binding = 2, scalar) writeonly buffer Counts { uint counts[]; };
+// binding 3: [0] a candidate count past 2^32, zeroed ahead of this pass.
+layout(set = 0, binding = 3, scalar) buffer Flags { uint overflow; };
+// binding 4: the candidates' block range, [0..2] the smallest block per axis
+// and [3..5] the largest, set to INT_MAX and INT_MIN ahead of this pass; left
+// so when no triangle counts.
+layout(set = 0, binding = 4, scalar) buffer Bounds { int bounds[]; };
+
+layout(push_constant, scalar) uniform Push {
+  VoxelGridParams grid;
+  uint tri_count;
+  uint item_base;  // the first triangle this dispatch covers
+} pc;
+
+bool vgridFinite(vec3 v) {
+  uvec3 exponent = floatBitsToUint(v) & uvec3(0x7F800000u);
+  return all(notEqual(exponent, uvec3(0x7F800000u)));
+}
+
+const int kIntMax = 0x7FFFFFFF;
+const int kIntMin = -kIntMax - 1;
+shared int s_bounds[6];
+
+void main() {
+  uint lane = gl_LocalInvocationID.x;
+  if (lane < 6u) {
+    s_bounds[lane] = lane < 3u ? kIntMax : kIntMin;
+  }
+  barrier();
+  uint t = pc.item_base + gl_GlobalInvocationID.x;
+  uint n = 0u;
+  if (t < pc.tri_count) {
+    vec3 v0 = vertices[indices[3u * t]];
+    vec3 v1 = vertices[indices[3u * t + 1u]];
+    vec3 v2 = vertices[indices[3u * t + 2u]];
+    if (vgridFinite(v0) && vgridFinite(v1) && vgridFinite(v2)) {
+      // The oracle's cross and dot, in its order.
+      precise vec3 a = v1 - v0;
+      precise vec3 b = v2 - v0;
+      precise float nx = a.y * b.z - b.y * a.z;
+      precise float ny = a.z * b.x - b.z * a.x;
+      precise float nz = a.x * b.y - b.x * a.y;
+      precise float area2 = nx * nx + ny * ny + nz * nz;
+      if (area2 > 0.0) {
+        ivec3 bmin;
+        uvec3 ext;
+        vgridCandidateBox(v0, v1, v2, pc.grid, bmin, ext);
+        uint plane_hi, plane, volume_hi;
+        umulExtended(ext.x, ext.y, plane_hi, plane);
+        umulExtended(plane, ext.z, volume_hi, n);
+        if ((plane_hi | volume_hi) != 0u) {
+          atomicOr(overflow, 1u);
+        }
+        ivec3 bmax = bmin + ivec3(ext) - ivec3(1);
+        atomicMin(s_bounds[0], bmin.x);
+        atomicMin(s_bounds[1], bmin.y);
+        atomicMin(s_bounds[2], bmin.z);
+        atomicMax(s_bounds[3], bmax.x);
+        atomicMax(s_bounds[4], bmax.y);
+        atomicMax(s_bounds[5], bmax.z);
+      }
+    }
+  }
+  if (t <= pc.tri_count) {
+    counts[t] = n;
+  }
+  barrier();
+  if (lane < 3u) {
+    if (s_bounds[lane] != kIntMax) atomicMin(bounds[lane], s_bounds[lane]);
+  } else if (lane < 6u) {
+    if (s_bounds[lane] != kIntMin) atomicMax(bounds[lane], s_bounds[lane]);
+  }
+}

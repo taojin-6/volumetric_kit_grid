@@ -4,7 +4,8 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
-// The brute force mesh_integrate.comp must match bit for bit
+// The brute force the write kernel (mesh_integrate_body.glsl) must match bit
+// for bit
 // (grid_voxelize_mesh_integrate_exact): one thread per voxel measures every
 // triangle of its block's bin -- the kernel as it was before it ruled
 // triangles out, its voxel, update and write unchanged. Two passes (pc.pass):
@@ -32,7 +33,7 @@ layout(set = 0, binding = 0, scalar) readonly buffer Vertices {
   vec3 vertices[];
 };
 layout(set = 0, binding = 1, scalar) readonly buffer Indices { uint indices[]; };
-// binding 2: the host's candidate offsets (triangle_candidates.glsl).
+// binding 2: the device's candidate offsets (triangle_candidates.glsl).
 layout(set = 0, binding = 3, scalar) readonly buffer Blocks {
   RefBlock blocks[];
 };

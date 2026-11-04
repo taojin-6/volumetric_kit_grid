@@ -9,8 +9,10 @@
 // out independently of the GLSL the kernels use, so the two are not the same
 // expression checked against itself.
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -112,6 +114,78 @@ inline Mesh cube(vgrid::Vec3f origin, float side) {
 inline Mesh dented_cube(vgrid::Vec3f origin, float side) {
   Mesh m = cube(origin, side);
   m.v[6] = origin + vgrid::Vec3f(0.6f * side);
+  return m;
+}
+
+// A sphere of radius `r` at `centre`, its radius displaced by up to 4 mm of
+// noise: `rings` x `segments` quads, two triangles each -- ~9 mm edges at
+// r = 0.25 m and 125 x 200, about the density of a scanned body. The pole
+// rows are degenerate (a ring of coincident vertices), as a scan's slivers
+// are.
+inline Mesh displaced_sphere(vgrid::Vec3f centre, float r, std::uint32_t rings,
+                             std::uint32_t segments, std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> noise(-0.004f, 0.004f);
+  Mesh m;
+  for (std::uint32_t i = 0; i <= rings; ++i) {
+    const float theta = 3.14159265f * float(i) / float(rings);
+    for (std::uint32_t j = 0; j < segments; ++j) {
+      const float phi = 2.0f * 3.14159265f * float(j) / float(segments);
+      const float rr = r + noise(rng);
+      m.v.push_back(centre +
+                    rr * vgrid::Vec3f(std::sin(theta) * std::cos(phi),
+                                      std::cos(theta),
+                                      std::sin(theta) * std::sin(phi)));
+    }
+  }
+  for (std::uint32_t i = 0; i < rings; ++i) {
+    for (std::uint32_t j = 0; j < segments; ++j) {
+      const std::uint32_t a = i * segments + j;
+      const std::uint32_t b = i * segments + (j + 1) % segments;
+      const std::uint32_t c = a + segments;
+      const std::uint32_t d = b + segments;
+      m.i.insert(m.i.end(), {a, c, b, b, c, d});
+    }
+  }
+  return m;
+}
+
+// `n` random triangles in a 1.6 m box around `centre`, edges up to `edge`.
+inline Mesh soup(vgrid::Vec3f centre, std::uint32_t n, float edge,
+                 std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> pos(-0.8f, 0.8f);
+  std::uniform_real_distribution<float> off(-edge, edge);
+  Mesh m;
+  for (std::uint32_t t = 0; t < n; ++t) {
+    const vgrid::Vec3f p = centre + vgrid::Vec3f(pos(rng), pos(rng), pos(rng));
+    for (int k = 0; k < 3; ++k) {
+      m.v.push_back(k == 0 ? p
+                           : p + vgrid::Vec3f(off(rng), off(rng), off(rng)));
+      m.i.push_back(static_cast<std::uint32_t>(m.v.size() - 1));
+    }
+  }
+  return m;
+}
+
+// `n` triangles whose vertices lie on multiples of half a 5 mm voxel within
+// `range` half-voxels of the origin, so world / voxel_size lands on (or next
+// to) a .5 that rounds to even, after the band's subtract and add.
+inline Mesh ties(std::uint32_t n, std::uint32_t seed, int range = 200) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> k(-range, range);
+  std::uniform_int_distribution<int> d(-6, 6);
+  Mesh m;
+  for (std::uint32_t t = 0; t < n; ++t) {
+    const int x = k(rng), y = k(rng), z = k(rng);
+    for (int v = 0; v < 3; ++v) {
+      const int dx = v == 0 ? 0 : d(rng), dy = v == 0 ? 0 : d(rng),
+                dz = v == 0 ? 0 : d(rng);
+      m.v.push_back(vgrid::Vec3f(float(x + dx), float(y + dy), float(z + dz)) *
+                    0.0025f);
+      m.i.push_back(static_cast<std::uint32_t>(m.v.size() - 1));
+    }
+  }
   return m;
 }
 

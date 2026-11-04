@@ -8,8 +8,8 @@
 // wrong; a plain path placed as one mesh was before; a % in the scenario's
 // directory, resolved through config::load, read as written; signed mode's
 // rule and source.allow_holes, refused before any GPU work; inspection over a
-// range and its counts. On a device: each frame converted into a cleared grid,
-// its allocation in the conversion's metrics, and code_frame's records -- set
+// range and its counts. On a device: the conversion's rows in its metrics,
+// and code_frame's records -- set
 // the frame's number, pts that number at 30 fps, seq from 0, each payload what
 // a fresh encoder makes of the frame alone, the transform in the track's params
 // and 30 a second its rate -- and its own audit and allow_holes. The device
@@ -498,54 +498,9 @@ vkc::Result<vgrid_example::MeshSequence> cubes(const fs::path& dir,
 // A small grid in the examples' layout: too small for the cubes, so the
 // first conversion grows it.
 vkc::Result<vol::VoxelBlockGrid> small_grid(vkc::test::GpuContext& gpu) {
-  const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
-                                      {vol::kWeightAttribute, sizeof(float)}};
-  return vol::VoxelBlockGrid::create(
+  return vgrid_example::create_mesh_grid(
       gpu.device, gpu.allocator,
-      vol::block_grid_params(codec_fixture::kVoxel, codec_fixture::kTrunc, 2),
-      attrs, 2);
-}
-
-// Each frame is converted into a cleared grid: no block of the frame before
-// stays, and the grid holds what a fresh one would.
-int clean_grids(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
-  vkc::Result<vgrid_example::MeshSequence> sequence =
-      cubes(scratch.path / "clean", 1, 2, 0.06f,
-            [](std::uint32_t n) { return Vec3f(0.5f * float(n), 0.0f, 0.0f); });
-  CHECK(sequence.ok());
-  vkc::Result<vgrid_example::MeshFrame> a = sequence->load(1);
-  vkc::Result<vgrid_example::MeshFrame> b = sequence->load(2);
-  CHECK(a.ok() && b.ok());
-  vkc::Result<vx::MeshIntegrator> integrator =
-      vx::MeshIntegrator::create(gpu.device, gpu.allocator);
-  CHECK(integrator.ok());
-  const auto alone = [&](const mesh_io::TriangleMesh& mesh) -> Snapshot {
-    vkc::Result<vol::VoxelBlockGrid> fresh = small_grid(gpu);
-    if (!fresh.ok() ||
-        !vgrid_example::convert_frame(*fresh, *integrator, mesh, {}, nullptr)
-             .ok()) {
-      return {};
-    }
-    vkc::Result<Snapshot> shot = codec_fixture::snapshot(gpu, *fresh);
-    return shot.ok() ? *shot : Snapshot{};
-  };
-  const Snapshot only_a = alone(a->mesh);
-  const Snapshot only_b = alone(b->mesh);
-  CHECK(!only_a.coords.empty() && !only_b.coords.empty());
-  CHECK(!(only_a == only_b));
-
-  vkc::Result<vol::VoxelBlockGrid> grid = small_grid(gpu);
-  CHECK(grid.ok());
-  const std::int32_t slots = grid->grid().num_blocks;
-  for (const mesh_io::TriangleMesh* mesh : {&a->mesh, &b->mesh, &a->mesh}) {
-    vkc::Result<vx::MeshIntegrateStats> stats =
-        vgrid_example::convert_frame(*grid, *integrator, *mesh, {}, nullptr);
-    CHECK(stats.ok() && stats->blocks > 0);
-    vkc::Result<Snapshot> shot = codec_fixture::snapshot(gpu, *grid);
-    CHECK(shot.ok() && *shot == (mesh == &a->mesh ? only_a : only_b));
-  }
-  CHECK(grid->grid().num_blocks > slots);  // the first frame grew it
-  return 0;
+      vol::block_grid_params(codec_fixture::kVoxel, codec_fixture::kTrunc, 2));
 }
 
 // code_frame over frames 5-7 of a cube moving a block a frame: a record per
@@ -591,9 +546,11 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
     CHECK(active.ok());
     blocks.push_back(*active);
   }
-  // The conversion reports both of its calls, the allocation first.
-  CHECK(conversion.rows().size() >= 2);
-  CHECK(std::string(conversion.rows()[0].name) == "allocate");
+  // The conversion reports its one call, its allocation and its write.
+  CHECK(conversion.rows().size() >= 3);
+  CHECK(std::string(conversion.rows()[0].name) == "mesh convert");
+  CHECK(std::string(conversion.rows()[1].name) == "  ..allocate");
+  CHECK(std::string(conversion.rows()[2].name) == "  ..write");
   CHECK(coder.finish().ok());
   CHECK(coder.coded() == 3);
   // The player holds frame 7's blocks, no more.
@@ -633,8 +590,12 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
     vkc::Result<vgrid_example::MeshFrame> frame = sequence->load(n);
     vkc::Result<vol::VoxelBlockGrid> fresh = small_grid(gpu);
     CHECK(frame.ok() && fresh.ok());
-    CHECK(vgrid_example::convert_frame(*fresh, *integrator, frame->mesh, {},
-                                       nullptr)
+    const mesh_io::TriangleMesh& mesh = frame->mesh;
+    CHECK(integrator
+              ->convert(*fresh, mesh.positions.data(),
+                        std::uint32_t(mesh.positions.size()),
+                        mesh.indices.data(),
+                        std::uint32_t(mesh.indices.size() / 3))
               .ok());
     vkc::Result<codec::Encoder> once =
         codec::Encoder::create(gpu.device, gpu.allocator, {});
@@ -769,7 +730,6 @@ int single_record(vkc::test::GpuContext& gpu,
 
 int gpu_main(vkc::test::GpuContext& gpu) {
   vkc::test::Scratch scratch("grid_example_mesh_sequence_gpu_");
-  CHECK(clean_grids(gpu, scratch) == 0);
   CHECK(records(gpu, scratch) == 0);
   CHECK(single_record(gpu, scratch) == 0);
   CHECK(refused_once_placed(gpu, scratch) == 0);

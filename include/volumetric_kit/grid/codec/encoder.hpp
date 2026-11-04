@@ -37,6 +37,14 @@ struct RecordedEncode;
 /// @ref EncoderConfig::true_sdf frame codes: `ceil(1 + 8 sqrt(3))`.
 inline constexpr std::uint32_t kTrueSdfBandVoxels = 15;
 
+/// @return A distance from zero, in metres, within which every corner of
+///         every cell an @ref EncoderConfig::true_sdf frame keeps lies: one
+///         voxel, plus the `sqrt(3)` voxels past which a corner is cut, plus
+///         1e-6 m for rounding. A kept cell either has a corner nearer zero
+///         than one voxel, its other corners within `sqrt(3)` voxels of that
+///         one, or changes sign with no corner past the cut.
+VGRID_CODEC_API float true_sdf_keep_distance(float voxel_size) noexcept;
+
 /// @brief How an @ref Encoder codes a frame.
 struct VGRID_CODEC_API EncoderConfig {
   /// Coefficients kept per block and their quantization steps.

@@ -3,7 +3,8 @@
 
 # grid_test_support: the helpers grid's tests share with a sibling's, as headers
 # (include/volumetric_kit/grid/testing/): a grid's blocks made and read on the
-# device (device_blocks.hpp, grid_readback.hpp), a sphere's field
+# device (device_blocks.hpp, grid_readback.hpp), a mesh's candidate blocks
+# counted on the host (triangle_oracle.hpp), a sphere's field
 # (sphere_scene.hpp), a codec test's device and grids (codec_fixture.hpp), a
 # stage's rows (stage_rows.hpp), a .vrst file's bytes (stream_files.hpp) and a
 # server and its clients on loopback (networking_loopback.hpp). Built with the

@@ -4,10 +4,10 @@
 // integrate pass can give each voxel the short list of triangles that can be
 // within trunc_dist of it instead of the whole mesh.
 //
-// One work item per (triangle, candidate block) pair -- the decomposition
-// VoxelHashMap::allocate_from_triangles allocates over, decoded and pruned by
-// the same triangle_candidates.glsl -- so this bins a triangle into exactly the
-// blocks that allocation made, and a large triangle costs more work items
+// One work item per (triangle, candidate block) pair -- the decomposition the
+// band index (hash_classify_triangles.comp) allocates over, decoded and pruned
+// by the same triangle_candidates.glsl -- so this bins a triangle into exactly
+// the blocks that allocation made, and a large triangle costs more work items
 // rather than a longer one. The prior engine signed its field brute force,
 // every voxel against every triangle of the mesh, which is the long-dispatch
 // shape the 2026-08-08 overflow-scan entry records hanging an M5 iPad.
@@ -22,8 +22,8 @@
 //            of a slot stores the same
 //            coordinate). An item whose band block the table does not hold
 //            adds 1 to `missing` instead -- one per (triangle, block) pair, not
-//            per block -- which the host reads, and refuses, before anything is
-//            written. The scan rewrites counts[] in place as each bin's
+//            per block -- which the host reads after the first batch, and
+//            refuses. The scan rewrites counts[] in place as each bin's
 //            first entry (an exclusive prefix sum), and they become cursors.
 //   fill  -- replays the count pass's slots rather than re-deriving them: an
 //            item takes the next entry of its slot's bin and writes its
@@ -31,7 +31,17 @@
 //            bin fills exactly to its count. A fill that re-ran the probe and
 //            the band test would only agree by assumption, and a bin one short
 //            leaves an entry nobody wrote for the integrate pass to read as a
-//            triangle index.
+//            triangle index. With a full band (pc.full_band > 0), an item
+//            whose slot mesh_full_band.comp dropped (its mask is 0) is not
+//            filed: that slot's count was zeroed before the scan.
+//
+// With a full band, the count pass also grades each block it bins: a block
+// whose centre lies within pc.full_band + its half-diagonal (plus a rounding
+// margin) of some triangle -- so one holding a voxel within pc.full_band of
+// the mesh is never missed -- gets VGRID_FULL_BLOCK in slot_mask, which
+// mesh_full_band.comp dilates and prunes by. The grading measures its own
+// distance after the band test, which stays vgridBlockInBand untouched, and
+// only where the triangle's bounding box comes that near the centre.
 //
 // Keyed by the block's heap SLOT (ptr / voxels_per_block) rather than a dense
 // grid over the mesh's bounding box, which the prior engine's shell mode built:
@@ -74,17 +84,23 @@ layout(set = 0, binding = 7, scalar) buffer Missing { uint missing; };
 layout(set = 0, binding = 8, scalar) writeonly buffer BinTris {
   uint bin_tris[];
 };
+// binding 9: with a full band only -- each slot's write mask
+// (mesh_full_band.comp): VGRID_FULL_BLOCK from the count pass, read by the
+// fill.
+layout(set = 0, binding = 9, scalar) buffer SlotMask { uint slot_mask[]; };
 
 layout(push_constant, scalar) uniform PushConstants {
   VoxelGridParams grid;
   uint tri_count;
   uint pass;  // kPassCount or kPassFill
   uint item_base;  // the first work item this dispatch covers
+  float full_band;  // metres from the mesh; 0 writes every band block whole
 } pc;
 
 const uint kPassCount = 0u;
 const uint kPassFill = 1u;
 const uint kNoSlot = 0xFFFFFFFFu;
+#include "mesh_common.glsl"
 
 void main() {
   uint gid = pc.item_base + gl_GlobalInvocationID.x;
@@ -94,7 +110,8 @@ void main() {
 
   if (pc.pass == kPassFill) {
     uint slot = item_slot[gid];
-    if (slot != kNoSlot) {
+    if (slot != kNoSlot &&
+        (pc.full_band <= 0.0 || slot_mask[slot] != 0u)) {
       bin_tris[atomicAdd(counts[slot], 1u)] = vgridTriangleOf(gid, pc.tri_count);
     }
     return;
@@ -118,6 +135,28 @@ void main() {
       slot = uint(ptr) / uint(pc.grid.voxels_per_block);
       slot_coord[slot] = coord;
       atomicAdd(counts[slot], 1u);
+      if (pc.full_band > 0.0) {
+        float span = float(pc.grid.block_size - 1) * pc.grid.voxel_size;
+        vec3 centre =
+            vec3(coord * pc.grid.block_size) * pc.grid.voxel_size +
+            vec3(0.5 * span);
+        float s = max(sizeOf(centre),
+                      max(sizeOf(v0), max(sizeOf(v1), sizeOf(v2))));
+        float reach = pc.full_band + 0.5 * sqrt(3.0) * span;
+        reach += VGRID_MARGIN * (s + reach);
+        // The triangle lies in its bounding box: a box farther than the
+        // reach rules the block out without the closest point.
+        vec3 out_box = max(max(min(v0, min(v1, v2)) - centre,
+                               centre - max(v0, max(v1, v2))),
+                           vec3(0.0));
+        if (dot(out_box, out_box) <= reach * reach) {
+          vec3 closest;
+          if (vgridPointTriangleDistance(centre, v0, v1, v2, closest) <=
+              reach) {
+            slot_mask[slot] = VGRID_FULL_BLOCK;
+          }
+        }
+      }
     }
   }
   item_slot[gid] = slot;

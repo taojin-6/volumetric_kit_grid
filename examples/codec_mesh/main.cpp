@@ -28,7 +28,7 @@
 #include "volumetric_kit/grid/mesh/marching_cubes.hpp"
 #include "volumetric_kit/grid/mesh_io/mesh_normalization.hpp"
 #include "volumetric_kit/grid/mesh_io/ply_writer.hpp"
-#include "volumetric_kit/grid/volume/voxel_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
 #include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 namespace vgrid = volumetric_kit::grid;
@@ -45,19 +45,11 @@ vkc::Status run(const Options& opt) {
   const bool is_signed =
       opt.source.sdf_mode == vgrid_example::config::SdfMode::Signed;
   const float trunc = opt.fusion.truncation_m;
-  const vgrid::volume::VoxelGridParams grid =
-      vgrid::volume::block_grid_params(opt.fusion.voxel_size_m, trunc, 1024);
   // Before any GPU work, and before the first pass loads every frame: a
   // step the codec or the conversion refuses costs neither.
-  vgrid::codec::EncoderConfig config;
-  vgrid::voxelize::MeshSdfParams sdf;
+  vgrid_example::MeshCodecConfig codec;
   if (!inspect) {
-    VKC_ASSIGN(config, vgrid_example::encoder_config(opt.codec));
-    VKC_ASSIGN(sdf, vgrid_example::mesh_sdf_config(opt.source, grid));
-    // A mesh's field is a true distance: it codes without the observed mask
-    // (DECISIONS 2026-10-21), in a band that observes every voxel it codes.
-    config.true_sdf = true;
-    VKC_TRY(vgrid_example::check_true_sdf_band(sdf, grid));
+    VKC_ASSIGN(codec, vgrid_example::mesh_codec_config(opt));
   }
   VKC_ASSIGN(const vgrid_example::MeshSequence sequence,
              vgrid_example::MeshSequence::open(opt));
@@ -81,12 +73,8 @@ vkc::Status run(const Options& opt) {
              vkc::Device::create(instance, gpu, vgrid::device_requirements()));
   VKC_ASSIGN(vkc::Allocator allocator,
              vkc::Allocator::create(instance.handle(), device));
-  const vgrid::volume::AttributeSpec attrs[] = {
-      {vgrid::volume::kTsdfAttribute, sizeof(float)},
-      {vgrid::volume::kWeightAttribute, sizeof(float)}};
-  VKC_ASSIGN(
-      vgrid::volume::VoxelBlockGrid volume,
-      vgrid::volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2));
+  VKC_ASSIGN(vgrid::volume::VoxelBlockGrid volume,
+             vgrid_example::create_mesh_grid(device, allocator, codec.grid));
   VKC_ASSIGN(vgrid::voxelize::MeshIntegrator integrator,
              vgrid::voxelize::MeshIntegrator::create(device, allocator));
   VKC_ASSIGN(mesh::MarchingCubes extractor,
@@ -97,16 +85,16 @@ vkc::Status run(const Options& opt) {
       vgrid_example::codec_outputs(opt.output);
   VKC_ASSIGN(codec_stream::CodecStream stream,
              codec_stream::CodecStream::create(
-                 device, allocator, config,
+                 device, allocator, codec.encoder,
                  vgrid_example::codec_session(
                      "codec_mesh", {vgrid_example::kNominalFps, 1}, placement),
                  outputs));
-  VKC_ASSIGN(
-      vgrid_example::CodecReport report,
-      vgrid_example::CodecReport::create(opt.output.csv, outputs.stream,
-                                         outputs.decode, config.intra_period));
+  VKC_ASSIGN(vgrid_example::CodecReport report,
+             vgrid_example::CodecReport::create(opt.output.csv, outputs.stream,
+                                                outputs.decode,
+                                                codec.encoder.intra_period));
   std::printf("codec: %s\n", vgrid_example::codec_settings(
-                                 config, opt.codec.quantization_table)
+                                 codec.encoder, opt.codec.quantization_table)
                                  .c_str());
 
   vkc::StageMetrics conversion;
@@ -116,7 +104,7 @@ vkc::Status run(const Options& opt) {
        ++i, ++n) {
     last.reset();  // one frame's geometry held at a time
     VKC_ASSIGN(last, vgrid_example::code_frame(sequence, n, volume, integrator,
-                                               sdf, stream, &conversion));
+                                               codec.sdf, stream, &conversion));
     VKC_TRY(report.add(n, last->sent));
     const std::string defects =
         vgrid_example::topology_defects(last->frame.topology);
@@ -184,8 +172,8 @@ vkc::Status run(const Options& opt) {
   vgrid_example::print_comparison(total_error, opt.fusion.voxel_size_m);
   if (opt.codec.sweep) {
     VKC_TRY(vgrid_example::run_codec_sweep(device, allocator, volume,
-                                           source_reference, extractor, config,
-                                           *stream.player()));
+                                           source_reference, extractor,
+                                           codec.encoder, *stream.player()));
   }
   return {};
 }

@@ -136,16 +136,6 @@ struct Inspection {
 /// @return What it found, or the first error.
 vkc::Result<Inspection> inspect_frames(const MeshSequence& sequence);
 
-/// @brief Convert @p mesh into @p grid alone: clear the grid, so no block of
-///        an earlier frame stays, allocate the mesh's band, growing the grid
-///        for capacity and retrying lost bucket-lock races, then integrate.
-/// @return The integrator's stats, or the first error.
-vkc::Result<vgrid::voxelize::MeshIntegrateStats> convert_frame(
-    vgrid::volume::VoxelBlockGrid& grid,
-    vgrid::voxelize::MeshIntegrator& integrator,
-    const vgrid::mesh_io::TriangleMesh& mesh,
-    const vgrid::voxelize::MeshSdfParams& params, vkc::StageMetrics* metrics);
-
 /// @brief What @ref code_frame did with one frame.
 struct CodedFrame {
   MeshFrame frame;                            ///< The frame as converted.
@@ -154,7 +144,7 @@ struct CodedFrame {
 };
 
 /// @brief One frame of a run: @ref MeshSequence::load, @ref
-///        MeshSequence::admit, @ref convert_frame into @p grid, then one
+///        MeshSequence::admit, `MeshIntegrator::convert` into @p grid, then one
 ///        record of @p stream (`codec_stream::CodecStream::code`), its set the
 ///        frame's number and its pts that number at @ref kNominalFps.
 /// @return The frame, or the first error, naming the frame.

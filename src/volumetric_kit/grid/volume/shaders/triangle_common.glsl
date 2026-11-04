@@ -3,8 +3,8 @@
 
 // Closest-point-on-triangle, the one geometric primitive the mesh-driven
 // passes share: `volume`'s triangle_candidates.glsl prunes candidate blocks
-// with it, and voxelize's mesh_integrate.comp evaluates the distance field
-// itself with it. It lives in `volume`, the lowest tier either is in, and a
+// with it, and voxelize's write kernel (mesh_integrate_body.glsl) evaluates
+// the distance field itself with it. It lives in `volume`, the lowest tier either is in, and a
 // second copy would compile clean, pass spirv-val, and disagree about a
 // voxel's sign only on the creases.
 //
@@ -21,8 +21,8 @@
 // Each of the three edge branches divides by a squared edge length -- d1-d3 is
 // |ab|^2, d2-d6 is |ac|^2, and (d4-d3)+(d5-d6) is |bc|^2 -- so every denominator
 // is non-zero for a triangle of non-zero area, and a degenerate one is the
-// caller's to exclude (volume::triangle_candidate_offsets drops zero-area
-// triangles before they reach a work item). The interior branch guards its own
+// caller's to exclude (voxelize's triangle_counts.comp counts a zero-area
+// triangle zero, so it reaches no work item). The interior branch guards its own
 // denominator anyway, since that one is a sum of signed barycentric areas and
 // can cancel.
 //
