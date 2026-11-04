@@ -132,9 +132,10 @@ inline Mesh displaced_sphere(vgrid::Vec3f centre, float r, std::uint32_t rings,
     for (std::uint32_t j = 0; j < segments; ++j) {
       const float phi = 2.0f * 3.14159265f * float(j) / float(segments);
       const float rr = r + noise(rng);
-      m.v.push_back(centre + rr * vgrid::Vec3f(std::sin(theta) * std::cos(phi),
-                                               std::cos(theta),
-                                               std::sin(theta) * std::sin(phi)));
+      m.v.push_back(centre +
+                    rr * vgrid::Vec3f(std::sin(theta) * std::cos(phi),
+                                      std::cos(theta),
+                                      std::sin(theta) * std::sin(phi)));
     }
   }
   for (std::uint32_t i = 0; i < rings; ++i) {

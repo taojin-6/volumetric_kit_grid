@@ -330,9 +330,9 @@ void VoxelHashMap::write_persistent_bindings() {
   // (allocate / distinct insert / delete / rehash) additionally share the
   // fail-counts buffer at binding 5 -- they never run in the same dispatch,
   // and each re-zeroes it before use. Their per-call input (coords at binding
-  // 4, delete's done flags at 6) is written before each dispatch. The depth kernel's sets (depth_sets_) are written whole by each
-  // allocate_from_depth. Compact uses entries + the compaction output + its
-  // counter.
+  // 4, delete's done flags at 6) is written before each dispatch. The depth
+  // kernel's sets (depth_sets_) are written whole by each allocate_from_depth.
+  // Compact uses entries + the compaction output + its counter.
   const VkBuffer entries = entries_.handle();
   const VkBuffer heap = heap_.handle();
   const VkBuffer counter = heap_counter_.handle();
@@ -445,8 +445,8 @@ core::Status VoxelHashMap::record_init(core::CommandBatch& batch,
 }
 
 core::Status VoxelHashMap::Internal::record_clear(VoxelHashMap& map,
-                                                 core::CommandBatch& batch,
-                                                 core::GpuStageScope* stage) {
+                                                  core::CommandBatch& batch,
+                                                  core::GpuStageScope* stage) {
   if (!map.valid()) {
     return core::Status::invalid_argument(
         "VoxelHashMap::Internal::record_clear: moved-from map");
@@ -464,8 +464,8 @@ core::Result<RecordedRounds> VoxelHashMap::Internal::record_allocate_distinct(
     core::GpuStageScope* stage) {
   // One round: a lock-free insert loses no race, so a second could only meet
   // the capacity limit the first met.
-  return map.record_rounds(false, batch, coords, count, gate, stage, nullptr,
-                           1, true, true);
+  return map.record_rounds(false, batch, coords, count, gate, stage, nullptr, 1,
+                           true, true);
 }
 
 core::Status VoxelHashMap::rebuild_heap_excluding(

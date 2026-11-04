@@ -97,13 +97,12 @@ struct Oracle {
 Oracle band_blocks(const vol::VoxelGridParams& grid, const Mesh& m) {
   Oracle out;
   const std::vector<std::uint32_t> offsets =
-      vgrid_test::triangle_candidate_offsets(grid, m.v.data(),
-                                             m.vertex_count(), m.i.data(),
-                                             m.triangle_count(), "oracle")
+      vgrid_test::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
+                                             m.i.data(), m.triangle_count(),
+                                             "oracle")
           .value();
   const double span = double(grid.block_size - 1) * double(grid.voxel_size);
-  const double limit =
-      double(grid.trunc_dist) + 0.5 * std::sqrt(3.0) * span;
+  const double limit = double(grid.trunc_dist) + 0.5 * std::sqrt(3.0) * span;
   for (std::uint32_t t = 0; t < m.triangle_count(); ++t) {
     if (offsets[t + 1] == offsets[t]) continue;
     const vgrid::Vec3f a = test_meshes::corner(m, t, 0);
@@ -120,10 +119,10 @@ Oracle band_blocks(const vol::VoxelGridParams& grid, const Mesh& m) {
     for (int z = lo.z; z <= hi.z; ++z) {
       for (int y = lo.y; y <= hi.y; ++y) {
         for (int x = lo.x; x <= hi.x; ++x) {
-          const Vec3d centre =
-              Vec3d(double(x), double(y), double(z)) * double(grid.block_size) *
-                  double(grid.voxel_size) +
-              Vec3d(0.5 * span);
+          const Vec3d centre = Vec3d(double(x), double(y), double(z)) *
+                                   double(grid.block_size) *
+                                   double(grid.voxel_size) +
+                               Vec3d(0.5 * span);
           const double d = glm::length(
               centre - closest_point(centre, Vec3d(a), Vec3d(b), Vec3d(c)));
           if (std::fabs(d - limit) < tol) {
@@ -153,8 +152,8 @@ int active(vol::VoxelBlockGrid& grid, std::set<Coord>& got) {
 }
 
 // Convert `m` into `grid`; its blocks into `got`, each written.
-int convert(vx::MeshIntegrator& integ, vol::VoxelBlockGrid& grid,
-            const Mesh& m, std::set<Coord>& got) {
+int convert(vx::MeshIntegrator& integ, vol::VoxelBlockGrid& grid, const Mesh& m,
+            std::set<Coord>& got) {
   vkc::Result<vx::MeshIntegrateStats> stats = integ.convert(
       grid, m.v.data(), m.vertex_count(), m.i.data(), m.triangle_count());
   if (!stats.ok()) {

@@ -5,8 +5,8 @@
 
 // The host oracle of a mesh's (triangle, candidate block) decomposition, the
 // rules voxelize's triangle_counts.comp counts by: each triangle's candidate
-// blocks counted and summed into exclusive offsets, as `MeshIntegrator::convert`
-// counts them on the device.
+// blocks counted and summed into exclusive offsets, as
+// `MeshIntegrator::convert` counts them on the device.
 
 #include <cmath>
 #include <cstddef>
@@ -66,16 +66,17 @@ inline bool zero_area(volumetric_kit::grid::Vec3f v0,
 // area, counts zero. Refuses a null array with triangles to read, an index at
 // or past vertex_count, and a total past 2^32, naming `who`.
 inline volumetric_kit::core::Result<std::vector<std::uint32_t>>
-triangle_candidate_offsets(const volumetric_kit::grid::volume::VoxelGridParams& grid,
-                           const volumetric_kit::grid::Vec3f* vertices,
-                           std::uint32_t vertex_count,
-                           const std::uint32_t* indices,
-                           std::uint32_t triangle_count, const char* who) {
+triangle_candidate_offsets(
+    const volumetric_kit::grid::volume::VoxelGridParams& grid,
+    const volumetric_kit::grid::Vec3f* vertices, std::uint32_t vertex_count,
+    const std::uint32_t* indices, std::uint32_t triangle_count,
+    const char* who) {
   namespace vgrid = volumetric_kit::grid;
   namespace vkc = volumetric_kit::core;
   const std::string name = who != nullptr ? who : "triangle_candidate_offsets";
   if (triangle_count != 0 && (vertices == nullptr || indices == nullptr)) {
-    return vkc::Status::invalid_argument(name + ": vertices or indices is null");
+    return vkc::Status::invalid_argument(name +
+                                         ": vertices or indices is null");
   }
   std::vector<std::uint32_t> offsets(std::size_t{triangle_count} + 1, 0u);
   std::uint64_t total = 0;

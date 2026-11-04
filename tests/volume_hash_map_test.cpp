@@ -103,10 +103,10 @@ vkc::Result<vol::AllocFailures> insert_distinct(
     vkc::test::GpuContext& gpu, vol::VoxelHashMap& map,
     const std::vector<vol::BlockIndex>& list) {
   const auto count = static_cast<std::uint32_t>(list.size());
-  VKC_ASSIGN(const vkc::Buffer coords,
-             vkc::test::upload_device_buffer(
-                 gpu.device, gpu.allocator, list.data(),
-                 list.size() * sizeof(vol::BlockIndex)));
+  VKC_ASSIGN(
+      const vkc::Buffer coords,
+      vkc::test::upload_device_buffer(gpu.device, gpu.allocator, list.data(),
+                                      list.size() * sizeof(vol::BlockIndex)));
   VKC_ASSIGN(const vkc::Buffer word,
              vkc::test::upload_device_buffer(gpu.device, gpu.allocator, &count,
                                              sizeof(count)));
@@ -169,12 +169,11 @@ int distinct_insert_case(vkc::test::GpuContext& gpu) {
   CHECK(placed.size() == half.size());
   map.advance_tick();
   vkc::Result<vol::AllocFailures> failed = insert_distinct(gpu, map, list);
-  CHECK(failed.ok() && failed.value().total == 0 &&
-        failed.value().lock == 0 && failed.value().rounds == 1);
+  CHECK(failed.ok() && failed.value().total == 0 && failed.value().lock == 0 &&
+        failed.value().rounds == 1);
   const std::vector<vol::BlockIndex> after =
       map.compact_active_blocks().value();
-  CHECK(after.size() == list.size() &&
-        map.allocated_blocks() == list.size());
+  CHECK(after.size() == list.size() && map.allocated_blocks() == list.size());
   std::set<Coord> got;
   std::set<int> ptrs;
   for (const vol::BlockIndex& b : after) {
@@ -209,8 +208,8 @@ int distinct_insert_case(vkc::test::GpuContext& gpu) {
       coords_in_bucket(0, c.num_buckets, 12);
   CHECK(crowd.size() == 12);
   failed = insert_distinct(gpu, chained.value(), crowd);
-  CHECK(failed.ok() && failed.value().chain == 5 &&
-        failed.value().total == 5 && failed.value().lock == 0);
+  CHECK(failed.ok() && failed.value().chain == 5 && failed.value().total == 5 &&
+        failed.value().lock == 0);
   const std::set<Coord> kept = active_coords(chained.value());
   CHECK(kept.size() == 7);
   // Each block the table holds is found again: a second insert places none.

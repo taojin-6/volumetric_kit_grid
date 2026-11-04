@@ -89,9 +89,9 @@ class VoxelHashMap::Internal {
   /// @return OK; `Status::Code::InvalidArgument` for a moved-from map, with
   ///         nothing recorded and the host's view unchanged; or the batch's
   ///         refusal.
-  VGRID_VOLUME_API static core::Status record_clear(
-      VoxelHashMap& map, core::CommandBatch& batch,
-      core::GpuStageScope* stage);
+  VGRID_VOLUME_API static core::Status record_clear(VoxelHashMap& map,
+                                                    core::CommandBatch& batch,
+                                                    core::GpuStageScope* stage);
 
   /// @brief @ref VoxelHashMap::record_allocate for a list whose coordinates
   ///        are distinct: one round of a lock-free insert

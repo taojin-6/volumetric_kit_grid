@@ -3,8 +3,8 @@
 
 // GPU test for voxelize::detail::MeshBand's candidate count: the offsets
 // counted and scanned on the device, and the block range the candidates fall
-// in. The oracle is tests/support's triangle_candidate_offsets: every offset, the
-// total included, and the range equal it word for word -- on a tilted quad,
+// in. The oracle is tests/support's triangle_candidate_offsets: every offset,
+// the total included, and the range equal it word for word -- on a tilted quad,
 // degenerate triangles (a repeated vertex, exactly collinear, one vertex three
 // times, first and last, all of them), two equal vertices, non-finite
 // vertices, body-like spheres at two placements (one straddling 0) and of
@@ -105,7 +105,8 @@ int same_as_host(vkc::test::GpuContext& gpu, MeshBand& band,
                  const char* what) {
   vkc::Result<std::vector<std::uint32_t>> host =
       vgrid_test::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
-                                      m.i.data(), m.triangle_count(), what);
+                                             m.i.data(), m.triangle_count(),
+                                             what);
   CHECK(host.ok());
   const vkc::Status counted = count(gpu, band, grid, m);
   if (!counted.ok()) {
@@ -115,8 +116,7 @@ int same_as_host(vkc::test::GpuContext& gpu, MeshBand& band,
   }
   vkc::Result<std::vector<std::uint32_t>> dev =
       vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
-                                          band.offset_buffer(),
-                                          host->size());
+                                          band.offset_buffer(), host->size());
   CHECK(dev.ok());
   std::size_t mismatches = 0;
   for (std::size_t t = 0; t < host->size(); ++t) {
@@ -150,8 +150,9 @@ int same_as_host(vkc::test::GpuContext& gpu, MeshBand& band,
 int device_refuses(vkc::test::GpuContext& gpu, MeshBand& band,
                    const vol::VoxelGridParams& grid, const Mesh& m,
                    const char* what) {
-  CHECK(!vgrid_test::triangle_candidate_offsets(grid, m.v.data(), m.vertex_count(),
-                                         m.i.data(), m.triangle_count(), what)
+  CHECK(!vgrid_test::triangle_candidate_offsets(grid, m.v.data(),
+                                                m.vertex_count(), m.i.data(),
+                                                m.triangle_count(), what)
              .ok());
   CHECK(band.set_mesh(grid, m.v.data(), m.vertex_count(), m.i.data(),
                       m.triangle_count(), "test")
@@ -160,9 +161,9 @@ int device_refuses(vkc::test::GpuContext& gpu, MeshBand& band,
   CHECK(refused.domain() == vkc::Status::Code::InvalidArgument);
   CHECK(band.total() == 0 && band.bounds().empty);
   vkc::Result<std::vector<std::uint32_t>> words =
-      vkc::test::read_back<std::uint32_t>(
-          gpu.device, gpu.allocator, band.offset_buffer(),
-          std::size_t{m.triangle_count()} + 1);
+      vkc::test::read_back<std::uint32_t>(gpu.device, gpu.allocator,
+                                          band.offset_buffer(),
+                                          std::size_t{m.triangle_count()} + 1);
   CHECK(words.ok() && words->back() == 0u);
   std::printf("  %s: refused at the wait (%s)\n", what,
               refused.message().c_str());
@@ -228,8 +229,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     const float inf = std::numeric_limits<float>::infinity();
     const float nan = std::numeric_limits<float>::quiet_NaN();
     Mesh m;
-    m.v = {{0.1f, 0.2f, 0.3f},   {0.15f, 0.2f, 0.3f},  {0.1f, 0.26f, 0.3f},
-           {nan, 0.2f, 0.3f},    {0.1f, inf, 0.3f},    {0.1f, 0.2f, -inf},
+    m.v = {{0.1f, 0.2f, 0.3f},   {0.15f, 0.2f, 0.3f}, {0.1f, 0.26f, 0.3f},
+           {nan, 0.2f, 0.3f},    {0.1f, inf, 0.3f},   {0.1f, 0.2f, -inf},
            {0.2f, 0.25f, 0.33f}, {nan, nan, nan}};
     // Vertex 7 is NaN but no triangle uses it.
     m.i = {0, 1, 3, 0, 1, 2, 4, 1, 2, 1, 2, 6, 0, 5, 6, 3, 4, 5, 0, 2, 6};
@@ -243,10 +244,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
           gpu, band, grid,
           test_meshes::displaced_sphere({0.0f, 0.0f, 0.0f}, 0.25f, 125, 200, 2),
           "body-like across 0") != 0 ||
-      same_as_host(gpu, band, grid,
-                   test_meshes::displaced_sphere({-1.3f, 0.4f, 2.1f}, 0.6f, 300,
-                                                 400, 3),
-                   "body-like, 240k") != 0 ||
+      same_as_host(
+          gpu, band, grid,
+          test_meshes::displaced_sphere({-1.3f, 0.4f, 2.1f}, 0.6f, 300, 400, 3),
+          "body-like, 240k") != 0 ||
       same_as_host(gpu, band, grid,
                    test_meshes::soup({0.2f, 0.9f, -0.1f}, 50000, 0.05f, 4),
                    "soup, 50k") != 0 ||
@@ -283,7 +284,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
           vkc::Status::Code::InvalidArgument);  // triangles, no vertices
     CHECK(band.set_mesh(grid, nullptr, 3, m.i.data(), 1, "test").domain() ==
           vkc::Status::Code::InvalidArgument);
-    std::printf("  index at vertex_count, 2^32 - 1, null: refused on the host\n");
+    std::printf(
+        "  index at vertex_count, 2^32 - 1, null: refused on the host\n");
   }
   {
     // A model in millimetres read as metres: one triangle 1 km across has
@@ -311,9 +313,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     // Every block holding a voxel within trunc_dist of a triangle, brute
     // force over each triangle's box and a block beyond it on every side.
     const Mesh tied = test_meshes::ties(300, 11, 40);  // within 0.1 m
-    const vol::AttributeSpec attrs[] = {
-        {vol::kTsdfAttribute, sizeof(float)},
-        {vol::kWeightAttribute, sizeof(float)}};
+    const vol::AttributeSpec attrs[] = {{vol::kTsdfAttribute, sizeof(float)},
+                                        {vol::kWeightAttribute, sizeof(float)}};
     vkc::Result<vol::VoxelBlockGrid> block_grid =
         vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, grid, attrs, 2);
     vkc::Result<vgrid::voxelize::MeshIntegrator> integ =
@@ -362,9 +363,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
       }
     }
     CHECK(want > 0);
-    std::printf("  300 triangles on half-voxel ties: every band block of %zu "
-                "allocated\n",
-                got.size());
+    std::printf(
+        "  300 triangles on half-voxel ties: every band block of %zu "
+        "allocated\n",
+        got.size());
   }
 
   std::printf("voxelize_mesh_candidates: OK\n");

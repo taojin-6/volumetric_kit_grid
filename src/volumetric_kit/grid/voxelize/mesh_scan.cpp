@@ -63,8 +63,7 @@ core::Result<std::unique_ptr<MeshScan>> MeshScan::create(
   return scan;
 }
 
-core::Status MeshScan::prepare(const core::Buffer& values,
-                               std::uint32_t size) {
+core::Status MeshScan::prepare(const core::Buffer& values, std::uint32_t size) {
   // 256-way hierarchy: even one leaf group is scanned once, leaving its
   // exclusive prefix zero and its aggregate in a separate root. At most
   // three summary passes cover every uint32-sized input.
@@ -110,8 +109,8 @@ core::Status MeshScan::record(core::CommandBatch& batch, std::uint32_t size,
     for (std::uint32_t first_group = 0; first_group < groups;) {
       const std::uint32_t n = std::min(groups - first_group, max_groups);
       const ScanPush push{items, first_group};
-      VKC_TRY(batch.dispatch(kernel, &push, sizeof(push), n, max_groups,
-                             stage));
+      VKC_TRY(
+          batch.dispatch(kernel, &push, sizeof(push), n, max_groups, stage));
       first_group += n;
     }
     return {};

@@ -630,11 +630,10 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     };
     const auto only = [&](const Mesh& m) {
       vkc::Result<vol::VoxelBlockGrid> fresh = fresh_grid();
-      if (!fresh.ok() ||
-          !integ
-               .convert(*fresh, m.v.data(), m.vertex_count(), m.i.data(),
-                        m.triangle_count(), kSigned)
-               .ok()) {
+      if (!fresh.ok() || !integ
+                              .convert(*fresh, m.v.data(), m.vertex_count(),
+                                       m.i.data(), m.triangle_count(), kSigned)
+                              .ok()) {
         return std::map<Coord, std::vector<float>>{};
       }
       return by_coord(gpu, *fresh);
@@ -661,8 +660,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     for (const std::uint32_t triangles : {2u, 0u}) {
       CHECK(convert(tet, kSigned).ok() && !active_blocks(grid).empty());
       vkc::Result<vx::MeshIntegrateStats> none =
-          integ.convert(grid, flat.v.data(), flat.vertex_count(),
-                        flat.i.data(), triangles, kSigned);
+          integ.convert(grid, flat.v.data(), flat.vertex_count(), flat.i.data(),
+                        triangles, kSigned);
       CHECK(none.ok() && none.value().blocks == 0 &&
             none.value().triangles == 0);
       CHECK(active_blocks(grid).empty());
@@ -783,8 +782,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   {
     const Mesh fine = divided_quad(0.013f, 0.043f, 0.027f, 0.057f, z0, 200);
     vkc::Result<vx::MeshIntegrateStats> r = convert(fine, kShell);
-    CHECK(!r.ok() && r.status().message().find("kMaxBinTriangles") !=
-                         std::string::npos);
+    CHECK(!r.ok() &&
+          r.status().message().find("kMaxBinTriangles") != std::string::npos);
     for (const float w : attr(gpu, grid, vol::kWeightAttribute)) {
       CHECK(w == 0.0f);
     }
