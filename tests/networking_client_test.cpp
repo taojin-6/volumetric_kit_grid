@@ -38,6 +38,7 @@
 #include <thread>
 #include <vector>
 
+#include "volumetric_kit/core/net/socket.hpp"
 #include "volumetric_kit/core/testing/test_allocation_failure.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/grid/testing/networking_loopback.hpp"
@@ -378,10 +379,11 @@ int zero_wait_case() {
 }
 
 // A partial record is progress even though next returns false. Each piece is
-// drained before another goes, and a later idle step in the same call must
-// not erase its progress. A separate idle call resets it. Records sent
-// together report progress too, including one already buffered by the call
-// before it; no receive is required to return a record.
+// in the client's socket before the call that drains it, and a later idle
+// step in the same call must not erase its progress. A separate idle call
+// resets it. Records sent together report progress too, including one
+// already buffered by the call before it; no receive is required to return a
+// record.
 int progress_case() {
   Sender sender;
   auto client = net::connect(sender.listener.port);
@@ -396,6 +398,21 @@ int progress_case() {
   CHECK(net::send_bytes(sender.peer.get(), session_bytes()));
   CHECK(net::wait_session(*client));
 
+  // A piece is all in the client's socket once the sender holds none of it
+  // unacknowledged: the client's end acknowledges what it has queued. The
+  // call's first receive then takes it whole, however late it runs; send()
+  // returning says only that the sender's socket took it.
+  const auto in_socket = [&sender] {
+    const Clock::time_point until = Clock::now() + 5s;
+    for (;;) {
+      const vkc::Result<std::size_t> held =
+          vkc::net::unacknowledged("progress_case", sender.peer.get());
+      if (!held.ok()) return false;
+      if (*held == 0) return true;
+      if (Clock::now() >= until) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+  };
   const Bytes payload = vrst::pattern(512 * 1024, 7);
   const Bytes record = vrst::record(0, 1, 0, 0, stream::kNoSet, payload);
   constexpr std::size_t kPiece = 128 * 1024;
@@ -403,6 +420,7 @@ int progress_case() {
     const std::size_t end = std::min(begin + kPiece, record.size());
     const Bytes piece(record.data() + begin, record.data() + end);
     CHECK(net::send_bytes(sender.peer.get(), piece));
+    CHECK(in_socket());
     progressed = false;
     r = client->next(20ms, &got.record, &got.payload, &progressed);
     CHECK(r.ok() && progressed);
@@ -419,9 +437,12 @@ int progress_case() {
       sender.peer.get(),
       concat({vrst::record(0, 0, 1, 1, stream::kNoSet, small),
               vrst::record(0, 0, 2, 2, stream::kNoSet, small)})));
+  // A call returns once its record parses, so the 5 s bound only covers a
+  // late segment: under ThreadSanitizer on macOS, these records came back
+  // 5-13 ms after send() returned, about as late as a 128 KiB piece.
   for (std::uint64_t seq = 1; seq <= 2; ++seq) {
     progressed = false;
-    r = client->next(20ms, &got.record, &got.payload, &progressed);
+    r = client->next(5s, &got.record, &got.payload, &progressed);
     CHECK(r.ok() && *r && progressed && got.record.info.seq == seq);
     CHECK(got.payload == small);
   }

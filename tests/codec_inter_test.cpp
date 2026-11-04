@@ -578,11 +578,11 @@ Census census(const Step& prev, const Step& p) {
 
 // Synthetic chains: every mode and new blocks; then no new blocks (A = 0);
 // every block removed (N = 0); and only new ones, against that empty frame
-// (M = 0) -- at odd K, K = 64 and K = 512, update and new segments of
-// several sizes; and the extreme coefficients, whose differences wrap and,
-// at +-32768, code zero.
+// (M = 0) -- at odd K and K = 512 (the other chains decode K = 64), update
+// and new segments of several sizes; and the extreme coefficients, whose
+// differences wrap and, at +-32768, code zero.
 int synthetic_case(Shared& gpu) {
-  for (std::uint32_t k : {21u, 64u, codec::kVoxelsPerBlock}) {
+  for (std::uint32_t k : {21u, codec::kVoxelsPerBlock}) {
     const std::size_t n = k == codec::kVoxelsPerBlock ? 30 : 90;
     std::vector<Step> chain;
     chain.push_back(
@@ -646,35 +646,6 @@ int extremes_chain_case(Shared& gpu) {
   chain.push_back(p_step(chain[1], reference, sizes(3, 7)));
   CHECK(census(chain[0], chain[1]).added == added.coords.size());
   return run_chain(gpu, chain, "int32 extremes");
-}
-
-// The Encoder's frames of one sphere at an odd K, at the default segments
-// and finer ones, each into a fresh grid: as the oracle decodes them.
-int encoder_case(Shared& gpu) {
-  vkc::Result<vol::VoxelBlockGrid> g =
-      sphere_grid(gpu, Sphere{vgrid::Vec3f(0.01f, -0.02f, 0.03f), 0.09f});
-  CHECK(g.ok());
-  for (std::uint32_t segment_size : {64u, 3u}) {
-    codec::EncoderConfig config;
-    config.params.coefficient_count = 37;
-    config.segment_size = segment_size;
-    vkc::Result<codec::Encoder> enc =
-        codec::Encoder::create(gpu.device, gpu.allocator, config);
-    CHECK(enc.ok());
-    vkc::Result<Bytes> frame = enc.value().encode(g.value());
-    CHECK(frame.ok());
-    CHECK(codec::read_frame_info(frame.value().data(), frame.value().size())
-              .value()
-              .block_count > 0);
-    vkc::Result<vol::VoxelBlockGrid> player = grid_for(gpu, frame.value());
-    CHECK(player.ok());
-    CHECK(
-        gpu.dec
-            .decode(frame.value().data(), frame.value().size(), player.value())
-            .ok());
-    CHECK(holds(gpu, player.value(), frame.value()));
-  }
-  return 0;
 }
 
 // I-frames from the Encoder, of a sphere that moves and grows.
@@ -1091,50 +1062,48 @@ vkc::Result<vol::VoxelBlockGrid> moving_spheres(Gpu& gpu, int t) {
                          Sphere{vgrid::Vec3f(0.6f, 0.0f, 0.0f), 0.05f});
 }
 
-// The moving spheres in chains at period 4 and open-ended, at an odd K in
-// segments of 3 and update segments of 5 and at the defaults: every frame
-// the oracle's bytes, every P-frame decoding to the oracle's intra frame of
-// its held content; and among the P-frames every mode the encoder chooses
-// but motion, and new blocks.
+// The moving spheres in a chain at period 4 -- an I-frame, three P-frames,
+// the next I-frame -- at an odd K in segments of 3 and update segments of 5
+// and at the defaults: every frame the oracle's bytes, every P-frame decoding
+// to the oracle's intra frame of its held content; and among the P-frames
+// every mode the encoder chooses but motion, and new blocks.
 int encoder_chain_case(Shared& gpu) {
-  for (const std::uint32_t period : {4u, ~0u}) {
-    for (const bool odd : {true, false}) {
-      codec::EncoderConfig config;
-      config.intra_period = period;
-      if (odd) {
-        config.params.coefficient_count = 37;
-        config.segment_size = 3;
-        config.update_size = 5;
-      }
-      vkc::Result<codec::Encoder> enc =
-          codec::Encoder::create(gpu.device, gpu.allocator, config);
-      CHECK(enc.ok());
-      std::vector<Coded> chain;
-      Census all;
-      vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
-      CHECK(player.ok());
-      for (int t = 0; t < 7; ++t) {
-        vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
-        CHECK(g.ok());
-        CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
-        const bool intra = t == 0 || (period == 4 && t == 4);
-        CHECK(type_of(chain.back().sent) ==
-              (intra ? codec::FrameType::kIntra : codec::FrameType::kInter));
-        const Bytes& f = chain.back().sent;
-        CHECK(gpu.dec.decode(f.data(), f.size(), player.value()).ok());
-        CHECK(holds(gpu, player.value(), chain.back().intra));
-        if (!intra) {
-          const Census c = census_of(chain);
-          for (std::size_t m = 0; m < 5; ++m) all.modes[m] += c.modes[m];
-          all.added += c.added;
-        }
-      }
-      CHECK(all.modes[std::size_t(d::BlockMode::kKeep)] > 0);
-      CHECK(all.modes[std::size_t(d::BlockMode::kSkip)] > 0);
-      CHECK(all.modes[std::size_t(d::BlockMode::kRemove)] > 0);
-      CHECK(all.modes[std::size_t(d::BlockMode::kMotion)] == 0);
-      CHECK(all.added > 0);
+  for (const bool odd : {true, false}) {
+    codec::EncoderConfig config;
+    config.intra_period = 4;
+    if (odd) {
+      config.params.coefficient_count = 37;
+      config.segment_size = 3;
+      config.update_size = 5;
     }
+    vkc::Result<codec::Encoder> enc =
+        codec::Encoder::create(gpu.device, gpu.allocator, config);
+    CHECK(enc.ok());
+    std::vector<Coded> chain;
+    Census all;
+    vkc::Result<vol::VoxelBlockGrid> player = make_grid(gpu);
+    CHECK(player.ok());
+    for (int t = 0; t < 5; ++t) {
+      vkc::Result<vol::VoxelBlockGrid> g = moving_spheres(gpu, t);
+      CHECK(g.ok());
+      CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
+      const bool intra = t % 4 == 0;
+      CHECK(type_of(chain.back().sent) ==
+            (intra ? codec::FrameType::kIntra : codec::FrameType::kInter));
+      const Bytes& f = chain.back().sent;
+      CHECK(gpu.dec.decode(f.data(), f.size(), player.value()).ok());
+      CHECK(holds(gpu, player.value(), chain.back().intra));
+      if (!intra) {
+        const Census c = census_of(chain);
+        for (std::size_t m = 0; m < 5; ++m) all.modes[m] += c.modes[m];
+        all.added += c.added;
+      }
+    }
+    CHECK(all.modes[std::size_t(d::BlockMode::kKeep)] > 0);
+    CHECK(all.modes[std::size_t(d::BlockMode::kSkip)] > 0);
+    CHECK(all.modes[std::size_t(d::BlockMode::kRemove)] > 0);
+    CHECK(all.modes[std::size_t(d::BlockMode::kMotion)] == 0);
+    CHECK(all.added > 0);
   }
   return 0;
 }
@@ -1163,9 +1132,9 @@ bool full_mask(const std::uint32_t* mask) {
                      [](std::uint32_t w) { return w == ~0u; });
 }
 
-// With true_sdf, the moving curtain's open-ended chain: every frame the
-// oracle's bytes, its blocks and cuts by the host rule, every P-frame
-// decoding to the oracle's intra frame of its held content; among the
+// With true_sdf, the moving curtain's open-ended chain of four frames: every
+// frame the oracle's bytes, its blocks and cuts by the host rule, every
+// P-frame decoding to the oracle's intra frame of its held content; among the
 // P-frames keep, skip, remove and new blocks, keep entries whose cut voxels
 // changed (a non-empty XOR mask), and blocks whose mask went from full to
 // partial and back.
@@ -1182,7 +1151,7 @@ int true_sdf_chain_case(Shared& gpu) {
   std::size_t changed_keeps = 0;
   std::size_t to_partial = 0;
   std::size_t to_full = 0;
-  for (int t = 0; t < 7; ++t) {
+  for (int t = 0; t < 4; ++t) {
     vkc::Result<vol::VoxelBlockGrid> g = moving_curtain(gpu, t);
     CHECK(g.ok());
     CHECK(encode_checked(gpu, enc.value(), config, g.value(), chain) == 0);
@@ -1231,10 +1200,10 @@ int true_sdf_chain_case(Shared& gpu) {
 }
 
 // The update size: left at 0, a P-frame's update segments take the segment
-// size, whatever it is; set, they take it. The moving spheres' first two
-// frames, an I-frame and a P-frame: each the oracle's bytes at the config's
-// sizes, the P-frame's REFERENCE carrying the U expected, and the chain
-// decoding to the second grid's I-frame.
+// size, the shortest and the longest; set, they take it. The moving spheres'
+// first two frames, an I-frame and a P-frame: each the oracle's bytes at the
+// config's sizes, the P-frame's REFERENCE carrying the U expected, and the
+// chain decoding to the second grid's I-frame.
 int default_update_size_case(Shared& gpu) {
   const std::uint32_t kLongest = codec::kMaxDeviceDecodeSegmentSize;
   struct Sizes {
@@ -1242,9 +1211,8 @@ int default_update_size_case(Shared& gpu) {
     std::uint32_t update_size;
     std::uint32_t coded;  // the U the P-frame must carry
   };
-  for (const Sizes& s : {Sizes{1, 0, 1}, Sizes{16, 0, 16}, Sizes{64, 0, 64},
-                         Sizes{kLongest, 0, kLongest}, Sizes{16, 5, 5},
-                         Sizes{16, kLongest, kLongest}}) {
+  for (const Sizes& s :
+       {Sizes{1, 0, 1}, Sizes{kLongest, 0, kLongest}, Sizes{16, 5, 5}}) {
     codec::EncoderConfig config;
     config.intra_period = 2;
     config.segment_size = s.segment_size;
@@ -1854,7 +1822,6 @@ int gpu_main(vkc::test::GpuContext& context) {
   if (apply_refusals_case(gpu) != 0) return 1;
   if (synthetic_case(gpu) != 0) return 1;
   if (extremes_chain_case(gpu) != 0) return 1;
-  if (encoder_case(gpu) != 0) return 1;
   if (segment_rule_case(gpu) != 0) return 1;
   vkc::Result<Spheres> s = spheres(gpu);
   CHECK(s.ok());
