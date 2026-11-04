@@ -9322,9 +9322,9 @@ blocks, 34.1 MB) through the 150 frames.
 **Verification.** codec_mesh on Rafa2 frames 1–150 writes each box's
 baseline `.vrst` with the PR head's setup (full band on): 12cfcd94… on the
 5090, 48715851… on the 4090, cb37b9ac… on the M5 Max and the M4, and the M4
-with the full band off writes it too. The grid suite passes in Release under
-the validation layer on all four, and recon's on the 5090 with this grid.
-Tests: the host oracle of the candidate offsets
+and the M5 Max with the full band off write it too. The grid suite passes in
+Release under the validation layer on all four, and recon's on the 5090 with
+this grid. Tests: the host oracle of the candidate offsets
 (`grid_voxelize_mesh_candidates`), the band's block set against a
 double-precision oracle, the index bound and growth
 (`grid_voxelize_mesh_band`), the call's submits and waits from the core's
@@ -9343,7 +9343,7 @@ ballot's upper half dropped; a 256 × 2 lane writing one voxel twice; a
 512 × 1 voxel map that writes one z layer of each brick twice, against the
 bytes the brute force verified on the device's own layout; no apron pass; an
 apron of face neighbours only; a grading without the half-diagonal; and a
-prune that keeps the dropped blocks' counts. The subgroup builds stay SPIR-V
-1.5, whose subgroups take the device's `subgroupSize`; a `static_assert` on
-the embedded modules fails a build at 1.6, which would let a device run them
-narrower.
+prune that keeps the dropped blocks' counts. The subgroup builds stay
+SPIR-V 1.5, whose subgroups take the device's `subgroupSize`; a
+`static_assert` on the embedded modules fails a build at 1.6, which would
+let a device run them narrower.
