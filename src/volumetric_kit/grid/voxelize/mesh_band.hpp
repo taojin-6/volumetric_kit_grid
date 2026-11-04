@@ -6,7 +6,8 @@
 /// @file mesh_band.hpp
 /// @brief @ref MeshBand: a triangle mesh on the device, its (triangle,
 ///        candidate block) decomposition counted there, and the index of the
-///        band's distinct blocks; and voxelize's test seams.
+///        band's distinct blocks; the write kernel's layouts; and voxelize's
+///        test seams.
 ///
 /// Internal (under src/, never installed): `MeshIntegrator` owns one. It
 /// carries `VGRID_VOXELIZE_API` so a test reaches it in a shared-library
@@ -45,7 +46,9 @@ namespace volumetric_kit::grid::voxelize::detail {
 ///
 /// Use: @ref set_mesh (the host's checks), @ref record_count into a batch the
 /// caller submits, then @ref settle_count once it has run. The mesh's
-/// buffers are retained and grow to the largest mesh.
+/// buffers are retained and grow to the largest mesh. @ref record_count also
+/// writes each triangle's record for the write kernel
+/// (mesh_tri_records.comp): its vertices, and the constants its bounds take.
 ///
 /// The band index: @ref prepare_index, then @ref record_index records the
 /// band test once a pair into a bounded open-addressed set of the distinct
@@ -71,6 +74,9 @@ class VGRID_VOXELIZE_API MeshBand {
     Vec3i max{0};
     bool empty = true;
   };
+
+  /// Bytes of one triangle's record (mesh_tri_records.comp): four vec4s.
+  static constexpr VkDeviceSize kTriangleRecordBytes = 16 * sizeof(float);
 
   /// The index's key window, in blocks along x, y and z
   /// (hash_classify_triangles.comp's).
@@ -102,8 +108,8 @@ class VGRID_VOXELIZE_API MeshBand {
                         std::uint32_t triangle_count, const char* who);
 
   /// @brief Record into @p batch the mesh's upload, the count, the scan, the
-  ///        offsets, and the read of their result, which @ref settle_count
-  ///        reads once @p batch has run.
+  ///        offsets, the triangles' records, and the read of the count's
+  ///        result, which @ref settle_count reads once @p batch has run.
   /// @param stage  Optional: the caller's scope, whose tile the work counts
   ///               to.
   /// @return OK, or the batch's refusal.
@@ -175,12 +181,14 @@ class VGRID_VOXELIZE_API MeshBand {
   const core::Buffer& index_buffer() const noexcept { return indices_; }
   /// @return Device-local, its `triangle_count + 1` candidate offsets.
   const core::Buffer& offset_buffer() const noexcept { return offsets_; }
+  /// @return Device-local, its triangles' records, @ref kTriangleRecordBytes
+  ///         each.
+  const core::Buffer& record_buffer() const noexcept { return records_buffer_; }
 
  private:
   MeshBand() = default;
 
-  core::Status grow(core::Buffer& buffer, VkDeviceSize bytes,
-                    const char* name);
+  core::Status grow(core::Buffer& buffer, VkDeviceSize bytes, const char* name);
 
   // The count pass's 16-byte result, as triangle_offsets.comp writes it.
   struct CountResult {
@@ -201,10 +209,12 @@ class VGRID_VOXELIZE_API MeshBand {
   std::unique_ptr<MeshScan> scan_;
   core::ComputeKernel finish_;
   core::ComputeKernel classify_;
+  core::ComputeKernel records_;
 
   core::Buffer vertices_;
   core::Buffer indices_;
   core::Buffer offsets_;
+  core::Buffer records_buffer_;
   core::Buffer flags_;
   core::Buffer result_buffer_;
   core::Buffer bounds_;
@@ -225,6 +235,31 @@ class VGRID_VOXELIZE_API MeshBand {
   std::uint32_t index_growths_ = 0;
   std::array<std::uint32_t, 4> index_state_{};
 };
+
+/// @brief The write kernel's layout (mesh_integrate_body.glsl): one round of
+///        512 invocations of one voxel each, or of 256 of two; its culling
+///        groups through shared memory, or each one 32-wide subgroup.
+struct WriteLayout {
+  bool wide = false;
+  bool subgroup_cull = false;
+};
+
+/// @return Whether @p device takes @p layout: 512 invocations a workgroup,
+///         and the wide shared build's 18,436 bytes of shared memory, for a
+///         wide one; compute subgroups always 32 wide, with basic, vote,
+///         ballot and arithmetic operations, for the subgroup cull.
+VGRID_VOXELIZE_API bool write_layout_fits(const core::Device& device,
+                                          WriteLayout layout);
+
+/// @return The layout `MeshIntegrator::create` builds on @p device: the
+///         subgroup cull where it fits; wide where it fits, except on Apple
+///         GPUs, where 256 invocations of two voxels write faster.
+VGRID_VOXELIZE_API WriteLayout default_write_layout(const core::Device& device);
+
+/// @brief For tests only: build @p layout in each `MeshIntegrator::create`,
+///        which then refuses a device that does not take it; null restores
+///        @ref default_write_layout. Process-wide.
+VGRID_VOXELIZE_API void set_test_write_layout(const WriteLayout* layout);
 
 /// @brief For tests only: start a band's index at @p slots slots (a power of
 ///        two, at least 2) when it is first sized, so a small mesh takes the

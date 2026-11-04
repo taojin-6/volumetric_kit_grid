@@ -126,11 +126,11 @@ struct MeshIntegrateStats {
 /// distinct block meets the hash table once. The write bins the band's
 /// triangles by block, and one workgroup per block writes its voxels: it
 /// sorts its bin nearest its centre first, and each voxel measures only the
-/// triangles no lower bound rules out (mesh_integrate.comp has the bounds,
-/// and why their rounding cannot matter). The minimum is taken with the
-/// triangle index as tie-break, and a triangle is ruled out only when it is
-/// strictly farther than the voxel's best so far, or than `trunc_dist` where
-/// that is nearer, so every voxel writes what measuring its whole bin
+/// triangles no lower bound rules out (mesh_integrate_body.glsl has the
+/// bounds, and why their rounding cannot matter). The minimum is taken with
+/// the triangle index as tie-break, and a triangle is ruled out only when it
+/// is strictly farther than the voxel's best so far, or than `trunc_dist`
+/// where that is nearer, so every voxel writes what measuring its whole bin
 /// writes, and the same mesh writes the same bytes.
 ///
 /// **Submits and waits.** A call stages the mesh and submits one batch --
@@ -183,8 +183,8 @@ class VGRID_VOXELIZE_API MeshIntegrator {
   /// triangles near a tenth of a voxel across, detail the grid cannot hold.
   static constexpr std::uint32_t kMaxBinTriangles = 1u << 16;
   /// The most voxels a block may hold (`VoxelGridParams::voxels_per_block`),
-  /// 16^3. One workgroup writes a block, 256 voxels at a time, each 256
-  /// scanning the bin again, so this bounds a workgroup's rounds at 16.
+  /// 16^3. One workgroup writes a block, 512 voxels at a time, each 512
+  /// scanning the bin again, so this bounds a workgroup's rounds at 8.
   static constexpr std::uint32_t kMaxVoxelsPerBlock = 1u << 12;
   /// The most bin entries one write submission measures: each is at most one
   /// closest-point test per voxel of its block. A write with more is split

@@ -1,0 +1,69 @@
+#version 450
+
+// One 64-byte record per triangle (voxelize::detail::MeshBand), written once a
+// call for the write kernel (mesh_integrate_body.glsl), which reads it in its
+// sort and its staging instead of fetching each vertex through the index
+// buffer and recomputing the triangle's constants in every block whose bin
+// holds it:
+//   a -- vertex a, and s_T, the largest |coordinate| of the three vertices
+//   b -- vertex b, and R, the farthest vertex from m = (a + b + c) / 3
+//   c -- vertex c, and H, the farthest vertex off the plane through m with
+//        normal n
+//   n -- n, the unit normal (+z for a triangle too thin to have one), and 0
+// The vertices are copied bit for bit. The constants feed only the write's
+// sort and bounds, which hold for any m and any unit n
+// (mesh_integrate_body.glsl), so they decide which triangles a voxel
+// measures, never what it writes.
+//
+// One invocation a triangle. Indices were checked on the host. A triangle the
+// count skips (zero area, non-finite) gets a record no bin reads.
+
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer Vertices {
+  vec3 vertices[];
+};
+layout(set = 0, binding = 1, scalar) readonly buffer Indices { uint indices[]; };
+struct TriRecord {
+  vec4 a;
+  vec4 b;
+  vec4 c;
+  vec4 n;
+};
+layout(set = 0, binding = 2, std430) writeonly buffer TriRecords {
+  TriRecord tri_rec[];
+};
+
+layout(push_constant, scalar) uniform PushConstants {
+  uint tri_count;
+  uint item_base;  // the first triangle this dispatch covers
+} pc;
+
+float sizeOf(vec3 v) { return max(abs(v.x), max(abs(v.y), abs(v.z))); }
+
+vec3 vertexOf(uint t, uint k) { return vertices[indices[3u * t + k]]; }
+
+void main() {
+  uint t = pc.item_base + gl_GlobalInvocationID.x;
+  if (t >= pc.tri_count) {
+    return;
+  }
+  vec3 a = vertexOf(t, 0u);
+  vec3 b = vertexOf(t, 1u);
+  vec3 c = vertexOf(t, 2u);
+  vec3 mid = (a + b + c) * (1.0 / 3.0);
+  float r = sqrt(max(dot(a - mid, a - mid),
+                     max(dot(b - mid, b - mid), dot(c - mid, c - mid))));
+  vec3 nrm = cross(b - a, c - a);
+  float nl2 = dot(nrm, nrm);
+  nrm = nl2 > 1e-30 ? nrm * inversesqrt(nl2) : vec3(0.0, 0.0, 1.0);
+  float h = max(abs(dot(a - mid, nrm)),
+                max(abs(dot(b - mid, nrm)), abs(dot(c - mid, nrm))));
+  float s = max(sizeOf(a), max(sizeOf(b), sizeOf(c)));
+  tri_rec[t].a = vec4(a, s);
+  tri_rec[t].b = vec4(b, r);
+  tri_rec[t].c = vec4(c, h);
+  tri_rec[t].n = vec4(nrm, 0.0);
+}

@@ -4,6 +4,7 @@
 #include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +29,10 @@
 #include "mesh_bin_comp.spv.hpp"
 #include "mesh_bin_ranges_comp.spv.hpp"
 #include "mesh_compact_bins_comp.spv.hpp"
-#include "mesh_integrate_comp.spv.hpp"
+#include "mesh_integrate_pair_comp.spv.hpp"
+#include "mesh_integrate_pair_subgroup_comp.spv.hpp"
+#include "mesh_integrate_wide_comp.spv.hpp"
+#include "mesh_integrate_wide_subgroup_comp.spv.hpp"
 
 namespace volumetric_kit::grid::voxelize {
 namespace {
@@ -40,7 +44,7 @@ using volume::VoxelGridParams;
 constexpr const char* kWho = "MeshIntegrator::convert";
 
 // Local group size, matching `layout(local_size_x = 256)` in the binning,
-// scan and compaction kernels; mesh_integrate.comp runs a workgroup per block.
+// scan and compaction kernels; the write kernel runs a workgroup per block.
 constexpr std::uint32_t kLocalSize = 256;
 // Bins whose starts share a window have at most window-1 entries between
 // their first and last starts, plus at most kMaxBinTriangles for the last bin.
@@ -63,8 +67,9 @@ constexpr std::uint32_t kPassFill = 1;
 // voxels and extract with holes.
 constexpr float kMinShellVoxels = 0.8660254f;  // sqrt(3) / 2
 
-// Mirrors the push-constant blocks of mesh_bin.comp and mesh_integrate.comp,
-// and their MeshBin struct, under scalar block layout.
+// Mirrors the push-constant blocks of mesh_bin.comp and
+// mesh_integrate_body.glsl, and their MeshBin struct, under scalar block
+// layout.
 struct BinPush {
   VoxelGridParams grid;
   std::uint32_t tri_count;
@@ -141,7 +146,75 @@ void bind(const core::ComputeKernel& kernel, std::uint32_t binding,
   kernel.set.write_storage_buffer(binding, buffer.handle(), 0, VK_WHOLE_SIZE);
 }
 
+// The shared memory the wide layout takes without the subgroup cull
+// (mesh_integrate_body.glsl's VGRID_SHARED_WORDS at 16 groups); every other
+// layout fits the 16,384 bytes every Vulkan device offers.
+constexpr std::uint32_t kWideSharedBytes = 18436;
+// Apple's PCI vendor ID (VkPhysicalDeviceProperties::vendorID).
+constexpr std::uint32_t kVendorApple = 0x106B;
+
+// What set_test_write_layout set: 0 for none, else 1 + wide + 2 subgroup_cull.
+std::atomic<std::uint32_t> g_test_write_layout{0};
+
+// Whether the device runs compute subgroups 32 wide, always, with the
+// operations the subgroup cull takes -- so a culling group of 32 invocations
+// can be one subgroup. A device that may pick a wider subgroup than its
+// default (Vulkan 1.3's maxSubgroupSize) does not qualify.
+bool subgroups_of_32(const core::Device& device) {
+  if (device.caps().api_version() < VK_API_VERSION_1_1) return false;
+  VkPhysicalDeviceSubgroupProperties sub{};
+  sub.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  VkPhysicalDeviceSubgroupSizeControlProperties size{};
+  size.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+  const bool v13 = device.caps().api_version() >= VK_API_VERSION_1_3;
+  if (v13) sub.pNext = &size;
+  VkPhysicalDeviceProperties2 props2{};
+  props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  props2.pNext = &sub;
+  vkGetPhysicalDeviceProperties2(device.physical_device(), &props2);
+  const VkSubgroupFeatureFlags ops =
+      VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+      VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+  return sub.subgroupSize == 32 &&
+         (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+         (sub.supportedOperations & ops) == ops &&
+         (!v13 || size.maxSubgroupSize == 32);
+}
+
 }  // namespace
+
+bool detail::write_layout_fits(const core::Device& device, WriteLayout layout) {
+  if (layout.subgroup_cull && !subgroups_of_32(device)) return false;
+  if (!layout.wide) return true;
+  const VkPhysicalDeviceLimits& limits = device.caps().limits();
+  return limits.maxComputeWorkGroupInvocations >= 512 &&
+         limits.maxComputeWorkGroupSize[0] >= 512 &&
+         (layout.subgroup_cull ||
+          limits.maxComputeSharedMemorySize >= kWideSharedBytes);
+}
+
+detail::WriteLayout detail::default_write_layout(const core::Device& device) {
+  // Measured on a mesh sequence's write, against two rounds of 256 voxels a
+  // block (DECISIONS 2026-11-03): one round of 512 is 10-20% faster on
+  // NVIDIA, where 256 x 2 is 2-3% slower; 256 x 2 is 5-11% faster on Apple
+  // GPUs, where 512 is 0-3%. No capability separates the two, so the vendor
+  // does. The subgroup cull is level to 2% on NVIDIA and 1-4% faster on
+  // Apple.
+  WriteLayout layout;
+  layout.subgroup_cull = subgroups_of_32(device);
+  layout.wide =
+      device.caps().properties().vendorID != kVendorApple &&
+      write_layout_fits(device, WriteLayout{true, layout.subgroup_cull});
+  return layout;
+}
+
+void detail::set_test_write_layout(const WriteLayout* layout) {
+  g_test_write_layout.store(layout == nullptr
+                                ? 0u
+                                : 1u + (layout->wide ? 1u : 0u) +
+                                      (layout->subgroup_cull ? 2u : 0u));
+}
 
 core::Status MeshSdfParams::validate(const VoxelGridParams& grid) const {
   if (mode == MeshSdfMode::Signed) return {};
@@ -174,11 +247,41 @@ core::Result<MeshIntegrator> MeshIntegrator::create(
   integ.device_ = &device;
   integ.allocator_ = &allocator;
 
+  // The write kernel's layout, by the device's facts unless a test set one.
+  detail::WriteLayout layout = detail::default_write_layout(device);
+  const std::uint32_t forced = g_test_write_layout.load();
+  if (forced != 0) {
+    layout =
+        detail::WriteLayout{((forced - 1) & 1u) != 0, ((forced - 1) & 2u) != 0};
+    if (!detail::write_layout_fits(device, layout)) {
+      return core::Status::invalid_argument(
+          "MeshIntegrator::create: the device does not take that write "
+          "layout");
+    }
+  }
+  struct Spirv {
+    const unsigned char* data;
+    std::size_t size;
+  };
+  const Spirv write =
+      layout.wide
+          ? (layout.subgroup_cull
+                 ? Spirv{vgrid_mesh_integrate_wide_subgroup_comp_spv,
+                         vgrid_mesh_integrate_wide_subgroup_comp_spv_size}
+                 : Spirv{vgrid_mesh_integrate_wide_comp_spv,
+                         vgrid_mesh_integrate_wide_comp_spv_size})
+          : (layout.subgroup_cull
+                 ? Spirv{vgrid_mesh_integrate_pair_subgroup_comp_spv,
+                         vgrid_mesh_integrate_pair_subgroup_comp_spv_size}
+                 : Spirv{vgrid_mesh_integrate_pair_comp_spv,
+                         vgrid_mesh_integrate_pair_comp_spv_size});
+
   // mesh_bin takes 9 storage buffers: 0 hash entries, 1 vertices, 2 indices,
   // 3 candidate offsets, 4 per-slot counts then cursors, 5 per-item slots,
-  // 6 per-slot coordinates, 7 missing-block counter, 8 bins. mesh_integrate
-  // takes 7: 0 tsdf, 1 weight, 2 vertices, 3 indices, 4 block bins, 5 bins,
-  // 6 per-slot coordinates. These counts and the shaders move together.
+  // 6 per-slot coordinates, 7 missing-block counter, 8 bins. The write kernel
+  // takes 9: 0 tsdf, 1 weight, 2 vertices, 3 indices, 4 block bins, 5 bins,
+  // 6 per-slot coordinates, 7 stamps, 8 triangle records. These counts and
+  // the shaders move together.
   VkPushConstantRange bin_range{};
   bin_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   bin_range.size = sizeof(BinPush);
@@ -188,9 +291,8 @@ core::Result<MeshIntegrator> MeshIntegrator::create(
   core::KernelSetBuilder kb(device);
   VKC_TRY(kb.add(integ.bin_, "voxelize_mesh_bin", vgrid_mesh_bin_comp_spv,
                  vgrid_mesh_bin_comp_spv_size, 9, &bin_range));
-  VKC_TRY(kb.add(integ.integrate_, "voxelize_mesh_integrate",
-                 vgrid_mesh_integrate_comp_spv,
-                 vgrid_mesh_integrate_comp_spv_size, 8, &integrate_range));
+  VKC_TRY(kb.add(integ.integrate_, "voxelize_mesh_integrate", write.data,
+                 write.size, 9, &integrate_range));
   VkPushConstantRange compact_range{VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                     sizeof(CompactPush)};
   VKC_TRY(kb.add(integ.compact_bins_, "voxelize_mesh_compact_bins",
@@ -328,14 +430,15 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
                              "voxelize.mesh_item_slots"));
       const std::uint32_t pairs =
           first ? static_cast<std::uint32_t>(std::min<VkDeviceSize>(
-                      item_slots_.size() / sizeof(std::uint32_t) /
-                          kLocalSize * kLocalSize,
+                      item_slots_.size() / sizeof(std::uint32_t) / kLocalSize *
+                          kLocalSize,
                       0xFFFFFF00u))
                 : band_->total();
       const std::uint32_t test_window = detail::test_write_range_window();
       const std::uint32_t window = test_window != 0 ? test_window : kBinWindow;
       // Bin entries are at most the pairs, so these 8-byte ranges cover them.
-      const std::uint32_t range_count = 1u + (std::max(pairs, 1u) - 1u) / window;
+      const std::uint32_t range_count =
+          1u + (std::max(pairs, 1u) - 1u) / window;
       const VkDeviceSize range_bytes =
           VkDeviceSize(range_count) * sizeof(BinRange);
       // Every buffer the batch binds is grown before the clear is recorded.
@@ -413,7 +516,8 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
         VKC_TRY(batch.dispatch(bin_ranges_, &ranges_push, sizeof(ranges_push),
                                group_count(range_count), max_workgroup_count_x_,
                                &allocate));
-        VKC_TRY(batch.readback(ranges_, 0, range_bytes, dispatch_ranges.data()));
+        VKC_TRY(
+            batch.readback(ranges_, 0, range_bytes, dispatch_ranges.data()));
         VKC_TRY(batch.readback(missing_, 0, sizeof(missing), &missing));
         VKC_TRY(batch.readback(scan_->root(), 0, sizeof(summary), &summary));
         VKC_TRY(batch.submit());
@@ -494,10 +598,11 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
   bind(integrate_, 5, bins_);
   bind(integrate_, 6, coordinates_);
   bind(integrate_, 7, grid.map().stamps_buffer());
+  bind(integrate_, 8, band_->record_buffer());
   const std::uint32_t tick = grid.map().tick();
 
   // Every range satisfies the entry budget. Splitting further for the device's
-  // workgroup-count limit (mesh_integrate.comp runs a workgroup per block)
+  // workgroup-count limit (the write runs a workgroup per block)
   // only reduces its work. One submission per range, with the fill in the
   // first: combining them would undo the watchdog contract. They go to the
   // queue without a host wait between them -- each batch's closing barrier
@@ -506,8 +611,8 @@ core::Result<MeshIntegrateStats> MeshIntegrator::convert(
   core::GpuStageScope write(metrics, gpu_timer_, "  ..write");
   std::uint32_t submissions = 0;
   for (const BinRange& range : dispatch_ranges) {
-    submissions += (range.count + max_workgroup_count_x_ - 1) /
-                   max_workgroup_count_x_;
+    submissions +=
+        (range.count + max_workgroup_count_x_ - 1) / max_workgroup_count_x_;
   }
   // Each pending submission keeps its query range until its wait reads it.
   if (metrics != nullptr && submissions > 8) {

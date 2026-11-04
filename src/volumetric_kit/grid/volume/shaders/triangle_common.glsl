@@ -3,8 +3,8 @@
 
 // Closest-point-on-triangle, the one geometric primitive the mesh-driven
 // passes share: `volume`'s triangle_candidates.glsl prunes candidate blocks
-// with it, and voxelize's mesh_integrate.comp evaluates the distance field
-// itself with it. It lives in `volume`, the lowest tier either is in, and a
+// with it, and voxelize's write kernel (mesh_integrate_body.glsl) evaluates
+// the distance field itself with it. It lives in `volume`, the lowest tier either is in, and a
 // second copy would compile clean, pass spirv-val, and disagree about a
 // voxel's sign only on the creases.
 //

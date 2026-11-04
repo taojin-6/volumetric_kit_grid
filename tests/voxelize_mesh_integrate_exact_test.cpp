@@ -18,7 +18,9 @@
 // nodes; slivers; triangles metres long, and a sphere hundreds of metres from
 // the origin, where rounding grows with the coordinates; bins past the 2,048
 // entries the kernel sorts; 2-, 8- and 16-voxel blocks; signed and shell, in
-// 8- and 16-voxel bands. Skips where no device is present.
+// 8- and 16-voxel bands. Every fixture runs on the write layout the device
+// picks, and the ones marked so on every other layout it takes. The triangle
+// records the write reads are checked too. Skips where no device is present.
 
 #include <algorithm>
 #include <array>
@@ -64,7 +66,8 @@ namespace {
 using test_meshes::Mesh;
 using vgrid::Vec3f;
 
-// mesh_integrate.comp's VGRID_MAX_SORTED: a bin past it has an unsorted tail.
+// mesh_integrate_body.glsl's VGRID_MAX_SORTED: a bin past it has an unsorted
+// tail.
 constexpr std::uint32_t kKernelSorted = 2048;
 constexpr float kVoxel = 0.005f;
 
@@ -353,6 +356,8 @@ struct Fixture {
   bool past_sorted = false;
   // Check the voxel at the origin holds -0, observed.
   bool minus_zero_at_origin = false;
+  // Run on every write layout the device takes, not only its own.
+  bool every_layout = false;
 };
 
 std::vector<Fixture> fixtures() {
@@ -380,6 +385,7 @@ std::vector<Fixture> fixtures() {
                  1.25 * 3.14159265358979323846 - 0.5 * step,
                  [](int k) { return k != 0; });
     f.minus_zero_at_origin = true;
+    f.every_layout = true;
     out.push_back(std::move(f));
   }
   // Each triangle four times: reversed, and its corners rotated -- exact ties
@@ -398,6 +404,7 @@ std::vector<Fixture> fixtures() {
       add_triangle(f.mesh, b, d, a);
       add_triangle(f.mesh, d, b, a);
     }
+    f.every_layout = true;
     out.push_back(std::move(f));
   }
   // Two tilted, divided sheets wound opposite ways, delta apart: coincident,
@@ -407,6 +414,7 @@ std::vector<Fixture> fixtures() {
     char name[64];
     std::snprintf(name, sizeof name, "sheets %g um apart", delta * 1e6);
     f.name = name;
+    f.every_layout = delta == 1e-5;
     const int n = 12;
     const float half = 0.12f;
     for (int s = 0; s < 2; ++s) {
@@ -528,11 +536,13 @@ std::vector<Fixture> fixtures() {
     f.mesh = icosphere(Vec3f(0.0137f, -0.021f, 0.0093f), 0.05f, 3);
     f.block_size = 2;
     f.trunc = 0.02f;
+    f.every_layout = true;
     out.push_back(std::move(f));
     Fixture g;
     g.name = "sphere, 16-voxel blocks";
     g.mesh = icosphere(Vec3f(0.0137f, -0.021f, 0.0093f), 0.15f, 3);
     g.block_size = 16;
+    g.every_layout = true;
     out.push_back(std::move(g));
   }
   // A small dense sphere: every bin holds every triangle, past the sort.
@@ -541,6 +551,7 @@ std::vector<Fixture> fixtures() {
     f.name = "dense sphere";
     f.mesh = icosphere(Vec3f(0.0031f, 0.0017f, -0.0029f), 0.03f, 4);
     f.past_sorted = true;
+    f.every_layout = true;
     out.push_back(std::move(f));
   }
   // Shell: the first fan and the duplicates together.
@@ -550,6 +561,7 @@ std::vector<Fixture> fixtures() {
     f.mode = vx::MeshSdfMode::Shell;
     append(f.mesh, out[0].mesh);
     append(f.mesh, out[3].mesh);
+    f.every_layout = true;
     out.push_back(std::move(f));
   }
   return out;
@@ -573,10 +585,76 @@ vkc::Result<vol::VoxelBlockGrid> make_grid(const vkc::test::Gpu& gpu,
   return vol::VoxelBlockGrid::create(gpu.device, gpu.allocator, gp, attrs, 2);
 }
 
+// The triangle records the write reads (mesh_tri_records.comp), as the
+// reference's band wrote them: the vertices and s_T bit for bit; a unit
+// normal; and R and H, measured from the centroid the write takes,
+// (a + b + c) / 3 in float, holding every vertex and tight to rounding -- a
+// record that left a vertex out would let a bound rule out a triangle that
+// can still be nearest.
+int check_records(const vkc::test::Gpu& gpu, const Reference& ref,
+                  const Fixture& f) {
+  const Mesh& m = f.mesh;
+  const std::uint32_t nt = m.triangle_count();
+  vkc::Result<std::vector<float>> rec_r = vkc::test::read_back<float>(
+      gpu.device, gpu.allocator, ref.band->record_buffer(),
+      std::size_t(nt) * 16);
+  CHECK(rec_r.ok());
+  const std::vector<float>& rec = rec_r.value();
+  int bad = 0;
+  for (std::uint32_t t = 0; t < nt; ++t) {
+    const float* r = &rec[std::size_t(t) * 16];
+    const Vec3f v[3] = {test_meshes::corner(m, t, 0),
+                        test_meshes::corner(m, t, 1),
+                        test_meshes::corner(m, t, 2)};
+    float s = 0.0f;
+    for (const Vec3f& p : v) {
+      s = std::max(s, std::max(std::fabs(p.x),
+                               std::max(std::fabs(p.y), std::fabs(p.z))));
+    }
+    bool ok = std::memcmp(&r[3], &s, 4) == 0;
+    for (int k = 0; k < 3; ++k) {
+      ok = ok && std::memcmp(&r[4 * k], &v[k].x, 4) == 0 &&
+           std::memcmp(&r[4 * k + 1], &v[k].y, 4) == 0 &&
+           std::memcmp(&r[4 * k + 2], &v[k].z, 4) == 0;
+    }
+    const float third = 1.0f / 3.0f;
+    const double mid[3] = {double((v[0].x + v[1].x + v[2].x) * third),
+                           double((v[0].y + v[1].y + v[2].y) * third),
+                           double((v[0].z + v[1].z + v[2].z) * third)};
+    const double n[3] = {r[12], r[13], r[14]};
+    const double nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    const double big_r = r[7];
+    const double big_h = r[11];
+    const double tol = 1e-6 * (double(s) + big_r);
+    double far_r = 0.0;
+    double far_h = 0.0;
+    for (const Vec3f& p : v) {
+      const double d[3] = {p.x - mid[0], p.y - mid[1], p.z - mid[2]};
+      far_r =
+          std::max(far_r, std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]));
+      far_h =
+          std::max(far_h, std::fabs(d[0] * n[0] + d[1] * n[1] + d[2] * n[2]));
+    }
+    ok = ok && std::fabs(nl - 1.0) < 1e-5 && far_r <= big_r + tol &&
+         big_r <= far_r + tol && far_h <= big_h + tol && big_h <= far_h + tol &&
+         r[15] == 0.0f;
+    if (!ok && bad++ < 4) {
+      std::fprintf(stderr,
+                   "FAIL %s: triangle %u record: s %.9g (want %.9g), R %.9g "
+                   "(vertices reach %.9g), H %.9g (%.9g), |n| %.9g\n",
+                   f.name.c_str(), t, double(r[3]), double(s), big_r, far_r,
+                   big_h, far_h, nl);
+    }
+  }
+  return bad == 0 ? 0 : 1;
+}
+
 // Convert `f` into `grid`, which empties it first, run the reference over the
-// blocks written, and compare every voxel's bits.
+// blocks written, and compare every voxel's bits; and, with `records`, check
+// the triangle records.
 int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
-                  Reference& ref, vol::VoxelBlockGrid& grid, const Fixture& f) {
+                  Reference& ref, vol::VoxelBlockGrid& grid, const Fixture& f,
+                  bool records) {
   const vol::VoxelGridParams& gp = grid.grid();
   const Mesh& m = f.mesh;
   const vx::MeshSdfParams params{f.mode, 1.5f};
@@ -602,6 +680,7 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
     return 1;
   }
   const RefResult& want = want_r.value();
+  if (records && check_records(gpu, ref, f) != 0) return 1;
   // The reference's bins are the integrator's.
   if (want.entries != stats.value().bin_entries) {
     std::fprintf(stderr,
@@ -680,23 +759,56 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(band.ok());
     ref.band = std::move(band).value();
   }
-  vkc::Result<vx::MeshIntegrator> integ_r =
-      vx::MeshIntegrator::create(gpu.device, gpu.allocator);
-  CHECK(integ_r.ok());
-  vx::MeshIntegrator integ = std::move(integ_r).value();
-
+  // The device's own write layout first, then every other one it takes.
+  const vx::detail::WriteLayout own =
+      vx::detail::default_write_layout(gpu.device);
+  if (gpu.device.caps().properties().vendorID == 0x106B) CHECK(!own.wide);
+  std::vector<vx::detail::WriteLayout> layouts{own};
+  for (const bool wide : {true, false}) {
+    for (const bool subgroup_cull : {true, false}) {
+      const vx::detail::WriteLayout l{wide, subgroup_cull};
+      if ((wide != own.wide || subgroup_cull != own.subgroup_cull) &&
+          vx::detail::write_layout_fits(gpu.device, l)) {
+        layouts.push_back(l);
+      }
+    }
+  }
   // One grid per block size and band, emptied by each fixture's convert.
   std::map<std::pair<int, float>, vol::VoxelBlockGrid> grids;
+  const std::vector<Fixture> all = fixtures();
   int failures = 0;
-  for (const Fixture& f : fixtures()) {
-    const std::pair<int, float> shape{f.block_size, f.trunc};
-    auto it = grids.find(shape);
-    if (it == grids.end()) {
-      vkc::Result<vol::VoxelBlockGrid> made = make_grid(gpu, f);
-      CHECK(made.ok());
-      it = grids.emplace(shape, std::move(made).value()).first;
+  for (std::size_t li = 0; li < layouts.size(); ++li) {
+    const vx::detail::WriteLayout& l = layouts[li];
+    vx::detail::set_test_write_layout(&l);
+    vkc::Result<vx::MeshIntegrator> integ_r =
+        vx::MeshIntegrator::create(gpu.device, gpu.allocator);
+    vx::detail::set_test_write_layout(nullptr);
+    CHECK(integ_r.ok());
+    vx::MeshIntegrator integ = std::move(integ_r).value();
+    std::printf("-- write layout: %s, %s%s\n", l.wide ? "512 x 1" : "256 x 2",
+                l.subgroup_cull ? "subgroup cull" : "shared cull",
+                li == 0 ? " (the device's own)" : "");
+    for (const Fixture& f : all) {
+      if (li != 0 && !f.every_layout) continue;
+      const std::pair<int, float> shape{f.block_size, f.trunc};
+      auto it = grids.find(shape);
+      if (it == grids.end()) {
+        vkc::Result<vol::VoxelBlockGrid> made = make_grid(gpu, f);
+        CHECK(made.ok());
+        it = grids.emplace(shape, std::move(made).value()).first;
+      }
+      failures += check_fixture(gpu, integ, ref, it->second, f, li == 0);
     }
-    failures += check_fixture(gpu, integ, ref, it->second, f);
+  }
+  // A layout the device does not take is refused.
+  for (const bool wide : {true, false}) {
+    const vx::detail::WriteLayout l{wide, true};
+    if (vx::detail::write_layout_fits(gpu.device, l)) continue;
+    vx::detail::set_test_write_layout(&l);
+    vkc::Result<vx::MeshIntegrator> refused =
+        vx::MeshIntegrator::create(gpu.device, gpu.allocator);
+    vx::detail::set_test_write_layout(nullptr);
+    CHECK(!refused.ok());
   }
   CHECK(failures == 0);
   std::printf("voxelize_mesh_integrate_exact: OK\n");
