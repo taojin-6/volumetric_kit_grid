@@ -92,6 +92,30 @@ class VoxelHashMap::Internal {
   VGRID_VOLUME_API static core::Status record_clear(
       VoxelHashMap& map, core::CommandBatch& batch,
       core::GpuStageScope* stage);
+
+  /// @brief @ref VoxelHashMap::record_allocate for a list whose coordinates
+  ///        are distinct: one round of a lock-free insert
+  ///        (hash_insert_distinct.comp), which loses no race, settled as
+  ///        @ref VoxelHashMap::record_allocate is.
+  ///
+  /// Internal because its precondition is not checked: a coordinate listed
+  /// twice is inserted twice, a table corrupted in silence. The one caller
+  /// is `voxelize`'s band index, which lists each block once.
+  /// @param coords  As @ref VoxelHashMap::record_allocate; every coordinate
+  ///                of the first `count` distinct.
+  /// @param count   As @ref VoxelHashMap::record_allocate.
+  /// @param gate    As @ref VoxelHashMap::record_allocate: 0 runs no group,
+  ///                and the round sets it to 0 when a capacity limit was met.
+  /// @param stage   As @ref VoxelHashMap::record_allocate.
+  /// @return As @ref VoxelHashMap::record_allocate; its outcome has
+  ///         `AllocFailures::lock` 0, and a chain failure may hold one heap
+  ///         block a push drew back from the heap until the table is cleared
+  ///         or resized.
+  /// @pre As @ref VoxelHashMap::record_allocate.
+  VGRID_VOLUME_API static core::Result<RecordedRounds> record_allocate_distinct(
+      VoxelHashMap& map, core::CommandBatch& batch, const core::Buffer& coords,
+      const DeviceCount& count, const DeviceCount* gate,
+      core::GpuStageScope* stage);
 };
 
 }  // namespace volumetric_kit::grid::volume

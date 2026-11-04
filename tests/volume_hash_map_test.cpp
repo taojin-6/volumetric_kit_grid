@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -24,6 +25,7 @@
 #include "volumetric_kit/core/testing/buffer_readback.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
 #include "volumetric_kit/grid/base/math/vector_types.hpp"
@@ -95,6 +97,129 @@ std::set<int> active_ptrs(vol::VoxelHashMap& map) {
 // allocate() from a device list: duplicate, present and new entries, never an
 // entry past the count, the heap's blocks back, a cached list stale only when
 // a block is taken, the refusals, and rounds under contention.
+// Internal::record_allocate_distinct: one recorded round of the lock-free
+// insert, settled as record_allocate is.
+vkc::Result<vol::AllocFailures> insert_distinct(
+    vkc::test::GpuContext& gpu, vol::VoxelHashMap& map,
+    const std::vector<vol::BlockIndex>& list) {
+  const auto count = static_cast<std::uint32_t>(list.size());
+  VKC_ASSIGN(const vkc::Buffer coords,
+             vkc::test::upload_device_buffer(
+                 gpu.device, gpu.allocator, list.data(),
+                 list.size() * sizeof(vol::BlockIndex)));
+  VKC_ASSIGN(const vkc::Buffer word,
+             vkc::test::upload_device_buffer(gpu.device, gpu.allocator, &count,
+                                             sizeof(count)));
+  vkc::CommandBatch batch(gpu.device, gpu.allocator);
+  VKC_ASSIGN(const vol::RecordedRounds rounds,
+             vol::VoxelHashMap::Internal::record_allocate_distinct(
+                 map, batch, coords, vol::DeviceCount{&word, 0, count}, nullptr,
+                 nullptr));
+  VKC_TRY(batch.submit());
+  return map.settle(rounds);
+}
+
+// The lock-free insert of a distinct list: half of it already placed, into a
+// table brought to load 0.8 by it, with overflow chains. One round places
+// every new coordinate once, finds each placed one at its own index, and
+// stamps all of them requested. Then many lanes push onto one chain at once,
+// and the chain still never passes max_chain: every block it holds stays
+// reachable, and the rest report a full chain.
+int distinct_insert_case(vkc::test::GpuContext& gpu) {
+  vol::VoxelGridParams g{};
+  g.voxel_size = 0.005f;
+  g.block_size = 8;
+  g.voxels_per_block = 512;
+  g.trunc_dist = 0.04f;
+  g.bucket_size = 4;
+  g.num_buckets = 64;
+  g.num_blocks = 256;
+  g.max_chain = 16;
+  vkc::Result<vol::VoxelHashMap> made =
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, g);
+  CHECK(made.ok());
+  vol::VoxelHashMap map = std::move(made).value();
+  std::vector<vol::BlockIndex> list;
+  for (int x = 1; x <= 6 && list.size() < 204; ++x) {
+    for (int y = 1; y <= 6 && list.size() < 204; ++y) {
+      for (int z = 1; z <= 6 && list.size() < 204; ++z) {
+        vol::BlockIndex b{};
+        b.coord = vgrid::Vec3i(x, -y, 3 * z);
+        list.push_back(b);
+      }
+    }
+  }
+  CHECK(list.size() == 204);  // load 204 / 256, about 0.8
+  // Overflow chains: some bucket holds more coordinates than its slots.
+  std::vector<int> per_bucket(std::size_t(g.num_buckets), 0);
+  int spilled = 0;
+  for (const vol::BlockIndex& b : list) {
+    if (++per_bucket[vgrid_test::hash_bucket(b.coord, g.num_buckets)] >
+        g.bucket_size) {
+      ++spilled;
+    }
+  }
+  CHECK(spilled > 0);
+  const std::vector<vol::BlockIndex> half(list.begin(), list.begin() + 102);
+  CHECK(vgrid_test::allocate_blocks(gpu, map, half).value() == 0);
+  std::map<Coord, int> placed;
+  for (const vol::BlockIndex& b : map.compact_active_blocks().value()) {
+    placed[{b.coord.x, b.coord.y, b.coord.z}] = b.ptr;
+  }
+  CHECK(placed.size() == half.size());
+  map.advance_tick();
+  vkc::Result<vol::AllocFailures> failed = insert_distinct(gpu, map, list);
+  CHECK(failed.ok() && failed.value().total == 0 &&
+        failed.value().lock == 0 && failed.value().rounds == 1);
+  const std::vector<vol::BlockIndex> after =
+      map.compact_active_blocks().value();
+  CHECK(after.size() == list.size() &&
+        map.allocated_blocks() == list.size());
+  std::set<Coord> got;
+  std::set<int> ptrs;
+  for (const vol::BlockIndex& b : after) {
+    const Coord c{b.coord.x, b.coord.y, b.coord.z};
+    got.insert(c);
+    ptrs.insert(b.ptr);
+    const auto was = placed.find(c);
+    CHECK(was == placed.end() || was->second == b.ptr);
+  }
+  CHECK(got.size() == list.size() && ptrs.size() == list.size());
+  const std::vector<vol::BlockStamp> stamps = map.read_block_stamps().value();
+  for (const vol::BlockIndex& b : after) {
+    CHECK(stamps[std::size_t(b.ptr / g.voxels_per_block)].requested ==
+          map.tick());
+  }
+  // Again: every coordinate found, nothing placed.
+  failed = insert_distinct(gpu, map, list);
+  CHECK(failed.ok() && failed.value().total == 0);
+  CHECK(map.compact_active_blocks().value().size() == list.size());
+
+  // Twelve coordinates of one bucket at once: four take its slots, three its
+  // chain (max_chain 4 keeps three links), five find it full -- however the
+  // pushes race.
+  vol::VoxelGridParams c = g;
+  c.num_buckets = 8;
+  c.num_blocks = 32;
+  c.max_chain = 4;
+  vkc::Result<vol::VoxelHashMap> chained =
+      vol::VoxelHashMap::create(gpu.device, gpu.allocator, c);
+  CHECK(chained.ok());
+  const std::vector<vol::BlockIndex> crowd =
+      coords_in_bucket(0, c.num_buckets, 12);
+  CHECK(crowd.size() == 12);
+  failed = insert_distinct(gpu, chained.value(), crowd);
+  CHECK(failed.ok() && failed.value().chain == 5 &&
+        failed.value().total == 5 && failed.value().lock == 0);
+  const std::set<Coord> kept = active_coords(chained.value());
+  CHECK(kept.size() == 7);
+  // Each block the table holds is found again: a second insert places none.
+  failed = insert_distinct(gpu, chained.value(), crowd);
+  CHECK(failed.ok() && failed.value().chain == 5);
+  CHECK(active_coords(chained.value()) == kept);
+  return 0;
+}
+
 int device_allocate_case(vkc::test::GpuContext& gpu,
                          const vol::VoxelGridParams& grid) {
   vkc::Result<vol::VoxelHashMap> made =
@@ -626,6 +751,7 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   }
 
   if (device_allocate_case(gpu, grid) != 0) return 1;
+  if (distinct_insert_case(gpu) != 0) return 1;
 
   // --- Move-only ------------------------------------------------------------
   // Move-construct: the source empties, the destination lives. A device list

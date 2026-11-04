@@ -36,6 +36,7 @@
 #include "hash_compact_frustum_comp.spv.hpp"
 #include "hash_delete_coords_comp.spv.hpp"
 #include "hash_init_comp.spv.hpp"
+#include "hash_insert_distinct_comp.spv.hpp"
 #include "hash_rehash_comp.spv.hpp"
 #include "hash_rounds_comp.spv.hpp"
 
@@ -292,6 +293,9 @@ core::Result<VoxelHashMap> VoxelHashMap::create(core::Device& device,
                  vgrid_hash_allocate_coords_comp_spv_size, 8, &push));
   VKC_TRY(kb.add(map.compact_, "hash_compact", vgrid_hash_compact_comp_spv,
                  vgrid_hash_compact_comp_spv_size, 3, &push));
+  VKC_TRY(kb.add(map.insert_distinct_, "hash_insert_distinct",
+                 vgrid_hash_insert_distinct_comp_spv,
+                 vgrid_hash_insert_distinct_comp_spv_size, 8, &push));
   VKC_TRY(kb.add(map.delete_, "hash_delete_coords",
                  vgrid_hash_delete_coords_comp_spv,
                  vgrid_hash_delete_coords_comp_spv_size, 9, &push));
@@ -340,8 +344,8 @@ void VoxelHashMap::write_persistent_bindings() {
   const VkBuffer counter = heap_counter_.handle();
   const VkBuffer mutex = bucket_mutex_.handle();
   for (const core::DescriptorSet* set :
-       {&init_.set, &allocate_.set, &delete_.set, &triangles_.set,
-        &rehash_.set}) {
+       {&init_.set, &allocate_.set, &insert_distinct_.set, &delete_.set,
+        &triangles_.set, &rehash_.set}) {
     set->write_storage_buffer(0, entries, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(1, heap, 0, VK_WHOLE_SIZE);
     set->write_storage_buffer(2, counter, 0, VK_WHOLE_SIZE);
@@ -349,17 +353,20 @@ void VoxelHashMap::write_persistent_bindings() {
   }
   const VkBuffer fail = fail_counts_.handle();
   for (const core::DescriptorSet* set :
-       {&allocate_.set, &delete_.set, &triangles_.set, &rehash_.set}) {
+       {&allocate_.set, &insert_distinct_.set, &delete_.set, &triangles_.set,
+        &rehash_.set}) {
     set->write_storage_buffer(5, fail, 0, VK_WHOLE_SIZE);
   }
   const VkBuffer stamps = stamps_.handle();
   init_.set.write_storage_buffer(4, stamps, 0, VK_WHOLE_SIZE);
   allocate_.set.write_storage_buffer(6, stamps, 0, VK_WHOLE_SIZE);
+  insert_distinct_.set.write_storage_buffer(6, stamps, 0, VK_WHOLE_SIZE);
   delete_.set.write_storage_buffer(7, stamps, 0, VK_WHOLE_SIZE);
   // The rounds: their state, which the two kernels they drive read their
   // count from, and the tally and heap counter they judge.
   const VkBuffer rounds = rounds_state_.handle();
   allocate_.set.write_storage_buffer(7, rounds, 0, VK_WHOLE_SIZE);
+  insert_distinct_.set.write_storage_buffer(7, rounds, 0, VK_WHOLE_SIZE);
   delete_.set.write_storage_buffer(8, rounds, 0, VK_WHOLE_SIZE);
   for (const core::DescriptorSet* set :
        {&remove_rounds_.set, &allocate_rounds_.set, &depth_rounds_.set}) {
@@ -457,6 +464,16 @@ core::Status VoxelHashMap::Internal::record_clear(VoxelHashMap& map,
   // is stale.
   map.topology_epoch_ = next_topology_epoch();
   return {};
+}
+
+core::Result<RecordedRounds> VoxelHashMap::Internal::record_allocate_distinct(
+    VoxelHashMap& map, core::CommandBatch& batch, const core::Buffer& coords,
+    const DeviceCount& count, const DeviceCount* gate,
+    core::GpuStageScope* stage) {
+  // One round: a lock-free insert loses no race, so a second could only meet
+  // the capacity limit the first met.
+  return map.record_rounds(false, batch, coords, count, gate, stage, nullptr,
+                           1, true, true);
 }
 
 core::Status VoxelHashMap::rebuild_heap_excluding(
@@ -577,7 +594,7 @@ core::Result<RecordedRounds> VoxelHashMap::record_rounds(
     const DeviceCount& count, const DeviceCount* gate,
     core::GpuStageScope* stage,
     const std::function<core::Status(core::CommandBatch&)>& first_round,
-    std::uint32_t rounds, bool stale_lists) {
+    std::uint32_t rounds, bool stale_lists, bool distinct) {
   const std::string op =
       removes ? "VoxelHashMap::record_remove" : "VoxelHashMap::record_allocate";
   if (!valid()) {
@@ -638,7 +655,8 @@ core::Result<RecordedRounds> VoxelHashMap::record_rounds(
   VKC_ASSIGN(const VkBuffer result,
              batch.output(slot, 0, sizeof(RoundsResult)));
   core::ComputeKernel& judge = removes ? remove_rounds_ : allocate_rounds_;
-  core::ComputeKernel& kernel = removes ? delete_ : allocate_;
+  core::ComputeKernel& kernel =
+      removes ? delete_ : (distinct ? insert_distinct_ : allocate_);
   judge.set.write_storage_buffer(0, count.buffer->handle(), 0, VK_WHOLE_SIZE);
   judge.set.write_storage_buffer(
       1, gate != nullptr ? gate->buffer->handle() : rounds_state_.handle(), 0,

@@ -1,0 +1,203 @@
+#version 450
+
+// Insert a list of DISTINCT block coordinates without bucket locks: the one
+// round of VoxelHashMap::Internal::record_allocate_distinct.
+//
+// Distinct is what makes the locks unnecessary. hash_allocate_coords.comp
+// locks a bucket so that two lanes inserting one coordinate cannot both
+// insert it; here no two lanes hold the same coordinate, and the blocks the
+// table held before the dispatch do not move within it (alloc and free run in
+// separate dispatches). So a lane:
+//   1. looks its coordinate up among the published entries (a pointer >= 0);
+//      a present block is done;
+//   2. claims a free slot of its home bucket by swapping the pointer from free
+//      to claimed, draws a heap block, writes the coordinate, then publishes
+//      the pointer. A reader skips a claimed slot, and sees a published one's
+//      coordinate behind its fence;
+//   3. with the bucket full, claims a free non-anchor slot further on in the
+//      same way and pushes it onto the bucket's chain: its link written first,
+//      then the anchor's head swapped to it, retried while another lane's push
+//      wins, so a walker always finds the rest of the chain.
+// Every swap that fails does so because another lane's succeeded, so a SIMD
+// group always progresses and no lane reports a lost race. The failures left
+// are the capacity ones -- chain full, heap low, no free slot -- which the
+// round judges and the caller answers as for every allocation.
+//
+// The chain's bound holds under concurrent pushes: a push counts the chain
+// under the head it swaps against, and a lost swap adds the nodes pushed since
+// before it tries again. A push refused that way has drawn its heap block and
+// cannot hand it back within the dispatch (the heap takes alloc and free in
+// separate dispatches): the block stays out of the heap until a clear, or the
+// resize the chain failure asks for, rebuilds it.
+
+#extension GL_GOOGLE_include_directive : require
+#include "hash_common.glsl"
+#define VGRID_STAMPS_BINDING 6
+#include "hash_allocate_common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 4, scalar) readonly buffer Coords {
+  BlockIndex coords[];
+};
+// hash_rounds.comp's state: the count at word pc.arg.
+layout(set = 0, binding = 7) readonly buffer Rounds { uint rounds_state[]; };
+
+// A slot claimed and not yet published.
+const int kClaimed = kLockEntry;
+
+// The block's pointer among published entries, or kFreeEntry.
+int vgridFindPublished(ivec3 coord, uint start, uint idx_last, uint total) {
+  for (uint i = 0u; i < uint(pc.grid.bucket_size); ++i) {
+    int p = entries[start + i].ptr;
+    if (p >= 0) {
+      memoryBarrierBuffer();  // acquire: pos is current for the ptr we saw
+      if (entries[start + i].pos == coord) {
+        return p;
+      }
+    }
+  }
+  uint idx = idx_last;
+  for (int it = 0; it < pc.grid.max_chain; ++it) {
+    int off = entries[idx].offset;
+    if (off == kNoOffset) {
+      break;
+    }
+    memoryBarrierBuffer();  // acquire: the next entry's fields are current
+    idx = (idx_last + uint(off)) % total;
+    int p = entries[idx].ptr;
+    if (p >= 0) {
+      memoryBarrierBuffer();
+      if (entries[idx].pos == coord) {
+        return p;
+      }
+    }
+  }
+  return kFreeEntry;
+}
+
+// The chain nodes from head `from` down to head `to`, which it reaches, as
+// chains only grow at the head within the dispatch; at most `limit`.
+int vgridChainNodes(int from, int to, uint idx_last, uint total, int limit) {
+  int n = 0;
+  for (int cur = from; cur != to && n < limit; ++n) {
+    memoryBarrierBuffer();  // acquire: the node's link is current
+    cur = entries[(idx_last + uint(cur)) % total].offset;
+  }
+  return n;
+}
+
+// A claimed slot's block from the heap; kFailHeap, with the slot freed, when
+// the heap is empty.
+int vgridDrawBlock(uint slot, out int ptr) {
+  uint block = consume_heap();
+  if (block == kHeapEmpty) {
+    atomicExchange(entries[slot].ptr, kFreeEntry);
+    return kFailHeap;
+  }
+  ptr = int(block * uint(pc.grid.voxels_per_block));
+  return -1;
+}
+
+// -1 on success (inserted, or present), with the block's pointer in `ptr`;
+// else the reason it failed (kFailChain / kFailHeap / kFailTable).
+int vgridInsertDistinct(ivec3 coord, out int ptr) {
+  uint bucket_size = uint(pc.grid.bucket_size);
+  uint total = uint(pc.grid.num_buckets) * bucket_size;
+  uint bucket = computeHashPos(coord, pc.grid.num_buckets);
+  uint start = bucket * bucket_size;
+  uint idx_last = start + bucket_size - 1u;
+  ptr = vgridFindPublished(coord, start, idx_last, total);
+  if (ptr != kFreeEntry) {
+    return -1;
+  }
+
+  // A slot of the home bucket. The anchor's link is the chain's head, so a
+  // key taking the anchor slot leaves it alone.
+  for (uint i = 0u; i < bucket_size; ++i) {
+    uint slot = start + i;
+    if (entries[slot].ptr != kFreeEntry ||
+        atomicCompSwap(entries[slot].ptr, kFreeEntry, kClaimed) != kFreeEntry) {
+      continue;
+    }
+    int fail = vgridDrawBlock(slot, ptr);
+    if (fail >= 0) {
+      return fail;
+    }
+    entries[slot].pos = coord;
+    if (slot != idx_last) {
+      entries[slot].offset = kNoOffset;
+    }
+    memoryBarrierBuffer();  // release: pos before the pointer
+    atomicExchange(entries[slot].ptr, ptr);
+    return -1;
+  }
+
+  // The bucket is full: a non-anchor slot further on, on the bucket's chain.
+  // The limits are hash_allocate_common.glsl's: the chain's length, and a
+  // heap below an eighth of the table, which a full sweep would not find room
+  // in (DECISIONS.md, 2026-08-08).
+  int head = atomicAdd(entries[idx_last].offset, 0);
+  int nodes = vgridChainNodes(head, kNoOffset, idx_last, total,
+                              pc.grid.max_chain);
+  if (nodes >= pc.grid.max_chain - 1) {
+    return kFailChain;
+  }
+  uint free_now = atomicAdd(heap_counter, 0u);
+  if (heap_empty(free_now) || free_now < uint(pc.grid.num_blocks) / 8u) {
+    return kFailHeap;
+  }
+  uint target = start + bucket_size;
+  for (uint n = 0u; n < total; ++n, ++target) {
+    if (target >= total) {
+      target = 0u;
+    }
+    if ((target + 1u) % bucket_size == 0u ||
+        entries[target].ptr != kFreeEntry ||
+        atomicCompSwap(entries[target].ptr, kFreeEntry, kClaimed) !=
+            kFreeEntry) {
+      continue;
+    }
+    int fail = vgridDrawBlock(target, ptr);
+    if (fail >= 0) {
+      return fail;
+    }
+    entries[target].pos = coord;
+    int rel = int(target) - int(idx_last);
+    for (;;) {
+      if (nodes >= pc.grid.max_chain - 1) {
+        // Pushes since the count filled the chain. The slot goes back; the
+        // block does not (see the top).
+        atomicExchange(entries[target].ptr, kFreeEntry);
+        return kFailChain;
+      }
+      entries[target].offset = head;
+      memoryBarrierBuffer();  // release: the link before the head
+      int seen = atomicCompSwap(entries[idx_last].offset, head, rel);
+      if (seen == head) {
+        break;
+      }
+      nodes += vgridChainNodes(seen, head, idx_last, total, pc.grid.max_chain);
+      head = seen;
+    }
+    memoryBarrierBuffer();  // release: pos before the pointer
+    atomicExchange(entries[target].ptr, ptr);
+    return -1;
+  }
+  return kFailTable;
+}
+
+void main() {
+  uint gid = pc.item_base + gl_GlobalInvocationID.x;
+  if (gid >= rounds_state[pc.arg]) {
+    return;
+  }
+  int ptr;
+  int fail = vgridInsertDistinct(coords[gid].coord, ptr);
+  if (fail < 0) {
+    // As allocate_block: the block is stamped as requested, present or new.
+    uint slot = uint(ptr) / uint(pc.grid.voxels_per_block);
+    atomicExchange(stamps[slot].requested, pc.tick);
+  }
+  report_alloc_fail(fail);
+}

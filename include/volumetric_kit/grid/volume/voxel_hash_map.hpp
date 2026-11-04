@@ -951,13 +951,15 @@ class VGRID_VOLUME_API VoxelHashMap {
   /// from the tally the round before left, then its gather into a claimed
   /// result slot. @p first_round, when set, records once nothing more can
   /// refuse, ahead of the rounds. @p stale_lists makes every device list
-  /// compacted before stale now, for a recording settled later.
+  /// compacted before stale now, for a recording settled later. @p distinct
+  /// (an allocation) inserts through hash_insert_distinct.comp, which takes
+  /// no bucket lock and requires every coordinate distinct.
   core::Result<RecordedRounds> record_rounds(
       bool removes, core::CommandBatch& batch, const core::Buffer& coords,
       const DeviceCount& count, const DeviceCount* gate,
       core::GpuStageScope* stage,
       const std::function<core::Status(core::CommandBatch&)>& first_round,
-      std::uint32_t rounds, bool stale_lists);
+      std::uint32_t rounds, bool stale_lists, bool distinct = false);
 
   /// The body of @ref allocate and @ref remove: @ref record_rounds over
   /// @p count, uploaded into @ref host_count_, one submit and @ref settle,
@@ -1074,7 +1076,7 @@ class VGRID_VOLUME_API VoxelHashMap {
   core::GpuTimer gpu_timer_;
   // One ComputeKernel per shader -- its descriptor-set layout, pipeline, and
   // the set allocated from the shared pool_ (see `ComputeKernel`). The
-  // KernelSetBuilder in create() builds all seven and sizes pool_ to them.
+  // KernelSetBuilder in create() builds all eight and sizes pool_ to them.
   // Every persistent-buffer binding is written once by
   // write_persistent_bindings(); only the genuinely per-call input (coords /
   // depth+camera / triangles) is (re)written before a dispatch. Depth adds the
@@ -1086,6 +1088,10 @@ class VGRID_VOLUME_API VoxelHashMap {
   core::ComputeKernel delete_;
   core::ComputeKernel depth_;
   core::ComputeKernel triangles_;
+  // hash_insert_distinct.comp: a list whose coordinates are distinct, placed
+  // without bucket locks in one round (Internal::record_allocate_distinct);
+  // allocate_'s bindings.
+  core::ComputeKernel insert_distinct_;
   core::ComputeKernel compact_frustum_;
   // Re-inserts a snapshot of active blocks into the grown table preserving each
   // block's index (insert_block with the block's own pointer, not a fresh heap
