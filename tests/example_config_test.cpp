@@ -4,13 +4,15 @@
 // The integration boundary: core-validated settings reach the runtime options
 // unchanged -- the stream's outputs, decoding for a sender only with a CSV or
 // a sweep, and its session among them -- and the codec checks the steps and
-// sizes core leaves to it; the codec sweep codes every row intra. The fusing
+// sizes core leaves to it; a mesh source codes a true SDF and refuses a band
+// too narrow for one; the codec sweep codes every row intra. The fusing
 // examples' templates are recon's (its example_fuse_config_test.cpp). No file
 // assets, device or camera are opened.
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <tuple>
@@ -58,7 +60,7 @@ int main() {
     const vgrid::codec_stream::CodecOutputs outputs =
         vgrid_example::codec_outputs(loaded.value().output);
     CHECK(!outputs.serve.has_value());
-    // No scenario codes a true SDF: codec_mesh alone sets it, in code.
+    // No scenario codes a true SDF: mesh_codec_config alone sets it, in code.
     const auto encoder = vgrid_example::encoder_config(loaded->codec);
     CHECK(encoder.ok() && !encoder->true_sdf);
   }
@@ -364,11 +366,39 @@ int main() {
             refused.message().find(least) != std::string::npos);
     }
   }
+  // A mesh source's codec settings (mesh_codec_config): for both templates,
+  // the scenario's grid, conversion and encoder, coding a true SDF. A band of
+  // 14 voxels is refused.
   for (const cfg::Config* mesh : {&single.value(), &sequence.value()}) {
-    const auto sdf =
-        vgrid_example::mesh_sdf_config(mesh->source, grid(mesh->fusion));
-    CHECK(sdf.ok() &&
-          vgrid_example::check_true_sdf_band(*sdf, grid(mesh->fusion)).ok());
+    const auto codec = vgrid_example::mesh_codec_config(*mesh);
+    const auto encoder = vgrid_example::encoder_config(mesh->codec);
+    const vgrid::volume::VoxelGridParams params = grid(mesh->fusion);
+    const auto sdf = vgrid_example::mesh_sdf_config(mesh->source, params);
+    CHECK(codec.ok() && encoder.ok() && sdf.ok());
+    CHECK(codec->encoder.true_sdf && !encoder->true_sdf);
+    CHECK(codec->encoder.params.coefficient_count ==
+              encoder->params.coefficient_count &&
+          codec->encoder.params.quantization_scale ==
+              encoder->params.quantization_scale &&
+          codec->encoder.params.quantization_weights ==
+              encoder->params.quantization_weights);
+    CHECK(codec->encoder.segment_size == encoder->segment_size &&
+          codec->encoder.update_size == encoder->update_size &&
+          codec->encoder.intra_period == encoder->intra_period);
+    CHECK(std::memcmp(&codec->grid, &params, sizeof params) == 0);
+    CHECK(codec->sdf.mode == sdf->mode &&
+          codec->sdf.shell_voxels == sdf->shell_voxels);
   }
+  const auto narrow = cfg::parse(R"({"version": 1, "operation": "codec",
+      "source": {"kind": "mesh", "path": "person.obj", "height_m": 1.7,
+                 "up_axis": "y"},
+      "fusion": {"voxel_size_m": 0.005, "truncation_m": 0.07}})",
+                                 cfg::Application::CodecMesh);
+  CHECK(narrow);
+  const auto refused = vgrid_example::mesh_codec_config(*narrow);
+  CHECK(!refused.ok() &&
+        refused.status().domain() == vkc::Status::Code::InvalidArgument &&
+        refused.status().message().find("at least 15 voxels") !=
+            std::string::npos);
   return 0;
 }

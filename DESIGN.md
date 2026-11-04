@@ -1214,8 +1214,10 @@ frame-number pattern, a range on a plain path and any frame file that is
 missing or not a regular file, checks a shell against the truncation
 (`MeshSdfParams::validate`), and refuses a band too narrow for a true SDF
 (`check_true_sdf_band`). It codes with `EncoderConfig::true_sdf` (the
-2026-10-21 entry), the one caller that sets it. Its first pass loads each
-frame, joins its bounds along `source.up_vector` (`mesh_io::extend_bounds`),
+2026-10-21 entry): `codec_config.hpp`'s `mesh_codec_config`, the one place
+that sets it, makes the codec's settings and those two checks for any example
+that codes a mesh, and `create_mesh_grid` its source grid. Its first pass
+loads each frame, joins its bounds along `source.up_vector` (`mesh_io::extend_bounds`),
 audits it and drops it, so memory does not grow with the range. In exact
 arithmetic a proper similarity changes none of the audit's counts, so a
 frame signed mode cannot

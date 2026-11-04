@@ -16,6 +16,8 @@
 #include "volumetric_kit/grid/codec/encoder.hpp"
 #include "volumetric_kit/grid/codec_stream/codec_stream.hpp"
 #include "volumetric_kit/grid/stream/session.hpp"
+#include "volumetric_kit/grid/volume/voxel_block_grid.hpp"
+#include "volumetric_kit/grid/volume/voxel_grid.hpp"
 #include "volumetric_kit/grid/voxelize/mesh_integrator.hpp"
 
 namespace vgrid_example {
@@ -171,6 +173,50 @@ mesh_sdf_config(const config::Source& source,
   result.shell_voxels = source.shell_voxels;
   VKC_TRY(result.validate(grid));
   return result;
+}
+
+/// @brief How a mesh source codes (@ref mesh_codec_config).
+struct MeshCodecConfig {
+  /// `fusion`'s voxel size and truncation, with 1024 hash buckets.
+  volumetric_kit::grid::volume::VoxelGridParams grid{};
+  /// `codec`'s settings (@ref encoder_config), with `true_sdf` set.
+  volumetric_kit::grid::codec::EncoderConfig encoder;
+  /// `source`'s conversion (@ref mesh_sdf_config).
+  volumetric_kit::grid::voxelize::MeshSdfParams sdf;
+};
+
+/// @brief A mesh source's codec settings, the one place an example sets
+///        `EncoderConfig::true_sdf`: a mesh's field is a true distance, so
+///        it codes without the observed mask (DECISIONS 2026-10-21), in a band
+///        @ref check_true_sdf_band takes. Host only, so a caller refuses a
+///        scenario before it loads a frame or does GPU work.
+/// @return The settings, or the InvalidArgument of @ref encoder_config,
+///         @ref mesh_sdf_config or @ref check_true_sdf_band, in that order.
+inline volumetric_kit::core::Result<MeshCodecConfig> mesh_codec_config(
+    const config::Config& settings) {
+  MeshCodecConfig result;
+  result.grid = volumetric_kit::grid::volume::block_grid_params(
+      settings.fusion.voxel_size_m, settings.fusion.truncation_m, 1024);
+  VKC_ASSIGN(result.encoder, encoder_config(settings.codec));
+  VKC_ASSIGN(result.sdf, mesh_sdf_config(settings.source, result.grid));
+  result.encoder.true_sdf = true;
+  VKC_TRY(check_true_sdf_band(result.sdf, result.grid));
+  return result;
+}
+
+/// @return A grid at @p grid that a mesh converts into and the codec reads:
+///         `tsdf` and `weight`, a float each; or `VoxelBlockGrid::create`'s
+///         error.
+inline volumetric_kit::core::Result<
+    volumetric_kit::grid::volume::VoxelBlockGrid>
+create_mesh_grid(volumetric_kit::core::Device& device,
+                 volumetric_kit::core::Allocator& allocator,
+                 const volumetric_kit::grid::volume::VoxelGridParams& grid) {
+  namespace volume = volumetric_kit::grid::volume;
+  const volume::AttributeSpec attrs[] = {
+      {volume::kTsdfAttribute, sizeof(float)},
+      {volume::kWeightAttribute, sizeof(float)}};
+  return volume::VoxelBlockGrid::create(device, allocator, grid, attrs, 2);
 }
 
 }  // namespace vgrid_example

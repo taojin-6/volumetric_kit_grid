@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-11-03
+
+### Added
+
+- **A mesh source's codec setup in the examples' helpers**
+  (`codec_config.hpp`): `mesh_codec_config` makes the grid, the encoder's
+  settings with `EncoderConfig::true_sdf` and the conversion's from a
+  scenario, and refuses a band too narrow for a true SDF, on the host before
+  any frame loads; `create_mesh_grid` makes the `tsdf` and `weight` grid a
+  mesh converts into. `codec_mesh` calls both, and writes the bytes 0.12.0
+  did.
+
 ## [0.12.0] - 2026-11-02
 
 ### Added
