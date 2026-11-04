@@ -9313,10 +9313,11 @@ full clocks (118 and 64 of the 280 and 140 after):
 Over every frame, clocks as they fell, the conversion after is 2.56 / 4.00
 on the 5090 and 3.43 / 9.13 on the 4090. With `full_band_m` left at 0, two
 runs an arm alternated with the setup's, it is 26.55 / 26.88 on the M4
-(22.92 / 23.30 with it). The integrator retains 76.3 MB, 71.4 before: 41.5
-the per-pair scratch, 27.7 the bins, 4.8 the triangle records, 1.6 the mesh,
-0.3 the band index, each at its size from frame 1. The grid keeps its 1,024
-buckets (8,192 blocks, 34.1 MB) through the 150 frames.
+(22.92 / 23.30 with it) and 8.85 / 12.46 on the M5 Max (8.59 / 11.45 with
+it). The integrator retains 76.3 MB, 71.4 before: 41.5 the per-pair scratch,
+27.7 the bins, 4.8 the triangle records, 1.6 the mesh, 0.3 the band index,
+each at its size from frame 1. The grid keeps its 1,024 buckets (8,192
+blocks, 34.1 MB) through the 150 frames.
 
 **Verification.** codec_mesh on Rafa2 frames 1–150 writes each box's
 baseline `.vrst` with the PR head's setup (full band on): 12cfcd94… on the
