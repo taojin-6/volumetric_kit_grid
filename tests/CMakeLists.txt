@@ -179,8 +179,9 @@ add_test(NAME grid_voxelize_mesh_candidates
 # voxelize mesh band: the blocks convert allocates equal a host oracle of the
 # band test on a sphere, a soup, two equal vertices, an index grown from 16
 # slots and four key windows, each listed once; containment against a voxel
-# brute force; and a grid grown once when the band does not fit. The band is
-# voxelize's (voxelize/mesh_band.hpp, by src/). Skips with no device.
+# brute force; and a grid grown once, to the band's need, when the band meets
+# its capacity, and kept when it does not. The band is voxelize's
+# (voxelize/mesh_band.hpp, by src/). Skips with no device.
 add_executable(grid_voxelize_mesh_band_test voxelize_mesh_band_test.cpp)
 target_link_libraries(
   grid_voxelize_mesh_band_test

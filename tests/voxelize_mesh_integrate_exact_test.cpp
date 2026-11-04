@@ -19,12 +19,15 @@
 // the origin, where rounding grows with the coordinates; bins past the 2,048
 // entries the kernel sorts; 2-, 8- and 16-voxel blocks; signed and shell, in
 // 8- and 16-voxel bands. Every fixture runs on the write layout the device
-// picks, and the ones marked so on every other layout it takes. The triangle
-// records the write reads are checked too. Skips where no device is present.
+// picks, against the brute force, and the ones marked so on every other layout
+// it takes, against the bytes the brute force verified there, block by block.
+// The triangle records the write reads are checked too. Skips where no device
+// is present.
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -649,12 +652,22 @@ int check_records(const vkc::test::Gpu& gpu, const Reference& ref,
   return bad == 0 ? 0 : 1;
 }
 
-// Convert `f` into `grid`, which empties it first, run the reference over the
-// blocks written, and compare every voxel's bits; and, with `records`, check
-// the triangle records.
+// A fixture's field as the brute force wrote it, kept to check the other
+// layouts against: each block's voxels in `field`'s order, by coordinate.
+struct Verified {
+  std::map<std::array<int, 3>, std::size_t> block;
+  RefResult field;
+};
+
+std::array<int, 3> key(const vgrid::Vec3i& c) { return {c.x, c.y, c.z}; }
+
+// Convert `f` into `grid`, which empties it first, and compare every voxel's
+// bits with the reference: with no `verified`, the brute force over the
+// blocks written, kept in `keep` when given, and with `records` the triangle
+// records too; else `verified`, which must name the same blocks.
 int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
                   Reference& ref, vol::VoxelBlockGrid& grid, const Fixture& f,
-                  bool records) {
+                  bool records, const Verified* verified, Verified* keep) {
   const vol::VoxelGridParams& gp = grid.grid();
   const Mesh& m = f.mesh;
   const vx::MeshSdfParams params{f.mode, 1.5f};
@@ -672,15 +685,45 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
   const std::vector<vol::BlockIndex>& active = active_r.value();
   CHECK(stats.value().blocks == active.size());
 
-  vkc::Result<RefResult> want_r =
-      run_reference(gpu, ref, grid, m, active, params);
-  if (!want_r.ok()) {
-    std::fprintf(stderr, "%s: reference: %s\n", f.name.c_str(),
-                 want_r.status().message().c_str());
-    return 1;
+  const auto vpb = static_cast<std::size_t>(gp.voxels_per_block);
+  RefResult want;
+  if (verified == nullptr) {
+    vkc::Result<RefResult> want_r =
+        run_reference(gpu, ref, grid, m, active, params);
+    if (!want_r.ok()) {
+      std::fprintf(stderr, "%s: reference: %s\n", f.name.c_str(),
+                   want_r.status().message().c_str());
+      return 1;
+    }
+    want = std::move(want_r).value();
+    if (records && check_records(gpu, ref, f) != 0) return 1;
+  } else {
+    // The verified field, in this layout's block order.
+    if (active.size() != verified->block.size()) {
+      std::fprintf(stderr, "%s: %zu blocks written, the verified layout %zu\n",
+                   f.name.c_str(), active.size(), verified->block.size());
+      return 1;
+    }
+    want.entries = verified->field.entries;
+    want.largest_bin = verified->field.largest_bin;
+    want.tsdf.reserve(active.size() * vpb);
+    want.weight.reserve(active.size() * vpb);
+    for (const vol::BlockIndex& b : active) {
+      const auto it = verified->block.find(key(b.coord));
+      if (it == verified->block.end()) {
+        std::fprintf(stderr, "%s: block (%d, %d, %d) is not the verified's\n",
+                     f.name.c_str(), b.coord.x, b.coord.y, b.coord.z);
+        return 1;
+      }
+      const auto from = static_cast<std::ptrdiff_t>(it->second * vpb);
+      const auto to = from + static_cast<std::ptrdiff_t>(vpb);
+      want.tsdf.insert(want.tsdf.end(), verified->field.tsdf.begin() + from,
+                       verified->field.tsdf.begin() + to);
+      want.weight.insert(want.weight.end(),
+                         verified->field.weight.begin() + from,
+                         verified->field.weight.begin() + to);
+    }
   }
-  const RefResult& want = want_r.value();
-  if (records && check_records(gpu, ref, f) != 0) return 1;
   // The reference's bins are the integrator's.
   if (want.entries != stats.value().bin_entries) {
     std::fprintf(stderr,
@@ -697,7 +740,6 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
   const std::vector<float> weight =
       vgrid_test::read_blocks<float>(gpu, grid, vol::kWeightAttribute, active)
           .value();
-  const auto vpb = static_cast<std::size_t>(gp.voxels_per_block);
   std::size_t differ = 0;
   std::size_t observed = 0;
   for (std::size_t b = 0; b < active.size(); ++b) {
@@ -738,7 +780,15 @@ int check_fixture(vkc::test::GpuContext& gpu, vx::MeshIntegrator& integ,
       f.name.c_str(), m.triangle_count(), active.size(), want.entries,
       want.largest_bin, observed, differ);
   CHECK(observed > 0);
-  return differ == 0 ? 0 : 1;
+  if (differ != 0) return 1;
+  if (keep != nullptr) {
+    keep->block.clear();
+    for (std::size_t b = 0; b < active.size(); ++b) {
+      keep->block[key(active[b].coord)] = b;
+    }
+    keep->field = std::move(want);
+  }
+  return 0;
 }
 
 int gpu_main(vkc::test::GpuContext& gpu) {
@@ -776,6 +826,9 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   // One grid per block size and band, emptied by each fixture's convert.
   std::map<std::pair<int, float>, vol::VoxelBlockGrid> grids;
   const std::vector<Fixture> all = fixtures();
+  // The brute force runs on the device's own layout; the other layouts are
+  // checked against what it verified there.
+  std::vector<Verified> verified(all.size());
   int failures = 0;
   for (std::size_t li = 0; li < layouts.size(); ++li) {
     const vx::detail::WriteLayout& l = layouts[li];
@@ -788,7 +841,8 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     std::printf("-- write layout: %s, %s%s\n", l.wide ? "512 x 1" : "256 x 2",
                 l.subgroup_cull ? "subgroup cull" : "shared cull",
                 li == 0 ? " (the device's own)" : "");
-    for (const Fixture& f : all) {
+    for (std::size_t fi = 0; fi < all.size(); ++fi) {
+      const Fixture& f = all[fi];
       if (li != 0 && !f.every_layout) continue;
       const std::pair<int, float> shape{f.block_size, f.trunc};
       auto it = grids.find(shape);
@@ -797,7 +851,15 @@ int gpu_main(vkc::test::GpuContext& gpu) {
         CHECK(made.ok());
         it = grids.emplace(shape, std::move(made).value()).first;
       }
-      failures += check_fixture(gpu, integ, ref, it->second, f, li == 0);
+      if (li != 0 && verified[fi].block.empty()) {
+        ++failures;  // its own layout failed: nothing verified to compare
+        continue;
+      }
+      failures += check_fixture(gpu, integ, ref, it->second, f, li == 0,
+                                li == 0 ? nullptr : &verified[fi],
+                                li == 0 && f.every_layout && layouts.size() > 1
+                                    ? &verified[fi]
+                                    : nullptr);
     }
   }
   // A layout the device does not take is refused.

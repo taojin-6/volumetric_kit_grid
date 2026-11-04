@@ -15,8 +15,10 @@
 // holding a voxel within trunc_dist is allocated, a 0.6 m triangle leaves no
 // hole, and a slanted triangle's far box corner stays out. Growth: a 2-bucket
 // grid grows once, to twice its buckets or the band's need at kGrowThreshold,
-// whichever is more, placing old and new blocks in one insert; a grid the band
-// fits keeps its buckets. Skips where no device is present.
+// whichever is more, placing old and new blocks in one insert -- once, since a
+// 27-block band ends at 5 buckets, which two grows cannot reach -- and a grid
+// the band fits below the insert's limits keeps its buckets. Skips where no
+// device is present.
 
 #include <algorithm>
 #include <cmath>
@@ -451,13 +453,34 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     std::set<Coord> want;
     if (convert(integ, *grid, ball, want) != 0) return 1;
     CHECK(got == want);
-    // The band fits: the grid keeps its buckets, whatever its load.
+    // The band fits below the insert's limits: the grid keeps its buckets.
     const std::int32_t buckets = tiny->grid().num_buckets;
     if (convert(integ, *tiny, ball, got) != 0) return 1;
     CHECK(tiny->grid().num_buckets == buckets);
     CHECK(grid->grid().num_buckets == codec.num_buckets);
-    std::printf("  2 buckets grew once to %d for %zu blocks\n", buckets,
-                got.size());
+    std::printf("  2 buckets grew to %d for %zu blocks\n", buckets, got.size());
+
+    // Once: each grow at least doubles, so from 2 buckets two grows reach 8
+    // or more, and a band whose need lies between 4 and 8 buckets ends there
+    // only by one grow to the need. A small triangle at a 40 mm band: 27
+    // blocks, 5 buckets at kGrowThreshold.
+    vkc::Result<vol::VoxelBlockGrid> small =
+        make_grid(gpu, grid_params(0.005f, 0.04f, 2));
+    CHECK(small.ok());
+    const Mesh dot =
+        one_triangle({0.011f, 0.007f, 0.013f}, {0.031f, 0.009f, 0.017f},
+                     {0.019f, 0.027f, 0.021f});
+    std::set<Coord> dot_got;
+    if (convert(integ, *small, dot, dot_got) != 0) return 1;
+    const Oracle dot_want = band_blocks(small->grid(), dot);
+    CHECK(dot_want.border.empty() && dot_got == dot_want.in);
+    const auto dot_need = static_cast<std::int32_t>(std::ceil(
+        std::ceil(double(dot_got.size()) / vol::VoxelHashMap::kGrowThreshold) /
+        8.0));
+    CHECK(dot_need > 4 && dot_need < 8);
+    CHECK(small->grid().num_buckets == dot_need);
+    std::printf("  2 buckets grew once to %d for %zu blocks\n", dot_need,
+                dot_got.size());
   }
 
   std::printf("voxelize_mesh_band: OK\n");
