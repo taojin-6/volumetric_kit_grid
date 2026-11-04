@@ -811,13 +811,27 @@ foreach(_vgrid_networking_test server client dial stress)
     grid_networking_${_vgrid_networking_test}_test
     PRIVATE volumetric_kit::grid_networking Threads::Threads)
   vgrid_target_warnings(grid_networking_${_vgrid_networking_test}_test)
-  add_test(NAME grid_networking_${_vgrid_networking_test}
-           COMMAND grid_networking_${_vgrid_networking_test}_test)
+  if(NOT _vgrid_networking_test STREQUAL "server")
+    add_test(NAME grid_networking_${_vgrid_networking_test}
+             COMMAND grid_networking_${_vgrid_networking_test}_test)
+  endif()
+endforeach()
+
+# The server's cases in three entries, a group each (its main), which ctest runs
+# side by side under --parallel, so their waits overlap: what a viewer is sent
+# (the wire, joins, newest key wins, keys on demand, two tracks), the limits,
+# and the rules, teardown, finish and signals.
+foreach(_vgrid_part serve limits finish)
+  add_test(NAME grid_networking_server_${_vgrid_part}
+           COMMAND grid_networking_server_test ${_vgrid_part})
 endforeach()
 
 # The dial test dials and listens with the core's net tier itself, which
-# grid_networking links privately.
+# grid_networking links privately; the client test asks it what a raw sender's
+# peer has not yet acknowledged.
 target_link_libraries(grid_networking_dial_test
+                      PRIVATE volumetric_kit::core_net)
+target_link_libraries(grid_networking_client_test
                       PRIVATE volumetric_kit::core_net)
 
 # The client also checks its progress output across an allocation failure while
@@ -986,17 +1000,25 @@ _vgrid_expect_message(
 
 # Start the slowest tests first under `ctest --parallel`. Without a COST, CTest
 # runs tests in the order they were added, and a fresh CI runner has no timing
-# history, so a slow test added late finished last. Seconds under recon's
-# sanitizers job, the longest in CI, in run 39717939263 (before the 2026-10-22
-# test trims); only the order matters.
-set_tests_properties(grid_codec_inter PROPERTIES COST 115)
-set_tests_properties(grid_codec_decoder PROPERTIES COST 96)
-set_tests_properties(grid_voxelize_mesh_integrate_exact PROPERTIES COST 56)
-set_tests_properties(grid_eval_mesh_distance PROPERTIES COST 55)
-set_tests_properties(grid_codec_device_frame PROPERTIES COST 52)
-set_tests_properties(grid_codec_stream PROPERTIES COST 49)
-set_tests_properties(grid_voxelize_mesh_integrate PROPERTIES COST 36)
-set_tests_properties(grid_codec_encoder PROPERTIES COST 30)
+# history, so a slow test added late finished last. Seconds under the sanitizer
+# job's settings, the longest in CI, on its home box with the suite at
+# --parallel 4 (2026-11-04), for each test over 5 s there; only the order
+# matters.
+set_tests_properties(grid_voxelize_mesh_candidates PROPERTIES COST 83)
+set_tests_properties(grid_codec_deblock PROPERTIES COST 27)
+set_tests_properties(grid_codec_inter PROPERTIES COST 23)
+set_tests_properties(grid_codec_encoder PROPERTIES COST 21)
+set_tests_properties(grid_codec_decoder PROPERTIES COST 17)
+set_tests_properties(grid_eval_mesh_distance PROPERTIES COST 14)
+set_tests_properties(grid_codec_recorded PROPERTIES COST 12)
+set_tests_properties(grid_codec_stream PROPERTIES COST 9)
+set_tests_properties(grid_voxelize_mesh_integrate_exact PROPERTIES COST 8)
+set_tests_properties(grid_codec_device_frame PROPERTIES COST 8)
+set_tests_properties(grid_voxelize_mesh_integrate PROPERTIES COST 6)
+set_tests_properties(grid_voxelize_mesh_full_band PROPERTIES COST 6)
+set_tests_properties(grid_voxelize_mesh_band PROPERTIES COST 6)
+set_tests_properties(grid_codec_decode_grid PROPERTIES COST 5)
+set_tests_properties(grid_networking_client PROPERTIES COST 5)
 
 # A test skips by exiting with the core's test::kSkipExitCode (gpu_test.hpp). A
 # hang (a fence never signalled, a deadlocked thread) fails in 300 s rather than

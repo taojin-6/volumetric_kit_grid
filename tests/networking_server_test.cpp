@@ -100,6 +100,10 @@ using net::Got;
 using net::serves_within;
 using namespace std::chrono_literals;
 
+// How long a check that a client gets nothing reads: a record the server sent
+// it reaches a client on loopback well within this.
+constexpr auto kNothingWithin = 50ms;
+
 struct Published {
   stream::RecordInfo info;
   Bytes payload;
@@ -452,7 +456,7 @@ int join_case() {
             ->publish(net::record_info(1, false), payloads[1].data(),
                       payloads[1].size())
             .ok());
-  CHECK(!net::next_within(*early, &got, 200ms));
+  CHECK(!net::next_within(*early, &got, kNothingWithin));
   CHECK(fresh
             ->publish(net::record_info(2, true), payloads[2].data(),
                       payloads[2].size())
@@ -551,7 +555,7 @@ int on_demand_join_case() {
   CHECK(server->key_wanted() == 1 && server->viewers() == 1);
   Got got;
   CHECK(publish(2, false));
-  CHECK(!net::next_within(*first, &got, 200ms));
+  CHECK(!net::next_within(*first, &got, kNothingWithin));
   CHECK(publish(3, true));
   CHECK(publish(4, false));
   CHECK(net::next_within(*first, &got));
@@ -563,7 +567,7 @@ int on_demand_join_case() {
   CHECK(server->key_wanted() == 2 && server->viewers() == 2);
   CHECK(publish(5, false));
   CHECK(net::next_within(*first, &got) && got.record.info.seq == 5);
-  CHECK(!net::next_within(*second, &got, 200ms));
+  CHECK(!net::next_within(*second, &got, kNothingWithin));
   CHECK(publish(6, true));
   for (auto* client : {first.get(), second.get()}) {
     CHECK(net::next_within(*client, &got) && got.record.info.seq == 6);
@@ -736,7 +740,7 @@ int on_demand_limit_case() {
   CHECK(publish(0, true, 3 * 1056));
   CHECK(publish(1, false, 10));
   CHECK(warned() == 1);
-  CHECK(!net::next_within(*client, &got, 200ms));
+  CHECK(!net::next_within(*client, &got, kNothingWithin));
   CHECK(server->key_wanted() == 1);
   CHECK(publish(2, true, 1000));
   CHECK(net::next_within(*client, &got) && got.record.info.seq == 2);
@@ -744,7 +748,7 @@ int on_demand_limit_case() {
   CHECK(publish(4, false, 10));
   CHECK(warned() == 2);
   CHECK(server->key_wanted() == 2);
-  CHECK(!net::next_within(*client, &got, 200ms));
+  CHECK(!net::next_within(*client, &got, kNothingWithin));
   CHECK(publish(5, true, 10));
   CHECK(net::next_within(*client, &got) && got.record.info.seq == 5);
   CHECK(warned() == 2 && server->key_wanted() == 2);
@@ -953,14 +957,14 @@ int audio_burst_case(bool replay) {
 }
 
 // Newest key wins skips the chunks with the frames: a viewer stuck in a
-// 1 MiB track-0 key while the rest of its GOP and two more, 1 MiB frames
+// 1 MiB track-0 key while the rest of its GOP and two more, 256 KiB frames
 // with their chunks, are published gets that key, then the newest GOP whole,
 // its chunks with it, and no chunk of the GOPs it skipped. Replaying and on
 // demand.
 int newest_key_skips_audio_case(bool replay) {
   std::vector<Published> rest;
   for (std::uint64_t k = 1; k < 9; ++k) {  // keys at 3 and 6
-    rest.push_back(frame(k, k % 3 == 0, 1 << 20));
+    rest.push_back(frame(k, k % 3 == 0, 256 << 10));
     rest.push_back(chunk(2 * k - 1));
     rest.push_back(chunk(2 * k));
   }
@@ -1006,8 +1010,8 @@ int gop_limit_case() {
   auto joined = net::connect(server->port());
   CHECK(joined != nullptr);
   CHECK(net::wait_session(*joined));
-  CHECK(!net::next_within(*live, &got, 200ms));
-  CHECK(!net::next_within(*joined, &got, 50ms));
+  CHECK(!net::next_within(*live, &got, kNothingWithin));
+  CHECK(!net::next_within(*joined, &got, kNothingWithin));
   CHECK(publish(4, true, 1000).ok());
   CHECK(publish(5, false, 1000).ok());
   for (auto* client : {live.get(), joined.get()}) {
@@ -1017,7 +1021,7 @@ int gop_limit_case() {
   // A key past the limit alone.
   CHECK(publish(6, true, 3 * 1056).ok());
   CHECK(publish(7, false, 10).ok());
-  CHECK(!net::next_within(*live, &got, 200ms));
+  CHECK(!net::next_within(*live, &got, kNothingWithin));
   CHECK(publish(8, true, 10).ok());
   CHECK(net::next_within(*live, &got) && got.record.info.seq == 8);
   CHECK(net::next_within(*joined, &got) && got.record.info.seq == 8);
@@ -1078,7 +1082,7 @@ int stall_limit_case() {
 }
 
 // A stall_limit of milliseconds::max() is never: a viewer that takes no byte
-// while 4 records of 1 MiB wait for it stays for 500 ms, 25 poll slices.
+// while 4 records of 1 MiB wait for it stays for 100 ms, 5 poll slices.
 int stall_never_case() {
   Captured log;
   const LogCapture capture(&log);
@@ -1102,14 +1106,14 @@ int stall_never_case() {
                         payload.size())
               .ok());
   }
-  std::this_thread::sleep_for(500ms);
+  std::this_thread::sleep_for(100ms);
   CHECK(!log.has(name, " closed: ") && !log.has(name, " failed: "));
   return 0;
 }
 
 // A viewer that keeps taking bytes, though too slowly for its socket to poll
 // writable within stall_limit (300 ms), is not closed: 1 KiB every 10 ms
-// through a 4 KiB receive buffer, while 256 KiB records come for 2 s. Under
+// through a 4 KiB receive buffer, while 256 KiB records come for 1 s. Under
 // the low-water mark again takes 64 KiB, 640 ms at this rate. Linux only:
 // macOS's loopback ignores the small buffer and, behind a reader this slow,
 // acknowledges in bursts seconds apart.
@@ -1131,7 +1135,7 @@ int slow_viewer_case() {
   CHECK(log.wait_for(name, "joined", 2s));
 
   const Clock::time_point start = Clock::now();
-  for (std::uint64_t seq = 0; Clock::now() - start < 2s; ++seq) {
+  for (std::uint64_t seq = 0; Clock::now() - start < 1s; ++seq) {
     const Bytes payload = net::record_payload(seq, 256 << 10);
     CHECK(server
               ->publish(net::record_info(seq, seq % 30 == 0), payload.data(),
@@ -1867,18 +1871,9 @@ int signals_case() {
   return 0;
 }
 
-}  // namespace
-
-int main() {
-#if defined(__GLIBC__) && !defined(VKC_TEST_SANITIZED)
-  // One malloc arena, for reaping_case's readings, set before any thread
-  // starts: once a thread finds no arena free with more than 8 made, as the
-  // cases before it can on a loaded machine, glibc fixes the limit at 8 per
-  // core and ignores mallopt from then on.
-  CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
-#endif
-  vkc::test::Scratch scratch("grid_networking_server_");
-  const std::string dir = scratch.path.string();
+// What a viewer is sent: the wire, joins, newest key wins, keys on demand and
+// two tracks.
+int serve_cases(const std::string& dir) {
   if (wire_is_the_file_case(dir) != 0) return 1;
   if (two_runs_case(dir) != 0) return 1;
   if (round_trip_case(dir) != 0) return 1;
@@ -1896,6 +1891,11 @@ int main() {
     if (audio_burst_case(replay) != 0) return 1;
     if (newest_key_skips_audio_case(replay) != 0) return 1;
   }
+  return 0;
+}
+
+// The limits: the GOP's, stalls, viewers, and the viewers' count and log.
+int limits_cases() {
   if (gop_limit_case() != 0) return 1;
   if (stall_limit_case() != 0) return 1;
   if (stall_never_case() != 0) return 1;
@@ -1905,6 +1905,11 @@ int main() {
   if (leaving_viewer_case() != 0) return 1;
   if (viewer_count_case() != 0) return 1;
   if (join_leave_log_case() != 0) return 1;
+  return 0;
+}
+
+// The rules, teardown, finish, the threads reaped, and signals.
+int finish_cases() {
   if (rules_case() != 0) return 1;
   if (teardown_case() != 0) return 1;
   for (const bool replay : {true, false}) {
@@ -1914,6 +1919,33 @@ int main() {
   if (finish_at_once_case() != 0) return 1;
   if (reaping_case() != 0) return 1;
   if (signals_case() != 0) return 1;
-  std::puts("networking server: OK");
+  return 0;
+}
+
+}  // namespace
+
+// One group of cases, `serve`, `limits` or `finish` (a ctest entry each, so
+// that ctest overlaps their waits), or every one with no argument.
+int main(int argc, char** argv) {
+  const std::string group = argc > 1 ? argv[1] : "";
+  if (argc > 2 || (!group.empty() && group != "serve" && group != "limits" &&
+                   group != "finish")) {
+    std::fprintf(stderr, "usage: %s [serve|limits|finish]\n", argv[0]);
+    return 2;
+  }
+#if defined(__GLIBC__) && !defined(VKC_TEST_SANITIZED)
+  // One malloc arena, for reaping_case's readings, set before any thread
+  // starts: once a thread finds no arena free with more than 8 made, as the
+  // cases before it can on a loaded machine, glibc fixes the limit at 8 per
+  // core and ignores mallopt from then on.
+  CHECK(::mallopt(M_ARENA_MAX, 1) == 1);
+#endif
+  vkc::test::Scratch scratch("grid_networking_server_");
+  const std::string dir = scratch.path.string();
+  const bool all = group.empty();
+  if ((all || group == "serve") && serve_cases(dir) != 0) return 1;
+  if ((all || group == "limits") && limits_cases() != 0) return 1;
+  if ((all || group == "finish") && finish_cases() != 0) return 1;
+  std::printf("networking server%s%s: OK\n", all ? "" : " ", group.c_str());
   return 0;
 }

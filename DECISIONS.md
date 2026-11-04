@@ -5949,7 +5949,10 @@ The new `recon_codec_inter` covers:
   K = 37 in segments of 64 and 3; chains of spheres from the `Encoder` that
   move and grow; synthetic chains with every mode and new blocks, then
   A = 0, N = 0 and M = 0, at K 21, 64 and 512; and coefficients that wrap or
-  differ by 32768;
+  differ by 32768. *Amended 2026-11-04 (the test budget):* the `Encoder`'s
+  frames at K = 37 went, as its P-frame chain at K = 37 in segments of 3
+  decodes its I-frames there too, and the synthetic chains run at K 21 and
+  512, as every other chain decodes K = 64;
 - a P-frame into a fresh grid built from `read_frame_info`;
 - `NotFound` with no reference, with a later I-frame held, and on a second
   decoder; `InvalidArgument` for a scale not the reference's, a new block on a
@@ -6438,7 +6441,11 @@ synchronization validation too.
   segments of 3 and at the defaults -- to the CPU oracle's bytes: its intra
   frame of the grid, or `write_frame` of the oracle's P-frame with the
   price (`codec_frames::encoder_frame`, `codec_oracle::payload_price`); each
-  decodes to its I-frame's grid. It makes each of the diff's choices from
+  decodes to its I-frame's grid. *Amended 2026-11-04 (the test budget):*
+  the chains run at period 4 alone, five frames each (an I-frame, three
+  P-frames, the next I-frame): the open-ended chains' later P-frames had the
+  first three's modes, and no planted bug needed them; `grid_codec_decoder`
+  still decodes open-ended chains. It makes each of the diff's choices from
   one edit: all skip, one block changed, a mask alone (keep, residuals 0),
   a block gone and one added, unrelated content zero and a small change
   keep, an empty frame all removed and then an I-frame; and a DC step of
