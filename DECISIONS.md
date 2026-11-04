@@ -9214,9 +9214,8 @@ bucket-lock races, then `integrate`. The host counted every triangle's
 candidate blocks twice a frame, once for each call, the allocation ran its
 band test per pair under bucket locks, and a frame took ten blocking waits.
 Every caller repeated the loop. On Rafa2 frames 1–150 (5 mm, 0.08 m, K 56,
-period 30, true SDF), conversion p50 over frames 11–150 was 14.0 / 19.3 /
-18.6 / 44.7 ms on an RTX 5090 / RTX 4090 / M5 Max / M4, measured against
-same-session controls in the prototypes below.
+period 30, true SDF) the conversion took 14 to 45 ms a frame across four
+GPUs (Measured, below).
 
 **The rule.** `convert(grid, mesh, params)` makes the grid hold the mesh's
 field and nothing else, in one tick; the two-step path is removed, so a
@@ -9277,9 +9276,8 @@ GPUs (0x106B), else 512 × 1 where 512 invocations and its 18,436 bytes of
 shared memory fit, else 256 × 2. Where compute subgroups are always 32 wide
 with vote, ballot and arithmetic, a culling group is one subgroup: two
 barriers a chunk instead of five, level on NVIDIA and −1 to −4% on the M5
-Max. A 4,096-entry sort, and a subgroup scan of the sort's buckets, were
-dropped: the first was slower on the M5 Max, the second wrong by a few ulps
-on the 5090 for reasons not found.
+Max. A 4,096-entry sort and a subgroup scan of the sort's buckets were
+tried and dropped.
 
 **The full band** (`MeshSdfParams::full_band_m`). A true-SDF frame keeps a
 cell only when a corner lies within one voxel of zero and the others within
@@ -9298,40 +9296,53 @@ the M5 Max), and a second pass seeded from a full neighbour's nearest
 triangle (−0.21 ms on the M4, +0.25 ms on the M5 Max and +0.7 ms on NVIDIA
 on top of the one-round write).
 
-**Measured** (Rafa2 1–150, frames 11–150 p50, ms; the prototypes on all
-four boxes, NVIDIA at full clocks, against same-session controls):
+**Measured** on Rafa2 frames 1–150, Release, ms p50 / p95 over frames
+11–150, from a local per-frame print: the code of this entry against the
+three calls before it, the arms alternated on each box, two runs an arm on
+the RTX 5090 and the M5 Max and one on the RTX 4090 and the M4. With less
+GPU work the NVIDIA clocks step down, so their rows take the frames run at
+full clocks (118 and 64 of the 280 and 140 after):
 
 | | 5090 | 4090 | M5 Max | M4 |
 |---|---|---|---|---|
-| Before (three calls) | 14.0 | 19.3 | 18.6 | 44.7 |
-| The count, insert and batch prototype | 3.47 | 4.38 | 9.41 | 34.85 |
-| Plus the one-round write and the full band | 2.79 | 3.79 | 8.99 | 24.56 |
+| Conversion, before | 14.29 / 15.03 | 18.96 / 19.92 | 17.45 / 19.98 | 44.76 / 45.64 |
+| Conversion, after | 2.46 / 2.56 | 3.21 / 3.61 | 8.48 / 10.35 | 22.94 / 23.33 |
+| Conversion and `stream.code`, before | 16.56 / 17.47 | 21.24 / 22.54 | 20.34 / 23.42 | 49.99 / 51.00 |
+| Conversion and `stream.code`, after | 4.55 / 5.02 | 5.29 / 6.50 | 12.57 / 14.69 | 27.87 / 28.54 |
 
-This PR's own sanity runs, one per arm with the control repeated last, from
-copies with a local per-frame print: the 5090, clocks between P1 and P8
-with another session's server resident, 3.63 / 3.64 (one call) → 3.07 (one
-round) → 2.94 (full band); the M5 Max, on battery at load 5.7–6.2, 8.88 /
-8.92 → 8.14 → 8.53. The full band's write saving on the M5 Max is about what
-its grading and its two passes cost there; on the M4 it cut the
-conversion by 7 ms in the prototype.
+Over every frame, clocks as they fell, the conversion after is 2.56 / 4.00
+on the 5090 and 3.43 / 9.13 on the 4090. With `full_band_m` left at 0, two
+runs an arm alternated with the setup's, it is 26.55 / 26.88 on the M4
+(22.92 / 23.30 with it). The integrator retains 76.3 MB, 71.4 before: 41.5
+the per-pair scratch, 27.7 the bins, 4.8 the triangle records, 1.6 the mesh,
+0.3 the band index, each at its size from frame 1. The grid keeps its 1,024
+buckets (8,192 blocks, 34.1 MB) through the 150 frames.
 
 **Verification.** codec_mesh on Rafa2 frames 1–150 writes each box's
 baseline `.vrst` with the PR head's setup (full band on): 12cfcd94… on the
-5090, 48715851… on the 4090, cb37b9ac… on the M5 Max and the M4. The grid
-suite passes in Release under the validation layer on all four. Tests: the
-host oracle of the candidate offsets (`grid_voxelize_mesh_candidates`), the
-band's block set against a double-precision oracle, the index bound and
-growth (`grid_voxelize_mesh_band`), the call's submits and waits from the
-core's `DeviceCounters`, the first call's redo, the write in four ranges
-equal to one, and the refusals (`grid_voxelize_mesh_integrate`), the brute
-force on every write layout the device takes and the records
-(`grid_voxelize_mesh_integrate_exact`), and the full band's oracle, shell
-and curtain cases (`grid_voxelize_mesh_full_band`). Planted mutants, each
-failing a test: a clear zeroing no attribute; the index check after the
-first batch; the clear in a submit of its own; zero-area triangles counted;
-the scan's carry ignored; a refused total kept; the classify without its
-overflow gate; the insert without the chain recount; stamps of 0; growth
-that only doubles; the records' R without one vertex; the subgroup ballot's
-upper half dropped; a 256 × 2 lane writing one voxel twice; no apron pass;
-an apron of face neighbours only; a grading without the half-diagonal; and
-a prune that keeps the dropped blocks' counts.
+5090, 48715851… on the 4090, cb37b9ac… on the M5 Max and the M4, and the M4
+with the full band off writes it too. The grid suite passes in Release under
+the validation layer on all four, and recon's on the 5090 with this grid.
+Tests: the host oracle of the candidate offsets
+(`grid_voxelize_mesh_candidates`), the band's block set against a
+double-precision oracle, the index bound and growth
+(`grid_voxelize_mesh_band`), the call's submits and waits from the core's
+`DeviceCounters`, the first call's redo, the write in four ranges equal to
+one, and the refusals (`grid_voxelize_mesh_integrate`), the brute force on
+the device's own write layout, each other layout it takes against those
+bytes, and the records (`grid_voxelize_mesh_integrate_exact`), and the full
+band's oracle, shell and curtain cases (`grid_voxelize_mesh_full_band`).
+Planted mutants, each failing a test: a clear zeroing no attribute; the
+index check after the first batch; the clear in a submit of its own;
+zero-area triangles counted; the scan's carry ignored; a refused total kept;
+the classify without its overflow gate; the insert without the chain
+recount; stamps of 0; growth that only doubles, and growth that doubles
+before it meets the need; the records' R without one vertex; the subgroup
+ballot's upper half dropped; a 256 × 2 lane writing one voxel twice; a
+512 × 1 voxel map that writes one z layer of each brick twice, against the
+bytes the brute force verified on the device's own layout; no apron pass; an
+apron of face neighbours only; a grading without the half-diagonal; and a
+prune that keeps the dropped blocks' counts. The subgroup builds stay SPIR-V
+1.5, whose subgroups take the device's `subgroupSize`; a `static_assert` on
+the embedded modules fails a build at 1.6, which would let a device run them
+narrower.
