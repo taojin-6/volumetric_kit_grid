@@ -854,6 +854,11 @@ class VGRID_VOLUME_API VoxelHashMap {
   /// Run the init kernel, resetting every slot to empty (used by create +
   /// clear).
   core::Status init_table();
+  /// Record the init kernel into @p batch: @ref init_table's body, and the
+  /// map's half of a recorded clear. Moves the heap's host copy to full,
+  /// after every recording so far.
+  core::Status record_init(core::CommandBatch& batch,
+                           core::GpuStageScope* stage);
 
   /// Rebuild the free-block heap so it holds exactly the block indices @p
   /// active does *not* occupy, in ascending order, with @ref heap_counter_ set

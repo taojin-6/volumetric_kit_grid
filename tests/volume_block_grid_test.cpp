@@ -20,6 +20,7 @@
 #include "volumetric_kit/core/base/stage_metrics.hpp"
 #include "volumetric_kit/core/testing/test_check.hpp"
 #include "volumetric_kit/core/vulkan/allocator.hpp"
+#include "volumetric_kit/core/vulkan/command_batch.hpp"
 #include "volumetric_kit/core/vulkan/device.hpp"
 #include "volumetric_kit/core/vulkan/gpu_timer.hpp"
 #include "volumetric_kit/core/vulkan/vulkan.hpp"
@@ -517,6 +518,66 @@ int gpu_main(vkc::test::GpuContext& gpu) {
     CHECK(empty.ok() && empty.value().empty());
   }
 
+  // --- record_clear() is clear() recorded into a caller's batch: every
+  // attribute zeroed, the table emptied, every stamp zeroed, the epoch moved
+  // and the heap's host copy full -- and work recorded after it in the same
+  // batch sees the empty grid: an allocation there places its block alone.
+  {
+    std::vector<vol::BlockIndex> old_blocks(cube.begin(), cube.begin() + 9);
+    CHECK(vgrid_test::allocate_blocks(gpu, vbg.map(), old_blocks).ok());
+    CHECK(put(vol::kTsdfAttribute,
+              std::vector<float>(get(vol::kTsdfAttribute).size(), 0.25f)) &&
+          put(vol::kWeightAttribute,
+              std::vector<float>(get(vol::kWeightAttribute).size(), 1.0f)));
+    const std::uint64_t epoch = vbg.topology_epoch();
+    vol::BlockIndex fresh_block{};
+    fresh_block.coord = vgrid::Vec3i(-7, 3, 11);
+    const std::uint32_t one = 1;
+    vkc::Result<vkc::Buffer> fresh_list = vkc::test::upload_device_buffer(
+        gpu.device, gpu.allocator, &fresh_block, sizeof(fresh_block));
+    vkc::Result<vkc::Buffer> fresh_count = vkc::test::upload_device_buffer(
+        gpu.device, gpu.allocator, &one, sizeof(one));
+    CHECK(fresh_list.ok() && fresh_count.ok());
+    vol::AllocFailures failed{};
+    {
+      vkc::CommandBatch batch(gpu.device, gpu.allocator);
+      CHECK(vbg.record_clear(batch).ok());
+      // The host's view moved at the recording, before the batch ran.
+      CHECK(vbg.topology_epoch() != epoch);
+      CHECK(vbg.map().allocated_blocks() == 0);
+      vkc::Result<vol::RecordedRounds> placed = vbg.map().record_allocate(
+          batch, fresh_list.value(),
+          vol::DeviceCount{&fresh_count.value(), 0, 1});
+      CHECK(placed.ok());
+      CHECK(batch.submit().ok());
+      vkc::Result<vol::AllocFailures> settled =
+          vbg.map().settle(placed.value());
+      CHECK(settled.ok());
+      failed = settled.value();
+    }
+    CHECK(failed.total == 0 && heap_agrees());
+    vkc::Result<std::vector<vol::BlockIndex>> live =
+        vbg.map().compact_active_blocks();
+    CHECK(live.ok() && live.value().size() == 1 &&
+          live.value()[0].coord == fresh_block.coord);
+    for (const float x : get(vol::kTsdfAttribute)) CHECK(x == 0.0f);
+    for (const float x : get(vol::kWeightAttribute)) CHECK(x == 0.0f);
+    vkc::Result<std::vector<vol::BlockStamp>> stamps =
+        vbg.map().read_block_stamps();
+    CHECK(stamps.ok());
+    const std::uint32_t fresh_slot =
+        static_cast<std::uint32_t>(live.value()[0].ptr) / grid.voxels_per_block;
+    for (std::size_t slot = 0; slot < stamps.value().size(); ++slot) {
+      const vol::BlockStamp& s = stamps.value()[slot];
+      if (slot == fresh_slot) {
+        CHECK(s.requested == vbg.map().tick());
+      } else {
+        CHECK(s.requested == 0 && s.weighted == 0 && s.changed == 0);
+      }
+    }
+    CHECK(vbg.clear().ok() && heap_agrees());
+  }
+
   // --- An impossible grow is rejected on the parameters, not after paying for
   // it. resize() used to build every enlarged attribute buffer beside the live
   // ones and only *then* call map_.resize, which validates -- so an
@@ -601,6 +662,17 @@ int gpu_main(vkc::test::GpuContext& gpu) {
   vol::VoxelBlockGrid moved = std::move(vbg);
   CHECK(moved.valid() && moved.has_attribute(vol::kTsdfAttribute));
   CHECK(!vbg.valid());  // NOLINT(bugprone-use-after-move) -- asserting empty
+  // A moved-from grid's record_clear is refused and records nothing: its
+  // batch submits nothing.
+  {
+    const std::uint64_t submits = gpu.device.counters().submits;
+    vkc::CommandBatch batch(gpu.device, gpu.allocator);
+    // NOLINTNEXTLINE(bugprone-use-after-move) -- a moved-from grid refuses
+    CHECK(vbg.record_clear(batch).domain() ==
+          vkc::Status::Code::InvalidArgument);
+    CHECK(batch.submit().ok());
+    CHECK(gpu.device.counters().submits == submits);
+  }
 
   std::printf(
       "grid volume block grid test passed: 2 SoA attributes (%llu voxels "

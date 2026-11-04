@@ -77,6 +77,21 @@ class VoxelHashMap::Internal {
                        std::uint64_t(map.grid_.bucket_size))
         .entries;
   }
+
+  /// @brief Record the map's half of `VoxelBlockGrid::record_clear` into
+  ///        @p batch: the init dispatch, which empties the table, returns
+  ///        every block to the heap and zeroes every stamp.
+  ///
+  /// Internal because a clear of the map alone frees block indices over the
+  /// attribute data they address; the grid zeroes that first. The host's view
+  /// moves now, as @ref VoxelHashMap::clear moves it: a new
+  /// @ref VoxelHashMap::topology_epoch, and a full heap.
+  /// @return OK; `Status::Code::InvalidArgument` for a moved-from map, with
+  ///         nothing recorded and the host's view unchanged; or the batch's
+  ///         refusal.
+  VGRID_VOLUME_API static core::Status record_clear(
+      VoxelHashMap& map, core::CommandBatch& batch,
+      core::GpuStageScope* stage);
 };
 
 }  // namespace volumetric_kit::grid::volume
