@@ -9381,7 +9381,7 @@ stand. Rejected:
 - A Geometry track's params: `decode_transform` refuses another length, and
   only Geometry tracks have them.
 - `Session::calibration`: the sensor package's document, which a viewer should
-  not parse, and empty on a live session.
+  not parse.
 - A track's reserved word: per track, and too small for a direction.
 
 **A direction, not an axis code.** Every writer today names a signed axis, so
@@ -9403,9 +9403,11 @@ Its signature stays, and any other session's up is its caller's to set.
 **Verification.** Apple M5 Max, Release with warnings as errors, under the
 Khronos validation layer. `grid_stream_container` pins a new golden with CRCs
 Python's `zlib.crc32` checked, and the three goldens from before, unchanged,
-read back with no up. `grid_stream_chunks` feeds H = 64 and H = 80 headers and
-a bad up to the parser, `grid_networking_server_serve` carries an up over TCP,
-and the writer, the encoder, the server and the reader each refuse NaN,
-infinity, lengths 2 and 0.5, and a length of 1e-30, which squares to zero in
-single precision. Three planted bugs fail them: H = 56 always, H = 72 always,
-and the up read from an H of 64.
+read back with no up. `grid_stream_chunks` feeds H = 64 and H = 80 headers, a
+set reserved word and a bad up at H = 72 and 80 to the parser, where another
+version or a flag comes first, `grid_networking_server_serve` carries an up
+over TCP, and the writer, the encoder, the server and the reader each refuse
+NaN, infinity, lengths 2 and 0.5, and a length of 1e-30, since unknown is
+exact zeros only. The tolerance is pinned by 1.00009 taken and 1.00011 refused.
+Three planted bugs fail them: H = 56 always, H = 72 always, and the up read
+from an H of 64.

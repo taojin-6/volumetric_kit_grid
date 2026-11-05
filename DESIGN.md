@@ -1264,11 +1264,11 @@ append, so the file is the report's own. A stream that does not decode
 `output.max_viewers` to `CodecOutputs`, and `codec_session` gives the
 `.vrst` one Geometry track at the source's nominal rate (the rig's
 `source.fps`, else 30 a second), with no session id or start time, so a
-rerun writes the same bytes; a record's set is the
-source index and its pts that index at 30 fps, as Replica frames carry no
-time. `codec_outputs` serves without `replay_gop`, so the viewers of recon's `fuse_orbbec`
-that join or fall behind get a key at the next set; `serve_stream`, which
-cannot make a key, keeps it.
+rerun writes the same bytes, and, with a mesh source's params, an up of +Y; a
+record's set is the source index and its pts that index at 30 fps, as Replica
+frames carry no time. `codec_outputs` serves without `replay_gop`, so the
+viewers of recon's `fuse_orbbec` that join or fall behind get a key at the next
+set; `serve_stream`, which cannot make a key, keeps it.
 
 The report opens the CSV once the stream's file is made, and refuses one
 that is that file under another name, through symlinks or case-insensitive

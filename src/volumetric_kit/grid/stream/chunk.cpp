@@ -190,8 +190,8 @@ bool up_unknown(const std::array<float, 3>& up) {
 }
 
 // Whether a session may hold `up`: all zero, or finite and of length 1 to
-// within 1e-4. In double, so a tiny component does not square to zero; a NaN
-// or an infinity fails the comparison.
+// within 1e-4. Unknown is exact zeros only, so a tiny up is refused, not taken
+// as unknown; a NaN or an infinity fails the comparison.
 bool up_allowed(const std::array<float, 3>& up) {
   if (up_unknown(up)) return true;
   const double x = up[0];
