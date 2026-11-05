@@ -63,8 +63,9 @@ class VGRID_STREAM_API StreamWriter {
   /// @param path     Where the new file goes; nothing may be there, and its
   ///                 directory must exist.
   /// @param session  The header. At least one track and at most 65535, each
-  ///                 of a nonzero kind with a nonzero `rate.den`, and a body
-  ///                 of at most @ref kMaxSessionBytes.
+  ///                 of a nonzero kind with a nonzero `rate.den`, an up
+  ///                 @ref Session::up allows, and a body of at most
+  ///                 @ref kMaxSessionBytes.
   /// @return The writer; `Status::Code::InvalidArgument` for an empty path or
   ///         one with a NUL, a session refused above (with nothing created),
   ///         or anything already at @p path, a symbolic link included (left

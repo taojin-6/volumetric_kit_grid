@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-11-05
+
+### Added
+
+- **`stream::Session::up`**: the world's up, a direction in the coordinates of
+  the session's geometry and poses, which a viewer keeps up on screen; all
+  zero, the default, when unknown. A session with one writes a `VRST` header
+  of 72 bytes, still version 0, whose up a reader before this one ignores; a
+  session without one writes the bytes it always did. The writer, the encoder,
+  the server and the readers refuse an up neither all zero nor finite and of
+  length 1 to within 1e-4 (the 2026-11-05 entry in DECISIONS.md).
+
+### Changed
+
+- **The examples' `codec_session`** states +Y, the placed mesh frame's up, for
+  a session with geometry params, so a `codec_mesh` stream names its up. Other
+  sessions leave it to their caller.
+
 ## [0.13.0] - 2026-11-03
 
 ### Removed

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -52,6 +53,7 @@ constexpr std::size_t kSessionIdAt = 24;
 constexpr std::size_t kCreatedAt = 40;
 constexpr std::size_t kTrackCountAt = 48;
 constexpr std::size_t kSessionFlagsAt = 50;
+constexpr std::size_t kUpAt = 52;  // in an H of kSessionUpHeaderBytes or more
 // A record's.
 constexpr std::size_t kTrackAt = 20;
 constexpr std::size_t kRecordFlagsAt = 22;
@@ -182,6 +184,42 @@ core::Status parse_session_body(std::string_view api, std::string_view path,
   return {};
 }
 
+// Whether `up` is the unknown up, all zero.
+bool up_unknown(const std::array<float, 3>& up) {
+  return up == std::array<float, 3>{};
+}
+
+// Whether a session may hold `up`: all zero, or finite and of length 1 to
+// within 1e-4. In double, so a tiny component does not square to zero; a NaN
+// or an infinity fails the comparison.
+bool up_allowed(const std::array<float, 3>& up) {
+  if (up_unknown(up)) return true;
+  const double x = up[0];
+  const double y = up[1];
+  const double z = up[2];
+  return std::abs(std::sqrt(x * x + y * y + z * z) - 1.0) <= 1e-4;
+}
+
+constexpr const char* kUpNotAllowed =
+    "an up neither all zero nor finite and of length 1";
+
+void store_up(std::uint8_t* header, const std::array<float, 3>& up) {
+  for (std::size_t i = 0; i < up.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &up[i], sizeof(bits));
+    store_le32(header + kUpAt + 4 * i, bits);
+  }
+}
+
+std::array<float, 3> load_up(const std::uint8_t* header) {
+  std::array<float, 3> up{};
+  for (std::size_t i = 0; i < up.size(); ++i) {
+    const std::uint32_t bits = load_le32(header + kUpAt + 4 * i);
+    std::memcpy(&up[i], &bits, sizeof(bits));
+  }
+  return up;
+}
+
 void put_string(std::uint8_t*& at, const std::string& s) {
   store_le32(at, static_cast<std::uint32_t>(s.size()));
   if (!s.empty()) std::memcpy(at + 4, s.data(), s.size());
@@ -227,6 +265,9 @@ core::Status encode_session(std::string_view api, const Session& session,
     return refuse("a session holds 1 to 65535 tracks, not " +
                   std::to_string(tracks));
   }
+  if (!up_allowed(session.up)) {
+    return refuse(std::string("the session has ") + kUpNotAllowed);
+  }
   std::uint64_t body = kTrackEntryBytes * tracks + 8 + session.writer.size() +
                        session.calibration.size();
   for (std::size_t i = 0; i < tracks; ++i) {
@@ -244,15 +285,17 @@ core::Status encode_session(std::string_view api, const Session& session,
                   std::to_string(body) + " bytes, above " +
                   std::to_string(kMaxSessionBytes));
   }
-  chunk->assign(
-      static_cast<std::size_t>(kSessionHeaderBytes + body + padding(body)), 0);
+  const std::uint32_t h =
+      up_unknown(session.up) ? kSessionHeaderBytes : kSessionUpHeaderBytes;
+  chunk->assign(static_cast<std::size_t>(h + body + padding(body)), 0);
   std::uint8_t* header = chunk->data();
   store_le32(header + kVersionAt, kSessionVersion);
   std::memcpy(header + kSessionIdAt, session.id.data(), session.id.size());
   store_le64(header + kCreatedAt, session.created_ns);
   store_le16(header + kTrackCountAt, static_cast<std::uint16_t>(tracks));
   store_le16(header + kSessionFlagsAt, 0);
-  std::uint8_t* const start = header + kSessionHeaderBytes;
+  if (h >= kSessionUpHeaderBytes) store_up(header, session.up);
+  std::uint8_t* const start = header + h;
   std::uint8_t* at = start;
   for (const Track& track : session.tracks) {
     store_le16(at, static_cast<std::uint16_t>(track.kind));
@@ -269,7 +312,7 @@ core::Status encode_session(std::string_view api, const Session& session,
     put_string(at, track.sensor);
     put_string(at, track.params);
   }
-  seal_header(header, kSessionTag, kSessionHeaderBytes, body,
+  seal_header(header, kSessionTag, h, body,
               crc32(start, static_cast<std::size_t>(body)));
   return {};
 }
@@ -437,6 +480,9 @@ core::Result<std::uint64_t> session_body_bytes(std::string_view api,
                         " sets session flags " + std::to_string(flags) +
                             ", which version 0 does not define"));
   }
+  if (h >= kSessionUpHeaderBytes && !up_allowed(load_up(header))) {
+    return bad_session(api, path, std::string("holds ") + kUpNotAllowed);
+  }
   const std::uint64_t size = load_le64(header + kBodySizeAt);
   if (size > kMaxSessionBytes) {
     return refuse_session(api, path,
@@ -448,8 +494,9 @@ core::Result<std::uint64_t> session_body_bytes(std::string_view api,
 }
 
 core::Status parse_session(std::string_view api, std::string_view path,
-                           const std::uint8_t* header, const std::uint8_t* body,
-                           std::uint64_t size, Session* session) {
+                           const std::uint8_t* header, std::uint32_t h,
+                           const std::uint8_t* body, std::uint64_t size,
+                           Session* session) {
   if (crc32(body, static_cast<std::size_t>(size)) !=
       load_le32(header + kBodyCrcAt)) {
     return refuse_session(api, path,
@@ -457,6 +504,8 @@ core::Status parse_session(std::string_view api, std::string_view path,
   }
   std::memcpy(session->id.data(), header + kSessionIdAt, session->id.size());
   session->created_ns = load_le64(header + kCreatedAt);
+  session->up =
+      h >= kSessionUpHeaderBytes ? load_up(header) : std::array<float, 3>{};
   return parse_session_body(api, path, body, size,
                             load_le16(header + kTrackCountAt), session);
 }
@@ -529,7 +578,7 @@ core::Result<std::uint64_t> read_session(std::string_view api,
   }
   std::vector<std::uint8_t> body(static_cast<std::size_t>(size));
   VKC_TRY(read_at(api, path, file.fd, h, body.data(), body.size()));
-  VKC_TRY(parse_session(api, path, header, body.data(), size, session));
+  VKC_TRY(parse_session(api, path, header, h, body.data(), size, session));
   return h + size + padding(size);
 }
 

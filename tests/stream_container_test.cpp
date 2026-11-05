@@ -5,7 +5,8 @@
 // whose CRCs Python's zlib.crc32 computed, and a geometry-only file's, written
 // and served as before audio; the CRC of every length to 64 at every alignment
 // against a bitwise one; round trips of the session, every record field and the
-// payloads; seeking by key; unknown kinds, chunks and header fields; the
+// payloads; the world's up, its bytes, its round trip and its refusals; seeking
+// by key; unknown kinds, chunks and header fields; the
 // payload limit and a body size near 2^64; every writer and reader refusal, a
 // file cut short after its open included; reads into caller memory; a payload
 // appended in two runs, under the one CRC its RecordPayload computed; two
@@ -16,6 +17,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
@@ -133,6 +135,8 @@ int crc_case(const std::string& dir) {
 
 // --- Golden bytes. -----------------------------------------------------------
 
+constexpr std::array<float, 3> kNoUp{};
+
 // Two tracks, three records, the footer: 552 bytes. Chunks at 0 (VRST), 144,
 // 208 and 264 (RECD), 328 (INDX) and 512 (TAIL).
 constexpr const char* kGoldenSmall =
@@ -208,6 +212,8 @@ int golden_case(const std::string& dir) {
       }
     }
     CHECK(file == expected);
+    auto r = open(path);
+    CHECK(r != nullptr && r->session().up == kNoUp);
   }
   {
     const std::string path = dir + "/golden_big.vrst";
@@ -229,7 +235,7 @@ int golden_case(const std::string& dir) {
     CHECK(Bytes(file.begin() + 160, file.begin() + 160 + 65543) == payload);
     CHECK(Bytes(file.end() - 152, file.end()) == footer);
     auto r = open(path);
-    CHECK(r != nullptr);
+    CHECK(r != nullptr && r->session().up == kNoUp);
     const vrst::ReadBack back = vrst::read_all(*r);
     CHECK(back.payloads.size() == 1 && back.payloads[0] == payload);
   }
@@ -287,6 +293,8 @@ int geometry_only_case(const std::string& dir) {
   CHECK(w->finish().ok());
   const Bytes expected = unhex(kGoldenGeometryOnly);
   CHECK(vkc::test::read_bytes(path) == expected);
+  auto reader = open(path);
+  CHECK(reader != nullptr && reader->session().up == kNoUp);
 
   // The wire: the session chunk and each record's, the file but its footer.
   vkc::Result<stream::ChunkEncoder> encoder = stream::ChunkEncoder::create(s);
@@ -302,6 +310,91 @@ int geometry_only_case(const std::string& dir) {
   }
   CHECK(wire.size() == 368);
   CHECK(Bytes(expected.begin(), expected.begin() + 368) == wire);
+  return 0;
+}
+
+// --- The world's up. ---------------------------------------------------------
+
+// Writer "t", one Geometry track at 30/1 on clock 1, up (0, 0, 1): the session
+// chunk alone, 120 bytes, each CRC checked by Python's zlib.crc32.
+constexpr const char* kGoldenUp =
+    "5652535448000000290000000000000003d95209000000000000000000000000"
+    "000000000000000000000000000000000100000000000000000000000000803f"
+    "000000005028484b010001001e00000001000000000000000000000000000000"
+    "010000007400000000000000000000000000000000000000";
+
+int up_case(const std::string& dir) {
+  stream::Session s = one_track("t");
+  s.tracks[0].rate = {30, 1};
+  s.up = {0.0f, 0.0f, 1.0f};
+  const std::string golden = dir + "/up_golden.vrst";
+  {
+    auto w = create(golden, s);
+    CHECK(w != nullptr);
+  }
+  const Bytes file = vkc::test::read_bytes(golden);
+  CHECK(file == unhex(kGoldenUp));
+  CHECK(vrst::get(file, 4, 4) == 72);
+  CHECK(vrst::get(file, 52, 4) == 0);
+  CHECK(vrst::get(file, 56, 4) == 0);
+  CHECK(vrst::get(file, 60, 4) == 0x3F800000u);
+  CHECK(vrst::get(file, 64, 4) == 0);
+  vkc::Result<stream::ChunkEncoder> encoder = stream::ChunkEncoder::create(s);
+  CHECK(encoder.ok() && encoder->session_chunk() == file);
+
+  // An oblique up, its bits kept, past the wider header: by the footer and by
+  // a scan, the record found after the session's body.
+  s.up = {0.26726124f, -0.5345225f, 0.8017837f};
+  const std::string oblique = dir + "/up_oblique.vrst";
+  auto w = create(oblique, s);
+  CHECK(w != nullptr);
+  CHECK(append(*w, info(0, true, 1, 0), pattern(9, 1)));
+  const std::string scanned = dir + "/up_oblique_scanned.vrst";
+  CHECK(vrst::write_bytes(scanned, vkc::test::read_bytes(oblique)));
+  CHECK(w->finish().ok());
+  for (const std::string& path : {oblique, scanned}) {
+    auto r = open(path);
+    CHECK(r != nullptr && same(r->session(), s));
+    CHECK(r->recovery().finished == (path == oblique));
+    const vrst::ReadBack back = vrst::read_all(*r);
+    CHECK(back.payloads.size() == 1 && back.payloads[0] == pattern(9, 1));
+  }
+
+  // Within the length's tolerance, and past it.
+  const std::string fresh = dir + "/up_refused.vrst";
+  stream::Session bad = s;
+  bad.up = {0.0f, 0.0f, 1.00005f};
+  CHECK(stream::ChunkEncoder::create(bad).ok());
+  bad.up = {0.0f, 0.0f, 1.0002f};
+  CHECK(stream::ChunkEncoder::create(bad).status().domain() ==
+        Code::InvalidArgument);
+
+  // A hand-built H = 72 with a zero up is unknown; a negative zero is too, and
+  // writes no up.
+  const Bytes body = vrst::session_body(1);
+  const std::string hand = dir + "/up_hand.vrst";
+  CHECK(vrst::write_bytes(
+      hand, vrst::chunk("VRST", vrst::session_fields(0, 1, 0, kNoUp), body)));
+  auto zero = open(hand);
+  CHECK(zero != nullptr && zero->session().up == kNoUp);
+  CHECK(zero->begin().offset == 72 + body.size() + vrst::padding(body.size()));
+  bad.up = {-0.0f, 0.0f, 0.0f};
+  encoder = stream::ChunkEncoder::create(bad);
+  CHECK(encoder.ok() && vrst::get(encoder->session_chunk(), 4, 4) == 56);
+
+  // Each up refused by the writer, with no file made, by the encoder, and by a
+  // reader of bytes that hold it.
+  for (const std::array<float, 3>& up : vrst::bad_ups()) {
+    bad.up = up;
+    CHECK(stream::StreamWriter::create(fresh, bad).status().domain() ==
+          Code::InvalidArgument);
+    CHECK(file_size(fresh) == ~std::uint64_t{0});
+    CHECK(stream::ChunkEncoder::create(bad).status().domain() ==
+          Code::InvalidArgument);
+    CHECK(vrst::write_bytes(
+        hand, vrst::chunk("VRST", vrst::session_fields(0, 1, 0, up), body)));
+    CHECK(open_code(hand) == Code::InvalidArgument);
+  }
   return 0;
 }
 
@@ -1005,6 +1098,7 @@ int main() {
   if (crc_case(dir) != 0) return 1;
   if (golden_case(dir) != 0) return 1;
   if (geometry_only_case(dir) != 0) return 1;
+  if (up_case(dir) != 0) return 1;
   if (round_trip_case(dir) != 0) return 1;
   if (seek_case(dir) != 0) return 1;
   if (unknown_case(dir) != 0) return 1;

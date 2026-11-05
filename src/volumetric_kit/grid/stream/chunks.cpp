@@ -231,8 +231,8 @@ core::Result<bool> ChunkParser::advance() {
       if (!size.ok()) return fail(std::move(size).status());
       if (available - *h < *size) return false;
       Session session;
-      core::Status parsed =
-          detail::parse_session(kParser, kStream, at, at + *h, *size, &session);
+      core::Status parsed = detail::parse_session(kParser, kStream, at, *h,
+                                                  at + *h, *size, &session);
       if (!parsed.ok()) return fail(std::move(parsed));
       session_ = std::move(session);
       next_ += *h + *size + detail::padding(*size);

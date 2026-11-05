@@ -32,7 +32,7 @@
 /// Python's `zlib.crc32` checks any chunk.
 ///
 /// **`VRST`**, the session header: the first chunk, its tag the file's
-/// magic (H = 56).
+/// magic (H = 56; 72 with an up).
 ///
 /// @code
 ///       20     4  version (0)
@@ -40,8 +40,17 @@
 ///       40     8  created_ns: system_clock ns since the Unix epoch; 0 unknown
 ///       48     2  T, the track count (1..65535)
 ///       50     2  flags (0)
-///       52     4  header_crc
+///       52    12  up: the world's up, binary32 x, y, z (H >= 72 only)
+///       64     4  reserved (H >= 72 only)
+///      H-4     4  header_crc
 /// @endcode
+///
+/// The up is written, with H = 72, only when the session has one; a session
+/// without writes H = 56, the bytes every writer before grid 0.14.0 wrote. A
+/// reader takes the up from an H of at least 72, and a smaller H as an unknown
+/// up; a reader before 0.14.0 ignores it, as any trailing field. An up is all
+/// zero, or finite and of length 1 to within 1e-4; the writer and the reader
+/// refuse another.
 ///
 /// Its body, at most @ref kMaxSessionBytes and parsed exactly: T track
 /// entries of 24 bytes, then strings, each a `u32` length and its bytes: the
@@ -193,6 +202,7 @@ struct Track {
 /// @code
 /// stream::Session session;
 /// session.writer = "codec_replica";
+/// session.up = {0.0f, 0.0f, 1.0f};  // the world's +z is up
 /// session.tracks.push_back({stream::TrackKind::Geometry});
 /// @endcode
 struct Session {
@@ -201,6 +211,12 @@ struct Session {
   /// unknown. The writer records what it is given, so two runs given the
   /// same session write the same bytes.
   std::uint64_t created_ns = 0;
+  /// The world's up: the direction, in the coordinates of the session's
+  /// geometry and poses, from the floor toward the ceiling, which a viewer
+  /// keeps up on screen. All zero, the default, when unknown: a viewer then
+  /// keeps +Y up. Otherwise finite and of length 1 to within 1e-4, stored as
+  /// binary32 bit for bit.
+  std::array<float, 3> up{};
   std::string writer;  ///< The program that wrote the file (UTF-8).
   /// The camera tier's calibration document, byte for byte, or empty.
   std::string calibration;

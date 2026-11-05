@@ -6,14 +6,16 @@
 // two runs framed as their joined bytes; its refusals
 // against the writer's, messages included; the parser fed a writer's file,
 // finished or not, whole, a byte at a time and in pseudo-random pieces,
-// against the reader; the chunks it skips and a wider session header; each
+// against the reader; the chunks it skips and wider session headers; each
 // refusal at the byte that completes what it refuses, bodies of 1 GiB before
 // any of them arrives; a failure returned by every later call; and a held
 // record's body read into caller memory.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -425,7 +427,8 @@ int parser_skips_case(const std::string& dir) {
 
 // A session header wider than this version's, as a later one might write:
 // its trailing fields are ignored, and its body and the record after it are
-// found past its H, as the reader finds them.
+// found past its H, as the reader finds them. A session's up is taken from an
+// H of at least 72 alone.
 int parser_wider_session_case(const std::string& dir) {
   Bytes fields = vrst::session_fields(0, 1, 0);
   fields.resize(fields.size() + 8, 0xA5);  // H 64
@@ -439,6 +442,24 @@ int parser_wider_session_case(const std::string& dir) {
   const Parsed parsed = parse_whole(bytes);
   CHECK(parsed.records.size() == 1 &&
         parsed.records[0].offset == bytes.size() - record.size());
+  // An H below 72 holds no up, whatever its trailing bytes.
+  stream::ChunkParser parser;
+  CHECK(parser.feed(bytes.data(), bytes.size()).ok());
+  CHECK(parser.session() != nullptr &&
+        parser.session()->up == (std::array<float, 3>{}));
+
+  // An H past 72: the up, and trailing fields ignored.
+  const std::array<float, 3> up = {0.0f, 0.0f, 1.0f};
+  Bytes past = vrst::session_fields(0, 1, 0, up);
+  past.resize(past.size() + 8, 0xA5);  // H 80
+  bytes = vrst::chunk("VRST", past, vrst::session_body(1));
+  CHECK(vrst::get(bytes, 4, 4) == 80);
+  bytes.insert(bytes.end(), record.begin(), record.end());
+  CHECK(vrst::write_bytes(path, bytes));
+  CHECK(parses_as_read(path, bytes) == 0);
+  stream::ChunkParser past_parser;
+  CHECK(past_parser.feed(bytes.data(), bytes.size()).ok());
+  CHECK(past_parser.session() != nullptr && past_parser.session()->up == up);
   return 0;
 }
 
@@ -491,6 +512,17 @@ int parser_refusals_case(const std::string&) {
       {"session body past its strings",
        vrst::chunk("VRST", vrst::session_fields(0, 1, 0), extra),
        56 + extra.size(), Code::InvalidArgument},
+      {"up not unit",
+       vrst::chunk("VRST", vrst::session_fields(0, 1, 0, {0.0f, 0.0f, 2.0f}),
+                   body),
+       72, Code::InvalidArgument},
+      {"up NaN",
+       vrst::chunk(
+           "VRST",
+           vrst::session_fields(
+               0, 1, 0, {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}),
+           body),
+       72, Code::InvalidArgument},
       {"H not a multiple of 8", after(vrst::header("ZZZZ", Bytes(4, 0), 0, 0)),
        g + 8, Code::InvalidArgument},
       {"RECD H below 56", after(vrst::header("RECD", Bytes(24, 0), 0, 0)),

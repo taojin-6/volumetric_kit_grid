@@ -15,6 +15,7 @@
 // and 30 a second its rate -- and its own audit and allow_holes. The device
 // part skips with no device.
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -564,6 +565,7 @@ int records(vkc::test::GpuContext& gpu, const vkc::test::Scratch& scratch) {
   const stream::StreamReader& reader = **opened;
   CHECK(reader.recovery().finished);
   CHECK(reader.session().tracks.size() == 1);
+  CHECK((reader.session().up == std::array<float, 3>{0.0f, 1.0f, 0.0f}));
   const stream::Track& track = reader.session().tracks[0];
   CHECK(track.kind == stream::TrackKind::Geometry && track.params == *params);
   CHECK(track.rate.num == 30 && track.rate.den == 1);
