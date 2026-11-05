@@ -448,9 +448,10 @@ int parser_wider_session_case(const std::string& dir) {
   CHECK(parser.session() != nullptr &&
         parser.session()->up == (std::array<float, 3>{}));
 
-  // An H past 72: the up, and trailing fields ignored.
+  // An H past 72: the up, with the reserved word and trailing fields ignored.
   const std::array<float, 3> up = {0.0f, 0.0f, 1.0f};
   Bytes past = vrst::session_fields(0, 1, 0, up);
+  past[44] = 0xA5;                     // byte 64, the reserved word
   past.resize(past.size() + 8, 0xA5);  // H 80
   bytes = vrst::chunk("VRST", past, vrst::session_body(1));
   CHECK(vrst::get(bytes, 4, 4) == 80);
@@ -488,6 +489,9 @@ int parser_refusals_case(const std::string&) {
   const Bytes zzzz = vrst::chunk("ZZZZ", Bytes(16, 0x5A), pattern(13, 2));
   Bytes extra = body;
   extra.push_back(0);
+  const std::array<float, 3> long_up = {0.0f, 0.0f, 2.0f};
+  Bytes wide_long_up = vrst::session_fields(0, 1, 0, long_up);
+  wide_long_up.resize(wide_long_up.size() + 8, 0);  // H 80
   const Bytes http = {'H', 'T', 'T', 'P', '/', '1',  '.',  '1',  ' ', '2',
                       '0', '0', ' ', 'O', 'K', '\r', '\n', '\r', '\n'};
   const std::vector<Refusal> refusals = {
@@ -513,9 +517,18 @@ int parser_refusals_case(const std::string&) {
        vrst::chunk("VRST", vrst::session_fields(0, 1, 0), extra),
        56 + extra.size(), Code::InvalidArgument},
       {"up not unit",
-       vrst::chunk("VRST", vrst::session_fields(0, 1, 0, {0.0f, 0.0f, 2.0f}),
-                   body),
-       72, Code::InvalidArgument},
+       vrst::chunk("VRST", vrst::session_fields(0, 1, 0, long_up), body), 72,
+       Code::InvalidArgument},
+      {"up not unit, H 80", vrst::chunk("VRST", wide_long_up, body), 80,
+       Code::InvalidArgument},
+      // Another version or a flag comes first: such a header's bytes 52..63
+      // need not be an up.
+      {"session version, bad up",
+       vrst::chunk("VRST", vrst::session_fields(1, 1, 0, long_up), body), 72,
+       Code::Unsupported},
+      {"session flags, bad up",
+       vrst::chunk("VRST", vrst::session_fields(0, 1, 4, long_up), body), 72,
+       Code::Unsupported},
       {"up NaN",
        vrst::chunk(
            "VRST",

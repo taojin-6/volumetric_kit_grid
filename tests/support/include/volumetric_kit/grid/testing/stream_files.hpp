@@ -137,9 +137,11 @@ inline Bytes session_fields(std::uint32_t version, std::uint16_t tracks,
 
 // The ups a session may not hold, each refused by whatever encodes or reads
 // one.
-inline std::array<std::array<float, 3>, 5> bad_ups() {
+inline std::array<std::array<float, 3>, 7> bad_ups() {
   return {{{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f},
+           {0.0f, std::numeric_limits<float>::quiet_NaN(), 0.0f},
            {std::numeric_limits<float>::infinity(), 0.0f, 0.0f},
+           {0.0f, 0.0f, -std::numeric_limits<float>::infinity()},
            {0.0f, 0.0f, 2.0f},
            {0.0f, 0.0f, 0.5f},
            {1e-30f, 0.0f, 0.0f}}};

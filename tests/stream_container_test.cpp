@@ -360,12 +360,12 @@ int up_case(const std::string& dir) {
     CHECK(back.payloads.size() == 1 && back.payloads[0] == pattern(9, 1));
   }
 
-  // Within the length's tolerance, and past it.
+  // Either side of the length's tolerance of 1e-4.
   const std::string fresh = dir + "/up_refused.vrst";
   stream::Session bad = s;
-  bad.up = {0.0f, 0.0f, 1.00005f};
+  bad.up = {0.0f, 0.0f, 1.00009f};
   CHECK(stream::ChunkEncoder::create(bad).ok());
-  bad.up = {0.0f, 0.0f, 1.0002f};
+  bad.up = {0.0f, 0.0f, 1.00011f};
   CHECK(stream::ChunkEncoder::create(bad).status().domain() ==
         Code::InvalidArgument);
 
