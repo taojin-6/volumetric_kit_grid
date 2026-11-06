@@ -16,9 +16,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `send_note` never waits, the newest wins, and no failure reading a note
   touches the stream. `read_notes` is off by default, which reads and drops
   what a viewer sends as ever, and a viewer that sends no note sends nothing.
-  The wire down is unchanged either way. With `read_notes`, a note landing as a
-  socket closes can cost that viewer the last records (`StreamServer::finish`;
-  the 2026-11-05 notes entry in DECISIONS.md).
+  The wire down is unchanged either way. A note landing as a socket closes, read
+  or not, can cost that viewer the last records (`StreamServer::finish`; the
+  2026-11-05 notes entry in DECISIONS.md).
 
 ## [0.14.0] - 2026-11-05
 

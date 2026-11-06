@@ -9472,18 +9472,19 @@ record, which bound what the parser holds.
 
 **One cost, accepted.** A viewer that never sends made every close a clean end.
 A note unread at the close, or landing after it, draws a reset, and the sender's
-kernel drops what it still held. Measured on loopback with plain sockets, macOS
-and Linux both lose the tail in both cases, and with neither they lose nothing.
-Through this server and client, a note just after `finish` cost a reader 49 KB
-of 128 records of 16 KiB and 66 KB of 32 of 64 KiB on macOS, and at most 16 KB
-on Linux, always whole records from the first. A viewer closes only once its
-socket polls writable, so what is unsent then is under the 128 KiB mark (half
-that on Linux, whose poll counts it double); the rest of the bound is what is in
-flight. The reader reads a reset on macOS and the sender's close on Linux, once
-either way, so a caller that counts failures counts one. Accepted, rather than
-draining the socket before each close: a sender that writes a file keeps those
-records, and a note about once a second rarely meets the moments the tail takes
-to drain.
+kernel drops what it still held. The kernel answers the note, so `read_notes`
+changes none of it, and a sender with it off lost as much. Through this server
+and client, a note just after `finish` cost a reader 49 KB of 128 records of
+16 KiB and 66 KB of 32 of 64 KiB on macOS, and at most 16 KB on Linux, always
+whole records from the first. A viewer closes only once its socket polls
+writable, so what is unsent then is under the 128 KiB mark (half that on Linux,
+whose poll counts it double); the rest of the bound is what is in flight. What
+already reached the reader's kernel it still reads, as a failed send leaves the
+end to the read. The reader reads a reset on macOS and the sender's close on
+Linux, once either way, so a caller that counts failures counts one. Accepted,
+rather than draining the socket before each close: a sender that writes a file
+keeps those records, and a note about once a second rarely meets the moments the
+tail takes to drain.
 
 **Nagle.** A reader's socket is not set up to send, so a note can wait for the
 next acknowledgement: about 100 ms at worst behind a 10 Hz stream. No option is
@@ -9494,8 +9495,10 @@ errors, and ThreadSanitizer on macOS. `grid_networking_notes` covers arrival, a
 burst, a note a byte at a time, the bytes up, each payload rule, eight kinds of
 bad bytes with the stream checked after each, `read_notes` off, the wire down
 byte for byte with notes flowing, a full socket, the connect and the end, a
-viewer leaving, a dialled viewer, the end of a take, and threads.
-`grid_networking_server_oom` fails `newest_note`'s and `send_note`'s allocations,
-and the reader's alone, as a test cannot arm a viewer's thread. Three planted
-bugs fail them: `read_notes` ignored, a bad note ending the viewer, and
-`send_note` waiting on a full socket.
+viewer leaving, a dialled viewer, the end of a take, a viewer that says and takes
+nothing, and threads. `grid_networking_server_oom` fails `newest_note`'s and
+`send_note`'s allocations, and the reader's alone, as a test cannot arm a
+viewer's thread. Eight planted bugs fail them: `read_notes` ignored, a bad note
+ending the viewer, `send_note` waiting on a full socket, a failed send ending the
+connection, a reader with no line limit, a short payload read as an empty line,
+a note feeding the stall rule, and a note kept after its viewer.

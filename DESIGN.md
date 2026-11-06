@@ -1132,7 +1132,8 @@ viewer's notes, logged at Warning, as nothing resyncs, and its later bytes are
 dropped. None of it reaches the stream: the read has no failure path to the
 viewer, and the stall rule counts only what a viewer takes. Without
 `read_notes`, the default, no host that reaches the port can post anything.
-`finish`'s doc states the one cost, a note landing as a socket closes.
+`finish`'s doc states the one cost, a note landing as a socket closes, read or
+not.
 
 **Finishing** (the 2026-10-30 finish entry). `finish` ends the stream
 without losing its tail: later records are refused, a connection is closed

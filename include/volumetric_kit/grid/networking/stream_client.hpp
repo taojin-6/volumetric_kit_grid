@@ -202,11 +202,11 @@ class VGRID_NETWORKING_API StreamClient {
   /// Newest wins: a note not begun is replaced, and one under way is finished
   /// first, what the socket would not take going at the next call of this or
   /// @ref next. Nothing goes up before the first note. The rate is the
-  /// caller's: a note is 60 bytes and its line, rounded up to 8, made for
-  /// about one a second. A sender drops it unread without
+  /// caller's, made for about one a second. A sender drops it unread without
   /// @ref ServerOptions::read_notes, as every sender before grid 0.15.0 does.
-  /// A client is one connection, so a caller that reconnects says its newest
-  /// note again on the new client.
+  /// One that lands as the sender closes can cost this client the last records
+  /// (@ref StreamServer::finish). A client is one connection, so a caller that
+  /// reconnects says its newest note again on the new client.
   /// @param note  Its tone and line; its `received` is not sent.
   /// @return OK, also before the connection is made (sent once it is) and
   ///         after it ended, which @ref next reports;

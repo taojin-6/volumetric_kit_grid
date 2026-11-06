@@ -33,7 +33,7 @@ inline constexpr std::size_t kMaxNoteLineBytes = 200;
 
 /// @brief What a viewer tells its sender, in words for a person to read
 ///        (@ref StreamClient::send_note, @ref StreamServer::newest_note). grid
-///        reads no word of it.
+///        reads no word of it, nor checks its UTF-8.
 struct ViewerNote {
   /// How the line reads. A value a reader does not know reads Neutral.
   enum class Tone : std::uint8_t { Neutral = 0, Good = 1, Caution = 2 };
@@ -247,10 +247,10 @@ class VGRID_NETWORKING_API StreamServer {
   /// one after is refused; @ref add_viewer meanwhile and after is refused,
   /// its socket closed. Later calls do nothing.
   ///
-  /// With @ref ServerOptions::read_notes, a note that lands as a viewer's
-  /// socket closes can reset it, so that viewer may lose the last records, at
-  /// most about 128 KiB plus what is in flight (a file the sender writes keeps
-  /// them), and its connection still ends once.
+  /// A note that lands as a viewer's socket closes, read or not, can reset it,
+  /// so that viewer may lose the last records, at most about 128 KiB plus what
+  /// is in flight (a file the sender writes keeps them), and its connection
+  /// still ends once.
   void finish() noexcept;
 
   /// @return The port listened on: the one asked for, or the one taken for
