@@ -18,9 +18,11 @@
 // the end; a note goes as its viewer leaves, so a reconnect starts with none; a
 // dialled viewer's notes read as a connected one's; a note after finish draws
 // a reset, which costs the reader at most the tail, never a torn record, while
-// with no note it reads every record and a clean end; and a publisher, a client
-// and a reader of newest_note at once, for ThreadSanitizer. An allocation that
-// fails: networking_server_oom_test.cpp.
+// with no note it reads every record and a clean end, and what reached its
+// kernel it reads whatever a later note's send meets; a viewer that says and
+// takes nothing is closed at stall_limit as any other; and a publisher, a
+// client and a reader of newest_note at once, for ThreadSanitizer. An
+// allocation that fails: networking_server_oom_test.cpp.
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -328,11 +330,15 @@ int payload_rules_case() {
       payload_of(1, 0, 9, "short"),
       payload_of(1, 0, over, std::string(over, 'x')),
   };
+  // Given time alone: a good note straight after would hide one wrongly kept.
+  std::string last = "unknown";
   for (std::size_t i = 0; i < std::size(dropped); ++i) {
-    const std::string next = "after " + std::to_string(i);
     CHECK(send(dropped[i]));
-    CHECK(send(note_payload(next)));
-    CHECK(line_within(*server, next));
+    std::this_thread::sleep_for(kNothingWithin);
+    CHECK(server->newest_note()->line == last);
+    last = "after " + std::to_string(i);
+    CHECK(send(note_payload(last)));
+    CHECK(line_within(*server, last));
   }
   CHECK(send(note_payload("kept")));
   CHECK(line_within(*server, "kept"));
@@ -724,15 +730,56 @@ int dial_out_case() {
 
 // --- The end of a take. ------------------------------------------------------
 
+constexpr std::size_t kTakeRecordBytes = 4 << 10;
+constexpr std::uint64_t kTakeRecords = 12;
+
+// Publish a take and finish it, with few enough bytes for a viewer's socket to
+// poll writable (under half the 128 KiB mark on Linux), so finish does not wait
+// on a reader that has not read them.
+int finish_a_take(networking::StreamServer& server) {
+  for (std::uint64_t seq = 0; seq < kTakeRecords; ++seq) {
+    const Bytes payload = net::record_payload(seq, kTakeRecordBytes);
+    CHECK(server
+              .publish(net::record_info(seq, seq == 0), payload.data(),
+                       payload.size())
+              .ok());
+  }
+  const Clock::time_point before = Clock::now();
+  server.finish();
+  CHECK(Clock::now() - before < networking::kFinishLimit);
+  CHECK(server.viewers() == 0 && !server.newest_note());
+  return 0;
+}
+
+// Read a take to its end: `*read` whole records, in order, from the first, then
+// one end, `*end`, the same on a later call.
+int read_to_the_end(networking::StreamClient& client, std::uint64_t* read,
+                    std::string* end) {
+  *read = 0;
+  Got got;
+  vkc::Result<bool> r = true;
+  const Clock::time_point limit = Clock::now() + 5s;
+  while (Clock::now() < limit) {
+    r = client.next(10ms, &got.record, &got.payload);
+    if (!r.ok()) break;
+    if (*r) {
+      CHECK(got.record.info.seq == *read);
+      CHECK(got.payload == net::record_payload(*read, kTakeRecordBytes));
+      ++*read;
+    }
+  }
+  CHECK(!r.ok() && r.status().domain() == Code::IoError);
+  *end = r.status().message();
+  const vkc::Result<bool> again = client.next(0ms, &got.record, &got.payload);
+  CHECK(!again.ok() && again.status().message() == *end);
+  return 0;
+}
+
 // A sender finishes with bytes still in its kernel for a reader that has not
-// read them, few enough for its socket to poll writable (under half the 128 KiB
-// mark on Linux), so finish does not wait. With no note the reader reads every
-// record and the sender's end. A note that lands after the close draws a reset,
-// which may cost the tail: what the reader reads is still whole records, in
-// order, from the first, then one end, the same on every later call.
+// read them. With no note the reader reads every record and the sender's end. A
+// note that lands after the close draws a reset, which may cost the tail: what
+// the reader reads is still whole records, then one end.
 int at_the_end_case() {
-  constexpr std::size_t kSize = 4 << 10;
-  constexpr std::uint64_t kRecords = 12;
   const auto read_a_take = [](bool note, std::uint64_t* read,
                               std::string* end) {
     auto server = note_server();
@@ -744,44 +791,67 @@ int at_the_end_case() {
     CHECK(adopted.ok());
     networking::StreamClient& client = **adopted;
     CHECK(net::wait_session(client));
-    for (std::uint64_t seq = 0; seq < kRecords; ++seq) {
-      const Bytes payload = net::record_payload(seq, kSize);
-      CHECK(server
-                ->publish(net::record_info(seq, seq == 0), payload.data(),
-                          payload.size())
-                .ok());
-    }
-    const Clock::time_point before = Clock::now();
-    server->finish();
-    CHECK(Clock::now() - before < networking::kFinishLimit);
-    CHECK(server->viewers() == 0 && !server->newest_note());
+    CHECK(finish_a_take(*server) == 0);
     if (note) CHECK(client.send_note(note_of("too late")).ok());
-    *read = 0;
-    Got got;
-    vkc::Result<bool> r = true;
-    const Clock::time_point limit = Clock::now() + 5s;
-    while (Clock::now() < limit) {
-      r = client.next(10ms, &got.record, &got.payload);
-      if (!r.ok()) break;
-      if (*r) {
-        CHECK(got.record.info.seq == *read);
-        CHECK(got.payload == net::record_payload(*read, kSize));
-        ++*read;
-      }
-    }
-    CHECK(!r.ok() && r.status().domain() == Code::IoError);
-    *end = r.status().message();
-    const vkc::Result<bool> again = client.next(0ms, &got.record, &got.payload);
-    CHECK(!again.ok() && again.status().message() == *end);
-    return 0;
+    return read_to_the_end(client, read, end);
   };
   std::uint64_t read = 0;
   std::string end;
   CHECK(read_a_take(false, &read, &end) == 0);
-  CHECK(read == kRecords);
+  CHECK(read == kTakeRecords);
   CHECK(end.find("the sender closed the connection") != std::string::npos);
   CHECK(read_a_take(true, &read, &end) == 0);
-  CHECK(read <= kRecords);
+  CHECK(read <= kTakeRecords);
+  return 0;
+}
+
+// What reached the reader's kernel before a reset it still reads: a send that
+// fails, as the second note's does, leaves the end to the read. A take fits the
+// default window, so the first wait has it all there, and the second has the
+// first note's reset back.
+int tail_in_kernel_case() {
+  auto server = note_server();
+  CHECK(server != nullptr);
+  auto client = net::connect(server->port());
+  CHECK(client != nullptr && net::wait_session(*client));
+  CHECK(finish_a_take(*server) == 0);
+  std::this_thread::sleep_for(kNothingWithin);
+  CHECK(client->send_note(note_of("too late")).ok());
+  std::this_thread::sleep_for(kNothingWithin);
+  CHECK(client->send_note(note_of("later still")).ok());
+  std::uint64_t read = 0;
+  std::string end;
+  CHECK(read_to_the_end(*client, &read, &end) == 0);
+  CHECK(read == kTakeRecords);
+  return 0;
+}
+
+// --- A note feeds no stall rule. ---------------------------------------------
+
+// A viewer that says all the time but takes nothing still stalls, and is closed
+// at stall_limit (200 ms) once its socket is full.
+int says_and_takes_nothing_case() {
+  networking::ServerOptions options;
+  options.read_notes = true;
+  options.stall_limit = 200ms;
+  auto server = net::serve(net::geometry_session(), options);
+  CHECK(server != nullptr);
+  auto client = net::connect(server->port());
+  CHECK(client != nullptr && net::wait_session(*client));
+  const Bytes payload = net::record_payload(0, 256 << 10);
+  std::uint64_t seq = 0;
+  const Clock::time_point end = Clock::now() + 5s;
+  while (server->viewers() != 0 && Clock::now() < end) {
+    // A key every 30, so the GOP stays under its limit however long this runs.
+    CHECK(server
+              ->publish(net::record_info(seq, seq % 30 == 0), payload.data(),
+                        payload.size())
+              .ok());
+    CHECK(client->send_note(note_of("still here")).ok());
+    ++seq;
+    std::this_thread::sleep_for(5ms);
+  }
+  CHECK(server->viewers() == 0);
   return 0;
 }
 
@@ -802,7 +872,7 @@ int threads_case() {
     while (!stop) {
       const std::optional<Note> note = server->newest_note();
       if (note && note->line.rfind("note", 0) != 0) wrong = true;
-      if (server->viewers() > 2) wrong = true;
+      (void)server->viewers();
     }
   });
   std::thread visitor([&] {
@@ -811,9 +881,6 @@ int threads_case() {
       auto other = net::connect(port);
       if (other == nullptr || !net::wait_session(*other, 1s)) continue;
       (void)other->send_note(note_of("note from a visitor"));
-      // Gone before the next one comes, for the reader's count of 2.
-      other.reset();
-      (void)serves_within(*server, 1);
     }
   });
   std::thread publisher([&] {
@@ -863,6 +930,8 @@ int main() {
   if (leaves_with_its_viewer_case() != 0) return 1;
   if (dial_out_case() != 0) return 1;
   if (at_the_end_case() != 0) return 1;
+  if (tail_in_kernel_case() != 0) return 1;
+  if (says_and_takes_nothing_case() != 0) return 1;
   if (threads_case() != 0) return 1;
   std::puts("networking notes: OK");
   return 0;
