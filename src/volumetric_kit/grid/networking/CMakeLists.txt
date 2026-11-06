@@ -19,8 +19,8 @@ set(_vgrid_networking_generated_inc
 add_library(grid_networking)
 add_library(volumetric_kit::grid_networking ALIAS grid_networking)
 
-target_sources(grid_networking PRIVATE gop_log.cpp stream_client.cpp
-                                       stream_server.cpp)
+target_sources(grid_networking PRIVATE gop_log.cpp note_wire.cpp
+                                       stream_client.cpp stream_server.cpp)
 
 generate_export_header(
   grid_networking

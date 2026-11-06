@@ -229,7 +229,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   kind 2 is Audio, in version 0. *Amended 2026-11-02:* kinds 3 and 4 are a
   sensor's RGB-D frames, in version 0, and a payload takes three runs.
   *Amended 2026-11-05:* the session header may hold the world's up, in
-  version 0.
+  version 0. *Amended 2026-11-05 again:* kind 5 is a viewer's notes, in
+  version 0, never in a file.
 - [**2026-10-12**](#2026-10-12--p-frames-are-frame-type-1-of-v3-each-reference-block-gets-a-mode-in-update-segments-new-blocks-follow-in-intra-segments-and-a-reference-section-names-the-reference-by-xxh64-of-its-bytes-experimental-until-golden-p-frames-freeze-it) —
   P-frames are frame type 1 of v3: a mode per reference block in update
   segments, new blocks in intra segments, the reference named by XXH64 of its
@@ -348,6 +349,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   destructor still closes at once. *Amended 2026-11-01:* `draining()`
   counts the viewers still sending the newest key's records. *Amended
   2026-11-02:* a sender may dial its reader, which listens, instead.
+  *Amended 2026-11-05:* a viewer may send notes up its socket, which a sender
+  reads only with `read_notes`.
 - [**2026-10-21**](#2026-10-21--meshintegrator-finds-each-voxels-nearest-triangle-with-an-exact-early-exit-a-triangle-is-ruled-out-only-by-a-lower-bound-less-a-rounding-margin-of-its-own-strictly-above-the-voxels-limit) —
   `MeshIntegrator` finds each voxel's nearest triangle with an exact early
   exit: a workgroup per block sorts its bin by a lower bound, and a triangle
@@ -530,6 +533,12 @@ entries relevant to your task; later amendments supersede earlier rules.
   version 0, written only when known, so a session without one writes the old
   bytes and an old reader ignores it. It is a direction, not an axis code. A
   placed mesh's session states +Y.
+- [**2026-11-05**](#2026-11-05--a-viewer-may-tell-its-sender-one-line-up-the-socket-it-reads-from-a-note-track-of-vrst-chunks-the-newest-kept-off-by-default-and-no-failure-reading-it-reaches-the-stream-amends-the-2026-10-12-container-and-2026-10-21-networking-entries) —
+  A viewer may tell its sender one line, up the socket it reads from: a `Note`
+  track of `.vrst` chunks through the public encoder and parser, in words grid
+  does not read. The sender keeps the newest, off by default, and no failure
+  reading one reaches the stream. A note landing as a socket closes can reset
+  it, which costs the reader's copy the tail: accepted.
 
 ## Decision record
 
@@ -5573,6 +5582,9 @@ takes three runs.
 *Amended 2026-11-05 (the world's up entry, below):* the session header may
 hold the world's up, a trailing field in version 0 (H = 72).
 
+*Amended 2026-11-05 (the notes entry, below):* kind 5 is `Note`, a viewer's
+line up its socket, in version 0 and never in a file.
+
 A recording holds tracks of several kinds, each on its own clock, the rig's
 calibration, and per record a pts, a sequence number, a capture set and
 whether decoding can start there. It must read up to its last whole record
@@ -7176,7 +7188,8 @@ replaying a recording, sends; the player reads.
   every reader takes. Each chunk carries H, B and both CRCs, so there is no
   framing of our own, and a viewer could save its bytes as a `.vrst`. The
   viewer sends nothing yet; a WebSocket would carry the same chunks, one a
-  message.
+  message. *Amended 2026-11-05 (the notes entry, below):* a viewer may send
+  notes, made and read the same way; a sender reads them only when asked.
 - **Newest key wins.** A viewer that falls behind must lose records, but a
   P-frame lost alone breaks every frame to the next key. So the server keeps
   one GOP, and a viewer skips the unsent rest of it only once a newer key
@@ -9411,3 +9424,78 @@ NaN, infinity, lengths 2 and 0.5, and a length of 1e-30, since unknown is
 exact zeros only. The tolerance is pinned by 1.00009 taken and 1.00011 refused.
 Three planted bugs fail them: H = 56 always, H = 72 always, and the up read
 from an H of 64.
+
+### 2026-11-05 — A viewer may tell its sender one line, up the socket it reads from: a `Note` track of `.vrst` chunks, the newest kept, off by default, and no failure reading it reaches the stream (amends the 2026-10-12 container and 2026-10-21 networking entries).
+
+A reader does work whose state the person at a sender wants to see, and a
+sender that dials out listens on nothing, so the socket it opened is the only
+way back. grid carries one line of plain words with a tone and reads no word
+of it; which words, and how they show, are its callers'.
+`networking/stream_server.hpp` and `stream_client.hpp` hold the contract,
+DESIGN.md the behaviour.
+
+**The wire is the file, both ways.** A viewer sends a small `.vrst` stream,
+made by `ChunkEncoder` and read by `ChunkParser`, so nothing is framed twice:
+104 bytes once a connection, then 80 bytes for a line of 16, at about one a
+second. It grows by the world's up entry's rule: a later field goes after the
+line, and a new meaning takes another kind, whose records a reader skips.
+Rejected:
+
+- A chunk of its own and a parser for it: a second copy of the framing and the
+  CRCs, in a tier that cannot reach the stream tier's private chunk code.
+- A second port, or the sender listening: one that dials out listens on nothing
+  by design, and a second port has to cross the VPN.
+- Typed state (an enum, counts): copies of the state across repositories, and a
+  sender built earlier cannot show a state added later. The cost is that a
+  sender can only show a note, not act on it.
+- A version byte: an old reader would refuse the next version.
+- Reading the socket apart from the viewer's thread: it would race that thread
+  for the bytes.
+- A queue: only the newest line is worth showing.
+
+**Off by default.** A sender that listens takes bytes from any host that reaches
+its port, so `read_notes` false keeps the read loop's drop, and any such host
+can post nothing. The wire down is the same either way.
+
+**Nothing reaches the stream.** An exception out of a viewer's send loop ends
+that viewer, so the read has a catch of its own and `feed` is `noexcept`.
+`newest_note` is `noexcept`, for a caller's UI thread. `send_note` never waits,
+and a failed send leaves the connection's end to the read that reports it. The
+stall rule counts only what a viewer takes, so a note neither feeds nor starves
+it.
+
+**Dropped or ended.** A well-framed note that cannot be read is dropped and the
+next is read: its CRC says it came as it was sent, so it is a writer's bug or a
+later format, and neither is worth the later notes. A chunk that fails a check
+ends that viewer's notes, as nothing resyncs, and so do 8 KiB with no whole
+record, which bound what the parser holds.
+
+**One cost, accepted.** A viewer that never sends made every close a clean end.
+A note unread at the close, or landing after it, draws a reset, and the sender's
+kernel drops what it still held. Measured on loopback with plain sockets, macOS
+and Linux both lose the tail in both cases, and with neither they lose nothing.
+Through this server and client, a note just after `finish` cost a reader 49 KB
+of 128 records of 16 KiB and 66 KB of 32 of 64 KiB on macOS, and at most 16 KB
+on Linux, always whole records from the first. A viewer closes only once its
+socket polls writable, so what is unsent then is under the 128 KiB mark (half
+that on Linux, whose poll counts it double); the rest of the bound is what is in
+flight. The reader reads a reset on macOS and the sender's close on Linux, once
+either way, so a caller that counts failures counts one. Accepted, rather than
+draining the socket before each close: a sender that writes a file keeps those
+records, and a note about once a second rarely meets the moments the tail takes
+to drain.
+
+**Nagle.** A reader's socket is not set up to send, so a note can wait for the
+next acknowledgement: about 100 ms at worst behind a 10 Hz stream. No option is
+added, since `set_up_sender` also sets the low-water mark and BBR.
+
+**Verification.** Apple M5 Max and Linux x86-64, Release with warnings as
+errors, and ThreadSanitizer on macOS. `grid_networking_notes` covers arrival, a
+burst, a note a byte at a time, the bytes up, each payload rule, eight kinds of
+bad bytes with the stream checked after each, `read_notes` off, the wire down
+byte for byte with notes flowing, a full socket, the connect and the end, a
+viewer leaving, a dialled viewer, the end of a take, and threads.
+`grid_networking_server_oom` fails `newest_note`'s and `send_note`'s allocations,
+and the reader's alone, as a test cannot arm a viewer's thread. Three planted
+bugs fail them: `read_notes` ignored, a bad note ending the viewer, and
+`send_note` waiting on a full socket.

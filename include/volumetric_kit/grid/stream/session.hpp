@@ -152,6 +152,12 @@ enum class TrackKind : std::uint16_t {
   /// anchors the GOP, so a live session serves one sensor's colour; each
   /// frame's colour record comes before its depth record.
   RgbdColor = 4,
+  /// What a viewer tells its sender, up the socket it reads the session from
+  /// (`networking::StreamClient::send_note`); never in a file. Every record is
+  /// a key, its pts 0. Its payload: `u8` tone (0 neutral, 1 good, 2 caution;
+  /// another reads neutral), `u8` reserved, `u16` L, L bytes of UTF-8, then
+  /// later fields, which a reader ignores. A new meaning takes another kind.
+  Note = 5,
 };
 
 /// @brief The clock of @ref Track::clock that is the host's

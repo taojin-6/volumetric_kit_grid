@@ -792,7 +792,8 @@ add_test(NAME grid_stream_rgbd_kinds COMMAND grid_stream_rgbd_kinds_test)
 # signals, the client's errors against raw senders, a sender that dials out
 # (add_viewer, adopt, on the core's dial and Listener: an adopted viewer reads
 # what a connected one reads, listen false binds nothing, each refusal, a thread
-# adding viewers while another publishes and finishes), and a stress run in both
+# adding viewers while another publishes and finishes), a viewer's notes up the
+# socket it reads from (networking_notes_test.cpp), and a stress run in both
 # modes for ThreadSanitizer. The socket calls, dial and Listener are the core's
 # net tier, tested there. Host-only.
 set(_vgrid_networking_src
@@ -804,7 +805,7 @@ target_include_directories(grid_networking_gop_log_test
 vgrid_target_warnings(grid_networking_gop_log_test)
 add_test(NAME grid_networking_gop_log COMMAND grid_networking_gop_log_test)
 
-foreach(_vgrid_networking_test server client dial stress)
+foreach(_vgrid_networking_test server client dial notes stress)
   add_executable(grid_networking_${_vgrid_networking_test}_test
                  networking_${_vgrid_networking_test}_test.cpp)
   target_link_libraries(
@@ -826,10 +827,12 @@ foreach(_vgrid_part serve limits finish)
            COMMAND grid_networking_server_test ${_vgrid_part})
 endforeach()
 
-# The dial test dials and listens with the core's net tier itself, which
-# grid_networking links privately; the client test asks it what a raw sender's
-# peer has not yet acknowledged.
+# The dial and notes tests dial and listen with the core's net tier themselves,
+# which grid_networking links privately; the client test asks it what a raw
+# sender's peer has not yet acknowledged.
 target_link_libraries(grid_networking_dial_test
+                      PRIVATE volumetric_kit::core_net)
+target_link_libraries(grid_networking_notes_test
                       PRIVATE volumetric_kit::core_net)
 target_link_libraries(grid_networking_client_test
                       PRIVATE volumetric_kit::core_net)
@@ -840,10 +843,15 @@ target_link_libraries(grid_networking_client_test
                       PRIVATE volumetric_kit::core_test_allocation_failure)
 
 # The server, keys on demand, when a record's copy fails: the viewers it sends
-# back counted before publish returns. Apart from the server's other tests,
-# which link no replaced operator new, so they build under ThreadSanitizer on
-# Linux too.
-add_executable(grid_networking_server_oom_test networking_server_oom_test.cpp)
+# back counted before publish returns; and a viewer's notes when an allocation
+# fails, the note reader internal and unexported, so this compiles its source
+# itself. Apart from the server's other tests, which link no replaced operator
+# new, so they build under ThreadSanitizer on Linux too.
+add_executable(
+  grid_networking_server_oom_test networking_server_oom_test.cpp
+                                  ${_vgrid_networking_src}/note_wire.cpp)
+target_include_directories(grid_networking_server_oom_test
+                           PRIVATE ${_vgrid_networking_src})
 target_link_libraries(
   grid_networking_server_oom_test
   PRIVATE volumetric_kit::grid_networking Threads::Threads
@@ -916,6 +924,7 @@ add_dependencies(
   grid_networking_server_oom_test
   grid_networking_client_test
   grid_networking_dial_test
+  grid_networking_notes_test
   grid_networking_stress_test
   grid_example_info_log_test)
 
