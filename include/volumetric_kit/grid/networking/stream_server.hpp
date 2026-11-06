@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "volumetric_kit/core/base/result.hpp"
@@ -26,6 +27,22 @@ inline constexpr std::uint16_t kDefaultPort = 47801;
 /// How long @ref StreamServer::finish lets the viewers take the records
 /// queued for them before it closes the ones still behind: 1 s.
 inline constexpr std::chrono::milliseconds kFinishLimit{1'000};
+
+/// The most bytes of UTF-8 a @ref ViewerNote's line holds.
+inline constexpr std::size_t kMaxNoteLineBytes = 200;
+
+/// @brief What a viewer tells its sender, in words for a person to read
+///        (@ref StreamClient::send_note, @ref StreamServer::newest_note). grid
+///        reads no word of it, nor checks its UTF-8.
+struct ViewerNote {
+  /// How the line reads. A value a reader does not know reads Neutral.
+  enum class Tone : std::uint8_t { Neutral = 0, Good = 1, Caution = 2 };
+  Tone tone = Tone::Neutral;  ///< How the line reads.
+  std::string line;           ///< At most @ref kMaxNoteLineBytes.
+  /// Set by @ref StreamServer: when the read that completed it came. Not on
+  /// the wire.
+  std::chrono::steady_clock::time_point received{};
+};
 
 /// @brief Where and how a @ref StreamServer serves.
 struct ServerOptions {
@@ -68,6 +85,11 @@ struct ServerOptions {
   /// that reaches the sender can connect to it; viewers come only through
   /// @ref StreamServer::add_viewer.
   bool listen = true;
+  /// true: read what viewers send as notes (@ref StreamServer::newest_note).
+  /// A note that cannot be read is dropped, and bytes that cannot be read as
+  /// chunks end the notes from that viewer, logged at Warning; neither ever
+  /// touches its stream. false: what a viewer sends is dropped unread.
+  bool read_notes = false;
 };
 
 /// @brief Serves one session to viewers over TCP as it is recorded: each
@@ -224,6 +246,11 @@ class VGRID_NETWORKING_API StreamServer {
   /// Info. A connection meanwhile is closed at accept, before any byte, and
   /// one after is refused; @ref add_viewer meanwhile and after is refused,
   /// its socket closed. Later calls do nothing.
+  ///
+  /// A note that lands as a viewer's socket closes, read or not, can reset it,
+  /// so that viewer may lose the last records, at most about 128 KiB plus what
+  /// is in flight (a file the sender writes keeps them), and its connection
+  /// still ends once.
   void finish() noexcept;
 
   /// @return The port listened on: the one asked for, or the one taken for
@@ -268,6 +295,17 @@ class VGRID_NETWORKING_API StreamServer {
   ///        @ref ServerOptions::max_viewers never does. Safe from any thread.
   /// @return The count, at most `max_viewers`.
   std::size_t viewers() const noexcept;
+
+  /// @brief The newest note any viewer sent, with
+  ///        @ref ServerOptions::read_notes: one kept, with no queue.
+  ///
+  /// It goes as the viewer that sent it leaves, before @ref viewers stops
+  /// counting that viewer, so a viewer that reconnects has none until it says
+  /// one again. Safe from any thread: a lock of its own, which neither
+  /// @ref publish nor a socket call ever waits on.
+  /// @return The note; none before the first, without `read_notes`, once its
+  ///         viewer has left, or when it cannot be copied.
+  std::optional<ViewerNote> newest_note() const noexcept;
 
  private:
   struct Impl;

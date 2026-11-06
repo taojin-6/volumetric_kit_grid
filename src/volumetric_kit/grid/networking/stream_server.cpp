@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "gop_log.hpp"
+#include "note_wire.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/net/address.hpp"
 #include "volumetric_kit/core/net/socket.hpp"
@@ -31,7 +32,7 @@ using Clock = std::chrono::steady_clock;
 constexpr std::string_view kServer = "StreamServer";
 constexpr std::uint8_t kZeros[8] = {};
 // What a viewer thread reads at a time of the bytes a viewer sends, which it
-// drops.
+// reads as notes or drops.
 constexpr std::size_t kDrainBytes = 4096;
 // The least time between two refusals logged at Warning; the rest go at Debug.
 constexpr std::chrono::seconds kRefusalWarningEvery{10};
@@ -96,6 +97,10 @@ struct StreamServer::Impl {
   // until the viewer leaves, fails or stalls, has every record once
   // finishing, or the server stops: why.
   std::string send_all(Viewer& viewer);
+  // With read_notes, take what `viewer` sent, keeping a note it completes, and
+  // say so if `reader` ends: no failure here reaches the viewer's stream.
+  void take_notes(const Viewer& viewer, detail::NoteReader& reader,
+                  const std::uint8_t* bytes, std::size_t size) noexcept;
   // Publish the log's count of the viewers that wanted a key. Under the
   // mutex.
   void count_key_wanted() noexcept { key_wanted = log.key_wanted(); }
@@ -134,6 +139,12 @@ struct StreamServer::Impl {
   // The accept thread's: when a refusal was last logged at Warning.
   std::optional<Clock::time_point> refusal_warned;
   std::thread acceptor;
+
+  // Held only to move or copy the newest note, never with another lock or
+  // over a socket call; publish never takes it.
+  std::mutex notes_mutex;
+  std::optional<ViewerNote> newest_note;  // under notes_mutex
+  const Viewer* newest_from = nullptr;    // under notes_mutex: its sender
 };
 
 void StreamServer::Impl::accept_loop() noexcept {
@@ -272,6 +283,13 @@ void StreamServer::Impl::serve(Viewer& viewer) noexcept {
   }
   viewer.fd.reset();
   {
+    const std::lock_guard<std::mutex> lock(notes_mutex);
+    if (newest_from == &viewer) {
+      newest_note.reset();
+      newest_from = nullptr;
+    }
+  }
+  {
     const std::lock_guard<std::mutex> lock(mutex);
     log.leave(&viewer.cursor);
     viewer.done = true;
@@ -281,6 +299,28 @@ void StreamServer::Impl::serve(Viewer& viewer) noexcept {
   try {
     log_at(core::LogLevel::Info,
            std::string(kServer) + ": viewer " + viewer.name + " " + why);
+  } catch (...) {
+  }
+}
+
+void StreamServer::Impl::take_notes(const Viewer& viewer,
+                                    detail::NoteReader& reader,
+                                    const std::uint8_t* bytes,
+                                    std::size_t size) noexcept {
+  if (!options.read_notes || reader.ended()) return;
+  try {
+    std::optional<ViewerNote> note = reader.feed(bytes, size);
+    if (note) {
+      note->received = Clock::now();
+      const std::lock_guard<std::mutex> lock(notes_mutex);
+      newest_note = std::move(note);
+      newest_from = &viewer;
+    }
+    if (reader.ended()) {
+      log_at(core::LogLevel::Warning,
+             std::string(kServer) + ": viewer " + viewer.name +
+                 ": its notes end, its stream goes on: " + reader.why());
+    }
   } catch (...) {
   }
 }
@@ -299,6 +339,7 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
   std::uint64_t written = 0;  // the bytes sent on the socket
   std::uint64_t taken = 0;    // of them, the ones the viewer acknowledged
   std::uint8_t drain[kDrainBytes];
+  detail::NoteReader notes;
   for (;;) {
     if (stop) {
       return finishing ? "closed: still behind " +
@@ -310,11 +351,12 @@ std::string StreamServer::Impl::send_all(Viewer& viewer) {
         net::wait_for(api, fd, POLLIN | POLLOUT, net::kPollSlice);
     if (!ready.ok()) return "failed: " + ready.status().message();
     if ((*ready & (POLLIN | POLLHUP | POLLERR)) != 0) {
-      // What a viewer sends is dropped; its end ends it.
+      // What a viewer sends is read as notes or dropped; its end ends it.
       const core::Result<net::Received> got =
           net::receive_some(api, fd, drain, sizeof drain);
       if (!got.ok()) return "failed: " + got.status().message();
       if (got->closed) return "left";
+      take_notes(viewer, notes, drain, got->bytes);
     }
     if ((*ready & POLLOUT) == 0) {
       // Under the low-water mark the socket polls writable, so this one
@@ -605,6 +647,15 @@ std::size_t StreamServer::draining() const noexcept {
 
 std::size_t StreamServer::viewers() const noexcept {
   return impl_->live.load();
+}
+
+std::optional<ViewerNote> StreamServer::newest_note() const noexcept {
+  try {
+    const std::lock_guard<std::mutex> lock(impl_->notes_mutex);
+    return impl_->newest_note;
+  } catch (...) {
+    return std::nullopt;
+  }
 }
 
 }  // namespace volumetric_kit::grid::networking

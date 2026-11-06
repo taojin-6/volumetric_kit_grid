@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-05
+
+### Added
+
+- **A viewer's notes**: `networking::ViewerNote` (a tone and a line of at most
+  `kMaxNoteLineBytes`, 200 bytes), `StreamClient::send_note`,
+  `ServerOptions::read_notes` and `StreamServer::newest_note`. A viewer tells
+  its sender one short line up the socket it reads from, as a small `.vrst`
+  stream of the new `stream::TrackKind::Note`, which never reaches a file.
+  `send_note` never waits, the newest wins, and no failure reading a note
+  touches the stream. `read_notes` is off by default, which reads and drops
+  what a viewer sends as ever, and a viewer that sends no note sends nothing.
+  The wire down is unchanged either way. A note landing as a socket closes, read
+  or not, can cost that viewer the last records (`StreamServer::finish`; the
+  2026-11-05 notes entry in DECISIONS.md).
+
 ## [0.14.0] - 2026-11-05
 
 ### Added

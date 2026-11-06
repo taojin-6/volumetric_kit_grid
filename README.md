@@ -201,7 +201,9 @@ serves the socket with `StreamServer::add_viewer`; the reader listens on
 one numeric address with `core::net::Listener` and reads each connection
 with `StreamClient::adopt`. A target that calls them links
 `volumetric_kit::core_net` itself. The stream is plain TCP, so it belongs
-inside a VPN.
+inside a VPN. A reader may tell such a sender one short line up that socket
+(`StreamClient::send_note`), which a sender reads with
+`ServerOptions::read_notes` and `StreamServer::newest_note`.
 
 On Linux a viewer that is not on loopback gets BBR congestion control if
 the sender's kernel lists it as allowed; a sender that prints `viewers keep

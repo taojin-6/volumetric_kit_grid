@@ -15,7 +15,7 @@
 #include "volumetric_kit/core/base/result.hpp"
 #include "volumetric_kit/core/base/unique_fd.hpp"
 #include "volumetric_kit/grid/networking/export.hpp"
-#include "volumetric_kit/grid/networking/stream_server.hpp"  // kDefaultPort
+#include "volumetric_kit/grid/networking/stream_server.hpp"  // kDefaultPort, ViewerNote
 #include "volumetric_kit/grid/stream/session.hpp"
 #include "volumetric_kit/grid/stream/stream_reader.hpp"
 
@@ -195,6 +195,25 @@ class VGRID_NETWORKING_API StreamClient {
   ///         as @ref next returns it.
   core::Status read(const stream::Record& record, std::uint8_t* dst,
                     std::size_t capacity);
+
+  /// @brief Tell the sender @p note, up this connection, never waiting on the
+  ///        socket.
+  ///
+  /// Newest wins: a note not begun is replaced, and one under way is finished
+  /// first, what the socket would not take going at the next call of this or
+  /// @ref next. Nothing goes up before the first note. The rate is the
+  /// caller's, made for about one a second. A sender drops it unread without
+  /// @ref ServerOptions::read_notes, as every sender before grid 0.15.0 does.
+  /// One that lands as the sender closes can cost this client the last records
+  /// (@ref StreamServer::finish). A client is one connection, so a caller that
+  /// reconnects says its newest note again on the new client.
+  /// @param note  Its tone and line; its `received` is not sent.
+  /// @return OK, also before the connection is made (sent once it is) and
+  ///         after it ended, which @ref next reports;
+  ///         `Status::Code::InvalidArgument` for a line over
+  ///         @ref kMaxNoteLineBytes; `Status::Code::OutOfMemory` when the note
+  ///         cannot be framed. Neither refusal touches the connection.
+  core::Status send_note(const ViewerNote& note);
 
  private:
   struct Impl;

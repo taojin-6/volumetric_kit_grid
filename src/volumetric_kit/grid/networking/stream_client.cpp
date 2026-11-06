@@ -13,6 +13,7 @@
 #include <thread>
 #include <utility>
 
+#include "note_wire.hpp"
 #include "volumetric_kit/core/base/check.hpp"
 #include "volumetric_kit/core/base/exception_status.hpp"
 #include "volumetric_kit/core/net/address.hpp"
@@ -65,6 +66,13 @@ struct StreamClient::Impl {
   core::Status idle_failure() const;
   // Close the connection and save `status`, which every later call returns.
   core::Status fail(core::Status status);
+  // Frame `note` as the next chunk up, in place of one not begun, with the
+  // session's chunk before the first. Throws what an allocation throws, with
+  // the note it would have replaced kept.
+  core::Status frame_note(const ViewerNote& note);
+  // Send what the socket takes now of the chunks up, once connected. A failed
+  // send leaves them, and the connection's end to the read that reports it.
+  void send_up() noexcept;
 
   const ClientOptions options;
   const std::string name;          // "host:port"
@@ -79,6 +87,13 @@ struct StreamClient::Impl {
   stream::ChunkParser parser;
   std::vector<std::uint8_t> buffer;  // what a receive reads into
   core::Status failure;
+  // What goes up, framed for the first note on: the chunk under way and its
+  // bytes sent, then the newest note's chunk, not begun.
+  std::optional<stream::ChunkEncoder> up;
+  std::uint64_t up_seq = 0;
+  std::vector<std::uint8_t> up_now;
+  std::size_t up_sent = 0;
+  std::vector<std::uint8_t> up_next;
 };
 
 core::Result<bool> StreamClient::Impl::step(Clock::time_point deadline) {
@@ -160,6 +175,47 @@ core::Status StreamClient::Impl::fail(core::Status status) {
   fd.reset();
   failure = std::move(status);
   return failure;
+}
+
+core::Status StreamClient::Impl::frame_note(const ViewerNote& note) {
+  if (!up) {
+    stream::Session session;
+    session.writer = "viewer";
+    stream::Track track;
+    track.kind = stream::TrackKind::Note;
+    session.tracks.push_back(std::move(track));
+    VKC_ASSIGN(stream::ChunkEncoder encoder,
+               stream::ChunkEncoder::create(session));
+    std::vector<std::uint8_t> session_chunk = encoder.session_chunk();
+    up = std::move(encoder);
+    up_now = std::move(session_chunk);
+  }
+  const std::vector<std::uint8_t> payload = detail::encode_note(note);
+  stream::RecordInfo info;
+  info.key = true;
+  info.seq = up_seq++;  // a seq that a failure below skips is no harm
+  VKC_ASSIGN(const stream::ChunkEncoder::RecordFraming framing,
+             up->frame(info, payload.data(), payload.size()));
+  std::vector<std::uint8_t> chunk(framing.header.begin(), framing.header.end());
+  chunk.insert(chunk.end(), payload.begin(), payload.end());
+  chunk.resize(chunk.size() + framing.padding);
+  up_next = std::move(chunk);
+  return {};
+}
+
+void StreamClient::Impl::send_up() noexcept {
+  while (connected && fd.valid()) {
+    if (up_sent == up_now.size()) {
+      if (up_next.empty()) return;
+      up_now.swap(up_next);
+      up_next.clear();
+      up_sent = 0;
+    }
+    const core::Result<std::size_t> n = net::send_some(
+        api, fd.get(), up_now.data() + up_sent, up_now.size() - up_sent);
+    if (!n.ok() || *n == 0) return;
+    up_sent += *n;
+  }
 }
 
 StreamClient::StreamClient(std::unique_ptr<Impl> impl) noexcept
@@ -269,6 +325,7 @@ core::Result<bool> StreamClient::next(std::chrono::milliseconds wait,
     // connect's end or bytes. The deadline ends the loop, though bytes keep
     // coming, and the parser keeps a part chunk for the next call.
     for (bool stepped = false, moved = false;; stepped = true) {
+      s.send_up();
       core::Result<bool> got = s.parser.next(record, payload);
       if (!got.ok()) return s.fail(std::move(got).status().with_context(s.api));
       if (*got) {
@@ -303,6 +360,25 @@ core::Status StreamClient::read(const stream::Record& record, std::uint8_t* dst,
   // A refusal leaves the record held and the connection open: the caller's
   // to correct.
   return s.parser.read(record, dst, capacity);
+}
+
+core::Status StreamClient::send_note(const ViewerNote& note) {
+  constexpr std::string_view kApi = "StreamClient::send_note";
+  Impl& s = *impl_;
+  try {
+    if (note.line.size() > kMaxNoteLineBytes) {
+      return core::Status::invalid_argument(
+          std::string(kApi) + ": a line of " +
+          std::to_string(note.line.size()) + " bytes, above the " +
+          std::to_string(kMaxNoteLineBytes) + " a note holds");
+    }
+    if (!s.failure.ok()) return {};
+    VKC_TRY(s.frame_note(note).with_context(kApi));
+    s.send_up();
+    return {};
+  } catch (...) {
+    return core::exception_status(kApi, core::Status::Code::OutOfMemory);
+  }
 }
 
 }  // namespace volumetric_kit::grid::networking

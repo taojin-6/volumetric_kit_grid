@@ -1037,8 +1037,9 @@ with a key in 30 records or 14 ms with every record a key (a 27.6 MB index).
 2026-10-21 entry). The wire is the file: the `VRST` chunk, then `RECD`
 chunks as `StreamWriter` writes them, made by `ChunkEncoder` and read by
 `ChunkParser`, with no footer and no framing of its own. A viewer sends
-nothing; the server reads and drops what one does send, and closes on its
-end. The port is 47801 (`kDefaultPort`).
+nothing but notes (below); without `read_notes` the server reads and drops
+what one does send, and it closes on its end. The port is 47801
+(`kDefaultPort`).
 
 **Serving** (`StreamServer`). `start` listens on a numeric IPv4 address, or
 every interface, and starts an accept thread; one thread per viewer sends,
@@ -1110,6 +1111,29 @@ server's too), and `StreamClient::adopt` reads it as a connected client is
 read, named by its peer, with no lookup or connect. One reset after it was
 taken fails at `adopt`, and the reader takes the next. The wire is
 unchanged.
+
+**Notes** (the 2026-11-05 notes entry). A viewer may tell its sender one
+short line for a person to read, with a tone, up the socket it reads from.
+`send_note` makes a small `.vrst` stream with `ChunkEncoder`: with the first
+note, a `VRST` chunk of writer `viewer` and one `Note` track (104 bytes), then
+a key `RECD` of pts 0 a note (60 bytes and the line, rounded up to 8); a client
+that says nothing sends nothing. It never waits: what the socket would not take
+goes at the next `send_note` or `next`, a chunk under way finishes first, and a
+newer note replaces one not begun. A failed send changes nothing, and the read
+reports the connection's end. With `read_notes`, a viewer's thread feeds what
+it receives, 4 KiB a pass, to a `ChunkParser` of its own and keeps the newest
+note of any viewer, one slot under a lock of its own that `publish` never takes.
+The note goes as its viewer leaves, before `viewers()` stops counting it, so no
+stale line outlives a connection and a viewer that reconnects says its line
+again. A record of another kind is skipped, and a note too short for what it
+says or with a line past `kMaxNoteLineBytes` (200) is dropped. A chunk that
+fails a check, 8 KiB with no whole record or a failed allocation ends that
+viewer's notes, logged at Warning, as nothing resyncs, and its later bytes are
+dropped. None of it reaches the stream: the read has no failure path to the
+viewer, and the stall rule counts only what a viewer takes. Without
+`read_notes`, the default, no host that reaches the port can post anything.
+`finish`'s doc states the one cost, a note landing as a socket closes, read or
+not.
 
 **Finishing** (the 2026-10-30 finish entry). `finish` ends the stream
 without losing its tail: later records are refused, a connection is closed
