@@ -811,6 +811,9 @@ int threads_case() {
       auto other = net::connect(port);
       if (other == nullptr || !net::wait_session(*other, 1s)) continue;
       (void)other->send_note(note_of("note from a visitor"));
+      // Gone before the next one comes, for the reader's count of 2.
+      other.reset();
+      (void)serves_within(*server, 1);
     }
   });
   std::thread publisher([&] {
