@@ -121,7 +121,8 @@ class VGRID_STREAM_API StreamReader {
   /// @return The reader; `Status::Code::InvalidArgument` for an empty path or
   ///         one with a NUL, something other than a regular file, a file
   ///         under 56 bytes or without the `VRST` magic, or a session header
-  ///         out of range, failing a CRC or unparsable;
+  ///         out of range, failing a CRC, holding an up @ref Session::up does
+  ///         not allow or unparsable;
   ///         `Status::Code::Unsupported` for a session header of another
   ///         version or setting a flag; `Status::Code::NotFound` when the
   ///         file or its directory does not exist; otherwise

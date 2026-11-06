@@ -13,12 +13,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -117,6 +119,32 @@ inline Bytes session_fields(std::uint32_t version, std::uint16_t tracks,
   put(f, tracks, 2);
   put(f, flags, 2);
   return f;
+}
+
+// The same with `up` and the reserved word after them: H = 72.
+inline Bytes session_fields(std::uint32_t version, std::uint16_t tracks,
+                            std::uint16_t flags,
+                            const std::array<float, 3>& up) {
+  Bytes f = session_fields(version, tracks, flags);
+  for (const float c : up) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &c, sizeof(bits));
+    put(f, bits, 4);
+  }
+  put(f, 0, 4);
+  return f;
+}
+
+// The ups a session may not hold, each refused by whatever encodes or reads
+// one.
+inline std::array<std::array<float, 3>, 7> bad_ups() {
+  return {{{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f},
+           {0.0f, std::numeric_limits<float>::quiet_NaN(), 0.0f},
+           {std::numeric_limits<float>::infinity(), 0.0f, 0.0f},
+           {0.0f, 0.0f, -std::numeric_limits<float>::infinity()},
+           {0.0f, 0.0f, 2.0f},
+           {0.0f, 0.0f, 0.5f},
+           {1e-30f, 0.0f, 0.0f}}};
 }
 
 // A `VRST` body of one Geometry track per `tracks`, writer "t", no strings
@@ -285,8 +313,10 @@ inline bool same(const stream::Track& a, const stream::Track& b) {
 }
 
 inline bool same(const stream::Session& a, const stream::Session& b) {
-  if (a.id != b.id || a.created_ns != b.created_ns || a.writer != b.writer ||
-      a.calibration != b.calibration || a.tracks.size() != b.tracks.size()) {
+  if (a.id != b.id || a.created_ns != b.created_ns ||
+      std::memcmp(a.up.data(), b.up.data(), sizeof(a.up)) != 0 ||
+      a.writer != b.writer || a.calibration != b.calibration ||
+      a.tracks.size() != b.tracks.size()) {
     return false;
   }
   for (std::size_t i = 0; i < a.tracks.size(); ++i) {

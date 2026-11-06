@@ -116,7 +116,10 @@ inline volumetric_kit::grid::codec_stream::CodecOutputs set_codec_outputs(
 ///         writer @p program and one Geometry track at @p rate, the source's,
 ///         whose params are @p geometry_params, empty or a mesh source's
 ///         `mesh_io::encode_transform` bytes (stream/session.hpp). No session
-///         id or start time, so a rerun writes the same bytes.
+///         id or start time, so a rerun writes the same bytes. A session with
+///         @p geometry_params is in the placed mesh frame, whose up is +Y
+///         (`mesh_io::fit_transform`), and says so (stream::Session::up); the
+///         others leave the up unknown for their caller to set.
 inline volumetric_kit::grid::stream::Session codec_session(
     const std::string& program, volumetric_kit::grid::stream::Rate rate,
     std::string geometry_params = {}) {
@@ -127,6 +130,7 @@ inline volumetric_kit::grid::stream::Session codec_session(
   geometry.params = std::move(geometry_params);
   stream::Session session;
   session.writer = program;
+  if (!geometry.params.empty()) session.up = {0.0f, 1.0f, 0.0f};
   session.tracks.push_back(std::move(geometry));
   return session;
 }

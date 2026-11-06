@@ -228,6 +228,8 @@ entries relevant to your task; later amendments supersede earlier rules.
   chunks are made and read in memory too, publicly. *Amended 2026-10-30:*
   kind 2 is Audio, in version 0. *Amended 2026-11-02:* kinds 3 and 4 are a
   sensor's RGB-D frames, in version 0, and a payload takes three runs.
+  *Amended 2026-11-05:* the session header may hold the world's up, in
+  version 0.
 - [**2026-10-12**](#2026-10-12--p-frames-are-frame-type-1-of-v3-each-reference-block-gets-a-mode-in-update-segments-new-blocks-follow-in-intra-segments-and-a-reference-section-names-the-reference-by-xxh64-of-its-bytes-experimental-until-golden-p-frames-freeze-it) —
   P-frames are frame type 1 of v3: a mode per reference block in update
   segments, new blocks in intra segments, the reference named by XXH64 of its
@@ -523,6 +525,11 @@ entries relevant to your task; later amendments supersede earlier rules.
   `MeshSdfParams::full_band_m` writes the band whole only near the zero
   level, plus a one-voxel apron, with the same bytes there; `codec_mesh`
   sets it and codes what it coded before.
+- [**2026-11-05**](#2026-11-05--the-worlds-up-is-a-trailing-field-of-the-vrst-header-in-version-0-sessionup-a-direction-all-zero-when-unknown-amends-the-2026-10-12-container-entry) —
+  The world's up is `Session::up`, a trailing field of the `VRST` header in
+  version 0, written only when known, so a session without one writes the old
+  bytes and an old reader ignores it. It is a direction, not an axis code. A
+  placed mesh's session states +Y.
 
 ## Decision record
 
@@ -5563,6 +5570,9 @@ samples as its params say, in version 0 and with no new record flag.
 wire form, in version 0 and with no new record flag; a record's payload
 takes three runs.
 
+*Amended 2026-11-05 (the world's up entry, below):* the session header may
+hold the world's up, a trailing field in version 0 (H = 72).
+
 A recording holds tracks of several kinds, each on its own clock, the rig's
 calibration, and per record a pts, a sequence number, a capture set and
 whether decoding can start there. It must read up to its last whole record
@@ -9354,3 +9364,50 @@ prune that keeps the dropped blocks' counts. The subgroup builds stay
 SPIR-V 1.5, whose subgroups take the device's `subgroupSize`; a
 `static_assert` on the embedded modules fails a build at 1.6, which would
 let a device run them narrower.
+
+### 2026-11-05 — The world's up is a trailing field of the `VRST` header in version 0, `Session::up`: a direction, all zero when unknown (amends the 2026-10-12 container entry).
+
+A viewer keeps a session's floor at the bottom, and the world's up differs by
+source: +Y for a placed mesh, +Z for a rig's tag world. So the stream names
+it. `stream/session.hpp` holds the layout.
+
+**Where it goes.** A trailing field of the header is the one place a version
+0 reader already ignores, and a `Session` field reaches every writer, server
+and reader with no other code. It is written only when known, with H = 72; a
+session without one writes the H = 56 bytes it always did, so the goldens
+stand. Rejected:
+
+- A body string, a session flag or a version: an older reader refuses each.
+- A Geometry track's params: `decode_transform` refuses another length, and
+  only Geometry tracks have them.
+- `Session::calibration`: the sensor package's document, which a viewer should
+  not parse.
+- A track's reserved word: per track, and too small for a direction.
+
+**A direction, not an axis code.** Every writer today names a signed axis, so
+a code would do, with no tolerance. The direction costs a length tolerance
+and a refusal on both sides. A format cannot take that choice back, and an up
+that is not an axis, such as the normal of a rig's camera plane or a measured
+gravity, then needs no new field. Plain floats, since the stream tier links
+the core's base tier alone.
+
+**A bad up is refused on read**, as a kind of 0 and a `rate_den` of 0 are: the
+CRC rules out damage, so only a buggy writer gets there. On write there is one
+check, in `encode_session`, so the writer, the encoder and the server refuse
+alike.
+
+**The examples.** `codec_session` states +Y when given geometry params: they
+are a placed mesh's transform, and `mesh_io::fit_transform` rotates up to +Y.
+Its signature stays, and any other session's up is its caller's to set.
+
+**Verification.** Apple M5 Max, Release with warnings as errors, under the
+Khronos validation layer. `grid_stream_container` pins a new golden with CRCs
+Python's `zlib.crc32` checked, and the three goldens from before, unchanged,
+read back with no up. `grid_stream_chunks` feeds H = 64 and H = 80 headers, a
+set reserved word and a bad up at H = 72 and 80 to the parser, where another
+version or a flag comes first, `grid_networking_server_serve` carries an up
+over TCP, and the writer, the encoder, the server and the reader each refuse
+NaN, infinity, lengths 2 and 0.5, and a length of 1e-30, since unknown is
+exact zeros only. The tolerance is pinned by 1.00009 taken and 1.00011 refused.
+Three planted bugs fail them: H = 56 always, H = 72 always, and the up read
+from an H of 64.

@@ -61,6 +61,7 @@
 #include <malloc.h>
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -320,6 +321,7 @@ int two_runs_case(const std::string& dir) {
 // offset the file's.
 int round_trip_case(const std::string& dir) {
   stream::Session session = net::geometry_session();
+  session.up = {0.0f, 0.0f, 1.0f};
   session.calibration = "{\"device_calibration\": {}}";
   session.tracks[0].params = "params";
   const std::vector<Published> records = some_records();
@@ -1418,6 +1420,11 @@ int rules_case() {
   stream::Session no_kind = session;
   no_kind.tracks[0].kind = stream::TrackKind{};
   CHECK(start(no_kind, local) == Code::InvalidArgument);
+  for (const std::array<float, 3>& up : vrst::bad_ups()) {
+    stream::Session bad_up = session;
+    bad_up.up = up;
+    CHECK(start(bad_up, local) == Code::InvalidArgument);
+  }
   for (const char* host : {"localhost", "::1", "1.2.3", "256.0.0.1", " "}) {
     networking::ServerOptions named = local;
     named.host = host;

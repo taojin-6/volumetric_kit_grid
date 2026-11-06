@@ -214,6 +214,10 @@ int main() {
   CHECK(session.tracks[0].kind == vgrid::stream::TrackKind::Geometry);
   CHECK(session.tracks[0].rate.num == 30 && session.tracks[0].rate.den == 1);
   CHECK(session.tracks[0].params == "placed");
+  // A placed mesh's world has +Y up, and any other leaves it to its caller.
+  CHECK((session.up == std::array<float, 3>{0.0f, 1.0f, 0.0f}));
+  CHECK((vgrid_example::codec_session("codec_mesh", {30, 1}).up ==
+         std::array<float, 3>{}));
 
   // Both codec profiles: the period as given, and with P-frames the update
   // size as given, core's 0 included, up to the format's longest segment;

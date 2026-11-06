@@ -78,6 +78,7 @@ inline constexpr std::uint32_t kSessionVersion = 0;
 inline constexpr std::uint32_t kMinHeaderBytes = 24;
 inline constexpr std::uint32_t kMaxHeaderBytes = 4096;
 inline constexpr std::uint32_t kSessionHeaderBytes = 56;
+inline constexpr std::uint32_t kSessionUpHeaderBytes = 72;  // with an up
 inline constexpr std::uint32_t kRecordHeaderBytes = 56;
 inline constexpr std::uint32_t kIndexHeaderBytes = 40;
 inline constexpr std::uint32_t kTailBytes = 40;
@@ -96,7 +97,8 @@ constexpr std::uint64_t padding(std::uint64_t n) { return (8 - n % 8) % 8; }
 
 // The whole `VRST` chunk for `session`, padding included; InvalidArgument,
 // naming `api`, for a session it cannot hold (no tracks or more than 65535,
-// a kind of 0, a rate_den of 0, a body over kMaxSessionBytes).
+// a kind of 0, a rate_den of 0, an up not allowed, a body over
+// kMaxSessionBytes).
 core::Status encode_session(std::string_view api, const Session& session,
                             std::vector<std::uint8_t>* chunk);
 
@@ -197,19 +199,21 @@ core::Result<std::uint32_t> session_header_bytes(std::string_view api,
                                                  std::uint64_t available);
 
 // The session header's B, from its `h` bytes at `header`: InvalidArgument
-// when they fail their CRC or B is above kMaxSessionBytes; Unsupported for a
-// version or flag this version does not know.
+// when they fail their CRC, hold an up not allowed or B is above
+// kMaxSessionBytes; Unsupported for a version or flag this version does not
+// know.
 core::Result<std::uint64_t> session_body_bytes(std::string_view api,
                                                std::string_view path,
                                                const std::uint8_t* header,
                                                std::uint32_t h);
 
-// The session the header at `header` and its body, `size` bytes at `body`,
-// hold, into `session`: InvalidArgument when the body fails its CRC or does
-// not parse exactly.
+// The session the `h` bytes of the header at `header` and its body, `size`
+// bytes at `body`, hold, into `session`: InvalidArgument when the body fails
+// its CRC or does not parse exactly.
 core::Status parse_session(std::string_view api, std::string_view path,
-                           const std::uint8_t* header, const std::uint8_t* body,
-                           std::uint64_t size, Session* session);
+                           const std::uint8_t* header, std::uint32_t h,
+                           const std::uint8_t* body, std::uint64_t size,
+                           Session* session);
 
 // --- The file. ---------------------------------------------------------------
 
@@ -228,9 +232,10 @@ core::Result<std::uint64_t> resync(std::string_view api, const FileView& file,
 
 // Read the session header, the file's first chunk, into `session`: where the
 // chunk after it starts. InvalidArgument for a file shorter than a session
-// header or without its magic, and for a header out of range, failing a CRC
-// or not parsing exactly; Unsupported for a version or flag this version
-// does not know; IoError when a read fails. `file.tracks` is not read.
+// header or without its magic, and for a header out of range, failing a CRC,
+// holding an up not allowed or not parsing exactly; Unsupported for a version
+// or flag this version does not know; IoError when a read fails.
+// `file.tracks` is not read.
 core::Result<std::uint64_t> read_session(std::string_view api,
                                          const FileView& file,
                                          Session* session);

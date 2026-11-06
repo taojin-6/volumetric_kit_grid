@@ -105,8 +105,8 @@ class VGRID_STREAM_API ChunkEncoder {
   /// @brief Encode @p session's chunk.
   /// @param session  As @ref StreamWriter::create takes it: at least one
   ///                 track and at most 65535, each of a nonzero kind with a
-  ///                 nonzero `rate.den`, and a body of at most
-  ///                 @ref kMaxSessionBytes.
+  ///                 nonzero `rate.den`, an up @ref Session::up allows, and
+  ///                 a body of at most @ref kMaxSessionBytes.
   /// @return The encoder, with no record framed;
   ///         `Status::Code::InvalidArgument` for a session refused above;
   ///         `Status::Code::OutOfMemory` when the chunk or a diagnostic
@@ -210,7 +210,8 @@ class VGRID_STREAM_API ChunkParser {
   /// @return OK; or the failure, which every later call returns again:
   ///         `Status::Code::InvalidArgument` for bytes that do not start
   ///         with `VRST`, a chunk header out of range or of a `RECD` of a
-  ///         track the session lacks, a CRC that fails, a session body above
+  ///         track the session lacks, a CRC that fails, a session whose up
+  ///         @ref Session::up does not allow, a session body above
   ///         @ref kMaxSessionBytes or not parsing exactly;
   ///         `Status::Code::Unsupported` for a session of another version or
   ///         setting a flag; `Status::Code::OutOfMemory` for another body

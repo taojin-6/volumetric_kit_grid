@@ -958,7 +958,9 @@ grid never parses: `TrackKind::RgbdDepth`, each frame's depth half a record,
 every record a key, and `TrackKind::RgbdColor`, one coded picture a record,
 in the same sets. Served live, the pictures must be track 0, so their keys
 anchor the GOP and a live session serves one sensor's colour. The writer
-takes any nonzero kind and the reader passes an unknown one through.
+takes any nonzero kind and the reader passes an unknown one through. A
+session's `up` names the world's up for a viewer, in a trailing field of the
+`VRST` header, written only when it is known (the 2026-11-05 entry).
 
 **Writing** (`StreamWriter`, one thread). `create` makes the file with
 `O_CREAT | O_EXCL`, so nothing at the path is touched, a symbolic link
@@ -1003,9 +1005,9 @@ its footer (`finished`) or the scan found a `TAIL` where the footer's starts
 (`footer_damaged`). `next` passes damage the same way as the scan,
 returning `InvalidArgument` once; a geometry consumer resumes at the next
 key record.
-A session header that is cut, out of range or fails a CRC is
-`InvalidArgument`, and one of another version or with a flag set
-`Unsupported`.
+A session header that is cut, out of range, fails a CRC or holds an up that
+is not allowed is `InvalidArgument`, and one of another version or with a
+flag set `Unsupported`.
 
 **In memory** (`stream/chunks.hpp`, the 2026-10-21 entry). `ChunkEncoder`
 makes the session chunk and frames each record by the record rules, whose
@@ -1262,11 +1264,11 @@ append, so the file is the report's own. A stream that does not decode
 `output.max_viewers` to `CodecOutputs`, and `codec_session` gives the
 `.vrst` one Geometry track at the source's nominal rate (the rig's
 `source.fps`, else 30 a second), with no session id or start time, so a
-rerun writes the same bytes; a record's set is the
-source index and its pts that index at 30 fps, as Replica frames carry no
-time. `codec_outputs` serves without `replay_gop`, so the viewers of recon's `fuse_orbbec`
-that join or fall behind get a key at the next set; `serve_stream`, which
-cannot make a key, keeps it.
+rerun writes the same bytes, and, with a mesh source's params, an up of +Y; a
+record's set is the source index and its pts that index at 30 fps, as Replica
+frames carry no time. `codec_outputs` serves without `replay_gop`, so the
+viewers of recon's `fuse_orbbec` that join or fall behind get a key at the next
+set; `serve_stream`, which cannot make a key, keeps it.
 
 The report opens the CSV once the stream's file is made, and refuses one
 that is that file under another name, through symlinks or case-insensitive
